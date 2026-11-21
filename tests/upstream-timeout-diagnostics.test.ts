@@ -17,13 +17,13 @@ function familyFailure(): TypeError {
     return new TypeError("fetch failed", { cause: aggregate });
 }
 
-test("ETIMEDOUT diagnostics do not claim that the idle watchdog expired", () => {
+test("ETIMEDOUT diagnostics identify a proven connect phase", () => {
     for (const error of [connectError("ETIMEDOUT", "192.0.2.1"), familyFailure()]) {
         const parts = describeUpstreamFailure(error, "https://chatgpt.com/backend-api/codex/responses");
-        assert.equal(parts.detail.kind, "upstream-timeout");
+        assert.equal(parts.detail.kind, "connect-timeout");
         assert.doesNotMatch(parts.detail.hint!, /idle budget expired/);
-        assert.match(parts.detail.hint!, /phase/);
-        assert.match(parts.detail.hint!, /not retried/);
+        assert.match(parts.detail.hint!, /TCP handshake never completed/);
+        assert.match(parts.detail.hint!, /bounded transparent replay/);
     }
 });
 
@@ -120,14 +120,21 @@ test("redacted causes remain valid JSON with quoted URLs and backslashes", () =>
     assert.ok(causes[0].message.includes("C:\\tmp\\file"));
 });
 
-test("diagnostic improvements preserve conservative timeout classification and retry behavior", async () => {
+test("unknown-phase and established-connection timeouts stay conservative and non-replayed", async () => {
     for (const code of ["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]) {
         assert.equal(classifyUpstreamFailure(Object.assign(new Error("timeout"), { code })), "upstream-timeout");
     }
     const original = globalThis.fetch;
     try {
         for (const send of [fetchWithRetry, fetchWithTransportRetry]) {
-            for (const error of [connectError("ETIMEDOUT", "127.0.0.1"), familyFailure()]) {
+            for (const error of [
+                Object.assign(new Error("connect ETIMEDOUT"), { code: "ETIMEDOUT" }),
+                Object.assign(new Error("read ETIMEDOUT"), { code: "ETIMEDOUT", syscall: "read" }),
+                new TypeError("fetch failed", { cause: Object.assign(new AggregateError([
+                    connectError("ETIMEDOUT", "127.0.0.1"),
+                    Object.assign(new Error("timeout"), { code: "ETIMEDOUT" }),
+                ], ""), { code: "ETIMEDOUT" }) }),
+            ]) {
                 let attempts = 0;
                 globalThis.fetch = async () => { attempts++; throw error; };
                 await assert.rejects(send("https://chatgpt.com/backend-api/codex/responses", { method: "POST", body: "{}" }, 5000, undefined), (actual) => actual === error);

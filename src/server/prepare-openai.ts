@@ -1,6 +1,7 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { isRenderedSummaryMessage, renderNudgeText, viableRanges } from "acp-kernel";
+import { recordNudgeInject } from "../cache-ledger.js";
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
@@ -13,6 +14,7 @@ import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTo
 import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
+import { emitNudgeInjected, nudgeDebugMeta } from "../nudge-debug.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
@@ -41,12 +43,12 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, outputBudgetField, readOutputBudget, writeOutputBudget } from "./budget.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
+import { evaluateWatermarkFastpath, finalizeWatermarkTurn, stampOnlyWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
@@ -139,6 +141,16 @@ export async function prepareOpenai(
         log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
         if (wpOutcome.hit) {
             wpHit = wpOutcome.hit;
+            // #6752: handle.ts already ran restoreOutputBudget on `parsed` —
+            // the rebind below re-parses scalar fields from the raw wire text,
+            // which would silently discard the restored budget (the log claims
+            // the restore while the wire still carries the client's shrunk
+            // value). Carry the restored budget across the rebind.
+            const budgetField = outputBudgetField(parsed);
+            const restoredBudget =
+                budgetField !== null
+                    ? readOutputBudget(parsed as Record<string, unknown>, budgetField)
+                    : undefined;
             const fields: Record<string, unknown> = {};
             for (const [key, span] of wpHit.fieldSpans) {
                 // "messages" keeps its WIRE POSITION (the scanner records it
@@ -146,6 +158,9 @@ export async function prepareOpenai(
                 // span so no bytes of the prefix are ever decoded.
                 if (key === "messages") fields[key] = wpHit.windowMessages;
                 else fields[key] = JSON.parse(bodyText.slice(span.start, span.end));
+            }
+            if (budgetField !== null && restoredBudget !== undefined) {
+                writeOutputBudget(fields, budgetField, restoredBudget);
             }
             parsed = fields as OpenAIRequestBody;
             inboundMessageCount = wpHit.totalT;
@@ -496,14 +511,20 @@ export async function prepareOpenai(
             // gentle/over-limit T1 arms ask the model first; EMERGENCY and
             // tier>=2 keep the legacy advisory.
             const useDecide = decide !== undefined && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
+            // Nudge debug record fields (billion-context-pi #326 parity) —
+            // computed from the PRE-nudge array so the turnKey is the user
+            // message, stable across the turn's re-injections.
+            const nudgeMeta = nudgeDebugMeta(turn.nudge, rebuiltMessages);
             if (useDecide && ladderMode(session.metadata) === "fallback") {
                 consumeFallback(session.metadata);
                 try {
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "openai");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "openai", kind: "fallback", text: wireText, ts: Date.now(), ...nudgeMeta });
                     } else {
                         nudgeOutcome = "skipped";
                     }
@@ -523,8 +544,10 @@ export async function prepareOpenai(
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "openai", kind: "directive", text: wireText, ts: Date.now(), ...nudgeMeta });
                     } else {
                         nudgeOutcome = "skipped";
                         log("info", `[${sessionId}] [acp-decide] yes but no live range left to target — skipping injection`);
@@ -541,8 +564,10 @@ export async function prepareOpenai(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "openai");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "openai", kind: "advisory", text: wireText, ts: Date.now(), ...nudgeMeta });
                     } else {
                         nudgeOutcome = "skipped";
                     }
@@ -552,12 +577,6 @@ export async function prepareOpenai(
             }
         } else if (emergencyPressureHeld) {
             nudgeOutcome = "gated";
-        }
-        // #4521: armed-but-silent window — same carrier + rationale as the
-        // anthropic lane (ephemeral trailing user message, current refs
-        // instead of model-guessed ones).
-        if (turn.statusLine) {
-            rebuiltMessages = [...rebuiltMessages, { role: "user", content: turn.statusLine }];
         }
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
         // trailing user note (kept last so it never reorders cached messages).
@@ -646,6 +665,14 @@ export async function prepareOpenai(
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
     snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
+    // #7346: on a HIT the pin is this turn's window (the new tail), NOT the
+    // complete raw log. snapshotMessages stamps it raw (folded=false), so the
+    // save presents the window as the full log and the #3285 authoritative-set
+    // sweep retires every verified prefix row the window omits — a 100k-session
+    // ledger drained to the ~2-row window each turn. Mark the pin non-raw so
+    // the save ingests the window through the bounded envelope view and does
+    // NOT sweep the prefix.
+    if (wpHit !== undefined) session.lastMessagesFolded = true;
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
     markDirty(session);
@@ -658,7 +685,15 @@ export async function prepareOpenai(
             turnStripCounts: wpTurnStrip,
         });
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
+    } else if (bodyText !== undefined && pluginMode && !isTitleGen && !featureEnabled("pluginFullResendWatermark")) {
+        // #7367: flag off — the fastpath never evaluates, but the x-bili-pf-seq
+        // heartbeat still must flow or the client's watermark freezes and its
+        // tail-ids grow past the 16 KB header limit. Stamp-only: no seed, no
+        // saved state (the fastpath re-establishes both when it next runs).
+        wpResponseHeaders = stampOnlyWatermarkTurn(bodyText);
+        if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
+    if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 

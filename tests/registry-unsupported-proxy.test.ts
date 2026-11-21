@@ -119,3 +119,60 @@ test("an unsupported proxy scheme neither rejects the loader nor poisons its mem
         await restore();
     }
 });
+
+// server/handle.ts awaits contextFromRegistry() on the request path for a model
+// the warm cache misses. A failed fetch leaves the cache on the fallback, so
+// before the backoff every such request refetched models.dev and stalled for
+// the full fetch timeout when it was slow or unreachable.
+test("after a failed fetch the request path serves the fallback instead of refetching", async () => {
+    const restore = await isolateLoaderEnv();
+    let calls = 0;
+    let reg: typeof import("../src/registry.ts") | undefined;
+    try {
+        reg = await import("../src/registry.ts");
+        reg._resetForTest();
+        reg._setRegistryFetchForTest(async () => {
+            calls += 1;
+            throw new Error("network down");
+        });
+
+        assert.equal(await reg.contextFromRegistry("no-such-model"), undefined);
+        assert.equal(calls, 1);
+        assert.equal(await reg.contextFromRegistry("no-such-model"), undefined);
+        assert.equal(calls, 1, "a second request inside the backoff must not refetch");
+
+        await reg.loadRegistry();
+        assert.equal(calls, 2, "loadRegistry itself still retries per call");
+    } finally {
+        reg?._setRegistryFetchForTest(undefined);
+        reg?._resetForTest();
+        await restore();
+    }
+});
+
+// The fetch watchdog is an idle timer: a models.dev that trickles bytes keeps
+// the load open long past its 15 s budget. The request path must not wait for
+// it — it answers from the current cache and lets the load finish behind it.
+test("the request path does not wait on a stalled fetch beyond its budget", async () => {
+    const restore = await isolateLoaderEnv();
+    let release: ((err: Error) => void) | undefined;
+    let reg: typeof import("../src/registry.ts") | undefined;
+    try {
+        reg = await import("../src/registry.ts");
+        reg._resetForTest();
+        reg._setRequestPathBudgetForTest(50);
+        reg._setRegistryFetchForTest(() => new Promise((_, reject) => { release = reject; }));
+
+        const started = Date.now();
+        assert.equal(await reg.contextFromRegistry("no-such-model"), undefined);
+        assert.ok(Date.now() - started < 1_000, "answered within the budget, not after the stalled fetch");
+    } finally {
+        // Settle the in-flight load before resetting so it cannot write the
+        // fallback back into the module state after this test.
+        if (release) { release(new Error("network down")); await reg?.loadRegistry(); }
+        reg?._setRequestPathBudgetForTest(undefined);
+        reg?._setRegistryFetchForTest(undefined);
+        reg?._resetForTest();
+        await restore();
+    }
+});

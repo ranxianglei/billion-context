@@ -1,3 +1,12 @@
+// RETIRED — no production importers (identity resolution lives in
+// src/session-resolve.ts, the neutral-skeleton successor). Retained ONLY as a
+// characterization pin: tests/issue2944-neutral-skeleton.test.ts,
+// tests/issue2601-model-drift-absorption.test.ts,
+// tests/issue2601-persona-fork-lineage.test.ts and
+// tests/dsh-persona-continuity.test.ts import it to freeze the old ladder's
+// behavior as a comparison artifact. Removing this file requires dropping all
+// four pins deliberately, not incidentally.
+//
 // #2241/#2250: continuity-aware persona anchor for id-sharing traffic
 // (dsh persona lanes, codex root threads / older builds, claude-over-Responses).
 //

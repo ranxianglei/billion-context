@@ -40,6 +40,7 @@ const sseReply = (res: http.ServerResponse, id: string, text: string): void => {
 
 interface HarnessOpts {
     window?: number;
+    pluginHeader?: string;
     /** First non-stream (summary side-call) request fails. */
     failFirstSideCall?: boolean;
     /** Status the failed first side-call answers with (default 500). */
@@ -110,7 +111,7 @@ async function harness(storageMode: "full" | "legacy", opts: HarnessOpts = {}): 
     if (!(proxy as unknown as { listening?: boolean }).listening) await once(proxy, "listening");
     const proxyUrl = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
     const post = async (body: Record<string, unknown>, sid = "threads-1") => {
-        const response = await fetch(`${proxyUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-api-key": "test-key", "anthropic-version": "2023-06-01", "x-acp-session": sid }, body: JSON.stringify(body) });
+        const response = await fetch(`${proxyUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-api-key": "test-key", "anthropic-version": "2023-06-01", "x-acp-session": sid, ...(opts.pluginHeader ? { "x-bili-plugin": opts.pluginHeader } : {}) }, body: JSON.stringify(body) });
         const text = await response.text();
         let parsed: unknown = text;
         try {
@@ -272,6 +273,63 @@ test("threads lane: post-reforge continue passes through (budget below the windo
         const next = h.forwarded.at(-1) as { thread?: { type?: string }; messages?: unknown[] };
         assert.equal(next.thread?.type, "continue", "plain continue, no re-reforge");
         assert.equal(next.messages?.length, 1);
+    } finally {
+        delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
+        await h.close();
+    }
+});
+
+for (const reloadMirror of [false, true]) {
+    test(`threads lane: repeated reforge carries the previous summary${reloadMirror ? " after reopening its store" : ""}`, async () => {
+        process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE = "1";
+        const h = await harness("full", { window: 5000 });
+        try {
+            await h.post(createBody([
+                { role: "user", content: turnText(1, 400) }, { role: "assistant", content: "answer 1" },
+                { role: "user", content: turnText(2, 400) }, { role: "assistant", content: "answer 2" },
+                { role: "user", content: turnText(3, 400) }, { role: "assistant", content: "answer 3" },
+            ]));
+            for (let turn = 4; turn <= 6; turn++) {
+                if (reloadMirror && turn > 4) __resetThreadsLaneForTests();
+                const reply = await h.post(continueBody([{ role: "user", content: turnText(turn, 400) }], `msg_${h.forwarded.length}`));
+                assert.equal(reply.status, 200);
+                const sideCalls = h.forwarded.filter((body) => body.stream === false && body.thread === undefined);
+                const round = turn - 3;
+                assert.equal(sideCalls.length, round, "each newly over-budget turn performs one reforge");
+                const summaryInput = JSON.stringify(sideCalls.at(-1)?.messages);
+                if (round > 1) {
+                    assert.ok(summaryInput.includes(`SUMMARY-${round - 1}`), "the existing folded history must reach the next summarizer");
+                    assert.ok(!summaryInput.includes("turn payload 1 "), "already-folded raw entries are not replayed alongside their summary");
+                }
+                assert.ok(summaryInput.includes(`turn payload ${round} `), "the newly folded slice accompanies the previous summary");
+                const rebuilt = h.forwarded.at(-1) as { thread?: { type?: string }; system?: unknown; tools?: unknown; messages?: { content?: unknown }[] };
+                assert.equal(rebuilt.thread?.type, "create");
+                assert.deepEqual(rebuilt.system, CLIENT_SYSTEM);
+                assert.deepEqual(rebuilt.tools, CLIENT_TOOLS);
+                assert.equal(rebuilt.messages?.at(-1)?.content, turnText(turn, 400), "the current delta stays verbatim");
+                assert.equal(h.readMirror("threads-1").meta?.foldedSummary, `SUMMARY-${round}`);
+            }
+        } finally {
+            delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
+            await h.close();
+        }
+    });
+}
+
+test("threads lane: plugin mode keeps ownership of its compression", async () => {
+    process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE = "1";
+    const h = await harness("full", { window: 5000, pluginHeader: "pi" });
+    const sid = "threads-plugin-owned";
+    try {
+        await h.post(createBody([
+            { role: "user", content: turnText(1, 400) }, { role: "assistant", content: "answer 1" },
+            { role: "user", content: turnText(2, 400) }, { role: "assistant", content: "answer 2" },
+            { role: "user", content: turnText(3, 400) }, { role: "assistant", content: "answer 3" },
+        ]), sid);
+        const reply = await h.post(continueBody([{ role: "user", content: turnText(4, 400) }], "msg_1"), sid);
+        assert.equal(reply.status, 200);
+        assert.equal(h.readMirror(sid).meta, undefined, "plugin mode does not enter the Threads mirror/reforge path");
+        assert.ok(!h.forwarded.some((body) => (JSON.stringify(body.system) ?? "").includes("You are compressing an older slice of a coding-agent conversation")), "the Threads summarizer is not called for a plugin-owned turn");
     } finally {
         delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
         await h.close();

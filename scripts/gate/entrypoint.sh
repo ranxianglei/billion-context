@@ -152,6 +152,10 @@ RC_GATE=${PIPESTATUS[0]}
 log "5.5 plugin + 5.7 restart lanes (concurrent)"
 CONCURRENT=${GATE_CONCURRENT:-1}
 P_PID=""; R_PID=""
+# Fresh per-run rc files: a stale copy left in a persistent outDir by an
+# earlier run must never be read back if the subshell dies before its final
+# echo (that failure direction HIDES a red in release verification).
+rm -f "$WORK/.rc-plugins" "$WORK/.rc-restart"
 if echo ",${SKIP}," | grep -q ",p,"; then
   sub "GATE_SKIP contains p — plugin lanes skipped"
   RC_PLUGINS=0
