@@ -461,6 +461,24 @@ cross-protocol conversion), #4433.
 
 **Does this work with [opencodex](https://github.com/lidge-jun/opencodex) (`ocx`) — the local Codex/Claude Code gateway with a ChatGPT account pool?** Same pattern: point the client at bili, and point bili at ocx through the `/bili/` prefix — OpenAI-style clients (chat completions and Responses, e.g. Codex) → `OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:10100/v1`; Anthropic-style clients → `ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:10100`. A dummy key value satisfies clients that require one; it rides through untouched. Keep bili *in front of* ocx rather than behind it: ocx owns the provider credentials and the account pool at its final hop, so only this order keeps compression and pooling working together. Loopback needs no key between the two (ocx's default loopback bind reads no token); a non-loopback bind takes `OPENCODEX_API_AUTH_TOKEN` plus the `x-opencodex-api-key` header per its docs. Request models by ocx's `provider/model` id so routing is deterministic; as with any gateway, routed ids are opaque to bili's window lookup (declare them via `models.<name>.context`) and a mid-session account rebind invalidates the prefix cache (watch `KEY SWITCHES` in `/acp-cache`). Verified end-to-end over all three wires (OpenAI Chat / Responses / Anthropic Messages), bili 0.1.212 × ocx 2.97.0.
 
+**Can I combine bili with the [qoder-trae-workbuddy-switch](https://github.com/NextAgentX/qoder-trae-workbuddy-switch) quota gateway?**
+Yes — same `/bili/` prefix pattern: `http://localhost:8787/bili/http://127.0.0.1:5789x/v1`
+(OpenAI wire) or without `/v1` (Anthropic wire) + the gateway's sk-* key; ports
+57891 WorkBuddy / 57892 unified / 57894 Trae / 57895 Qoder. Caveats: ① the
+gateway's account stickiness reads ONLY the non-standard body field
+`metadata.conversation_id` (no header fallback) — clients that don't write it
+(Claude Code, Codex) get a per-request account draw from the pool, and each
+vendor account keeps its own prefix cache, so cross-turn prefix-cache hits ≈ 0;
+use a client that writes the field (Cursor/Cline) or set the gateway's pick
+mode to Sequential / keep one account in the allowlist; ② the unified gateway
+requires namespaced model names `<ns>:<model>` (bare names → 400) — declare
+their context windows under the providers key via `models.<name>.context`
+(#2317); ③ the Qoder lane reports zero token usage upstream → bili's usage
+stats degrade there (compression is unaffected — it runs on local tokenization);
+④ mid-conversation account switches invalidate the provider's prefix cache and
+stay invisible to bili's KEY SWITCHES attribution (the outbound key is always
+the stable sk-* gateway key). Full analysis: #5193.
+
 **Where are logs and session data stored?** Log:
 `~/.local/state/billion-context/bili.log` (also mirrored to stderr); session
 state: `~/.local/share/billion-context/` (XDG-overridable; Windows AV exclusion
