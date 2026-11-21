@@ -112,7 +112,7 @@ test("envelope import: stored block lineage is preserved; new messages still lan
                 messages: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(msgRow),
                 blocks: [blockRow("b1", 0, "COARSE summary of everything", ids(0, 12), T0 + 5_000)],
                 deadRefs: [], refs: [], ccrEntries: [],
-            }, undefined, { envelopeImport: true });
+            }, { envelopeImport: true });
 
             const blocks = store.getBlocks("imp-lineage");
             assert.equal(blocks.length, 2, "stored blocks must survive the coarse envelope import");
@@ -153,7 +153,7 @@ test("envelope import: stats may advance, never regress", () => {
                 messages: [0, 1, 2].map(msgRow),
                 blocks: [blockRow("b1", 0, "s", ids(0, 2), T0)],
                 deadRefs: [], refs: [], ccrEntries: [],
-            }, undefined, { envelopeImport: true });
+            }, { envelopeImport: true });
             assert.equal(store.getSessionRow("imp-stats")!.statsJson, JSON.stringify({ requests: 150 }), "advancing counters must apply");
 
             // And a stale envelope arriving afterwards cannot pull it back.
@@ -162,7 +162,7 @@ test("envelope import: stats may advance, never regress", () => {
                 messages: [0, 1, 2].map(msgRow),
                 blocks: [blockRow("b1", 0, "s", ids(0, 2), T0)],
                 deadRefs: [], refs: [], ccrEntries: [],
-            }, undefined, { envelopeImport: true });
+            }, { envelopeImport: true });
             assert.equal(store.getSessionRow("imp-stats")!.statsJson, JSON.stringify({ requests: 150 }), "a smaller incoming total must not regress the stored counters");
         } finally {
             store.close();
@@ -182,7 +182,7 @@ test("envelope import: a session with no stored blocks adopts the envelope struc
                 messages: [0, 1, 2, 3, 4].map(msgRow),
                 blocks: [blockRow("b1", 0, "e", ids(0, 4), T0)],
                 deadRefs: [], refs: [], ccrEntries: [],
-            }, undefined, { envelopeImport: true });
+            }, { envelopeImport: true });
             assert.equal(store.getBlocks("imp-first").length, 1, "true first import must adopt the envelope's blocks");
         } finally {
             store.close();

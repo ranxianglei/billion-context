@@ -115,7 +115,7 @@ test("plain exports and non-placeholder text remain verbatim", async () => {
         for (const [full, text] of [[false, PLACEHOLDER], [true, "ordinary text"], [true, `quoted: ${PLACEHOLDER}`]] as const) {
             const value = session("saved original");
             value.lastMessages![0]!.text = text;
-            store.ingestSession(plan(value), undefined, { completeLog: true });
+            store.ingestSession(plan(value), { completeLog: true });
             const lines = records(await renderSessionJsonlFromTables(new SqliteBackend(store), value.id, full));
             const last = lines.filter((line) => line.type === "message").at(-1)!;
             assert.deepEqual(last.message, value.lastMessages![0]);

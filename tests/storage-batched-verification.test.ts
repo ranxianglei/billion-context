@@ -113,7 +113,7 @@ for (const asyncLane of [false, true]) {
     });
 }
 
-test("a changed message beyond the first batch trips drift and clears the watermark", (t) => {
+test("a changed message beyond the first batch trips drift and latches the session", (t) => {
     const { store, shadow, dbPath, view } = fixture(t);
     changeBeforeRead(t, store, dbPath, (db) => {
         const row = db.prepare("SELECT content_hash FROM messages WHERE session_id = ? AND msg_id = ?").get(view.id, "raw-70") as { content_hash: string };
@@ -121,7 +121,8 @@ test("a changed message beyond the first batch trips drift and clears the waterm
     });
     shadow.record(view);
     assert.equal(shadow.stats.verifyDrift, 1, shadow.stats.lastError ?? "changed content must drift");
-    assert.equal(store.ingestWatermark(view.id), null);
+    // The heal IS the latch: latched saves take the exact full path until a
+    // clean sample re-admits (the #3133 watermark it used to clear is gone).
     assert.ok(shadow.driftedSessions.has(view.id));
 });
 
@@ -141,7 +142,8 @@ test("later block batches detect changed, missing and extra block contents", (t)
         });
         shadow.record(view);
         assert.equal(shadow.stats.verifyDrift, 1, `${kind}: ${shadow.stats.lastError}`);
-        assert.equal(store.ingestWatermark(view.id), null, kind);
+        // (pre-2026-11-21: cleared the ingest watermark; now the drift latch
+        //  forces the full path — no stored trust to clear)
     }
 });
 
@@ -156,6 +158,7 @@ test("missing and retired tail rows remain visible as drift", (t) => {
         });
         shadow.record(view);
         assert.equal(shadow.stats.verifyDrift, 1, shadow.stats.lastError ?? "missing referenced message must drift");
-        assert.equal(store.ingestWatermark(view.id), null);
+        // (pre-2026-11-21: cleared the ingest watermark; now the drift latch
+        //  forces the full path — no stored trust to clear)
     }
 });

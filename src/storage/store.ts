@@ -23,6 +23,10 @@ import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import { identityOfStoredContent } from "./identity.js";
+// ESM cycle with ingest.ts (it imports sha256Hex + row types from here;
+// we import the reconciler planner from there). Safe: both sides use the
+// other's exports only inside function bodies, never at module top level.
+import { planReconciled, type LegacySessionLike, type StoredMessageRow } from "./ingest.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
@@ -121,8 +125,9 @@ export interface SessionRow {
     ccrJson: string | null;
     /** #3133 ingest watermark: highest absolute message seq whose bytes this
      *  index has verified (NULL = no trusted prefix → next save ingests
-     *  fully). Computed by ingestSession only (delta provenance or full-path
-     * alignment) — never by planners or callers; read via ingestWatermark(). */
+     *  fully). DEPRECATED 2026-11-21: the #3133 watermark is removed —
+     *  writers always store NULL, kept for column compatibility. Trust is
+     *  now established per save by identity reconciliation (planReconciled). */
     lastIngestedSeq?: number | null;
     /** #3841 reap journal: contents of reaped blocks (state.blocks lost
      *  the entry, blockContents keeps the text). Served via loadLegacyView
@@ -1025,28 +1030,51 @@ export class UnifiedStore {
         });
     }
 
-    /** Ingests one session plan as a single transaction. Full path (no
-     *  `delta`): identity-based absolute-seq remap of every plan row; the
-     *  watermark becomes the abs seq backing the plan's LAST tail message
-     *  (NULL when the plan carries no tail) — the trusted tip need not be
-     *  the table's max, because delta appends anchor at max(seq)+1, never
-     *  at watermark+1, so rows above the tip (a fold's summary) cannot
-     *  collide with them.
+    /** One row of the in-transaction stored-message index — the join set
+     *  planReconciled matches against. Read inside the write transaction
+     *  (BEGIN IMMEDIATE serializes writers, so the partition it produces is
+     *  exactly what the apply sees — a pre-transaction read could join
+     *  against a partition a racing writer just changed and land a pin on a
+     *  vanished row). Retired rows are included on purpose: a pointer may
+     *  legally land on a tombstone (rewind-redo) and the reactivation path
+     *  needs its seq. */
+    storedMessagesIndex(sessionId: string): StoredMessageRow[] {
+        const rows = this.db
+            .prepare("SELECT seq, msg_id, content_hash, identity, retired_at, ref FROM messages WHERE session_id = ?")
+            .all(sessionId) as { seq: number; msg_id: string; content_hash: string; identity: string; retired_at: number | null; ref: string | null }[];
+        return rows.map((r) => ({ seq: r.seq, msgId: r.msg_id, contentHash: r.content_hash, identity: r.identity, retiredAt: r.retired_at, ref: r.ref }));
+    }
+
+    /** Steady-state save: reconcile the session's wire view against its
+     *  stored messages rows by CLIENT-SENT identity (planReconciled) and
+     *  apply the result through the shared transaction. No stored trust, no
+     *  watermark, no process-handoff voiding — the reconciler converges two
+     *  writers on the same identities instead of one writer vouching for a
+     *  positional prefix (2026-11-21; the #3133 last_ingested_seq
+     *  watermark it replaces is gone). `deep` (drift-latched sessions,
+     *  #5677) forces the exact full path: every row re-serializes and the
+     *  save converges a proven-divergent view. `completeLog` gates the
+     *  #3285 authoritative-set sweep (raw-tail saves and latched re-renders
+     *  only — pruned envelope renders must never sweep). A transaction
+     *  failure throws (the shadow's 3-strike health path owns recovery). */
+    ingestReconciled(legacy: LegacySessionLike, opts: { deep?: boolean; completeLog?: boolean } = {}): boolean {
+        const ok = this.db.transaction(() => {
+            const plan = planReconciled(legacy, this.storedMessagesIndex(legacy.id), { deep: opts.deep });
+            return this.applySessionPlan(plan, opts);
+        });
+        if (ok) this.maybeCheckpointWal();
+        return ok;
+    }
+
+    /** Ingests one DEEP (fully-serialized) session plan as a single
+     *  transaction: the identity remap (remapPlanToAbsolute), the #3285
+     *  authoritative-set sweep for complete logs, then the shared apply
+     *  (sessions upsert, messages, blocks, refs, dead_refs, ccr). The
+     *  steady-state entry is ingestReconciled, which delegates here when a
+     *  deep save is forced (drift latch) — deep plans are planIngest's
+     *  relative-seq plans, which the remap turns absolute. A transaction
+     *  failure throws (the shadow's 3-strike health path owns recovery).
      *
-     *  Delta path (#3133, `delta` given): the plan carries ONLY messages
-     *  past the trusted prefix, with placeholder seqs (renumbered here).
-     *  The boundary row (msg_id + content_hash at seq trustedSeq) is
-     *  RE-VERIFIED inside this transaction (BEGIN IMMEDIATE serializes
-     *  writers, so the in-tx check is authoritative — the caller's pre-plan
-     *  probe was just an optimization), every delta message's identity must
-     *  be absent (strictly-append — a re-derived tail would otherwise be
-     *  silently dropped by the UNIQUE constraint), and new rows take
-     *  max(seq)+1.. so no slot can collide. On any disagreement this
-     *  returns false WITHOUT writing anything; the caller falls back to the
-     *  full plan. A stale or foreign-written watermark therefore costs one
-     *  redundant full write — never wrong rows — and the watermark write
-     *  itself rides the SAME transaction as the rows. */
-    /**
      *  opts.envelopeImport (2026-11-21, #7156 incident follow-up): the plan
      *  came from a LEGACY ENVELOPE, not from this process's own state. An
      *  envelope is a pruned render, possibly written by ANOTHER process (a
@@ -1061,60 +1089,20 @@ export class UnifiedStore {
      */
     ingestSession(
         input: IngestSessionInput,
-        delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
         opts?: { completeLog?: boolean; envelopeImport?: boolean },
     ): boolean {
+        const ok = this.db.transaction(() => this.applySessionPlan(input, opts));
+        if (ok) this.maybeCheckpointWal();
+        return ok;
+    }
+
+    /** Shared apply body of ingestSession / ingestReconciled — runs INSIDE
+     *  the caller's transaction: remap → #3285 sweep → sessions upsert →
+     *  messages → blocks → refs → dead_refs → ccr. Mutates
+     *  input.session.tailJson (pointer sequences become absolute). */
+    private applySessionPlan(input: IngestSessionInput, opts?: { completeLog?: boolean; envelopeImport?: boolean }): boolean {
         const s = input.session;
-        const ok = this.db.transaction((): boolean => {
-            let messages: MessageRow[];
-            let watermark: number | null;
-            if (delta) {
-                const probe = this.probeIngestBoundary(s.sessionId, delta.trustedSeq);
-                if (!probe || probe.msgId !== delta.boundaryMsgId || probe.contentHash !== delta.boundaryHash) {
-                    return false;
-                }
-                // Strictly-append guard: a delta message whose identity
-                // already has a row (rewound/re-derived tail) must not be
-                // silently skipped by the UNIQUE(session_id, msg_id,
-                // content_hash) constraint — its tailSeqs slot would point
-                // at nothing and the read view would drop it. One indexed
-                // probe per NEW message; any hit → full ingest instead.
-                const existingIdentity = this.db.prepare(
-                    "SELECT 1 FROM messages WHERE session_id = ? AND msg_id = ? AND identity = ?",
-                );
-                for (const m of input.messages) {
-                    if (!m.contentHash) return false;
-                    // #4390: join on identity (position-independent). Retired
-                    // rows count as existing — a rewind-redo falls back to the
-                    // full path, which reactivates the tombstone in place.
-                    if (existingIdentity.get(s.sessionId, m.msgId, m.identity ?? identityOfStoredContent(m.content))) return false;
-                }
-                // Placeholder→absolute renumber: the plan emitted
-                // watermark+1.. under the aligned assumption; anchoring at
-                // the CURRENT max(seq)+1 (re-read inside this transaction)
-                // is what makes slot collisions structurally impossible —
-                // identical to the full path's nextSeq discipline, and it
-                // keeps the delta valid even when a fold left rows above
-                // the trusted tip.
-                messages = input.messages.map((m, i) => ({ ...m, seq: probe.maxSeq + 1 + i }));
-                const tail = JSON.parse(s.tailJson) as { tailSeqs?: number[] | null };
-                // Defense: the plan's tailSeqs prefix must be exactly the
-                // trusted prefix the watermark read produced (same-tick by
-                // construction; disagreement means a stale plan).
-                const prefixOk =
-                    Array.isArray(tail.tailSeqs) &&
-                    tail.tailSeqs.length === delta.trustedTailSeqs.length + input.messages.length &&
-                    delta.trustedTailSeqs.every((v, i) => tail.tailSeqs?.[i] === v);
-                if (!prefixOk) return false;
-                s.tailJson = JSON.stringify({
-                    ...tail,
-                    tailSeqs: [...delta.trustedTailSeqs, ...messages.map((m) => m.seq)],
-                });
-                watermark = messages.length > 0 ? messages[messages.length - 1].seq : delta.trustedSeq;
-            } else {
-                const full = this.remapPlanToAbsolute(input);
-                messages = full.messages;
-                watermark = full.watermark;
+            const messages = this.remapPlanToAbsolute(input);
                 // #3285: authoritative-set discipline for messages — same as
                 // blocks / refs / dead_refs / ccr_entries below, but ONLY when
                 // completeLog says the plan IS the whole log (the raw tail).
@@ -1137,7 +1125,7 @@ export class UnifiedStore {
                 // past. Sweeping them would invalidate the epoch (cold rebuild
                 // serves an empty canonical → 409 loop). Lane-owned sessions
                 // therefore opt out; they keep #3166-class orphans (bounded —
-                // the boot watermark reset still re-establishes delta trust).
+                // identity reconciliation re-establishes trust at every save).
                 if (opts?.completeLog === true && !this.hasLaneExt(s.sessionId)) {
                     const incomingIds = new Set<string>();
                     for (const m of messages) {
@@ -1194,7 +1182,6 @@ export class UnifiedStore {
                         for (const rm of retiredMedia) this.releaseContent(rm.media_hash);
                     }
                 }
-            }
             // Lineage belongs to the first parent, including its nullable fork
             // point. Later metadata must not reparent or mix the stored pair.
             this.db
@@ -1204,7 +1191,7 @@ export class UnifiedStore {
                        meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json)
                      VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle, @namespace, @origin,
                        @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
-                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, @lastIngestedSeq, @orphansJson)
+                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, NULL, @orphansJson)
                      ON CONFLICT(session_id) DO UPDATE SET
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
                        fork_point_seq = CASE WHEN sessions.parent_session_id IS NULL THEN excluded.fork_point_seq ELSE sessions.fork_point_seq END,
@@ -1242,7 +1229,7 @@ export class UnifiedStore {
                        kstate_json = CASE WHEN kstate_json IS excluded.kstate_json THEN sessions.kstate_json ELSE excluded.kstate_json END,
                        tail_json = excluded.tail_json,
                        ccr_json = CASE WHEN ccr_json IS excluded.ccr_json THEN sessions.ccr_json ELSE excluded.ccr_json END,
-                       last_ingested_seq = excluded.last_ingested_seq,
+                       last_ingested_seq = NULL,
                        -- #6780: no same-value skip here (or for the #6325 columns): an unchanged
                        -- OVERFLOW blob (a JSON column big enough to spill onto overflow pages) is
                        -- copied onto fresh pages whenever ANY column of this row changes, so a
@@ -1272,7 +1259,6 @@ export class UnifiedStore {
                     tailJson: s.tailJson,
                     ccrJson: s.ccrJson,
                     statsGuard: opts?.envelopeImport === true ? 1 : 0,
-                    lastIngestedSeq: watermark,
                     // #4216/#4242: orphan journal rides the normal upsert with
                     // MERGE semantics (existing entries survive — LazyBlockContents
                     // means the live map may not carry trimmed entries).
@@ -1293,6 +1279,9 @@ export class UnifiedStore {
             //  per-message first-sight stamp all carry the same second.
             const batchTs = Date.now();
             for (const m of messages) {
+                // Blind pin: the live row (and its CAS bytes) already exists
+                // and was verified at plan time — no content work at all.
+                if (m.content === "") continue;
                 const hash = this.putContent(m.content, m.contentHash);
                 const res = this.db
                     .prepare(
@@ -1656,9 +1645,6 @@ export class UnifiedStore {
                     .run(s.sessionId, e.ord, e.key, hash);
             }
             return true;
-        });
-        if (ok) this.maybeCheckpointWal();
-        return ok;
     }
 
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
@@ -1702,10 +1688,13 @@ export class UnifiedStore {
         return `, ${formatDbSize(walBytes)} WAL${tick}`;
     }
 
-    /** Full-ingest path of ingestSession, extracted for readability: the
-     *  absolute-seq remap plus the #3133 watermark alignment decision.
-     *  Mutates input.session.tailJson (pointer sequences become absolute). */
-    private remapPlanToAbsolute(input: IngestSessionInput): { messages: MessageRow[]; watermark: number | null } {
+    /** Shared apply path of ingestSession / ingestReconciled, extracted
+     *  for readability: the absolute-seq identity remap. Mutates
+     *  input.session.tailJson (pointer sequences become absolute). Plan rows
+     *  may already carry ABSOLUTE seqs (the reconciler's pins and sentinels)
+     *  or relative ones (deep plans) — identity join handles both; only the
+     *  seq allocation for NEW identities is absolute (max stored seq + 1). */
+    private remapPlanToAbsolute(input: IngestSessionInput): MessageRow[] {
         const s = input.session;
         // Absolute-seq remap (#2671 soak finding): planIngest assigns seq
         // RELATIVE to the current snapshot's log (pluginSnapshot first,
@@ -1736,12 +1725,6 @@ export class UnifiedStore {
             storedRefBySeq.set(row.seq, row.ref);
             if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
         }
-        // #3133 watermark gate (full path): the watermark names the abs seq
-        // backing the plan's LAST tail message. It need not be the table's
-        // max — a fold's summary lands above surviving old rows — because
-        // delta appends anchor at max(seq)+1, never at watermark+1. NULL
-        // when the plan carries no tail (envelope-only imports): the next
-        // save runs the full ingest.
         const planToAbs = new Map<number, number>();
         const repairs: { seq: number; msgId: string; from: string; to: string; content: string }[] = [];
         // #6947: rows written by the turn-final handoff write-back carry
@@ -1846,38 +1829,18 @@ export class UnifiedStore {
             seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
         const pluginSnapshotSeqs = remapSeqs(input.pluginSnapshotSeqs);
         const tailSeqs = remapSeqs(input.tailSeqs);
-        const watermark = tailSeqs !== null && tailSeqs !== undefined && tailSeqs.length > 0 ? tailSeqs[tailSeqs.length - 1] : null;
         s.tailJson = JSON.stringify({
             ...(JSON.parse(s.tailJson) as Record<string, unknown>),
             ...(pluginSnapshotSeqs !== undefined ? { pluginSnapshotSeqs } : {}),
             ...(tailSeqs !== undefined ? { tailSeqs } : {}),
         });
-        return { messages, watermark };
+        return messages;
     }
 
-    /** #3133: the session's ingest watermark — the absolute seq backing the
-     *  LAST message of the tail as ingested by the most recent save, plus
-     *  that save's trusted tailSeqs (same transaction wrote both). NULL (or
-     *  a shape that disagrees with tail_json — foreign write, partial
-     *  upgrade) means "no trusted prefix": the next save runs the full
-     *  ingest. Point read on the sessions PK. */
-    ingestWatermark(sessionId: string): { seq: number; tailSeqs: number[] } | null {
-        const row = this.db
-            .prepare("SELECT last_ingested_seq, tail_json FROM sessions WHERE session_id = ?")
-            .get(sessionId) as { last_ingested_seq: number | null; tail_json: string } | undefined;
-        if (!row) return null;
-        const seq = row.last_ingested_seq;
-        if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null;
-        const tail = JSON.parse(row.tail_json) as { tailSeqs?: number[] | null };
-        const seqs = tail.tailSeqs;
-        if (!Array.isArray(seqs) || seqs.length === 0 || seqs[seqs.length - 1] !== seq) return null;
-        return { seq, tailSeqs: seqs };
-    }
 
     /** #3756 snapshot render: the sessions row's tail_json view — the seq
      *  pointer list of the logical transcript view (lastMessages order at
-     *  save time). Unlike ingestWatermark this does NOT require a trusted
-     *  watermark; it just reads the pointer list. Null when absent/malformed
+     *  save time). Reads the pointer list only. Null when absent/malformed
      *  — the render lane degrades to legacy. */
     tailSeqs(sessionId: string): number[] | null {
         const row = this.db
@@ -1892,32 +1855,7 @@ export class UnifiedStore {
         }
     }
 
-    /** #3166 review (heal half of the sampled-verify backstop): drop the
-     *  durable watermark so the next save takes the exact full path and
-     *  re-points every tail slot. Called when the read-back digest proves
-     *  the stored prefix no longer matches the record of truth — without it
-     *  every same-length save would re-take the unverified empty delta
-     *  against a stale watermark and the divergence would be permanent. */
-    clearIngestWatermark(sessionId: string): void {
-        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
-    }
 
-    /** #3285: drop EVERY session's ingest watermark at once. A watermark
-     *  vouches "the writer that set it verified this prefix" but carries no
-     *  writer identity, so the trust must not survive a process handoff:
-     *  under the multi-process shared-directory contract (#2671) a
-     *  restart-handoff overlap (old instance still draining while the new
-     *  one boots, both sharing index.db) leaves a foreign process's rows
-     *  AND its watermark behind, and inheriting that trust lets the new
-     *  process take unverified empty deltas against rows it never wrote.
-     *  Called once at writer init (UnifiedShadow.maybeOpen); pure readers
-     *  (export) must not call it. After the reset each session's first save
-     *  takes the exact full path — an authoritative replace, see
-     *  ingestSession — re-establishing trust from this process's own view.
-     *  Cost: one full ingest per saved session per boot. */
-    resetAllIngestWatermarks(): void {
-        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL").run();
-    }
 
     /** #3248 lane-ownership probe for the message sweep (#3285): every ext
      *  key the incremental lane persists is "inc:"-prefixed, so any such key
@@ -1926,36 +1864,7 @@ export class UnifiedStore {
         return this.db.prepare("SELECT 1 FROM session_ext WHERE session_id = ? AND key LIKE 'inc:%' LIMIT 1").get(sessionId) !== undefined;
     }
 
-    /** #3133 boundary probe: the identity of the messages row at
-     *  (session_id, seq) plus the session's current max seq — both lookups
-     *  ride the PRIMARY KEY (session_id, seq) / idx_messages_session (no
-     *  full existing-rows scan, no seqByIdentity map). null when the row is
-     *  missing. The identity half is the trust decision; the max-seq half
-     *  is the ANCHOR delta appends continue after (max+1, the same
-     *  strictly-above discipline as the full path's remap, so appends can
-     *  never collide with an existing slot — rows above the watermark,
-     *  e.g. a fold's summary, are expected and harmless). */
-    probeIngestBoundary(sessionId: string, seq: number): { msgId: string; contentHash: string; maxSeq: number } | null {
-        const row = this.db
-            .prepare("SELECT msg_id, content_hash FROM messages WHERE session_id = ? AND seq = ?")
-            .get(sessionId, seq) as { msg_id: string; content_hash: string } | undefined;
-        if (!row) return null;
-        const max = this.db
-            .prepare("SELECT MAX(seq) AS m FROM messages WHERE session_id = ?")
-            .get(sessionId) as { m: number | null };
-        return { msgId: row.msg_id, contentHash: row.content_hash, maxSeq: max.m ?? -1 };
-    }
 
-    /** #3919: identity-only point read backing the delta path's head probe —
-     *  msg_id at (session_id, seq), null when the row is missing. PK lookup;
-     *  id-only by design (content-derived ids make a rewrite visible without
-     *  re-serializing a potentially MB-sized row). */
-    headRowMsgId(sessionId: string, seq: number): string | null {
-        const row = this.db
-            .prepare("SELECT msg_id FROM messages WHERE session_id = ? AND seq = ?")
-            .get(sessionId, seq) as { msg_id: string } | undefined;
-        return row ? row.msg_id : null;
-    }
 
     /** #3301: message rows for the given ids — EVERY seq row matching an id
      *  (edits append; callers keep the latest per id) plus, when
@@ -3356,7 +3265,7 @@ export class UnifiedStore {
                 // the prepared child atomically rather than falling back to
                 // an unchecked upsert after releasing this transaction.
                 if (!initial) return false;
-                if (!this.ingestSession(initial, undefined, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
+                if (!this.ingestSession(initial, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
                 return true;
             }
             if (existing !== null) {
@@ -3418,7 +3327,7 @@ export class UnifiedStore {
                     parentId,
                     throughSeq,
                 );
-            if (initial && !this.ingestSession(initial, undefined, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
+            if (initial && !this.ingestSession(initial, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
             return true;
         });
     }

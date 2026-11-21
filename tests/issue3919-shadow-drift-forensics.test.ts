@@ -21,10 +21,10 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { UnifiedStore } from "../src/storage/store.ts";
+import { UnifiedStore, viewPointerSeqs } from "../src/storage/store.ts";
 import { UnifiedShadow, describeViewDivergence, formatDriftDiagnostics } from "../src/storage/shadow.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
-import { planIngestDelta, loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { setLogCapture } from "../src/logger.ts";
 import type { CoreMessage } from "acp-kernel";
 
@@ -87,7 +87,6 @@ function mkLegacy(id: string, lastMessages: LegacySessionLike["lastMessages"]): 
 
 interface StatsView {
     ingests: number;
-    deltaIngests: number;
     verifySamples: number;
     verifyOk: number;
     verifyDrift: number;
@@ -137,7 +136,7 @@ function tamperFirstRowBytes(dir: string, sessionId: string): string {
     }
 }
 
-test("head probe: a rewritten first tail slot fails the delta immediately and converges via the full path", () => {
+test("a rewritten first tail slot converges on the same save — reconciliation re-points it (the #3919 drift window is structurally closed)", () => {
     const dir = tmpdir("bili-3919-head-");
     try {
         const { shadow, store } = openShadow(dir);
@@ -145,34 +144,28 @@ test("head probe: a rewritten first tail slot fails the delta immediately and co
             const base = Array.from({ length: 12 }, (_, i) => msg(i));
             shadow.record(mkLegacy("drift-head", base), { lastMessages: base });
             shadow.record(mkLegacy("drift-head", [...base, msg(12)]), { lastMessages: [...base, msg(12)] });
-            assert.equal(stats(shadow).deltaIngests, 1, "steady append rides the delta");
 
-            // Interior rewrite BELOW the boundary: slot 0 replaced, the rest
-            // intact, two fresh turns appended. Pre-#3919 this rode the delta
-            // (only the last slot was probed) and surfaced ≤20 saves later as
-            // DIGEST DRIFT; now the head probe refuses it on this very save.
+            // Interior rewrite BELOW the old delta boundary: slot 0 replaced
+            // (content-derived id flips with the bytes), the rest intact, two
+            // fresh turns appended. Pre-#3919 this rode the delta (only the
+            // last slot was probed) and surfaced ≤20 saves later as DIGEST
+            // DRIFT; pre-2026-11-21 the #3919 head probe refused it on this
+            // very save. With the watermark and both probes gone,
+            // reconciliation converges it directly: the new head gets its row,
+            // the stale h_msg0 row is swept (raw tail → completeLog), every
+            // tail slot re-points — there is no drift window to close.
             const rewritten = [
                 { id: "h_msg0_v2", role: "user", contentType: "text", text: "rewritten head" } as CoreMessage,
                 ...base.slice(1), msg(12), msg(13),
             ];
             shadow.record(mkLegacy("drift-head", rewritten), { lastMessages: rewritten });
-            assert.equal(stats(shadow).deltaIngests, 1, "rewritten head slot below the boundary must refuse the delta");
-            assert.deepEqual(view(store, "drift-head").lastMessages, rewritten, "the full path re-points every slot — the view converges exactly");
-            let mark = store.ingestWatermark("drift-head");
-            assert.ok(mark && mark.tailSeqs.length === 14, "watermark re-established across the whole new tail");
+            assert.deepEqual(view(store, "drift-head").lastMessages, rewritten, "reconciliation re-points every slot — the view converges exactly");
+            const live = store.getMessages("drift-head");
+            assert.equal(live.length, 14, "the stale head row was swept — no ghost of the old bytes");
+            assert.ok(live.some((r) => r.msgId === "h_msg0_v2"), "the new head row is live");
 
             shadow.record(mkLegacy("drift-head", [...rewritten, msg(14)]), { lastMessages: [...rewritten, msg(14)] });
-            assert.equal(stats(shadow).deltaIngests, 2, "a normal append after the heal still rides the delta (probe must not over-refuse)");
-
-            // The pure planner gate agrees (defense in depth).
-            mark = store.ingestWatermark("drift-head");
-            assert.ok(mark, "watermark for the planner gate");
-            const b = store.probeIngestBoundary("drift-head", mark.seq);
-            assert.ok(b, "boundary row for the planner gate");
-            const sess = mkLegacy("planner", [...rewritten, msg(14)]);
-            assert.ok(planIngestDelta(sess, mark.seq, mark.tailSeqs, { msgId: b.msgId, contentHash: b.contentHash }, true, { msgId: rewritten[0].id }), "matching head → plan");
-            assert.equal(planIngestDelta(sess, mark.seq, mark.tailSeqs, { msgId: b.msgId, contentHash: b.contentHash }, true, { msgId: "h_msg0" }), null, "stale head identity → refuse");
-            assert.ok(planIngestDelta(sess, mark.seq, mark.tailSeqs, { msgId: b.msgId, contentHash: b.contentHash }, true), "no head arg → legacy behavior (plan)");
+            assert.deepEqual(view(store, "drift-head").lastMessages, [...rewritten, msg(14)], "a normal append after the heal still converges (no over-refusal to fix)");
         } finally {
             shadow.close();
             store.close();
@@ -284,8 +277,13 @@ test("repeat marker: consecutive sampled drift stays flagged until a clean sampl
             assert.equal(lines.length, 2, "two drifts logged");
             assert.ok(!lines[0].includes("(repeat:"), "the first drift is not flagged as repeat");
             assert.ok(lines[1].includes("(repeat: consecutive sampled drift"), `the second consecutive drift IS flagged: ${lines[1]}`);
-            const mark = store.ingestWatermark(ids);
-            assert.ok(mark && mark.tailSeqs.length === k, "watermark re-established across the healed tail");
+            // Post-heal sanity: the tail re-points across the whole healed
+            // view (pre-2026-11-21 this was read back as the re-established
+            // watermark's tailSeqs — the column is gone; the pointer table in
+            // tail_json is the same contract).
+            const row = store.getSessionRow(ids);
+            assert.ok(row, "session row present");
+            assert.equal(viewPointerSeqs(row.tailJson).length, k, "tail points at every healed slot");
         } finally {
             shadow.close();
             store.close();

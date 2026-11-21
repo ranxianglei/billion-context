@@ -67,10 +67,10 @@ function openStore(label: string): { dir: string; store: UnifiedStore; close(): 
 test("#5312 engine: allMessageIds returns every ingested id (live + retired)", () => {
     const h = openStore("allids");
     try {
-        h.store.ingestSession(planIngest(session("s1", ["A", "B", "C"].map(msg), [])), undefined, { completeLog: true });
+        h.store.ingestSession(planIngest(session("s1", ["A", "B", "C"].map(msg), [])), { completeLog: true });
         // Rewind A out of the view: the sweep must RETIRE its row (not delete),
         // else a fold covering A would read zero-overlap. Pins that invariant.
-        h.store.ingestSession(planIngest(session("s1", ["B", "C"].map(msg), [])), undefined, { completeLog: true });
+        h.store.ingestSession(planIngest(session("s1", ["B", "C"].map(msg), [])), { completeLog: true });
         const got = h.store.allMessageIds("s1").slice().sort();
         assert.deepEqual(got, ["A", "B", "C"], "retired id A must stay queryable alongside live B/C");
         // Empty session (no messages) → empty set, not null.

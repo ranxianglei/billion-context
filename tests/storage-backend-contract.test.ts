@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { planIngest, planIngestDelta, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 // The contract suite deliberately imports NOTHING from store.ts: every
 // assertion goes through the StorageBackend interface only. When the mysql
 // backend lands (#3388 step 2) this same file runs against it unchanged.
@@ -140,6 +140,53 @@ test("contract: ingest → reads round-trip through the interface", async () => 
     }
 });
 
+// #4739: ordinary loads must fetch ONLY the tail/pluginSnapshot pointer rows —
+// the historical log stays on disk but is not decoded. Both lanes carry this
+// contract (sqlite pins it here; the mysql lane below pins the same shape).
+test("contract: sessionViewRows scopes message fetch to tail pointers (#4739)", async () => {
+    const dir = scratch();
+    try {
+        const backend = await openBackend("sqlite", path.join(dir, "index.db"));
+        try {
+            const N = 6;
+            const msgs = Array.from({ length: N }, (_, i) => mkMsg(`m${i + 1}`, `body-${i + 1} ` + "z".repeat(120)));
+            assert.ok(await backend.ingestSession(planIngest(mkSession("sess-view", msgs))), "gen-1 ingest ok");
+
+            // Generation 2 — the production shape after an idle fold: the
+            // table keeps every row, tail_json points at the bounded suffix.
+            const all = await backend.getMessages("sess-view");
+            assert.equal(all.length, N, "generation 1 ingested the full history");
+            const K = 3;
+            const suffixSeqs = all.slice(-K).map((m) => m.seq);
+            // Pre-2026-11-21 this was an "empty delta" off the watermark.
+            // Reconciliation is the same shape with no trust: suffix rows pin
+            // to their stored seqs, the tail re-points, completeLog:false
+            // sweeps nothing.
+            assert.ok(
+                await backend.ingestReconciled(mkSession("sess-view", msgs.slice(-K)), { completeLog: false }),
+                "gen-2 window save ok",
+            );
+
+            const view = await backend.sessionViewRows("sess-view");
+            assert.ok(view, "view bundle present");
+            assert.equal(view!.session.sessionId, "sess-view");
+            const stillAll = await backend.getMessages("sess-view");
+            assert.equal(stillAll.length, N, "full history retained on disk");
+            assert.deepEqual(view!.messages.map((m) => m.seq), suffixSeqs, "only the pointer seqs were fetched");
+            const bySeq = new Map(stillAll.map((m) => [m.seq, m]));
+            for (const row of view!.messages) {
+                assert.equal(row.content, bySeq.get(row.seq)!.content, "pointer row byte-equal to the full-log row");
+                assert.equal(row.contentHash, bySeq.get(row.seq)!.contentHash);
+            }
+            assert.equal(await backend.sessionViewRows("no-such-session"), null, "null on session miss");
+        } finally {
+            await backend.close();
+        }
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("contract: session_ext + watermark + tailSeqs", async () => {
     const dir = scratch();
     try {
@@ -155,12 +202,9 @@ test("contract: session_ext + watermark + tailSeqs", async () => {
             // (verbatim store semantics — the contract keeps them).
             assert.equal(await backend.getSessionExt("sess-ext", "inc:canonical-ptrs"), undefined);
 
-            const wm = await backend.ingestWatermark("sess-ext");
-            assert.ok(wm && typeof wm.seq === "number", "watermark readable");
+            // (the #3133 ingest-watermark read/clear pair is gone — 2026-11-21)
             const tails = await backend.tailSeqs("sess-ext");
             assert.ok(Array.isArray(tails), "tailSeqs readable");
-            await backend.clearIngestWatermark("sess-ext");
-            assert.equal(await backend.ingestWatermark("sess-ext"), null, "clearIngestWatermark clears it");
         } finally {
             await backend.close();
         }
@@ -310,11 +354,8 @@ test("mysql lane: contract surface against MySQL 8.0", { skip: MYSQL_DSN.length 
     // ext / watermark / tailSeqs
     await backend.setSessionExt(sid, "inc:canonical-ptrs", [0, 1]);
     assert.deepEqual(await backend.getSessionExt(sid, "inc:canonical-ptrs"), [0, 1]);
-    const wm = await backend.ingestWatermark(sid);
-    assert.ok(wm && typeof wm.seq === "number", "watermark readable");
+    // (the #3133 ingest-watermark read/clear pair is gone — 2026-11-21)
     assert.ok(Array.isArray(await backend.tailSeqs(sid)), "tailSeqs readable");
-    await backend.clearIngestWatermark(sid);
-    assert.equal(await backend.ingestWatermark(sid), null);
 
     // re-ingest the same identity is stable (seq preservation via remap)
     assert.ok(await backend.ingestSession(planIngest(mkSession(sid, msgs))), "re-ingest ok");
@@ -355,6 +396,20 @@ test("mysql lane: contract surface against MySQL 8.0", { skip: MYSQL_DSN.length 
     assert.ok(await backend.cloneSessionRows(cpSid, chSid, 1), "idempotent replay ok");
     assert.equal((await backend.getMessages(chSid)).length, 2, "replay is a no-op");
     assert.equal(await backend.cloneSessionRows(`sess-mysql-absent-${run}`, `${chSid}-orphan`, 5), false, "absent parent → false");
+    // #4739: sessionViewRows pointer scoping on the mysql lane (per-statement
+    // reads are safe because ingestSession commits message rows + session row
+    // in one transaction; the sqlite twin pins the same shape above)
+    const vwSid = `sess-mysql-view-${run}`;
+    const vwMsgs = [mkMsg("m1", "view " + "v".repeat(80)), mkMsg("m2", "view " + "w".repeat(80)), mkMsg("m3", "view " + "q".repeat(80)), mkMsg("m4", "view " + "e".repeat(80))];
+    assert.ok(await backend.ingestSession(planIngest(mkSession(vwSid, vwMsgs))), "view gen-1 ok");
+    const vwAll = await backend.getMessages(vwSid);
+    const vwSuffix = vwAll.slice(-2).map((m) => m.seq);
+    assert.ok(await backend.ingestReconciled(mkSession(vwSid, vwMsgs.slice(-2)), { completeLog: false }), "view gen-2 window save ok");
+    const vwView = await backend.sessionViewRows(vwSid);
+    assert.ok(vwView, "view bundle present");
+    assert.deepEqual(vwView!.messages.map((m) => m.seq), vwSuffix, "only the pointer seqs were fetched");
+    assert.equal(await backend.sessionViewRows(`no-such-${run}`), null, "null on session miss");
+    await backend.deleteSession(vwSid);
 
     // reap journal
     await backend.reapBlocks(sid, new Set(["b2"]), new Map([["b2", { one: null, full: { text: "orphaned", count: 0 } }]]));
@@ -412,7 +467,7 @@ for (const lane of lanes) {
             const messages = Array.from({ length: 400 }, (_, i) => i === 3
                 ? { ...mkMsg(`m-${i}`, `body ${i}`), contentType: "image", imageBase64: image, imageMediaType: "image/png" }
                 : mkMsg(`m-${i}`, `body ${i}`));
-            const save = (tail: CoreMsg[], full: boolean) => backend.ingestSession(planIngest(mkSession(sid, tail)), undefined, { completeLog: full });
+            const save = (tail: CoreMsg[], full: boolean) => backend.ingestSession(planIngest(mkSession(sid, tail)), { completeLog: full });
             try {
                 assert.ok(await save(messages, true));
                 await backend.ingestSession(planIngest(mkSession(other, messages.slice(0, 2))));

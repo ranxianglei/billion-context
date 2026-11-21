@@ -16,6 +16,13 @@
  *    pluginSnapshot is the frozen raw prefix; lastMessages is the folded
  *    visible tail — a suffix SLICE of the log would be wrong because
  *    folding removes entries from the middle.
+ *  - Cross-save reconciliation is by CLIENT IDENTITY ONLY ((session_id,
+ *    msg_id, identity); 2026-11-21, #3285 follow-through): a save points a
+ *    view slot at the stored row whose id matches, serializes only what is
+ *    new, and the completeLog sweep retires rows whose identity the view no
+ *    longer presents. There is NO positional watermark and no writer trust
+ *    — a slot's identity match holds across processes by construction, so
+ *    nothing has to be vouched for (or NULLed) at a handoff.
  *  - ref numbers come from state.messageRefs.byRaw verbatim (TEXT, may be
  *    \"BLOCKED\"); ref_num is the numeric projection for ordering queries.
  *  - blocks.ord = state.blocks array order (== blockContents Map order);
@@ -62,24 +69,54 @@ export interface LegacySessionLike {
     pluginSnapshot?: CoreMessage[];
     /** #3301: external-converter import payload — original message
      *  decompositions interned BEFORE the snapshot/tail so their rows get the
-     *  lowest seqs (they are the oldest evidence). Consumed by the full
-     *  ingest only; the delta planner falls back to the full path while it is
-     *  present (its rows would otherwise be skipped as "trusted prefix"). */
+     *  lowest seqs (they are the oldest evidence). */
     decompositionLog?: CoreMessage[];
     contentStore?: { version: 1; byHash: Record<string, string>; byRef: Record<string, unknown> };
 }
 
 interface IngestPlan extends IngestSessionInput {
-    /** Resolved log seqs for pluginSnapshot entries (null when absent). */
+    /** Resolved log seqs for pluginSnapshot entries (null when absent).
+     *  Reconciled (shallow) plans carry a MIX: non-negative values are
+     *  ABSOLUTE stored seqs (identity pointer), negative values are
+     *  sentinels -(j+1) naming messages[j]. */
     pluginSnapshotSeqs: number[] | null;
     tailSeqs: number[] | null;
+    /** Reconciled (shallow) plans only: for messages[i], the ABSOLUTE seq the
+     *  row must take (pinned reactivation at a stored row's seq) or null (new
+     *  row — the store assigns max(seq)+1..). Absent on deep plans. */
+    pinnedSeqs?: (number | null)[];
+    /** Reconciled plans only: identity keys `msg_id\u0000identity` of the rows
+     *  this save POINTS AT without re-storing — the completeLog sweep must
+     *  count them as presented (or it retires everything it preserved). */
+    preserved?: string[];
+    /** #6947: minted-ref backfills for stored rows the save points at whose
+     *  ref column is still NULL (turn-final write-back rows). */
+    refBackfills?: { seq: number; ref: string; refNum: number }[];
+    /** True when this is a reconciled (shallow) plan — the store's applier
+     *  must renumber sentinels, honor pinnedSeqs and merge `preserved` into
+     *  the sweep set. Deep plans go through the identity remap instead. */
+    reconciled?: boolean;
+}
+
+/** One row of the in-transaction stored-message index (the reconciler's
+ *  join set) — read by UnifiedStore.storedMessagesIndex inside the write
+ *  transaction so the partition it produces is exactly what the apply sees.
+ *  Retired rows are included on purpose: a pointer may legally land on a
+ *  tombstone (rewind-redo) and the pin/reactivate path needs its seq. */
+export interface StoredMessageRow {
+    seq: number;
+    msgId: string;
+    contentHash: string;
+    identity: string;
+    retiredAt: number | null;
+    ref: string | null;
 }
 
 /** #3133 test instrumentation: per-message JSON serializations performed by
- *  the planners in this process (intern pass, delta probe, delta new-tail
- *  pass). The watermark fix exists to make this O(new messages) per save
- *  instead of O(full log) — the storage watermark tests assert exactly
- *  that; production code never reads it. */
+ *  the planners in this process (intern pass, reconciler new/ambiguous pass).
+ *  Reconciliation exists to make this O(new messages) per save instead of
+ *  O(full log) — the reconciliation tests assert exactly that; production
+ *  code never reads it. */
 export const ingestSerializations = { count: 0 };
 
 /** One messages-log entry with its ABSOLUTE seq already assigned (intern
@@ -226,26 +263,22 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     // Pass 1: ordered union of identities (msg_id + content hash).
     // #3133: no cross-save memo — the wire entry points replace the message
     // array with freshly parsed objects on every request, so an object-
-    // identity WeakMap never hits on the production save path. The cost cut
-    // lives in planIngestDelta + the sessions.last_ingested_seq watermark.
+    // identity WeakMap never hits on the production save path. The per-save
+    // cost cut lives in planReconciled's blind pins (zero serializations for
+    // slots whose id already has one live stored row).
     const log: LogEntry[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
-        const raw = serializeForStore(m);
-        ingestSerializations.count++;
-        const parsed = JSON.parse(raw) as { role: string; contentType?: string };
-        const split = splitMediaContent(raw);
-        const entry = { msgId: m.id, content: split.content, hash: split.hash, role: parsed.role, kind: parsed.contentType ?? "message", media: split.media };
         // #4390: the cross-save JOIN key is the POSITION-INDEPENDENT identity
         // (stored-bytes serialization minus id/wireIndex). content_hash stays
         // the byte-faithful CAS key; only the join moves to identity.
-        const identity = identityOfStoredContent(entry.content);
-        const key = `${m.id}\u0000${identity}`;
+        const entry = entryFor(m, byRawRef);
+        const key = `${m.id}\u0000${entry.identity}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}), ...(typeof m.ts === "number" ? { ts: m.ts } : {}) });
+        log.push({ seq, ...entry });
         return seq;
     };
     // #3301: import payload first — its rows must sit below the snapshot/tail
@@ -257,152 +290,149 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
 }
 
-/** #3133 fast-path planner: build the ingest plan for a session whose
- *  stored tail is a VERIFIED trusted prefix — the sessions row's watermark
- *  names the absolute seq backing the LAST tail message at save time, and
- *  `trustedTailSeqs` is that save's persisted tailSeqs (same transaction
- *  wrote both, so they cannot disagree). Soundness of skipping rows 0..L-1:
- *  every one of them was part of the tail that set the watermark (rows
- *  written by that save), and the probe pins slot L-1 to row `watermark`
- *  with nothing above it — so this save only has to append tail[L..] at
- *  watermark+1, watermark+2, … Only messages PAST the trusted prefix pay
- *  stringify+hash; given the same log, finishPlan() emits every row family
- *  byte-identical to planIngest's. The store-state equivalence holds under
- *  a strict-append precondition (#4182): no message in tail[L..] may
- *  carry an ALREADY-STORED identity (msg_id + content_hash). The planner
- *  cannot see stored prefix identities — that is the point of skipping
- *  them — so a resent/replayed message (#3661-class: content-derived ids
- *  mean a resend IS the same identity) is appended as a fresh placeholder
- *  slot, and the RAW PLAN diverges from planIngest, which dedups it onto
- *  its existing seq via seqByIdentity. That divergence is by design,
- *  neutralized at the store layer: UnifiedStore.ingestSession's delta
- *  branch probes every new message's identity against the messages table
- *  inside its transaction (the strictly-append guard behind
- *  UNIQUE(session_id, msg_id, content_hash), SQLite + MySQL) and refuses
- *  the whole plan on any hit; the caller then runs the exact full path,
- *  whose dedup makes the COMMITTED store state equal to a pure full
- *  ingest's anyway. Cost of a violation: one refused delta attempt + one
- *  redundant full write — never wrong rows.
- *
- *  A second, intra-plan facet of the #4182 divergence stays open: two NEW
- *  byte-identical messages inside the same tail share ONE content-derived
- *  identity, so both pass the stored-identity probe above; the UNIQUE
- *  constraint then silently skips the second insert, leaving its tailSeqs
- *  slot pointing at nothing — the read view drops that entry for one save
- *  cycle. The next save self-heals: the boundary probe finds no row at the
- *  new watermark, refuses the delta, and the exact full path re-dedups.
- *  Bounded and unusual-input-only; closing it (an intra-plan seen-set in
- *  the store guard) changes fallback behavior and is a separate decision.
- *
- *  Returns null (→ full ingest) when: a pluginSnapshot is present (its
- *  entries may dedup against the trusted prefix and renumber the log),
- *  the tail is absent or not longer than the trusted prefix (shrunk /
- *  rewound / folded-in-place), or the boundary identity disagrees with the
- *  tail slot at L-1 (edited/deleted/re-minted history). Interior edits
- *  BELOW the boundary are the watermark design's accepted trade-off — they
- *  never mis-attribute, only leave stale rows, and the sampled verify
- *  digest is the backstop. Exception (#3919): the HEAD slot (index 0) is
- *  additionally probed via `head` (id-only, zero serialization cost — core
- *  ids are content-derived, so a rewrite changes the id) so prefix rewrites
- *  fail the delta immediately instead of riding it for ≤ VERIFY_EVERY_
- *  INGESTS saves; deeper same-id byte drift below the boundary stays the
- *  sampled backstop's job. */
-export function planIngestDelta(
-    session: LegacySessionLike,
-    watermark: number,
-    trustedTailSeqs: number[],
-    boundary: { msgId: string; contentHash: string },
-    hasRawTail: boolean,
-    head?: { msgId: string } | null,
-): IngestPlan | null {
-    if (session.pluginSnapshot && session.pluginSnapshot.length > 0) return null;
-    // #3301: an import payload would be skipped as "trusted prefix" here — force
-    // the full path so its rows actually land.
-    if (session.decompositionLog && session.decompositionLog.length > 0) return null;
-    const tail = session.lastMessages;
-    const trustedLen = trustedTailSeqs.length;
-    if (
-        !tail ||
-        trustedLen === 0 ||
-        !Number.isSafeInteger(watermark) ||
-        watermark < 0 ||
-        // An equal-length tail is a VALID empty delta, but ONLY on the raw
-        // lineage: a caller passing the envelope's bounded folded RE-RENDER
-        // (no rawTail — e.g. the stale-convergence record(disk) path) may
-        // present the SAME identities in a DIFFERENT order (#2960 ⑤: the
-        // table holds the raw tail; the envelope re-renders it folded), and
-        // the boundary probe can match while the served view would stay on
-        // the raw ordering instead of the envelope render the disk record
-        // promised. Envelope renders must fall through to the full ingest,
-        // which rebuilds tailSeqs in the envelope's order.
-        (tail.length === trustedLen && !hasRawTail) ||
-        tail.length < trustedLen ||
-        trustedTailSeqs[trustedLen - 1] !== watermark
-    ) {
-        return null;
-    }
-    // Boundary probe, content side: ONE serialization+hash of the tail slot
-    // at the trusted prefix's end. Identities are content-derived and
-    // unique within one conversion pass, so a match proves this tail slot
-    // IS the message the watermark was set from.
-    const probe = serializeForStore(tail[trustedLen - 1]);
+/** New-row sentinels in reconciled plans: a slot the reconciler cannot
+ *  pin to a stored row carries SENTINEL_BASE + its log index; the store
+ *  renumbers them from max(stored seq)+1 inside the write transaction
+ *  (same anchoring discipline the old delta path had, without the trust
+ *  the watermark carried). The base sits far above any real seq and never
+ *  touches the -1/-1 "no claim" block-bounds sentinel. */
+export const RECONCILE_SENTINEL_BASE = 2_000_000_000;
+
+/** One serialized log entry without its seq — the shared per-message work
+ *  of both planners (serializeForStore → #5627-guarded parse →
+ *  splitMediaContent → role/kind → #4390 position-independent identity).
+ *  Both planners MUST derive byte-identical entries from the same wire
+ *  message: a drift here would make the deep and reconciled paths assign
+ *  different content hashes to one logical message and fork the CAS pool. */
+function entryFor(m: CoreMessage, byRawRef: Record<string, string>): Omit<LogEntry, "seq"> {
+    const raw = serializeForStore(m);
     ingestSerializations.count++;
-    // #3762: the stored boundary hash covers the MEDIA-SPLIT serialization;
-    // split the probe the same way so image messages verify identically.
-    if (tail[trustedLen - 1].id !== boundary.msgId || splitMediaContent(probe).hash !== boundary.contentHash) return null;
-    // #3919 head probe: the positional assumption covers the whole trusted
-    // prefix, but historically only its LAST slot was vouched for — a
-    // rewrite of an older message below the boundary rode the delta until
-    // the sampled verify cleared the watermark ≤ VERIFY_EVERY_INGESTS saves
-    // later (in full mode those stale bytes could even be served from the
-    // index). Id-only compare: core ids are content-derived, so a rewrite
-    // changes the id at zero serialization cost per save; mismatch fails
-    // soft to the exact full path. Deeper same-id byte drift below the
-    // boundary stays the sampled backstop's job (trade-off unchanged).
-    if (head !== undefined && head !== null && trustedLen > 1 && tail[0].id !== head.msgId) return null;
-    const byRawRef = session.state.messageRefs.byRaw;
-    const log: LogEntry[] = [];
-    const appended: number[] = [];
-    for (let i = trustedLen; i < tail.length; i++) {
-        const m = tail[i];
-        const raw = serializeForStore(m);
-        ingestSerializations.count++;
-        const parsed = JSON.parse(raw) as { role: string; contentType?: string };
-        const split = splitMediaContent(raw);
-        // Placeholder seqs under the aligned assumption (no rows above the
-        // watermark); ingestSession renumbers from max(seq)+1 inside the
-        // transaction when a fold left rows above the trusted tip.
-        const seq = watermark + 1 + log.length;
-        appended.push(seq);
-        log.push({
-            seq,
-            msgId: m.id,
-            content: split.content,
-            hash: split.hash,
-            identity: identityOfStoredContent(split.content),
-            role: parsed.role,
-            kind: parsed.contentType ?? "message",
-            ref: byRawRef[m.id] ?? null,
-            ...(split.media.length > 0 ? { media: split.media } : {}),
-            ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
-        });
-    }
-    // planIngest's snapshot ternary replicated on the ORIGINAL value: an
-    // array (even empty, as fork receipts carry) maps to [], null stays
-    // null — loadLegacyView distinguishes the two, so they must not collapse.
-    const pluginSnapshotSeqs = session.pluginSnapshot ? [] : null;
-    // tailSeqs stay ABSOLUTE (the trusted prefix's seqs are the stored ones,
-    // holes included — folding removes log positions from the middle); the
-    // delta path skips remapPlanToAbsolute by construction.
-    const tailSeqs = [...trustedTailSeqs, ...appended];
-    return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
+    const parsed = JSON.parse(raw) as { role: string; contentType?: string };
+    const split = splitMediaContent(raw);
+    return {
+        msgId: m.id,
+        content: split.content,
+        hash: split.hash,
+        identity: identityOfStoredContent(split.content),
+        role: parsed.role,
+        kind: parsed.contentType ?? "message",
+        ref: byRawRef[m.id] ?? null,
+        ...(split.media.length > 0 ? { media: split.media } : {}),
+        ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
+    };
 }
 
+/** Cross-save reconciler (2026-11-21 — REPLACES planIngestDelta and the
+ *  sessions.last_ingested_seq watermark it rode on). One save reconciles
+ *  its log against the session's stored messages rows by CLIENT-SENT
+ *  identity only: a presented msg id re-points at its stored row instead
+ *  of writing a new one; everything genuinely new is a new row; rows whose
+ *  identity the save does not present are retired by the store's sweep
+ *  (completeLog gate — same discipline as the deep path). There is NO
+ *  stored trust: nothing in the DB vouches for a prefix, a process
+ *  handoff inherits nothing to be voided, and two writers converge on the
+ *  same identities — the second simply re-points the rows the first wrote.
+ *
+ *  Cost model (the #3133 property, kept): a msg id with exactly ONE live
+ *  stored row pins BLIND — zero serializations for that slot (client ids
+ *  are content-derived, so a slot rewrite mints a NEW id and arrives as a
+ *  new row; the same-id byte-drift residue — a #4390 wireIndex re-mint
+ *  keeping id AND identity — rides the pinned old generation and is
+ *  healed by the sampled verify → deep path within VERIFY_EVERY_INGESTS
+ *  saves, the exact trade-off the #3919 delta made for its prefix). Only
+ *  unknown ids, multi-generation ids (split tool-call cores, #1476) and
+ *  tombstone rows (rewind-redo) pay stringify+hash.
+ *
+ *  `known` MUST come from the SAME transaction the plan is applied in
+ *  (UnifiedStore.ingestReconciled reads it under BEGIN IMMEDIATE); a
+ *  pre-transaction read could join against a partition a racing writer
+ *  just changed and land a pin on a vanished row.
+ *
+ *  Pin shape: the pinned log slot carries ABSOLUTE stored seq, the stored
+ *  content hash, and — for blind pins — EMPTY content (""), which tells
+ *  the store's insert loop "live row, CAS intact: skip all CAS/media
+ *  ops". New rows carry RECONCILE_SENTINEL_BASE + log index; tailSeqs /
+ *  pluginSnapshotSeqs mix absolutes and sentinels until the store
+ *  renumbers. `opts.deep` (drift-latched sessions, #5677) never pins — it
+ *  delegates to planIngest so every row re-serializes and the save
+ *  converges a proven-divergent view (the old latched-full behavior). */
+export function planReconciled(
+    session: LegacySessionLike,
+    known: StoredMessageRow[],
+    opts: { deep?: boolean } = {},
+): IngestPlan {
+    if (opts.deep === true) return planIngest(session);
+    const byRawRef = session.state.messageRefs.byRaw;
+    const knownById = new Map<string, StoredMessageRow[]>();
+    for (const row of known) {
+        const list = knownById.get(row.msgId);
+        if (list === undefined) knownById.set(row.msgId, [row]);
+        else list.push(row);
+    }
+    const log: LogEntry[] = [];
+    const newDedup = new Map<string, number>();
+    const intern = (m: CoreMessage): number => {
+        const candidates = knownById.get(m.id);
+        if (candidates !== undefined && candidates.length === 1) {
+            const row = candidates[0];
+            if (row.retiredAt === null) {
+                // BLIND pin (the steady-state append): zero serializations.
+                const idx = log.length;
+                log.push({ seq: row.seq, msgId: m.id, content: "", hash: row.contentHash, identity: row.identity, role: "pinned", kind: "pinned", ref: byRawRef[m.id] ?? null });
+                return idx;
+            }
+        }
+        // Serialize: unknown id, multi-generation id, or a tombstone row
+        // (rewind-redo — the insert loop restores its media mappings and
+        // the store clears the tombstone when the identity matches).
+        const entry = entryFor(m, byRawRef);
+        let pin: StoredMessageRow | undefined;
+        if (candidates !== undefined) {
+            pin = candidates.find((r) => r.identity === entry.identity);
+        }
+        if (pin !== undefined) {
+            const idx = log.length;
+            log.push({ seq: pin.seq, ...entry });
+            return idx;
+        }
+        // New row (or divergent generation): relative sentinel seq for now.
+        // Two slots of the same NEW identity dedup onto one log entry —
+        // the intra-plan half of #4182 falls out for free (both tailSeqs
+        // slots carry that one entry's seq).
+        const key = `${m.id}\u0000${entry.identity}`;
+        const existing = newDedup.get(key);
+        if (existing !== undefined) return existing;
+        const idx = log.length;
+        log.push({ seq: RECONCILE_SENTINEL_BASE + idx, ...entry });
+        newDedup.set(key, idx);
+        return idx;
+    };
+    // #3301: import payload first — same order as planIngest, so a deep
+    // re-plan of the same session interns in the identical sequence.
+    if (session.decompositionLog && session.decompositionLog.length > 0) session.decompositionLog.forEach(intern);
+    // The plan's tail/snapshot pointers must carry each entry's OWN seq
+    // (absolute for pins, sentinel for new rows) — NOT the log index. The
+    // store's remap builds planToAbs keyed by the entry's seq; deep plans
+    // happen to have seq === log index, but a reconciled plan's pins carry
+    // arbitrary absolute seqs, so log-index pointers would silently
+    // survive the remap as stale numbers (tail resolves to the wrong row
+    // or to no row at all). finishPlan stores these arrays verbatim in
+    // tail_json.
+    const toSeqs = (idxs: number[] | null): number[] | null => (idxs === null ? null : idxs.map((i) => log[i]!.seq));
+    const pluginSnapshotSeqs = session.pluginSnapshot ? toSeqs(session.pluginSnapshot.map(intern)) : null;
+    const tailSeqs = session.lastMessages ? toSeqs(session.lastMessages.map(intern)) : null;
+    return {
+        ...finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs),
+        reconciled: true,
+    };
+}
+
+
 /** Shared plan tail (everything except the messages log): given the same
- *  log + session, byte-identical output for both planners — the watermark
- *  fast path must not change what a full ingest would write. (#4182: the
- *  duplicate-identity case feeds this function DIFFERENT logs by design;
- *  see planIngestDelta's strict-append precondition.) */
+ *  log + session, byte-identical output for both planners — the reconciler
+ *  must not change what a deep ingest would write for the same log. (#4182:
+ *  duplicate-identity slots dedup onto one log entry in both planners, so
+ *  their tailSeqs slots share the one row's seq.) */
 function finishPlan(
     session: LegacySessionLike,
     byRawRef: Record<string, string>,

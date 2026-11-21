@@ -123,7 +123,7 @@ test("media CAS: stale-row sweep releases media refs and mappings (full re-inges
         const store = UnifiedStore.open(path.join(dir, "index.db"));
         const mImg = mkMsg("m-img", "image turn", IMG_B64);
         const mTxt = mkMsg("m-txt", "plain turn");
-        store.ingestSession(planIngest(mkSession("sess-sweep", [mImg, mTxt])), undefined, { completeLog: true });
+        store.ingestSession(planIngest(mkSession("sess-sweep", [mImg, mTxt])), { completeLog: true });
         assert.equal(store.mediaRefCount(IMG_B64), 1, "one media reference before re-ingest");
 
         // The session's raw tail no longer contains the image message: the
@@ -131,7 +131,7 @@ test("media CAS: stale-row sweep releases media refs and mappings (full re-inges
         // its media mapping and CAS refcount must still go with it, or the
         // bulky image bytes leak until archive (#3762 review, #3901, #4506).
         // The TEXT row itself stays retired (retired_at set), never deleted.
-        store.ingestSession(planIngest(mkSession("sess-sweep", [mTxt])), undefined, { completeLog: true });
+        store.ingestSession(planIngest(mkSession("sess-sweep", [mTxt])), { completeLog: true });
 
         assert.equal(store.mediaRefCount(IMG_B64), 0, "swept message released its media ref");
         const mappings = (store as unknown as { db: { prepare(q: string): { all(...a: unknown[]): { n: number }[] } } })
@@ -145,7 +145,7 @@ test("media CAS: stale-row sweep releases media refs and mappings (full re-inges
         // #4506 rewind-redo: the SAME image message comes back (undo of the
         // undo). The tombstone reactivates in place AND its media mapping +
         // refcount are re-established by the re-ingest — no manual repair.
-        store.ingestSession(planIngest(mkSession("sess-sweep", [mImg, mTxt])), undefined, { completeLog: true });
+        store.ingestSession(planIngest(mkSession("sess-sweep", [mImg, mTxt])), { completeLog: true });
         assert.equal(store.mediaRefCount(IMG_B64), 1, "reactivated message re-owns its media ref");
         const live = (store as unknown as { db: { prepare(q: string): { all(...a: unknown[]): { n: number }[] } } })
             .db.prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL").all("sess-sweep");

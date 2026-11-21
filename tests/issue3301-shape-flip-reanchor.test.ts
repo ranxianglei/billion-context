@@ -10,7 +10,7 @@ import {
     type ReconcileOptions,
 } from "../src/fold-reconcile.ts";
 import { resolveStoredDecompositions, type StoredRow } from "../src/fold-decomposition-lookup.ts";
-import { planIngest, planIngestDelta, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { planIngest, planReconciled, type LegacySessionLike } from "../src/storage/ingest.ts";
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 
@@ -331,10 +331,16 @@ describe("decompositionLog ingest (#3301)", () => {
         assert.deepEqual(plan.tailSeqs, [1, 2, 3]);
     });
 
-    test("delta planner forces the full path while an import payload is present", () => {
+    test("reconciliation never skips a payload as a trusted prefix", () => {
+        // Pre-2026-11-21: planIngestDelta had to return null while an import
+        // payload was present (the payload must ride the full path). The delta
+        // planner is gone — reconciliation has no trusted prefix at all, so
+        // the property holds by construction: every wire message, payload
+        // included, is interned into the plan.
         const r1 = msg("r1", "assistant", "R words", { contentType: "reasoning" });
         const legacy = mkLegacy("imp2", [r1], [msg("d0", "user", "older evidence")]);
-        const out = planIngestDelta(legacy, 0, [], { msgId: "x", contentHash: "y" }, true);
-        assert.equal(out, null, "payload must not be skipped as trusted prefix");
+        const plan = planReconciled(legacy, [], {});
+        assert.ok(plan.messages.some((m) => m.msgId === "d0"), "payload interned");
+        assert.ok(plan.messages.some((m) => m.msgId === "r1"), "tail message interned");
     });
 });

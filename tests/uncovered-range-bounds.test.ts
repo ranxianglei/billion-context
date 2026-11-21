@@ -16,7 +16,7 @@ function fixture(count: number) {
             id: `message-${i + 1}`, role: "user", contentType: "text", text: `body ${i + 1}`,
         })), lastMessagesFolded: false,
     } as unknown as LegacySessionLike);
-    store.ingestSession(plan, undefined, { completeLog: true });
+    store.ingestSession(plan, { completeLog: true });
     return { store, plan, close() {
         store.close();
         rmSync(dir, { recursive: true, force: true });
@@ -50,7 +50,7 @@ test("bounded range queries preserve inclusive overlap, empty and reversed-range
         ];
         for (const [ranges, expected] of cases) assert.deepEqual(f.store.uncoveredRows("session", ranges).map((row) => row.seq), expected);
         f.plan.messages = f.plan.messages.slice(1);
-        f.store.ingestSession(f.plan, undefined, { completeLog: true });
+        f.store.ingestSession(f.plan, { completeLog: true });
         assert.deepEqual(f.store.uncoveredRows("session", [[3, 12]]).map((row) => row.seq), [1, 2]);
     } finally { f.close(); }
 });

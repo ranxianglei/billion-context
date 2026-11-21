@@ -83,7 +83,7 @@ test("#4910: the fork child's first save keeps the lineage the clone wrote", () 
         );
 
         // Second save and a full-log sweep: still no clobber (idempotent).
-        store.ingestSession(planIngest(session(child, full)), undefined, { completeLog: true });
+        store.ingestSession(planIngest(session(child, full)), { completeLog: true });
         assert.equal(store.getSessionRow(child)!.parentSessionId, parent, "completeLog sweeps keep the lineage too");
         assert.equal(store.getSessionRow(child)!.forkPointSeq, throughSeq, "completeLog sweeps keep the fork point");
 
