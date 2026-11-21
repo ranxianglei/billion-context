@@ -247,11 +247,13 @@ test("repair (no --from): salvage extracts what survived into a fresh schema", {
             const rows = ro.db.prepare("SELECT count(*) AS n FROM sessions").get() as { n: number };
             assert.equal(rows.n, 3);
             // WITHOUT ROWID tables are in the report and self-consistent:
-            // whatever the salvager claims, the new db must agree.
+            // whatever the salvager claims, the new db must agree. The fresh
+            // schema carries a system row (schema_reader_floor, #5788) the
+            // salvager does not copy — count only user rows.
             const kv = data.tables.find((t) => t.table === "kv_store");
             assert.ok(kv, "kv_store (WITHOUT ROWID) must appear in the per-table report");
-            const n = (ro.db.prepare("SELECT count(*) AS n FROM kv_store").get() as { n: number }).n;
-            assert.equal(kv.salvaged, n, "kv_store salvaged count must match the new db");
+            const n = (ro.db.prepare("SELECT count(*) AS n FROM kv_store WHERE NOT (namespace = 'storage' AND key = 'schema_reader_floor')").get() as { n: number }).n;
+            assert.equal(kv.salvaged, n, "kv_store salvaged count must match the new db's user rows");
             if (n < 2) assert.ok(kv.note, "a lost WITHOUT ROWID table must carry a note");
         } finally {
             ro.db.close();
