@@ -90,7 +90,7 @@ type FakeProxy = {
     close(): Promise<void>;
 };
 
-async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean; decompressFailure?: boolean } = {}): Promise<FakeProxy> {
+async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean; decompressFailure?: boolean; statusPhase?: "pre-first-request" } = {}): Promise<FakeProxy> {
     const toolCalls: FakeProxy["toolCalls"] = [];
     const registers: FakeProxy["registers"] = [];
     const runtimeInfos: FakeProxy["runtimeInfos"] = [];
@@ -153,9 +153,17 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean;
             if (opts.statusOk === false) {
                 res.writeHead(404, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
-            } else {
+            } else if (opts.statusPhase === "pre-first-request") {
+                // Realistic no-session 200: the proxy knows the id from
+                // runtime-info but has never tracked a session for it (the
+                // #7060 bypass shape). sessionId: null is the carriage
+                // discriminator — a 200 alone is NOT carriage evidence.
                 res.writeHead(200, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: true, contextTokens: 1234 }));
+                res.end(JSON.stringify({ ok: true, phase: "pre-first-request", sessionId: null, contextTokens: 0 }));
+            } else {
+                // Realistic full-session 200: a live tracked session (sessionId set).
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, sessionId: "sess-carried", contextTokens: 1234 }));
             }
             return;
         }
@@ -538,20 +546,29 @@ test("#1382: compaction cancel requires evidence the proxy carries this conversa
     await runOmpCase(true, true, "omp: proxy confirms carriage → announced auto compaction cancelled");
     await runOmpCase(false, false, "omp: proxy never saw the conversation → announced auto compaction proceeds");
 
-    // (H) omp identity fast path: a successful identity register is local
-    // evidence — the cancel holds even though the proxy reports unknown.
-    const identityProxy = await startFakeProxy({ statusOk: false });
+    // (H) omp identity register is NOT carriage evidence (#7060): the proxy
+    // is UP and knows the id (identity registered + runtime-info reported)
+    // but has NEVER tracked a session for it — the status endpoint answers
+    // 200 pre-first-request with sessionId: null. That 200 is NOT carriage
+    // evidence, so the plugin must NOT claim ownership: native compaction
+    // proceeds. (The 404 "proxy never saw the conversation" shape is covered
+    // by runOmpCase(false, false) above.)
+    const identityProxy = await startFakeProxy({ statusPhase: "pre-first-request" });
     try {
         await withEnv({ BILLION_CONTEXT_PROXY: identityProxy.origin }, async () => {
             const omp = makeFakePi();
             createBiliPlugin("omp")(omp as never);
             // #1403: pck stamping (the identity signal) only fires for
             // destinations bili actually processes — route through /bili/.
-            const ctx = { ...httpCtx("sess-omp-id"), model: { contextWindow: 1000000, baseUrl: `${identityProxy.origin}/bili/https://api.example.com/v1` } };
+            // model.id present so reportOmpRuntimeInfo fires (it is gated on a
+            // non-empty model id) — that is the precondition for the proxy to
+            // answer 200 pre-first-request, the real #7060 bypass shape.
+            const ctx = { ...httpCtx("sess-omp-id"), model: { id: "test-model", contextWindow: 1000000, baseUrl: `${identityProxy.origin}/bili/https://api.example.com/v1` } };
             const payload = await omp.events.get("before_provider_request")!({ payload: { messages: [{ role: "user", content: "hi" }] } }, ctx);
             assert.equal((payload as { prompt_cache_key?: string })?.prompt_cache_key, "sess-omp-id", "identity registration completed with the request");
+            assert.ok(identityProxy.runtimeInfos.some((r) => r.conversationId === "sess-omp-id"), "runtime-info was reported under the session id");
             omp.events.get("auto_compaction_start")!({}, undefined);
-            assert.deepEqual(await omp.events.get("session_before_compact")!({}, ctx), { cancel: true }, "identity-registered session is carried by construction");
+            assert.deepEqual(await omp.events.get("session_before_compact")!({}, ctx), undefined, "identity-registered + runtime-info session is NOT carried — 200 pre-first-request (sessionId null) → native compaction proceeds");
         });
     } finally {
         await identityProxy.close();
