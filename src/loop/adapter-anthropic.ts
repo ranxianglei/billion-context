@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, healAnthropicSystemPositions, insertBeforeTrailingSystemRun, type AnthropicRequestBody } from "acp-kernel/wire";
 import { dedupeAdjacentOutputConfig } from "../dedupe-adjacent-output-config.js";
-import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
+import { appendSystemText, declaredInclusiveFromUsage, lastIterationContext } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
@@ -291,6 +291,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             let roundInput: number | undefined;
             let roundCached: number | undefined;
             let roundCreation: number | undefined;
+            let roundContext: number | undefined;
             // #4072: verbatim cache_creation breakdown for THIS round's frames —
             // like the numerics above, the final round's value is what the
             // synthetic terminal carries (stitched turns take the post-fold
@@ -687,6 +688,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     // #4128: honour a billing_usage stamp carried on the delta frame.
                     const declared = declaredInclusiveFromUsage(u);
                     if (declared !== undefined) roundDeclaredInclusive = declared;
+                    roundContext = lastIterationContext(u);
                     if (input !== undefined && input > 0 && cached !== undefined) {
                         // Complete authoritative usage object — e.g. the synthetic
                         // terminal of a stitched multi-round stream (round1
@@ -733,6 +735,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             creationTokens: roundCreation,
                             declaredInclusive: roundDeclaredInclusive,
                             cacheCreation: roundCacheCreation,
+                            contextTokens: roundContext,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
@@ -758,6 +761,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             creationTokens: roundCreation,
                             declaredInclusive: roundDeclaredInclusive,
                             cacheCreation: roundCacheCreation,
+                            contextTokens: roundContext,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);

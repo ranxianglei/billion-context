@@ -269,3 +269,52 @@ test("e2e #4079 both-ways: bodies under the doom bars still forward — includin
         rmrf(root);
     }
 });
+
+test("e2e #6844 both-ways: a model-hidden DSH top-level field no longer meters the fuse, while a genuinely oversized unknown field still does", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-6844-"));
+    const { ctx, calls, close } = await setup();
+    try {
+        // Incident #6844's shape: DSH 0.2.2-rc.3 attaches `dsh_session_log`
+        // (up to 8 MiB, documented as staying outside model input) as a
+        // top-level body field. No `model` in the body → preflight skipped →
+        // the relay fuse is the last line. The hidden field alone measures
+        // ~1.25M tokens — over the 1M floored bar — while the visible content
+        // is a few KB. Pre-#6844 this body 413'd with `other` at 88% of the
+        // measured body; the fuse is a meter, not a filter: the field still
+        // rides to the upstream byte-exact.
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({
+                stream: true,
+                messages: [{ role: "user", content: "hello" }],
+                dsh_session_log: "L".repeat(5_000_000),
+            }),
+        });
+        assert.equal(r.status, 200, `a model-hidden DSH field must not trip the fuse (got ${r.status})`);
+        await r.text();
+        assert.equal(calls.length, 1, "the body forwarded to the upstream");
+
+        // Gate discipline (#3617): an UNKNOWN top-level field is still metered
+        // — the exemption is a documented-field allowlist, not a hole in the
+        // fuse — and the 413 names the field dominating the `other` bucket
+        // (#6844 item 3), so the next unknown field needs no manual arithmetic.
+        const doomed = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({
+                stream: true,
+                messages: [{ role: "user", content: "hello" }],
+                custom_extension: "E".repeat(5_000_000),
+            }),
+        });
+        assert.equal(doomed.status, 413, `an oversized unknown field must still stop at the fuse (got ${doomed.status})`);
+        const parsed = JSON.parse(await doomed.text()) as { error?: { code?: string; message?: string } };
+        assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself");
+        assert.match(parsed.error?.message ?? "", /top field: custom_extension ~[\d,]+/, "the 413 names the field dominating the other bucket");
+        assert.equal(calls.length, 1, "the unknown-field body never reached the upstream");
+    } finally {
+        await close();
+        rmrf(root);
+    }
+});

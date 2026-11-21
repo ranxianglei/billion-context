@@ -130,9 +130,13 @@ Two lanes, same plugin (#941):
      registers a cordis `internal/config` overlay (vendored from
      deshark42/dsh-compaction-basic-disable, MIT) that marks the preset's
      `compaction-basic` and `command-compact` rows `disabled: true` while
-     bili owns the lane, and the preset gate rows in the bundle patch make
-     each Web preset wait for that overlay's service before it can register.
-     Native
+     bili owns the lane. The four Web presets used to WAIT for that overlay's
+     service through an entry-level `inject`, which is fail-closed (no
+     optional dependency, no timeout, no fallback): a missing gate service
+     left them pending forever and bricked session creation while the host
+     still booted. Since #7111 they no longer wait — a preset mounted before
+     the gate entry activates is re-submitted once it does, so losing the gate
+     service costs the overlay, never the session. Native
     auto-compaction is OFF in these profiles too (and `/compact` is
     unavailable there — that is EXPECTED, not a bug (#4002): bili owns
     compression on the lane, so the preset's compact command and its
@@ -141,10 +145,9 @@ Two lanes, same plugin (#941):
     ACP compression is unaffected. Since #4147 the overlay matches
     STRUCTURALLY — any entry whose resolved `config.plugins` nests
     `compaction-basic`/`command-compact` rows gets them disabled, custom
-    and profile-local presets exactly like the factory ones (the four
-    gate-row ids in `dsh.bundle.patch.yml` are ordering insurance for the
-    factory roster, not the coverage boundary — a profile shipping other
-    preset ids is covered by the structural walk). The one-time `[dsh-client]`
+    and profile-local presets exactly like the factory ones (a profile
+    shipping other preset ids is covered by the structural walk; there is no
+    id list to keep in sync since #7111). The one-time `[dsh-client]`
     boot note names the actual entries the overlay rewrote (#3962), so a
     patch-row miss on a renamed roster is visible without reading the host
     loader log. The overlay rides an
@@ -171,8 +174,12 @@ Two lanes, same plugin (#941):
      separate always-on `bili-compaction-gate` entry: disabling or
      kill-switching (`BILLION_CONTEXT_PLUGIN=0`) `bili-native` hands the
      lane back to STOCK dsh behavior — presets boot normally and native
-     auto-compaction returns; compression is simply off. Do NOT disable
-     `bili-compaction-gate` itself — that re-creates the brick. To fully
+      auto-compaction returns; compression is simply off. Do NOT disable
+      `bili-compaction-gate` itself: since #7111 that no longer bricks session
+      creation (the presets are fail-open), but it leaves native compaction
+      ARMED while bili owns the lane — a dsh checkpoint landing outside bili's
+      knowledge destroys the compression substrate (the #1729 wire-level
+      refusal is only the backstop). To fully
      uninstall, remove `billion-context` from the profile's
      `dsh.profile.bundles` (and its dependency) and restart: the whole
      patch layer disappears and `compaction-basic` returns to stock

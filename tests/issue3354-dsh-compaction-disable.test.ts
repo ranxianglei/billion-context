@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { BILI_COMPACTION_DISABLE_SERVICE, compactionDisablePatchRows, declareDshCompactionActive, detectCompactionOverlayGap, disableBasicCompaction, registerCompactionDisable, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
+import { BILI_COMPACTION_DISABLE_SERVICE, declareDshCompactionActive, detectCompactionOverlayGap, disableBasicCompaction, registerCompactionDisable, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { writeDshAcpPatch } from "../src/launcher.ts";
 
 // #3354: the vendored dsh basic-compaction disable overlay (deshark42/
@@ -13,7 +13,6 @@ import { writeDshAcpPatch } from "../src/launcher.ts";
 // The apply-level wiring is covered in tests/dsh-native.test.ts.
 
 const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
-const PRESET_ROWS = compactionDisablePatchRows();
 // #3662: both carriers must mount the always-on gate entry alongside
 // bili-native — without it the preset inject rows pend forever whenever
 // bili-native does not run.
@@ -100,7 +99,9 @@ test("#3806 detectCompactionOverlayGap: missing service provide -> no-service-pr
 });
 
 test("#3354 registerCompactionDisable: transform honors the entry predicate and preserves siblings", () => {
-    type Mw = (raw: unknown, next: () => unknown) => unknown;
+    // #7112: cordis' real binding — `this` is null, the fiber is the FIRST
+    // argument; the mock calls below pass it there.
+    type Mw = (fiber: unknown, next: () => unknown) => unknown;
     let mw: Mw | undefined;
     let options: unknown;
     // #3662: the transform acts only while bili-native declared the lane owned.
@@ -119,8 +120,8 @@ test("#3354 registerCompactionDisable: transform honors the entry predicate and 
             { name: "@deepseek-ai/dsh-tool-result-pruner" },
         ];
         const cfg: Record<string, unknown> = { plugins, isolate: { compaction: true } };
-        const self = { entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } };
-        const out = mw?.call(self, null, () => cfg) as { plugins?: Array<Record<string, unknown>>; isolate?: Record<string, unknown> };
+        const presetFiber = { entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } };
+        const out = mw?.call(null, presetFiber, () => cfg) as { plugins?: Array<Record<string, unknown>>; isolate?: Record<string, unknown> };
         assert.deepEqual(out.isolate, { compaction: true });
         assert.equal(out.plugins?.[0]?.disabled, true);
         assert.equal(out.plugins?.[1]?.disabled, true);
@@ -129,26 +130,25 @@ test("#3354 registerCompactionDisable: transform honors the entry predicate and 
         // compaction rows is rewritten too (custom presets), while an entry
         // whose plugins carry none keeps its resolved config object identity.
         const custom: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
-        const customOut = mw?.call({ entry: { options: { name: "preset-general" } } }, null, () => custom) as { plugins?: Array<Record<string, unknown>> };
+        const customOut = mw?.call(null, { entry: { options: { name: "preset-general" } } }, () => custom) as { plugins?: Array<Record<string, unknown>> };
         assert.equal(customOut.plugins?.[0]?.disabled, true);
         const untouched: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-other" }] };
-        assert.equal(mw?.call({ entry: { options: { name: "other-entry" } } }, null, () => untouched), untouched);
+        assert.equal(mw?.call(null, { entry: { options: { name: "other-entry" } } }, () => untouched), untouched);
         assert.equal(mw?.call(undefined, null, () => untouched), untouched);
         // next() returning nothing → verbatim passthrough
-        assert.equal(mw?.call(self, null, () => undefined), undefined);
+        assert.equal(mw?.call(null, presetFiber, () => undefined), undefined);
     } finally {
         _resetDshCompactionVerdictForTest();
     }
 });
 
-test("#3354 patch carriers agree: root bundle yml and launcher overlay carry the identical preset gate rows", () => {
+test("#3354/#7111 patch carriers agree: both mount the gate entry and neither gates the presets", () => {
     // #2631: normalize CRLF checkouts before the byte-exact includes
     const bundle = fs.readFileSync(path.join(TESTS_DIR, "..", "dsh.bundle.patch.yml"), "utf8").replaceAll("\r\n", "\n");
     for (const id of ["preset-standard", "preset-ptc", "preset-minimal", "preset-cordis"]) {
         const row = `- id: ${id}\n  inject: [${BILI_COMPACTION_DISABLE_SERVICE}]\n`;
-        assert.ok(bundle.includes(row), `bundle yml must carry the ${id} gate row`);
+        assert.ok(!bundle.includes(row), `bundle yml must NOT gate ${id} on the gate service (#7111)`);
     }
-    assert.ok(bundle.includes(PRESET_ROWS), "bundle yml must carry the gate rows contiguously");
     assert.ok(bundle.includes(GATE_INSERT), "bundle yml must mount the always-on gate entry (#3662)");
 
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-patch-"));
@@ -156,7 +156,7 @@ test("#3354 patch carriers agree: root bundle yml and launcher overlay carry the
         const file = writeDshAcpPatch(home, "billion-context");
         assert.ok(file, "overlay patch must be written");
         const overlay = fs.readFileSync(file!, "utf8").replaceAll("\r\n", "\n");
-        assert.ok(overlay.includes(PRESET_ROWS), "launcher overlay must carry the same gate rows");
+        assert.ok(!overlay.includes(`inject: [${BILI_COMPACTION_DISABLE_SERVICE}]`), "launcher overlay must NOT gate the presets (#7111)");
         assert.ok(overlay.includes(GATE_INSERT), "launcher overlay must mount the same gate entry (#3662)");
         // the overlay still stands down the host plane and keeps the #2605 retries
         assert.ok(overlay.includes("- id: compaction-basic\n  config:\n    auto: false\n"));

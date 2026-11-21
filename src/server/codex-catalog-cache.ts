@@ -9,6 +9,8 @@ type Entry = { key: string; savedAt: number; body: string; etag?: string; lastMo
 type Log = (level: "info" | "warn", message: string) => void;
 const MAX_BYTES = 1024 * 1024;
 const MAX_ENTRIES = 16;
+const WARM_DEADLINE_MS = 4000;
+const COLD_DEADLINE_MS = 10000;
 const TRANSIENT_CODES = new Set([
     "ECONNRESET",
     "ECONNREFUSED",
@@ -101,6 +103,33 @@ export function isCodexCatalogRequest(url: string, init: FetchOptions): boolean 
     } catch {
         return false;
     }
+}
+
+function awaitCatalogAbort<T>(pending: Promise<T>, signal: AbortSignal, onLate?: (value: T) => void): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        let settled = false;
+        const finish = (complete: () => void) => {
+            if (settled) return;
+            settled = true;
+            signal.removeEventListener("abort", abort);
+            complete();
+        };
+        const abort = () => finish(() => reject(signal.reason ?? new DOMException("Aborted", "AbortError")));
+        void pending.then(
+            (value) => {
+                if (settled) {
+                    // Round already settled (deadline or caller abort): late-response cleanup
+                    // is best-effort and must not surface past the settled outcome.
+                    try { onLate?.(value); } catch { /* best-effort cleanup */ }
+                    return;
+                }
+                finish(() => resolve(value));
+            },
+            (error: unknown) => finish(() => reject(error)),
+        );
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+    });
 }
 
 export function createCodexCatalogFetch(
@@ -256,11 +285,14 @@ export function createCodexCatalogFetch(
             return replay(entry!);
         };
         const deadline = new AbortController();
-        const timeout = entry ? setTimeout(() => deadline.abort(), options.deadlineMs ?? 4000) : undefined;
-        const linked = entry ? AbortSignal.any([...(signal ? [signal] : []), deadline.signal]) : signal;
+        const timeout = setTimeout(
+            () => deadline.abort(Object.assign(new Error("model catalog deadline exceeded"), { name: "TimeoutError", code: "ETIMEDOUT" })),
+            options.deadlineMs ?? (entry ? WARM_DEADLINE_MS : COLD_DEADLINE_MS),
+        );
+        const linked = AbortSignal.any([...(signal ? [signal] : []), deadline.signal]);
         let result: FetchResult | undefined;
         try {
-            result = await operation(linked);
+            result = await awaitCatalogAbort(operation(linked), linked, discard);
             signal?.throwIfAborted();
             const status = result.response.status;
             if ([500, 502, 503, 504].includes(status)) return current() && fresh(entry) ? cached(`temporary HTTP ${status}`, result) : result;
@@ -305,7 +337,7 @@ export function createCodexCatalogFetch(
             if (reader) {
                 try {
                     while (true) {
-                        const part = await reader.read();
+                        const part = await awaitCatalogAbort(reader.read(), linked);
                         if (part.done) {
                             complete = true;
                             break;

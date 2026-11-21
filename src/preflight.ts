@@ -27,7 +27,7 @@ import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
-import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
+import { applyEstimateCalibration, currentCalibrationFactor, type WireProtocol } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { isCodexClient } from "./codex-compact.js";
@@ -465,9 +465,45 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // `source.data` and Gemini `inline_data.data` were already excluded.
 const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
 
-export function estimateRawBodyTokens(parsed: unknown): number {
+// #6828: a dual-shape body carries the conversation under TWO top-level keys —
+// the lane's native field (messages[] on openai/anthropic, input[] on
+// responses, contents[] on google) plus another protocol's field (a
+// Responses-native host such as dsh sends `input` alongside `messages`). The
+// upstream bills only the native field, so counting the foreign copy double-
+// counts the conversation and the egress fuse false-trips on the phantom total
+// (1,815,699 measured vs ~380K billed, 4.77x). Skip the foreign conversation
+// fields for the lane's protocol, TOP LEVEL ONLY — a nested key with the same
+// name (a message's own `input` content) is real content and stays counted.
+// Without a protocol the meter keeps its fail-closed count-everything behavior.
+const FOREIGN_CONVERSATION_FIELDS: Record<WireProtocol, ReadonlySet<string>> = {
+    responses: new Set(["messages", "system"]),
+    openai: new Set(["input", "instructions"]),
+    anthropic: new Set(["input", "instructions"]),
+    google: new Set(["input", "instructions", "messages", "system"]),
+};
+
+// #6844: DSH attaches model-hidden provider metadata as top-level body fields
+// (`dsh_session_log` diagnostics, `dsh_plugin_packages` inventory) — documented
+// as staying outside model input — but the measured-body walks priced every
+// top-level field, so an ordinary request 413'd at the egress fuse with the
+// hidden field dominating the `other` bucket (88% of the measured body, #6844).
+// Excluded at the top level only: the same key nested inside messages[] is
+// model-visible content and still counts.
+const MODEL_HIDDEN_BODY_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
+
+export function estimateRawBodyTokens(parsed: unknown, protocol?: WireProtocol): number {
     let tokens = 0;
-    const pending: [unknown, string | undefined][] = [[parsed, undefined]];
+    const foreign = protocol === undefined ? undefined : FOREIGN_CONVERSATION_FIELDS[protocol];
+    const pending: [unknown, string | undefined][] = [];
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (foreign?.has(k)) continue; // #6828: the other protocol's conversation field
+            if (MODEL_HIDDEN_BODY_KEYS.has(k)) continue; // #6844: DSH-internal fields the model never sees
+            pending.push([v, k]);
+        }
+    } else {
+        pending.push([parsed, undefined]);
+    }
     while (pending.length > 0) {
         const [value, key] = pending.pop()!;
         if (typeof value === "string") {
@@ -491,38 +527,51 @@ export function estimateRawBodyTokens(parsed: unknown): number {
  *  oversized content" is actively misleading for a 55.2 MiB body whose
  *  messages[] is only 1.44 MiB. Same walk + same exclusions as
  *  estimateRawBodyTokens, split on the TOP-LEVEL field, so `total` always
- *  equals estimateRawBodyTokens(parsed) exactly. */
+ *  equals estimateRawBodyTokens(parsed, protocol) exactly for the same protocol. */
 export interface RawBodyBreakdown {
     total: number;
     messages: number;
     tools: number;
     system: number;
     other: number;
+    /** #6844: per-top-level-field token counts inside the `other` bucket,
+     *  descending by tokens — the field dominating `other` is the actionable
+     *  signal in a measured-doom 413 (which host-attached field is metered).
+     *  Empty when `other` is empty. */
+    otherTop: Array<{ field: string; tokens: number }>;
 }
 
-export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
+export function estimateRawBodyBreakdown(parsed: unknown, protocol?: WireProtocol): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
-    const pending: [unknown, string | undefined, number][] = [];
-    if (parsed && typeof parsed === "object") {
+    const foreign = protocol === undefined ? undefined : FOREIGN_CONVERSATION_FIELDS[protocol];
+    const otherByField = new Map<string, number>();
+    const pending: [unknown, string | undefined, number, string | undefined][] = [];
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (foreign?.has(k)) continue; // #6828: the other protocol's conversation field
+            if (MODEL_HIDDEN_BODY_KEYS.has(k)) continue; // #6844: DSH-internal fields the model never sees
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
-            pending.push([v, k, bucket]);
+            pending.push([v, k, bucket, bucket === 3 ? k : undefined]);
         }
     } else {
-        pending.push([parsed, undefined, 3]);
+        pending.push([parsed, undefined, 3, undefined]);
     }
     while (pending.length > 0) {
-        const [value, key, bucket] = pending.pop()!;
+        const [value, key, bucket, field] = pending.pop()!;
         if (typeof value === "string") {
-            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) {
+                const tokens = defaultCountTokens(value);
+                buckets[bucket] += tokens;
+                if (bucket === 3 && field !== undefined) otherByField.set(field, (otherByField.get(field) ?? 0) + tokens);
+            }
             continue;
         }
         if (Array.isArray(value)) {
-            for (const item of value) pending.push([item, key, bucket]);
+            for (const item of value) pending.push([item, key, bucket, field]);
             continue;
         }
         if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket]);
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket, field]);
         }
     }
     return {
@@ -531,6 +580,7 @@ export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
         tools: buckets[1],
         system: buckets[2],
         other: buckets[3],
+        otherTop: [...otherByField.entries()].map(([field, tokens]) => ({ field, tokens })).sort((a, b) => b.tokens - a.tokens),
     };
 }
 
