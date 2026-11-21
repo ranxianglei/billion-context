@@ -81,21 +81,6 @@ interface IngestPlan extends IngestSessionInput {
      *  sentinels -(j+1) naming messages[j]. */
     pluginSnapshotSeqs: number[] | null;
     tailSeqs: number[] | null;
-    /** Reconciled (shallow) plans only: for messages[i], the ABSOLUTE seq the
-     *  row must take (pinned reactivation at a stored row's seq) or null (new
-     *  row — the store assigns max(seq)+1..). Absent on deep plans. */
-    pinnedSeqs?: (number | null)[];
-    /** Reconciled plans only: identity keys `msg_id\u0000identity` of the rows
-     *  this save POINTS AT without re-storing — the completeLog sweep must
-     *  count them as presented (or it retires everything it preserved). */
-    preserved?: string[];
-    /** #6947: minted-ref backfills for stored rows the save points at whose
-     *  ref column is still NULL (turn-final write-back rows). */
-    refBackfills?: { seq: number; ref: string; refNum: number }[];
-    /** True when this is a reconciled (shallow) plan — the store's applier
-     *  must renumber sentinels, honor pinnedSeqs and merge `preserved` into
-     *  the sweep set. Deep plans go through the identity remap instead. */
-    reconciled?: boolean;
 }
 
 /** One row of the in-transaction stored-message index (the reconciler's
@@ -421,10 +406,7 @@ export function planReconciled(
     const toSeqs = (idxs: number[] | null): number[] | null => (idxs === null ? null : idxs.map((i) => log[i]!.seq));
     const pluginSnapshotSeqs = session.pluginSnapshot ? toSeqs(session.pluginSnapshot.map(intern)) : null;
     const tailSeqs = session.lastMessages ? toSeqs(session.lastMessages.map(intern)) : null;
-    return {
-        ...finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs),
-        reconciled: true,
-    };
+    return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
 }
 
 
