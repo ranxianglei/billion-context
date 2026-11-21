@@ -239,6 +239,10 @@ interface ShadowStats {
     verifySamples: number;
     verifyOk: number;
     verifyDrift: number;
+    /** #5677: ingests that took the deep (full re-serialize) path because the
+     *  session was drift-latched. The #3133 deltaIngests counter is gone with
+     *  the delta/watermark mechanism; this is the latch's observable. */
+    deepIngests: number;
     imports: number;
     /** Retained on the status wire for panel compatibility. Never set to true
      *  anymore — the self-disable breaker was removed (2026-10-30 owner policy:
@@ -271,7 +275,7 @@ export function orphanContents(legacy: LegacySessionLike): boolean {
 
 export class UnifiedShadow {
     readonly mode: StorageMode;
-    readonly stats: ShadowStats = { ingests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null, orphanSkips: 0 };
+    readonly stats: ShadowStats = { ingests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, deepIngests: 0, imports: 0, disabled: false, lastError: null, orphanSkips: 0 };
     /** #3135 ④/#3818: sessions whose last sampled verify drifted. Members are
      *  served from the JSON envelope by persist.loadSync (while it exists)
      *  until a save verifies clean again; surfaced on /__bili/status wire as
@@ -676,6 +680,7 @@ export class UnifiedShadow {
             const completeLog = hasRawTail || latched;
             this.sync.ingestReconciled(legacy, { deep: latched, completeLog });
             this.stats.ingests++;
+            if (latched) this.stats.deepIngests++;
             const ingestMs = Math.round(performance.now() - tIngestStart);
             if (ingestMs > SLOW_INGEST_WARN_MS) {
                 // #5744: attach WAL forensics so a stall spike can be attributed
@@ -1297,6 +1302,7 @@ export class UnifiedShadow {
                 phase = "ingest-session";
                 await backend.ingestReconciled(legacy, { deep: latched, completeLog });
                 this.stats.ingests++;
+                if (latched) this.stats.deepIngests++;
                 phase = "verify-sample";
                 const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
                 this.ingestCounts.set(legacy.id, count);
