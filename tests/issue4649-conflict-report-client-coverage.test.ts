@@ -152,6 +152,8 @@ test("#4649 registry: family resolution mirrors the conflict ladder", () => {
     assert.equal(clientFamilyOf({ "user-agent": "Codex Desktop/9.9.9" }), "codex", "capitalized variant prefix");
     assert.equal(clientFamilyOf({ "user-agent": "vendor/tool codex_foo/1.0" }), "codex", "token-level lenient fallback (#645)");
     assert.equal(clientFamilyOf({ "user-agent": "vendor/codex-wrapper" }), "other", "mid-token codex mention is NOT codex (#1641)");
+    assert.equal(clientFamilyOf({ "user-agent": "antigravity/hub/2.26.0 (aidev_client; os_type=windows)" }), "antigravity", "antigravity UA shape (#4688)");
+    assert.equal(clientFamilyOf({ "user-agent": "vendor/antigravity-wrapper/1.0" }), "other", "mid-token antigravity mention is NOT antigravity");
     assert.equal(clientFamilyOf({ "x-claude-code-session-id": "s", "user-agent": "anything/1" }), "claude", "header sniff beats UA guess");
     assert.equal(clientFamilyOf({ "x-opencode-session": "ses_1", "user-agent": "anything/1" }), "opencode", "opencode header sniff");
     assert.equal(clientFamilyOf({ "x-bili-plugin": "dsh", "user-agent": "codex_cli_rs/1.0" }), "dsh", "declared plugin agent wins over UA shape");
