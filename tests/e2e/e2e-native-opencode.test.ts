@@ -287,7 +287,18 @@ async function startCtx(): Promise<Ctx> {
   // the two push-back runs clear deterministically.
   fs.writeFileSync(
     path.join(ctx.xdg.config, "billion-context", "billion-context.json"),
-    JSON.stringify({ compress: { preserveRecentTokens: 0 } }, null, 2),
+    JSON.stringify(
+        {
+            compress: { preserveRecentTokens: 0 },
+            // #6480 made pure-SQLite the default (jsonWriter off), so the JSON
+            // session envelopes this lane's sessionFiles() traversal asserts on
+            // are no longer written. Same test-only dual-write pin as the
+            // pi/dsh native lanes: an explicit choice for this lane's assertions.
+            storage: { unified: "full", jsonWriter: "on" },
+        },
+        null,
+        2,
+    ),
   );
 
   await assertPortDead(ctx.fakePort); // #1689: prove still free right before the child binds it

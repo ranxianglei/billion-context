@@ -246,6 +246,23 @@ async function startCtx(): Promise<Ctx> {
   ])
     fs.mkdirSync(d, { recursive: true });
 
+  // #6480 flipped the storage default to pure-SQLite (the JSON envelope
+  // writer is off unless dual-write is explicitly requested), so a default-
+  // posture sandbox no longer contains session JSON files at all — and every
+  // persistence assertion in this suite walks those files (sessionFiles()
+  // below), failing structurally. Pin dual-write the way BILI_PI_INLINE=0
+  // pins the spawn posture above: these assertions verify what they have
+  // always verified (envelope presence, folded blocks, the pluginAgent
+  // binding); the pure-sqlite default itself is covered by the unit suites
+  // (storage-json-writer-off*). ensureConfigTemplate() never overwrites an
+  // existing file, so this pre-seed survives plugin bootstrap.
+  const cfgDir = path.join(ctx.xdg.config, "billion-context");
+  fs.mkdirSync(cfgDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(cfgDir, "billion-context.json"),
+    JSON.stringify({ storage: { unified: "full", jsonWriter: "on" } }, null, 2),
+  );
+
   await assertPortDead(ctx.fakePort); // #1689: prove still free right before the child binds it
   const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
     env: {

@@ -363,7 +363,15 @@ function writeBiliConfig(ctx: Ctx): void {
   // cannot fold under the kernel's default protected-zone token window.
   fs.writeFileSync(
     path.join(dir, "billion-context.json"),
-    JSON.stringify({ providers: {}, compress: { preserveRecentTokens: 0 } }, null, 2) + "\n",
+    JSON.stringify({
+      providers: {},
+      compress: { preserveRecentTokens: 0 },
+      // #6480 made pure-SQLite the default (jsonWriter off), so the JSON
+      // envelopes this lane's sessionFiles() traversal asserts on are no
+      // longer written. Pin dual-write the way BILI_PI_INLINE=0 pins the
+      // posture: a test-only, explicit choice for this lane's assertions.
+      storage: { unified: "full", jsonWriter: "on" },
+    }, null, 2) + "\n",
   );
 }
 

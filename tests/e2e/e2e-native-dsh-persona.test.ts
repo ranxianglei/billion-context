@@ -396,7 +396,15 @@ function buildRig(tag: string, withAutoReview: boolean): Rig {
     // compress could never fold ("Range is entirely within the protected
     // zone"). Zeroing them is established product behavior, not a hack.
     fs.writeFileSync(path.join(xdg.config, "billion-context", "billion-context.json"),
-        JSON.stringify({ providers: {}, compress: { preserveRecentTokens: 0, preserveRecentMessages: 0 } }, null, 2) + "\n");
+        JSON.stringify({
+            providers: {},
+            compress: { preserveRecentTokens: 0, preserveRecentMessages: 0 },
+            // #6480 made pure-SQLite the default (jsonWriter off), so the JSON
+            // envelopes this lane's persistedSessions() traversal asserts on are
+            // no longer written. Pin dual-write the way BILI_PI_INLINE=0 pins the
+            // posture: a test-only, explicit choice for this lane's assertions.
+            storage: { unified: "full", jsonWriter: "on" },
+        }, null, 2) + "\n");
 
     const env: NodeJS.ProcessEnv = {
         ...cleanEnv(),
