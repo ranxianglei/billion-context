@@ -10,7 +10,7 @@ import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin
 import { estimateRawBodyTokens, estimateRawBodyBreakdown } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -719,7 +719,7 @@ interface Rig {
 // sonnet-4-5 → 200k) unless the operator explicitly tunes
 // compress.modelContextLimit, which outranks everything (#344). The rig exposes
 // both so tests can pin the exact window the guard sees.
-async function startRig(opts?: { modelContextLimit?: number; compressModelContextLimit?: number; store?: SessionStore; routeModels?: Record<string, { context?: number; output?: number }> }): Promise<Rig> {
+async function startRig(opts?: { modelContextLimit?: number; compressModelContextLimit?: number; outputHeadroomMaxPct?: number; store?: SessionStore; routeModels?: Record<string, { context?: number; output?: number }> }): Promise<Rig> {
     const modelContextLimit = opts?.modelContextLimit ?? 200_000;
     const rig: Rig = { proxyPort: 0, upstreamPort: 0, proxy: null as unknown as http.Server, upstream: null as unknown as http.Server, sideScript: null, lastBody: null, upstreamHits: 0, sideErrorStatus: null, sideErrorBody: null };
     const upstream = http.createServer((req, res) => {
@@ -761,7 +761,7 @@ async function startRig(opts?: { modelContextLimit?: number; compressModelContex
         routes: { [`http://127.0.0.1:${upstreamPort}`]: opts?.routeModels ? { models: opts.routeModels } : {} },
         modelContextLimit,
         kernelConfig: defaultConfig(modelContextLimit),
-        compress: { injectTool: true, injectNudge: true, ...(opts?.compressModelContextLimit !== undefined ? { modelContextLimit: opts.compressModelContextLimit } : {}) },
+        compress: { injectTool: true, injectNudge: true, outputHeadroomMaxPct: opts?.outputHeadroomMaxPct, ...(opts?.compressModelContextLimit !== undefined ? { modelContextLimit: opts.compressModelContextLimit } : {}) },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -1164,6 +1164,111 @@ test("e2e: oversized side request is blocked locally (413), never reaches the up
     } finally {
         await closeRig(rig);
     }
+});
+
+test("e2e: Codex Guardian side guard uses matched model evidence in place of the anonymous default", async (t) => {
+    const model = "codex-auto-review";
+    const home = mkdtempSync(join(tmpdir(), "bili-guardian-window-"));
+    const previousHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    t.after(() => {
+        if (previousHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = previousHome;
+        rmrf(home);
+    });
+
+    const body = {
+        model,
+        input: mainConversation(1850),
+        tools: [],
+        text: { format: { type: "json_object" } },
+    };
+    const estimate = estimateRawBodyTokens(body);
+    assert.ok(estimate > 230_000 && estimate < 258_400, `incident-shaped estimate: ${estimate}`);
+    const oversized = { ...body, input: mainConversation(2600) };
+    assert.ok(estimateRawBodyTokens(oversized) > 272_000 * 1.15);
+    const headers = { "content-type": "application/json", "x-acp-session": SESSION, "user-agent": "codex_cli_rs/0.169.0" };
+    const post = (rig: Rig, request: typeof body, requestHeaders = headers) => fetch(
+        `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/responses`,
+        { method: "POST", headers: requestHeaders, body: JSON.stringify(request) },
+    );
+
+    const assertBlocked = async (response: Response, limit: number) => {
+        assert.equal(response.status, 413);
+        const { error } = await response.json() as { error: { code: string; message: string } };
+        assert.equal(error.code, "side_request_payload_too_large");
+        assert.match(error.message, new RegExp(`effective context window ${limit}\\b`));
+    };
+
+    const assertGuard = async (window: number, request = body) => {
+        const rig = await startRig();
+        try {
+            const parent = getSession(SESSION);
+            parent.stats.lastInputTokens = 78_000;
+            parent.stats.requests = 10;
+            const mainBefore = JSON.stringify([parent.state, parent.stats, parent.lastMessages]);
+
+            const response = await post(rig, request);
+            assert.equal(response.status, 200, await response.text());
+            assert.equal(rig.upstreamHits, 1);
+            assert.deepEqual(rig.lastBody, request, "Guardian history and response format forwarded unchanged");
+
+            await assertBlocked(await post(rig, oversized), window);
+            assert.equal(rig.upstreamHits, 1, "oversized review never reaches the upstream");
+            assert.equal(JSON.stringify([parent.state, parent.stats, parent.lastMessages]), mainBefore);
+        } finally {
+            await closeRig(rig);
+        }
+    };
+
+    await t.test("matched bundled model", () => assertGuard(272_000));
+    writeFileSync(join(home, "models_cache.json"), JSON.stringify({ models: [{ slug: model, context_window: 272_000 }] }));
+    const withOutputBudget = { ...body, max_output_tokens: 50_000 };
+    await t.test("matched live model already reserves output", () => assertGuard(258_400, withOutputBudget));
+
+    await t.test("a lower overflow arm still reserves output", async () => {
+        const rig = await startRig();
+        try {
+            getSession(SESSION).stats.overflowArmTokens = 210_000;
+            await assertBlocked(await post(rig, withOutputBudget), 160_000);
+            assert.equal(rig.upstreamHits, 0);
+        } finally {
+            await closeRig(rig);
+        }
+    });
+
+    await t.test("anonymous model and foreign client keep the default", async () => {
+        const rig = await startRig();
+        try {
+            await assertBlocked(await post(rig, { ...body, model: "unknown-review-fixture" }), 200_000);
+            await assertBlocked(await post(rig, body, { ...headers, "user-agent": "other-client" }), 200_000);
+            assert.equal(rig.upstreamHits, 0);
+        } finally {
+            await closeRig(rig);
+        }
+    });
+
+    await t.test("explicit operator limits still govern", async () => {
+        for (const opts of [{ routeModels: { [model]: { context: 160_000 } } }, { compressModelContextLimit: 160_000 }]) {
+            const rig = await startRig(opts);
+            try {
+                await assertBlocked(await post(rig, body), 160_000);
+                assert.equal(rig.upstreamHits, 0);
+            } finally {
+                await closeRig(rig);
+            }
+        }
+    });
+
+    await t.test("explicit operator headroom still applies", async () => {
+        const rig = await startRig({ outputHeadroomMaxPct: 0.25 });
+        try {
+            await assertBlocked(await post(rig, withOutputBudget), 208_400);
+            assert.equal(rig.upstreamHits, 0);
+        } finally {
+            await closeRig(rig);
+        }
+    });
 });
 
 test("e2e: overflow 400 on a side request arms the stated window; next one is blocked locally (#554)", async () => {
