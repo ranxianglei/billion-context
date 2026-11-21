@@ -60,7 +60,8 @@ interface EgressRecordSourceMsg {
     contentType?: unknown;
     text?: unknown;
 }
-import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
+import { rebuildOutboundFromLog, rebuildOutboundWithLadder } from "../storage/egress-serve.js";
+import type { EgressViewRow } from "../storage/egress-state.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
@@ -141,6 +142,11 @@ export async function prepareOpenai(
     // :coreToOpenai chain) — the shadow comparison target for serve-from-log.
     let legacyCoreElements: unknown = undefined;
     let egressServedFromLog = false;
+    // #7439 ruling 3: the in-memory view cache (session.egressView) is GONE —
+    // the flow table is the single source of truth. This local is only the
+    // current turn's recorded view (for the shadow-compare below); the prev
+    // view for the NEXT turn is read from the flow table, not from memory.
+    let egressViewThisTurn: EgressViewRow[] | null = null;
     // The EXACT array fed to the outbound chain (post reasoning-drop / ccr /
     // image-rescale) — segment 3 records this, not processedMessages, so the
     // log view is position-for-position what outbound saw.
@@ -618,24 +624,37 @@ export async function prepareOpenai(
         if (!isTitleGen && featureEnabled("egressServeLog")) {
             const st = getStore().egressOpLogStore();
             if (st) {
+                let ladder: { elements: ReturnType<typeof coreToOpenai>; logSeq: number; rows: number } | null = null;
                 try {
-                    session.egressView = recordEgressTurn({
+                    // #7439 ruling 3: no in-memory cache — the prev view is
+                    // read from the flow table (single source of truth); the
+                    // current turn's ops are appended, then the outbound is
+                    // rebuilt from the flow.
+                    egressViewThisTurn = recordEgressTurn({
                         store: st,
                         sessionId,
-                        prev: session.egressView,
                         conversation: egressMessages,
                         systemText: openaiOutboundSystem,
                         nowMs: Date.now(),
                     });
-                    const reb = rebuildOutboundFromLog(session.egressView);
-                    if (reb !== null) {
-                        rebuiltMessages = reb.elements;
-                        egressServedFromLog = true;
-                        log("info", `[${sessionId}] egress-serve: served ${session.egressView.length} rows from op-log (self-contained bytes)`);
-                    }
+                    // #7439 ruling 5: the degradation ladder — current point
+                    // first, then walk back to the nearest healthy flow point
+                    // (NEVER a fallback to client bytes).
+                    ladder = rebuildOutboundWithLadder(st, sessionId);
                 } catch (err) {
-                    egressServedFromLog = false;
-                    log("warn", `[${sessionId}] egress-serve rebuild failed — legacy kept: ${String(err)}`);
+                    log("warn", `[${sessionId}] egress-serve rebuild failed: ${String(err)}`);
+                }
+                if (ladder !== null) {
+                    rebuiltMessages = ladder.elements;
+                    egressServedFromLog = true;
+                    log("info", `[${sessionId}] egress-serve: served ${ladder.rows} rows from flow (logSeq=${ladder.logSeq})`);
+                } else {
+                    // whole flow unreadable — session-level recovery (log +
+                    // admin surface); the request fails rather than serving
+                    // client bytes (#7439 ruling 5).
+                    log("error", `[${sessionId}] egress-serve: WHOLE flow unreadable — session recovery, request fails`);
+                    session.metadata.egressFlowUnreadable = true;
+                    throw new Error(`[egress-serve] whole flow unreadable for session ${sessionId} — session recovery`);
                 }
             }
         }
@@ -867,18 +886,21 @@ export async function prepareOpenai(
     if (!isTitleGen && featureEnabled("egressOpLog")) {
         try {
             const st = getStore().egressOpLogStore();
-            if (st && session.egressView === undefined) {
-                session.egressView = recordEgressTurn({
+            // #7439 ruling 3: no in-memory cache — skip if the serve path
+            // already recorded this turn (egressViewThisTurn is set);
+            // otherwise record without prev (the prev view is read from the
+            // flow table, the single source of truth).
+            if (st && egressViewThisTurn === null) {
+                egressViewThisTurn = recordEgressTurn({
                     store: st,
                     sessionId,
-                    prev: session.egressView,
                     conversation: egressRecordSource ?? (processedMessages.length > 0 ? processedMessages : originalMessages),
                     systemText: openaiOutboundSystem ?? openaiSystemText,
                     nowMs: Date.now(),
                 });
             }
         } catch (err) {
-            session.egressView = undefined;
+            egressViewThisTurn = null;
             log("warn", `[${sessionId}] egress op-log recording disabled for this session: ${String(err)}`);
         }
     }
@@ -891,7 +913,7 @@ export async function prepareOpenai(
     if (!isTitleGen && featureEnabled("egressServeLog") && !egressServedFromLog) {
         try {
             const st = getStore().egressOpLogStore();
-            const view = session.egressView;
+            const view = egressViewThisTurn;
             if (st && view && legacyCoreElements !== undefined) {
                 const reb = rebuildOutboundFromLog(view);
                 if (reb === null) {

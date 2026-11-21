@@ -689,10 +689,6 @@ export type Session = {
      *  the state ranges). Cleared by snapshotMessages on the next live
      *  request — the client re-sends full raw history, restoring the invariant. */
     lastMessagesFolded?: boolean;
-    /** #7398 seg 3: in-memory cache of the egress op-log view for this
-     * session (per process; hydrated from egress_state on first record).
-     * Never persisted — the tables are the source of truth. */
-    egressView?: import("./storage/egress-state.js").EgressViewRow[];
     pluginSnapshot?: CoreMessage[];
     /** #3301: original message decompositions supplied by an external state
      *  converter (e.g. opencode-acp migration) at import time. Transient

@@ -87,7 +87,11 @@ export interface EgressOpLogStore {
 export function recordEgressTurn(args: {
     store: EgressOpLogStore;
     sessionId: string;
-    prev: EgressViewRow[] | undefined;
+    /** #7439 ruling 3: optional — when omitted, the prev view is read from
+     *  the flow table (the single source of truth), not from an in-memory
+     *  cache. Callers that still hold a local view may pass it to skip the
+     *  read. */
+    prev?: EgressViewRow[];
     conversation: readonly EgressSourceMsg[];
     systemText: string | undefined;
     nowMs: number;

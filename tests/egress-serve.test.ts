@@ -16,9 +16,9 @@ import assert from "node:assert/strict";
 import { isRenderedSummaryMessage } from "acp-kernel";
 import { coreToOpenai, type BiliMessage } from "acp-kernel/wire";
 import { hardenOpenaiAssistantContent, systemToUser } from "../src/util.ts";
-import { egressStateAppend, egressStateCompact, egressStateView } from "../src/storage/egress-state.ts";
+import { egressStateAppend, egressStateAt, egressStateCompact, egressStateView, egressFlowMaxSeq } from "../src/storage/egress-state.ts";
 import { recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
-import { rebuildOutboundFromLog } from "../src/storage/egress-serve.ts";
+import { rebuildOutboundFromLog, rebuildOutboundWithLadder, type EgressLadderStore } from "../src/storage/egress-serve.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
 import * as fs from "node:fs";
@@ -32,7 +32,7 @@ process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 interface Harness {
     db: ReturnType<typeof openSqliteDatabase>["db"];
-    store: EgressOpLogStore;
+    store: EgressOpLogStore & EgressLadderStore;
     dir: string;
 }
 
@@ -40,9 +40,11 @@ function open(): Harness {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-egress-serve-"));
     const { db } = openSqliteDatabase(path.join(dir, "index.db"));
     migrateSchema(db);
-    const store: EgressOpLogStore = {
+    const store: EgressOpLogStore & EgressLadderStore = {
         egressStateAppendOps: (sid: string, ops: Parameters<typeof egressStateAppend>[2], nowMs: number) => egressStateAppend(db, sid, ops, nowMs),
         egressStateView: (sid: string) => egressStateView(db, sid),
+        egressStateViewAt: (sid: string, logSeq: number) => egressStateAt(db, sid, logSeq),
+        egressFlowMaxSeq: (sid: string) => egressFlowMaxSeq(db, sid),
         egressStateCompactView: (sid: string, view: Parameters<typeof egressStateCompact>[2], nowMs: number) => egressStateCompact(db, sid, view, nowMs),
     };
     return { db, store, dir };
@@ -187,6 +189,67 @@ test("the view rows are self-contained: every non-system row carries its bytes i
             assert.equal(parsed.id, r.msgid, "the inline bytes carry the message id");
             assert.equal(parsed.role, r.role, "the inline bytes carry the message role");
         }
+    } finally {
+        close(H);
+    }
+});
+
+// #7439 ruling 5: the degradation ladder. The current point is served first;
+// a corrupt point walks back to the nearest healthy flow point; a fully
+// unreadable flow returns null (session recovery — NEVER client bytes).
+
+test("ladder #1: a healthy current point is served as-is (logSeq = maxSeq)", () => {
+    const H = open();
+    try {
+        const S = "sess-l1";
+        const msgs: BiliMessage[] = [M("a", "hello"), M("b", "world", "assistant")];
+        recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: msgs, systemText: undefined, nowMs: 1000 });
+        const maxSeq = egressFlowMaxSeq(H.db, S);
+        const ladder = rebuildOutboundWithLadder(H.store, S);
+        assert.ok(ladder !== null, "a healthy flow rebuilds");
+        assert.equal(ladder!.logSeq, maxSeq, "served from the current point");
+        assert.equal(ladder!.rows, 2, "the current view has 2 rows");
+        assert.equal(JSON.stringify(ladder!.elements), JSON.stringify(legacyChain(msgs)), "the served elements are byte-identical");
+    } finally {
+        close(H);
+    }
+});
+
+test("ladder #2: a corrupt current point walks back to the nearest healthy point", () => {
+    const H = open();
+    try {
+        const S = "sess-l2";
+        const turn1: BiliMessage[] = [M("a", "hello"), M("b", "world", "assistant")];
+        recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: turn1, systemText: undefined, nowMs: 1000 });
+        const turn2: BiliMessage[] = [...turn1, M("c", "third")];
+        recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: turn2, systemText: undefined, nowMs: 2000 });
+        // corrupt the LATEST I row in the STATE table (the current point) —
+        // its bytes went NULL (corruption). The current point now fails.
+        H.db.prepare("UPDATE egress_state SET bytes = NULL WHERE session_id = ? AND row_type = 'I' AND log_seq = (SELECT MAX(log_seq) FROM egress_state WHERE session_id = ? AND row_type = 'I')").run(S, S);
+        const ladder = rebuildOutboundWithLadder(H.store, S);
+        assert.ok(ladder !== null, "the ladder finds a healthy point");
+        // turn-1's point is logSeq 2 (I a = logSeq 1, I b = logSeq 2 — the
+        // log_seq values start at 1, not 0). The corrupt current point is
+        // logSeq 3 (I c), so the ladder walks back to logSeq 2.
+        assert.equal(ladder!.logSeq, 2, "served from the turn-1 point (logSeq 2), not the corrupt current point (logSeq 3)");
+        assert.equal(ladder!.rows, 2, "the turn-1 view has 2 rows (a + b)");
+        assert.equal(JSON.stringify(ladder!.elements), JSON.stringify(legacyChain(turn1)), "the served elements are turn-1's bytes");
+    } finally {
+        close(H);
+    }
+});
+
+test("ladder #3: a fully unreadable flow returns null (session recovery, never client bytes)", () => {
+    const H = open();
+    try {
+        const S = "sess-l3";
+        const msgs: BiliMessage[] = [M("a", "hello"), M("b", "world", "assistant")];
+        recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: msgs, systemText: undefined, nowMs: 1000 });
+        // corrupt EVERY I row in BOTH tables — no point rebuilds.
+        H.db.prepare("UPDATE egress_state SET bytes = NULL WHERE session_id = ? AND row_type = 'I'").run(S);
+        H.db.prepare("UPDATE egress_flow SET bytes = NULL WHERE session_id = ? AND row_type = 'I'").run(S);
+        const ladder = rebuildOutboundWithLadder(H.store, S);
+        assert.equal(ladder, null, "no healthy point → null (the caller does session recovery)");
     } finally {
         close(H);
     }

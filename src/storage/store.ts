@@ -29,6 +29,7 @@ import {
     egressStateAt,
     egressStateCompact,
     egressStateView,
+    egressFlowMaxSeq,
     EgressStateCorruptError,
     type EgressOp,
     type EgressViewRow,
@@ -2057,6 +2058,12 @@ export class UnifiedStore {
     /** Rollback reconstruction at any log_seq (flow table is total). */
     egressStateViewAt(sessionId: string, logSeq: number): EgressViewRow[] {
         return egressStateAt(this.db, sessionId, logSeq);
+    }
+
+    /** #7439 ruling 5: the highest flow log_seq for a session (-1 when none)
+     *  — the degradation ladder's starting point. */
+    egressFlowMaxSeq(sessionId: string): number {
+        return egressFlowMaxSeq(this.db, sessionId);
     }
 
     egressStateCompactView(sessionId: string, view: EgressViewRow[], nowMs: number): number {

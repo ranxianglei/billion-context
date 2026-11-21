@@ -280,6 +280,16 @@ export function egressStateAt(db: SqliteDatabase, sessionId: string, x: number):
     return applyOps(sessionId, rows);
 }
 
+/** The highest log_seq in the FLOW table for a session (-1 when the session
+ * has no flow rows). #7439 ruling 5: the degradation ladder walks backward
+ * from this point to the nearest healthy reconstruction. */
+export function egressFlowMaxSeq(db: SqliteDatabase, sessionId: string): number {
+    const row = db
+        .prepare("SELECT MAX(log_seq) AS m FROM egress_flow WHERE session_id = ?")
+        .get(sessionId) as { m: number | null } | undefined;
+    return row && typeof row.m === "number" ? row.m : -1;
+}
+
 /** Compaction: persist the replayed view as a new base row, then physically
  * delete every STATE row below it (flow untouched — rollback stays total).
  * The base carries the entries themselves; base + later ops must reproduce
