@@ -221,12 +221,20 @@ test("#7197: requireRecommendation refusals do NOT arm the breaker (range-correc
   );
 });
 
-test("#6728: one success after arming disarms the breaker (gate refusals behave like other failures)", () => {
+test("#6728: armed breaker blocks the 4th call even with live credit (#7418 Option A)", () => {
   const ctx = nudgeGateCtx();
   runApply(ctx, NUDGE_CALL);
   runApply(ctx, NUDGE_CALL);
   runApply(ctx, NUDGE_CALL);
   assert.ok(compressBreakerArmed(ctx.session), "setup: breaker must be armed");
+  // #7418 Option A: once the breaker is armed, EVERY model-initiated compress
+  // call is refused before execution — even with a live nudge credit. The
+  // "success disarms while armed" recovery path is removed because under the
+  // #7418 trigger conditions (remaining compressible content below the gate)
+  // no successful spec exists; letting the model probe for a non-existent
+  // "good spec" just extends the loop. The breaker disarms on 10 min without
+  // a failing call (a blocked model makes no new failing call, so the quiet
+  // window runs from the last failure — bounded cycle, no deadlock).
   storeUnpromptedGate(ctx.session, {
     nudgeInjected: true,
     requireNudge: true,
@@ -234,12 +242,16 @@ test("#6728: one success after arming disarms the breaker (gate refusals behave 
   });
   const out = runApply(ctx, NUDGE_CALL);
   assert.ok(
-    out.startsWith("[Compressed"),
-    `credit live again — fold must succeed, got: ${out.slice(0, 120)}`,
+    out.includes("compress circuit breaker is armed"),
+    `armed breaker must block the 4th call, got: ${out.slice(0, 120)}`,
   );
   assert.ok(
-    !compressBreakerArmed(ctx.session),
-    "one success must clear the breaker",
+    out.includes("NOT because of your range selection"),
+    "refusal must state the reason is the streak, not range choice",
+  );
+  assert.ok(
+    compressBreakerArmed(ctx.session),
+    "breaker stays armed after the refusal (the refusal does not charge the ledger)",
   );
 });
 
