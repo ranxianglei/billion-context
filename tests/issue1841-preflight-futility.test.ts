@@ -165,7 +165,7 @@ function bulkTokens(repeat: number, pairs: number): number {
     return Math.round((pairs * (22 * repeat + 45)) / 4);
 }
 
-test("#1841 A: a payload whose foldable pool cannot close the gap skips the round with zero summary calls", async () => {
+test("#1841 A (#7537): a payload whose foldable pool cannot close the gap still skips the round — and is FORWARDED instead of the old 413", async () => {
     CALLS = [];
     summaryResponder = () => ({ content: SUMMARY_TEXT, finishReason: "stop" });
     const p = await boot();
@@ -189,13 +189,14 @@ test("#1841 A: a payload whose foldable pool cannot close the gap skips the roun
         seedEvidence(p.upstreamPort, "issue1841-futility-skip");
         const resp = await post(p, "issue1841-futility-skip", messages);
         const body = await resp.text();
-        assert.equal(resp.status, 413, `a futile round must fail fast non-retryably (#3461): HTTP ${resp.status} ${body.slice(0, 240)}`);
-        const json = JSON.parse(body) as { error?: { code?: string; message?: string } };
-        assert.equal(json.error?.code, "preflight_compress_failed");
-        assert.match(json.error?.message ?? "", /futile round/, `names the futility verdict (got: ${json.error?.message})`);
-        assert.match(json.error?.message ?? "", /maximum possible saving/, `quotes the pool bound (got: ${json.error?.message})`);
+        // #7537: the futility verdict no longer answers a local 413 — the
+        // skipped round's payload is forwarded as-is (fold-first unchanged: it
+        // just wasn't worth folding), and the upstream decides. This mock
+        // upstream accepts it → 200.
+        assert.equal(resp.status, 200, `a futile round now forwards (#7537): HTTP ${resp.status} ${body.slice(0, 240)}`);
+        assert.ok(body.includes("forwarded answer"), "the model reply must reach the client");
         assert.equal(CALLS.filter((c) => c.summary).length, 0, "a skipped round must spend ZERO summarization calls");
-        assert.equal(CALLS.length, 0, "the over-window payload must not be forwarded either");
+        assert.equal(CALLS.length, 1, "the over-window payload is forwarded exactly once (the upstream is the size authority)");
     } finally {
         await p.cleanup();
     }
