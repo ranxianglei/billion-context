@@ -1,0 +1,31 @@
+name: e2e egress bench (master + manual)
+
+# #7474: resident performance gate for the egress plane (ruling 7439).
+# Runs tests/egress-bench.test.ts (3 runs, growing pinned session, +20% over
+# the recorded baseline). Master push + manual dispatch only — this is a
+# performance lane, not a correctness leg: it must not slow down per-PR CI.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-egbench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  egbench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - env:
+          ACP_TEST_EG_BENCH: "1"
+        run: node --import tsx --test tests/egress-bench.test.ts
