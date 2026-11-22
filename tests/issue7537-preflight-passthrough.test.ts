@@ -162,7 +162,7 @@ test("#7537 A: the mathematically-doomed payload is FORWARDED, and the upstream'
         // upstream's verdict is the authoritative one bili must relay.
         const r = await post(ctx, bigMessages(500, 4_400));
         const body = await r.text();
-        const parsed = JSON.parse(body) as { error?: { message?: string; retryable?: boolean }; bili_evidence?: { outboundTextTokens?: number | null; inboundBytes?: number; verdict?: string } };
+        const parsed = JSON.parse(body) as { error?: { message?: string } };
 
         // THE fix: no local estimate-refusal — the payload reached the
         // upstream, which made the authoritative call (413).
@@ -170,15 +170,11 @@ test("#7537 A: the mathematically-doomed payload is FORWARDED, and the upstream'
             `the forward must reach the upstream (calls=${JSON.stringify(calls.map((c) => ({ s: c.summary, n: c.contentChars })))})`);
         assert.equal(r.status, 413, "the status is the UPSTREAM's 413");
         assert.match(parsed.error?.message ?? "", /maximum context length exceeded/, "the UPSTREAM's own error text (not bili's local estimate) is what the host sees");
-        // Annotation: non-retryable marking so status-code-driven hosts stop
-        // retry-looping the already-refused body.
+        // Annotation: non-retryable marking via HEADERS so status-code-driven
+        // hosts stop retry-looping the already-refused body. The upstream BODY
+        // stays verbatim (no merge — #1195 B / request-input-lifetime pin).
         assert.equal(r.headers.get("x-bili-retryable"), "false", "x-bili-retryable header present");
         assert.equal(r.headers.get("x-bili-cause"), "upstream-size", "x-bili-cause header present");
-        assert.equal(parsed.error?.retryable, false, "error.retryable=false merged into the JSON body");
-        assert.ok(parsed.bili_evidence, "bili_evidence merged into the JSON body");
-        assert.ok(typeof parsed.bili_evidence?.inboundBytes === "number" && (parsed.bili_evidence?.inboundBytes ?? 0) > 100_000,
-            `evidence carries the measured inbound size (got ${JSON.stringify(parsed.bili_evidence)})`);
-        assert.match(parsed.bili_evidence?.verdict ?? "", /do NOT retry/i, "the evidence names the anti-retry verdict");
     } finally {
         await close();
         rmrf(root);

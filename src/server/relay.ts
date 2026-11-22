@@ -77,7 +77,7 @@ import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferStreamIfFits, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, noteUpstreamSizeVerdict, type Prepared } from "../server.js";
+import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Retry the same input when the provider proved only its output reservation overflows. */
 function capOverflowOutput(body: string | Buffer, info: ContextOverflowInfo): { body: string; cap: number } | null {
@@ -2154,53 +2154,28 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}${terminalCause}`);
         // #7537 (owner ruling 2026-11-22): local estimate-refusals are gone —
         // when the UPSTREAM itself rejects the body as too large, its verdict
-        // is authoritative. bili logs its own measurement as evidence and
-        // marks the response non-retryable so status-code-driven hosts don't
-        // retry-loop an unchanged body the upstream already rejected (burning
-        // rate limits). Log always; header + body merge only for non-stream
-        // pipeline-prepared forwards where the body is still under bili's
-        // control (stream in-band errors and already-committed-200 responses
-        // stay verbatim). Body merge only when the upstream body is valid
-        // JSON — anything else passes through byte-identical.
+        // is authoritative. bili logs its own measurement as evidence and marks
+        // the response non-retryable via HEADERS so status-code-driven hosts
+        // don't retry-loop an unchanged body the upstream already rejected
+        // (burning rate limits). Log always; headers only for non-stream, not-
+        // yet-sent responses. The upstream BODY passes through byte-identical:
+        // verbatim pass-through is a pinned contract (#1195 B,
+        // request-input-lifetime), so no body merge. The anti-loop protection
+        // for the truly-doomed payload lives in preflight's evidence branch
+        // (deterministic exhaustion against a proven wall → local 413 after
+        // the arm stamps, #496/#767/#857).
         const SIZE_ERROR_RE = /request entity too large|payload.*too (large|big)|body too (large|big)|too many (tokens|messages|bytes)|exceeds? (the |a |your )?(maximum|limit|allowed|context)|context (length|window|size)|input is too long|maximum context length|token (limit|count|budget)|content is too long|message\[?s?\]?.*(too long|exceed)/i;
         const upstreamSizeVerdict = upstream.status === 413 || (upstream.status === 400 && SIZE_ERROR_RE.test(bodyText));
         if (prepared && upstreamSizeVerdict) {
-            // #7537/#496: this EXACT outbound body drew a size verdict — record
-            // it (SHA-1 of the preflight serialization, origin+model scoped,
-            // 10-minute TTL) so a byte-identical resend is refused locally by
-            // the preflight loop guard instead of re-burning the wire. The
-            // identity fast path and every changed body re-forward freely.
-            const preparedOutbound = typeof prepared.body === "string" ? prepared.body : (prepared.body instanceof Buffer ? prepared.body.toString("utf8") : undefined);
-            noteUpstreamSizeVerdict(prepared.session, normalizeUpstreamOrigin(upstreamUrl), prepared.model, preparedOutbound);
             const sizeMeasured = measuredOutbound(prepared);
             const declaredWindow = typeof prepared.session.metadata.effectiveContextLimit === "number" && prepared.session.metadata.effectiveContextLimit > 0
                 ? prepared.session.metadata.effectiveContextLimit
                 : 0;
             const inboundBytes = typeof wireBody === "string" ? wireBody.length : wireBody ? wireBody.length : 0;
-            log("warn", `[${errSid}] upstream size verdict ${upstream.status} (authoritative per #7537): bili measured outbound ~${sizeMeasured?.tokens?.toLocaleString("en-US") ?? "n/a"} TEXT tokens${sizeMeasured?.breakdown ? ` (${measuredBreakdownClause(sizeMeasured.breakdown)})` : ""}, inbound ${inboundBytes.toLocaleString("en-US")} bytes, effective window ${declaredWindow.toLocaleString("en-US")} (model=${prepared.model ?? "unknown"}); marking non-retryable to stop host retry loops`);
+            log("warn", `[${errSid}] upstream size verdict ${upstream.status} (authoritative per #7537): bili measured outbound ~${sizeMeasured?.tokens?.toLocaleString("en-US") ?? "n/a"} TEXT tokens${sizeMeasured?.breakdown ? ` (${measuredBreakdownClause(sizeMeasured.breakdown)})` : ""}, inbound ${inboundBytes.toLocaleString("en-US")} bytes, effective window ${declaredWindow.toLocaleString("en-US")} (model=${prepared.model ?? "unknown"}); marking non-retryable via headers to stop host retry loops — the upstream body passes through verbatim`);
             if (!res.headersSent && req.method !== "GET" && req.method !== "HEAD") {
                 respHeaders["x-bili-cause"] = "upstream-size";
                 respHeaders["x-bili-retryable"] = "false";
-                if (errBody) {
-                    try {
-                        const asText = new TextDecoder().decode(errBody);
-                        const json = JSON.parse(asText) as Record<string, unknown>;
-                        if (json && typeof json === "object" && !Array.isArray(json)) {
-                            json.bili_evidence = {
-                                outboundTextTokens: sizeMeasured?.tokens ?? null,
-                                breakdown: sizeMeasured?.breakdown ?? null,
-                                inboundBytes,
-                                effectiveWindow: declaredWindow || null,
-                                verdict: `upstream refused this body as too large; bili's local measurement above is evidence, not the cause; do NOT retry the unchanged body (#7537)`,
-                            };
-                            const errObj = json.error;
-                            if (errObj && typeof errObj === "object" && !Array.isArray(errObj)) {
-                                (errObj as Record<string, unknown>).retryable = false;
-                            }
-                            errBody = Buffer.from(JSON.stringify(json));
-                        }
-                    } catch { /* non-JSON upstream body — headers + log only */ }
-                }
             }
         }
         if (prepared?.session && prepared.nudgeStampsBefore && upstream.status >= 400 && upstream.status < 500) rejectNudge(prepared.session, prepared.nudgeStampsBefore, upstream.status);

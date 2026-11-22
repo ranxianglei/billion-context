@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
 import tls from "node:tls";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, defaultPrompts, deactivateBlock } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "./compress-settings.js";
@@ -3447,63 +3447,6 @@ function localRefusalCovers(metadata: Record<string, unknown>, origin: string | 
     return readLocalRefusals(metadata).some((r) => r.origin === origin && r.model === model && r.window >= window);
 }
 
-// #7537 (with #496): the one loop the old estimate-refusals happened to break
-// — a status-code-driven host re-sending the SAME bytes an upstream already
-// rejected as too large — must stay broken after the local size 413s are gone.
-// The guard is EVIDENCE, not estimate: it fires only on a byte-identical
-// resend (same SHA-1 of the wire body) to the same origin+model whose exact
-// bytes the upstream already refused with a size verdict. Changed bodies
-// re-forward freely; the record TTLs out like #3846's (10 minutes).
-interface UpstreamSizeVerdictRecord {
-    origin: string;
-    model: string;
-    hash: string;
-    at: number;
-}
-
-const SIZE_VERDICT_MAX_RECORDS = 16;
-const SIZE_VERDICT_TTL_MS = LOCAL_REFUSAL_TTL_MS;
-
-function wireBodyHash(body: string): string {
-    return createHash("sha1").update(body).digest("hex").slice(0, 16);
-}
-
-function readSizeVerdicts(metadata: Record<string, unknown>): UpstreamSizeVerdictRecord[] {
-    const raw = metadata.upstreamSizeVerdicts;
-    if (!Array.isArray(raw)) return [];
-    const now = Date.now();
-    return raw.filter((r): r is UpstreamSizeVerdictRecord =>
-        !!r && typeof r === "object"
-        && typeof (r as UpstreamSizeVerdictRecord).origin === "string"
-        && typeof (r as UpstreamSizeVerdictRecord).model === "string"
-        && typeof (r as UpstreamSizeVerdictRecord).hash === "string"
-        && typeof (r as UpstreamSizeVerdictRecord).at === "number"
-        && (r as UpstreamSizeVerdictRecord).at > now - SIZE_VERDICT_TTL_MS,
-    );
-}
-
-/** Relay-side: the upstream answered a size verdict for these exact outbound
- *  bytes — record it so the byte-identical resend is refused locally (#496
- *  loop guard, #7537). The hash must be of the SAME outbound serialization
- *  preflight checks (prepared.body) — call with that value, not wire bytes
- *  that later pipes may have re-serialized. */
-export function noteUpstreamSizeVerdict(session: Session, origin: string | undefined, model: string | undefined, outboundBody: string | undefined): void {
-    if (!origin || !model || typeof outboundBody !== "string" || outboundBody.length === 0) return;
-    const h = wireBodyHash(outboundBody);
-    const records = readSizeVerdicts(session.metadata);
-    if (records.some((r) => r.origin === origin && r.model === model && r.hash === h)) return;
-    session.metadata.upstreamSizeVerdicts = [...records, { origin, model, hash: h, at: Date.now() }].slice(-SIZE_VERDICT_MAX_RECORDS);
-    markDirty(session);
-}
-
-/** Preflight-side: true when THIS exact wire body (same origin+model) already
- *  drew an upstream size verdict — the resend must not ride the wire again. */
-function upstreamSizeVerdictCovers(metadata: Record<string, unknown>, origin: string | undefined, model: string | undefined, body: string | undefined): boolean {
-    if (!origin || !model || typeof body !== "string" || body.length === 0) return false;
-    const h = wireBodyHash(body);
-    return readSizeVerdicts(metadata).some((r) => r.origin === origin && r.model === model && r.hash === h);
-}
-
 /** #568: commit the response early so a long preflight cannot lose the client
  *  to its header timeout. Streaming clients get an SSE stream with keep-alive
  *  comment lines (`: bili-preflight` — a spec-mandated no-op for every SSE
@@ -4069,18 +4012,6 @@ export async function preflightCompressIfNeeded(
     // started before this field existed) keep the legacy behavior.
     let baselineFloor = baselineFloorRaw;
     const currentOrigin = normalizeUpstreamOrigin(route?.upstream);
-    // #7537/#496: byte-identical resend of a body the upstream ALREADY refused
-    // as too large — the one refusal that survives the estimate-refusal removal
-    // (evidence, not estimate): refuse locally with the loop-guard verdict so a
-    // status-code-driven host cannot re-burn the same doomed payload in a
-    // retry loop. Changed bodies and new sessions judge fresh.
-    if (currentOrigin !== undefined && model !== undefined && model.length > 0) {
-        const verdictBody = typeof prepared.body === "string" ? prepared.body : (prepared.body instanceof Buffer ? prepared.body.toString("utf8") : undefined);
-        if (verdictBody !== undefined && upstreamSizeVerdictCovers(session.metadata, currentOrigin, model, verdictBody)) {
-            log("warn", `[${session.id}] preflight fail-fast 413 (retryable=false, upstream-size evidence): the upstream already refused THIS exact body as too large — refusing the byte-identical resend locally instead of re-burning the wire (#7537/#496 loop guard)`);
-            return { failFast: true, status: 413, message: `the upstream already refused this exact body as too large (its size verdict is on record for these bytes, #7537/#496). Do NOT retry the unchanged body — shrink the session (rewind or restart), or change the payload, and retry.`, retryable: false, respond: !res.writableEnded };
-        }
-    }
     const baselineOrigin = normalizeUpstreamOrigin(session.stats.lastInputTokensOrigin);
     if (baselineFloor > 0 && currentOrigin !== undefined && baselineOrigin !== undefined && baselineOrigin !== currentOrigin) {
         log("info", `[${session.id}] preflight usage-baseline ~${baselineFloor} tok was measured on ${maskUrlForLog(baselineOrigin)}, request now routes to ${maskUrlForLog(currentOrigin)} — demoting to untrusted, judging by this payload's own estimate (#1933)`);
@@ -4944,8 +4875,21 @@ export async function preflightCompressIfNeeded(
     // a local refusal: the summary relay itself is down (non-deterministic
     // exhaustion → 502) or the relay hit an upstream 429 (→ 503).
     if (f?.kind === "exhausted" && f.deterministic && !payloadFitsWindow) {
+        if (statedWall > 0) {
+            // Evidence-based refusal — the one local 413 that survives the
+            // #7537 estimate-refusal ruling: the UPSTREAM itself proved this
+            // wall (a stated overflow number, or its own 400/413 arming at
+            // ~statedWall tok), the futile-round math proves no combination of
+            // folds can close the gap, and bili's calibrated meter agrees the
+            // payload is over the window. This is upstream evidence, not a
+            // local estimate (#3461/#496/#767/#857) — re-forwarding unchanged
+            // bytes would only re-burn the wire and re-teach the same wall.
+            noteLocalRefusal(session, currentOrigin, model, limit);
+            log("warn", `[${session.id}] preflight fail-fast 413 (retryable=false): deterministic size exhaustion against a PROVEN window (~${statedWall.toLocaleString("en-US")} tok upstream evidence; local estimate ~${Math.round(result.payloadEstimate)} tok after ${result.compressedRanges} fold(s), window ${limit}) — refusing locally; estimate-based refusals are gone (#7537) but this one is upstream evidence (#3461/#496)`);
+            return failFast(413, f?.detail ?? "the payload still exceeds the window after preflight compression — the upstream has already proved this wall and nothing more can fold", false, result.compressedRanges > 0 ? foldedCalibratedSize : undefined, result.rangesRemaining);
+        }
         const fwdMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
-        log("warn", `[${session.id}] fold walk exhausted deterministically (nothing more can fold and the payload is still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative${shrinkNote}`);
+        log("warn", `[${session.id}] fold walk exhausted deterministically (nothing more can fold and the payload is still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) — no proven upstream wall on record — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative${shrinkNote}`);
         log("info", `[${session.id}] preflight forward core-text profile: ${describeCoreTextDuplication(fwdMsgs)}`);
         return outbound;
     }

@@ -171,15 +171,13 @@ test("e2e #4079 (#7537): a body that no window can fit is FORWARDED — the fuse
         // fake upstream 413s above 2MB.
         const r = await post(ctx, bigMessages(2000, 4_400), false);
         const body = await r.text();
-        const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: boolean; message?: string }; bili_evidence?: { inboundBytes?: number; verdict?: string } };
+        const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: unknown; message?: string } };
 
         assert.equal(r.status, 413, `the upstream's size verdict must pass through (got ${r.status}): ${body.slice(0, 300)}`);
         assert.match(parsed.error?.message ?? "", /upstream says: request entity too large/, "the 413 is the UPSTREAM's message, not a local refusal");
         assert.equal(r.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
         assert.equal(r.headers.get("x-bili-retryable"), "false", "non-retryable — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.equal(parsed.error?.retryable, false, "the host must not retry the unchanged body");
-        assert.ok((parsed.bili_evidence?.inboundBytes ?? 0) > 1_000_000, "bili's local measurement rides along as evidence (not cause)");
-        assert.match(parsed.bili_evidence?.verdict ?? "", /do NOT retry/i, "the evidence tells the host what to do");
+        assert.equal(parsed.error?.retryable, undefined, "the upstream body stays verbatim — no bili merge (header-only annotation)");
         // THE behavior under test: the payload WAS forwarded — the fuse logs,
         // it does not judge (#7537).
         assert.equal(calls.length, 1, `upstream must see exactly one call (got ${JSON.stringify(calls)})`);
@@ -209,14 +207,12 @@ test("e2e #5000 (#7537): a body whose mass rides tools[] is FORWARDED — the me
             body: JSON.stringify({ model: "gpt-test", stream: true, tools, messages }),
         });
         const body = await r.text();
-        const parsed = JSON.parse(body) as { error?: { message?: string; retryable?: boolean }; bili_evidence?: { inboundBytes?: number; verdict?: string } };
+        const parsed = JSON.parse(body) as { error?: { message?: string } };
 
         assert.equal(r.status, 413, `the upstream's size verdict must pass through (got ${r.status}): ${body.slice(0, 300)}`);
         assert.match(parsed.error?.message ?? "", /upstream says: request entity too large/, "the 413 is the UPSTREAM's message");
+        assert.equal(r.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
         assert.equal(r.headers.get("x-bili-retryable"), "false", "non-retryable — the tools[] mass won't change on retry");
-        assert.equal(parsed.error?.retryable, false, "the host must not retry the unchanged body");
-        assert.ok((parsed.bili_evidence?.inboundBytes ?? 0) > 1_000_000, "bili's local measurement rides along as evidence (not cause)");
-        assert.match(parsed.bili_evidence?.verdict ?? "", /do NOT retry/i, "the evidence tells the host what to do");
         // THE behavior under test: the payload WAS forwarded — the measured
         // tier is now an evidence logger, not a judge (#7537).
         assert.equal(calls.length, 1, `upstream must see exactly one call (got ${JSON.stringify(calls)})`);
@@ -240,14 +236,12 @@ test("e2e #4543 (#7537): a dense CJK body over every old bar is FORWARDED — th
         const messages = [{ role: "user", content: cjk + "\n" + "x".repeat(3_072) }] as Array<{ role: string; content: string }>;
         const r = await post(ctx, messages, false);
         const body = await r.text();
-        const parsed = JSON.parse(body) as { error?: { message?: string; retryable?: boolean }; bili_evidence?: { inboundBytes?: number; verdict?: string } };
+        const parsed = JSON.parse(body) as { error?: { message?: string } };
 
         assert.equal(r.status, 413, `the upstream's size verdict must pass through (got ${r.status}): ${body.slice(0, 300)}`);
         assert.match(parsed.error?.message ?? "", /upstream says: request entity too large/, "the 413 is the UPSTREAM's message");
         assert.equal(r.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
-        assert.equal(parsed.error?.retryable, false, "non-retryable — the CJK mass won't change on retry");
-        assert.ok((parsed.bili_evidence?.inboundBytes ?? 0) > 1_000_000, "bili's local measurement rides along as evidence (not cause)");
-        assert.match(parsed.bili_evidence?.verdict ?? "", /do NOT retry/i, "the evidence tells the host what to do");
+        assert.equal(r.headers.get("x-bili-retryable"), "false", "non-retryable — the CJK mass won't change on retry");
         // THE behavior under test: the payload WAS forwarded — the fuse logs,
         // it does not judge (#7537).
         assert.equal(calls.length, 1, `upstream must see exactly one call (got ${JSON.stringify(calls)})`);
