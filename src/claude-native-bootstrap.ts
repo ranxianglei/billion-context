@@ -331,6 +331,8 @@ export function isClaudeHostArgv(argv: string[]): boolean {
         return stripQuotes(parts[parts.length - 1] ?? "");
     };
     if (/^claude(\.exe)?$/i.test(base(argv[0] ?? ""))) return true;
+    // Native installs run <data dir>/claude/versions/<version>; Remote Control spawns its children by that path.
+    if (/[\\/]claude[\\/]versions[\\/]\d+\.\d+\.\d+(\.exe)?$/i.test(stripQuotes(argv[0] ?? ""))) return true;
     if (/^(node|bun|deno)(\.exe)?$/i.test(base(argv[0] ?? ""))) {
         return argv.slice(1).some((arg) => /^claude(\.exe)?$/i.test(base(arg)) || /@anthropic-ai[\\/]claude-code/.test(arg));
     }

@@ -113,6 +113,10 @@ export function createCodexCatalogFetch(
 ) {
     const memory = new Map<string, Entry>();
     const invalidated = new Set<string>();
+    // Invalidating a key also invalidates requests already reading its old
+    // catalog. Bound the generation registry like the existing tombstones.
+    const generations = new Map<string, object>();
+    const diskUpdates = new Map<string, Promise<void>>();
     const offSpec304Noted = new Set<string>();
     const clock = options.now ?? Date.now;
     const maxAge = options.maxAgeMs ?? 6 * 60 * 60 * 1000;
@@ -124,6 +128,13 @@ export function createCodexCatalogFetch(
         clock() >= entry.savedAt &&
         clock() - entry.savedAt <= maxAge &&
         validCatalog(entry.body);
+    const updateDisk = async (key: string, operation: () => Promise<void>) => {
+        const previous = diskUpdates.get(key) ?? Promise.resolve();
+        const pending = previous.catch(() => {}).then(operation);
+        diskUpdates.set(key, pending);
+        try { await pending; }
+        finally { if (diskUpdates.get(key) === pending) diskUpdates.delete(key); }
+    };
     return async (
         operation: (signal?: AbortSignal) => Promise<FetchResult>,
         url: string,
@@ -142,6 +153,13 @@ export function createCodexCatalogFetch(
                 ]),
             )
             .digest("hex");
+        let generation = generations.get(key);
+        if (!generation) {
+            generation = {};
+            generations.set(key, generation);
+            if (generations.size > 256) generations.delete(generations.keys().next().value!);
+        }
+        const current = () => generations.get(key) === generation;
         const directory = options.directory === undefined ? path.join(cacheDir(), "codex-model-catalog-v1") : options.directory;
         const file = directory ? path.join(directory, `${key}.json`) : null;
         let entry = invalidated.has(key) ? undefined : memory.get(key);
@@ -155,49 +173,60 @@ export function createCodexCatalogFetch(
                 /* Cache absence or corruption is a miss. */
             }
         }
-        if (!fresh(entry)) entry = undefined;
+        if (!current() || !fresh(entry)) entry = undefined;
         const remember = async (value: Entry) => {
+            if (!current()) return false;
             entry = value;
             invalidated.delete(key);
             memory.delete(key);
             memory.set(key, value);
             while (memory.size > MAX_ENTRIES) memory.delete(memory.keys().next().value!);
-            if (!file || !directory) return;
-            const temp = `${file}.${randomUUID()}.tmp`;
-            try {
-                await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-                await fs.writeFile(temp, JSON.stringify(value), { mode: 0o600 });
-                await fs.rename(temp, file);
-                const names = (await fs.readdir(directory)).filter((name) => /^[a-f0-9]{64}\.json$/.test(name));
-                if (names.length > MAX_ENTRIES) {
-                    const dated = await Promise.all(
-                        names.map(async (name) => ({
-                            name,
-                            mtime: (await fs.stat(path.join(directory, name))).mtimeMs,
-                        })),
-                    );
-                    dated.sort((a, b) => b.mtime - a.mtime);
-                    await Promise.all(dated.slice(MAX_ENTRIES).map((item) => fs.unlink(path.join(directory, item.name)).catch(() => {})));
+            if (!file || !directory) return true;
+            await updateDisk(key, async () => {
+                if (!current()) return;
+                const temp = `${file}.${randomUUID()}.tmp`;
+                try {
+                    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+                    await fs.writeFile(temp, JSON.stringify(value), { mode: 0o600 });
+                    await fs.rename(temp, file);
+                    const names = (await fs.readdir(directory)).filter((name) => /^[a-f0-9]{64}\.json$/.test(name));
+                    if (names.length > MAX_ENTRIES) {
+                        const dated = await Promise.all(
+                            names.map(async (name) => ({
+                                name,
+                                mtime: (await fs.stat(path.join(directory, name))).mtimeMs,
+                            })),
+                        );
+                        dated.sort((a, b) => b.mtime - a.mtime);
+                        await Promise.all(dated.slice(MAX_ENTRIES).map((item) => fs.unlink(path.join(directory, item.name)).catch(() => {})));
+                    }
+                } catch {
+                    log("warn", "[model-catalog] private cache write unavailable; using memory cache");
+                } finally {
+                    await fs.unlink(temp).catch(() => {});
                 }
-            } catch {
-                log("warn", "[model-catalog] private cache write unavailable; using memory cache");
-            } finally {
-                await fs.unlink(temp).catch(() => {});
-            }
+            });
+            return current();
         };
         const invalidate = async () => {
+            if (!current()) return;
             entry = undefined;
             memory.delete(key);
             invalidated.add(key);
+            generations.set(key, {});
             if (invalidated.size > 256) invalidated.delete(invalidated.values().next().value!);
             if (file) {
-                // A tombstone prevents a failed deletion from reviving old capabilities.
-                await fs
-                    .writeFile(file, JSON.stringify({ key, invalidated: true }), {
-                        mode: 0o600,
-                    })
-                    .catch(() => {});
-                await fs.unlink(file).catch(() => {});
+                // Wait for an already-started rename before deleting: otherwise
+                // that rename can publish the invalid catalog after deletion.
+                await updateDisk(key, async () => {
+                    // A tombstone prevents a failed deletion from reviving old capabilities.
+                    await fs
+                        .writeFile(file, JSON.stringify({ key, invalidated: true }), {
+                            mode: 0o600,
+                        })
+                        .catch(() => {});
+                    await fs.unlink(file).catch(() => {});
+                });
             }
         };
         const discard = (result?: FetchResult) => {
@@ -234,9 +263,9 @@ export function createCodexCatalogFetch(
             result = await operation(linked);
             signal?.throwIfAborted();
             const status = result.response.status;
-            if ([500, 502, 503, 504].includes(status)) return fresh(entry) ? cached(`temporary HTTP ${status}`, result) : result;
+            if ([500, 502, 503, 504].includes(status)) return current() && fresh(entry) ? cached(`temporary HTTP ${status}`, result) : result;
             if (status === 304) {
-                if (!entry) return result;
+                if (!current() || !entry) return result;
                 // A 304 only means "not modified" when THIS request was
                 // conditional — the wrapper itself never sends a validator,
                 // but the end client may have added if-none-match /
@@ -261,7 +290,7 @@ export function createCodexCatalogFetch(
                     await invalidate();
                     return result;
                 }
-                await remember({ ...entry, savedAt: clock() });
+                if (!await remember({ ...entry, savedAt: clock() })) return result;
                 discard(result);
                 return replay(entry, false);
             }
@@ -293,11 +322,11 @@ export function createCodexCatalogFetch(
             if (validCatalog(text)) {
                 const etag = result.response.headers.get("etag");
                 const lastModified = result.response.headers.get("last-modified");
-                await remember({ key, savedAt: clock(), body: text,
+                const saved = await remember({ key, savedAt: clock(), body: text,
                     ...(etag !== null ? { etag } : {}),
                     ...(lastModified !== null ? { lastModified } : {}),
                 });
-                log("info", "[model-catalog] complete catalog refreshed; offline protection ready");
+                if (saved) log("info", "[model-catalog] complete catalog refreshed; offline protection ready");
             } else {
                 await invalidate();
             }
@@ -307,7 +336,7 @@ export function createCodexCatalogFetch(
                 discard(result);
                 throw error;
             }
-            if (fresh(entry) && (deadline.signal.aborted || transient(error))) return cached("network interruption", result);
+            if (current() && fresh(entry) && (deadline.signal.aborted || transient(error))) return cached("network interruption", result);
             discard(result);
             throw error;
         } finally {
