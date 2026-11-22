@@ -3509,6 +3509,23 @@ async function handleRequest(
                         // summarization call (external summary chain) — a
                         // different request, not the fail-fasted payload. The
                         // "NOT forwarded" wording is therefore always true.
+                        // #7382: structured size evidence — the verdict's meter
+                        // readings (core text bytes / window / foldable ranges /
+                        // inbound bytes) ride in the error JSON when the verdict
+                        // computed them, so a stuck client can see WHICH wall it
+                        // hit without reading bili's logs.
+                        const failFastPayload = {
+                            error: {
+                                type: "server_error",
+                                code: "preflight_compress_failed",
+                                message: outcome.message,
+                                retryable: outcome.retryable,
+                                ...(outcome.coreTextBytes !== undefined ? { coreTextBytes: outcome.coreTextBytes } : {}),
+                                ...(outcome.windowTokens !== undefined ? { windowTokens: outcome.windowTokens } : {}),
+                                ...(outcome.foldableRanges !== undefined ? { foldableRanges: outcome.foldableRanges } : {}),
+                                ...(outcome.inboundBytes !== undefined ? { inboundBytes: outcome.inboundBytes } : {}),
+                            },
+                        };
                         if (respondFailFast && outcome.respond && !res.destroyed) {
                             if (res.headersSent) {
                                 // #568: the hold already committed 200 early — the status
@@ -3519,14 +3536,7 @@ async function handleRequest(
                                     emitPreflightError(res, prepared!.commandcode ? "commandcode" : prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
                                 } else {
                                     try {
-                                        res.end(JSON.stringify({
-                                            error: {
-                                                type: "server_error",
-                                                code: "preflight_compress_failed",
-                                                message: outcome.message,
-                                                retryable: outcome.retryable,
-                                            },
-                                        }));
+                                        res.end(JSON.stringify(failFastPayload));
                                     } catch { /* client gone */ }
                                 }
                             } else {
@@ -3537,14 +3547,7 @@ async function handleRequest(
                                     "content-type": "application/json",
                                     ...(outcome.status === 503 ? { "retry-after": "30" } : {}),
                                 });
-                                res.end(JSON.stringify({
-                                    error: {
-                                        type: "server_error",
-                                        code: "preflight_compress_failed",
-                                        message: outcome.message,
-                                        retryable: outcome.retryable,
-                                    },
-                                }));
+                                res.end(JSON.stringify(failFastPayload));
                             }
                         }
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);

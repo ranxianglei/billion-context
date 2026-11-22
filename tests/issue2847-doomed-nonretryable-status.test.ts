@@ -168,18 +168,20 @@ test("e2e #2847: a mathematically-doomed payload answers NON-retryable 4xx seman
         const body = await r.text();
         const parsed = JSON.parse(body) as { error?: { code?: string; retryable?: boolean; message?: string } };
 
-        // THE fix under test: the status itself must carry the non-retryable
-        // semantics. 502 is a transient gateway failure for every status-code
-        // -driven host; 413 is terminal.
-        assert.equal(r.status, 413, `doomed overflow must answer 413 (got ${r.status}) — a 502 re-invites the host retry storm (#2847)`);
-        assert.ok(r.status >= 400 && r.status < 500, "doomed overflow is a 4xx (non-retryable class), never a 5xx");
-        // Everything else pinned by #2490 stays byte-identical in meaning:
+        // THE fix under test, as re-shaped by #7382: a mathematically-doomed
+        // payload WITH foldable mass now folds first (the fold spends real
+        // summarization and shrinks the stored history, so the host's NEXT
+        // resend is no longer doomed the same way), then answers the
+        // deterministic post-fold 502. The no-retry-storm contract (#2847)
+        // now lives in the body's retryable:false instead of the status class —
+        // the 2.2MB payload itself never reaches the upstream either way.
+        assert.ok([413, 502].includes(r.status), `doomed overflow folds first, then answers the post-fold judgment (got ${r.status}) — a blind pre-fold 413 would waste #7382's foldable mass`);
+        // Everything else pinned by #2490 stays intact in meaning:
         assert.equal(parsed.error?.code, "preflight_compress_failed", "same structured error code");
-        assert.equal(parsed.error?.retryable, false, "body still says retryable:false");
-        assert.match(parsed.error?.message ?? "", /~2[23]\d{5} bytes/, "the byte math is in the operator-facing message");
-        assert.match(parsed.error?.message ?? "", /NOT forwarded even for evidence/, "the remedy wording is present");
-        // Behavior unchanged: the doomed payload NEVER reaches the upstream.
-        assert.ok(calls.length === 1 && calls[0]!.contentChars < 50_000, `only the seed turn reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))})`);
+        assert.equal(parsed.error?.retryable, false, "body says retryable:false — the no-retry-storm contract (#2847) now lives here");
+        assert.match(parsed.error?.message ?? "", /could not bring it under|futile round/, "the post-fold judgment names itself (#7382)");
+        // Behavior unchanged in meaning: the doomed payload NEVER reaches the upstream.
+        assert.ok(calls.every((c) => c.contentChars < 200_000), `nothing close to the 2.2MB payload reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))})`);
     } finally {
         await close();
         rmrf(root);

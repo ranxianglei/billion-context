@@ -3341,6 +3341,14 @@ interface PreflightFailFast {
     retryable: boolean;
     /** False when the client already disconnected — there is nothing to write. */
     respond: boolean;
+    // #7382: structured size evidence — the 413 body previously carried only a
+    // prose message while bili's own logs held the numbers (inbound=14.1MiB,
+    // core text bytes, window), so a stuck client could not tell WHICH wall it
+    // hit or how far over it was. Written into the error JSON when present.
+    coreTextBytes?: number;
+    windowTokens?: number;
+    foldableRanges?: number;
+    inboundBytes?: number;
 }
 
 export function isPreflightFailFast(outcome: Prepared | PreflightFailFast): outcome is PreflightFailFast {
@@ -4132,7 +4140,59 @@ export async function preflightCompressIfNeeded(
             const countMessage = `message count ${msgCount.toLocaleString("en-US")} exceeds the upstream wire limit ${maxMessages.toLocaleString("en-US")} (COUNT dimension — the messages[] array length is a hard upstream constraint that no byte/token estimate expresses, #5000: a 26,903-message session cleared every size gate and died at the upstream). Folding cannot close ~${gap.toLocaleString("en-US")} messages inside one preflight; reduce the session history — restart the session or rewind to an earlier point — and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false, count gate): ${countMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: countMessage, retryable: false, respond: !res.writableEnded };
+            return { failFast: true, status: 413, message: countMessage, retryable: false, respond: !res.writableEnded, inboundBytes: inboundBody.byteLength };
+        }
+    }
+    // #7167: the tool surface is irreducible — preflight folding rewrites the
+    // MESSAGE surface only (messages[] on the chat lanes, input[] on the
+    // responses lane); tools[]/system ride through verbatim on every outbound.
+    // When the non-message surface alone reaches the window, every fold spends
+    // summarization calls (and permanently rewrites history) to end at the
+    // same 413. Judge BEFORE the trigger guard for the same reason the count
+    // gate above does: a tools-doomed payload may never trigger folding at all
+    // (its messages[] text can be small) yet still be doomed.
+    // The meter is the #554 CJK-aware estimate on the ACTUAL parsed body
+    // (measuredOutbound); a parse failure returns undefined and falls open —
+    // the egress fuse still measures the serialized truth downstream.
+    // Deliberately NOT exempted under growthArmed: a growth trigger is operator
+    // intent to fold, but folding a tools-doomed body is a guaranteed-waste bet
+    // (the forward-once fail-open exists for billing-caliber disagreement, not
+    // for mathematically-irreducible payloads).
+    if (limit > 0 && model) {
+        const preFold = measuredOutbound(prepared);
+        if (preFold !== undefined) {
+            // estimateRawBodyBreakdown's buckets key on "messages" only; the
+            // responses lane's conversation lives in "input" and is folded the
+            // same way — so measure the foldable surface explicitly and judge
+            // the REST as the irreducible non-message surface.
+            let foldable = 0;
+            const pb = prepared.parsedBody;
+            if (pb !== undefined && pb !== null && typeof pb === "object" && !Array.isArray(pb)) {
+                const p = pb as Record<string, unknown>;
+                const foldableBody: Record<string, unknown> = {};
+                for (const key of ["messages", "input"]) {
+                    if (key in p) foldableBody[key] = p[key];
+                }
+                if (Object.keys(foldableBody).length > 0) foldable = estimateRawBodyBreakdown(foldableBody).total;
+            }
+            const { tools, system, other } = preFold.breakdown;
+            const irreducible = preFold.tokens - foldable;
+            if (irreducible >= limit) {
+                // #736: when the wall is bili's own shrunken window, say so —
+                // the same note the post-fold failFast() closure appends.
+                const doomShrinkNote = buildWindowShrinkNote({
+                    reason: windowShrinkReason,
+                    limit,
+                    nativeWindow: resolvedNativeWindow,
+                    routeMissedConfigured: Object.keys(opts.routes).length > 0 && findRouteKey(opts.routes, route?.rewrittenUrl) === undefined,
+                    upstreamEndpoint: route?.rewrittenUrl,
+                    knownKeys: Object.keys(opts.routes),
+                });
+                const doomMessage = `non-message surface (tools[] ~${tools.toLocaleString("en-US")} + system ~${system.toLocaleString("en-US")} + other ~${other.toLocaleString("en-US")}; messages/input ~${foldable.toLocaleString("en-US")} is the only foldable part) = ~${irreducible.toLocaleString("en-US")} tokens of irreducible surface ≥ the model window ${limit.toLocaleString("en-US")} (model=${model}); preflight folding only rewrites the conversation and can never shrink the tool surface — trim the tool list, use a leaner preset, or a larger-window model. NOT forwarded.${doomShrinkNote}`;
+                log("error", `[${session.id}] preflight fail-fast 413 (retryable=false, irreducible tool surface): ${doomMessage}`);
+                noteLocalRefusal(session, currentOrigin, model, limit);
+                return { failFast: true, status: 413, message: doomMessage, retryable: false, respond: !res.writableEnded, windowTokens: limit, inboundBytes: inboundBody.byteLength };
+            }
         }
     }
     if (limit <= 0 || !model || !triggerFires) return prepared;
@@ -4199,11 +4259,14 @@ export async function preflightCompressIfNeeded(
         // would block cannot acquire upstream evidence: use the normal fold
         // path instead, without recording a persistent route refusal.
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
+        let probeDoomedFoldable = false;
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             if (trustedForward) {
                 log("warn", `[${session.id}] identity fast path: local doom-math says core text alone (~${coreTextBytes} bytes ≥ ~${Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN)} tok at the densest observed density) can never fit window ${limit}, but upstream reality (~${session.stats.lastInputTokens} tok, ${evidenceSource}) exists for this origin+model — forwarding as configured; a genuine 400 is handled by the overflow arm`);
                 return prepared;
             }
+            const foldableRanges = (prepared.nudge?.compressibleRanges ?? []).length;
+            if (foldableRanges === 0) {
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
             log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(prepared.processedMessages)}`);
             const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
@@ -4218,7 +4281,20 @@ export async function preflightCompressIfNeeded(
             // math, same message, same no-forward behavior — status only.
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
+            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded, coreTextBytes, windowTokens: limit, foldableRanges: 0, inboundBytes: inboundBody.byteLength };
+            }
+            // #7382: the blind probe is doomed on bytes, but foldable mass
+            // EXISTS (269 viable ranges in the field case) — a blind forward is
+            // a wasted guaranteed 400 and a fail-fast wastes the one lever that
+            // works. Fall through to the fold path below; the post-fold gates
+            // re-judge the rebuilt body and fail fast if folding cannot save it
+            // (no infinite folding: preflightCompress is round-budgeted).
+            probeDoomedFoldable = true;
+            // #4079: the profile line belongs to the DOOMED PROBE verdict, not
+            // the fail-fast branch — a fold-first payload is equally doomed for
+            // a blind forward, so the operator gets the same readability signal.
+            log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(prepared.processedMessages)}`);
+            log("info", `[${session.id}] core text alone is ~${coreTextBytes} bytes (doomed for a blind probe, #2490) but ${foldableRanges} compressible range(s) exist — folding before forwarding instead of fail-fast (#7382)`);
         }
         const declaredWindow = typeof session.metadata.effectiveContextLimit === "number" && session.metadata.effectiveContextLimit > 0
             ? session.metadata.effectiveContextLimit : 0;
@@ -4226,7 +4302,10 @@ export async function preflightCompressIfNeeded(
             ? measuredOutbound(prepared) : undefined;
         const probeBlockedByEgress = probeMeasurement !== undefined
             && probeMeasurement.tokens > Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
-        if (localRefusalHere) {
+        if (probeDoomedFoldable) {
+            // (already logged above) fall through to preflightCompress — do NOT
+            // forward the doomed probe.
+        } else if (localRefusalHere) {
             // #3846: bili already refused this scope locally — the estimate-only
             // bet is spent. Fall through to fold/fail-fast instead of re-forwarding.
             log("warn", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for evidence; falling through to fold/fail-fast (#3846)`);

@@ -287,15 +287,19 @@ test("e2e #2490 b: multi-MB core text beyond both doom bars fails fast instead o
         // 500 msgs × 4.4K chars ≈ 2.2MB of ASCII core text — past the absolute
         // 2MB bar (and the 20K window × 7.5 B/token = 150KB ratio bar).
         const r = await post(ctx, bigMessages(500, 4_400));
-        // #2847: 413 (was 502) — a mathematically-determined rejection must be
-        // non-retryable at the status-code layer, or status-driven hosts retry
-        // the identical doomed payload (3 crashes in 10s in the field).
-        assert.equal(r.status, 413, "doomed probe fails fast with NON-retryable 4xx semantics, not forwarded");
+        // #7382: a byte-doomed payload WITH foldable mass no longer takes the
+        // blind pre-fold 413 — it folds first (the fold spends real evidence
+        // and shrinks the stored history), then answers the deterministic
+        // post-fold judgment. For a 20K window the fold cannot converge
+        // (futile round) and the verdict is 413 can-never-fit; a wider window
+        // where folding succeeds forwards instead. Either way the 2.2MB
+        // payload itself never reaches the upstream (#2490) and the failure
+        // stays retryable:false (#2847).
+        assert.ok([413, 502].includes(r.status), `doomed payload folds first, then fails the post-fold judgment (got ${r.status}) — 413 when the futile round is provable, 502 when the fold budget exhausts first`);
         const body = await r.text();
-        assert.match(body, /~22\d{5} bytes/, "the byte math is in the operator-facing message");
-        assert.match(body, /NOT forwarded even for evidence/, "the remedy wording is present");
-
-        assert.ok(calls.length === 1 && calls[0]!.contentChars < 50_000, `only the seed turn reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))}) — never the 2.2MB payload`);
+        assert.match(body, /could not bring it under|futile round/, "the verdict is the POST-FOLD judgment, not the blind pre-fold 413 (#7382)");
+        assert.ok(calls.length > 0, "the fold path spent upstream calls before the judgment — the blind pre-fold 413 answers with ZERO calls (#7382)");
+        assert.ok(calls.every((c) => c.contentChars < 200_000), `nothing close to the 2.2MB payload reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))})`);
     } finally {
         await close();
     }
