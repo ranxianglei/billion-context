@@ -3905,11 +3905,11 @@ interface MeasuredOutbound {
 // of the body carries the mass, so "trim the oversized content" tells the
 // operator WHERE (a 55.2 MiB #5000 body with 1.44 MiB of messages[] means the
 // mass is tools[], not a giant paste).
-export function measuredBreakdownClause(b: RawBodyBreakdown): string {
+function measuredBreakdownClause(b: RawBodyBreakdown): string {
     return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
 }
 
-export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {
+function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {
     let parsed: unknown = prepared.parsedBody;
     if (parsed === undefined) {
         const raw = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
