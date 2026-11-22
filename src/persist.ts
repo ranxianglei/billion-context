@@ -3413,8 +3413,9 @@ export class SessionStore {
             this.durabilityArms.delete(session.id);
             return;
         }
-        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
-            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "scheduled");
+        const frozen = this.envelopeFrozen(session.id);
+        if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
+            if (frozen) this.noteFrozenSkip(session.id, "scheduled");
             // Phase 3 (#2960): index-only persistence — the builder closure
             // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
             // guard; no envelope write is armed, so no debounce is needed.
@@ -3705,8 +3706,9 @@ export class SessionStore {
             this.durabilityArms.delete(session.id);
             throw new Error(`Originals were not saved for ${session.id}`);
         }
-        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
-            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "writeNow");
+        const frozen = this.envelopeFrozen(session.id);
+        if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
+            if (frozen) this.noteFrozenSkip(session.id, "writeNow");
             // #3133: drop the armed microtask (token mismatch below) — this
             // sync build subsumes it; later mutations re-arm on their own.
             this.writerOffPending.delete(session.id);
@@ -4013,8 +4015,9 @@ export class SessionStore {
         this.consumePendingLedgerAlign(session); // #5608-D: before any serialization
         if (!this.saveContentStore(session)) return false;
         this.tryRecoverSidecar(); // #5188: eviction-time flushes are also a recovery opportunity
-        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
-            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "flushSync");
+        const frozen = this.envelopeFrozen(session.id);
+        if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
+            if (frozen) this.noteFrozenSkip(session.id, "flushSync");
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
             const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
