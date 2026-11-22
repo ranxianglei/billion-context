@@ -3473,9 +3473,19 @@ export class SessionStore {
                     // removed together with the 3-strike breaker itself
                     // (2026-10-30 owner policy: index writes are never
                     // abandoned, jsonWriter=off accepts index-only persistence).
-                    this.noteDurable(session.id, proofRevision);
-                    this.lastSaveLanded.set(session.id, true);
-                    this.runIdleSpillIfIdle(session.id);
+                    if (this.egressProjectionFrozen(session)) {
+                        // #7474 P2 (ruling 7439): the build above did NOT land
+                        // in the unified store (op-log authority) — do not
+                        // stamp it as durable: the durableRevision gate is what
+                        // authorizes the droppable-field discharge to
+                        // reconstruct thinned fields FROM that store, and for
+                        // this session that store holds nothing to read back.
+                        this.lastSaveLanded.set(session.id, true);
+                    } else {
+                        this.noteDurable(session.id, proofRevision);
+                        this.lastSaveLanded.set(session.id, true);
+                        this.runIdleSpillIfIdle(session.id);
+                    }
                     settledOk = true;
                     // #3818 writerOff safety valve REMOVED (#4216/#4242):
                     // the orphan/reap shape is now representable — its
@@ -3716,12 +3726,24 @@ export class SessionStore {
             const rec = this.guardedBuild(session)();
             this.maybeCutForkBase(session);
             this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only build landed
-            this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
-            this.lastSaveLanded.set(session.id, true);
-            this.foldResidentTail(session);
-            this.dropResidentBlockContents(session);
-            this.dropResidentMetadata(session);
-            this.dropResidentContentStore(session);
+            if (!this.egressProjectionFrozen(session)) {
+                this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
+                this.lastSaveLanded.set(session.id, true);
+                this.foldResidentTail(session);
+                this.dropResidentBlockContents(session);
+                this.dropResidentMetadata(session);
+                this.dropResidentContentStore(session);
+            } else {
+                // #7474 P2 (ruling 7439): the build above deliberately did NOT
+                // land in the unified store (the op log is the transcript
+                // authority), so the droppable-field discharge — which
+                // reconstructs thinned fields FROM that store — must not run:
+                // a thinned resident metadata/block-content would 502 on the
+                // next turn's re-materialization (#4788 D2). The session keeps
+                // its full residency for its lifetime; the flow table already
+                // holds the same bytes on disk.
+                this.lastSaveLanded.set(session.id, true);
+            }
             return;
         }
         // #6793-review: full-build path (store.writeNow) never consults the
@@ -4034,12 +4056,21 @@ export class SessionStore {
             }
             this.maybeCutForkBase(session);
             if (rec) this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only flush landed
-            this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
-            this.lastSaveLanded.set(session.id, true);
-            this.foldResidentTail(session);
-            this.dropResidentBlockContents(session);
-            this.dropResidentMetadata(session);
-            this.dropResidentContentStore(session);
+            if (!this.egressProjectionFrozen(session)) {
+                this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
+                this.lastSaveLanded.set(session.id, true);
+                this.foldResidentTail(session);
+                this.dropResidentBlockContents(session);
+                this.dropResidentMetadata(session);
+                this.dropResidentContentStore(session);
+            } else {
+                // #7474 P2 (ruling 7439): build did not land in the unified
+                // store — do not stamp it durable and do not thin resident
+                // fields that can only be re-materialized from that store
+                // (#4788 D2). Full residency stays; the flow table holds the
+                // same bytes on disk.
+                this.lastSaveLanded.set(session.id, true);
+            }
             return true;
         }
         // Mirror the kernel flushSync contract: a sync commit supersedes any
