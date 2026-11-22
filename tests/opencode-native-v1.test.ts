@@ -214,25 +214,21 @@ describe("createV1ServerHooks", () => {
         assert.deepEqual(deps.forwarded, [{ conversationId: "ses_1", tool: "compress", args: { range: "m1-m2" }, nativeCaller: true }]);
     });
 
-    // #7505: opencode passes the whole Tool.Context to execute — ctx.id is the
-    // CallID the host minted for this call (the same id the host re-sends in
-    // its compress tool-call). Forwarding it lets the server record the
-    // block's compressCallId so the anchor strip adjudication hits: the
-    // summary is billed once, not twice. No id → no field added.
-    it("#7505 forwards the host's per-call id (ctx.id) as toolCallId; absent id adds no field", async () => {
+    it("#7505: forwards the host tool-call id (ctx.id) and omits it when absent", async () => {
         const deps = makeDeps();
         const hooks = createV1ServerHooks(() => origin, {}, deps);
         const cfg: V1Config = { provider: { o: { options: { baseURL: "https://api.openai.com/v1" } } } };
         await hooks.config?.(cfg);
         const compress = hooks.tool?.compress;
         assert.ok(compress);
-        // host mints a CallID → it rides the forward (forwardTool's 7th arg)
-        const out = await compress.execute({ range: "m1-m2" }, { sessionID: "ses_1", id: "call-7505-op-1" });
-        assert.equal(out, "panel:compress");
-        assert.deepEqual(deps.forwarded, [{ conversationId: "ses_1", tool: "compress", args: { range: "m1-m2" }, nativeCaller: true, toolCallId: "call-7505-op-1" }]);
-        // host without an id → forward has NO toolCallId field at all
-        await compress.execute({ range: "m3-m4" }, { sessionID: "ses_1" });
-        assert.deepEqual(deps.forwarded[1], { conversationId: "ses_1", tool: "compress", args: { range: "m3-m4" }, nativeCaller: true });
+        await compress.execute({ range: "m1-m2" }, { sessionID: "ses_1", id: "call_77aa88" });
+        await compress.execute({ range: "m1-m3" }, { sessionID: "ses_1" });
+        // direction 1: host-minted id arrives on the wire
+        assert.equal(deps.forwarded[0]?.toolCallId, "call_77aa88");
+        assert.equal(deps.forwarded[0]?.conversationId, "ses_1");
+        assert.equal(deps.forwarded[0]?.nativeCaller, true);
+        // direction 2: no id in the context → no toolCallId key (no empty-string noise)
+        assert.equal("toolCallId" in (deps.forwarded[1] ?? {}), false);
     });
 
     // #7505 (review supplement): the injected-deps test above covers the call

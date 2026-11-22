@@ -515,16 +515,15 @@ export function _resetNativeStateForTest(): void {
 
 export type ZodLike = typeof import("zod");
 
-// #7505: opencode passes the whole Tool.Context to tool.execute(args, ctx) —
-// ctx.id is the CallID the host minted for this call (the same id the host
-// re-sends in its compress tool-call). Forwarding it lets the server record
-// the block's compressCallId so the anchor strip adjudication hits and the
-// summary is billed once, not twice.
 interface V1ToolContext {
     sessionID: string;
     messageID?: string;
     agent?: string;
     abort?: AbortSignal;
+    // #7505: Tool.Context.id — the host's tool-call id (opencode schema/tool.ts
+    // CallID), the same id that rides the model wire and is resent verbatim.
+    // Forward it so the server can key the fold block on it and drop the
+    // redundant inline anchor (see dsh-native.ts ToolExec for the twin).
     id?: string;
 }
 
@@ -690,8 +689,7 @@ export interface V1NativeDeps {
     /** zod module (tests inject; runtime lazy-imports "zod"). */
     z?: ZodLike;
     /** Tool forwarder (tests inject; runtime POSTs /__bili/plugin/tool). #2204:
-     *  carries the business outcome so failures surface as host errors.
-     *  #7505: the host's per-call id rides the 6th param (forwardTool's 7th). */
+     *  carries the business outcome so failures surface as host errors. */
     forward?: (origin: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean, toolCallId?: string) => Promise<ForwardedToolResult>;
     /** Absorbed opencode-acp for legacy sessions (#920); when present its DCP
      *  tool slots serve BOTH lanes (legacy → acp executor, new → forward). */

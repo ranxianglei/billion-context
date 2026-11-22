@@ -217,6 +217,31 @@ test("codebuddy adapter: id+parentId rows only, system rows out, loose role map"
     });
 });
 
+test("workbuddy adapter (#7456): same layout under the workbuddy config root; cross-root collision degrades to null", () => {
+    const wbDir = fs.mkdtempSync(path.join(os.tmpdir(), "ih-wb-"));
+    const CONV = "1a2b3c4d-66bb-4ccc-9ddd-000033334444";
+    const rows = [
+        { id: "w1", parentId: "", role: "user" },
+        { id: "w2", parentId: "w1", role: "assistant" },
+        { id: "w3", parentId: "w2", role: "user" },
+    ];
+    writeFixture(wbDir, CONV, rows); // <config>/projects/<dir>/<conversation-id>.jsonl
+    resetIdentityHarvestForTest();
+    registerCodebuddyIdentitySource();
+    const base = { "x-conversation-id": CONV };
+    withEnv({ CODEBUDDY_CONFIG_DIR: undefined, WORKBUDDY_CONFIG_DIR: wbDir, [ENV]: "codebuddy", [ROLLOUT_ENV]: "1" }, () => {
+        const ok = harvestIdentity(ctx({ sessionId: CONV, expectedLen: 3, headers: base, messageRoles: ["user", "assistant", "user"] }));
+        assert.deepEqual(ok?.ids, ["w1", "w2", "w3"]);
+    });
+    // The same conversation id present under BOTH config roots → two files →
+    // the whole turn degrades (no ids) rather than mixing stores.
+    const cbDir = fs.mkdtempSync(path.join(os.tmpdir(), "ih-wb-cb-"));
+    writeFixture(cbDir, CONV, rows);
+    withEnv({ CODEBUDDY_CONFIG_DIR: cbDir, WORKBUDDY_CONFIG_DIR: wbDir, [ENV]: "codebuddy", [ROLLOUT_ENV]: "1" }, () => {
+        assert.equal(harvestIdentity(ctx({ sessionId: CONV, expectedLen: 3, headers: base })), null);
+    });
+});
+
 test("mcode adapter: sqlite harvest per-turn snapshot, count parity + role spot-check", () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ih-mcode-"));
     const dbFile = path.join(dataDir, "v2", "sqlite", "runtime-state.sqlite");

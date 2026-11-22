@@ -136,12 +136,11 @@ type CommandInvocation = {
     attachments?: unknown;
     signal?: AbortSignal | undefined;
 };
-// #7505: dsh hands the host's per-call exec object to tool.execute(args, exec)
-// whole — exec.callId is the wire id the model minted for this call (the same
-// id the host re-sends in its compress tool-call). Forwarding it lets the
-// server record the block's compressCallId, so the anchor strip adjudication
-// (visibleCompressCallIds) hits and the summary is billed once, not twice.
-type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal; callId?: string | undefined };
+// #7505: exec carries the host's tool-call id — the SAME wire id the model minted
+// (deepseek-harness translate.ts brands native.id into ToolCallId and resends it
+// verbatim; pipeline.ts hands the whole exec to tool.execute). Forward it so the
+// server can key the fold block on it and drop the redundant inline anchor.
+type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal; callId?: string };
 
 type ToolDefinition = {
     name: string;

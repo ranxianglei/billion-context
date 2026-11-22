@@ -772,45 +772,37 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
     }
 });
 
-// #7505: dsh passes the host's per-call id (exec.callId) — the same id the
-// model minted on the wire — so the server records the block's
-// compressCallId and the anchor strip hits: the summary is billed once, not
-// twice. No id → no field added (no new surface on the wire).
-test("#7505 apply() forwards the host's per-call id as toolCallId; absent id adds no field", async () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-7505-"));
-    try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
-            const calls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }> = [];
-            const cap = await startMockProxy(calls);
-            try {
-                process.env.BILLION_CONTEXT_PROXY = cap.origin;
-                _resetRegisterForTest(cap.origin);
-                const ctx = mockCtx();
-                apply(ctx);
-                await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
-                const t = ctx.registeredTools[0];
-                // host mints a call id → it rides the forward body
-                const out = await t.execute({ summary: "s" }, { agent: { session: { id: "session-7" } }, callId: "call-7505-1" });
-                assert.equal(out, "compressed 42 tokens");
-                assert.deepEqual(calls, [{ conversationId: "session-7", tool: "compress", args: { summary: "s" }, nativeCaller: true, toolCallId: "call-7505-1" }]);
-                // host without an id → body has NO toolCallId field at all
-                await t.execute({ summary: "s" }, { agent: { session: { id: "session-7" } } });
-                assert.deepEqual(calls[1], { conversationId: "session-7", tool: "compress", args: { summary: "s" }, nativeCaller: true });
-            } finally {
-                cap.close();
-                _resetRegisterForTest(undefined);
-            }
-        });
-    } finally {
-        rmrf(home);
-    }
-});
-
 // #3616: a superseded world's verify flight must not land its writes on top of
 // the new one — pre-fix, a late healthy-attach probe reverted register.base to
 // the stale origin and tool calls followed it there (windows-22 CI: the call
 // was answered by the previous test's still-alive mock). The held manifest
 // keeps world 1's probe IN FLIGHT across the reset deterministically.
+test("#7505: dsh forwards exec.callId as the toolCallId when the host supplies it (and omits it when not)", async () => {
+    const calls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }> = [];
+    const cap = await startMockProxy(calls);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-callid-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: cap.origin }, async () => {
+            _resetRegisterForTest(cap.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (callid)");
+            const tool = ctx.registeredTools[0];
+            await tool.execute({ summary: "s" }, { agent: { session: { id: "session-cid" } }, callId: "call_9f8e7d" });
+            await tool.execute({ summary: "s" }, { agent: { session: { id: "session-cid" } } });
+        });
+        // direction 1: host-minted id arrives on the wire
+        assert.equal(calls[0]?.toolCallId, "call_9f8e7d");
+        assert.equal(calls[0]?.conversationId, "session-cid");
+        // direction 2: no id in exec → no toolCallId key in the body (no empty-string noise)
+        assert.equal("toolCallId" in (calls[1] ?? {}), false);
+    } finally {
+        cap.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
 test("#3616 apply() attach mode: a superseded verify landing must not revert the registered origin", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-gen-"));
     try {
