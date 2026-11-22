@@ -35,7 +35,7 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
+import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, qoderSideTaskConversation, zcodeMemoryConversation } from "../session-id.js";
 import { preferKiroConversationIdentity } from "../kiro.js";
 import { personaConversationOrder, type SessionOrderResolution } from "../session-resolve.js";
 
@@ -1511,7 +1511,20 @@ async function handleRequest(
         const zcodeMemory = zcodeParentIdentity?.clientProvided
             ? zcodeMemoryConversation(zcodeParentIdentity.value, req.headers)
             : undefined;
-        const conversation = zcodeMemory !== undefined ? zcodeMemory : protocol === "google"
+        // #7439 worklist — Qoder side tasks (agent/webfetch/hook summary) reuse
+        // the parent x-session-id and are tagged only in body
+        // metadata.business_type; give each its own |aux: lane (zcode-memory
+        // pattern) so they don't merge into the parent conversation. Responses
+        // wire only; plain Task subagents carry no wire marker.
+        const qoderSideTask = protocol === "responses"
+            ? qoderSideTaskConversation(
+                (responsesIdentity?.value
+                    ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)) ?? "",
+                parsed,
+            )
+            : undefined;
+        const auxSidecar = zcodeMemory ?? qoderSideTask;
+        const conversation = auxSidecar !== undefined ? auxSidecar : protocol === "google"
             // #2730: the google lane is persona-aware too — dsh stamps its one
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
             // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google

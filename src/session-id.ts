@@ -120,6 +120,25 @@ export function zcodeMemoryConversation(parent: string, headers: Record<string, 
     return `${parent}|aux:zcode-memory:${query}`;
 }
 
+/** #7439 worklist — Qoder side tasks (agent summary / webfetch summary / hook
+ *  prompt) reuse the parent `x-session-id` and carry their task type only in the
+ *  Responses body `metadata.business_type`. Give each side task its own `|aux:`
+ *  lane so it does not merge into the parent conversation (same pattern as
+ *  zcodeMemoryConversation above). Plain Task subagents carry no wire marker (a
+ *  fresh `x-request-set-id` only) and are unfixable here. The business_type
+ *  values are Qoder-specific, so applying this to any Responses-wire request is
+ *  safe. */
+const QODER_SIDE_TASK_TYPES = new Set(["agent_summary", "webfetch_summary", "hook_prompt"]);
+export function qoderSideTaskConversation(parent: string, body: unknown): string | undefined {
+    const metadata = (body as { metadata?: unknown } | undefined)?.metadata;
+    if (typeof metadata !== "object" || metadata === null) return undefined;
+    const bt = (metadata as Record<string, unknown>).business_type;
+    if (typeof bt === "string" && QODER_SIDE_TASK_TYPES.has(bt)) {
+        return `${parent}|aux:qoder-${bt}`;
+    }
+    return undefined;
+}
+
 /** #1106/#1102: whether the Responses-wire instructions fingerprint should
  *  participate in the compression-session key at all. Inverted allowlist: the
  *  fingerprint is OFF by default and applies ONLY to signals with a verified
@@ -549,6 +568,21 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
  */
 const MAIN_SYSTEM_PREFIXES = ["You are Claude Code", "You are an interactive agent"] as const;
 
+/** #7439: claude-code ≥2.1.247 sends a per-task class header
+ *  `x-claude-code-request-class` (main / subagent / workflow / compaction /
+ *  auxiliary / side_reply) — but ONLY when not on a 3rd-party base URL unless
+ *  `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is set (bili's launcher sets it, see
+ *  the `extras` on the claude preset in src/launcher.ts). Validated against the
+ *  observed set; undefined when absent or unknown so callers keep the legacy
+ *  agent-id/system-prefix path byte-for-byte. */
+const CLAUDE_REQUEST_CLASSES = ["main", "subagent", "workflow", "compaction", "auxiliary", "side_reply"] as const;
+
+export function claudeRequestClassOf(headers: Record<string, string | string[] | undefined>): string | undefined {
+    const raw = headers["x-claude-code-request-class"];
+    const v = typeof raw === "string" ? raw.trim() : "";
+    return v !== "" && (CLAUDE_REQUEST_CLASSES as readonly string[]).includes(v) ? v : undefined;
+}
+
 export function claudeSubagentAgentId(
     headers: Record<string, string | string[] | undefined>,
     systemBlocks: string[],
@@ -561,6 +595,15 @@ export function claudeSubagentAgentId(
     const agentId = typeof agent === "string" && agent.trim().length > 0 ? agent.trim() : undefined;
     const parentId = typeof parent === "string" && parent.trim().length > 0 ? parent.trim() : undefined;
     if (agentId === undefined && parentId === undefined) return undefined;
+    // #7439: an explicit client-side task label (x-claude-code-request-class,
+    // gated on CLAUDE_CODE_GATEWAY_HINT_HEADERS) overrides the system-prefix
+    // heuristic. Strictly additive: "subagent" forces the split even when the
+    // system text looks main-like; "main" suppresses it; an absent label keeps
+    // the legacy path below byte-for-byte. The unique id is still
+    // agentId ?? parentId (no lane-token threading).
+    const reqClass = claudeRequestClassOf(headers);
+    if (reqClass === "subagent") return agentId ?? parentId;
+    if (reqClass === "main") return undefined;
     const isMain = systemBlocks.some((block) => {
         const t = block.trimStart();
         return MAIN_SYSTEM_PREFIXES.some((p) => t.startsWith(p));
