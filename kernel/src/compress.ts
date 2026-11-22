@@ -2533,7 +2533,8 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     // inject because growth/floor/cadence isn't met — the old fixed
     // "< threshold" string lied in that case.
     // The floor below which NO tier can fire by mass; with all tiers unset
-    // this is exactly nudgeGrowthTokens (the T1 threshold is the minimum).
+    // this is min(nudgeGrowthTokens, the T2 band gate) — since #7464 the
+    // band-relative T2 floor (0.75 × step) can sit below the T1 bar.
     const minTierThreshold = Math.min(
       tierThresholds[1],
       tierThresholds[2],
