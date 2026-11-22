@@ -338,3 +338,46 @@ Construction = the user scenario's plugin shape: client history grows from 1 mes
 - A valid delta-arm rerun in the growing scenario (with `pluginDeltaResend:true`).
 - The compact B row ≈8MB @ 100k rows vs the "few-KB per turn" red line: a design-declared exception (#7398 §5); to hold the red line strictly, the B row could become a "range reference + anti-forgery fingerprint" (the #7064 l1_world demotion idea), at the cost of losing the state table's self-contained replay closure — needs an owner ruling.
 - After an archive restore the egress op-log restarts empty (the next turn re-appends the full +I view — correct, but one full batch).
+
+## 6. Round 2 — ruling 7439-2 (KDD #22): the op log as sole canonical, lazy projection, window re-anchor (2026-11-22)
+
+> Round-2 work landed on the same branch after the §1–§5 snapshot. Where this section and earlier sections conflict, THIS section wins.
+
+### 6.1 R-A: canonical message numbering (op_seq / log_seq)
+
+- Both egress tables carry TWO keys: `op_seq` (PK, per-table append-only row cursor — the recovery/truncation key) and `log_seq` (canonical message number, **I rows only**; D/U/B rows are NULL). `log_seq` is session-scoped and **never re-issued** (kernel id contract); every I row's `log_seq` = the canonical index of that turn's new row in the live view, stamped at record time — numbering no longer derives from position or from the messages table.
+- `recoverEgressBase` is bounded (the state table is physically compacted); a row-less session bootstraps via a fresh B op; a pinned session with rows but **no healthy point hard-fails the turn** (ruling 7439-5: 500 + `x-bili-egress: unreadable` + `{type:'egress_flow_unreadable'}` via `EgressAuthorityRejectError` — the lane catch no longer swallows it; the session never truncates its own corrupt rows and never re-bootstraps from client bytes).
+- R-B: fork = `egressFork` whole-table op-log copy (self-fork throws; empty parent no-ops).
+
+### 6.2 B: in-txn window re-anchor delta (#7474 — the 2s-floor root cause)
+
+Root cause of the pre-fix growing-session latency (ep3 ON 5697 ms/turn @ 100k): the pf-watermark lane persists ONLY the ~56-element tail window every HIT turn (`lastMessagesFolded`), while `planIngestDelta` was built for strict-append turns — its equal-len/shrink/boundary-id gates structurally rejected a sliding window, so nearly EVERY turn fell to the full path: `remapPlanToAbsolute` = SELECT **all** ~100k session rows + identity→seq map rebuild + per-row byte repair. Writes were never the cost; the READ was O(total ledger).
+
+Fix: `planIngestReanchor` + the `ingestSession` re-anchor txn branch. Per window row, ONE indexed `(session_id, msg_id, identity)` probe: existing rows **keep their seq** (identity-stability invariant; byte-hash + retired_at checks), new rows land at `MAX(seq)+1`, #6947 ref backfill; `anchored === 0` or a stored-`tail_json` mismatch → the branch declines and the full path runs UNCHANGED. O(window) point lookups ≈ ms; the full path remains the universal fallback.
+
+### 6.3 P2b/P2b-ext: the egress-on session's messages projection goes LAZY (KDD #22)
+
+For sessions with `metadata.egressAuthority === true` (and `egressPlane` on):
+
+- **No per-turn unified ingest**: `ingestRowsNow` and the debounced unified legs early-return — the `messages` table is demoted to a **lazy projection** for these sessions (rebuilt one-time O(n) on plane rollback / web read / replica restore). Boot after restart still comes from the op log (`recoverEgressBase`), not from the projection.
+- **Pin channel reads the op log**: the KDD #20/#21 pin ledger (tail-overlap / live-id re-stamp) for egress-on sessions resolves from `egress_flow` I rows (msgid + log_seq) instead of the messages ledger (`snapPinLiveIds` shim). Wire unchanged.
+- **Envelope frozen at bootstrap** (`d28d9ff3a`): no per-turn read+rewrite of the 15.5MB growing session JSON (kernel refs are never pruned — messageRefs 10MB + tsStamps 5.5MB at 100k); the frozen route must keep the resident fields unthinned (`9183ea817`, #4788 D2) or the pinned turn 502s.
+- **Verification**: the egress probe (flow vs client sample) is the SOLE drift verifier for egress-on sessions — `BatchedViewVerification` is off for them (`13b9baae2`): the client-vs-canonical leg would only measure the known server-wins divergence (ruling 7439-5) and re-latch drift forever.
+- Flow-corruption semantics: HARD FAIL, no projection fallback for outbound — flow and messages die together anyway (flow independence, ruling 7439-2 §2).
+
+### 6.4 Post-fix measured (100k cumulative, folded shape view ~1800–2100, 8-turn steady, same box/dist per pair)
+
+| run | arm | build | steady p50 / max | total |
+|---|---|---|---|---|
+| ep3 | ON pre-fix | a33d02184 | 5697 / 6298 ms | 3273 s |
+| ep5f | OFF pre-fix | a33d02184 | 2301 / 2946 ms | 1124 s |
+| ep8d | OFF post-B | fb88bc2af | 1954 / 2735 ms | 1067 s |
+| ep10 | ON post-fix | fb88bc2af | 1327 / 1374 ms | 676 s |
+| ep18 / ep20 | ON merged | dbf4b140b | 730 / 761 · **638 / 655 ms** | 462 / 456 s |
+| ep22 | OFF merged | dbf4b140b | 2016 / 2957 ms | 1070 s |
+
+**Acceptance `<1s` @ 10w cumulative met by the ON arm (638 ms p50, 9× faster than pre-fix); ON is now faster than the same-build OFF arm.** ep20 DB: no JSON envelope, messages table 0 rows for the egress-on session, egress_flow 1 row/turn, state 25 rows bounded, WAL capped at 8 MiB (journal_size_limit). The OFF-arm floor (~2s) is the pre-PR #5744 family (per-turn full read+rewrite of the growing JSON envelope + 244MB DB fsync) — out of scope per the single-switch ruling. The ep14c-era 2.2GB WAL anomaly was a pre-WAL-cap build; post-cap builds hold 8 MiB.
+
+### 6.5 Resident perf gate (ruling: e2e bench ×3, ≤+20% over baseline)
+
+`tests/egress-bench.test.ts` (gate `ACP_TEST_EG_BENCH=1`; dedicated CI lane `.github/workflows/ci-e2e-egbench.yml` on master): hermetic in-process proxy (port 0, temp XDG), 30k-row growing pinned session with host-side folds + the pf watermark channel, median-of-3 steady p50/max within +20% of `tests/e2e/bench/egress-bench.baseline.json` (calibration 201/300 ms; missing baseline prints CALIBRATION and passes). Pins per-turn cost to O(live-window): a regression back to a full-table path goes red. The 100k growing-run matrix above stays as the deep-dive reference; the bench is the resident guard.

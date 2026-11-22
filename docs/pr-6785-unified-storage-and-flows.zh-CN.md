@@ -2,6 +2,8 @@
 
 > 范围:`2026-11-15_msgid-snapshot-unified` @ `39941c816`(base `origin/master` `b10c1a0d4`)。
 > 134 文件 +13740/−367。本文是本 PR 的**审查级**完整梳理:四部分(表结构 / 实现逻辑 / 数据流转 / 开关)+ 实测验证 + 本轮发现与修复。行号均指 head 处源码。
+> **第 2 轮(owner 裁定 7439-2,KDD #22,2026-11-22)已落在同一分支、晚于本快照**——op log 正史编号、窗口 re-anchor delta、messages 惰性投影与常驻性能门。见 **§6**(与本文件 §1.2 egress DDL 草图、§5.4 遗留项冲突处以 §6 为准)。
+
 
 ---
 
@@ -338,3 +340,46 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 - delta 臂在增长场景的有效重跑(带 `pluginDeltaResend:true`)。
 - 压实 B 行 ≈8MB @10w 行 vs "每轮新增存储几 K" 红线:设计自认的例外(7398 §5);若要彻底守住红线,可把 B 行改成"区间引用+防伪指纹"(#7064 对 l1_world 的降级思路),代价是失去"状态表独立可重放"的封闭性——需 owner 裁定。
 - 归档恢复后 egress op-log 从空重启(下一轮全量 +I 重建,正确但有一次全批)。
+
+## 6. 第 2 轮——裁定 7439-2(KDD #22):op log 唯一正史、惰性投影、窗口 re-anchor(2026-11-22)
+
+> 第 2 轮工作落在同一分支、晚于 §1–§5 快照。本节与前面章节冲突时,以本节为准。
+
+### 6.1 R-A:正史消息编号(op_seq / log_seq)
+
+- 两张 egress 表各带两个键:`op_seq`(PK,每表 append-only 行游标——恢复/截断键)与 `log_seq`(正史消息编号,**仅 I 行**;D/U/B 行为 NULL)。`log_seq` 会话内作用域、**永不重发**(kernel id 契约);每条 I 行的 `log_seq` = 该轮新增行在存活视图里的正史下标,记账时戳定——编号不再依赖位置、也不再依赖 messages 表。
+- `recoverEgressBase` 有界(state 表被 compaction 物理裁剪);无行会话经新 B op 引导;有行但**无健康点**的 pinned 会话整轮**硬失败**(裁定 7439-5:500 + `x-bili-egress: unreadable` + `{type:'egress_flow_unreadable'}`,经 `EgressAuthorityRejectError`——车道 catch 不再吞掉;会话永不截断自己的坏行、永不从客户端字节重引导)。
+- R-B:fork = `egressFork` 整表 op log 拷贝(self-fork 抛错;空父 no-op)。
+
+### 6.2 B:事务内窗口 re-anchor delta(#7474——2s 地板的根因)
+
+修复前增长会话延迟(10w 时 ON 臂 ep3 5697ms/轮)的根因:pf 水位车道每个 HIT 轮只持久化 ~56 元素尾窗(`lastMessagesFolded`),而 `planIngestDelta` 为严格追加轮设计——其等长/缩短/边界 id 门结构性拒绝滑动窗口 ⇒ 几乎**每轮**落入全量路径:`remapPlanToAbsolute` = SELECT **全部** ~10w 会话行 + identity→seq 映射重建 + 逐行字节修复。写从来不是成本;读是 O(总账本)。
+
+修复:`planIngestReanchor` + `ingestSession` re-anchor 事务分支。每窗口行一次索引点查 `(session_id, msg_id, identity)`:已存在行**保持原 seq**(身份稳定性不变量;字节 hash + retired_at 校验),新行落在 `MAX(seq)+1`,#6947 ref 回填;`anchored === 0` 或存储 `tail_json` 不符 ⇒ 分支让位,全量路径原样执行。O(窗口) 点查 ≈ 毫秒;全量路径仍是通用兜底。
+
+### 6.3 P2b/P2b-ext:egress-on 会话的 messages 投影惰性化(KDD #22)
+
+对 `metadata.egressAuthority === true`(且 `egressPlane` 开)的会话:
+
+- **不再逐轮统一 ingest**:`ingestRowsNow` 与防抖统一腿早退——这些会话的 `messages` 表降级为**惰性投影**(平面回滚 / web 读 / 副本恢复时一次性 O(n) 重建)。重启后的引导仍走 op log(`recoverEgressBase`),不走投影。
+- **pin 通道读 op log**:KDD #20/#21 pin 账本(尾重叠 / 活 id 重盖)在 egress-on 会话上改从 `egress_flow` I 行(msgid + log_seq)解析,不经 messages 账本(`snapPinLiveIds` shim)。wire 不变。
+- **信封在 bootstrap 冻结**(`d28d9ff3a`):不再逐轮读+写 15.5MB 的会话 JSON(kernel refs 永不裁剪——10w 时 messageRefs 10MB + tsStamps 5.5MB);冻结路由必须保持常驻字段不被裁剪(`9183ea817`,#4788 D2),否则 pinned 轮 502。
+- **校验**:egress 探针(flow vs 客户端抽样)是 egress-on 会话唯一的漂移校验器——`BatchedViewVerification` 对它们关闭(`13b9baae2`):客户端 vs 正史那条腿只会量到已知的服务端赢分歧(裁定 7439-5),并把 drift 永远锁死。
+- flow 损坏语义:硬失败,出站无投影兜底——flow 与 messages 同生共死(flow 独立性,裁定 7439-2 §2)。
+
+### 6.4 修复后实测(10w 累计,折叠形态视图 ~1800–2100,稳态 8 轮,同机同 dist 成对)
+
+| 跑 | 臂 | build | 稳态 p50 / max | 总时长 |
+|---|---|---|---|---|
+| ep3 | ON 修复前 | a33d02184 | 5697 / 6298 ms | 3273 s |
+| ep5f | OFF 修复前 | a33d02184 | 2301 / 2946 ms | 1124 s |
+| ep8d | OFF 修复后(B) | fb88bc2af | 1954 / 2735 ms | 1067 s |
+| ep10 | ON 修复后 | fb88bc2af | 1327 / 1374 ms | 676 s |
+| ep18 / ep20 | ON 合并后 | dbf4b140b | 730 / 761 · **638 / 655 ms** | 462 / 456 s |
+| ep22 | OFF 合并后 | dbf4b140b | 2016 / 2957 ms | 1070 s |
+
+**验收线「10w 累计 <1s」由 ON 臂达成(638ms p50,比修复前快 9×);ON 臂现在比同 build 的 OFF 臂更快。** ep20 DB:无 JSON 信封,egress-on 会话 messages 表 0 行,egress_flow 每轮 1 行,state 25 行有界,WAL 上限 8MiB(journal_size_limit)。OFF 臂地板(~2s)属修复前 #5744 家族(逐轮全量读+写膨胀的 JSON 信封 + 244MB DB fsync)——按单开关裁定不在本 PR 范围。ep14c 时代 2.2GB WAL 异常是 WAL 上限前的 build;上限后的 build 稳在 8MiB。
+
+### 6.5 常驻性能门(裁定:e2e bench ×3,不超基线 +20%)
+
+`tests/egress-bench.test.ts`(gate `ACP_TEST_EG_BENCH=1`;专属 CI 车道 `.github/workflows/ci-e2e-egbench.yml`,master 触发):hermetic 进程内代理(port 0、临时 XDG),3w 行增长的 pinned 会话(宿主侧折叠 + pf 水位通道),3 次中位稳态 p50/max 不超 `tests/e2e/bench/egress-bench.baseline.json`(校准值 201/300 ms;基线缺失时打印 CALIBRATION 并放行)。把单轮成本钉在 O(存活窗口):任何退回全表路径的回归会红。上面的 10w 增长矩阵留作深查参照;bench 是常驻守卫。

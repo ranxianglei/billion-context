@@ -26,9 +26,11 @@
 
 **一致性。** 检查点帧签名 + S4 逐行校验和；判决只信链、不信内容相似。可选静态加密：AES-256-GCM（#708）+ zstd（#1080）。`src/storage/mysql.ts` 的 mysql 方言只是**测试镜像**（mysql-contract CI 车道）——生产存储永远是 SQLite。
 
+**egress 平面（KDD #22，#7398/#7439——出站会话 op log）。** `egress_state`/`egress_flow`（仅 SQLite 车道，gate `rollout.features.egressPlane`）存每个会话出站视图的稀疏 I/D/U op log；行自包含（字节随行走，不经内容 CAS）。两表均以 `(session_id, op_seq)` 为主键（append-only 行游标，恢复/截断键），I 行另带 `log_seq`——正史消息编号，永不重发。对 egress-on 会话，op log 是**唯一**正史消息权威：出站字节从它 serve，pin 通道解析它的 I 行而非 messages 账本，逐轮统一 ingest 停止（messages 降级为**惰性投影**，回滚/web 读/恢复时一次性重建），会话 JSON 信封在 bootstrap 冻结。恢复 = `recoverEgressBase`（有界 state 重放）；无健康点 ⇒ 整轮硬失败（裁定 7439-5），绝不降级到客户端字节。完整梳理：[PR #6785 文档 §6](../pr-6785-unified-storage-and-flows.zh-CN.md)。
+
 ## 硬不变量（动手前先读 AGENTS.md）
 
-- 消息 id 永不复用（内核契约）；`messages.msgId` 是规范 id。
+- 消息 id 永不复用（内核契约）；`messages.msgId` 是规范 id——KDD #22 例外：egress-on 会话的正史消息权威是 op log 的 I 行（`egress_flow.msgid` + `log_seq`），messages 行是惰性投影。
 - 行序 = 身份载体；折叠 = inactive 标记，不是物理删除。
 - 升级纯加性；破坏性变化前先回滚演练。
 
