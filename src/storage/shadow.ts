@@ -31,7 +31,7 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, planIngestDelta, planIngestDeltaWindow, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import { planIngest, planIngestDelta, planIngestReanchor, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { CcrLedgerRow } from "./slim.ts";
 import { splitMediaContent } from "./identity.js";
 import type { BlockView } from "../session.js";
@@ -861,38 +861,32 @@ export class UnifiedShadow {
                 if (headMsgId === null) return false;
                 head = { msgId: headMsgId };
             }
-            let plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail, head);
-            if (!plan) {
-                // #7439 window re-anchor delta: the pf watermark fast-path HIT
-                // turn persists only the tail window (~56 rows), so
-                // tail.length < trustedLen (shrink) is the structural shape.
-                // Per-row point-lookup the absolute seq of each window row via
-                // idx_messages_identity; all hit → window plan, any miss →
-                // full ingest as before. No invariant loosened.
-                const tail = legacy.lastMessages;
-                const trustedLen = mark.tailSeqs.length;
-                if (tail && trustedLen > 0 && tail.length < trustedLen) {
-                    const windowSeqs: number[] = [];
-                    let allHit = true;
-                    for (let i = 0; i < tail.length; i++) {
-                        const seq = this.sync.lookupSeqByMsgId(legacy.id, tail[i].id);
-                        if (seq === null) { allHit = false; break; }
-                        windowSeqs.push(seq);
-                    }
-                    if (allHit) {
-                        plan = planIngestDeltaWindow(legacy, tail.length, windowSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail, head);
-                    }
+            const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail, head);
+            if (plan) {
+                const applied = this.sync.ingestSession(plan, {
+                    trustedSeq: mark.seq,
+                    boundaryMsgId: boundary.msgId,
+                    boundaryHash: boundary.contentHash,
+                    trustedTailSeqs: mark.tailSeqs,
+                });
+                if (applied) this.stats.deltaIngests++;
+                return applied;
+            }
+            // #7474 window re-anchor: envelope (folded-render) shapes that
+            // violate strict-append — the pf-window lane's sliding tail
+            // window — resolve per-row by indexed identity instead of the
+            // O(all rows) full remap. Raw lineage never enters (its delta
+            // gates stay authoritative there); any in-txn doubt returns the
+            // caller to the exact full path.
+            if (!hasRawTail) {
+                const rp = planIngestReanchor(legacy);
+                if (rp) {
+                    const applied = this.sync.ingestSession(rp, undefined, undefined, { trustedTailSeqs: mark.tailSeqs });
+                    if (applied) this.stats.deltaIngests++;
+                    return applied;
                 }
             }
-            if (!plan) return false;
-            const applied = this.sync.ingestSession(plan, {
-                trustedSeq: mark.seq,
-                boundaryMsgId: boundary.msgId,
-                boundaryHash: boundary.contentHash,
-                trustedTailSeqs: mark.tailSeqs,
-            });
-            if (applied) this.stats.deltaIngests++;
-            return applied;
+            return false;
         } catch {
             return false;
         }
@@ -1218,6 +1212,13 @@ export class UnifiedShadow {
         return this.sync.snapMsgIdLiveIds(sessionId);
     }
 
+    /** #7474 P2 (ruling 7439): pin ledger entry — egress op log when the
+     *  session has one, messages rows otherwise (see UnifiedStore.snapPinLiveIds). */
+    snapPinLiveIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.snapPinLiveIds(sessionId);
+    }
+
     /** #7398 seg 3: the sqlite UnifiedStore behind this shadow — the egress
      *  op-log recorder's narrow seam. Null on network backends (mysql): the
      *  shadow tables are sqlite-lane only, and the recorder skips the turn
@@ -1480,6 +1481,15 @@ export class UnifiedShadow {
                                 if (plan) {
                                     applied = await backend.ingestSession(plan, { trustedSeq: mark.seq, boundaryMsgId: boundary.msgId, boundaryHash: boundary.contentHash, trustedTailSeqs: mark.tailSeqs });
                                     if (applied) this.stats.deltaIngests++;
+                                } else if (!hasRawTail) {
+                                    // #7474 window re-anchor (async twin): sliding
+                                    // tail windows resolve per-row by indexed
+                                    // identity instead of the O(all rows) remap.
+                                    const rp = planIngestReanchor(legacy);
+                                    if (rp) {
+                                        applied = this.sync?.ingestSession(rp, undefined, undefined, { trustedTailSeqs: mark.tailSeqs }) ?? false;
+                                        if (applied) this.stats.deltaIngests++;
+                                    }
                                 }
                             }
                         }

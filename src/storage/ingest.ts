@@ -74,6 +74,13 @@ interface IngestPlan extends IngestSessionInput {
     /** Resolved log seqs for pluginSnapshot entries (null when absent). */
     pluginSnapshotSeqs: number[] | null;
     tailSeqs: number[] | null;
+    /** Window re-anchor (#7474): every plan row is RESOLVED by indexed
+     *  identity point lookup inside the ingest transaction (existing row
+     *  keeps its seq, new rows continue after max(seq)) instead of the
+     *  full path's O(all rows) identity-map scan. A plan with zero
+     *  resolvable rows (nothing anchored yet) refuses in-txn and falls to
+     *  the full ingest. */
+    reanchor?: boolean;
 }
 
 /** #3133 test instrumentation: per-message JSON serializations performed by
@@ -399,51 +406,37 @@ export function planIngestDelta(
     return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
 }
 
-/** #7439 window re-anchor delta: handles the sliding-window shape where
- *  tail.length < trustedLen (the pf watermark fast-path HIT turn persists
- *  only the tail window, not the full history). Instead of the strict-append
- *  assumption, per-row point-lookup the absolute seq of each window row via
- *  idx_messages_identity. All rows must hit → tailSeqs = resolved seq list
- *  (envelope order), new rows append at max(seq)+1, sweep stays off. Any
- *  row missing → null (caller falls back to full ingest).
- *
- *  @param windowSeqs the resolved absolute seqs for each row in
- *  `session.lastMessages[0..windowLen)`, in envelope order. Must be the same
- *  length as `windowLen`. null if any lookup failed.
- */
-export function planIngestDeltaWindow(
-    session: LegacySessionLike,
-    windowLen: number,
-    windowSeqs: number[],
-    boundary: { msgId: string; contentHash: string },
-    hasRawTail: boolean,
-    head?: { msgId: string } | null,
-): IngestPlan | null {
+/** #7474 window re-anchor planner: the pf-window lane persists only the
+ *  tail window (~56 rows), so planIngestDelta's strict-append assumption
+ *  (the tail EXTENDS the trusted prefix) is structurally false — equal /
+ *  sliding / shrinking windows refuse at the gate, and the full ingest
+ *  pays O(all session rows) per HIT turn to re-derive what one indexed
+ *  point lookup per window row can answer (idx_messages_identity):
+ *  existing rows keep their seq, new rows continue after max(seq). Every
+ *  window row is identity-probed inside the transaction — no positional
+ *  assumption rides below the window (the same trust model the full path
+ *  gives window plans; the sampled digest stays the backstop). Any doubt
+ *  (all rows new, a tombstone, changed bytes at a stable identity) refuses
+ *  to the exact full path. */
+export function planIngestReanchor(session: LegacySessionLike): IngestPlan | null {
     if (session.pluginSnapshot && session.pluginSnapshot.length > 0) return null;
+    // #3301: import payloads need the full path (sweep + lowest-seq rows).
     if (session.decompositionLog && session.decompositionLog.length > 0) return null;
     const tail = session.lastMessages;
-    if (!tail || windowLen <= 0 || windowLen > tail.length || windowSeqs.length !== windowLen) return null;
-    // Boundary probe: the LAST window row must match the boundary.
-    const probe = serializeForStore(tail[windowLen - 1]);
-    ingestSerializations.count++;
-    if (tail[windowLen - 1].id !== boundary.msgId || splitMediaContent(probe).hash !== boundary.contentHash) return null;
-    // Head probe: the FIRST window row must match the head.
-    if (head !== undefined && head !== null && windowLen > 1 && tail[0].id !== head.msgId) return null;
+    if (!tail || tail.length === 0) return null;
     const byRawRef = session.state.messageRefs.byRaw;
     const log: LogEntry[] = [];
-    const appended: number[] = [];
-    const maxWindowSeq = Math.max(...windowSeqs);
-    // New rows (beyond the window) append at max(windowSeqs) + 1.
-    for (let i = windowLen; i < tail.length; i++) {
+    for (let i = 0; i < tail.length; i++) {
         const m = tail[i];
         const raw = serializeForStore(m);
         ingestSerializations.count++;
         const parsed = JSON.parse(raw) as { role: string; contentType?: string };
         const split = splitMediaContent(raw);
-        const seq = maxWindowSeq + 1 + log.length;
-        appended.push(seq);
+        // Placeholder seqs in WINDOW ORDER (1..n); the transaction resolves
+        // each to its absolute seq (existing row's seq or max(seq)+k) and
+        // remaps tailSeqs + block bounds through the same map.
         log.push({
-            seq,
+            seq: i + 1,
             msgId: m.id,
             content: split.content,
             hash: split.hash,
@@ -456,9 +449,9 @@ export function planIngestDeltaWindow(
         });
     }
     const pluginSnapshotSeqs = session.pluginSnapshot ? [] : null;
-    // tailSeqs = resolved window seqs (envelope order) + new row seqs.
-    const tailSeqs = [...windowSeqs, ...appended];
-    return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
+    const plan = finishPlan(session, byRawRef, log, pluginSnapshotSeqs, log.map((e) => e.seq));
+    plan.reanchor = true;
+    return plan;
 }
 
 /** Shared plan tail (everything except the messages log): given the same
