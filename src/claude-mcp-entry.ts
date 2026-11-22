@@ -106,7 +106,9 @@ export function _setClaudeHostPidForTest(pid: number | undefined): void {
 async function probeProxyHealth(origin: string): Promise<boolean> {
     try {
         const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(2000) });
-        return res.ok;
+        if (!res.ok) return false;
+        const payload = await res.json() as { ok?: unknown } | null;
+        return payload?.ok === true;
     } catch {
         return false;
     }
