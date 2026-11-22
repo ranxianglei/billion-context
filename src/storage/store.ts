@@ -42,6 +42,7 @@ import {
     snapR3LatchedList,
 } from "./snap.js";
 import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
+import { EGRESS_SYSTEM_MSGID } from "./egress-record.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
@@ -1199,12 +1200,83 @@ export class UnifiedStore {
         input: IngestSessionInput,
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
         opts?: { completeLog?: boolean; envelopeImport?: boolean },
+        reanchor?: { trustedTailSeqs: number[] },
     ): boolean {
         const s = input.session;
         const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
-            if (delta) {
+            if (reanchor) {
+                // #7474 window re-anchor: the pf-window lane persists a
+                // SLIDING tail window, so the delta planner's strict-append
+                // assumption is structurally false and the full path paid
+                // O(all session rows) per HIT turn. Resolve every window row
+                // by ONE indexed identity point lookup instead (same
+                // answer, O(window)); existing rows keep their seq, new
+                // rows continue after max(seq) — byte-identical to what the
+                // full path's remap would write for a window plan (which
+                // also skips the sweep: completeLog is false). Every doubt
+                // returns false → the exact full path.
+                // The DEFENSE reads the STORED tail_json (the plan's
+                // SessionRow carries the planner's placeholder seqs — the
+                // stored row is the same-tick authority the watermark read
+                // came from).
+                const storedTailRow = this.db.prepare("SELECT tail_json FROM sessions WHERE session_id = ?").get(s.sessionId) as { tail_json: string } | undefined;
+                if (!storedTailRow) return false;
+                const tail = JSON.parse(storedTailRow.tail_json) as { tailSeqs?: number[] | null };
+                const trusted = reanchor.trustedTailSeqs;
+                if (
+                    !Array.isArray(tail.tailSeqs) ||
+                    tail.tailSeqs.length !== trusted.length ||
+                    !trusted.every((v, i) => tail.tailSeqs?.[i] === v)
+                ) {
+                    return false;
+                }
+                const maxRow = this.db.prepare("SELECT MAX(seq) AS m FROM messages WHERE session_id = ?").get(s.sessionId) as { m: number | null };
+                let nextSeq = maxRow.m === null ? 0 : maxRow.m;
+                const resolve = this.db.prepare(
+                    "SELECT seq, content_hash, retired_at, ref FROM messages WHERE session_id = ? AND msg_id = ? AND identity = ?",
+                );
+                const mapped: { m: MessageRow; abs: number }[] = [];
+                let anchored = 0;
+                for (const m of input.messages) {
+                    if (!m.contentHash) return false;
+                    const row = resolve.get(s.sessionId, m.msgId, m.identity ?? identityOfStoredContent(m.content)) as
+                        | { seq: number; content_hash: string; retired_at: number | null; ref: string | null }
+                        | undefined;
+                    if (row) {
+                        // A tombstoned row is the #4390 rewind-redo case —
+                        // the full path reactivates it in place; a pointer
+                        // at a retired seq would drop the row from the view.
+                        if (row.retired_at !== null) return false;
+                        // #4793: stable identity + changed bytes is the
+                        // repair case — only the full path adopts fresher
+                        // bytes at the same seq. Never keep the stale
+                        // generation silently.
+                        if (row.content_hash !== m.contentHash) return false;
+                        // #6947: minted-ref backfill at first join (the
+                        // IS NULL re-check keeps it idempotent).
+                        if (m.ref !== null && m.ref !== "BLOCKED" && m.refNum !== null && row.ref === null) {
+                            this.db
+                                .prepare("UPDATE messages SET ref = ?, ref_num = ? WHERE session_id = ? AND seq = ? AND ref IS NULL")
+                                .run(m.ref, m.refNum, s.sessionId, row.seq);
+                        }
+                        mapped.push({ m, abs: row.seq });
+                        anchored++;
+                    } else {
+                        mapped.push({ m, abs: ++nextSeq });
+                    }
+                }
+                // Nothing anchored (first save / unknown session) — the full
+                // path establishes the rows.
+                if (anchored === 0) return false;
+                messages = mapped.map((x) => ({ ...x.m, seq: x.abs }));
+                // tailSeqs = the window's absolute seqs in ENVELOPE order —
+                // exactly the shape the full path writes for a window plan;
+                // the sweep never ran on those (no completeLog claim).
+                s.tailJson = JSON.stringify({ ...tail, tailSeqs: mapped.map((x) => x.abs) });
+                watermark = mapped[mapped.length - 1].abs;
+            } else if (delta) {
                 const probe = this.probeIngestBoundary(s.sessionId, delta.trustedSeq);
                 if (!probe || probe.msgId !== delta.boundaryMsgId || probe.contentHash !== delta.boundaryHash) {
                     return false;
@@ -1929,6 +2001,34 @@ export class UnifiedStore {
             .prepare("SELECT msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq")
             .all(sid) as { msg_id: string }[];
         return rows.map((r) => r.msg_id);
+    }
+
+    /** #7474 P2 (ruling 7439): the pin ledger of an egress-on session lives
+     *  in the op log — egress_state is the compaction-bounded serving read, and
+     *  these sessions stop growing the messages projection entirely, so the
+     *  messages-row read would freeze at the arm turn. Order = log_seq = view
+     *  order (the pin's 0-based index ⇔ position contract); the constant system
+     *  row is not part of the msgid ledger. */
+    snapEgressPinLiveIds(sid: string): string[] {
+        const view = egressStateView(this.db, sid);
+        return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map((r) => r.msgid);
+    }
+
+    /** #7474 P2 (ruling 7439): ONE pin-ledger entry for both storage
+     *  authorities — the egress op log when the session has one, the messages
+     *  rows otherwise (identical output for every non-egress session). A
+     *  corrupt op log degrades to the messages ledger: the tail-overlap check
+     *  then mismatches and takes the full signal — never a reject. */
+    snapPinLiveIds(sid: string): string[] {
+        try {
+            const view = egressStateView(this.db, sid);
+            if (view.length > 0) {
+                return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map((r) => r.msgid);
+            }
+        } catch {
+            // EgressStateCorruptError — degrade to the messages ledger below.
+        }
+        return this.snapMsgIdLiveIds(sid);
     }
 
     /** #6181 M3: whether this sid's R3 breaker latch PERSISTED from a

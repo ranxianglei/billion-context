@@ -205,7 +205,7 @@ export function runStage0(opts: Stage0Input): Stage0Result {
                 // fault reads empty (conservative: takes the FAULT side).
                 let liveIds: string[] = [];
                 try {
-                    liveIds = getStore()?.snapMsgIdLiveIds(sessionId) ?? [];
+                    liveIds = getStore()?.snapPinLiveIds(sessionId) ?? [];
                 } catch {
                     liveIds = [];
                 }
@@ -348,7 +348,7 @@ export function tryIncrementalPin(
         liveIds = preReadLiveIds;
     } else {
         try {
-            liveIds = getStore()?.snapMsgIdLiveIds(sessionId) ?? [];
+            liveIds = getStore()?.snapPinLiveIds(sessionId) ?? [];
         } catch {
             return null; // a store fault degrades — never a 500 on the pin path
         }

@@ -39,6 +39,7 @@ import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
+import { featureEnabled } from "./rollout.js";
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
@@ -2512,6 +2513,15 @@ export class SessionStore {
         return this.liveShadow().snapMsgIdLiveIds(sessionId);
     }
 
+    /** #7474 P2 (ruling 7439): pin ledger entry for both storage authorities —
+     *  the egress op log when the session has one, the messages rows otherwise.
+     *  [] when the unified store is unavailable (same degradation as
+     *  snapMsgIdLiveIds — the caller degrades to the full-list signal). */
+    snapPinLiveIds(sessionId: string): string[] {
+        if (!this.replicasAvailable()) return [];
+        return this.liveShadow().snapPinLiveIds(sessionId);
+    }
+
     /** #7398 seg 3: egress op-log surface (dual tables egress_state/
      *  egress_flow). Null when the sqlite lane is unavailable (legacy mode,
      *  network backends) — callers skip recording for the turn (shadow lane,
@@ -3159,10 +3169,12 @@ export class SessionStore {
                 // folded saves present the envelope render (no override),
                 // which the delta path already routes to the full ingest.
                 const tail = session.lastMessagesFolded !== true ? session.lastMessages : undefined;
-                this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
-                    tail && tail.length > 0
-                        ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                        : undefined, session.contentStore ?? undefined);
+                if (!this.egressProjectionFrozen(session)) {
+                    this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
+                        tail && tail.length > 0
+                            ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
+                            : undefined, session.contentStore ?? undefined);
+                }
                 this.noteOwnCommit(session.id, record);
                 return record;
             }
@@ -3182,7 +3194,7 @@ export class SessionStore {
             // to the live session so serving converges on the same newest-wins
             // arbitration the write side just used.
             this.convergeToDisk(session, disk);
-            this.shadow?.record(disk);
+            if (!this.egressProjectionFrozen(session)) this.shadow?.record(disk);
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
             this.noteOwnCommit(session.id, disk);
@@ -3302,6 +3314,20 @@ export class SessionStore {
         loggerLog("error", `[persist] ${sessionId}: skipping ${route} envelope save — JSON envelope writes FROZEN since ${since} (digest-drift escalation #4323); the unified store keeps receiving the save and compression continues from the in-memory view, but the two copies are NOT converging — see the [storage] DIGEST DRIFT lines for the divergence diagnosis (#5408)`);
     }
 
+    /** #7474 P2 (ruling 7439, proposal comment-19805485): the egress-on
+     *  session's transcript authority lives in the op log
+     *  (egress_state/egress_flow), so the per-turn unified-index ingest — the
+     *  O(ledger) double bookkeeping behind the 2s→5.7s @10w-row steady RT
+     *  (#7474) — stops: the messages projection is FROZEN and rebuilt lazily
+     *  by the first legacy FULL ingest after the plane rolls back (the rollback
+     *  turn resends full client history, the delta probe misses, the full path
+     *  re-interns everything). Gated on the LIVE plane flag so a mid-process
+     *  rollback resumes normal ingest at once. The JSON envelope (where
+     *  active) keeps flowing — only the unified legs are skipped. */
+    private egressProjectionFrozen(session: Session): boolean {
+        return session.metadata["egressAuthority"] === true && featureEnabled("egressPlane");
+    }
+
     /** #3397 (PR #6326): durability-before-render — make a session's unified-index
      *  rows durable SYNCHRONOUSLY (the small SQLite ingest) WITHOUT writing the
      *  JSON envelope. The incremental lane calls this the instant a turn's
@@ -3315,6 +3341,7 @@ export class SessionStore {
      *  envelope write and its landing stamp. */
     ingestRowsNow(session: Session): void {
         if (!this.shadow) return; // legacy-only (no unified index) — nothing to back
+        if (this.egressProjectionFrozen(session)) return; // #7474 P2: op log is the authority
         try {
             const stamp = this.liveStorageStamp;
             const record = this.buildRecordForSave(session, stamp);

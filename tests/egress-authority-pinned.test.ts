@@ -155,6 +155,31 @@ test("pinned lane: bootstrap, steady serve, unpinned control, hard-fail (#7439-5
         await settle("conv-armed");
         assert.ok(flowRows("conv-armed") > flowAfterBootstrap, "the flow keeps appending (the view is not frozen)");
 
+        // 2b. #7474 P2 (ruling 7439): with the projection frozen the PIN
+        //     ledger moves to the op log. The messages rows stop growing at
+        //     bootstrap while the flow keeps every turn — and the NEXT pinned
+        //     turn still resolves incrementally (its tail-overlap check runs
+        //     against the FLOW, not the frozen messages ledger).
+        const msgsLedgerAfterT2 = store!.snapMsgIdLiveIds("conv-armed").length;
+        const flowLedgerAfterT2 = store!.snapPinLiveIds("conv-armed");
+        assert.ok(flowLedgerAfterT2.length >= 4, `the flow ledger carries the pinned ids (got ${flowLedgerAfterT2.length})`);
+        assert.ok(!flowLedgerAfterT2.includes("egress-system"), "the constant system row is not part of the pin ledger");
+        const seed3 = [...seed2, msg("user", 4)];
+        logs.length = 0;
+        const r2b = await post("conv-armed", seed3, seed3.map((_, i) => hostId(i)));
+        assert.equal(r2b.status, 200, `the post-freeze pinned turn must succeed (got ${r2b.status}: ${r2b.body.slice(0, 200)})`);
+        assert.ok(
+            logs.some((l) => l.includes("conv-armed") && l.includes("existing row(s) served from the op-log")),
+            "the post-freeze turn still serves from the op-log",
+        );
+        await settle("conv-armed");
+        assert.equal(
+            store!.snapMsgIdLiveIds("conv-armed").length,
+            msgsLedgerAfterT2,
+            "the messages projection is FROZEN for the egress-on session (no per-turn ingest)",
+        );
+        assert.ok(store!.snapPinLiveIds("conv-armed").length > flowLedgerAfterT2.length, "the flow ledger kept growing while the projection froze");
+
         // 3. Unpinned control: the seam never logs egress-authority.
         const r3 = await post("conv-plain", [msg("user", 0)], undefined);
         assert.equal(r3.status, 200);
