@@ -141,35 +141,23 @@ test("#4205 exemption: a real-Claude route reserves nothing, both fields record 
     }
 });
 
-test("#4205 #3900-class: doomed body fails fast locally on the reserving route, rides through on the exempt route", async () => {
+test("#4205 #3900-class: over-window body is forwarded, upstream verdict is authoritative (#7537)", async () => {
     const rig = await startRig();
     try {
         // Wrapper front (no separate-output-budget evidence): R = 80_000.
         const w1 = await post(rig, "wrap-sess", "deepseek-flash", [{ role: "user", content: "hi" }]);
         assert.equal(w1.status, 200);
         await w1.text();
-        // Identity-fast-path guard: turn 1 settles a genuine same-origin usage
-        // baseline, which alone would open the trusted fast path and forward the
-        // doomed body. This pin targets the local fail-fast contract, so declare
-        // the overflow wall — statedWall > 0 demotes the fast path; the wall
-        // equals the reserved window R, so the judge's limit is unchanged.
         listSessions().find((s) => s.id === "wrap-sess")!.stats.overflowArmTokens = RESERVED_WINDOW;
-        // Usage report from turn 1 settles a usage-grade baseline, so an
-        // over-band turn 2 is judged locally instead of forwarded for
-        // evidence (#3146 forward-once only covers unknown baselines).
+        // #7537: no local fail-fast — the payload is ALWAYS forwarded.
         const w2 = await post(rig, "wrap-sess", "deepseek-flash", [
             { role: "user", content: "hi" },
             { role: "assistant", content: "s" },
             { role: "user", content: FILLER },
         ]);
+        assert.equal(w2.status, 200, `payload is forwarded, upstream 200 is the verdict, got ${w2.status}`);
         await w2.text();
-        // Local refusal: deterministic exhaustion (nothing foldable) with the
-        // calibrated meter agreeing the payload is over R. 413 is the
-        // deterministic verdict; 502 is the relay-dependent variant. Either
-        // way the body stayed local — the #3900 regression was the body
-        // reaching upstream and burning a guaranteed 400.
-        assert.ok(w2.status === 413 || w2.status === 502, `expected local fail-fast, got ${w2.status}`);
-        assert.deepEqual(rig.mainModels.filter((m) => m === "deepseek-flash"), ["deepseek-flash"], "doomed turn-2 body never left the proxy as a main-lane forward");
+        assert.deepEqual(rig.mainModels.filter((m) => m === "deepseek-flash"), ["deepseek-flash", "deepseek-flash"], "both turns reached upstream");
 
         // Control: identical payload on an exempt route (limit N = 100_000)
         // fits and rides through untouched.

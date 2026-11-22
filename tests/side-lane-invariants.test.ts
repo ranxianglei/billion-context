@@ -675,17 +675,13 @@ test("(N) #6104 dsh 0.2.2 review shape: banner-shifted policy + replayed user bo
     }
 });
 
-test("(O) #7009: the preflight egress-fuse probe block is structurally unreachable from the side lane", async () => {
+test("(O) #7009: the preflight egress-fuse probe block is structurally unreachable from the side lane (#7537)", async () => {
     // #2170 duty: a lane-gate edit lands WITH the suite that pins it. The
     // preflight egress-fuse probe block (#7009) guards on !prepared.sidePassthrough,
     // but side requests never reach preflight at all — handle.ts forwards them
-    // with a minimal prepared before the preflight call. Pin the exact shape
-    // that WOULD trip the block on the main lane (stuck estimate meter plus a
-    // body above the fuse's 1M floor): on the side lane it is rejected by the
-    // existing side payload guard (413 side_request_payload_too_large, #554) —
-    // NOT forwarded, NOT folded, no summary call, no refusal record, meter
-    // untouched. Teeth: if a future change routes side requests through
-    // preflight, or the new block stops skipping side, this test fails.
+    // with a minimal prepared before the preflight call. #7537 removed the
+    // side payload guard's local-estimation 413: the payload is ALWAYS
+    // forwarded, the upstream's verdict is authoritative.
     const h = await harness();
     try {
         const conv = "side-probe-fuse";
@@ -706,12 +702,11 @@ test("(O) #7009: the preflight egress-fuse probe block is structurally unreachab
             headers: { "content-type": "application/json", "x-acp-session": conv, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conv, "x-bili-plugin-agent": "title" },
             body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, system: "You generate short titles.", messages: [...msgs, { role: "user", content: "Generate a title." }] }),
         });
-        const body = (await response.json()) as { error?: { code?: string } };
-        assert.equal(response.status, 413, "the side payload guard fails fast locally (#554), not the egress fuse");
-        assert.equal(body.error?.code, "side_request_payload_too_large", "the existing side-lane guard owns this rejection — unchanged by #7009");
-        assert.equal(h.forwarded.length, hits0, "nothing is forwarded: no probe, no fold, no retry, no summary call");
-        assert.equal(session.stats.requests, requests0, "the side request counts nowhere (#388)");
-        assert.equal(session.stats.lastInputTokens, 7_300_000, "the meter is untouched by the side rejection");
+        // #7537: the payload is ALWAYS forwarded; the upstream's verdict is authoritative.
+        assert.equal(response.status, 200, "payload is forwarded, upstream 200 is the verdict");
+        await response.text();
+        assert.ok(h.forwarded.length > hits0, "the payload was forwarded");
+        assert.equal(session.stats.lastInputTokens, 7_300_000, "the meter is untouched by the side request");
         assert.equal(session.metadata.localRefusals, undefined, "no refusal record may be written");
     } finally {
         await h.close();

@@ -153,7 +153,7 @@ async function closeAll(...servers: http.Server[]): Promise<void> {
     });
 }
 
-test("#1993 systemic hard 400: body surfaced in log+message, bounded halving cascade, deterministic diagnosis on every retry", async () => {
+test("#1993 systemic hard 400: payload forwarded, upstream 200 is the verdict (#7537)", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls, 0, 400, SYSTEMIC_400_BODY);
     upstream.listen(0, "127.0.0.1");
@@ -164,50 +164,22 @@ test("#1993 systemic hard 400: body surfaced in log+message, bounded halving cas
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const r1 = await driveResponses(proxyPort, upstreamPort, "s1993-systemic", "gpt-7-sol", longResponsesInput(12));
-        assert.equal(r1.status, 502, `systemic hard 400 must fail-fast, got ${r1.status}`);
-        const j1 = (await r1.json()) as { error?: { code?: string; message?: string; retryable?: boolean } };
-        assert.equal(j1.error?.code, "preflight_compress_failed");
-        assert.equal(j1.error?.retryable, false);
-        assert.ok(
-            j1.error?.message?.includes("rejected by the upstream (HTTP 400)"),
-            `fail-fast message must name the rejection, got: ${j1.error?.message}`,
-        );
-        // The core of #1993: WHY the upstream said no must reach the operator.
-        assert.ok(
-            j1.error?.message?.includes("request too large: 523200 tokens exceeds the 128000 input limit"),
-            `fail-fast message must carry the rejection body snippet, got: ${j1.error?.message}`,
-        );
+        assert.equal(r1.status, 200, `payload is forwarded, upstream 200 is the verdict, got ${r1.status}`);
+        await r1.text();
         const summaries = calls.filter((c) => c.summary);
-        // More than one call proves the halving cascade ran instead of the old
-        // instant give-up; the ceiling is the per-preflight budget.
-        assert.ok(summaries.length >= 2 && summaries.length <= 16, `summary calls must be bounded by the cascade, got ${summaries.length}: ${JSON.stringify(summaries)}`);
-        assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded on failure");
+        assert.ok(summaries.length >= 1, `summary calls were made, got ${summaries.length}`);
+        assert.ok(calls.some((c) => !c.summary), "the payload was forwarded");
 
         const sess = listSessions().find((s) => s.id.includes("s1993-systemic"));
-        // (#4079) the #726 dead-end cooldown was removed: a deterministic
-        // exhaustion must answer fail-fast WITHOUT persisting any marker —
-        // the retryable:false answer is the whole retry contract, and a
-        // stored marker froze every identical retry for 5 minutes (#3974).
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "no dead-end marker may persist (#4079)");
 
         const callsBeforeRetry = calls.length;
         const r2 = await driveResponses(proxyPort, upstreamPort, "s1993-systemic", "gpt-7-sol", longResponsesInput(12));
-        assert.equal(r2.status, 502, `deterministic exhaustion must fail fast again, got ${r2.status}`);
-        const j2 = (await r2.json()) as { error?: { code?: string; message?: string; retryable?: boolean } };
-        assert.equal(j2.error?.code, "preflight_compress_failed");
-        assert.equal(j2.error?.retryable, false);
-        // The walk REGENERATES the diagnosis on the fresh turn (token counts
-        // shift with per-turn injections) — pin the stable core instead of the
-        // old cached-verbatim equality the cooldown used to guarantee.
-        assert.ok(
-            j2.error?.message?.includes("rejected by the upstream (HTTP 400)")
-                && j2.error?.message?.includes("request too large: 523200 tokens exceeds the 128000 input limit")
-                && j2.error?.message?.includes("This request's over-window payload was NOT forwarded to the upstream."),
-            `regenerated diagnosis must carry the same rejection core, got: ${j2.error?.message}`,
-        );
+        assert.equal(r2.status, 200, `resend is also forwarded, got ${r2.status}`);
+        await r2.text();
         const retrySummaries = calls.slice(callsBeforeRetry).filter((c) => c.summary);
-        assert.ok(retrySummaries.length >= 2 && retrySummaries.length <= 16, `the re-run walk is itself bounded by the cascade (#4079 trade), got ${retrySummaries.length}`);
-        assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded on failure");
+        assert.ok(retrySummaries.length >= 1, `the re-run walk made summary calls, got ${retrySummaries.length}`);
+        assert.ok(calls.slice(callsBeforeRetry).some((c) => !c.summary), "the resend was forwarded");
     } finally {
         await closeAll(proxy, upstream);
     }
@@ -246,7 +218,7 @@ test("#1993 size-driven 400: oversized chunk rejected, halved chunk recovers, se
     }
 });
 
-test("#1993 non-size 4xx does not shrink: 401 fails fast after exactly one summary call", async () => {
+test("#1993 non-size 4xx: payload forwarded, upstream 200 is the verdict (#7537)", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls, 0, 401, '{"error":"unauthorized"}');
     upstream.listen(0, "127.0.0.1");
@@ -257,12 +229,11 @@ test("#1993 non-size 4xx does not shrink: 401 fails fast after exactly one summa
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const r = await driveResponses(proxyPort, upstreamPort, "s1993-auth", "gpt-7-sol", longResponsesInput(12));
-        assert.equal(r.status, 502, `auth rejection must fail-fast, got ${r.status}`);
-        const j = (await r.json()) as { error?: { message?: string; retryable?: boolean } };
-        assert.equal(j.error?.retryable, false);
-        assert.ok(j.error?.message?.includes("rejected by the upstream (HTTP 401)"), `got: ${j.error?.message}`);
+        assert.equal(r.status, 200, `payload is forwarded, upstream 200 is the verdict, got ${r.status}`);
+        await r.text();
         const summaries = calls.filter((c) => c.summary);
-        assert.equal(summaries.length, 1, `401 must not burn the budget on halving, got ${summaries.length} calls`);
+        assert.ok(summaries.length >= 1, `summary calls were made, got ${summaries.length}`);
+        assert.ok(calls.some((c) => !c.summary), "the payload was forwarded");
         const sess = listSessions().find((s) => s.id.includes("s1993-auth"));
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker persists — the cooldown is gone");
     } finally {
@@ -270,7 +241,7 @@ test("#1993 non-size 4xx does not shrink: 401 fails fast after exactly one summa
     }
 });
 
-test("#1993 warn log carries the rejection body snippet and the halving decision", async () => {
+test("#1993 warn log carries the summary rejection and forwarding evidence (#7537)", async () => {
     const lines: string[] = [];
     setLogCapture((_level, msg) => { lines.push(msg); });
     const calls: Call[] = [];
@@ -283,15 +254,11 @@ test("#1993 warn log carries the rejection body snippet and the halving decision
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const r = await driveResponses(proxyPort, upstreamPort, "s1993-log", "gpt-7-sol", longResponsesInput(12));
-        assert.equal(r.status, 502);
+        assert.equal(r.status, 200, `payload is forwarded, got ${r.status}`);
         await r.text();
         assert.ok(
             lines.some((l) => l.includes("[preflight] summarization failed: HTTP 400") && l.includes("request too large: 523200")),
             `warn log must carry the rejection body snippet, got: ${lines.filter((l) => l.includes("summarization failed")).join(" | ")}`,
-        );
-        assert.ok(
-            lines.some((l) => /\[preflight\] chunk m\d+:m\d+ rejected with HTTP 400; retrying with smaller chunks/.test(l)),
-            `warn log must record the halving decision`,
         );
     } finally {
         setLogCapture(null);
@@ -299,7 +266,7 @@ test("#1993 warn log carries the rejection body snippet and the halving decision
     }
 });
 
-test("#1993 BILI_DUMP_4XX persists the rejected summary exchange (request + response)", async () => {
+test("#1993 BILI_DUMP_4XX persists the rejected summary exchange; payload forwarded (#7537)", async () => {
     const savedGate = process.env.BILI_DUMP_4XX;
     const savedDir = process.env.ACP_DUMP_DIR;
     const dumpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-summary-dump-"));
@@ -315,7 +282,7 @@ test("#1993 BILI_DUMP_4XX persists the rejected summary exchange (request + resp
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const r = await driveResponses(proxyPort, upstreamPort, "s1993-dump", "gpt-7-sol", longResponsesInput(12));
-        assert.equal(r.status, 502);
+        assert.equal(r.status, 200, `payload is forwarded, got ${r.status}`);
         await r.text();
 
         const files = fs.readdirSync(dumpDir).filter((f) => f.startsWith("summary-err-") && f.endsWith("-400.json"));
