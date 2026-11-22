@@ -354,6 +354,18 @@ export class UnifiedShadow {
             this.lastWarnKey = key;
             loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${this.consecutiveFailures} in a row; ${detail})${sqliteOpenFailureHint(String(err))} — the index write will be RETRIED on every subsequent save until it succeeds again (no self-disable; the JSON envelope keeps serving meanwhile)`);
         }
+        // #7156 (2026-11-21): open no longer writes — with the per-session
+        // watermark prime, the FIRST write of a process happens at its first
+        // ingest. If that write hits proven corruption before the integrity
+        // verdict has landed (large store: async quick_check in flight, or a
+        // cached .chk verdict skipped the rescan), say so LOUDLY and trip the
+        // latch so the status surface shows the proven-corrupt state; the
+        // save itself falls back to the envelope as usual (the warn above).
+        const corruption = sqliteCorruptionDetail(err);
+        if (corruption !== null) {
+            integrityQuickCheckFailed = true;
+            loggerLog("error", `[storage] index.db FAILED at an ingest write (${corruption}) — the integrity check has not run/landed yet (large store / cached verdict), so the corruption surfaced here instead of at quick_check. No file moved, no copy, no automatic rebuild (2026-10-30 owner policy): back up ${this.dbPath ?? "index.db"}{,-wal,-shm}, then MOVE those files aside by hand and start again (#7156)`);
+        }
     }
 
     /** #3931 step 3: true when this shadow rides a network backend (mysql).
@@ -440,11 +452,11 @@ export class UnifiedShadow {
                 );
                 return null;
             }
-            // #3285: watermark trust does not cross process boundaries — a
-            // restart-handoff overlap leaves the previous writer's rows AND
-            // watermark behind; drop them all so this process's first save
-            // per session re-establishes trust from its own view.
-            store.resetAllIngestWatermarks();
+            // #3285 (2026-11-21 per-session rework): watermark trust no longer
+            // gets a global open-time reset — it would make OPEN a write and
+            // touch every session (the #7156 first-write hazard). Each
+            // session's foreign watermark is dropped lazily on this process's
+            // first touch of it, right before the watermark is read (below).
         } catch (err) {
             // The inner gate's refusal throw (or any StorageIntegrityError the
             // inner catch let through) re-enters THIS catch — it is already
@@ -458,7 +470,7 @@ export class UnifiedShadow {
             // 512 MiB sync threshold checks in the background, or a poisoned
             // .chk verdict cache skipped the rescan (see the close-time gate
             // in store.ts) — the corruption surfaces at the FIRST post-open
-            // write (resetAllIngestWatermarks) instead of at quick_check.
+            // write (an open-path write: migration/DDL) instead of at quick_check.
             // Classify it exactly like the inner catch: proven-corrupt →
             // start WITHOUT the index, files left in place, loud alarm naming
             // the manual fix (2026-10-30 owner policy).
@@ -479,8 +491,10 @@ export class UnifiedShadow {
                 applyProvenCorruptionPolicy(dir, env, fileUnified, fileJsonWriter, fileBackend, `first post-open write failed: ${corruptionDetail}`, err);
                 loggerLog(
                     "error",
-                    `[storage] index.db FAILED at the first post-open write (${corruptionDetail}) — the integrity check did not run synchronously (large store / cached verdict), so the corruption surfaced here instead of at quick_check. Starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#7156/#4175/#4626)`,
+                    `[storage] index.db FAILED at an open-path write (${corruptionDetail}) — the integrity check did not run synchronously (large store / cached verdict), so the corruption surfaced here instead of at quick_check. Starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#7156/#4175/#4626)`,
                 );
+                recordSidecarOpenFailure(`open-path write failed: ${corruptionDetail}`);
+                integrityQuickCheckFailed = true; // proven-corrupt: operator hand-fix only — no in-process auto-retry
                 return null;
             }
             // Deleting the index cannot fix a no-engine failure (the engine is
@@ -805,6 +819,11 @@ export class UnifiedShadow {
     private ingestDelta(legacy: LegacySessionLike, hasRawTail: boolean): boolean {
         if (this.sync === null) return false;
         try {
+            // #3285 (2026-11-21 per-session): prime THIS session's trust
+            // before reading the watermark — a foreign-set watermark
+            // (previous process) must not vouch for its rows; own watermarks
+            // stay trusted (idempotent, no second write).
+            this.sync.primeIngestTrust(legacy.id);
             const mark = this.sync.ingestWatermark(legacy.id);
             if (!mark) return false;
             // The pre-transaction probe is an optimization (skip building a
@@ -1335,6 +1354,9 @@ export class UnifiedShadow {
                 // generation so the next sample can re-admit and release it.
                 if (!this.driftedSessions.has(legacy.id)) {
                     try {
+                        // #3285 (2026-11-21 per-session): prime THIS session's
+                        // trust before reading the watermark (idempotent).
+                        await backend.primeIngestTrust(legacy.id);
                         const mark = await backend.ingestWatermark(legacy.id);
                         if (mark) {
                             const boundary = await backend.probeIngestBoundary(legacy.id, mark.seq);

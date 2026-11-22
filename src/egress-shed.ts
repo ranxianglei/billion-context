@@ -51,6 +51,117 @@ export interface ShedWireImagesResult {
     stats: ShedStats;
 }
 
+/** Pure byte-space projection of what shedWireImages WOULD do — no jimp, no
+ *  string writes, safe to run in hot estimate paths. The token-space twin of the
+ *  actual shed: preflight must judge the payload the wire will really carry
+ *  (post-shed), not the pre-shed memo — the 2026-11-22 incident measured
+ *  ~948K image tokens that the 10 MiB byte budget would have archived to
+ *  ~30-token placeholder notes before leaving the machine, so the local
+ *  doom-math refused a payload the wire had already carried minutes earlier.
+ *  Note costs are floored at zero: a placeholder note is a few tokens, and
+ *  over-estimating them would re-create the very refusal we are fixing.
+ *  Downscale byte deltas are NOT simulated (jimp decode would defeat the
+ *  purpose): rung B only shrinks the remaining images, so the projection is
+ *  conservative in the forwarding-safe direction (it never reports MORE
+ *  surviving images than the real shed). */
+function simulateShedImages(
+    body: string,
+    protocol: WireProtocol,
+    targetBytes: number,
+): { projectedFinalBytes: number; archived: number; downscaled: number; changed: boolean } {
+    const originalBytes = byteLen(body);
+    if (targetBytes <= 0 || originalBytes <= targetBytes) {
+        return { projectedFinalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(body);
+    } catch {
+        return { projectedFinalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
+    }
+    if (!isObj(parsed)) return { projectedFinalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
+    const occurrences = collectOccurrences(protocol, parsed).filter((o) => !o.exempt);
+    if (occurrences.length === 0) return { projectedFinalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
+
+    const totalEntries = protocol === "google" ? (Array.isArray(parsed.contents) ? parsed.contents.length : 0)
+        : protocol === "responses" ? (Array.isArray(parsed.input) ? parsed.input.length : 0)
+            : Array.isArray(parsed.messages) ? parsed.messages.length : 0;
+    const protectFrom = Math.max(0, totalEntries - PROTECTED_TAIL_ENTRIES);
+    for (const o of occurrences) o.protectedTail = o.entryIndex >= protectFrom;
+
+    let est = originalBytes;
+    let archived = 0;
+    let downscaled = 0;
+    // Rung A (pure): archive oldest non-protected images to placeholder notes until under target.
+    for (const o of occurrences) {
+        if (est <= targetBytes) break;
+        if (o.protectedTail) continue;
+        est -= byteLen(dataUrl(o.mediaType, o.b64));
+        o.archived = true;
+        archived++;
+    }
+    // Rung B (bounded estimate): downscale only when rung A alone cannot fit; the
+    // real pass decodes through jimp, the projection assumes it succeeds.
+    if (est > targetBytes) {
+        const work = occurrences.filter((o) => !o.archived).slice(0, MAX_SHED_IMAGES);
+        outer: for (const dim of DOWNSCALE_DIM_LADDER) {
+            for (const o of work) {
+                if (est <= targetBytes) break;
+                const dims = decodeImageDims(o.b64);
+                if (dims !== undefined && Math.max(dims.w, dims.h) <= dim) continue;
+                est -= byteLen(dataUrl(o.mediaType, o.b64));
+                downscaled++;
+            }
+            if (est <= targetBytes) break outer;
+        }
+    }
+    return { projectedFinalBytes: Math.max(est, 0), archived, downscaled, changed: archived > 0 || downscaled > 0 };
+}
+
+/** #3701: the post-shed token caliber of the body's images — measure
+ *  imageReserve over the body after a rung-A archive projection (the
+ *  placeholder notes are measured as empty). Returns the PRE-shed body when
+ *  the lane would not shed at all (managed-but-not-WS transport, under
+ *  budget, unparseable, no non-exempt images): the caller keeps its usual
+ *  estimate. Pure; never mutates the input. */
+export function postShedImageView(body: string, protocol: WireProtocol): { body: string; sheddable: boolean } {
+    const t = currentFetchTransport();
+    let budget: number;
+    if (isWsLaneTransport(t)) {
+        budget = limitsWsOutboundBytes();
+    } else if (t === undefined) {
+        budget = limitsHttpOutboundBytes();
+    } else {
+        // managed-but-not-WS transport: never shed (#3701 Finding 1).
+        return { body, sheddable: false };
+    }
+    if (budget <= 0) return { body, sheddable: false };
+    const sim = simulateShedImages(body, protocol, budget);
+    if (!sim.changed) return { body, sheddable: false };
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(body);
+    } catch {
+        return { body, sheddable: false };
+    }
+    if (!isObj(parsed)) return { body, sheddable: false };
+    const occurrences = collectOccurrences(protocol, parsed).filter((o) => !o.exempt);
+    if (occurrences.length === 0) return { body, sheddable: false };
+    const totalEntries = protocol === "google" ? (Array.isArray(parsed.contents) ? parsed.contents.length : 0)
+        : protocol === "responses" ? (Array.isArray(parsed.input) ? parsed.input.length : 0)
+            : Array.isArray(parsed.messages) ? parsed.messages.length : 0;
+    const protectFrom = Math.max(0, totalEntries - PROTECTED_TAIL_ENTRIES);
+    let archived = 0;
+    for (const o of occurrences) {
+        if (archived >= sim.archived) break;
+        if (o.protectedTail) continue;
+        o.applyArchive("*");
+        archived++;
+    }
+    if (archived === 0) return { body, sheddable: false };
+    return { body: JSON.stringify(parsed), sheddable: true };
+}
+
 interface ShedOptions {
     /** Best-effort mNNNNN resolver (session incoming-image index); placeholders quote it. */
     resolveRef?: (mediaType: string, b64: string) => Promise<string | undefined>;
@@ -279,22 +390,25 @@ export async function shedWireImages(
     const protectFrom = Math.max(0, totalEntries - PROTECTED_TAIL_ENTRIES);
     for (const o of occurrences) o.protectedTail = o.entryIndex >= protectFrom;
 
+    // Rung A: archive oldest non-protected images until the byte budget fits —
+    // the exact walk the pure projection (simulateShedImages) runs, so the
+    // token-space caliber preflight judges and the wire path actually carry
+    // agree on WHICH images leave (the two differ only in note size, which
+    // the projection floors at zero). Walks every occurrence (not just the
+    // first MAX_SHED_IMAGES): archiving is a string swap, so the jimp CPU
+    // bound does not apply here — capping it left any session with more than
+    // 64 images permanently over budget (#5745: 582 images shed only 64, the
+    // body stayed over the 10 MiB cap and upstream 400'd every round).
     let est = originalBytes;
     let archived = 0;
     let downscaled = 0;
-    // Rung A: archive oldest non-protected images to placeholder notes until under target.
-    // Walks every occurrence (not just the first MAX_SHED_IMAGES): archiving is a string swap,
-    // so the jimp CPU bound does not apply here — capping it left any session with more than
-    // 64 images permanently over budget (#5745: 582 images shed only 64, the body stayed over
-    // the 10 MiB cap and upstream 400'd every round).
     for (const o of occurrences) {
         if (est <= targetBytes) break;
         if (o.protectedTail) continue;
         const note = await shedNote(o.mediaType, o.b64, opts.resolveRef);
         o.applyArchive(note);
         o.archived = true;
-        // the serialized value being removed is the whole data URL, not the bare base64
-        est += byteLen(JSON.stringify(note)) - byteLen(dataUrl(o.mediaType, o.b64));
+        est -= byteLen(dataUrl(o.mediaType, o.b64));
         archived++;
     }
 

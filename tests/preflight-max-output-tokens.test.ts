@@ -220,17 +220,18 @@ test("e2e #663 (order A, stream-first): learn both rejections, summary recovers,
         assert.ok(learned && typeof learned === "object", "max_output_tokens rejection learned on the session");
         assert.equal(learned?.[learnKey(upstreamUrl, "gpt-6-astra")], true, "learning scoped to upstream URL + model");
 
-        // Second request (grown over-window again): every summary call is
-        // first-shot compatible — stream, no max_output_tokens.
+        // Second request (grown over-window again): under the one-shot fold
+        // gate the session is compression-managed after request 1's folds,
+        // so preflight no longer re-folds it — the payload is forwarded
+        // as-is with ZERO summary calls (overflow recovery stays with the
+        // #1195 in-request refold). The first-shot compatibility property is
+        // already proven by request 1's post-rejection summaries above.
         const callsBefore = calls.length;
         const r2 = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-a", "gpt-6-astra", longResponsesInput(24));
         assert.equal(r2.status, 200, `second request must succeed, got ${r2.status}`);
         const newSummaries = calls.slice(callsBefore).filter((c) => c.summary);
-        assert.ok(newSummaries.length >= 1, "second request triggered preflight summaries");
-        assert.ok(
-            newSummaries.every((c) => c.stream && c.maxOutputTokens === undefined),
-            `second-request summaries must be first-shot compatible, got ${JSON.stringify(newSummaries)}`,
-        );
+        assert.equal(newSummaries.length, 0, "one-shot gate: the managed session's second request is forwarded as-is, no re-fold");
+        assert.ok(calls.slice(callsBefore).some((c) => !c.summary), "the second request was forwarded upstream");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();
@@ -378,17 +379,18 @@ test("e2e #663 (model scoping): rejection learned for model A keeps model B's 32
             `every model A retry must drop the cap, got ${JSON.stringify(astraSummaries)}`,
         );
 
-        // Same session, different model: preflight must fire again (grown
-        // over-window) and model B's summary keeps the cap.
+        // Same session, different model: the session is compression-managed
+        // after model A's folds, so the one-shot gate forwards the second
+        // request as-is — no summary call for model B either (model-B cap
+        // retention on summary calls is covered by the metadata scoping
+        // below: model B's key was never learned, so a future first-shot
+        // session for B would carry the cap).
         const callsBefore = calls.length;
         const r2 = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-d", "gpt-6-standard", longResponsesInput(24));
         assert.equal(r2.status, 200, `second request (model B) must succeed, got ${r2.status}`);
         const standardSummaries = calls.slice(callsBefore).filter((c) => c.summary);
-        assert.ok(standardSummaries.length >= 1, "second request triggered preflight summaries");
-        assert.ok(
-            standardSummaries.every((c) => c.model === "gpt-6-standard" && typeof c.maxOutputTokens === "number" && c.maxOutputTokens <= 32768),
-            `model B summaries must keep the output cap (<= 32768; #987 may clamp it), got ${JSON.stringify(standardSummaries)}`,
-        );
+        assert.equal(standardSummaries.length, 0, "one-shot gate: the managed session's second request is forwarded as-is, no re-fold for model B either");
+        assert.ok(calls.slice(callsBefore).some((c) => !c.summary), "the second request was forwarded upstream");
 
         const sess = listSessions().find((s) => s.id.includes("s663-resp-d"));
         const learned = sess?.metadata?.preflightNoMaxOutputTokens as Record<string, unknown> | undefined;
