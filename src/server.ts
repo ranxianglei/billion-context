@@ -3985,12 +3985,11 @@ export async function preflightCompressIfNeeded(
     // the ORIGIN changed since the last evidence (#1933 F2 demotion
     // semantics), or the upstream has already stated its overflow wall
     // (#3450 — that wall IS recorded reality and must keep judging). Model
-    // changes are deliberately NOT a demotion: the "model billed" provenance
-    // is not recoverable at preflight time (prepare re-stamps
-    // metadata.lastModel with the CURRENT request's model before this runs,
-    // and threading a stamped model through all three billing lanes is a
-    // separate change); a model-specific 400 is absorbed by the overflow arm
-    // exactly like any other over-accept, which shrinks the judged wall.
+    // changes ARE a demotion: acceptance evidence is per model as well as per
+    // origin (#2189 — a bill on claude-big binds nothing for claude-small), so
+    // the gate below requires the settlement-stamped model to match this
+    // request's model; a model switch since the last evidence closes the fast
+    // path and the protection chain judges.
     const evidenceSource = session.stats.lastInputTokensSource;
     const hasUpstreamReality = session.stats.lastInputTokens > 0
         && (evidenceSource === "usage" || evidenceSource === "overflow-arm");
