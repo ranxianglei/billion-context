@@ -29,7 +29,7 @@ const EXTERNAL_SUMMARY_FAILURE_CAUSE = `${EXTERNAL_SUMMARY_FAILURE_CAUSE_PREFIX}
 // It carries no new numbers/refs the model could anchor on beyond n and
 // decayMinutes (both real values from the streak).
 function armedExternalSummaryRefusal(n: number, decayMinutes: number): string {
-    return `[Compression refused: the external-summary circuit breaker is already armed (${n} consecutive all-failure batches — every configured summary candidate failed or exceeded its budget). Nothing was compressed and no summary request was sent. Do not call compress again to retry the same configuration: the breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Fix the external-summary configuration (endpoint/credentials/budget) if it is misconfigured, or continue your task without compressing — compression resumes automatically once the breaker decays and a summary succeeds.]`;
+    return `[Compression refused: the external-summary circuit breaker is already armed (${n} consecutive all-failure batches — every configured summary candidate failed or exceeded its budget). Nothing was compressed and no summary request was sent. Do not call compress again to retry the same configuration: the breaker disarms on one substantial fold (a trivial one that saves almost nothing does not count) or ${decayMinutes} minutes without a failing call. Fix the external-summary configuration (endpoint/credentials/budget) if it is misconfigured, or continue your task without compressing — compression resumes automatically once the breaker decays and a summary succeeds.]`;
 }
 
 function withOptionalSummaries(input: unknown): unknown {
