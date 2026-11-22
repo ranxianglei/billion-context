@@ -3325,7 +3325,7 @@ export class SessionStore {
      *  rollback resumes normal ingest at once. The JSON envelope (where
      *  active) keeps flowing — only the unified legs are skipped. */
     private egressProjectionFrozen(session: Session): boolean {
-        return session.metadata["egressAuthority"] === true && featureEnabled("egressPlane");
+        return session.metadata?.["egressAuthority"] === true && featureEnabled("egressPlane");
     }
 
     /** #3397 (PR #6326): durability-before-render — make a session's unified-index
