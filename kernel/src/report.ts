@@ -4,6 +4,11 @@ import { BLOCKED_REF, orderedRefPair, refForRaw } from "./refs.js";
 import { countMessageTokens } from "./tokenize.js";
 import { segmentGroups } from "./segment.js";
 import { isLiveCheckpointCarrier } from "./state.js";
+import {
+  isRenderedSummaryMessage,
+  summaryBlockIdOf,
+} from "./prune.js";
+import { tierActionHint } from "./compress.js";
 import { computeProtectedRefs } from "./recommend.js";
 import {
   buildProjectionShared,
@@ -95,11 +100,25 @@ interface VisibleMessageInfo {
   gapBefore: boolean;
 }
 
+/** A rendered block-summary node still resident in the view (id
+ *  acp_summary_bN). It is visible on-wire mass, but its mass is already
+ *  accounted in the summaryTokens ledger and it is NOT foldable as a plain
+ *  m-ref range — only tier distillation (block-ID boundaries) folds it. */
+interface SummaryNodeRow {
+  ref: string;
+  blockId: string;
+  tokens: number;
+}
+
 function collectVisible(
   messages: CoreMessage[],
   state: CompressionState,
   countTokens: (t: string) => number,
-): { visible: VisibleMessageInfo[]; summaryTokens: number } {
+): {
+  visible: VisibleMessageInfo[];
+  summaryTokens: number;
+  summaryNodes: SummaryNodeRow[];
+} {
   const coveredIds = new Set<string>();
   for (const block of state.blocks) {
     if (!block.active) continue;
@@ -114,6 +133,7 @@ function collectVisible(
     if (block.active && !block.retired) summaryTokens += summaryTokensOf(block, countTokens);
   }
   const visible: VisibleMessageInfo[] = [];
+  const summaryNodes: SummaryNodeRow[] = [];
   // Tool RESULTS carry no toolName of their own — resolve them through
   // their call so the tool bucket attributes result payload (#386: with
   // `toolName ?? "text"` every tool-result landed in the text bucket and
@@ -137,6 +157,23 @@ function collectVisible(
     const ref = refForRaw(state.messageRefs, message.id);
     if (!ref) return;
     const tokens = countMessageTokens(message, countTokens);
+    // Rendered block-summary nodes: their mass is already counted in
+    // summaryTokens above, and the nudge surface (buildCompressibleRanges)
+    // never offers them as plain compressible ranges — it skips them and
+    // opens a gap. Listing them as ordinary uncompressed rows made
+    // already-compressed blocks look like fresh fold targets; the ranges
+    // view now shows them in a labeled section instead, and splits there,
+    // exactly where the nudge table splits.
+    if (isRenderedSummaryMessage(message)) {
+      if (ref !== BLOCKED_REF && tokens > 0) {
+        const blockId = summaryBlockIdOf(message.id);
+        if (blockId !== null) {
+          summaryNodes.push({ ref, blockId, tokens });
+          pendingGap = true;
+        }
+      }
+      return;
+    }
     if (!coveredIds.has(message.id) && tokens > 0) {
       const isTool = isToolMessage(message);
       const tool = isTool
@@ -164,7 +201,7 @@ function collectVisible(
     }
     if (ref !== BLOCKED_REF && tokens > 0) pendingGap = true;
   });
-  return { visible, summaryTokens };
+  return { visible, summaryTokens, summaryNodes };
 }
 
 /** Host-declared surface facts for status reports. The kernel never resolves
@@ -228,7 +265,7 @@ export function buildStatusReport(
     );
   }
 
-  const { visible, summaryTokens } = collectVisible(
+  const { visible, summaryTokens, summaryNodes } = collectVisible(
     messages,
     state,
     countTokens,
@@ -240,6 +277,7 @@ export function buildStatusReport(
     }
     return renderUncompressedRanges(
       visible,
+      summaryNodes,
       sort,
       limit,
       state,
@@ -296,9 +334,6 @@ function renderOverview(
       (toolTypeMap.get(message.tool) ?? 0) + message.tokens,
     );
   }
-  const topTool = [...toolTypeMap.entries()].sort(
-    (a, b) => b[1] - a[1],
-  )[0]?.[0];
 
   const totalTool = visible
     .filter((m) => m.isTool)
@@ -391,15 +426,18 @@ function renderOverview(
   lines.push("");
   // #5555 audit: was leaking an internal function name + option keys;
   // scope/view/tool are declared params on every wire now, so this hint is
-  // honest advice in the public contract.
+  // honest advice in the public contract. The default uncompressed output IS
+  // the compressible-ranges listing (aligned with the injected nudge table)
+  // — steer models there, not into the per-message detail view.
   lines.push(
-    `Tip: call again with scope:"uncompressed", view:"messages"${topTool ? `, tool:"${topTool}"` : ""} for a per-message listing`,
+    `Tip: call again with scope:"uncompressed" for the compressible-ranges listing (view:"messages" drills into individual refs)`,
   );
   return lines.join("\n");
 }
 
 function renderUncompressedRanges(
   visible: VisibleMessageInfo[],
+  summaryNodes: SummaryNodeRow[],
   sort: string,
   limit: number,
   state: CompressionState,
@@ -413,7 +451,7 @@ function renderUncompressedRanges(
     `UNCOMPRESSED — ${formatTokens(totalTokens)} | ${visible.length} visible messages`,
   );
   lines.push("");
-  if (visible.length === 0) {
+  if (visible.length === 0 && summaryNodes.length === 0) {
     lines.push("  (no uncompressed messages)");
     return lines.join("\n");
   }
@@ -518,20 +556,74 @@ function renderUncompressedRanges(
   }
   lines.push(`Sorted by ${sort === "time" ? "time" : "size"}`);
   lines.push("");
-  for (const r of merged.slice(0, limit)) {
-    // Ascending endpoint labels: non-monotonic refs (#1001) can make a
-    // positional span's labels numerically descending (#2168).
-    const range =
-      r.count === 1
-        ? r.startRef
-        : orderedRefPair(r.startRef, r.endRef).join("–");
-    const flag = flagFor ? flagFor(r) : null;
+  if (visible.length === 0) {
+    lines.push("  (no raw uncompressed messages)");
+  } else {
+    for (const r of merged.slice(0, limit)) {
+      // Ascending endpoint labels: non-monotonic refs (#1001) can make a
+      // positional span's labels numerically descending (#2168).
+      const range =
+        r.count === 1
+          ? r.startRef
+          : orderedRefPair(r.startRef, r.endRef).join("–");
+      const flag = flagFor ? flagFor(r) : null;
+      lines.push(
+        `  ${range}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}${flag ? `  ${flag}` : ""}`,
+      );
+    }
+    if (merged.length > limit) {
+      lines.push(`  ... and ${merged.length - limit} more ranges`);
+    }
+    // Static skeleton (never range-aware — expanded skeletons grow with the
+    // listing and leak onto query-only surfaces, #2302): the exact call shape
+    // the ranges above are meant to be folded with.
+    lines.push("");
     lines.push(
-      `  ${range}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}${flag ? `  ${flag}` : ""}`,
+      `  To fold one of the ranges above: compress({ content: "m00150\u2013m00220 optional topic\\n<summary markdown>" })`,
     );
   }
-  if (merged.length > limit) {
-    lines.push(`  ... and ${merged.length - limit} more ranges`);
+  // Rendered block-summary nodes: already-compressed mass that plain m-ref
+  // ranges do not fold. Shown separately (and split, as the nudge table does)
+  // instead of masquerading as fresh fold targets.
+  if (summaryNodes.length > 0) {
+    const sumTokens = summaryNodes.reduce((s, n) => s + n.tokens, 0);
+    lines.push("");
+    lines.push(
+      `ALREADY-COMPRESSED SUMMARY NODES — ${summaryNodes.length} node(s), ${formatTokens(sumTokens)}`,
+    );
+    const shown = summaryNodes.slice(0, limit);
+    lines.push(
+      `  ${shown
+        .map((n) => {
+          const block = state.blocks.find(
+            (b) => b.blockId === n.blockId && b.active,
+          );
+          return block
+            ? `${n.blockId} (T${block.tier}) ${formatTokens(n.tokens)}`
+            : `${n.blockId} ${formatTokens(n.tokens)}`;
+        })
+        .join(" \u00b7 ")}`,
+    );
+    if (summaryNodes.length > limit) {
+      lines.push(
+        `  ... and ${summaryNodes.length - limit} more nodes (scope:"compressed" lists every block)`,
+      );
+    }
+    lines.push(
+      `  These are block summaries already in the view — plain m-ref ranges do not fold them; only tier distillation (block-ID boundaries) does.`,
+    );
+    const hint = config ? tierActionHint(config, state).trim() : "";
+    if (hint) {
+      lines.push(`  ${hint}`);
+    } else if (config) {
+      lines.push(
+        `  Tier distillation is not armed yet — the nudge announces when block-ID distillation is actionable.`,
+      );
+    } else {
+      lines.push(
+        `  Fold them via tier distillation: compress({ content: "b1\u2013bN optional topic\\nsummary markdown..." })`,
+      );
+    }
   }
   return lines.join("\n");
 }

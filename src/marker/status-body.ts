@@ -31,6 +31,7 @@ const SECTION_HEADS: readonly string[] = [
     "COMPRESSED BLOCKS",
     "COMPRESSED — ",
     "UNCOMPRESSED — ",
+    "ALREADY-COMPRESSED SUMMARY NODES — ",
     "Sorted by size",
     "Sorted by time",
     "Sorted by tool",
