@@ -90,6 +90,7 @@ export function mergeCompress(
         tiers: pick("tiers"),
         protectedLatestTools: pick("protectedLatestTools"),
         protectedTools: pick("protectedTools"),
+        protectedUserPatterns: pick("protectedUserPatterns"),
         neverPreserveRecentTools: pick("neverPreserveRecentTools"),
         preserveRecentTools: pick("preserveRecentTools"),
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
@@ -373,6 +374,22 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
         };
     }
+    // Host-marked current-task prompts: the kernel already hard-excludes any
+    // message for which Config.isMessageProtected returns true. Map the literal
+    // substrings here so a long-lived session can keep its live task prompt out
+    // of fold ranges even when tool-result/image user messages follow it (the
+    // kernel's last-user protection only covers the last one).
+    const protectedUserPatterns = s.protectedUserPatterns ?? [];
+    const inheritedMessageProtected = base.isMessageProtected;
+    const isMessageProtected =
+        protectedUserPatterns.length > 0
+            ? (msg: Parameters<NonNullable<Config["isMessageProtected"]>>[0]) => {
+                  if (inheritedMessageProtected?.(msg) === true) return true;
+                  if (msg.role !== "user" || typeof msg.text !== "string") return false;
+                  const text = msg.text;
+                  return protectedUserPatterns.some((pattern) => text.includes(pattern));
+              }
+            : inheritedMessageProtected;
     const resolved: ResolvedKernelConfig = {
         ...base,
         modelContextLimit: limit,
@@ -391,6 +408,9 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         },
         protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         protectedTools: s.protectedTools ?? base.protectedTools,
+        // Combined host predicate: literal current-task markers OR whatever
+        // the lane already installed (durable skill catalog etc.).
+        ...(isMessageProtected ? { isMessageProtected } : {}),
         neverPreserveRecentTools: s.neverPreserveRecentTools ?? base.neverPreserveRecentTools,
         // base is Config (0.0.92 lacks the field) — the cast keeps both kernel windows compiling.
         preserveRecentTools: s.preserveRecentTools ?? (base as ResolvedKernelConfig).preserveRecentTools,

@@ -258,6 +258,17 @@ entries:
     desc_ja: "T1→T3 の階層型蒸留により、フォールドコストを世代間で分散する。"
     site_en: "On by default: tiered T1→T3 distillation spreads folding cost across generations."
     site_zh: "默认开：T1→T3 分级蒸馏，把折叠成本摊到多代。"
+  - key: compress.protectedUserPatterns
+    type: "string[]"
+    default: "none"
+    group: compress
+    id: ct.pup
+    render: compress-row
+    desc_en: "Literal substrings on user text messages: matching prompts never fold, even when they are not the latest user message. For host-marked current-task prompts in long-lived sessions."
+    desc_zh: "用户文本消息的字面子串：命中即永不折叠，即使它不是最后一条 user 消息。用于长会话里 host 标记的当前任务 prompt。"
+    desc_ja: "ユーザー本文のリテラル部分文字列：一致したプロンプトは最新のユーザーメッセージでなくてもフォールドされない。長寿命セッションでホストが現在のタスクを示す用途。"
+    site_en: "Protect host-marked current-task prompts from folding (literal substrings)."
+    site_zh: "保护 host 标记的当前任务 prompt 不被折叠（字面子串）。"
   - key: compress.protectedTools
     type: "string[]"
     default: "none"
