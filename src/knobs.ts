@@ -283,6 +283,9 @@ export function mitmHandshakeTimeoutMs(): number {
 
 const DEFAULT_LIMITS_RECEIVE_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
+// #7277: shipped defaults, kept as named exports (tests pin against them).
+export const DEFAULT_MAX_LARGE_DECODED_REQUESTS = 2;
+export const DEFAULT_LARGE_DECODED_ADMISSION_BYTES = 32 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
 const DEFAULT_HTTP_OUTBOUND_BYTES = 10 * 1024 * 1024;
@@ -308,6 +311,25 @@ const DEFAULT_INGEST_BODY_BYTES = 0;
 export function limitsReceiveBytes(): number {
     const v = tInt("BILI_RECEIVE_BODY_BYTES", loadConfigFile().network?.receiveBodyBytes);
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_RECEIVE_BYTES;
+}
+
+/** #7277: how many OVER-BAND decoded requests may be admitted at once (the 503
+ *  request_body_busy budget). BILI_MAX_LARGE_DECODED_REQUESTS >
+ *  network.maxLargeDecodedRequests > 2. 0 = refuse every over-band body (the
+ *  budget was hardcoded 2, so an operator facing a long in-flight upstream
+ *  stream had no way to widen it without a patch). */
+export function maxLargeDecodedRequests(): number {
+    const v = tInt("BILI_MAX_LARGE_DECODED_REQUESTS", loadConfigFile().network?.maxLargeDecodedRequests);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_MAX_LARGE_DECODED_REQUESTS;
+}
+
+/** #7277: decoded bytes above which a request consumes one admission slot.
+ *  BILI_LARGE_DECODED_ADMISSION_BYTES > network.largeDecodedAdmissionBytes >
+ *  32 MiB. observe() still takes Math.min with limitsReceiveBytes(), so a
+ *  smaller operator receive cap stays binding. */
+export function largeDecodedAdmissionBytes(): number {
+    const v = tInt("BILI_LARGE_DECODED_ADMISSION_BYTES", loadConfigFile().network?.largeDecodedAdmissionBytes);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LARGE_DECODED_ADMISSION_BYTES;
 }
 
 /** BILI_DECODED_BODY_BYTES > network.decodedBodyBytes > 10 GiB. Max DECODED bytes after
