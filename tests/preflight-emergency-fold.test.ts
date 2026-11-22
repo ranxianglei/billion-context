@@ -122,31 +122,30 @@ test("default: the #2383 emergency digest regime is OFF — unconvergent extreme
 
     try {
         assert.equal(process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST, undefined, "test premise: the opt-in env is unset (default)");
-        // 80 msgs x 32k chars ~= 2.56M chars — ABOVE the 2MB doomed-probe byte
-        // floor and, under the unknown-baseline char-count upper bound, ~106x
-        // the 24k window (far past the 19.2x coverage bound). NOTE the fresh-
-        // session geometry: the regime's char-based trigger needs >19.2x
-        // window-in-chars (~4.6M at this window), which the byte floor forbids
-        // — so a FRESH session at this size is answered fail-fast (deterministic
-        // can-never-fit, no LLM budget spent) instead of entering the walk.
-        // Either way the user-visible contract under default-off is: NO
-        // digest blocks, NO forward, fail-fast. (A FRESH session below the
-        // byte floor cannot reach the regime at all — see the size math in
-        // EMERGENCY_FOLD_COVERAGE; production #2383's 21.2x case carried a
-        // known baseline, which is why the char floor never applied there.)
+        // 60 msgs x 32k chars ~= 1.92M chars — deliberately BELOW the 2MB
+        // doomed-probe byte floor (src/server.ts: the fail-fast 413 fires at
+        // coreTextBytes > max(2MB, window×7.5)), so preflight actually RUNS
+        // and the default-off gate is what the test pins: the payload is ~20x
+        // the 24k window under the token regime — past the 19.2x coverage
+        // bound — so the ladder runs with REAL summarization calls and NO
+        // digest blocks are minted. (The old 80×32k = 2.56MB size tripped the
+        // byte floor and answered 413 before preflight, pinning nothing about
+        // this gate.) Same size as the e2e scenario A below, which pins the
+        // opt-in side (env=1): zero summarization calls + digest blocks — a
+        // clean A/B of the default flip.
         const mark = calls.length;
         const r = await fetch(url, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "emg-default-off" },
-            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(80, 32_000) }),
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(60, 32_000) }),
         });
         const body = await r.text();
-        assert.ok(r.status === 413 || r.status === 502,
-            `the unconvergent extreme-overflow request fails fast (got ${r.status}); body: ${body.slice(0, 400)}`);
-        assert.ok(!body.includes("[deterministic digest"), "no digest artifacts in the fail-fast answer");
-
+        assert.ok(r.status === 200 || r.status === 502,
+            `the extreme-overflow request converges (200) or exhausts the LLM ladder (502) — never a digest fast-path or a 413 (got ${r.status}); body: ${body.slice(0, 400)}`);
         const step = calls.slice(mark);
-        assert.equal(step.filter((c) => c.stream).length, 0, "the over-window payload was never forwarded");
+        assert.ok(step.filter((c) => !c.stream).length >= 1,
+            "the LLM fold ladder ran (real summarization calls) instead of the zero-call digest regime");
+        assert.ok(!body.includes("[deterministic digest"), "no digest artifacts in the answer");
 
         const s = listSessions().find((x) => x.id === "emg-default-off");
         const blocks = (s?.state.blocks ?? []).filter((b) => b.active);

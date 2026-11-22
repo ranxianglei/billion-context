@@ -2014,6 +2014,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // attempts keeps the #2662 no-backoff path intact.
     let poolQueueDrop = false;
     const triedKeys = new Set<string>();
+    // #1993 parity, across rounds, for the fresh parallel lane: a summary call
+    // rejected with a hard 400/413 means the full-size span will keep being
+    // rejected — the serial walk retries the two halves within its own round
+    // via pushSpanHalves, but the lane re-nominates from the kernel's plan
+    // each round, so the snapped halves are remembered here by ref pair and
+    // consumed by the next round's nomination before the full span is retried.
+    const freshHalvedSpans = new Map<string, Array<{ startRef: string; endRef: string }>>();
     let rangesRemaining = 0;
     // #1933 F3: scale the depth budgets with the entry overshoot (coverage-bound
     // note atop the file). A raised budget is only a ceiling — well-behaved
@@ -2048,13 +2055,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // Fresh-session parallel fold gate (owner decision 2026-11-22): a session
     // that has NEVER been forwarded (no usage sample ever landed —
     // lastInputTokens <= 0; stats.requests is already 1 here because the
-    // prepare lanes count this request before preflight runs) resends raw
-    // history verbatim, so no compression blocks can be "lost" and folding is
-    // pure gain. Existing sessions keep the serial walk byte-identically:
-    // a large payload there may indicate LOST folds, and the owner's rule for
-    // that case is to diagnose (warn), not to spend tokens folding.
+    // prepare lanes count this request before preflight runs) AND has never
+    // landed a fold (zero blocks) resends raw history verbatim, so no
+    // compression blocks can be "lost" and folding is pure gain. Existing
+    // sessions keep the serial walk byte-identically: a large payload there
+    // may indicate LOST folds, and the owner's rule for that case is to
+    // diagnose (warn), not to spend tokens folding. The blocks clause is what
+    // actually enforces that: the two look-alikes of "fresh" both carry
+    // active blocks — long-folded sessions whose settle resets lastInputTokens
+    // to 0 (cache-ledger credit floor) and adopted anonymous forks that
+    // inherit blocks but intentionally not stats (fork-adoption).
     const freshParallelFold = !baselineKnown && !emergencyFold
         && deps.session.stats.lastInputTokens <= 0
+        && deps.session.state.blocks.length === 0
         && entryLocal <= FRESH_PARALLEL_FOLD_MAX_CHARS;
     if (freshParallelFold) {
         deps.log("info", `[preflight] fresh-session parallel fold armed: ~${entryLocal} chars of verbatim history (≤ ${FRESH_PARALLEL_FOLD_MAX_CHARS} bound), ${FRESH_PARALLEL_FOLDS} concurrent in-model summarization call(s) per round instead of one serial fold`);
@@ -2891,6 +2904,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         effectiveMessageIds: string[];
                         targetKey: string;
                         spanUnits: number;
+                        // The nominated (snapped) span's message-index bounds —
+                        // #1993 halving on a hard 400/413 needs them to
+                        // remember smaller retry spans across rounds.
+                        spanIdx: [number, number];
+                        // This round's idx→ref map — the halving handler runs
+                        // in the worker, after the nomination loop's own map
+                        // is out of scope; messages are stable within the
+                        // round, so the reference stays valid.
+                        idxToRef: Map<number, string>;
                     };
                     const freshNoms: FreshNomination[] = [];
                     let freshReservedCalls = 0;
@@ -2920,6 +2942,23 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         // full-budget chunk first, sub-minimum fragments merged
                         // back up to the kernel's minCompressRange floor (#4740).
                         const spans = mergeSubMinimumFragments(messages, splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText), minChars, coveredIdx).slice().reverse();
+                        // #1993: a hard 400/413 on this range last round
+                        // remembered its halved spans — consume one (largest
+                        // first) before retrying the full-size span. Stale
+                        // halves (messages since folded away) fail to resolve
+                        // and are dropped.
+                        const remembered = freshHalvedSpans.get(skipKey);
+                        if (remembered && remembered.length > 0) {
+                            remembered.sort((a, b) => refNum(b.endRef) - refNum(a.endRef) || refNum(b.startRef) - refNum(a.startRef));
+                            const half = remembered.shift()!;
+                            const hs = refToIdx.get(half.startRef);
+                            const he = refToIdx.get(half.endRef);
+                            if (hs === undefined || he === undefined || hs > he) {
+                                noteSkip(`${skipKey}: remembered halved span ${half.startRef}–${half.endRef} no longer resolves (#1993)`);
+                                continue;
+                            }
+                            spans.push([hs, he]);
+                        }
                         const span = spans.pop();
                         if (!span) continue;
                         const maps = refMaps(messages, deps.session.state);
@@ -3018,12 +3057,22 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         // the external batch lane above):
                         if (summaryCalls + freshReservedCalls + chunks.length > summaryBudget) break;
                         freshReservedCalls += chunks.length;
-                        freshNoms.push({ skipKey, startRef, endRef, content, chunks, effectiveMessageIds: planned.effectiveMessageIds, targetKey, spanUnits });
+                        freshNoms.push({ skipKey, startRef, endRef, content, chunks, effectiveMessageIds: planned.effectiveMessageIds, targetKey, spanUnits, spanIdx: [bStart, bEnd], idxToRef: maps.idxToRef });
                     }
                     if (freshNoms.length >= 2) {
                         const maxSummary = activeConfig.compress.maxSummaryLength;
                         const startedAt = Date.now();
                         let laneFailure: PreflightFailure | undefined;
+                        // First hard verdict wins (walk parity: the serial
+                        // walk breaks on its first failure, so which error it
+                        // reports is deterministic — concurrent workers must
+                        // not make that racy). An abort always wins: the
+                        // client is gone either way. Declared before the
+                        // Promise.all below so the worker catch handlers can
+                        // reference it (no TDZ).
+                        const setLaneFailure = (f: PreflightFailure): void => {
+                            if (laneFailure === undefined || f === ABORTED_FAILURE) laneFailure = f;
+                        };
                         type FreshOutcome = { candidate?: string; reason?: string };
                         const outcomes = await Promise.all(freshNoms.map(async (nom): Promise<FreshOutcome> => {
                             // #1775: spread maxSummaryLength across the chunks so
@@ -3076,7 +3125,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                                         const transient = isTransientUpstreamError(err.status, err.body);
                                         const shapeRejection = isCredentialShapeRejection(err.status, err.body);
                                         const bodySnippet = safePrefix(err.body.trim(), 200);
-                                        laneFailure = {
+                                        setLaneFailure({
                                             kind: "upstream",
                                             status: err.status,
                                             retryable: shapeRejection ? false : transient,
@@ -3084,14 +3133,44 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                                                 ? shapeRejection
                                                     ? `the summarization call was rejected with HTTP 429 (rate_limit_error "Error") — suspected credential-shape rejection rather than a rate limit (#2189)`
                                                     : `the summarization call was rate-limited by the upstream (HTTP 429)`
-                                                : `the summarization call was rejected by the upstream (HTTP ${err.status})${bodySnippet ? `: ${bodySnippet}` : ""}`,
-                                        };
+                                                : `the summarization call was rejected by the upstream (HTTP ${err.status})${bodySnippet ? `: ${bodySnippet}` : ""}${shapeRejection ? ". The upstream requires a request attribute missing from the summary call, e.g. the client's billing-attribution system block" : ""}`,
+                                        });
                                         deps.log("warn", `[preflight] fresh-parallel summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)${bodySnippet ? `: ${bodySnippet}` : ""}`);
+                                        if (!transient && (err.status === 400 || err.status === 413)) {
+                                            // #1993 parity: the body was too large for the
+                                            // summary endpoint, so retrying the full
+                                            // span next round would be rejected again.
+                                            // The walk pushes the two snapped halves onto
+                                            // its own round's span queue; the lane
+                                            // re-nominates from the kernel's plan each
+                                            // round, so remember them here by ref — the
+                                            // next round's nomination consumes them before
+                                            // the full span is tried again. At/below the
+                                            // floor the walk gives up on the span; do the
+                                            // same (skipSet) instead of halving forever.
+                                            const [hs, he] = nom.spanIdx;
+                                            if (he > hs && spanUnitsOf(messages, hs, he, countText) >= 2 * minChars) {
+                                                const mid = Math.floor((hs + he) / 2);
+                                                const halves: Array<[number, number] | null> = [snapToUsableBounds(nom.idxToRef, mid + 1, he), snapToUsableBounds(nom.idxToRef, hs, mid)];
+                                                for (const half of halves) {
+                                                    if (!half) continue;
+                                                    const sr = nom.idxToRef.get(half[0]);
+                                                    const er = nom.idxToRef.get(half[1]);
+                                                    if (sr === undefined || er === undefined) continue;
+                                                    const arr = freshHalvedSpans.get(nom.skipKey);
+                                                    if (arr) arr.push({ startRef: sr, endRef: er });
+                                                    else freshHalvedSpans.set(nom.skipKey, [{ startRef: sr, endRef: er }]);
+                                                }
+                                            } else {
+                                                skipSet.add(nom.skipKey);
+                                                noteSkip(`${nom.skipKey}: summary body hard-rejected at/below the minimum span size (${err.status}, #1993)`);
+                                            }
+                                        }
                                     } else if (err instanceof SummaryTransportError) {
                                         const caNote = isTlsTrustCode(err.code) ? ` — ${tlsTrustRemediation()}` : "";
-                                        laneFailure = { kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) };
+                                        setLaneFailure({ kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) });
                                     } else {
-                                        laneFailure = { kind: "upstream", detail: "the summarization call failed unexpectedly" };
+                                        setLaneFailure({ kind: "upstream", detail: "the summarization call failed unexpectedly" });
                                     }
                                     return { reason: "summarization call failed" };
                                 }
@@ -3116,28 +3195,43 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             }
                             return { reason: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${maxSummary}) and cannot be rescued` };
                         }));
-                        // Sequential commits (kernel state mutates single-threaded,
-                        // #2678 shape): nomination order, oldest first.
+                        // Sequential commits (kernel state mutates
+                        // single-threaded, #2678 shape): nomination order
+                        // (size-desc, matching the ordered sort).
+                        // walk parity: a hard upstream verdict stands as the
+                        // round's failure BEFORE the commits — each successful
+                        // commit below clears it via commitFold's #1993 reset
+                        // (the payload shrank, so the stale verdict no longer
+                        // describes the end state), and with nothing committed
+                        // it is reported as-is — including a deterministic
+                        // shape wall (#2189) that the old "committed === 0"
+                        // guard silently swallowed behind one lucky commit.
+                        if (laneFailure) failure = laneFailure;
                         let committed = 0;
                         for (let ni = 0; ni < freshNoms.length; ni++) {
                             const out = outcomes[ni];
                             const nom = freshNoms[ni];
                             if (out.candidate === undefined) {
                                 // Deliberately NOT added to the skipSet — the
-                                // serial walk below takes the range over this
-                                // round (halving/transient semantics), and later
-                                // rounds re-nominate it (same contract as the
-                                // external batch lane).
-                                deps.log("warn", `[preflight] fresh-parallel range ${nom.skipKey} not folded this round (${out.reason}) — the serial walk may take it over`);
+                                // next round re-nominates the range (a hard
+                                // 400/413 also leaves remembered halves in
+                                // freshHalvedSpans, #1993 parity), and a round
+                                // where the lane commits nothing falls through
+                                // to the serial walk below. Note the walk does
+                                // NOT run in a round where the lane committed a
+                                // fold — that commit already fills the round's
+                                // maxFoldsPerRound = 1 budget.
+                                deps.log("warn", `[preflight] fresh-parallel range ${nom.skipKey} not folded this round (${out.reason}) — re-nominated next round, walk takes over only if this lane commits nothing`);
                                 continue;
                             }
                             commitFold(nom.skipKey, nom.startRef, nom.endRef, out.candidate, nom.effectiveMessageIds, false, nom.targetKey);
                             committed += 1;
                         }
-                        // A hard failure with zero commits stands as the round's
-                        // failure (mirroring the walk: a successful commit clears
-                        // the stale verdict via commitFold's #1993 reset).
-                        if (committed === 0 && laneFailure) failure = laneFailure;
+                        // A successful commit cleared any stale verdict via
+                        // commitFold's #1993 reset; nothing more to do here —
+                        // see the pre-commit assignment above for the walk-
+                        // parity reasoning.
+                        void committed;
                         deps.log("info", `[preflight] fresh-parallel fold: ${committed}/${freshNoms.length} range(s) committed in ${Date.now() - startedAt}ms (${freshReservedCalls} concurrent in-model summarization call(s))`);
                     }
                 }
