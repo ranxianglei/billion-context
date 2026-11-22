@@ -175,6 +175,21 @@ const EMERGENCY_ROUND_CAP = 512;
 // Per-entry head-fragment length in digest form A (form B strips heads when
 // even that does not fit the bounds).
 const DIGEST_HEAD_CHARS = 120;
+// Fresh-session parallel fold gate (owner decision 2026-11-22, #2383 follow-up).
+// A FRESH session (no usage baseline yet) resends its whole raw history verbatim
+// — no compression blocks can have been lost, so folding is pure gain, not a
+// token spend on a possibly-broken session. Below this char bound (≈1M real
+// tokens × 4 chars/token × 1.5 headroom, the owner's "non-strict 1M" gate)
+// the fold work is worth paying: its ranges are summarized K-AT-A-ONCE instead
+// of one-per-round serially. Above the bound the request fails fast instead
+// (the digest regime is default-off) — folding tens-of-MB histories would burn
+// the call budget without converging in one invocation.
+const FRESH_PARALLEL_FOLD_MAX_CHARS = 6_000_000;
+// Concurrent in-model summarization calls per fold round for fresh sessions.
+// 2 halves the ladder's wall clock on the common case while keeping the per-
+// call budget, the probe/dead-verdict and the transient-retry semantics
+// simple to reason about; raise to 4 if upstream rate limits allow.
+const FRESH_PARALLEL_FOLDS = 2;
 
 // #869 review: coverage bound of the two depth budgets above. One round folds
 // ONE range and each fold removes at most CHUNK_FRACTION x window tokens (the
@@ -2030,6 +2045,20 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) but the emergency digest regime is disabled (default off — model-visible hard truncation, #2383; set BILI_PREFLIGHT_EMERGENCY_DIGEST=1 or network.emergencyDigest to restore) — running the LLM fold ladder, which may exhaust its budget and fail fast`);
     }
     const effectiveRoundCap = emergencyFold ? EMERGENCY_ROUND_CAP : roundBudget;
+    // Fresh-session parallel fold gate (owner decision 2026-11-22): a session
+    // that has NEVER been forwarded (no usage sample ever landed —
+    // lastInputTokens <= 0; stats.requests is already 1 here because the
+    // prepare lanes count this request before preflight runs) resends raw
+    // history verbatim, so no compression blocks can be "lost" and folding is
+    // pure gain. Existing sessions keep the serial walk byte-identically:
+    // a large payload there may indicate LOST folds, and the owner's rule for
+    // that case is to diagnose (warn), not to spend tokens folding.
+    const freshParallelFold = !baselineKnown && !emergencyFold
+        && deps.session.stats.lastInputTokens <= 0
+        && entryLocal <= FRESH_PARALLEL_FOLD_MAX_CHARS;
+    if (freshParallelFold) {
+        deps.log("info", `[preflight] fresh-session parallel fold armed: ~${entryLocal} chars of verbatim history (≤ ${FRESH_PARALLEL_FOLD_MAX_CHARS} bound), ${FRESH_PARALLEL_FOLDS} concurrent in-model summarization call(s) per round instead of one serial fold`);
+    }
     if (emergencyFold) {
         deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) — folding with deterministic digests instead of summarization calls; originals stay restorable via decompress (#2383)`);
     }
@@ -2846,6 +2875,272 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     }
                 }
             }
+            // Fresh-session parallel fold (owner decision 2026-11-22, #2383
+            // follow-up). Sibling of the external-summary batch lane above —
+            // that one only runs when an explicit external summary runtime is
+            // configured; this is the in-model path for FRESH sessions, where
+            // the serial walk below would pay N sequential 15-40s ladder
+            // rounds to fold a megabytes-of-raw-history first resend:
+            if (freshParallelFold && !(probeGated && probeDead)) {
+                    type FreshNomination = {
+                        skipKey: string;
+                        startRef: string;
+                        endRef: string;
+                        content: string;
+                        chunks: string[];
+                        effectiveMessageIds: string[];
+                        targetKey: string;
+                        spanUnits: number;
+                    };
+                    const freshNoms: FreshNomination[] = [];
+                    let freshReservedCalls = 0;
+                    for (let oi = 0; oi < ordered.length && freshNoms.length < FRESH_PARALLEL_FOLDS; oi++) {
+                        const range = ordered[oi];
+                        const skipKey = `${range.startRef}:${range.endRef}`;
+                        if (skipSet.has(skipKey)) continue;
+                        const { refToIdx } = refMaps(messages, deps.session.state);
+                        const startIdx = refToIdx.get(range.startRef);
+                        const endIdx = refToIdx.get(range.endRef);
+                        if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) {
+                            skipSet.add(skipKey);
+                            const why = startIdx === undefined
+                                ? `start ref ${range.startRef} is absent from the current messages`
+                                : endIdx === undefined
+                                    ? `end ref ${range.endRef} is absent from the current messages`
+                                    : `position resolution inverted the range (${startIdx} > ${endIdx})`;
+                            deps.log("warn", `[preflight] skipping range ${skipKey}: ${why}`);
+                            noteSkip(`${skipKey}: ${why}`);
+                            continue;
+                        }
+                        if (!triedKeys.has(skipKey)) {
+                            triedKeys.add(skipKey);
+                            rangesTried += 1;
+                        }
+                        // Same span selection as the walk/batch lanes: oldest
+                        // full-budget chunk first, sub-minimum fragments merged
+                        // back up to the kernel's minCompressRange floor (#4740).
+                        const spans = mergeSubMinimumFragments(messages, splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText), minChars, coveredIdx).slice().reverse();
+                        const span = spans.pop();
+                        if (!span) continue;
+                        const maps = refMaps(messages, deps.session.state);
+                        // #2672 parity with the walk: snap instead of dropping —
+                        // a boundary without a plain ref loses at most its
+                        // unreferencable rim (the kernel excludes it anyway).
+                        const bounds = snapToUsableBounds(maps.idxToRef, span[0], span[1]);
+                        const bStart = bounds?.[0];
+                        const bEnd = bounds?.[1];
+                        let startRef = bStart !== undefined ? maps.idxToRef.get(bStart) : undefined;
+                        let endRef = bEnd !== undefined ? maps.idxToRef.get(bEnd) : undefined;
+                        if (bStart === undefined || bEnd === undefined || !startRef || !endRef) {
+                            deps.log("warn", `[preflight] dropping span ${span[0]}..${span[1]} of range ${skipKey}: no message carries a usable ref (protected or unreferenced)`);
+                            noteSkip(`${skipKey}: span ${span[0]}..${span[1]} has no usable ref boundary`);
+                            continue;
+                        }
+                        // #1001: refs are not monotonic with position after a
+                        // client history rewrite — emit ascending pairs.
+                        if (refNum(startRef) > refNum(endRef)) {
+                            [startRef, endRef] = [endRef, startRef];
+                        }
+                        const preview = deps.core.applyCompression({
+                            messages,
+                            state: deps.session.state,
+                            config: activeConfig,
+                            ranges: [{ startRef, endRef, summary: "x".repeat(Math.max(MIN_SUMMARY_CHARS, activeConfig.compress.minSummaryLength)) }],
+                        });
+                        const previousBlockIds = new Set(deps.session.state.blocks.map((block) => block.blockId));
+                        const planned = preview.state.blocks.find((block) => !previousBlockIds.has(block.blockId));
+                        if (!planned) {
+                            const verdict = safePrefix([...preview.result.errors, ...preview.result.warnings].join("; "), 300)
+                                || "the kernel created no block and reported no error";
+                            deps.log("warn", `[preflight] preview rejected range ${skipKey}: ${verdict}`);
+                            noteSkip(`${skipKey}: preview rejected — ${verdict}`);
+                            // #2638/#1372 (walk parity): the structural-empty
+                            // verdicts are regime-independent — remember them so
+                            // neither this lane nor the walk re-nominates them.
+                            const named = parseStructuralEmptyVerdict([...preview.result.errors, ...preview.result.warnings].join("\n"));
+                            if (named !== null) {
+                                skipSet.add(skipKey);
+                                recordDeadRange(deps.session, startRef, endRef, named);
+                            }
+                            continue;
+                        }
+                        const targetKey = foldTargetKey(planned, deps.session.state);
+                        // Direct raw messages render host-side (#781 image notes
+                        // live in BiliMessage sidecars); consumed child blocks
+                        // render through the kernel as summaries — byte-identical
+                        // to the walk's renderer.
+                        const idxById = new Map(messages.map((m, i) => [m.id, i]));
+                        const byRaw = deps.session.state?.messageRefs?.byRaw;
+                        const parts: string[] = [];
+                        const droppedParts: string[] = [];
+                        for (const id of planned.directMessageIds) {
+                            const i = idxById.get(id);
+                            if (i === undefined) { droppedParts.push(`message ${id} not found in current messages`); continue; }
+                            const m = messages[i];
+                            let text = m.text ?? "";
+                            const notes = imagePlaceholdersForSummary(m, byRaw?.[m.id]);
+                            if (notes.length > 0) {
+                                const note = notes.join(" ");
+                                text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+                            }
+                            if (!text) { droppedParts.push(`message ${id} rendered no text`); continue; }
+                            const label =
+                                m.contentType === "tool-call"
+                                    ? `assistant tool-call ${m.toolName ?? "?"}`
+                                    : m.contentType === "tool-result"
+                                        ? `tool result ${m.toolName ?? "?"}`
+                                        : m.contentType === "reasoning"
+                                            ? "assistant reasoning"
+                                            : m.role;
+                            parts.push(`[${label}]\n${text}`);
+                        }
+                        for (const nid of planned.directBlockIds) {
+                            const nb = deps.session.state.blocks.find((b) => b.blockId === nid);
+                            if (!nb) { droppedParts.push(`child block ${nid} missing from state`); continue; }
+                            const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
+                            parts.push(`[summarized ${label}]\n${nb.summary}`);
+                        }
+                        if (droppedParts.length > 0) {
+                            deps.log("debug", `[preflight] range ${skipKey}: ${droppedParts.length} part(s) rendered nothing (${droppedParts.slice(0, 3).join("; ")})`);
+                        }
+                        const content = parts.join("\n\n");
+                        if (content.length === 0) {
+                            deps.log("warn", `[preflight] planned block for range ${skipKey} rendered no text: ${droppedParts.slice(0, 5).join("; ") || "all parts empty"}`);
+                            noteSkip(`${skipKey}: planned block rendered no text (${droppedParts.slice(0, 3).join("; ") || "all parts empty"})`);
+                            continue;
+                        }
+                        const chunks = splitSummaryContent(content, budget, countText);
+                        // Char regime only here (freshParallelFold ⇒ !baselineKnown):
+                        // the net-shrink bound's units are the folded span's raw
+                        // char mass, matching the post-fold accounting in commitFold.
+                        const spanUnits = coveredMessageChars(messages, planned.effectiveMessageIds);
+                        // Reserve the calls before dispatching (same discipline as
+                        // the external batch lane above):
+                        if (summaryCalls + freshReservedCalls + chunks.length > summaryBudget) break;
+                        freshReservedCalls += chunks.length;
+                        freshNoms.push({ skipKey, startRef, endRef, content, chunks, effectiveMessageIds: planned.effectiveMessageIds, targetKey, spanUnits });
+                    }
+                    if (freshNoms.length >= 2) {
+                        const maxSummary = activeConfig.compress.maxSummaryLength;
+                        const startedAt = Date.now();
+                        let laneFailure: PreflightFailure | undefined;
+                        type FreshOutcome = { candidate?: string; reason?: string };
+                        const outcomes = await Promise.all(freshNoms.map(async (nom): Promise<FreshOutcome> => {
+                            // #1775: spread maxSummaryLength across the chunks so
+                            // each call carries a per-chunk character ceiling.
+                            const perChunkBudget = maxSummary > 0
+                                ? Math.floor((maxSummary - (nom.chunks.length - 1) * SUMMARY_JOIN_GAP) / nom.chunks.length)
+                                : undefined;
+                            const partTexts: string[] = [];
+                            for (const chunk of nom.chunks) {
+                                if (summaryCalls >= summaryBudget) { budgetHit = true; break; }
+                                if (deps.signal?.aborted) return { reason: "client aborted" };
+                                summaryCalls += 1;
+                                try {
+                                    let part = await summarizeRange(deps, chunk, nom.startRef, nom.endRef, perChunkBudget);
+                                    let transientTries = 0;
+                                    while (
+                                        "unusable" in part && part.transient &&
+                                        transientTries < TRANSIENT_EMPTY_SUMMARY_RETRIES &&
+                                        transientRetryBudget > 0 &&
+                                        summaryCalls < summaryBudget &&
+                                        !deps.signal?.aborted
+                                    ) {
+                                        transientTries += 1;
+                                        transientRetryBudget -= 1;
+                                        const delayMs = replayBackoffMs(transientTries);
+                                        await sleep(delayMs, deps.signal);
+                                        summaryCalls += 1;
+                                        part = await summarizeRange(deps, chunk, nom.startRef, nom.endRef, perChunkBudget);
+                                    }
+                                    if ("unusable" in part) {
+                                        if (part.deterministic) {
+                                            // #2832: a deterministic empty (normal stop,
+                                            // zero text) is not size-driven — remember the
+                                            // strike and skip this range without halving.
+                                            recordDeterministicEmpty();
+                                            skipSet.add(nom.skipKey);
+                                            noteSkip(`${nom.skipKey}: deterministic empty summary (${part.unusable.slice(0, 160)})`);
+                                        } else {
+                                            clearDeterministicProbe();
+                                        }
+                                        return { reason: part.unusable.slice(0, 200) };
+                                    }
+                                    clearDeterministicProbe();
+                                    partTexts.push(part.summary);
+                                } catch (err) {
+                                    if (deps.signal?.aborted) {
+                                        laneFailure = ABORTED_FAILURE;
+                                    } else if (err instanceof UpstreamHttpError) {
+                                        // #1993/#2189 parity with the walk's catch:
+                                        const transient = isTransientUpstreamError(err.status, err.body);
+                                        const shapeRejection = isCredentialShapeRejection(err.status, err.body);
+                                        const bodySnippet = safePrefix(err.body.trim(), 200);
+                                        laneFailure = {
+                                            kind: "upstream",
+                                            status: err.status,
+                                            retryable: shapeRejection ? false : transient,
+                                            detail: err.status === 429
+                                                ? shapeRejection
+                                                    ? `the summarization call was rejected with HTTP 429 (rate_limit_error "Error") — suspected credential-shape rejection rather than a rate limit (#2189)`
+                                                    : `the summarization call was rate-limited by the upstream (HTTP 429)`
+                                                : `the summarization call was rejected by the upstream (HTTP ${err.status})${bodySnippet ? `: ${bodySnippet}` : ""}`,
+                                        };
+                                        deps.log("warn", `[preflight] fresh-parallel summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)${bodySnippet ? `: ${bodySnippet}` : ""}`);
+                                    } else if (err instanceof SummaryTransportError) {
+                                        const caNote = isTlsTrustCode(err.code) ? ` — ${tlsTrustRemediation()}` : "";
+                                        laneFailure = { kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) };
+                                    } else {
+                                        laneFailure = { kind: "upstream", detail: "the summarization call failed unexpectedly" };
+                                    }
+                                    return { reason: "summarization call failed" };
+                                }
+                            }
+                            if (partTexts.length < nom.chunks.length) {
+                                return { reason: budgetHit ? "summary budget exhausted" : "incomplete assembly" };
+                            }
+                            // Acceptance identical to the walk/batch lanes: absolute
+                            // cap, then net-shrink monotonicity (#861/#1775/#1819),
+                            // rescue-truncate when truncating still nets savings.
+                            const candidate = partTexts.join("\n\n");
+                            const shrinkOk = (text: string): boolean => countText(text) <= nom.spanUnits * NET_SHRINK_TOLERANCE;
+                            if (maxSummary <= 0 || candidate.length <= maxSummary) {
+                                return shrinkOk(candidate) ? { candidate } : { reason: `assembled summary (~${countText(candidate)} units) does not shrink its range (~${nom.spanUnits} units) — suspected regurgitation` };
+                            }
+                            if (candidate.length < nom.content.length) {
+                                const rescued = truncateSummaryToLimit(candidate, maxSummary, activeConfig.compress.minSummaryLength);
+                                if (rescued !== null && shrinkOk(rescued)) {
+                                    deps.log("warn", `[preflight] fresh-parallel range ${nom.skipKey}: assembled summary ${candidate.length} chars exceeded maxSummaryLength (${maxSummary}); truncated to ${rescued.length} chars`);
+                                    return { candidate: rescued };
+                                }
+                            }
+                            return { reason: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${maxSummary}) and cannot be rescued` };
+                        }));
+                        // Sequential commits (kernel state mutates single-threaded,
+                        // #2678 shape): nomination order, oldest first.
+                        let committed = 0;
+                        for (let ni = 0; ni < freshNoms.length; ni++) {
+                            const out = outcomes[ni];
+                            const nom = freshNoms[ni];
+                            if (out.candidate === undefined) {
+                                // Deliberately NOT added to the skipSet — the
+                                // serial walk below takes the range over this
+                                // round (halving/transient semantics), and later
+                                // rounds re-nominate it (same contract as the
+                                // external batch lane).
+                                deps.log("warn", `[preflight] fresh-parallel range ${nom.skipKey} not folded this round (${out.reason}) — the serial walk may take it over`);
+                                continue;
+                            }
+                            commitFold(nom.skipKey, nom.startRef, nom.endRef, out.candidate, nom.effectiveMessageIds, false, nom.targetKey);
+                            committed += 1;
+                        }
+                        // A hard failure with zero commits stands as the round's
+                        // failure (mirroring the walk: a successful commit clears
+                        // the stale verdict via commitFold's #1993 reset).
+                        if (committed === 0 && laneFailure) failure = laneFailure;
+                        deps.log("info", `[preflight] fresh-parallel fold: ${committed}/${freshNoms.length} range(s) committed in ${Date.now() - startedAt}ms (${freshReservedCalls} concurrent in-model summarization call(s))`);
+                    }
+                }
         }
         // #4224: emergency digests are CPU-only (zero upstream calls), so the
         // LLM-path "one fold per round" cap wastes hundreds of rounds.
