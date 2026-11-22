@@ -284,7 +284,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 
 | 键 | 默认 | 作用 |
 |---|---|---|
-| ~~`storage.snapBase.*`~~ | — | **本 PR 已退役**(bc51c9445)——config.ts/knobs.ts 已移除;残留键被忽略 | | `network.ingestBodyBytes` | 32MiB | 入站 body 上限(实测 155MB 场景需调 1GiB;env `BILI_INGEST_BODY_BYTES` 优先) |
+| ~~`storage.snapBase.*`~~ | — | **本 PR 已退役**(bc51c9445)——config.ts/knobs.ts 已移除;残留键被忽略 | `network.ingestBodyBytes` | 32MiB | 入站 body 上限(实测 155MB 场景需调 1GiB;env `BILI_INGEST_BODY_BYTES` 优先) |
 
 ### 4.3 响应头(协议面)
 

@@ -282,7 +282,7 @@ Fold tx: blocks insert/update + covered rows retired (same tx) + one fold_journa
 
 | Key | Default | Effect |
 |---|---|---|
-| ~~`storage.snapBase.*`~~ | — | **RETIRED by this PR** (bc51c9445) — removed from config.ts/knobs.ts; a leftover key is ignored | | `network.ingestBodyBytes` | 32MiB | inbound body cap (the measured 155MB scenario needs 1GiB; env `BILI_INGEST_BODY_BYTES` takes priority) |
+| ~~`storage.snapBase.*`~~ | — | **RETIRED by this PR** (bc51c9445) — removed from config.ts/knobs.ts; a leftover key is ignored | `network.ingestBodyBytes` | 32MiB | inbound body cap (the measured 155MB scenario needs 1GiB; env `BILI_INGEST_BODY_BYTES` takes priority) |
 
 ### 4.3 Response/request headers (protocol surface)
 
