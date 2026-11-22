@@ -28,7 +28,6 @@ import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
 import { listInstances, type RegistryEntry } from "../instance.js";
 import type { MessageContentStore } from "acp-kernel";
-import type { BlockView } from "../session.js";
 
 /** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
  *  built-in autocheckpoint alone cannot guarantee reclamation in a long-lived
@@ -78,23 +77,11 @@ export function rewriteArchiveLog(file: string, text: string): void {
         try { unlinkSync(tmp); } catch { /* rename already consumed the temporary file */ }
     }
 }
-/** #4739 test instrumentation: message rows materialized by getMessages /
- *  getMessagesAt (including content decoding + media hydration). Production
- *  code never reads this; tests assert ordinary loads stop decoding the
- *  whole historical log. */
+/** #4739 test instrumentation: message rows materialized by getMessages
+ *  (including content decoding + media hydration). Production code never
+ *  reads this; tests assert ordinary loads stop decoding the whole
+ *  historical log. */
 export const messageRowReads = { count: 0 };
-
-/** #4739: the message seqs a view actually resolves — the union of the
- *  tail/pluginSnapshot pointers in a tail_json document. loadLegacyView
- *  consumes ONLY these rows; the rest of the log is decode waste on an
- *  ordinary load. Non-number entries are dropped (they can only ever miss
- *  in pointer resolution, i.e. count as gaps); malformed JSON throws —
- *  the view path's existing corrupt-fallback contract. */
-export function viewPointerSeqs(tailJson: string): number[] {
-    const tail = JSON.parse(tailJson) as { tailSeqs?: unknown; pluginSnapshotSeqs?: unknown };
-    const pick = (v: unknown): number[] => (Array.isArray(v) ? v.filter((s): s is number => typeof s === "number") : []);
-    return [...pick(tail.tailSeqs), ...pick(tail.pluginSnapshotSeqs)];
-}
 
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
@@ -1917,21 +1904,29 @@ export class UnifiedStore {
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
     }
 
-    /** #3285: drop EVERY session's ingest watermark at once. A watermark
-     *  vouches "the writer that set it verified this prefix" but carries no
-     *  writer identity, so the trust must not survive a process handoff:
-     *  under the multi-process shared-directory contract (#2671) a
-     *  restart-handoff overlap (old instance still draining while the new
-     *  one boots, both sharing index.db) leaves a foreign process's rows
-     *  AND its watermark behind, and inheriting that trust lets the new
-     *  process take unverified empty deltas against rows it never wrote.
-     *  Called once at writer init (UnifiedShadow.maybeOpen); pure readers
-     *  (export) must not call it. After the reset each session's first save
-     *  takes the exact full path — an authoritative replace, see
-     *  ingestSession — re-establishing trust from this process's own view.
-     *  Cost: one full ingest per saved session per boot. */
-    resetAllIngestWatermarks(): void {
-        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL").run();
+    /** #3285 (2026-11-21 per-session rework): watermark trust does not cross
+     *  process boundaries — a watermark vouches "the writer that set it
+     *  verified this prefix" but carries no writer identity, so under the
+     *  multi-process shared-directory contract (#2671) a restart-handoff
+     *  overlap leaves a foreign process's rows AND its watermark behind,
+     *  and inheriting that trust lets the new process take unverified empty
+     *  deltas against rows it never wrote.
+     *  The 2026-10-31 implementation dropped EVERY session's watermark in one
+     *  global write at open — it touched every other session and made open
+     *  itself a write (the #7156 first-write hazard). The trust boundary is
+     *  actually per-session: a process only needs to distrust watermarks it
+     *  did not set, for the session it is about to save. So the invalidation
+     *  moved here — first touch of a session in THIS process drops any
+     *  foreign-set watermark for that ONE session (→ the next save takes the
+     *  exact full path, re-establishing trust from this process's own view);
+     *  later touches trust this process's own watermarks. Per (process,
+     *  session) the trust decision is byte-identical to the global reset;
+     *  untouched sessions keep their watermarks, and open performs no write. */
+    private readonly ingestTouchedThisProcess = new Set<string>();
+    primeIngestTrust(sessionId: string): void {
+        if (this.ingestTouchedThisProcess.has(sessionId)) return;
+        this.ingestTouchedThisProcess.add(sessionId);
+        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
     }
 
     /** #3248 lane-ownership probe for the message sweep (#3285): every ext
@@ -3682,53 +3677,22 @@ export class UnifiedStore {
         return row?.orphans_json ?? null;
     }
 
-    /** Dual-mode accessor — two PRs converged on one name (arity-dispatched):
-     *  - `getBlockContents(id, { limit, offset })`: one bounded page of
-     *    block-content CAS bytes for batched view decoding
-     *    (storage-bounded-load / issue4739-storage-read-snapshot pin this shape);
-     *  - `getBlockContents(id)`: the full narrow replay-leg contents map for
-     *    lazy-field restore (#4739) — block-row summary/one CAS bytes plus the
-     *    orphans_json journal precedence, WITHOUT resurrecting state.blocks
-     *    (issue4739-bounded-session-load pins this). */
-    getBlockContents(sessionId: string, opts: { limit: number; offset?: number }): Pick<BlockRow, "blockId" | "summary" | "one">[];
-    getBlockContents(sessionId: string): BlockContentsMap | null;
-    getBlockContents(sessionId: string, opts?: { limit: number; offset?: number }): Pick<BlockRow, "blockId" | "summary" | "one">[] | BlockContentsMap | null {
-        if (opts !== undefined) {
-            const rows = this.db.prepare(`SELECT b.block_id, b.one_hash, s.bytes AS summary_bytes, o.bytes AS one_bytes
-                FROM (SELECT block_id, ord, summary_hash, one_hash FROM blocks
-                    WHERE session_id = ? ORDER BY ord, block_id LIMIT ? OFFSET ?) b
-                LEFT JOIN content s ON s.hash = b.summary_hash
-                LEFT JOIN content o ON o.hash = b.one_hash
-                ORDER BY b.ord, b.block_id`)
-                .all(sessionId, opts.limit, opts.offset ?? 0) as { block_id: string; one_hash: string | null; summary_bytes: Buffer | null; one_bytes: Buffer | null }[];
-            return rows.map((row) => ({
-                blockId: row.block_id,
-                summary: row.summary_bytes === null ? "" : Buffer.from(row.summary_bytes).toString("utf8"),
-                one: row.one_hash && row.one_bytes !== null ? Buffer.from(row.one_bytes).toString("utf8") : null,
-            }));
-        }
-        const row = this.db
-            .prepare("SELECT orphans_json FROM sessions WHERE session_id = ?")
-            .get(sessionId) as { orphans_json: string | null } | undefined;
-        if (!row) return null;
-        const out: BlockContentsMap = new Map();
-        for (const b of this.getBlocks(sessionId)) {
-            out.set(b.blockId, {
-                one: b.one === null ? null : (JSON.parse(b.one) as BlockView),
-                full: JSON.parse(b.summary) as BlockView,
-            });
-        }
-        if (row.orphans_json !== null && row.orphans_json !== undefined && row.orphans_json !== "") {
-            try {
-                const orphans = JSON.parse(row.orphans_json) as Record<string, { one: BlockView | null; full: BlockView }>;
-                for (const [blockId, view] of Object.entries(orphans)) {
-                    if (!out.has(blockId)) out.set(blockId, view);
-                }
-            } catch {
-                // corrupt journal → skip (same boundary as loadLegacyView)
-            }
-        }
-        return out;
+    /** #4739: one bounded page of block-content CAS bytes for batched view
+     *  decoding (storage-bounded-load / issue4739-storage-read-snapshot pin
+     *  this shape). */
+    getBlockContents(sessionId: string, opts: { limit: number; offset?: number }): Pick<BlockRow, "blockId" | "summary" | "one">[] {
+        const rows = this.db.prepare(`SELECT b.block_id, b.one_hash, s.bytes AS summary_bytes, o.bytes AS one_bytes
+            FROM (SELECT block_id, ord, summary_hash, one_hash FROM blocks
+                WHERE session_id = ? ORDER BY ord, block_id LIMIT ? OFFSET ?) b
+            LEFT JOIN content s ON s.hash = b.summary_hash
+            LEFT JOIN content o ON o.hash = b.one_hash
+            ORDER BY b.ord, b.block_id`)
+            .all(sessionId, opts.limit, opts.offset ?? 0) as { block_id: string; one_hash: string | null; summary_bytes: Buffer | null; one_bytes: Buffer | null }[];
+        return rows.map((row) => ({
+            blockId: row.block_id,
+            summary: row.summary_bytes === null ? "" : Buffer.from(row.summary_bytes).toString("utf8"),
+            one: row.one_hash && row.one_bytes !== null ? Buffer.from(row.one_bytes).toString("utf8") : null,
+        }));
     }
     getSessionRow(sessionId: string): SessionRow | null {
         const row = this.db
@@ -4020,84 +3984,6 @@ export class UnifiedStore {
         });
     }
 
-    /** #4739: live message rows for EXACTLY the given seqs — the bounded
-     *  fetch for ordinary loads (the view resolves only tail/pluginSnapshot
-     *  pointers). Same row shape and media hydration as getMessages; retired
-     *  rows stay excluded and missing seqs simply don't come back (the view
-     *  counts them as gaps). Chunked IN keeps the bound independent of
-     *  pointer count. */
-    getMessagesAt(sessionId: string, seqs: readonly number[]): (MessageRow & { contentHash: string })[] {
-        if (seqs.length === 0) return [];
-        const unique = [...new Set(seqs)];
-        const CHUNK = 500;
-        const out: (MessageRow & { contentHash: string })[] = [];
-        for (let i = 0; i < unique.length; i += CHUNK) {
-            const chunk = unique.slice(i, i + CHUNK);
-            const rows = this.db
-                .prepare(
-                    `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts, c.bytes AS content_bytes FROM messages
-                     LEFT JOIN content c ON c.hash = messages.content_hash
-                     WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
-                )
-                .all(sessionId, ...chunk) as Record<string, unknown>[];
-            for (const r of rows) {
-                messageRowReads.count++;
-                out.push({
-                    seq: r.seq as number,
-                    msgId: r.msg_id as string,
-                    ref: (r.ref as string | null) ?? null,
-                    refNum: (r.ref_num as number | null) ?? null,
-                    role: r.role as string,
-                    kind: r.kind as string,
-                    contentHash: r.content_hash as string,
-                    ts: (r.ts as number | null) ?? null,
-                    content: this.hydrateMedia(r.content_bytes === null ? "" : Buffer.from(r.content_bytes as Uint8Array).toString("utf8")),
-                });
-            }
-        }
-        out.sort((a, b) => a.seq - b.seq);
-        return out;
-    }
-
-    /** #4739: exactly what viewFor needs, from ONE consistent read snapshot.
-     *  The deferred transaction pins the WAL snapshot across all five reads,
-     *  so a concurrent ingest can no longer land between the session row and
-     *  its pointer rows. Messages are fetched ONLY at the tail/pluginSnapshot
-     *  pointer seqs — the historical log is not decoded on ordinary loads.
-     *  Null on session miss; malformed tail_json throws into the caller's
-     *  corrupt-fallback (same as before). */
-    sessionViewRows(sessionId: string): {
-        session: SessionRow;
-        messages: (MessageRow & { contentHash: string })[];
-        blocks: ReturnType<UnifiedStore["getBlocks"]>;
-        deadRefs: ReturnType<UnifiedStore["getDeadRefs"]>;
-        refs: RefRow[];
-    } | null {
-        return this.db.transaction(() => {
-            const session = this.getSessionRow(sessionId);
-            if (!session) return null;
-            return {
-                session,
-                messages: this.getMessagesAt(sessionId, viewPointerSeqs(session.tailJson)),
-                blocks: this.getBlocks(sessionId),
-                deadRefs: this.getDeadRefs(sessionId),
-                refs: this.getRefs(sessionId),
-            };
-        });
-    }
-
-    /** #4739: single-column metadata read for lazy-field restore (no block or
-     *  message rows involved). Null when the session has no index row;
-     *  corrupt JSON throws like every other column read — callers fall back
-     *  to the envelope. */
-    getSessionMetadata(sessionId: string): Record<string, unknown> | null {
-        const row = this.db
-            .prepare("SELECT metadata_json FROM sessions WHERE session_id = ?")
-            .get(sessionId) as { metadata_json: string } | undefined;
-        if (!row) return null;
-        return JSON.parse(row.metadata_json) as Record<string, unknown>;
-    }
-
     /** #3762: swap {"$media": hash} references back to the CAS bytes. Only
      *  touches content that carries the marker; key order is preserved by
      *  parse/stringify so the result is byte-identical to the pre-split
@@ -4228,10 +4114,3 @@ export class UnifiedStore {
         }));
     }
 }
-
-/** #4739: the viewFor bundle shape (see UnifiedStore.sessionViewRows). */
-export type SessionViewRows = ReturnType<UnifiedStore["sessionViewRows"]>;
-
-/** #4739: blockContents map shape shared by UnifiedStore.getBlockContents
- *  and the shadow facade (Map is invariant — one alias keeps both sides exact). */
-export type BlockContentsMap = Map<string, { one: BlockView | null; full: BlockView }>;

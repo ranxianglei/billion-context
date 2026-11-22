@@ -195,8 +195,24 @@ function openaiCachedTokens(u: Record<string, unknown>): number | null {
 
 export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, absorbName?: string, notes?: string[], errorShape: "protocol" | "completion" = "protocol"): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
+    // OpenAI clients opt into the trailing usage frame with
+    // stream_options.include_usage. bili forces the upstream option on for its
+    // own ledger, but the frame must also reach the CLIENT when it asked for
+    // it: cost/context-aware clients read provider fields from that frame, and
+    // swallowing it on plain-text rounds silently loses them. Tool-call rounds
+    // keep the existing verbatim forward.
+    const clientWantsUsage = (() => {
+        const so = (requestBody as { stream_options?: unknown }).stream_options;
+        return typeof so === "object" && so !== null
+            && (so as Record<string, unknown>).include_usage === true;
+    })();
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     let toolIndex = 0;
+    // Last upstream usage object seen on the wire. The synthesized completion
+    // frame re-states tokens; provider-specific fields (cost/credits, cache
+    // details, validity flags) must survive that re-statement — dropping them
+    // breaks any client that prices or accounts the turn from them.
+    let lastUsageRaw: Record<string, unknown> | null = null;
 
     const makeBase = () => ({
         id: responseId,
@@ -280,6 +296,9 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
         },
 
         async *parseStream(upstream, round) {
+            // Per-round scope: a later round that emits no usage frame must not
+            // inherit the previous round's provider fields (e.g. `credits`).
+            lastUsageRaw = null;
             const pending = new Map<number, ToolCallBuffer>();
             // #206: strip model-imitated render tags from PROSE deltas; the
             // filter may hold back a short tail, flushed at finish/[DONE].
@@ -535,6 +554,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 if (!choice) {
                     if (parsed.usage) {
                         const u = parsed.usage as Record<string, unknown>;
+                        lastUsageRaw = u;
                         yield {
                             kind: "usage",
                             inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
@@ -545,7 +565,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         // from this trailing empty-choices frame; raw tool-call rounds
                         // must forward it verbatim, not swallow it into the internal
                         // ledger.
-                        if (sawRealToolCall) {
+                        if (sawRealToolCall || clientWantsUsage) {
                             yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
                         }
                     }
@@ -578,6 +598,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 // only the ledger gains the sample.
                 if (parsed.usage && !finishReason && delta && Object.keys(delta).length === 0) {
                     const u = parsed.usage as Record<string, unknown>;
+                    lastUsageRaw = u;
                     yield {
                         kind: "usage",
                         inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
@@ -591,6 +612,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     const hadToolCalls = [...pending.values()].some((tc) => tc.name.length > 0 || tc.id.length > 0);
                     yield* settleToolCalls();
                     const u = parsed.usage as Record<string, unknown> | undefined;
+                    if (u) lastUsageRaw = u;
                     yield {
                         kind: "usage",
                         inputTokens: typeof u?.prompt_tokens === "number" ? u.prompt_tokens : undefined,
@@ -727,13 +749,18 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // Numeric fields must never serialize to absent/undefined: strict
             // clients (dsh's mapUsage) compute over prompt_tokens/completion_tokens
             // and a usage object missing them yields NaN (non-JSON-serializable).
+            const raw = lastUsageRaw ?? {};
+            const rawDetails = raw.prompt_tokens_details && typeof raw.prompt_tokens_details === "object"
+                ? raw.prompt_tokens_details as Record<string, unknown>
+                : undefined;
             const usage = opts?.usage
                 ? {
+                      ...raw,
                       prompt_tokens: opts.usage.inputTokens ?? 0,
                       completion_tokens: opts.usage.outputTokens ?? 0,
                       total_tokens: (opts.usage.inputTokens ?? 0) + (opts.usage.outputTokens ?? 0),
                       ...(typeof opts.usage.cachedTokens === "number"
-                          ? { prompt_tokens_details: { cached_tokens: opts.usage.cachedTokens } }
+                          ? { prompt_tokens_details: { ...rawDetails, cached_tokens: opts.usage.cachedTokens } }
                           : {}),
                   }
                 : null;

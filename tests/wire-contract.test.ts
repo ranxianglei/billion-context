@@ -21,6 +21,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
+import { emitStreamError } from "../src/stream-error.ts";
+import { validateResponsesContentIndex } from "./wire-contract-fakes.ts";
 
 process.env.NODE_ENV = "test";
 
@@ -56,6 +58,25 @@ import {
 import { verifySdkHmac, WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
+
+test("WC-026 Responses content-part indices are explicit, including legacy error completions", () => {
+    for (const type of ["response.content_part.added", "response.output_text.delta", "response.output_text.done", "response.content_part.done"]) {
+        for (const content_index of [0, 2]) assert.deepEqual(validateResponsesContentIndex({ type, content_index }), []);
+        for (const content_index of [undefined, null, "0", -1, 0.5]) assert.match(validateResponsesContentIndex({ type, content_index })[0], /WC-026/);
+    }
+    assert.deepEqual(validateResponsesContentIndex({ type: "response.output_item.done" }), []);
+    const frames: Record<string, unknown>[] = [];
+    const res = {
+        write(chunk: string) {
+            for (const line of chunk.split("\n")) if (line.startsWith("data: ")) frames.push(JSON.parse(line.slice(6)));
+            return true;
+        },
+        end() { return this; },
+    } as unknown as http.ServerResponse;
+    emitStreamError(res, "responses", "fixture failure", undefined, "completion");
+    assert.equal(frames.length, 7);
+    assert.deepEqual(frames.flatMap(validateResponsesContentIndex), []);
+});
 
 test("WC-013: WebSocket transport envelopes omit HTTP-only fields", () => {
     assert.deepEqual(validateResponsesWsCreate({ type: "response.create", input: [] }), []);
@@ -369,6 +390,7 @@ test("wire-contract ledger: every lane-scoped rule has a live enforcement clause
     // Lane-scoped constraints hold on ONE client's lane only — the shared wire validator
     // cannot enforce them (WC-013 forbids exactly what WC-017 requires, same frame shape).
     const laneProbes: Array<{ ruleId: string; validate: (body: unknown) => string[]; body: unknown }> = [
+        { ruleId: "WC-026", validate: validateResponsesContentIndex, body: { type: "response.output_text.delta", output_index: 0, delta: "x" } },
         { ruleId: "WC-017", validate: validateCodexResponsesWsCreate, body: { type: "response.create", input: [] } },
         // WC-019/020/021 are the Vertex Anthropic lane (lane: "vertex-anthropic") — the wire rules that
         // hold only on that lane, so the shared anthropic validator must not carry them. WC-019 is
