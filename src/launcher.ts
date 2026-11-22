@@ -1106,7 +1106,13 @@ const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
      *  child's own egress now comes from the aux-proxy handoff in the spawn path
      *  instead. The loopback exclusion that keeps the /bili/ leg direct when the
      *  child DOES carry a proxy lives in mergeLoopbackNoProxy (#3446). */
-    claude: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"], ownBaseUrlKeys: ["ANTHROPIC_VERTEX_BASE_URL"] },
+    claude: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"], ownBaseUrlKeys: ["ANTHROPIC_VERTEX_BASE_URL"],
+        /** #7439: let claude-code send its per-task class header
+         *  (`x-claude-code-request-class`) to bili — it is gated OFF under a
+         *  3rd-party base URL (i.e. bili) unless this env is set. The reader is
+         *  claudeRequestClassOf / the additive override in
+         *  claudeSubagentAgentId (src/session-id.ts). */
+        extras: [["CLAUDE_CODE_GATEWAY_HINT_HEADERS", "1"]] },
     codebuddy: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["CODEBUDDY_BASE_URL"] },
     /** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
      *  override env), so the launcher can only route it via cert MITM: its

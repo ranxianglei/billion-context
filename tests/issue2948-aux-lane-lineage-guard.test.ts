@@ -16,6 +16,10 @@
 //   B. a REAL ref-holding fork is STILL followed even when a ref-less aux
 //      lane is fresher than it (filter-then-pick; #2601 preserved).
 import test, { after } from "node:test";
+// trustStampedId is GA-on by default (#7439). This suite pins the legacy |sub:
+// fork behavior — force the feature OFF so it keeps asserting the
+// pre-retirement path (issue2944-neutral-skeleton idiom).
+process.env.BILI_ROLLOUT_TRUST_STAMPED_ID = "0";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
