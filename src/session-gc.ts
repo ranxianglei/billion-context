@@ -3,7 +3,7 @@ import type { Stats } from "node:fs";
 import path from "node:path";
 import { log as loggerLog } from "./logger.js";
 import { defaultCountTokens } from "acp-kernel";
-import { getStore, type SessionStore } from "./persist.js";
+import { getStore, relPathFor, type SessionStore } from "./persist.js";
 import { sessionsDir } from "./paths.js";
 import { dropSessionForGc, peekSession } from "./session.js";
 import { stateDir } from "./paths.js";
@@ -264,10 +264,20 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         // deletion loses.
         const companion = file.slice(0, -".json".length) + companionSuffix;
         let compSt: Stats | undefined;
+        let companionStatFailed = false;
         try {
-            const s = await stat(companion);
-            if (s.isFile()) compSt = s;
-        } catch { /* no companion */ }
+            compSt = await stat(companion);
+        } catch (error) {
+            // Only absence proves there are no companion bytes to account
+            // for. A transient failure must not turn them into orphaned data
+            // that the second pass can delete after removing this session.
+            companionStatFailed = (error as NodeJS.ErrnoException)?.code !== "ENOENT";
+        }
+        if (companionStatFailed || (compSt && !compSt.isFile())) {
+            loggerLog("info", `[gc] kept session ${path.relative(dir, file)}: companion ${path.basename(companion)} cannot be inspected as a file`);
+            result.kept++;
+            continue;
+        }
         if (compSt) {
             const stored = contentStoreTokens(await store.readRawFile(companion));
             if (stored === null) {
@@ -312,11 +322,13 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         deletedSessions.add(file);
         // #1995 review ②: the image-restore spill tree
         // (<state>/retrieve/img/<sessionId>/) shares this session's lifecycle —
-        // refs are per-session, so once the file is gone the spills are
+        // refs are per-session, so once its last file is gone the spills are
         // unreachable. Co-delete; anything this deterministic path misses (null
         // id, a pre-salt dir name from an older build) is collected by the
         // stale-mtime pass below.
-        if (view.id !== null) {
+        const hasSurvivingTwin = view.id !== null && matchingSessions(path.basename(relPathFor(view.id), ".json"))
+            .some((candidate) => !deletedSessions.has(candidate));
+        if (view.id !== null && !hasSurvivingTwin) {
             try {
                 const imgDir = opts?.imgRoot !== undefined
                     ? path.join(opts.imgRoot, restoreExportDirName(view.id))

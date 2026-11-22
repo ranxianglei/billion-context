@@ -16,8 +16,8 @@ operators with a real model endpoint and takes ~4-5h per round.
 | U | registry | dsh-managed proxy reads `update.registry`, refuses in-place self-update, "profile bundle up to date" | `scripts/release-gate-local.mjs` |
 | I | install | `npm i -g <tarball> --install-links` = **true copy** (no symlink leak, #1225), CLI reports candidate version | `docker-lanes.mjs` |
 | X | auto-update | publish a fake-newer build of the same commit → `bili update` **installs it** through `update.registry`, CLI lands on the new version | `docker-lanes.mjs` |
-| P | host lanes | real host CLIs (dsh/pi/opencode/codex/claude) through bili **plugin mode**: traffic hits the upstream, compress tools are live on the wire, nudge lands on-wire, fold fires + markers recalled (details below) | `plugin-lanes.mjs` |
-| R | restart | a long session is first forced over its context wall (default 16384-token small window ⇒ fold with headroom; smaller walls are structurally infeasible — the folded steady state sits around ~20k tokens and preflight refuses turns it cannot bring under) while a real model answers; then it is killed repeatedly and must keep working: **dsh** — the self-spawned proxy child is killed via kill -15 / kill -9 / clean shutdown, each respawn resumes the same session from disk, outbound stays well below raw-history size *and* above a bare-greeting floor (compact AND non-empty), exactly one live proxy holds the session (no split-brain); **pi** — the engine runs inline inside the pi CLI, so the kill matrix hits the pi host process itself mid-turn. A marker word from the recent zone is re-asked after every kill (evidence line — verbatim-through-fold quality is Lane A's assertion), and upstream `cached_tokens` must recover ≥50% of prior prompt tokens when reported | `restart-lanes.mjs` |
+| P | host lanes | real host CLIs (dsh/dsh-google/pi/opencode/codex/claude — four client-side wires: openai-chat, google, responses, anthropic) through bili **plugin mode**: traffic hits the upstream, compress tools are live on the wire, nudge lands on-wire, fold fires + markers recalled (details below) | `plugin-lanes.mjs` |
+| R | restart | a long session is first forced over its context wall (default 16384-token small window ⇒ fold with headroom; smaller walls are structurally infeasible — the folded steady state sits around ~20k tokens and preflight refuses turns it cannot bring under) while a real model answers; **claude** (opt-in via `agentsR`) adds the anthropic wire to the matrix — a prefix-topology lane where the harness-managed proxy child is killed and re-established on the same port, and the session must resume; then it is killed repeatedly and must keep working: **dsh** — the self-spawned proxy child is killed via kill -15 / kill -9 / clean shutdown, each respawn resumes the same session from disk, outbound stays well below raw-history size *and* above a bare-greeting floor (compact AND non-empty), exactly one live proxy holds the session (no split-brain); **pi** — the engine runs inline inside the pi CLI, so the kill matrix hits the pi host process itself mid-turn. A marker word from the recent zone is re-asked after every kill (evidence line — verbatim-through-fold quality is Lane A's assertion), and upstream `cached_tokens` must recover ≥50% of prior prompt tokens when reported | `restart-lanes.mjs` |
 
 ## The secret/endpoint contract
 
@@ -52,9 +52,28 @@ Config keys (all optional except `model1.baseUrl` / `model1.model`):
 clones from — keeps container egress at zero and works behind host git
 proxies), `gitProxy`, `npmRegistry` (deps mirror for the build; unrelated to
 the in-container lane registry), `turnTimeoutMs`, `agents` (Lane P set),
-`agentsR` (Lane R set; default `dsh,pi`), `r.{corpusTokens,window,capRatio,
+`agentsR` (Lane R set; default `dsh,pi`, add `claude` for the anthropic-wire lane),
+`snapBase` (P/R lanes only: run the candidate's snapBase egress plane ON in the
+gate's bili.json — `"all"` = every protocol cohort, `"openai,responses,anthropic,google"`
+subset = explicit cohorts, absent/`"off"` = off, byte-identical gate; for
+candidate-branch verification, e.g. #6785), `laneScript` (P lanes only: force a
+specific harness-script copy, e.g. the bundled `/gate-tools/plugin-lanes.mjs` —
+needed when the candidate checkout predates a harness fix; default is the
+candidate's OWN `scripts/gate/plugin-lanes.mjs`, bundled copy as fallback),
+`snapshotRender` (`"1"` writes `rollout.features.snapshotRender=true` into the
+P/R lane bili.json — config tier, beats the 0% rollout default; plugin-mode
+lanes stay client-authoritative by design), `r.{corpusTokens,window,capRatio,
 cacheRatio}`, `network` (`host` | `bridge`; bridge is the Docker-Desktop
 shape — point the config URLs at `host.docker.internal`), `outDir`, `keep`.
+
+Concurrency: the P (plugin) and R (restart) lanes run SIDE BY SIDE by default
+(their agents are fully isolated — per-lane recorder ports, XDG dirs, port
+zones — and the shared upstream absorbs ~6 concurrent consumers). Tune via
+host env vars passed straight into the container: `GATE_CONCURRENT` (default
+`1`; set `0` to restore the legacy serial order — use it if a cache-recovery
+assertion false-reds under concurrency and you need pristine cache isolation),
+`GATE_P_CONC` (default `4`, in-flight P agents) and `GATE_R_CONC` (default `2`,
+in-flight R agents).
 
 Everything lands in `outDir` (mounted as `/work`): `gate-local.log`
 (A/B/U), `plugin-lanes.log` (+ `plugin-lanes/<agent>/…`), `restart-lanes.log`,
@@ -172,8 +191,11 @@ Two known facts:
     turn dies on a ValidationError. The whole lane drops out of the gate; it
     auto-promotes when the client ships the protocol — no script change needed.
 
-Not in the default GATE_AGENTS set; runs only when explicitly listed:
-`GATE_AGENTS=dsh,dsh-responses,dsh-anthropic,dsh-google,dsh-proxy`.
+Not in the default GATE_AGENTS set — runs only when explicitly listed (e.g.
+`GATE_AGENTS=dsh,dsh-responses,dsh-anthropic,dsh-proxy`): `dsh-responses`,
+`dsh-anthropic`, `dsh-proxy`. `dsh-google` IS in the default set — it degrades
+to CLIENT-BLOCKED and is excluded from the tally when the client can't express
+the protocol, so listing it there costs nothing.
 
 ## Lane flow
 
@@ -203,13 +225,14 @@ TGZ=/path/to/billion-context-x.y.z.tgz \
 REPO=/path/to/billion-context-checkout \
 MODEL1_BASE_URL=<primary model base url> \
 MODEL1_MODEL=<model-id> \
-GATE_AGENTS=dsh,pi,codex,opencode,claude \
+GATE_AGENTS=dsh,pi,codex,opencode,claude,dsh-google \
 node scripts/gate/plugin-lanes.mjs
 ```
 
 - `GATE_AGENTS` selects a subset of lanes; `GATE_TURN_TIMEOUT_MS` (default
-  300000), `GATE_BIG/MID/SMALL_WINDOW`, and `PLUGIN_LANES_WORK` (artifact
-  dir, default `./plugin-lanes/`) are tunable
+  300000), `GATE_BIG/MID/SMALL_WINDOW`, `GATE_P_CONC` (in-flight agent cap,
+  default 4), and `PLUGIN_LANES_WORK` (artifact dir, default `./plugin-lanes/`)
+  are tunable
 - dsh lanes: `GATE_DSH_VERSION` (each lane self-installs
   `@deepseek-ai/dsh@<v>`, default latest — system dsh may be too old and a
   global billion-context shadows the candidate bundle), `GATE_OUTPUT_TOKENS`

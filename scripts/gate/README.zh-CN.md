@@ -13,8 +13,8 @@
 | U | registry | dsh 托管代理读 `update.registry`,拒绝原地自更新,「profile bundle up to date」 | `scripts/release-gate-local.mjs` |
 | I | 安装 | `npm i -g <tarball> --install-links` = **真拷贝**(无 symlink 泄漏,#1225),CLI 报告候选版本 | `docker-lanes.mjs` |
 | X | 自动更新 | 发一个假新版本的同 commit 构建 → `bili update` **装上了它**,CLI 落到新版本 | `docker-lanes.mjs` |
-| P | 宿主车道 | 真实宿主 CLI(dsh/pi/opencode/codex/claude)走 bili **插件模式**:流量到上游、compress 工具在 wire 上活着、nudge 上 wire、fold 开火+暗号回忆(细节见下) | `plugin-lanes.mjs` |
-| R | 重启 | 长会话先被压过上下文墙(默认 16384 token 小窗 ⇒ 有余量的 fold;更小的墙结构上不可行——折后稳态 ~20k tok,preflight 拒绝压不下的回合),真模型持续应答;然后反复 kill 且必须继续干活:**dsh**——自起的代理子进程经 kill -15 / kill -9 / 干净退出被杀,每次重生从磁盘恢复同一会话,出站远低于裸历史大小**且**高于裸问候地板(既压缩又非空),恰好一个活代理持有会话(无脑裂);**pi**——引擎内联在 pi CLI 里,kill 矩阵直接打在 pi 宿主进程身上。每次 kill 后重问近区标记词(证据行——折后逐字质量是 Lane A 的断言),上报 `cached_tokens` 时须恢复到先前 prompt token 的 ≥50% | `restart-lanes.mjs` |
+| P | 宿主车道 | 真实宿主 CLI(dsh/dsh-google/pi/opencode/codex/claude——四种客户端 wire:openai-chat、google、responses、anthropic)走 bili **插件模式**:流量到上游、compress 工具在 wire 上活着、nudge 上 wire、fold 开火+暗号回忆(细节见下) | `plugin-lanes.mjs` |
+| R | 重启 | 长会话先被压过上下文墙(默认 16384 token 小窗 ⇒ 有余量的 fold;更小的墙结构上不可行——折后稳态 ~20k tok,preflight 拒绝压不下的回合),真模型持续应答;**claude**(经 `agentsR` 选入)把 anthropic wire 带进矩阵——prefix 拓扑,代理子进程由 harness 管理,被杀后在同一端口重建,会话必须续上;然后反复 kill 且必须继续干活:**dsh**——自起的代理子进程经 kill -15 / kill -9 / 干净退出被杀,每次重生从磁盘恢复同一会话,出站远低于裸历史大小**且**高于裸问候地板(既压缩又非空),恰好一个活代理持有会话(无脑裂);**pi**——引擎内联在 pi CLI 里,kill 矩阵直接打在 pi 宿主进程身上。每次 kill 后重问近区标记词(证据行——折后逐字质量是 Lane A 的断言),上报 `cached_tokens` 时须恢复到先前 prompt token 的 ≥50% | `restart-lanes.mjs` |
 
 ## 密钥/端点契约
 
@@ -45,10 +45,15 @@ scripts/gate/bili-gate.sh --config ... --dry-run           # 只打印 docker �
 model,apiKey}`、`model2.{baseUrl,model,apiKey}`(Lane B)、`rev`、`skip`、
 `sourceRepo`、`mirror`(容器 clone 的本地裸 git 镜像——容器零出站,且可走宿主
 git 代理)、`gitProxy`、`npmRegistry`(构建依赖镜像;与容器内车道 registry
-无关)、`turnTimeoutMs`、`agents`(Lane P 集合)、`agentsR`(Lane R 集合,默认
-`dsh,pi`)、`r.{corpusTokens,window,capRatio,cacheRatio}`、`network`
+无关)、`turnTimeoutMs`、`agents`(Lane P 集合)、`agentsR`(Lane R 集合,默认 `dsh,pi`;加 `claude` 跑 anthropic wire 车道)、`snapBase`(仅 P/R 车道:在 gate 的 bili.json 里打开候选的 snapBase 出站平面——`"all"` = 全部协议 cohort,`"openai,responses,anthropic,google"` 子集 = 指定 cohort,缺省/`"off"` = 关,gate 行为逐字节不变;用于候选分支验证,如 #6785)、`laneScript`(仅 P 车道:强制指定 harness 脚本副本,如内置 `/gate-tools/plugin-lanes.mjs`——候选 checkout 早于 harness 修复时需要;默认优先用候选自己的 `scripts/gate/plugin-lanes.mjs`,内置副本兜底)、`snapshotRender`(填 `"1"` 在 P/R 车道 bili.json 写 `rollout.features.snapshotRender=true`——配置层,压过 0% rollout 默认;插件模式车道按设计仍由客户端权威)、`r.{corpusTokens,window,capRatio,cacheRatio}`、`network`
 (`host` | `bridge`;bridge 是 Docker Desktop 形态——把配置里的 URL 指向
 `host.docker.internal`)、`outDir`、`keep`。
+
+并发:P(插件)车道与 R(重启)车道默认**并行**跑(各 agent 完全隔离——独立
+recorder 端口、XDG 目录、端口区间;共享上游能吃 ~6 路并发)。用宿主环境变量
+直接透传进容器来调:`GATE_CONCURRENT`(默认 `1`;置 `0` 回到旧的纯串行顺序——
+若并发下缓存恢复断言假红、需要「缓存完全独占」复核就用它)、`GATE_P_CONC`
+(默认 `4`,在途 P agent 数)、`GATE_R_CONC`(默认 `2`,在途 R agent 数)。
 
 所有产物落 `outDir`(挂载为 `/work`):`gate-local.log`(A/B/U)、
 `plugin-lanes.log`(+ `plugin-lanes/<agent>/…`)、`restart-lanes.log`、
@@ -145,7 +150,7 @@ google=`contents`),防止静默换线假绿;首个出站请求存
     + 每回合死于 ValidationError。整条车道不计入 gate,客户端放出该协议后
     自动转正,脚本不用改。
 
-不进默认 GATE_AGENTS 集,显式加入才跑:`GATE_AGENTS=dsh,dsh-responses,dsh-anthropic,dsh-google,dsh-proxy`。
+其中 `dsh-responses`、`dsh-anthropic`、`dsh-proxy` 不进默认 GATE_AGENTS 集,显式加入才跑(如 `GATE_AGENTS=dsh,dsh-responses,dsh-anthropic,dsh-proxy`);`dsh-google` 在默认集内——客户端表达不了该协议时自动降级 CLIENT-BLOCKED 且不计入统计,所以默认列上它没有代价。
 
 ## 车道流程
 
@@ -171,13 +176,13 @@ TGZ=/path/to/billion-context-x.y.z.tgz \
 REPO=/path/to/billion-context-checkout \
 MODEL1_BASE_URL=<主模型 base url> \
 MODEL1_MODEL=<model-id> \
-GATE_AGENTS=dsh,pi,codex,opencode,claude \
+GATE_AGENTS=dsh,pi,codex,opencode,claude,dsh-google \
 node scripts/gate/plugin-lanes.mjs
 ```
 
 - `GATE_AGENTS` 选车道子集;`GATE_TURN_TIMEOUT_MS`(默认 300000)、
-  `GATE_BIG/MID/SMALL_WINDOW`、`PLUGIN_LANES_WORK`(工件目录,默认
-  `./plugin-lanes/`)可调
+  `GATE_BIG/MID/SMALL_WINDOW`、`GATE_P_CONC`(在途 agent 上限,默认 4)、
+  `PLUGIN_LANES_WORK`(工件目录,默认 `./plugin-lanes/`)可调
 - dsh 车道:`GATE_DSH_VERSION`(每车道自装 `@deepseek-ai/dsh@<v>`,默认
   latest——系统 dsh 可能太旧且全局 billion-context 会遮蔽候选 bundle)、
   `GATE_OUTPUT_TOKENS`(输出预算:bili.json 预留 + dsh cordis maxTokens,
