@@ -594,7 +594,7 @@ test("arbitration: non-emergency T1 effective >= threshold → tier 1", () => {
   );
 });
 
-test("arbitration: non-emergency T2 >= 1.5x threshold AND > T1 effective → tier 2", () => {
+test("arbitration: non-emergency T2 >= band-relative gate AND > T1 effective → tier 2", () => {
   const core = createCore();
   // minCompressRange > 0 so the effective filter engages (see test above).
   const config = buildConfig({
@@ -614,7 +614,7 @@ test("arbitration: non-emergency T2 >= 1.5x threshold AND > T1 effective → tie
     tokenCount: 50000,
   }).state;
   // Two T1 blocks anchored to real messages (m1, m2) with ~6K-token summaries
-  // each → T2 ~12K >= 9000 (1.5x); T1 effective is ~0 (preserve + blocks cover
+  // each → T2 ~12K >= gate 6000 (#7464: max(12000/2, 6000×1.5/2 = 4500)); T1 effective is ~0 (preserve + blocks cover
   // all visible messages).
   state = { ...state, blocks: t1Blocks([["m1"], ["m2"]], 24000) };
   const turn = core.processTurn({ messages, state, config, tokenCount: 60000 });
@@ -622,7 +622,7 @@ test("arbitration: non-emergency T2 >= 1.5x threshold AND > T1 effective → tie
   assert.equal(
     turn.nudge.tier,
     2,
-    "T2 ~12K >= 9000 (1.5x) and > T1 effective → tier 2",
+    "T2 ~12K >= 6000 (band) and > T1 effective → tier 2",
   );
 });
 
@@ -659,9 +659,10 @@ test("arbitration: non-emergency T2 large but T1 effective >= threshold → tier
 // mass trigger independently; unset tiers keep their derived defaults.
 // Mass model here: each makeMessages message ≈ 5000 tokens (20000 chars / 4);
 // block summary mass = summaryChars / 4. Derived defaults under buildConfig:
-// T1 = 6000, T2/T3 = 9000 (1.5x).
+// T1 = 6000, T2 = band-relative gate max((t2Pen+t3Pen)/2, 6000×1.5/2 = 4500)
+// (#7464), T3 = 9000 (1.5x).
 
-test("tier thresholds: lowered t2 fires T2 below the derived 1.5x mass", () => {
+test("tier thresholds: an explicit t2 pin overrides the band-relative default (#7464)", () => {
   const core = createCore();
   const base = buildConfig({
     compress: {
@@ -674,8 +675,9 @@ test("tier thresholds: lowered t2 fires T2 below the derived 1.5x mass", () => {
   });
   const messages = makeMessages(10);
 
-  // One tier-1 block, summary 28000 chars → T2 mass 7000: above T1 effective
-  // (5000) but BELOW the derived 9000 → default config must not inject.
+  // Two tier-1 blocks × 6000 tokens = 12000: above the #7464 band-relative
+  // default gate (max(12000/2, 4500) = 6000) and above T1 effective (5000)
+  // → the default distills.
   let state = createInitialState();
   state = core.processTurn({
     messages,
@@ -683,7 +685,7 @@ test("tier thresholds: lowered t2 fires T2 below the derived 1.5x mass", () => {
     config: base,
     tokenCount: 50000,
   }).state;
-  state = { ...state, blocks: t1Blocks([["m1"]], 28000) };
+  state = { ...state, blocks: t1Blocks([["m1"], ["m2"]], 24000) };
   const defaultTurn = core.processTurn({
     messages,
     state,
@@ -692,31 +694,75 @@ test("tier thresholds: lowered t2 fires T2 below the derived 1.5x mass", () => {
   });
   assert.equal(
     defaultTurn.nudge.shouldInject,
-    false,
-    "default: T2 mass 7000 < derived 9000 → no nudge",
+    true,
+    `default band gate 6000 < 12000 must distill: ${defaultTurn.nudge.reason}`,
+  );
+  assert.equal(
+    defaultTurn.nudge.tier,
+    2,
+    "default: 12000 >= 6000 (band) and > T1 effective",
   );
 
-  // Same state, t2 pinned to 6000: 7000 >= 6000 and > T1 effective → tier 2.
-  const lowered = buildConfig({
+  // Same mass with t2 pinned to 20000: the explicit pin wins over the
+  // derived default → suppressed (T1 5000 < 6000 as well).
+  const raised = buildConfig({
     ...base,
-    nudge: { ...base.nudge, tierGrowthTokens: { t2: 6000 } },
+    nudge: { ...base.nudge, tierGrowthTokens: { t2: 20000 } },
   });
   state = createInitialState();
   state = core.processTurn({
     messages,
     state,
-    config: lowered,
+    config: raised,
     tokenCount: 50000,
   }).state;
-  state = { ...state, blocks: t1Blocks([["m1"]], 28000) };
+  state = { ...state, blocks: t1Blocks([["m1"], ["m2"]], 24000) };
+  const raisedTurn = core.processTurn({
+    messages,
+    state,
+    config: raised,
+    tokenCount: 60000,
+  });
+  assert.equal(
+    raisedTurn.nudge.shouldInject,
+    false,
+    `pinned 20000 suppresses a 12000 band: ${raisedTurn.nudge.reason}`,
+  );
+});
+
+test("tier thresholds: sub-floor band stays silent by default (#7464 floor term)", () => {
+  const core = createCore();
+  const base = buildConfig({
+    compress: {
+      minCompressRange: 5000,
+      maxSummaryLength: 0,
+      minSummaryLength: 0,
+    },
+    preserveRecentMessages: 9,
+  });
+  const messages = makeMessages(10);
+
+  // One block × 4000 tokens < the 4500 floor (max(4000/2, 4500)); it is
+  // also below T1 effective (5000) → neither the gate nor dominance fires.
+  let state = createInitialState();
+  state = core.processTurn({
+    messages,
+    state,
+    config: base,
+    tokenCount: 50000,
+  }).state;
+  state = { ...state, blocks: t1Blocks([["m1"]], 16000) };
   const turn = core.processTurn({
     messages,
     state,
-    config: lowered,
+    config: base,
     tokenCount: 60000,
   });
-  assert.equal(turn.nudge.shouldInject, true);
-  assert.equal(turn.nudge.tier, 2, "lowered t2 lets T2 distill early");
+  assert.equal(
+    turn.nudge.shouldInject,
+    false,
+    `sub-floor band must not distill: ${turn.nudge.reason}`,
+  );
 });
 
 test("tier thresholds: raised t1 suppresses T1 while nothing else is ready", () => {
@@ -780,7 +826,7 @@ test("tier thresholds: pinning one tier leaves the others on derived defaults", 
       minSummaryLength: 0,
     },
     preserveRecentMessages: 9,
-    // Only t1 pinned (high); t2 stays on its derived 1.5x threshold.
+    // Only t1 pinned (high); t2 stays on its derived band-relative gate.
     nudge: { ...buildConfig().nudge, tierGrowthTokens: { t1: 100000 } },
   });
   const messages = makeMessages(10);
@@ -791,7 +837,7 @@ test("tier thresholds: pinning one tier leaves the others on derived defaults", 
     config,
     tokenCount: 50000,
   }).state;
-  // Two tier-1 blocks → T2 mass 12000 >= derived 9000 and > T1 effective.
+  // Two tier-1 blocks → T2 mass 12000 >= derived band gate 6000 and > T1 effective.
   state = { ...state, blocks: t1Blocks([["m1"], ["m2"]], 24000) };
   const turn = core.processTurn({
     messages,
@@ -896,11 +942,11 @@ test("arbitration: emergency T1 effective largest → tier 1", () => {
   assert.equal(turn.nudge.breakdown.emergencyOverride, 1);
 });
 
-test("arbitration: T2 boundary — must NOT fire when pending ∈ [nudgeGrowthTokens, 1.5×)", () => {
+test("arbitration: T2 boundary — silent below the 4500 band floor, fires at it (#7464)", () => {
   const core = createCore();
-  // OLD code fired T2 at >= nudgeGrowthTokens; NEW requires >= 1.5× — this
-  // range (T2 pending ~7500 ∈ [6000, 9000)) proves the boundary. Diverges from
-  // master, which injected T2 here.
+  // #7464 moved the default T2 gate from the absolute 1.5× step (9000) to the
+  // band-relative max((t2Pen+t3Pen)/2, step×1.5/2 = 4500): with no tier-2
+  // mass the silent zone is pending < 4500 (the floor term dominates).
   const config = buildConfig({
     compress: {
       minCompressRange: 5000,
@@ -918,14 +964,23 @@ test("arbitration: T2 boundary — must NOT fire when pending ∈ [nudgeGrowthTo
     tokenCount: 10000,
   }).state;
   // preserveRecentMessages:10 → no compressible msgs → T1 effective = 0.
-  // 1 T1 block, summary 'x'.repeat(30000) → 7500 tokens ∈ [6000, 9000).
-  state = { ...state, blocks: t1Blocks([["m0"]], 30000) };
-  const turn = core.processTurn({ messages, state, config, tokenCount: 35000 });
+  // 1 T1 block, summary 'x'.repeat(16000) → 4000 tokens < 4500 floor.
+  state = { ...state, blocks: t1Blocks([["m0"]], 16000) };
+  const below = core.processTurn({ messages, state, config, tokenCount: 35000 });
   assert.equal(
-    turn.nudge.shouldInject,
+    below.nudge.shouldInject,
     false,
-    "T2 pending 7500 < 9000 (1.5×) and T1 effective 0 < 6000 → no injection",
+    `T2 pending 4000 < 4500 floor and T1 effective 0 < 6000 → no injection: ${below.nudge.reason}`,
   );
+  // At the boundary: 4500 >= gate max(2250, 4500) and > T1 effective 0.
+  state = { ...state, blocks: t1Blocks([["m0"]], 18000) };
+  const at = core.processTurn({ messages, state, config, tokenCount: 35000 });
+  assert.equal(
+    at.nudge.shouldInject,
+    true,
+    `T2 pending 4500 >= 4500 floor must distill: ${at.nudge.reason}`,
+  );
+  assert.equal(at.nudge.tier, 2);
 });
 
 test("arbitration: non-emergency T3 >= 1.5× threshold AND > T2 AND > T1 effective → tier 3", () => {
@@ -1453,7 +1508,9 @@ test("arbitration: below tier2Trigger count and below token gate -> no T2 nudge"
   assert.equal(turn.nudge.shouldInject, false, `reason: ${turn.nudge.reason}`);
   assert.match(
     turn.nudge.reason ?? "",
-    /max compressible 400 < threshold 6000/,
+    // The idle diagnostic reports the TIGHTEST tier threshold: since #7464
+    // the band-relative T2 floor (6000×1.5/2 = 4500) sits below the T1 bar.
+    /max compressible 400 < threshold 4500/,
   );
   assert.doesNotMatch(turn.nudge.reason ?? "", /tier2Trigger/);
 });

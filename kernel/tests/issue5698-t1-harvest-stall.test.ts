@@ -311,7 +311,7 @@ test("#5698 (F): stalled but distill mass sub-threshold — no escalation", () =
 
   // Tiny partial fold: harvests far less than STALL_HARVEST_RATIO of the offer
   // (stall set) AND the new tier-1 block's summary mass (~250 tokens) stays
-  // below the T2 threshold (7500), so no distill tier qualifies.
+  // below the T2 threshold (4500, #7464 band-relative floor), so no distill tier qualifies.
   const folded = core.applyCompression({
     ranges: [{ startRef: refOf(state, "m0"), endRef: refOf(state, "m0"), summary: "s".repeat(1000) }],
     messages,

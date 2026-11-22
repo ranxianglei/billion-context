@@ -2251,21 +2251,48 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   // effective; T3 > T2 and > T1 effective). Per-tier thresholds (#2376):
   // nudge.tierGrowthTokens.{t1,t2,t3} may pin each mass trigger independently;
   // each unset tier keeps its derived default (T1 = growth step, T2/T3 = the
-  // shared multiplier threshold), so absent config decides byte-identically.
-  const tier2Threshold = Math.round(
+  // shared multiplier threshold), so an explicit pin still decides on its
+  // own. #7464 (direction A, owner-approved 2026-11-22): the T2 DEFAULT mass
+  // gate is BAND-RELATIVE, not absolute. The old default was a fixed
+  // 1.5 × nudgeGrowthTokens (75K at the flat-50K step) — but the live
+  // tier-1 band drains as fast as it fills (each T1 fold reclaims its own
+  // summaries), so t2Pen asymptotes BELOW 75K (measured 45-50K in the 19.5h
+  // session-8421629a, issue #7464) and the gate could never open: T2 — the
+  // only tier that distills the anchor band itself — was structurally
+  // starved while the usage floor ratcheted up. New default:
+  //
+  //   max( round((t2Pen + t3Pen) / 2),                 ← ratio term
+  //        round(nudgeGrowthTokens × tier2GrowthMultiplier / 2) )  ← floor
+  //
+  // The ratio term means "tier-1 mass ≥ tier-2 mass" (t2Pen ≥ (t2Pen+t3Pen)/2
+  // ⟺ t2Pen ≥ t3Pen): distillation becomes possible exactly when the band
+  // that feeds T2 is at least as large as the band it would produce. The
+  // floor term (half of the old absolute threshold) keeps tiny bands from
+  // distilling on noise and preserves the #5698 sub-threshold negative
+  // contract. An explicit nudge.tierGrowthTokens.t2 pin still wins outright
+  // (#2376) — the documented user escape hatch. T1's flat-50K cadence (KDD
+  // #8) is untouched: this is tier arbitration between already-ready tiers —
+  // the T2 mass leg only evaluates when T1 itself is not ready (t1Eff below
+  // the T1 bar) — not the nudge interval. T3 keeps its absolute 1.5×
+  // default (out of #7464's scope).
+  const t1Eff = tiers[1]?.pending ?? 0;
+  const t2Pen = tiers[2]?.pending ?? 0;
+  const t3Pen = tiers[3]?.pending ?? 0;
+  const tier2MultiplierBase = Math.round(
     nudgeGrowthTokens * (config.nudge.tier2GrowthMultiplier ?? 1.5),
+  );
+  const t2BandGate = Math.max(
+    Math.round((t2Pen + t3Pen) / 2),
+    Math.round(tier2MultiplierBase / 2),
   );
   const tierThresholds: Record<CompressionTier, number> = {
     1: config.nudge.tierGrowthTokens?.t1 ?? nudgeGrowthTokens,
-    2: config.nudge.tierGrowthTokens?.t2 ?? tier2Threshold,
-    3: config.nudge.tierGrowthTokens?.t3 ?? tier2Threshold,
+    2: config.nudge.tierGrowthTokens?.t2 ?? t2BandGate,
+    3: config.nudge.tierGrowthTokens?.t3 ?? tier2MultiplierBase,
   };
   let injectedTier: CompressionTier | null = null;
   let injectedReason = "";
   let bestPending = 0;
-  const t1Eff = tiers[1]?.pending ?? 0;
-  const t2Pen = tiers[2]?.pending ?? 0;
-  const t3Pen = tiers[3]?.pending ?? 0;
   const maxPending = Math.max(0, t1Eff, t2Pen, t3Pen);
   // #5698: the T1 channel is PROVEN non-draining — its last fire was answered
   // by a fold harvesting < STALL_HARVEST_RATIO of the offered pending
@@ -2413,7 +2440,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
       if (cadenceMet) {
         injectedTier = 2;
         stallEscalated = true;
-        injectedReason = `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (1.5x)" : ""}, usage ${Math.round(usage * 100)}%`;
+        injectedReason = `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (band)" : ""}, usage ${Math.round(usage * 100)}%`;
       }
     }
     if (injectedTier === null && t1Eff >= tierThresholds[1]) {
@@ -2431,7 +2458,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
         injectedTier = 2;
         injectedReason = t2CountReady
           ? `T2 distill ready: ${t2Count} tier-1 blocks >= tier2Trigger ${config.tiers.tier2Trigger} (${t2Pen} tokens), usage ${Math.round(usage * 100)}%`
-          : `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (1.5x)" : ""} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
+          : `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (band)" : ""} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
       }
     } else if (
       injectedTier === null &&

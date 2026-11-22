@@ -493,17 +493,26 @@ export interface NudgeConfig {
   minGrowthRatio: number;
   /** Emergency override: always nudge when usage ≥ this fraction. Default 0.98 (98%). */
   emergencyThresholdPct: number;
-  /** Growth multiplier for the tier-2 trigger: T2 distillation fires when T2
-   *  pending ≥ nudgeGrowthTokens × this multiplier AND T2 > T1 effective.
-   *  Default 1.5. */
+  /** #7464: growth multiplier scaling the T2 distillation mass gate. With no
+   *  explicit nudge.tierGrowthTokens.t2 pin, T2 fires when T2 pending ≥
+   *  max((T2+T3 pending) / 2, nudgeGrowthTokens × this multiplier / 2) AND
+   *  T2 > T1 effective — band-relative by default (the old absolute 1.5×step
+   *  threshold was unreachable once the tier-1 band drains as fast as it
+   *  fills — T2 starvation, #7464). This multiplier still sets the FLOOR
+   *  term, so a lower value lowers the floor. Also the (absolute) default
+   *  for the T3 mass gate. Default 1.5. */
   tier2GrowthMultiplier: number;
   /** Per-tier growth thresholds in tokens (#2376): independent trigger sizes
-   *  for the T1/T2/T3 token-mass paths. Each UNSET tier falls back to the
-   *  derived default (T1 = resolved nudgeGrowthTokens, T2/T3 =
-   *  nudgeGrowthTokens × tier2GrowthMultiplier), so an absent or empty object
-   *  is fully backward compatible. Only the token-mass trigger comparisons
-   *  change — count triggers, cadence floor, first-sight mass bypass and the
-   *  pressure/emergency routing keep their existing bases. */
+   *  for the T1/T2/T3 token-mass paths. Each UNSET tier falls back to its
+   *  derived default — T1 = resolved nudgeGrowthTokens, T3 =
+   *  nudgeGrowthTokens × tier2GrowthMultiplier, and (since #7464) T2 = the
+   *  band-relative gate max((T2+T3 pending) / 2,
+   *  nudgeGrowthTokens × tier2GrowthMultiplier / 2) — so an absent or empty
+   *  object keeps those defaults (the T2 default CHANGED in #7464 from the
+   *  old absolute 1.5× step; pin t2 explicitly to restore the old value).
+   *  Only the token-mass trigger comparisons change — count triggers,
+   *  cadence floor, first-sight mass bypass and the pressure/emergency
+   *  routing keep their existing bases. */
   tierGrowthTokens?: { t1?: number; t2?: number; t3?: number };
   /** Minimum tokens the pressure band (usage ≥ maxContextLimitPct /
    *  emergencyThresholdPct) must be able to reclaim before injecting. Below
