@@ -126,21 +126,20 @@ mitm: { enabled: false, domains: [] },
         assert.equal(s!.metadata.confirmedContextLimits, undefined, "#987: no window ever learned");
         assert.equal((s!.stats as { lastInputTokens?: number }).lastInputTokens, 10_000, "emergency shrink armed at the declared window");
 
-        // --- Request 2: overflow EVIDENCE now exists → NO forward-once → fail-fast ---
+        // #7537: no local 413 rejections — the resend is also forwarded and
+        // the upstream's real size error is the authoritative verdict.
         const r2 = await fetch(url, { method: "POST", headers, body: screenshotPayload() });
-        // #3461: the image payload is over-window per bili's own meter and no
-        // fold can close the gap — a structurally doomed verdict answers 413
-        // (non-retryable) instead of the legacy 502.
-        assert.equal(r2.status, 413, "second request fails fast instead of forwarding again");
-        const err2 = JSON.parse(await r2.text()) as { error?: { code?: string } };
-        assert.equal(err2.error?.code, "preflight_compress_failed");
-        assert.deepEqual(streamForwards, [true], "request 2 was NEVER forwarded (loop broken after one rejection)");
+        assert.equal(r2.status, 400, "second request is also forwarded and gets the upstream 400");
+        const r2text = await r2.text();
+        assert.ok(r2text.includes("context_window_exceeded"), "relay error body passes through on resend");
+        assert.equal(r2.headers.get("x-bili-retryable"), "false", "x-bili-retryable: false on upstream size error");
+        assert.deepEqual(streamForwards, [true, true], "request 2 was forwarded again");
 
-        // --- Request 3: stable — still fail-fast, still exactly one forward total ---
+        // --- Request 3: stable — still forwarded, still gets the upstream 400 ---
         const r3 = await fetch(url, { method: "POST", headers, body: screenshotPayload() });
-        assert.equal(r3.status, 413, "third request also fails fast (cooldown replays the same verdict, #3461)");
+        assert.equal(r3.status, 400, "third request is also forwarded and gets the upstream 400");
         await r3.text();
-        assert.deepEqual(streamForwards, [true], "still exactly one forward total (no re-forwarding loop)");
+        assert.deepEqual(streamForwards, [true, true, true], "request 3 was forwarded again (no local 413, #7537)");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();
