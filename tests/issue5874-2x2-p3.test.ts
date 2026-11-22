@@ -720,6 +720,7 @@ function d23Harness(t: test.TestContext) {
         snapStage0: (sid: string, ids: string[], opts?: { seqs?: number[] | null }) => store.snapStage0(sid, ids, opts),
         snapConvBound: (sid: string) => store.snapConvBound(sid),
         snapMsgIdLiveIds: (sid: string) => store.snapMsgIdLiveIds(sid),
+        snapPinLiveIds: (sid: string) => store.snapPinLiveIds(sid),
         snapR3Latched: (sid: string) => store.snapR3Latched(sid),
     } as unknown as Parameters<typeof _setStoreForTest>[0]);
     t.after(() => {
