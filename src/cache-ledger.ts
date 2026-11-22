@@ -1477,8 +1477,15 @@ export function recordCacheSample(
                     return k !== null && k < Math.min(prevIn.msgs, curIn.msgs);
                 })();
                 if (!clientBreak) {
-                    const lcp = seamLcp(prevB.head, curB.head);
                     const bothClipped = curB.bytes > SEAM_BODY_CAP && prevB.bytes > SEAM_BODY_CAP;
+                    // #7528 review: a clipped head never parses — seamLcp's JSON
+                    // pass is wasted work on both-clipped pairs (the parse-derived
+                    // fields are unused there). byteLcp returns the same lcpBytes
+                    // integer (first-differing-byte offset) without the parse, per
+                    // the multi-MiB cost note above it.
+                    const lcp: { lcpBytes: number; msgIndex: number | null; prevMsgs: number; curMsgs: number } = bothClipped
+                        ? { lcpBytes: byteLcp(prevB.head, curB.head), msgIndex: null, prevMsgs: 0, curMsgs: 0 }
+                        : seamLcp(prevB.head, curB.head);
                     const midBreak = lcp.lcpBytes > 0 && lcp.lcpBytes < curB.head.byteLength && (bothClipped || (lcp.msgIndex !== null && lcp.prevMsgs > 0 && lcp.msgIndex < lcp.prevMsgs));
                     if (midBreak) {
                         const xMeasured = Math.round(s.input * (lcp.lcpBytes / curB.bytes));
