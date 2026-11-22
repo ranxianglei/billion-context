@@ -580,6 +580,11 @@ interface V1ToolContext {
     messageID?: string;
     agent?: string;
     abort?: AbortSignal;
+    // #7505: Tool.Context.id — the host's tool-call id (opencode schema/tool.ts
+    // CallID), the same id that rides the model wire and is resent verbatim.
+    // Forward it so the server can key the fold block on it and drop the
+    // redundant inline anchor (see dsh-native.ts ToolExec for the twin).
+    id?: string;
 }
 
 interface V1Tool {
@@ -745,7 +750,7 @@ export interface V1NativeDeps {
     z?: ZodLike;
     /** Tool forwarder (tests inject; runtime POSTs /__bili/plugin/tool). #2204:
      *  carries the business outcome so failures surface as host errors. */
-    forward?: (origin: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => Promise<ForwardedToolResult>;
+    forward?: (origin: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean, toolCallId?: string) => Promise<ForwardedToolResult>;
     /** Absorbed opencode-acp for legacy sessions (#920); when present its DCP
      *  tool slots serve BOTH lanes (legacy → acp executor, new → forward). */
     legacy?: LegacyAcpModule;
@@ -942,7 +947,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
             }
             maybeReportDerived(base, input.sessionID);
         };
-        const forward = deps.forward ?? ((o, conversationId, tool, args, nativeCaller) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args, undefined, nativeCaller === true)));
+        const forward = deps.forward ?? ((o, conversationId, tool, args, nativeCaller, toolCallId) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args, undefined, nativeCaller === true, toolCallId)));
         if (legacy !== undefined) {
             // Tool slots carry acp's DCP schemas (kernel-parseable object form)
             // for BOTH lanes; executors route per session. acp_context_recap
@@ -960,7 +965,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         }
                         const base = getOrigin();
                         if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                        const out = await forward(base, v1ctx.sessionID, name, args, true);
+                        const out = await forward(base, v1ctx.sessionID, name, args, true, v1ctx.id);
                         // #2204: V1 tool results are plain strings — a business
                         // failure throws so the host renders an error, not text.
                         if (out.failed) throw new Error(out.text);
@@ -980,7 +985,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         execute: async (args, v1ctx) => {
                             const base = getOrigin();
                             if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                            const out = await forward(base, v1ctx.sessionID, fn.name, args, true);
+                            const out = await forward(base, v1ctx.sessionID, fn.name, args, true, v1ctx.id);
                             // #2204: same as the legacy-lane slot above — plain-string
                             // results have no error flag, so failures throw.
                             if (out.failed) throw new Error(out.text);
