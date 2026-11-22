@@ -125,6 +125,14 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // now with `rollout.features.passDshExtensions: true` /
     // `BILI_ROLLOUT_PASS_DSH_EXTENSIONS=1`.
     passDshExtensions: { percent: 0 },
+    // #7439 — stamped session-id identity: the server trusts the client's stamped
+    // session id + purpose and stops content-guessing subagent forks (the |sub:…
+    // ladder in session-resolve.ts). GA — ON by default (owner ruling 2026-11-22):
+    // the stamped id is battle-tested across the dsh/claude/codex lanes. The #5095
+    // client-declared subagent lane-token tail is NOT gated (it is the declared
+    // "tail" path, not a guess). Force OFF only to debug the legacy ladder, with
+    // BILI_ROLLOUT_TRUST_STAMPED_ID=0 or `rollout.features.trustStampedId: false`.
+    trustStampedId: { percent: 100 },
 };
 
 export const BP_MAX = 10_000;
