@@ -13,6 +13,7 @@
 
 import type { NudgeDecision } from "acp-kernel";
 import { buildSessionCacheReport, type ModelSwitchEvent } from "./cache-ledger.js";
+import type { ProtectedMassLedger } from "./uncovered.js";
 import { displayContextBest, type Session } from "./session.js";
 
 /** Max events per trail published in the view (newest first). */
@@ -70,6 +71,11 @@ interface ContextView {
     anchor: ContextViewAnchor | null;
     folds: ContextViewFold[];
     switches: ContextViewSwitch[];
+    /** #7463: token mass metered into usage but in no compress offer (hard
+     *  protection + protected recent window), with top carriers. A slice of
+     *  sentTotal already counted in the categories above, NOT a new category.
+     *  Absent below the render floor or when the audit is unavailable. */
+    protectedMass?: ProtectedMassLedger;
 }
 
 interface BuildInput {
@@ -79,6 +85,9 @@ interface BuildInput {
     systemPromptTokens: number;
     limit: number;
     session: Session;
+    /** #7463: protected-mass ledger (token mass metered into usage but in no
+     *  compress offer). Absent when below the render floor or unavailable. */
+    protectedMass?: ProtectedMassLedger;
 }
 
 /** null when no breakdown exists yet (no messages processed this process) —
@@ -144,5 +153,9 @@ export function buildContextView(input: BuildInput): ContextView | null {
         anchor: best !== null ? { tokens: best.tokens, kind: best.kind, at: best.at ?? null } : null,
         folds,
         switches,
+        // #7463: metered-but-unoffered mass (hard protection + protected recent
+        // window) — the dsh Context tab's attribution segment. A slice of
+        // sentTotal already counted in the rows above, NOT a new category.
+        ...(input.protectedMass !== undefined ? { protectedMass: input.protectedMass } : {}),
     };
 }
