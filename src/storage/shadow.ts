@@ -1,19 +1,25 @@
 /**
  * Unified-storage sidecar (#2671).
  *
- * Two opt-in levels via BILI_STORAGE_UNIFIED:
+ * Selections via BILI_STORAGE_UNIFIED / storage.unified:
+ *   - absent or `sqlite` (the DEFAULT since #6480, "pure-sqlite"): the
+ *     drop-in replacement. Reads go unified-first with organic import (a
+ *     session the index has not seen is imported from its legacy file on
+ *     first load) and legacy fallback on any miss, and the JSON envelope
+ *     WRITER defaults off — index.db is the only persistent copy (restore
+ *     dual-write with storage.jsonWriter=on).
+ *   - `full`: the historical #3818 posture — the same unified-first
+ *     machinery, but the JSON envelope writer defaults ON (dual-write;
+ *     rollback = unset the knob).
  *   - `1`/`true`/`shadow` (Phase 1): double-write dry-run. Every session
  *     record the legacy SessionStore commits is ALSO ingested into
  *     <sessionsDir>/index.db, and the reconstructed view is digest-checked
  *     against what the legacy loader (buildSession) would serve after a
  *     restart. Any drift is logged as an error — that is the entire point:
  *     the unified layer must replay legacy bytes exactly, and production
- *     traffic becomes the migration test corpus.
- *   - `full` (Phase 1.5): the drop-in replacement. Reads flip to
- *     unified-first with organic import (a session the index has not seen
- *     is imported from its legacy file on first load) and legacy fallback
- *     on any miss. Legacy files keep being written (rollback = unset the
- *     env), but the unified index is the load path.
+ *     traffic becomes the migration test corpus. The JSON envelope stays
+ *     the sole source of truth at this level.
+ *   - `legacy`: the one-line escape hatch — no sidecar at all.
  *
  * Failure policy: sidecar problems must NEVER break the legacy write path.
  * All work is try/catch'd. The sidecar NEVER gives up on index writes
@@ -28,7 +34,7 @@ import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import { splitMediaContent } from "./identity.js";
 import type { BlockView } from "../session.js";
-import { resolveStorageMode, resolveStorageWalJournalSizeLimit, effectiveJsonWriterOff, type StorageMode } from "../knobs.ts";
+import { effectiveJsonWriterOff, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
@@ -348,6 +354,18 @@ export class UnifiedShadow {
             this.lastWarnKey = key;
             loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${this.consecutiveFailures} in a row; ${detail})${sqliteOpenFailureHint(String(err))} — the index write will be RETRIED on every subsequent save until it succeeds again (no self-disable; the JSON envelope keeps serving meanwhile)`);
         }
+        // #7156 (2026-11-21): open no longer writes — with the per-session
+        // watermark prime, the FIRST write of a process happens at its first
+        // ingest. If that write hits proven corruption before the integrity
+        // verdict has landed (large store: async quick_check in flight, or a
+        // cached .chk verdict skipped the rescan), say so LOUDLY and trip the
+        // latch so the status surface shows the proven-corrupt state; the
+        // save itself falls back to the envelope as usual (the warn above).
+        const corruption = sqliteCorruptionDetail(err);
+        if (corruption !== null) {
+            integrityQuickCheckFailed = true;
+            loggerLog("error", `[storage] index.db FAILED at an ingest write (${corruption}) — the integrity check has not run/landed yet (large store / cached verdict), so the corruption surfaced here instead of at quick_check. No file moved, no copy, no automatic rebuild (2026-10-30 owner policy): back up ${this.dbPath ?? "index.db"}{,-wal,-shm}, then MOVE those files aside by hand and start again (#7156)`);
+        }
     }
 
     /** #3931 step 3: true when this shadow rides a network backend (mysql).
@@ -434,11 +452,11 @@ export class UnifiedShadow {
                 );
                 return null;
             }
-            // #3285: watermark trust does not cross process boundaries — a
-            // restart-handoff overlap leaves the previous writer's rows AND
-            // watermark behind; drop them all so this process's first save
-            // per session re-establishes trust from its own view.
-            store.resetAllIngestWatermarks();
+            // #3285 (2026-11-21 per-session rework): watermark trust no longer
+            // gets a global open-time reset — it would make OPEN a write and
+            // touch every session (the #7156 first-write hazard). Each
+            // session's foreign watermark is dropped lazily on this process's
+            // first touch of it, right before the watermark is read (below).
         } catch (err) {
             // The inner gate's refusal throw (or any StorageIntegrityError the
             // inner catch let through) re-enters THIS catch — it is already
@@ -452,7 +470,7 @@ export class UnifiedShadow {
             // 512 MiB sync threshold checks in the background, or a poisoned
             // .chk verdict cache skipped the rescan (see the close-time gate
             // in store.ts) — the corruption surfaces at the FIRST post-open
-            // write (resetAllIngestWatermarks) instead of at quick_check.
+            // write (an open-path write: migration/DDL) instead of at quick_check.
             // Classify it exactly like the inner catch: proven-corrupt →
             // start WITHOUT the index, files left in place, loud alarm naming
             // the manual fix (2026-10-30 owner policy).
@@ -473,8 +491,10 @@ export class UnifiedShadow {
                 applyProvenCorruptionPolicy(dir, env, fileUnified, fileJsonWriter, fileBackend, `first post-open write failed: ${corruptionDetail}`, err);
                 loggerLog(
                     "error",
-                    `[storage] index.db FAILED at the first post-open write (${corruptionDetail}) — the integrity check did not run synchronously (large store / cached verdict), so the corruption surfaced here instead of at quick_check. Starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#7156/#4175/#4626)`,
+                    `[storage] index.db FAILED at an open-path write (${corruptionDetail}) — the integrity check did not run synchronously (large store / cached verdict), so the corruption surfaced here instead of at quick_check. Starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#7156/#4175/#4626)`,
                 );
+                recordSidecarOpenFailure(`open-path write failed: ${corruptionDetail}`);
+                integrityQuickCheckFailed = true; // proven-corrupt: operator hand-fix only — no in-process auto-retry
                 return null;
             }
             // Deleting the index cannot fix a no-engine failure (the engine is
@@ -501,10 +521,26 @@ export class UnifiedShadow {
         recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         const walTag = ` [wal-cap: ${walLimit}]`;
+        // #7408: the FULL-mode line must state the ACTUAL writer state and
+        // selection — the pre-#6480 wording ("legacy files keep being
+        // written — unset the knob to roll back") is false under the
+        // pure-sqlite default (no knob set, envelopes NOT written) and
+        // contradicted the accurate jsonWriter-off line printed by persist.
+        // At this point mode is full, the backend is sqlite (mysql logs its
+        // own line in openAsync), and encryption-blocking never reaches here
+        // (persist gates the open), so effectiveJsonWriterOff equals the
+        // jsonWriterOff persist.ts computes for save decisions.
+        const sqliteSelection = unifiedSelectionIsSqlite(env, fileUnified);
+        const selection = sqliteSelection
+            ? "pure-sqlite selection (storage.unified absent or =sqlite)"
+            : "storage.unified=full or BILI_STORAGE_UNIFIED=full";
+        const writerOff = effectiveJsonWriterOff(env, fileJsonWriter, fileUnified);
         loggerLog(
             "info",
             mode === "full"
-                ? `[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back${engineTag}${walTag}`
+                ? writerOff
+                    ? `[storage] unified FULL mode ENABLED (${selection}): index.db is the load path AND the only persistent copy — JSON envelopes are not written; restore dual-write with storage.jsonWriter=on${engineTag}${walTag}`
+                    : `[storage] unified FULL mode ENABLED (${selection}): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — ${sqliteSelection ? "remove the explicit storage.jsonWriter=on to return to the pure-sqlite default" : "unset the knob to roll back"}${engineTag}${walTag}`
                 : `[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled${engineTag}${walTag}`,
         );
         return shadow;
@@ -783,6 +819,11 @@ export class UnifiedShadow {
     private ingestDelta(legacy: LegacySessionLike, hasRawTail: boolean): boolean {
         if (this.sync === null) return false;
         try {
+            // #3285 (2026-11-21 per-session): prime THIS session's trust
+            // before reading the watermark — a foreign-set watermark
+            // (previous process) must not vouch for its rows; own watermarks
+            // stay trusted (idempotent, no second write).
+            this.sync.primeIngestTrust(legacy.id);
             const mark = this.sync.ingestWatermark(legacy.id);
             if (!mark) return false;
             // The pre-transaction probe is an optimization (skip building a
@@ -1179,31 +1220,6 @@ export class UnifiedShadow {
         return this.sync.getCcr(sessionId);
     }
 
-    /** #4739: narrow single-column metadata read for lazy-field restore.
-     *  Full-trust only (shadow mode's index may lag its envelopes) — callers
-     *  gate on readsUnified; network backends degrade to null (the caller
-     *  falls back to the envelope, exactly like today's sync loadSync). */
-    getSessionMetadata(sessionId: string): Record<string, unknown> | null {
-        if (this.sync === null) return null;
-        try {
-            return this.sync.getSessionMetadata(sessionId);
-        } catch {
-            return null;
-        }
-    }
-
-    /** #4739: narrow blockContents read for lazy-field restore (block rows +
-     *  orphans journal, no message rows). Same trust/degrade contract as
-     *  getSessionMetadata. */
-    getBlockContents(sessionId: string): import("./store.ts").BlockContentsMap | null {
-        if (this.sync === null) return null;
-        try {
-            return this.sync.getBlockContents(sessionId) as import("./store.ts").BlockContentsMap | null;
-        } catch {
-            return null;
-        }
-    }
-
     /** #4316 PR3/3: raw id → canonical seq (single-row ids only) for the
      *  one-time ledger re-stamp. Shadow mode's index may lag files it has
      *  not re-recorded, so like getCcr this is full-trust only: sync store
@@ -1338,6 +1354,9 @@ export class UnifiedShadow {
                 // generation so the next sample can re-admit and release it.
                 if (!this.driftedSessions.has(legacy.id)) {
                     try {
+                        // #3285 (2026-11-21 per-session): prime THIS session's
+                        // trust before reading the watermark (idempotent).
+                        await backend.primeIngestTrust(legacy.id);
                         const mark = await backend.ingestWatermark(legacy.id);
                         if (mark) {
                             const boundary = await backend.probeIngestBoundary(legacy.id, mark.seq);
