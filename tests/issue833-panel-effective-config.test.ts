@@ -129,9 +129,12 @@ test("#833 status panel Nudge line reflects globally configured nudgeGrowthToken
         await sendTurn(h, conv);
         const panel = await fetchPanel(h, conv);
         assert.match(panel, /^Nudge: idle — .*/m);
-        // 90000 → fixed growth band; floor = max(2e4, 0.45 × 90000) = 40500.
-        assert.match(panel, /< threshold 90000; growth -?\d+ < floor 40500/);
-        assert.doesNotMatch(panel, /threshold 50000/);
+        // 90000 → T1 bar 90000, but since #7464 the T2 band-gate floor
+        // (0.75 × 90000 = 67500, no tier mass yet) sits below the T1 bar,
+        // so the panel's min-tier threshold shows 67500;
+        // floor = max(2e4, 0.45 × 90000) = 40500.
+        assert.match(panel, /< threshold 67500; growth -?\d+ < floor 40500/);
+        assert.doesNotMatch(panel, /threshold 37500/);
         assert.doesNotMatch(panel, /floor 22500/);
     } finally {
         await h.close();
@@ -148,10 +151,11 @@ test("#833 status panel Nudge line reflects provider-level nudgeGrowthTokens (be
         await sendTurn(h, conv);
         const panel = await fetchPanel(h, conv);
         assert.match(panel, /^Nudge: idle — .*/m);
-        // 75000 → floor = max(2e4, 0.45 × 75000) = 33750.
-        assert.match(panel, /< threshold 75000; growth -?\d+ < floor 33750/);
-        assert.doesNotMatch(panel, /threshold 90000/);
-        assert.doesNotMatch(panel, /threshold 50000/);
+        // 75000 → T2 band-gate floor 0.75 × 75000 = 56250 (below the T1
+        // bar, #7464); floor = max(2e4, 0.45 × 75000) = 33750.
+        assert.match(panel, /< threshold 56250; growth -?\d+ < floor 33750/);
+        assert.doesNotMatch(panel, /threshold 67500/);
+        assert.doesNotMatch(panel, /threshold 37500/);
     } finally {
         await h.close();
     }
@@ -172,9 +176,9 @@ test("#833 plugin tool API (acp_status) renders under the session's resolved con
         assert.equal(body.ok, true);
         assert.ok(typeof body.result === "string" && body.result.length > 0, "tool result rendered");
         assert.match(body.result!, /Nudge: idle —/);
-        assert.match(body.result!, /threshold 90000/);
+        assert.match(body.result!, /threshold 67500/);
         assert.match(body.result!, /floor 40500/);
-        assert.doesNotMatch(body.result!, /threshold 50000/);
+        assert.doesNotMatch(body.result!, /threshold 37500/);
     } finally {
         await h.close();
     }
