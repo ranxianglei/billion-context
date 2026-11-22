@@ -332,7 +332,7 @@ export function evaluateWatermarkFastpath(
             for (let hi = 0; hi < seedHead.length; hi++) {
                 const a = headCores.msgs[hi];
                 const b = seedHead[hi];
-                if (a.id !== b.id || JSON.stringify(a) !== JSON.stringify(b)) return miss("head-prefix-drift", false, tailIds);
+                if (headCoreContentDiffers(a, b)) return miss("head-prefix-drift", false, tailIds);
             }
         }
         const windowRaw = openaiToCore(windowFragment as OpenAIRequestBody);
@@ -405,6 +405,21 @@ function rekeyWindowCores(
 function baseOfRawId(id: string): string {
     const m = /^h_[0-9a-f]{16}(?:_\d+)?$/u.exec(id);
     return m === null ? id : id.slice(0, 18);
+}
+
+/** In-place head-edit check, IGNORING the `id` field. In a pinned session
+ *  (pluginLaneServerHistory) the seed cores carry host/ledger msgids while a
+ *  fresh openaiToCore parse mints content-hash ids, so the id namespace differs
+ *  structurally on every turn (#7345) — the id is not a content signal here.
+ *  Content/role/shape inequality is still caught via the full JSON minus the
+ *  id; a remint with identical bytes is not a rewrite. */
+function headCoreContentDiffers(a: CoreMessage, b: CoreMessage): boolean {
+    const strip = (c: CoreMessage): Record<string, unknown> => {
+        const rest: Record<string, unknown> = { ...c };
+        delete rest.id;
+        return rest;
+    };
+    return JSON.stringify(strip(a)) !== JSON.stringify(strip(b));
 }
 
 /** openaiToCore materializes user content-array images as distinct cores
@@ -510,6 +525,21 @@ export function finalizeWatermarkTurn(
     writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt, l: outcome.receivedTailIds });
     headers[PF_SEQ_HEADER] = String(T);
     return headers;
+}
+
+/** Stamp-only turn (flag off, #7367): the x-bili-pf-seq heartbeat is the
+ *  client's watermark advance, NOT fastpath-only state. When
+ *  pluginFullResendWatermark is gated off the fastpath never evaluates, so
+ *  finalizeWatermarkTurn never runs and the stamp stops — the client's k2
+ *  freezes and its x-bili-pf-tail-ids grows one id per turn until it crosses
+ *  Node's 16 KB header limit and wedges the session. Emit the stamp whenever
+ *  T is measurable (the structural scan is the same zero-allocation pass the
+ *  fastpath uses) so the client's tail stays bounded. No seed, no saved
+ *  state: the fastpath re-establishes both on its first evaluated turn. */
+export function stampOnlyWatermarkTurn(bodyText: string): Record<string, string> {
+    const scan = scanMessagesSpans(bodyText, "all");
+    if (scan === null) return {};
+    return { [PF_SEQ_HEADER]: String(scan.total) };
 }
 
 /** Drop the in-process seed (e.g. an announced compaction was detected while

@@ -33,6 +33,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { limitsIngestBytes } from "../src/knobs.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 const WINDOW = 20_000;
@@ -115,6 +116,22 @@ async function setup(window = WINDOW): Promise<{ ctx: Ctx; calls: Call[]; close:
         },
     };
 }
+
+// #7426: the band is DISABLED by default (0 = no ingest cap) for ALL lanes. The e2e tests
+// below arm it explicitly (1 MiB via BILI_INGEST_BODY_BYTES), so this pins the new default
+// they would otherwise hide, plus the opt-in re-arm path (operator still has the escape hatch).
+test("#7426: ingest band defaults to 0 (unlimited, all lanes); BILI_INGEST_BODY_BYTES re-arms it", () => {
+    const prev = process.env.BILI_INGEST_BODY_BYTES;
+    try {
+        delete process.env.BILI_INGEST_BODY_BYTES;
+        assert.equal(limitsIngestBytes(), 0, `default must be 0 = no ingest cap (#7426), got ${limitsIngestBytes()}`);
+        process.env.BILI_INGEST_BODY_BYTES = "33554432";
+        assert.equal(limitsIngestBytes(), 33554432, "BILI_INGEST_BODY_BYTES re-arms the #5794 cost band");
+    } finally {
+        if (prev === undefined) delete process.env.BILI_INGEST_BODY_BYTES;
+        else process.env.BILI_INGEST_BODY_BYTES = prev;
+    }
+});
 
 const postMessages = (ctx: Ctx, content: string) =>
     fetch(ctx.url, {
