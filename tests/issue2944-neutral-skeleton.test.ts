@@ -46,6 +46,10 @@ process.env.XDG_DATA_HOME = join(XDG, "data");
 process.env.XDG_STATE_HOME = join(XDG, "state");
 process.env.BILI_PERSIST = "0";
 process.env.NODE_ENV = "test";
+// Pin the legacy |sub: ladder: trustStampedId is now GA-on by default
+// (#7439), but this suite characterizes the OLD resolver forks — force the
+// feature OFF so it keeps asserting the pre-retirement behavior.
+process.env.BILI_ROLLOUT_TRUST_STAMPED_ID = "0";
 
 const { prefixAffinity } = await import("../src/prefix-affinity.ts");
 // retired-module pin: persona-anchor — intentional dual-run 瞄点 (this suite

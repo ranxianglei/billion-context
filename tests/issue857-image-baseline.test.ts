@@ -200,11 +200,16 @@ test("#857 B: genuine overflow evidence (learned limit == configured window) sti
         await r1.text();
 
         // A byte-counting relay that REJECTED at the configured window is real
-        // evidence: an armed baseline (usage-grade, what an overflow 400's arm
-        // leaves behind) above the stale baseline on top.
+        // evidence: an armed baseline above the stale baseline on top.
+        // Identity-fast-path update: a usage-grade baseline is now TOLERANCE
+        // evidence (#496/#1800 hatch open), so the fixture stamps the real
+        // overflow-arm provenance (source + stated wall) that a genuine
+        // overflow 400 leaves behind — that is the overflow evidence this pin
+        // targets, and statedWall > 0 also demotes the trusted fast path.
         const s = sess("s857b");
         s.stats.lastInputTokens = FAKE_CONFIRMED;
-        s.stats.lastInputTokensSource = "usage";
+        s.stats.lastInputTokensSource = "overflow-arm";
+        s.stats.overflowArmTokens = WINDOW;
 
         const r2 = await fetch(url, { method: "POST", headers, body: body(MODEL, "s857b", imageInput()) });
         // #3461: over-window per bili's own meter with no foldable mass left → 413.
@@ -231,11 +236,16 @@ test("#857 C: unusable image-fold summaries leave the grounded baseline and forw
         assert.equal(r1.status, 200);
         await r1.text();
 
-        // A usage report put the baseline above the window. Historical images
+        // An overflow arm put the baseline above the window. Historical images
         // can now leave the wire, so the reserve alone cannot prove futility.
+        // Identity-fast-path update: a usage-grade baseline is now TOLERANCE
+        // evidence (#496/#1800 hatch open), so the fixture stamps the real
+        // overflow-arm provenance (source + stated wall) that keeps the hatch
+        // closed — the contract this pin targets — and demotes the fast path.
         const s = sess("s857c");
         s.stats.lastInputTokens = FAKE_CONFIRMED;
-        s.stats.lastInputTokensSource = "usage";
+        s.stats.lastInputTokensSource = "overflow-arm";
+        s.stats.overflowArmTokens = WINDOW;
 
         // The mock cannot supply an acceptable summary. The bounded image-fold
         // attempts must therefore fail without forwarding the original wire or
@@ -249,11 +259,11 @@ test("#857 C: unusable image-fold summaries leave the grounded baseline and forw
         assert.ok(stats.summaryCalls > 0, "image-bearing candidates receive bounded summary attempts");
 
         // No fold ran, so nothing in the turn may touch the baseline: the armed
-        // usage value stays exactly where the test put it (far below the image
-        // floor — nothing to re-poison) with its grounded provenance intact.
+        // overflow-arm value stays exactly where the test put it (far below the
+        // image floor — nothing to re-poison) with its grounded provenance intact.
         const after = sess("s857c");
         assert.equal(after.stats.lastInputTokens, FAKE_CONFIRMED, "failed folds leave the baseline untouched");
-        assert.equal(after.stats.lastInputTokensSource, "usage", "grounded provenance preserved");
+        assert.equal(after.stats.lastInputTokensSource, "overflow-arm", "grounded provenance preserved");
         assert.equal(confirmedOf("s857c"), undefined, "#987: no window is ever learned from session traffic");
     } finally {
         upstream.close();
