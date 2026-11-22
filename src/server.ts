@@ -90,6 +90,7 @@ import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompres
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
+import { postShedImageView } from "./egress-shed.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, flushResignPending, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals, type ApigCredential } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
@@ -3566,7 +3567,17 @@ export function outboundPayloadBreakdown(
     reqUrl: string,
 ): { textEstimate: number; overheadEstimate: number; imageTokens: number; payloadEstimate: number; armEstimate: number } {
     const billingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(reqUrl) ? reqUrl : opts.upstream);
-    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, prepared.parsedBody ?? prepared.body, opts, billingUpstream);
+    // Post-shed image caliber (2026-11-22 incident): the byte budget archives
+    // old images to placeholder notes at SEND time, so the token estimate must
+    // judge what the wire will actually carry, not the pre-shed memo (which the
+    // 2026-11-22 opencode payload over-stated ~4x: ~948K estimated vs ~229K
+    // really billed after shed). When the lane would not shed, this returns
+    // the pre-shed body — behavior unchanged. The projection re-parses, so
+    // hand it a STRING view (parsedBody may be the already-parsed object;
+    // body may arrive as a Buffer).
+    const imageBodyStr = prepared.parsedBody !== undefined ? JSON.stringify(prepared.parsedBody) : (typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8"));
+    const imageShedView = postShedImageView(imageBodyStr, prepared.protocol);
+    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, imageShedView.body, opts, billingUpstream);
     // #1498-F2: a kernel-transform failure leaves processedMessages empty while
     // the outbound IS the raw client body — measure that view instead of arming
     // at wire overhead only (the mirror of localInputEstimate's fallback).
