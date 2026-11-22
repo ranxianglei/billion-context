@@ -111,6 +111,7 @@
 | `rollout.features.egressPlane` | boolean \| number | 0(关) | BILI_ROLLOUT_EGRESS_PLANE | egress 平面——整条新链路的**唯一开关**(#7398/#7439;取代已退役的 egressOpLog/egressServeLog 双键)。开:四条 wire 车道(OpenAI/Anthropic/Responses/Google)每轮把出站会话视图记为稀疏 op(I/D/U)写入 egress_state/egress_flow 双表——行**自包含**(消息字节随行走,不经内容 CAS,裁定 7439-1)——并从 op 日志回放重建出站核心消息段,按构造字节一致(行内字节就是管线自己的最终 core JSON);pinned 插件车道另获服务端权威——内核输入从流水回放(裁定 7439-3/5)。有界回溯阶梯恢复到最近健康日志点;任何不可重建行(缺/空字节、未知 role)、日志损坏或探针失败,整轮降级 legacy 链路——绝不部分替换、绝不客户端为准。system 块两条路径都保持 live 构建(前缀缓存锚点纪律)。仅 SQLite 车道;标题生成/压缩侧路请求排除。默认 0 = 关:legacy 链路,零行,与特性前字节一致。 |
 | `rollout.features.pluginDeltaResend` | boolean \| number | 0(关) | BILI_ROLLOUT_PLUGIN_DELTA_RESEND | Delta 重发——全量重发水位快路径的尾切片形态:稳态轮发 x-bili-pf-delta: 1 + body.messages = **只有**新元素(L = T − stampT,无前置);服务端用钉存前缀核 + 解析出的尾部重建视图(与全量车道同源的命中可证)。任何不成立的声明(count/body/tail-ids 宽度不符、已知清单后锚链断裂、灰度关)返回 400 pf_delta_reanchor + x-bili-msgid-mode: full,客户端当轮改发全量形态——一轮收敛,绝不静默错解。默认**关**:delta body 对未上车的服务端不可处理,故保持 0 直到客户端发送端就位。见 technical-notes.zh-CN.md「Delta 重发」。 |
 | `rollout.features.pluginFullResendWatermark` | boolean \| number | 5(实验性灰度) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | 全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 technical-notes.zh-CN.md「全量重发水位快路径」。 |
+| `rollout.features.passDshExtensions` | boolean \| number | 0(关 = 拦截) | BILI_ROLLOUT_PASS_DSH_EXTENSIONS | DSH 客户端扩展拦截(#7168/#7439):DSH(deepseek-harness)每个请求都带顶层 `dsh_*` 字段——`dsh_session_log`(给官方 DeepSeek API 的 8 MiB 增量无损会话日志,模型根本不读)加孪生字段 `dsh_plugin_packages`;fork/seed 会话在水位追上前每轮从头整段重传。默认 0% = 拦截:bili 在入站 body 解析后、任何协议路径构建出站前,删掉所有**顶层** `dsh_*` 键(src/server/handle.ts),8 MiB 永不转发上游——不浪费带宽,非 DeepSeek 上游也不见陌生大字段。DSH 不受影响:其上传水位只在 2xx 时推进,bili 照常回 2xx,重传自愈。窗口计量另由 #7168 的 dsh_* 豁免(src/preflight.ts)兜底。等服务端权威 egress 工作(#6785 / 讨论 #7439)把客户端扩展旁路带做好后,翻到 100%(或移除裁切)即放开;现在想临时放行用 `true` / env = 1。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `security.adminRelay` | boolean | false | — | 允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。仅 anthropic 线路 —— Responses 线路上本开关无效（见 `subagentSplit` / BOTH-mechanisms 作用域说明）。 |
@@ -178,7 +179,7 @@
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 死胡同 preflight 后，对同一会话重试校准的冷却时长。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | 同一请求在向上游暴露错误前的最大传输失败重放次数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | 重放之间的基础退避延迟（指数增长）。 |
-| `network.throttle429Enabled` | boolean | true | BILI_THROTTLE_429 | 出站 429 治理器（#4204）：连续上游 429 会在本地应答而不再转发。账号限额及无法识别/格式错误的响应按 origin+凭据持有；只有 KeyRing 精确返回 `keyring_model_temporarily_unavailable` 且响应模型与请求模型完全相同时，才按 origin+凭据+模型持有，让其他模型继续可用。模型不匹配或缺失仍按账号级处理；设为 false 恢复旧的总是转发行为。 |
+| `network.throttle429Enabled` | boolean | false | BILI_THROTTLE_429 | 出站 429 治理器（#4204），自 #6639/#5853 起默认关闭：上游 429 原样转发给客户端，bili 每观测到一次 429 打一条 [429-passthrough] warn 日志。设为 true（或 BILI_THROTTLE_429=1）重新启用，作为逃生舱：连续上游 429 会在本地应答而不再转发。账号限额及无法识别/格式错误的响应按 origin+凭据持有；只有 KeyRing 精确返回 `keyring_model_temporarily_unavailable` 且响应模型与请求模型完全相同时，才按 origin+凭据+模型持有，让其他模型继续可用。模型不匹配或缺失仍按账号级处理。 |
 | `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | 连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到账号级 hold 收到任意非 429 响应，或模型级 hold 收到同一模型的非 429 响应后清除。 |
 | `network.throttle429BaseDelayMs` | number | 2000 | BILI_THROTTLE_429_BASE_DELAY_MS | 429 hold 的基础退避（每连续一次 429 翻倍、抖动到 [0.5×, 1×]、以 throttle429MaxDelayMs 封顶；上游 Retry-After 更大时优先）。 |
 | `network.throttle429MaxDelayMs` | number | 30000 | BILI_THROTTLE_429_MAX_DELAY_MS | 429 hold 退避的上限，也是终局阶段探测间隔的上限。 |
@@ -2024,6 +2025,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
 | `BILI_ROLLOUT_EGRESS_PLANE` | `rollout.features.egressPlane` | 0 (off) |
 | `BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST` | `rollout.features.identityChannelHarvest` | 0 (off) |
+| `BILI_ROLLOUT_PASS_DSH_EXTENSIONS` | `rollout.features.passDshExtensions` | 0 (off = intercept) |
 | `BILI_ROLLOUT_PLUGIN_DELTA_RESEND` | `rollout.features.pluginDeltaResend` | 0 (off) |
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 100 (on, GA) |
@@ -2047,7 +2049,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
-| `BILI_THROTTLE_429` | `network.throttle429Enabled` | true |
+| `BILI_THROTTLE_429` | `network.throttle429Enabled` | false |
 | `BILI_THROTTLE_429_BASE_DELAY_MS` | `network.throttle429BaseDelayMs` | 2000 |
 | `BILI_THROTTLE_429_MAX_CONSECUTIVE` | `network.throttle429MaxConsecutive` | 5 |
 | `BILI_THROTTLE_429_MAX_DELAY_MS` | `network.throttle429MaxDelayMs` | 30000 |

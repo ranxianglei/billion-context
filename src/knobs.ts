@@ -135,15 +135,17 @@ const THROTTLE_429_MAX_CONSECUTIVE = 5;
 const THROTTLE_429_BASE_DELAY_MS = 2_000;
 const THROTTLE_429_MAX_DELAY_MS = 30_000;
 
-/** BILI_THROTTLE_429 > network.throttle429Enabled > true. The egress 429
- *  governor (#4204) is ON by default: consecutive upstream 429s put sends to
- *  that origin+credential on local backoff instead of amplifying a
- *  concurrency-style provider limit. "0"/"false" restores the legacy
- *  always-forward behavior. Read per request so the switch flips live. */
+/** BILI_THROTTLE_429 > network.throttle429Enabled > false. The egress 429
+ *  governor (#4204) is OFF by default (#6639/#5853): upstream 429s are
+ *  forwarded to the client untouched — the host owns the retry decision —
+ *  and bili only warns in the log. Opt in ("1"/"true" here, or
+ *  network.throttle429Enabled: true) for accounts where host retry storms
+ *  pin a shared concurrency-style provider limit (#4204). Read per request
+ *  so the switch flips live. */
 export function throttle429Enabled(): boolean {
     const envRaw = process.env.BILI_THROTTLE_429;
     if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
-    return fileNetwork().throttle429Enabled !== false;
+    return fileNetwork().throttle429Enabled === true;
 }
 
 /** BILI_THROTTLE_429_MAX_CONSECUTIVE > network.throttle429MaxConsecutive > 5.

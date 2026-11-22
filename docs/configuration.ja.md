@@ -108,6 +108,7 @@
 | `rollout.features.egressPlane` | boolean \| number | 0 (off) | BILI_ROLLOUT_EGRESS_PLANE | egress プレーン — 新しい経路全体の**単一スイッチ**(#7398/#7439；退役した egressOpLog/egressServeLog の二キーを置き換え)。ON：全 wire レーン（OpenAI/Anthropic/Responses/Google）が毎ターン送信会話ビューをスパース op（I/D/U）として egress_state/egress_flow デュアルテーブルに記録 — 行は**自己完結**（メッセージバイトが同行する；コンテンツ CAS を経由しない、裁定 7439-1）— 送信コアメッセージ部分を op ログから復元し再構築、構造によりバイト一致（行内バイトはパイプライン自身の最終 core JSON）；ピン留め済みプラグインレーンは加えてサーバー権威を取得 — カーネル入力をフローからリプレイ（裁定 7439-3/5）。有界の遡行ラダーで最新の健全ログ点に回復；再構築不能行（バイト欠落/空、未知 role）、ログ破損、プローブ失敗のいずれかで**そのターン全体**をレガシーチェーンにデグレード — 部分的な swap は絶対にしない、クライアントを権威にしない。system ブロックは両経路でライブ構築のまま（プレフィックスキャッシュアンカー規律）。SQLite レーンのみ；タイトル生成/圧縮のサイドリクエストは除外。デフォルト 0 = オフ：レガシー経路、0 行、機能前とバイト一致。 |
 | `rollout.features.pluginDeltaResend` | boolean \| number | 0 (off) | BILI_ROLLOUT_PLUGIN_DELTA_RESEND | Delta 再送 — フルリセンドウォーターマークレーンのテールスライス形態：定常プラグインレーンのターンは `x-bili-pf-delta: 1` + body.messages = 新要素のみ（L = T − stampT、プレフィックスなし）を送る；サーバーはスタッシュ済みプレフィックスコアとパース済みテールからビューを再構築する（フルレーンと同一のヒット由来）。満たせない主張（count/body/tail-ids 幅の不一致、既知リスト後のアンカーチェーン破断、ロールアウトオフ）は 400 `pf_delta_reanchor` + `x-bili-msgid-mode: full` を返し、クライアントはそのターンをフルフォームで再送する — 1ラウンドで収束、静かな誤パースは絶対にしない。デフォルトオフ：delta body はこのアームを持たないサーバーでは処理できないため、クライアント送信側が実装されるまでキーは 0 のまま。`technical-notes.md` の「Delta resend」を参照。 |
 | `rollout.features.pluginFullResendWatermark` | boolean \| number | 5 (experimental grey) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | フルリセンドウォーターマークファストパス (#5403/#5418)：前回のレスポンスに `x-bili-pf-seq` ス tamp を持っていたプラグインレーンのチャットコンプリートターンでは、エコーされたカウントにより再送信プレフィックスをアサートする（構造スキャン、フルパースなし）；ヒット時にパイプラインはスタッシュされた正規プレフィックスコアと新しいテールウィンドウのみを消費する（バイト同一の送信プロベナンス；疑義がある場合はターンごとに未変更のフルパースパスにフォールバックし再スタンプ、5回のクレジットミスでレーンを1時間保持）。クライアントがスタンプを `x-bili-pf-count` としてエコーバックすることを要求（dsh/pi/opencode/omp は対応；未適応レーンはヒットしない）。実験的グレースケールロールアウト — インストールの約5%でデフォルトON（オーナー裁定 2026-11-02：GA前に小規模コホート；Web UIで全インストールに一度限りの導入通知、クイック設定に3状態スイッチ）。`true` で強制、`false`（またはパーセンテージ）/ 環境変数 = 0 でオフ。`technical-notes.md` の「Full-resend watermark fastpath」を参照。 |
+| `rollout.features.passDshExtensions` | boolean \| number | 0 (off = intercept) | BILI_ROLLOUT_PASS_DSH_EXTENSIONS | DSHクライアント拡張インターセプト (#7168/#7439)：DSH（deepseek-harness）は全リクエストにトップレベルの `dsh_*` フィールドを載せる — `dsh_session_log`（公式 DeepSeek API 向けの 8 MiB 無損セッションログアップロード；モデルは読まない）と姉妹フィールド `dsh_plugin_packages`；フォーク/シードされたセッションはウォーターマークが追いつくまで毎ターンログ全体を再送する。デフォルト 0% = インターセプト：bili は受信ボディの解析後、プロトコルパスが送信を構築する前に、すべてのトップレベル `dsh_*` キーを削除する（`src/server/handle.ts`）ため、8 MiB は決して上流に転送されない — バンド幅の無駄がなく、非 DeepSeek 上流での未知フィールドリスクもない。DSH には影響なし：アップロードウォーターマークは 2xx のみで前進し、bili は依然 2xx を返すため、再送は自己修復する。ウィンドウメーターは #7168 の dsh_* スキップ（`src/preflight.ts`）で別途免除。サーバー権威エグレス作業（#6785 / ディスカッション #7439）がクライアント拡張サイドバンドを搭載したら 100% に切り替える（またはストリップを削除する）ことでリリース；当面は `true` / 環境変数 = 1 でパストスルーを強制。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | ログ内の非公開ターゲットホストを <private-host> としてマスクする。認証情報ヘッダーは常にマスクされる。 |
 | `security.adminRelay` | boolean | false | — | エンベディングホスト（現在は dsh web）が、リモートブラウザからパネルを開けるように（#3373）、その自身のエントリーオリジンを通じて /__bili/ 管理サーフェス全体をリレーすることを許可する。フェイルクローズ、ファイルのみ。リレーされたホップはローカル非ブラウザクライアントとしてプロキシに到達する（ループバックソース + ループバック Host、Origin なし）ため、管理ゲートは変更されない。これを有効にすると、ホスト Web エントリーに到達できる者に設定編集と認証情報の書き込みが露出する — まずそのエントリー（認証 / リバースプロキシ）を保護すること。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude Code サブエージェントは、メインセッションのキューに並ぶ代わりに、独自のセッション名前空間（<session>\|sub:<agent-id>）を取得します。Anthropic-wire 専用 — Responses wire ではこのスイッチは no-op です（`subagentSplit` / BOTH-mechanisms スコープ注記を参照）。 |
@@ -175,7 +176,7 @@
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 行き止まりのプリフライト後、同じセッションの調整を再試行するまでのクールダウン。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | エラーを表面化させる前に、同一リクエストの最大トランスポート失敗リプレイ回数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | リプレイ間のベースバックオフ遅延（指数関数的）。 |
-| `network.throttle429Enabled` | boolean | true | BILI_THROTTLE_429 | エグレス側の 429 ガバナナ（#4204）：繰り返される上流 429 は転送されるのではなくローカルで応答される。アカウント制限および未認識/不正なレスポンスは origin+credential を保持する；KeyRing の正確な keyring_model_temporarily_unavailable コードと一致するリクエストモデルのみが origin+credential+model を保持し、他のモデルを適格とする。モデルの不一致または欠落はアカウント全体に適用される；false は従来の常に転送する動作を復元する。 |
+| `network.throttle429Enabled` | boolean | false | BILI_THROTTLE_429 | エグレス側の 429 ガバナナ（#4204）、#6639/#5853 以降既定でオフ：上流の 429 は変更なしにクライアントへ転送され、bili は 1 件あたり [429-passthrough] warn ログを記録する。true（または BILI_THROTTLE_429=1）にするとエスケープハッチとして再有効化：繰り返される上流 429 が転送されずローカルで応答される。アカウント制限および未認識/不正なレスポンスは origin+credential を保持；KeyRing の正確な keyring_model_temporarily_unavailable コードと一致するリクエストモデルのみが origin+credential+model を保持し、他のモデルを適格とする。モデルの不一致または欠落はアカウント全体に適用される。 |
 | `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | ホールドがターミナル（既知のすべての SDK リトライセットの外側のローカル 424）に変わるまでの連続上流 429 の回数；バックオフウィンドウごとに1回のプローブが、アカウントホールドをクリアする非 429 レスポンス、またはそのモデルホールドをクリアする一致するモデルの非 429 レスポンスがあるまでチェックを続ける。 |
 | `network.throttle429BaseDelayMs` | number | 2000 | BILI_THROTTLE_429_BASE_DELAY_MS | 429 ホールドのベースバックオフ（連続する 429 ごとに倍増し、[0.5×, 1×] にジャッターされ、throttle429MaxDelayMs で上限が設定される；上流の Retry-After が大きい場合は優先される）。 |
 | `network.throttle429MaxDelayMs` | number | 30000 | BILI_THROTTLE_429_MAX_DELAY_MS | 429 のバックオフおよびターミナルフェーズのプローブ間隔の上限。 |
@@ -2032,6 +2033,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
 | `BILI_ROLLOUT_EGRESS_PLANE` | `rollout.features.egressPlane` | 0 (off) |
 | `BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST` | `rollout.features.identityChannelHarvest` | 0 (off) |
+| `BILI_ROLLOUT_PASS_DSH_EXTENSIONS` | `rollout.features.passDshExtensions` | 0 (off = intercept) |
 | `BILI_ROLLOUT_PLUGIN_DELTA_RESEND` | `rollout.features.pluginDeltaResend` | 0 (off) |
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 100 (on, GA) |
@@ -2055,7 +2057,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
-| `BILI_THROTTLE_429` | `network.throttle429Enabled` | true |
+| `BILI_THROTTLE_429` | `network.throttle429Enabled` | false |
 | `BILI_THROTTLE_429_BASE_DELAY_MS` | `network.throttle429BaseDelayMs` | 2000 |
 | `BILI_THROTTLE_429_MAX_CONSECUTIVE` | `network.throttle429MaxConsecutive` | 5 |
 | `BILI_THROTTLE_429_MAX_DELAY_MS` | `network.throttle429MaxDelayMs` | 30000 |
