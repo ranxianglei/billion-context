@@ -50,7 +50,7 @@ When auditing host behavior (plugin APIs, tool-call-id exposure, compaction seam
 | zed | MITM | [zed-industries/zed](https://github.com/zed-industries/zed) (zed.dev) |
 | jcode (JCode) | MITM (Rust; no plugin seam, #962) | [1jehuang/jcode](https://github.com/1jehuang/jcode) |
 | qoder (Qoder CLI) | MITM / launcher | closed: https://qoder.com · https://download.qoder.com/qoder-app/releases/latest/Qoder-linux-amd64.deb |
-| workbuddy / codebuddy (Tencent) | config seam (#7456) | closed: https://workbuddy.ai · https://download.codebuddy.ai · https://codebuddy.cn |
+| workbuddy / codebuddy (Tencent) | config seam (workbuddy, #7456) / launcher (codebuddy) | closed: https://workbuddy.ai · https://download.codebuddy.ai · https://codebuddy.cn |
 | trae (Trae CLI) | MITM | closed: https://trae.ai |
 | iflow (iFlow CLI) | launcher | https://iflow.cn |
 | mcode (MiniMax Code) | MITM (event hooks only, #1050) | closed: https://minimax.io |
