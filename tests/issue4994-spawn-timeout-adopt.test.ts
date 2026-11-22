@@ -122,7 +122,7 @@ test("#4994 rung 2: laddered child found via its own pid-tagged listen line is a
                 // spawner captured spawnLogOffset (append-only port log).
                 fs.appendFileSync(
                     logPath,
-                    `2026-10-27T15:48:00.000Z [info] acp-proxy v0.1.208 (pid ${CHILD_PID}, id deadbeef) listening on ${ladder}\n`,
+                    `2026-10-27T15:48:00.000Z [info] acp-proxy v0.1.208 (pid ${CHILD_PID}, id deadbeef, daemon) listening on ${ladder}\n`,
                 );
                 return makeFakeChild(CHILD_PID, kills);
             },
