@@ -34,16 +34,26 @@ type LoadedRegistry = { reg: RegistryShape; costs: CostsShape | null };
 let cache: RegistryShape | null = null;
 let costCache: CostsShape | null = null;
 let loading: Promise<RegistryShape | null> | null = null;
+const FAILED_FETCH_BACKOFF_MS = 10 * 60 * 1000;
+let lastFailedFetchMs = 0;
+let requestPathBudgetMs = 3_000;
+export function _setRequestPathBudgetForTest(ms: number | undefined): void {
+    requestPathBudgetMs = ms ?? 3_000;
+}
 const warnedConflicts = new Set<string>();
 const warnedPriceConflicts = new Set<string>();
 // Case-folded key indexes for the roster maps (#2074): models.dev keys are
 // mixed-case ("minimax/MiniMax-M3", "google/gemma-4-E2B-it") while relay ids
 // often arrive lowercased — exact-key hits and suffix scans were case-
 // sensitive on both sides, so any case drift silently fell back to the
-// built-in table / default window. One slot per source object; identity-
-// checked, so loadRegistry / _setForTest swaps invalidate automatically.
+// built-in table / default window. Identity-checked, so loadRegistry /
+// _setForTest swaps invalidate automatically. regLowerIdx is a single slot
+// (one model registry at a time); costLowerIdx is a small Map because the
+// billing path scans TWO cost tables per lookup (the overrides table, then the
+// registry fallback) and a single slot evicted one on the other, rebuilding
+// the large registry index on every overrides-miss lookup (#7278).
 let regLowerIdx: { reg: RegistryShape; idx: LowerKeyIndex<ModelEntry> } | null = null;
-let costLowerIdx: { costs: CostsShape; idx: LowerKeyIndex<CostRow> } | null = null;
+let costLowerIdx: Map<CostsShape, LowerKeyIndex<CostRow>> | null = null;
 
 /** Full models.dev snapshot committed at src/registry-snapshot.json
  *  (refresh with `npm run registry:snapshot`) and inlined into dist at build
@@ -242,6 +252,7 @@ export async function loadRegistry(): Promise<RegistryShape | null> {
     if (loading) return loading;
     const pending = (async () => {
         const fresh = await fetchFresh();
+        lastFailedFetchMs = fresh ? 0 : Date.now();
         if (fresh) {
             cache = fresh.reg;
             costCache = fresh.costs;
@@ -358,8 +369,23 @@ export function providerFromHost(host: string): string | undefined {
 }
 
 export async function contextFromRegistry(model: string, host?: string): Promise<number | undefined> {
-    const reg = await loadRegistry();
-    return registryLookup(reg, model, host);
+    // Request path (server/handle.ts awaits this for a model the warm cache
+    // misses). The fetch watchdog is an idle timer, so a models.dev that
+    // trickles bytes holds the load open far past its 15 s budget, and a
+    // failed fetch leaves `cache` on a fallback so loadRegistry() fetches
+    // again on every call. Wait at most requestPathBudgetMs (the load keeps
+    // warming the cache in the background) and skip the wait entirely during
+    // the backoff after a failure; loadRegistry() itself still retries per call.
+    if (cache && Date.now() - lastFailedFetchMs < FAILED_FETCH_BACKOFF_MS) return registryLookup(cache, model, host);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<RegistryShape | null>((resolve) => {
+        timer = setTimeout(() => resolve(cache), requestPathBudgetMs);
+    });
+    try {
+        return registryLookup(await Promise.race([loadRegistry(), budget]), model, host);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 /** Synchronous cache-only lookup: returns the window when the models.dev
@@ -582,10 +608,27 @@ function registryLowerIndex(reg: RegistryShape): LowerKeyIndex<ModelEntry> {
     return regLowerIdx.idx;
 }
 
+// Cap is exactly the two cost tables that ever flow through the billing path
+// (the overrides table and the registry snapshot); evict the least-recently-
+// used on a new table so both stay hot across overrides-miss lookups (#7278).
+const COST_IDX_CAP = 2;
 function costLowerIndex(costs: CostsShape): LowerKeyIndex<CostRow> {
-    if (costLowerIdx && costLowerIdx.costs === costs) return costLowerIdx.idx;
-    costLowerIdx = { costs, idx: buildLowerKeyIndex(costs) };
-    return costLowerIdx.idx;
+    if (!costLowerIdx) costLowerIdx = new Map();
+    const cached = costLowerIdx.get(costs);
+    if (cached) {
+        // Refresh recency (Map preserves insertion order; re-set moves to end).
+        costLowerIdx.delete(costs);
+        costLowerIdx.set(costs, cached);
+        return cached;
+    }
+    const idx = buildLowerKeyIndex(costs);
+    costLowerIdx.set(costs, idx);
+    while (costLowerIdx.size > COST_IDX_CAP) {
+        const oldest = costLowerIdx.keys().next().value;
+        if (oldest === undefined) break;
+        costLowerIdx.delete(oldest);
+    }
+    return idx;
 }
 
 function registryLookup(reg: RegistryShape | null, model: string, host: string | undefined, field: "context" | "output"): number | undefined;
@@ -659,6 +702,7 @@ export function _resetForTest(): void {
     cache = null;
     costCache = null;
     loading = null;
+    lastFailedFetchMs = 0;
     regLowerIdx = null;
     costLowerIdx = null;
     warnedConflicts.clear();

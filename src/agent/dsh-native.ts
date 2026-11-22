@@ -136,7 +136,11 @@ type CommandInvocation = {
     attachments?: unknown;
     signal?: AbortSignal | undefined;
 };
-type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal };
+// #7505: exec carries the host's tool-call id — the SAME wire id the model minted
+// (deepseek-harness translate.ts brands native.id into ToolCallId and resends it
+// verbatim; pipeline.ts hands the whole exec to tool.execute). Forward it so the
+// server can key the fold block on it and drop the redundant inline anchor.
+type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal; callId?: string };
 
 type ToolDefinition = {
     name: string;
@@ -923,7 +927,7 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
             if (typeof sid !== "string" || sid.length === 0) {
                 throw new Error(`bili tool ${tool.name} requires an owning agent session`);
             }
-            const out = await forwardTool(base, sid, tool.name, args, exec.signal, true);
+            const out = await forwardTool(base, sid, tool.name, args, exec.signal, true, exec.callId);
             // #2204: dsh tool results are plain strings — a business failure
             // throws so the host renders an error, not success text.
             if (out.failed) throw new Error(out.text);

@@ -131,8 +131,11 @@ function completed(protocol: PreflightProtocol, events: unknown[], streaming: bo
                 terminal = true;
             }
         } else {
-            if (record(item.promptFeedback)?.blockReason) return false;
-            const candidate = Array.isArray(item.candidates) ? record(item.candidates[0]) : undefined;
+            const gItem = record(item.response) && !("candidates" in item) && !("usageMetadata" in item) && !("promptFeedback" in item)
+                ? record(item.response)!
+                : item;
+            if (record(gItem.promptFeedback)?.blockReason) return false;
+            const candidate = Array.isArray(gItem.candidates) ? record(gItem.candidates[0]) : undefined;
             const parts = record(candidate?.content)?.parts;
             if (Array.isArray(parts) && parts.some((part) => record(part)?.functionCall)) return false;
             if (candidate?.finishReason) {
