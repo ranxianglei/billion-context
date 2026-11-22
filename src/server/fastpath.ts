@@ -195,9 +195,12 @@ export interface FastpathOutcome {
     readonly clientSess?: string;
     /** #5403/#5418 v6 (contract R7): set when the cs (sess-change) gate
      *  fired — the incoming conversation SWAPPED. finalize honors it by
-     *  holding the cumulative ledger: a swapped-in conversation's ids must
-     *  never fold into this session's ledger (they describe different
-     *  clients' history and would poison the set-diff baseline). */
+     *  holding ledger growth for the swap turn itself: the turn goes
+     *  legacy and re-seeds, and identity follows the traffic (cs
+     *  converges to the incoming conversation on the same turn), so from
+     *  the NEXT turn the incoming conversation's ids grow the ledger as
+     *  usual — a mixed ledger is inert bloat under host-msgid uniqueness,
+     *  bounded by the FIFO cap. */
     readonly ledgerHold?: boolean;
 }
 
@@ -714,9 +717,10 @@ export function finalizeWatermarkTurn(
     const saved = readSaved(session.id);
     // #5403/#5418 v6 (R2/R7): sole ledger growth site. Grow when this turn
     // delivered a shape-valid list, the v6 knob is on, and the conversation
-    // did not swap (cs gate fired ⇒ ledgerHold — a swapped-in conversation's
-    // ids must not fold into this session's baseline). Non-grow turns carry
-    // the stored ledger forward unchanged (never wipe).
+    // did not swap (cs gate fired ⇒ ledgerHold — the swap turn itself goes
+    // legacy and re-seeds; identity follows the traffic, so from the next
+    // turn the incoming conversation's ids grow the ledger as usual).
+    // Non-grow turns carry the stored ledger forward unchanged (never wipe).
     const lg = outcome.receivedTailIds !== undefined && !outcome.ledgerHold && featureEnabled("watermarkCompactionPassthrough")
         ? growPfLedger(saved, outcome.receivedTailIds)
         : saved?.lg;
