@@ -1805,9 +1805,10 @@ export function cacheBlockContent(session: Session, blockId: string, content: Bl
 // #5984: canonical names of the two compress-failure accounting keys that
 // stream.ts writes — the #2146 consecutive-failure breaker (COMPRESS_LOOP_KEY)
 // and the #847 exact-spec repeat guard (FAIL_STREAK_KEY). Both live on metadata
-// and are cleared on a successful compress; a native-compaction rebase must
-// clear them too, because the ref space they describe is gone (refs restart at
-// m00001). Defined here — not in stream.ts — because resetSessionCompression
+// and are cleared on a successful compress (the #2146 breaker only on a
+// SUBSTANTIAL one — #7300); a native-compaction rebase must clear them too,
+// because the ref space they describe is gone (refs restart at m00001). Defined
+// here — not in stream.ts — because resetSessionCompression
 // is the single choke point every rebase funnels through, and session.ts cannot
 // import stream.ts (stream already imports session: a cycle). Exported so both
 // modules share one source of truth for the key names.

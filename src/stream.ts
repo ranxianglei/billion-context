@@ -357,10 +357,10 @@ export function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs
     // post-rebase grace window, do NOT advance the model-failure breaker for it:
     // returning "" leaves the non-armed hint cluster (rebaseNote +
     // currentRefsSnapshot + the kernel's acp_status guidance) visible until one
-    // success clears everything. acp_status independently surfaces the rebase
-    // via nativeCompactionBoundary, so it does not depend on this streak to know
-    // the refs changed. Non-stale causes (parse / covered / content-changed) are
-    // unaffected and still count even right after a rebase.
+    // SUBSTANTIAL success clears everything (#7300). acp_status independently
+    // surfaces the rebase via nativeCompactionBoundary, so it does not depend on
+    // this streak to know the refs changed. Non-stale causes (parse / covered /
+    // content-changed) are unaffected and still count even right after a rebase.
     if (freshCause.startsWith("stale-ref") && withinRebaseGrace(ctx.session)) {
         ctx.log(`[info: compress-loop] stale-ref failure within ${REBASE_STALE_GRACE_MS / 60000} min of a native-compaction rebase — counted as proxy-caused, model breaker not advanced`);
         return "";
