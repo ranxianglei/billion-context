@@ -372,6 +372,3 @@ function noJoin(): ReconcileOutput {
 function estTokens(id: string): number {
     return Math.max(1, Math.ceil(id.length / 4));
 }
-
-// Re-exported for the audit/observability stream (grep-able sentinels).
-export { sha256hex, canonicalJson, s4Aggregate };

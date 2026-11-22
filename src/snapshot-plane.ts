@@ -150,7 +150,6 @@ export interface FoundationTurn {
 
 const PLANE_LATCH_KEY = "snapshot:plane";
 const DIVERGE_KEY = "snapshot:diverge";
-const R3_KEY = "snapshot:r3";
 /** Committed model-turn counter (session_ext, flat JSON number). The ckpt
  *  cadence (turnCount % ckptEveryNTurns) is driven by it — the row ledger
  *  itself cannot count turns (no-op turns append no events). */
