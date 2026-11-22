@@ -110,6 +110,7 @@
 | `rollout.features.pluginFullResendWatermark` | boolean \| number | 5(实验性灰度) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | 全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 technical-notes.zh-CN.md「全量重发水位快路径」。 |
 | `rollout.features.snapshotFoundation` | boolean \| number | 0(关——主门) | BILI_ROLLOUT_SNAPSHOT_FOUNDATION | 快照表压缩基础**主灰度门**(#5874):入组安装的插件车道车队会话(snapshot.cohortHosts)把压缩台账放在服务端快照表里,出站前缀从表渲染——跨客户端字节抖动保持稳定,含压缩折叠。要求客户端每轮回带消息 id 信封(biliMsgIds);入组请求缺信封时硬 400、零副作用(R3),十分钟内三次故障该会话锁回老路径。任何红色门槛(校验和/台账断裂 R1、无法解释的历史变化 R2、世界纪元失步 R3、未落盘的结构提交 R4)都会把该会话永久拉回老路径——绝不砖。默认 0%:放量前零行为变化。 |
 | `rollout.features.snapshotLane` | boolean \| number | 100(基座嵌套:主分组内恒开) | BILI_ROLLOUT_SNAPSHOT_LANE | 快照表基础**车道开关**(#5874):仅在 snapshotFoundation 分组内评估(基座嵌套),因此入组与否完全由主门决定;本键用于在已入组安装内单独关掉车道行为(或测试中不动主门而强开)。默认 100——改动它永不重排任何人;它是针对车道行为本身的手术刀级开关。 |
+| `rollout.features.passDshExtensions` | boolean \| number | 0(关 = 拦截) | BILI_ROLLOUT_PASS_DSH_EXTENSIONS | DSH 客户端扩展拦截(#7168/#7439):DSH(deepseek-harness)每个请求都带顶层 `dsh_*` 字段——`dsh_session_log`(给官方 DeepSeek API 的 8 MiB 增量无损会话日志,模型根本不读)加孪生字段 `dsh_plugin_packages`;fork/seed 会话在水位追上前每轮从头整段重传。默认 0% = 拦截:bili 在入站 body 解析后、任何协议路径构建出站前,删掉所有**顶层** `dsh_*` 键(src/server/handle.ts),8 MiB 永不转发上游——不浪费带宽,非 DeepSeek 上游也不见陌生大字段。DSH 不受影响:其上传水位只在 2xx 时推进,bili 照常回 2xx,重传自愈。窗口计量另由 #7168 的 dsh_* 豁免(src/preflight.ts)兜底。等服务端权威 egress 工作(#6785 / 讨论 #7439)把客户端扩展旁路带做好后,翻到 100%(或移除裁切)即放开;现在想临时放行用 `true` / env = 1。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `security.adminRelay` | boolean | false | — | 允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。仅 anthropic 线路 —— Responses 线路上本开关无效（见 `subagentSplit` / BOTH-mechanisms 作用域说明）。 |
@@ -2028,6 +2029,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
 | `BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST` | `rollout.features.identityChannelHarvest` | 0 (off) |
+| `BILI_ROLLOUT_PASS_DSH_EXTENSIONS` | `rollout.features.passDshExtensions` | 0 (off = intercept) |
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
 | `BILI_ROLLOUT_SNAPSHOT_FOUNDATION` | `rollout.features.snapshotFoundation` | 0 (off — the master gate) |

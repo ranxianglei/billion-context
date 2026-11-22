@@ -127,6 +127,22 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // the master; this entry exists so a lane-level ramp needs no code
     // change. Force with `BILI_ROLLOUT_SNAPSHOT_LANE=1`.
     snapshotLane: { percent: 100, base: "snapshotFoundation" },
+    // #7168/#7439 DSH client-extension intercept: DSH (deepseek-harness) rides
+    // top-level `dsh_*` fields on every request — `dsh_session_log` (the 8 MiB
+    // lossless session-log upload for the official DeepSeek API; the model never
+    // reads it) plus the sibling `dsh_plugin_packages`. On forked/seeded sessions
+    // it resends the whole log each turn until its watermark catches up. Default
+    // 0% = INTERCEPT: bili strips top-level `dsh_*` from the inbound body
+    // (handle.ts) so the 8 MiB is never forwarded upstream — no bandwidth waste,
+    // no unknown-field risk on a non-DeepSeek upstream. DSH self-heals because its
+    // upload watermark only advances on a 2xx (llm-deepseek/adapter.ts), which bili
+    // still returns; the window meter is separately exempt (#7168 dsh_* skip).
+    // RELEASE once the server-authoritative egress work (#6785 / discussion #7439)
+    // ships the client-extension sideband — flip this to 100% (or remove the strip)
+    // and DSH's official-DeepSeek session-log upload resumes. Force pass-through
+    // now with `rollout.features.passDshExtensions: true` /
+    // `BILI_ROLLOUT_PASS_DSH_EXTENSIONS=1`.
+    passDshExtensions: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;
