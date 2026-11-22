@@ -54,7 +54,7 @@ import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, 
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { rebuildLaneCore, recordLaneTurn } from "./egress-lane-io.js";
+import { authorityLaneTurn } from "./egress-lane-io.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -544,15 +544,14 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         if (!isCompactionTrigger && featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             if (st) {
+                // Ruling 7439-5: the flow is the sole content authority.
                 // Record FIRST with the lane's stable system text (the
                 // developer block is injected below and is rebuilt live
                 // every turn — recording it would churn the system row),
-                // then serve the view that call just wrote (record-first —
-                // the served core must contain this turn's new message;
-                // see egress-lane-io ORDER MATTERS).
-                recordLaneTurn(st, sessionId, laneCore, projection.systemParts.join("\n\n"), log);
-                const served = rebuildLaneCore(st, sessionId, log);
-                if (served !== null) laneCore = served;
+                // then serve the view that call just wrote. Turn 1 =
+                // bootstrap; turn 2+ = kernel input is the flow replay.
+                // Unreadable flow → hard fail.
+                laneCore = authorityLaneTurn({ st, sessionId, conversation: laneCore, systemText: projection.systemParts.join("\n\n"), log });
             }
         }
         rebuiltInput = patchResponsesInput(projection, laneCore);

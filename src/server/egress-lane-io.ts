@@ -15,19 +15,16 @@
 // lane's OUTBOUND system text (post-injection), so system drift is visible
 // as a +U op on that row.
 //
-// Authority scoping (ruling 7439-5): these lanes serve the RECORDED view as
-// an optimization surface; the client remains the input authority (its
-// resends are what get recorded). A corrupt/unreadable log point therefore
-// degrades the ONE turn to the lane's legacy core (re-attempts next turn) —
-// never a crash, never a partial rebuild. The hard-fail semantics of the
-// ruling (whole-flow unreadable ⇒ the request fails, never client
-// bytes-as-authority) apply to the PINNED plugin lane, which is the OpenAI
-// authority seam in prepare-openai.ts — there a divergent client would be
-// served stale server content, so failing loud beats guessing.
+// Authority (ruling 7439-5): the server flow is the sole content authority
+// for egress-on sessions. `authorityLaneTurn` implements the full swap +
+// hard-fail semantics: the kernel input is the flow replay result (not
+// client bytes), and an unreadable flow hard-fails the turn (never degrades
+// to client bytes). The first turn (empty flow) is a one-time bootstrap
+// where client bytes are recorded once.
 //
 // Rollout gate (egressPlane, default 0) is owned by the caller.
 
-import { recoverEgressBase, recordEgressTurn, type EgressOpLogStore } from "../storage/egress-record.js";
+import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, type EgressOpLogStore } from "../storage/egress-record.js";
 import { rebuildCoreFromLog } from "../storage/egress-serve.js";
 import type { BiliMessage } from "acp-kernel/wire";
 
@@ -73,4 +70,49 @@ export function serveLaneTurn(args: {
 }): BiliMessage[] | null {
     recordLaneTurn(args.st, args.sessionId, args.conversation, args.systemText, args.log);
     return rebuildLaneCore(args.st, args.sessionId, args.log);
+}
+
+/** Ruling 7439-5 full authority: the flow is the sole content source.
+ *
+ * Turn 1 (empty flow): bootstrap — record client bytes once, return them
+ * unchanged (the one-time content source).
+ * Turn 2+: existing messages are served from the flow (client resends are
+ * identity verification only); new messages (not yet in the flow) come from
+ * the client. The SWAPPED conversation (flow bytes + new client bytes) is
+ * what gets recorded. Unreadable flow → EgressAuthorityRejectError (hard
+ * fail, never client bytes).
+ *
+ * Returns the core to use as kernel input + outbound. Throws on unreadable
+ * flow (the lane must propagate the error). */
+export function authorityLaneTurn(args: {
+    st: EgressOpLogStore;
+    sessionId: string;
+    conversation: BiliMessage[];
+    systemText: string;
+    log: LaneLog;
+}): BiliMessage[] {
+    const { st, sessionId, conversation, systemText, log } = args;
+    const base = recoverEgressBase(st, sessionId);
+    if (base === null) {
+        log("error", `[${sessionId}] egress-authority: no healthy flow point (ruling 7439-5) — hard-failing instead of trusting client bytes`);
+        throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (ruling 7439-5) — failing the turn instead of trusting client bytes`);
+    }
+    if (base.view.length === 0) {
+        // Turn-1 bootstrap: client bytes are the content source exactly once.
+        recordLaneTurn(st, sessionId, conversation, systemText, log);
+        log("info", `[${sessionId}] egress-authority: bootstrap — empty flow, client bytes recorded once (turn 1)`);
+        return conversation;
+    }
+    // Turn 2+: swap existing messages with flow bytes, keep new client
+    // messages, record the swapped conversation, return it.
+    const flowCore = rebuildCoreFromLog(base.view);
+    if (flowCore === null || flowCore.length === 0) {
+        log("error", `[${sessionId}] egress-authority: flow unreadable (ruling 7439-5) — hard-failing`);
+        throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} flow unreadable (ruling 7439-5) — failing the turn`);
+    }
+    const flowById = new Map(flowCore.map((m) => [m.id, m] as const));
+    const swapped = conversation.map((c) => flowById.get(c.id) ?? c);
+    recordLaneTurn(st, sessionId, swapped, systemText, log);
+    log("info", `[${sessionId}] egress-authority: ${flowCore.length} rows from op-log, ${Math.max(0, conversation.length - flowCore.length)} fresh from client${base.degraded ? ` (degraded, log_seq=${base.seq})` : ""}`);
+    return swapped;
 }

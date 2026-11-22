@@ -43,7 +43,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
-import { serveLaneTurn } from "./egress-lane-io.js";
+import { authorityLaneTurn } from "./egress-lane-io.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -383,13 +383,16 @@ export async function prepareGoogle(
         // instead of being re-serialized into a new shape.
         const extraSystemParts = sysParts.slice(googleClientSystem ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
-        // #7398 all-lanes (ruling 7439-4): record THIS turn's core view, then
-        // serve the view that call just wrote (record-first — the served
-        // core must contain this turn's new message; see egress-lane-io).
+        // #7398 all-lanes (ruling 7439-4/5): the flow is the sole content
+        // authority. Turn 1 = bootstrap (client bytes recorded once); turn 2+
+        // = kernel input is the flow replay result (client resends are
+        // identity verification only). Unreadable flow → hard fail.
         if (!isTitleGen && featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
-            const served = st ? serveLaneTurn({ st, sessionId, conversation: laneCoreForRecord, systemText: googleOutboundSystem ?? googleClientSystem, log }) : null;
-            if (served !== null) rebuiltContents = coreToGoogle(served, { model });
+            if (st) {
+                const core = authorityLaneTurn({ st, sessionId, conversation: laneCoreForRecord, systemText: googleOutboundSystem ?? googleClientSystem, log });
+                rebuiltContents = coreToGoogle(core, { model });
+            }
         }
         if (injectTools) {
             toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_GOOGLE] : []), ...(blockOpsActive ? blockOps.google : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));

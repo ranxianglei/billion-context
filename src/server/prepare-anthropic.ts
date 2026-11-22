@@ -52,7 +52,7 @@ import { tryIncrementalPin } from "../snapshot/stage0.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { yieldToEventLoop } from "../yield-loop.js";
-import { serveLaneTurn } from "./egress-lane-io.js";
+import { authorityLaneTurn } from "./egress-lane-io.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -575,14 +575,16 @@ export async function prepareAnthropic(
         }
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, laneDecisions.compressSurfaceOff, laneDecisions.mcpDialect, detectGenerationBoundary(session, processedMessages, log));
-        // #7398 all-lanes (ruling 7439-4): record THIS turn's core view, then
-        // serve the view that call just wrote (record-first — the served
-        // core must contain this turn's new message; see egress-lane-io).
-        // No title-gen side requests ride this lane, so no extra gate.
+        // #7398 all-lanes (ruling 7439-4/5): the flow is the sole content
+        // authority. Turn 1 = bootstrap (client bytes recorded once); turn 2+
+        // = kernel input is the flow replay result (client resends are
+        // identity verification only). Unreadable flow → hard fail.
         if (featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
-            const served = st ? serveLaneTurn({ st, sessionId, conversation: laneCoreForRecord, systemText: extractSystem(systemOut) ?? "", log }) : null;
-            if (served !== null) rebuiltMessages = coreToAnthropic(served, anthropicCacheMarks ?? clientCacheControls);
+            if (st) {
+                const core = authorityLaneTurn({ st, sessionId, conversation: laneCoreForRecord, systemText: extractSystem(systemOut) ?? "", log });
+                rebuiltMessages = coreToAnthropic(core, anthropicCacheMarks ?? clientCacheControls);
+            }
         }
         // #1637: stamp the steady body's system. NOTE: parsed.system stays the
         // #1085 frozen CLIENT head (injectSystem's in-place view) — the round-2
