@@ -4162,21 +4162,52 @@ export async function preflightCompressIfNeeded(
         const preFold = measuredOutbound(prepared);
         if (preFold !== undefined) {
             // estimateRawBodyBreakdown's buckets key on "messages" only; the
-            // responses lane's conversation lives in "input" and is folded the
-            // same way — so measure the foldable surface explicitly and judge
-            // the REST as the irreducible non-message surface.
+            // responses lane's conversation lives in "input" and the google
+            // lane's in "contents" — both folded the same way — so measure the
+            // foldable surface explicitly and judge the REST as the
+            // irreducible non-message surface.
             let foldable = 0;
             const pb = prepared.parsedBody;
+            let pbObj: Record<string, unknown> | undefined;
             if (pb !== undefined && pb !== null && typeof pb === "object" && !Array.isArray(pb)) {
-                const p = pb as Record<string, unknown>;
+                pbObj = pb as Record<string, unknown>;
+            } else {
+                // parsedBody is optional (some call sites build Prepared
+                // without it); the body is valid JSON — measuredOutbound parsed
+                // it — so re-parse for the meter rather than judging the whole
+                // body irreducible (foldable=0 → false 413 on any over-window
+                // payload that carries foldable conversation).
+                const raw = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
+                try {
+                    const r: unknown = JSON.parse(raw);
+                    if (r !== null && typeof r === "object" && !Array.isArray(r)) pbObj = r as Record<string, unknown>;
+                } catch { /* fall open: foldable stays 0 */ }
+            }
+            if (pbObj !== undefined) {
                 const foldableBody: Record<string, unknown> = {};
-                for (const key of ["messages", "input"]) {
-                    if (key in p) foldableBody[key] = p[key];
+                for (const key of ["messages", "input", "contents"]) {
+                    if (key in pbObj) foldableBody[key] = pbObj[key];
                 }
                 if (Object.keys(foldableBody).length > 0) foldable = estimateRawBodyBreakdown(foldableBody).total;
             }
+            // #2391: on the responses wire deferred function schemas are
+            // invisible to the model (projected to {type,name,defer_loading})
+            // and loaded records ride in input[] as tool definitions, not
+            // conversation — the raw tools[] mass overstates the non-message
+            // surface by the deferred share, so a 272k deferred catalog
+            // against a 204k window is NOT irreducible. Judge that wire on the
+            // model-visible meter (estimateWireOverhead: system +
+            // modelVisibleTools + loaded records); other wires have no
+            // deferral, so the raw breakdown is exact there.
             const { tools, system, other } = preFold.breakdown;
-            const irreducible = preFold.tokens - foldable;
+            let responsesVisible = false;
+            let irreducible: number;
+            if (pbObj !== undefined && prepared.protocol === "responses") {
+                responsesVisible = true;
+                irreducible = estimateWireOverhead("responses", pbObj);
+            } else {
+                irreducible = preFold.tokens - foldable;
+            }
             if (irreducible >= limit) {
                 // #736: when the wall is bili's own shrunken window, say so —
                 // the same note the post-fold failFast() closure appends.
@@ -4188,7 +4219,10 @@ export async function preflightCompressIfNeeded(
                     upstreamEndpoint: route?.rewrittenUrl,
                     knownKeys: Object.keys(opts.routes),
                 });
-                const doomMessage = `non-message surface (tools[] ~${tools.toLocaleString("en-US")} + system ~${system.toLocaleString("en-US")} + other ~${other.toLocaleString("en-US")}; messages/input ~${foldable.toLocaleString("en-US")} is the only foldable part) = ~${irreducible.toLocaleString("en-US")} tokens of irreducible surface ≥ the model window ${limit.toLocaleString("en-US")} (model=${model}); preflight folding only rewrites the conversation and can never shrink the tool surface — trim the tool list, use a leaner preset, or a larger-window model. NOT forwarded.${doomShrinkNote}`;
+                const surface = responsesVisible
+                    ? "model-visible non-message surface (system + visible tools + loaded records; deferred schemas are invisible to the model)"
+                    : `non-message surface (tools[] ~${tools.toLocaleString("en-US")} + system ~${system.toLocaleString("en-US")} + other ~${other.toLocaleString("en-US")}; messages/input/contents ~${foldable.toLocaleString("en-US")} is the only foldable part)`;
+                const doomMessage = `${surface} = ~${irreducible.toLocaleString("en-US")} tokens of irreducible surface ≥ the model window ${limit.toLocaleString("en-US")} (model=${model}); preflight folding only rewrites the conversation and can never shrink the tool surface — trim the tool list, use a leaner preset, or a larger-window model. NOT forwarded.${doomShrinkNote}`;
                 log("error", `[${session.id}] preflight fail-fast 413 (retryable=false, irreducible tool surface): ${doomMessage}`);
                 noteLocalRefusal(session, currentOrigin, model, limit);
                 return { failFast: true, status: 413, message: doomMessage, retryable: false, respond: !res.writableEnded, windowTokens: limit, inboundBytes: inboundBody.byteLength };
