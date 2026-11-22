@@ -273,6 +273,14 @@ test("#2189 bare-Error 429 fails fast after ONE attempt, retryable=false, retrie
         assert.equal(r1.status, 200);
         await r1.text();
 
+        // Pin a stated upstream wall: the session's same-origin+model usage
+        // reality (300k) would otherwise open the identity fast path and
+        // forward the over-window outbound instead of failing fast, bypassing
+        // the 429 handling under test (#7532). The wall demotes the fast path.
+        const seed = listSessions().find((s) => s.id.includes("s2189-shape"));
+        assert.ok(seed, "session exists after r1");
+        seed.stats.overflowArmTokens = 12_000;
+
         const body2 = { model: "claude-small", max_tokens: 1024, stream: true, system: ccSystem(), messages: bigConversation() };
         const r2 = await drive(proxyPort, upstreamPort, "s2189-shape", body2);
         assert.equal(r2.status, 503);
@@ -318,6 +326,14 @@ test("#2189 a genuine rate limit keeps the legacy 3-attempt replay and retryable
         });
         assert.equal(r1.status, 200);
         await r1.text();
+
+        // Pin a stated upstream wall: the session's same-origin+model usage
+        // reality (300k) would otherwise open the identity fast path and
+        // forward the over-window outbound instead of failing fast, bypassing
+        // the 429 handling under test (#7532). The wall demotes the fast path.
+        const seed = listSessions().find((s) => s.id.includes("s2189-genuine"));
+        assert.ok(seed, "session exists after r1");
+        seed.stats.overflowArmTokens = 12_000;
 
         const r2 = await drive(proxyPort, upstreamPort, "s2189-genuine", {
             model: "claude-small", max_tokens: 1024, stream: true, system: ccSystem(), messages: bigConversation(),
