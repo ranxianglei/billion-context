@@ -9,6 +9,11 @@ import {
   summaryBlockIdOf,
 } from "./prune.js";
 import { tierActionHint } from "./compress.js";
+import {
+  COMPRESS_EXCHANGE_KEEP_RECENT,
+  collectAgedCompressCallIds,
+  isCompressToolName,
+} from "./protected.js";
 import { computeProtectedRefs } from "./recommend.js";
 import {
   buildProjectionShared,
@@ -98,6 +103,9 @@ interface VisibleMessageInfo {
   index: number;
   isUser: boolean;
   gapBefore: boolean;
+  /** Present for tool halves; lets the drill-down label BLOCKED compress
+   *  receipts aged vs newest without re-scanning the message array. */
+  toolCallId?: string;
 }
 
 /** A rendered block-summary node still resident in the view (id
@@ -191,6 +199,7 @@ function collectVisible(
         index,
         isUser: message.role === "user",
         gapBefore: pendingGap,
+        toolCallId: message.toolCallId,
       });
       // #2663: a live checkpoint carrier stays listed (it IS visible mass) but
       // must not be bridged across by a range row — the apply side refuses to
@@ -273,7 +282,25 @@ export function buildStatusReport(
 
   if (scope === "uncompressed") {
     if (view === "messages") {
-      return renderMessageDrilldown(visible, toolFilter, sort, limit);
+      // #7536: BLOCKED compress rows in the drill-down must read the same
+      // way the fold gate judges them — aged receipts fold when a range
+      // spans them, the newest few are working memory (kernel #4348).
+      const cfg = options.config;
+      const orig = options.originalMessages;
+      const blockedInfo =
+        cfg && orig
+          ? {
+              agedIds: collectAgedCompressCallIds(orig, cfg),
+              isCompress: (t: string) => isCompressToolName(t, cfg),
+            }
+          : undefined;
+      return renderMessageDrilldown(
+        visible,
+        toolFilter,
+        sort,
+        limit,
+        blockedInfo,
+      );
     }
     return renderUncompressedRanges(
       visible,
@@ -447,8 +474,15 @@ function renderUncompressedRanges(
 ): string {
   const lines: string[] = [];
   const totalTokens = visible.reduce((s, m) => s + m.tokens, 0);
+  // BLOCKED rows (protection-pinned, no numeric ref) cannot end or cite a
+  // range — buildCompressibleRanges (the nudge table) skips them WITHOUT
+  // opening a gap, so range rows are built from the resolvable entries only
+  // and the pinned mass gets its own labeled section below. Same splits,
+  // same mass, no phantom "mX–BLOCKED ⚠ not foldable" rows.
+  const blockedRows = visible.filter((m) => m.ref === BLOCKED_REF);
+  const rangeable = visible.filter((m) => m.ref !== BLOCKED_REF);
   lines.push(
-    `UNCOMPRESSED — ${formatTokens(totalTokens)} | ${visible.length} visible messages`,
+    `UNCOMPRESSED — ${formatTokens(totalTokens)} | ${rangeable.length} raw message(s)${blockedRows.length > 0 ? ` + ${blockedRows.length} blocked` : ""}`,
   );
   lines.push("");
   if (visible.length === 0 && summaryNodes.length === 0) {
@@ -478,7 +512,7 @@ function renderUncompressedRanges(
     return best;
   };
   const merged: Merged[] = [];
-  for (const group of segmentGroups(visible)) {
+  for (const group of segmentGroups(rangeable)) {
     const first = group[0]!;
     const r: Merged = {
       startRef: first.ref,
@@ -556,7 +590,7 @@ function renderUncompressedRanges(
   }
   lines.push(`Sorted by ${sort === "time" ? "time" : "size"}`);
   lines.push("");
-  if (visible.length === 0) {
+  if (rangeable.length === 0) {
     lines.push("  (no raw uncompressed messages)");
   } else {
     for (const r of merged.slice(0, limit)) {
@@ -625,6 +659,51 @@ function renderUncompressedRanges(
       );
     }
   }
+  // Protection-pinned mass: no numeric ref, so no range can cite or fold it
+  // directly — the nudge table skips it silently; this section is where the
+  // meter-vs-offer gap is named on this surface (the host-side attribution
+  // line is PROTECTED MASS, #7463). Compress receipts carry the #4348 truth:
+  // aged ones ARE consumed by any fold that spans their position, the newest
+  // few are working memory.
+  if (blockedRows.length > 0) {
+    const blockedTokens = blockedRows.reduce((s, m) => s + m.tokens, 0);
+    lines.push("");
+    lines.push(
+      `BLOCKED MESSAGES — ${blockedRows.length} msg(s), ${formatTokens(blockedTokens)} (no m-refs — cannot be cited or folded directly)`,
+    );
+    const isCompressRow = (m: VisibleMessageInfo) =>
+      config ? isCompressToolName(m.tool, config) : m.tool === "compress";
+    const compressRows = blockedRows.filter(isCompressRow);
+    const otherRows = blockedRows.filter((m) => !isCompressRow(m));
+    if (compressRows.length > 0) {
+      const cTokens = compressRows.reduce((s, m) => s + m.tokens, 0);
+      const callIds = new Set<string>();
+      for (const m of compressRows) if (m.toolCallId) callIds.add(m.toolCallId);
+      const exchangeCount =
+        callIds.size > 0 ? callIds.size : compressRows.length;
+      let detail = " — pinned compress receipts";
+      if (config && original) {
+        const agedAll = collectAgedCompressCallIds(original, config);
+        const aged = [...callIds].filter((id) => agedAll.has(id)).length;
+        const newest = exchangeCount - aged;
+        detail =
+          " — pinned compress receipts: " +
+          (newest > 0 ? `${newest} newest = working memory; ` : "") +
+          (aged > 0
+            ? `the ${aged} older exchange(s) are consumed by any fold that spans their position (cite the refs on either side)`
+            : `all ${exchangeCount} are protected working memory (newest ${COMPRESS_EXCHANGE_KEEP_RECENT} stay pinned)`);
+      }
+      lines.push(
+        `  compress: ${exchangeCount} exchange(s), ${formatTokens(cTokens)}${detail}`,
+      );
+    }
+    if (otherRows.length > 0) {
+      const oTokens = otherRows.reduce((s, m) => s + m.tokens, 0);
+      lines.push(
+        `  other: ${otherRows.length} msg(s), ${formatTokens(oTokens)} — hard protection (unrecoverable media / protectedTools)`,
+      );
+    }
+  }
   return lines.join("\n");
 }
 
@@ -633,6 +712,10 @@ function renderMessageDrilldown(
   toolFilter: string | undefined,
   sort: string,
   limit: number,
+  blockedInfo?: {
+    agedIds: Set<string>;
+    isCompress: (tool: string) => boolean;
+  },
 ): string {
   let filtered = visible;
   if (toolFilter) filtered = filtered.filter((m) => m.tool === toolFilter);
@@ -652,8 +735,22 @@ function renderMessageDrilldown(
   const lines = [header, `Sorted by ${sort}`, ""];
   const shown = filtered.slice(0, limit);
   for (const message of shown) {
+    // #7536: a bare "BLOCKED (x) compress" row read as uncompressible junk;
+    // the fold gate (kernel #4348) says otherwise for the aged ones. Label
+    // with the same split the gate uses.
+    let suffix = "";
+    if (message.ref === BLOCKED_REF) {
+      if (blockedInfo?.isCompress(message.tool)) {
+        suffix =
+          message.toolCallId && blockedInfo.agedIds.has(message.toolCallId)
+            ? " \u00b7 aged \u2014 folds when a range spans it"
+            : " \u00b7 newest \u2014 working memory";
+      } else if (message.tool !== "text") {
+        suffix = " \u00b7 protected";
+      }
+    }
     lines.push(
-      `  ${message.ref} (${formatTokens(message.tokens)}) ${message.tool}`,
+      `  ${message.ref} (${formatTokens(message.tokens)}) ${message.tool}${suffix}`,
     );
   }
   if (filtered.length > shown.length) {
