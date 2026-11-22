@@ -2237,6 +2237,10 @@ export const headroomEffectiveLogged = new Set<string>();
  * session overflow arm's judging wall is session-scoped evidence, unlike the
  * config-derived [headroom] value, so the dedup key carries the session id. */
 export const armJudgingWallLogged = new Set<string>();
+/** One-shot preflight fold gate — per-session "blocked trigger" log dedupe
+ *  (managed sessions re-trigger every turn once growth outruns the fold).
+ *  Process-lifetime like armJudgingWallLogged; never cleared. */
+export const preflightGateBlockedLogged = new Set<string>();
 
 // #1840: best-known OUTPUT ceiling for the request's model, resolved through
 // the SAME source chain (and rank order) the output-headroom fallback uses
@@ -4136,6 +4140,29 @@ export async function preflightCompressIfNeeded(
         }
     }
     if (limit <= 0 || !model || !triggerFires) return prepared;
+    // One-shot fold gate: proxy-driven preflight folding gets exactly ONE
+    // effective attempt per session lifecycle. Once the session has been
+    // compressed by bili (a committed fold) or its fold attempt was aborted
+    // by a client disconnect, the trigger forwards as-is. Why: a slow
+    // self-summarizer + a client stream watchdog (~300s) turn repeated
+    // triggers into a never-shrinking abort loop (2026-11-22 incident:
+    // nine preflight runs of the same ~77K payload, each a 3.5-4 min
+    // self-summary, each aborted at exactly +300.0s, payload identical on
+    // every retry). Fast summary failures (429/400/empty) do NOT spend the
+    // shot — the #726/#4079 contract keeps re-running the walk on
+    // transient summary outages. After the shot is spent, overflow recovery
+    // stays with #1195 in-request refold and the egress fuse, and
+    // steady-state growth is the model's job via the compress tool
+    // (nudge path) — not another proxy-side multi-minute summary.
+    const compressionCommitted = (session.state.stats?.compressionCount ?? 0) > 0;
+    const preflightSpent = (session.stats.preflightRuns ?? 0) > 0;
+    if (compressionCommitted || preflightSpent) {
+        if (!preflightGateBlockedLogged.has(session.id)) {
+            preflightGateBlockedLogged.add(session.id);
+            log("warn", `[${session.id}] preflight trigger fired but the session's one-shot fold is already spent (${compressionCommitted ? `session compression-managed (${session.state.stats?.compressionCount} committed fold(s))` : "an earlier fold attempt was aborted by a client disconnect"}) — forwarding as-is; overflow recovery stays with #1195 in-request refold and the egress fuse`);
+        }
+        return prepared;
+    }
     // #3846: an earlier local 413 for THIS origin+model at an equal or wider
     // window is independent evidence the payload cannot fit here — the
     // forward-once escapes below must not re-bet the estimator guess. Fitting
@@ -4589,6 +4616,16 @@ export async function preflightCompressIfNeeded(
     const f = result.failure;
     // 重建过程也会让出执行权；所有转发许可都必须在此重新检查取消。
     if (clientAbort.signal.aborted || f?.kind === "aborted") {
+        // One-shot fold gate: a client-disconnected abort is the livelock
+        // shape (2026-11-22 log-32: nine 3.5-4 min self-summaries of the
+        // same payload, each cut at exactly +300.0s, payload never
+        // shrinking). The aborted attempt spent the session's one preflight
+        // shot: the next trigger forwards as-is (overflow recovery stays
+        // with #1195 in-request refold). A FAST failure (summary 429/400/
+        // empty) does NOT spend the shot — the #726/#4079 retry contract
+        // must keep re-running the walk on transient summary outages.
+        session.stats.preflightRuns = (session.stats.preflightRuns ?? 0) + 1;
+        markDirty(session);
         const detail = f?.kind === "aborted" ? f.detail : "the client disconnected during preflight compression";
         log("warn", `[${session.id}] preflight aborted (${detail}); not forwarding`);
         return { failFast: true, status: 0, message: detail, retryable: false, respond: false };
