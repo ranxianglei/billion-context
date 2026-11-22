@@ -181,6 +181,14 @@ export const workerResolveHost: WorkerProbe = (host) =>
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            if (msg?.error === "ETIMEDOUT") {
+                // #7407: the inner deadline won — the worker's getaddrinfo may
+                // still be queued in its libuv pool, keeping the one-shot
+                // thread (and a pool slot) alive. Same termination as the
+                // outer deadline; other failure codes mean the lookup already
+                // settled, and the worker drains and exits on its own.
+                try { void worker?.terminate().catch(() => undefined); } catch { /* already gone */ }
+            }
             if (msg && msg.ok === true && Array.isArray(msg.addrs)) resolve(msg.addrs);
             else reject(Object.assign(new Error(`worker dns lookup failed (${String(msg?.error ?? "unknown")})`), { code: typeof msg?.error === "string" && msg.error ? msg.error : "EWORKERLOOKUP" }));
         });
@@ -214,8 +222,6 @@ export function localMachineIps(): Set<string> {
                 if (ni.address) ips.add(ni.address.toLowerCase());
             }
         }
-        // The whole 127/8 loopback range routes to this machine.
-        for (let i = 0; i <= 255; i++) ips.add(`127.0.0.${i}`);
         localAddrCache = { at: now, ips };
     }
     return localAddrCache.ips;
@@ -355,8 +361,13 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
     // destination routes to the local host, so our own port through them is
     // a self-loop even though neither literal sits in the interface set.
     if (ctx.selfPort !== undefined && port === ctx.selfPort) {
-        const mine = (ctx.localIps ?? localMachineIps)();
-        if (ips.some((ip) => ip === "0.0.0.0" || ip === "::" || mine.has(ip.toLowerCase()) || mine.has(`::ffff:${ip.toLowerCase()}`))) {
+        const mine = new Set(Array.from((ctx.localIps ?? localMachineIps)(), normalizeIpLiteral));
+        if (ips.some((address) => {
+            const ip = normalizeIpLiteral(address);
+            // Loopback is a range, not a list of configured interfaces. DNS
+            // answers also need the mapped-IPv4 normalization literals get.
+            return ip === "0.0.0.0" || classifyIp(ip) === "loopback" || mine.has(ip);
+        })) {
             return { ok: false, code: "self", message: "the bili tunnel may not target the proxy itself" };
         }
     }

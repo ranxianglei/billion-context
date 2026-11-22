@@ -1,10 +1,9 @@
 // #3776 sub-defect 2: CA trust material for bili's OWN outbound upstream fetch.
-// Node's default TLS trust is the built-in Mozilla bundle + NODE_EXTRA_CA_CERTS;
-// it does NOT read the OS certificate store, so a security-software MITM root
-// (Kaspersky / corporate DLP) installed in the Windows/Mac store is untrusted and
+// Node's default TLS trust may omit the OS certificate store, so a security-software MITM root
+// (Kaspersky / corporate DLP) installed in the Windows/Mac store can be untrusted and
 // every request dies with SELF_SIGNED_CERT_IN_CHAIN (#3773). network.caFile /
-// BILI_CA_FILE points at that vendor's PEM; we MERGE it with the built-ins (never
-// replace) so all other upstreams keep working. When unset we return undefined and
+// BILI_CA_FILE points at that vendor's PEM; we MERGE it with Node's effective trust
+// so all other upstreams keep working. When unset we return undefined and
 // the dispatcher uses Node's default trust byte-for-byte (no connect override).
 
 import { readFileSync, statSync } from "node:fs";
@@ -47,7 +46,7 @@ export function upstreamCaIdentity(now = Date.now()): string {
     return lastIdentity;
 }
 
-/** Merged CA list (built-ins + NODE_EXTRA_CA_CERTS + network.caFile) for bili's
+/** Merged CA list (Node's effective trust + NODE_EXTRA_CA_CERTS + network.caFile) for bili's
  *  own fetch, or undefined when no caFile is configured — in which case the
  *  dispatcher must NOT set connect.ca and Node's default trust applies unchanged.
  *  The merge (not replace) matters: an explicit undici connect.ca REPLACES the
@@ -56,7 +55,11 @@ export function upstreamExtraCa(): string[] | undefined {
     const identity = upstreamCaIdentity();
     if (identity === "none") return undefined;
     if (cacheKey === identity) return cacheValue;
-    const merged: string[] = [...tls.rootCertificates];
+    // Node 22.15+ exposes the effective store, including opted-in system CAs
+    // and programmatic defaults. rootCertificates contains only bundled roots.
+    const merged: string[] = typeof tls.getCACertificates === "function"
+        ? [...tls.getCACertificates("default")]
+        : [...tls.rootCertificates];
     const nodeExtra = process.env["NODE_EXTRA_CA_CERTS"];
     // Node treats NODE_EXTRA_CA_CERTS as ONE file path — no list separator on any
     // platform (verified against Node 22: the whole value is loaded as a single

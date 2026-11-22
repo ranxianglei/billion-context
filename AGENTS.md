@@ -26,6 +26,38 @@
 | GitHub | https://github.com/ranxianglei/billion-context |
 | License | MIT |
 
+### Supported Hosts — Official Source & Binary Locations
+
+When auditing host behavior (plugin APIs, tool-call-id exposure, compaction seams, wire quirks), clone the source repos from THIS table — never guess the location. Lane semantics (launcher / MITM / config seam / native tool lane) are documented per client in docs/clients.md.
+
+| Host (lane name) | Mode | Official source / binary |
+|---|---|---|
+| pi | native tool lane + launcher | [earendil-works/pi](https://github.com/earendil-works/pi) (pi.dev) |
+| omp (oh-my-pi) | native tool lane (pi factory) | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) (omp.sh) |
+| dsh (deepseek-harness) | native tool lane | [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) |
+| opencode | native tool lane (V1 plugin API) | [anomalyco/opencode](https://github.com/anomalyco/opencode) (opencode.ai) |
+| kimi (Kimi Code) | native tool lane + MITM | [MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code) (kimi.com) |
+| hermes (Hermes Agent) | native Python plugin | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
+| zcode (Z.ai) | native tool lane | [zai-org/ZCode](https://github.com/zai-org/ZCode) (z.ai) |
+| claude (Claude Code) | native MCP lane | closed (Anthropic): https://claude.com/product/claude-code |
+| codex (Codex CLI) | launcher + MCP shell | [openai/codex](https://github.com/openai/codex) |
+| gemini (Gemini CLI) | launcher | [google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli) |
+| qwen (Qwen Code) | launcher / MITM | [QwenLM/qwen-code](https://github.com/QwenLM/qwen-code) |
+| copilot (Copilot CLI) | launcher (closed Go binary) | [github/copilot-cli](https://github.com/github/copilot-cli) |
+| aider | MITM | [Aider-AI/aider](https://github.com/Aider-AI/aider) |
+| goose | launcher | [aaif-goose/goose](https://github.com/aaif-goose/goose) |
+| crush (Charm) | MITM | [charmbracelet/crush](https://github.com/charmbracelet/crush) (charm.land/crush) |
+| zed | MITM | [zed-industries/zed](https://github.com/zed-industries/zed) (zed.dev) |
+| jcode (JCode) | MITM (Rust; no plugin seam, #962) | [1jehuang/jcode](https://github.com/1jehuang/jcode) |
+| qoder (Qoder CLI) | MITM / launcher | closed: https://qoder.com · https://download.qoder.com/qoder-app/releases/latest/Qoder-linux-amd64.deb |
+| workbuddy / codebuddy (Tencent) | config seam (workbuddy, #7456) / launcher (codebuddy) | closed: https://workbuddy.ai · https://download.codebuddy.ai · https://codebuddy.cn |
+| trae (Trae CLI) | MITM | closed: https://trae.ai |
+| iflow (iFlow CLI) | launcher | https://iflow.cn |
+| mcode (MiniMax Code) | MITM (event hooks only, #1050) | closed: https://minimax.io |
+| amp (Amp CLI) | MITM (closed Go, #1049) | closed: https://ampcode.com |
+| kiro (AWS Kiro CLI) | MITM | closed (Rust shell + Node agent server) |
+| antigravity (Google) | launcher (closed Go; additive-only plugin surface, #2115) | closed (Google) |
+
 ## 2. Architecture
 
 ### Module Map
@@ -43,7 +75,7 @@ Tier A entries are every-session rules and stay in full below. Tier B entries ca
 5. **The kernel lives in-repo; determinism comes from git, not a registry pin (#2092) (Tier B)** — consumed via `"acp-kernel": "file:./kernel"`; a commit IS the pin. Any kernel source change MUST bump `version` in `kernel/package.json` (CI-enforced — see Kernel Boundary); `pi-subagents/` follows the same pattern. Full text: design-decisions.md #5.
 6. **Single-writer plugin copies (#991)** — every bili presence has exactly ONE writer; mixing writers is what the guard forbids. The canonical statement is the Install-Lane & Update-Ownership Contract below.
 7. **Two compression modes with different summary carriers** (CRITICAL — reason in BOTH, see §6):
-   - **pluginMode** (the `x-bili-plugin` header / registered agent, e.g. `bili pi`): the ACP-native agent OWNS compression — it executes `compress` locally, the call+result live in its own re-sent history, and the wire summary carrier is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`).
+   - **pluginMode** (the `x-bili-plugin` header / registered agent, e.g. `bili pi`): the ACP-native agent OWNS compression **on the wire** — the `compress` call+result live in its own re-sent history (the computation still runs server-side under the session lock — docs/plugin-protocol.md Why-table; do NOT read "owns" as "executes locally"), and the wire summary carrier is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`).
    - **proxy mode** (plain client, no header): the proxy executes `compress` server-side; the tool call is ephemeral (never enters the client's history) and preflight blocks have none, so the carrier is the **`acp_summary` message** — the kernel renders it role `system`, but `systemToUser` (`src/util.ts`) re-voices it as a **`user` message** (leaving it at its anchor) so strict backends (SGLang: exactly one system at index 0, #377) accept it and the head system message stays byte-stable for the prefix cache.
    - The mode is decided per request and bound per session (`session.metadata.pluginAgent`, sticky, upgrade-only). See docs/technical-notes.md "Two compression modes".
 8. **Nudge cadence is flat 50K by design (kernel contract)** — acp-kernel pins the growth interval at 50000 for every window size (`nudge.growthFloor == nudge.growthCap == 50000`; window-percentage scaling was deliberately removed — #379/#380 settled "growth-driven, no usage/count proxy gates"). Do NOT re-scale the interval with the context window or reintroduce percentage gates; a 1M-window session folding every 50K of growth is intended lean-context behavior. User escape hatch: `compress.nudgeGrowthTokens` (flattens `growthFloor`+`growthCap` to a fixed step) — big-window users who want a lazier cadence set it explicitly. Prompt wording is kernel-owned (`src/nudge-text.ts`).
@@ -116,6 +148,16 @@ npm test               # node --import tsx --test tests/*.test.ts (bili suite; k
 
 Test against the REAL published artifact: `npm run build && npm install -g billion-context@latest && bili start --port 8787`. `npm install -g . --install-links` also works, but `--install-links` is REQUIRED on npm ≥ 9 (without it the global install is a SYMLINK to the dev tree — leaks edits and silently re-links on reinstall, #1225). Verify: `readlink $(npm root -g)/billion-context` — empty = real copy. Full recipe: [reference/testing.md](reference/testing.md).
 
+**Per-model / per-purpose testing:** keep one config file per model under `~/.config/billion-context/<name>.json` and switch with `-c` (short for `--config`) instead of exporting `BILI_CONFIG_FILE`:
+
+```bash
+bili start -c dsh-test            # plain proxy with the dsh-test.json config
+bili -c dsh-test pi               # launcher lane: the spawned proxy inherits the same named config
+bili -c typo-ref                  # refuses to start (exit 2) and lists the names that exist
+```
+
+Resolution rule: a value with `/` (or `\`, or an existing file in the CWD) is a PATH exactly as before; a bare NAME maps to `<configDir>/<NAME>.json`. A missing NAME fails fast with the sibling list; a missing explicit PATH keeps its historical empty-config behavior.
+
 ### E2E Regression (real client through bili)
 
 The `tests/e2e/` suites are the only coverage that exercises real client behavior (UA, wire quirks, retry loops):
@@ -173,12 +215,22 @@ Env vars are a **scarce surface**: by default a new behavior knob becomes a conf
 | **Branch naming** | `YYYY-MM-DD_short-title`; releases: `*_release-v*` (bili) / `*_release-kernel-v*` (kernel, §5) |
 | **NEVER modify `version` off release branches** | `"version"` touched ONLY on `*_release-v*` branches. Content commits must NEVER bump it. See Version Bumps below. |
 | **NEVER cut a release without owner approval** | Release branches and release PRs are opened ONLY after the owner explicitly approves the release in-thread (「发版 vX」/「批准发布」). An Agent may **propose** a release but never pushes the branch or opens the PR itself. If asked, reply: "Releases need your go — approve in-thread and I'll cut the PR." (Owner rule 2026-10-12, #2910) |
+| **NEVER ship a broadcast-to-all announcement** | An announcement record visible to every machine unconditionally is strictly forbidden — owner confirmation + explicit blast radius + audience restriction required (§ Remote Announcements). (Owner rule 2026-11-13, #6508/#6509) |
 
 **Opening a PR** (no `gh` CLI): `git push origin HEAD` → token from `git credential fill` (shell var only, never print) → POST `/repos/ranxianglei/billion-context/pulls` with base `master`. Full token/curl recipe: [reference/git-pr.md](reference/git-pr.md). Merging stays human-only.
 
 **External contributors' PRs — fix directly, don't replace.** Fixes go out as **additive commits to the contributor's PR branch**, whoever authored it (owner rule 小问题直接修, 2026-10-01). What stays off-limits is REPLACING the contribution: no rebase-and-replace with an Agent-owned PR, no closing a still-mergeable contribution in favor of a new one (#1765) — the contributor's commits, diff and authorship stay in the merged history. A deleted head branch does NOT kill an open PR (GitHub freezes `refs/pull/N/head`; check `mergeable`/`mergeStateStatus` first), and `BEHIND` is not a blocker. Mechanics: [reference/git-pr.md](reference/git-pr.md).
 
 **Post-merge supplements** → a small follow-up PR whose body references the original PR number; never append to / rebase the merged PR. Verify a supplement is actually needed first (replaying the same commit on newer master is verification, not content).
+
+### Remote Announcements (公告) — owner-gated, no broadcast-to-all (MANDATORY)
+
+The remote announcement feed ([`announcements/remote.json`](announcements/remote.json), #5548) reaches **every running instance within ~3 minutes of a master merge** — it is a safety surface in the same class as merge/release, not a docs file. Rules (owner ruling 2026-11-13, #6508/#6509 — the dsh-live-compact entry shipped as an ungated broadcast, hit every machine, and had to be retracted):
+
+1. **No broadcast-to-all（严格禁止对所有用户公告）.** A record visible to every machine unconditionally is strictly forbidden. Every record must be restricted to a defined audience — `versions` / `requiresScan` / time window, as applicable. If you cannot state a narrow audience, do not ship the record.
+2. **Explicit owner confirmation for ANY announcement.** Adding, changing, or retracting any announcement record requires the owner's explicit confirmation in-thread BEFORE the PR is opened — same class as releases (§ Version Bumps). An Agent may **propose** announcement content and scope but never opens or pushes the announcement PR itself.
+3. **The announcement PR must state the blast radius.** The body must spell out: (a) the audience (which client / version / install-state sees it); (b) version coverage — explicitly which OLDER versions ignore new gate fields (e.g. `requiresScan`) and therefore see the record unconditionally; (c) the display duration — when and by whom the record comes out of the feed (retraction PR vs. `until` window).
+4. **Plugin-targeted announcements are disallowed in principle（原则上不允许针对某个插件的公告）.** Surfacing plugin conflicts belongs to the read-only conflict scan (#1206), which is inherently per-machine. Any plugin-targeted notice must be **trigger-based, not announcement-based**: a scan surface (CLI WARNING / session conflict ledger / `/__bili/stats` / interception-failure web banner), or — only when a persistent web notice is genuinely needed — a feed record carrying a `requiresScan` gate so delivery matches the stated audience. Precedent: the #5984 dsh-live-compact record, broadcast ungated, retracted 2026-11-13 (#6508/#6509).
 
 ### Issue & Problem Tracking (MANDATORY)
 
@@ -259,6 +311,8 @@ Commit convention: `feat:` / `fix:` / `refactor:` / `test:` / `docs:` / `release
 - **Symptom ≠ mechanism.** Before attributing a bug to bili's mechanism, verify against upstream logs — repeated-compression logs may be an upstream rate-limit retry illusion, not over-compression (#282).
 - **Wire-constraint ledger only grows (#1304).** Every upstream rejection or validation constraint discovered in production or provider docs (e.g. #1299: Anthropic rejects top-level `oneOf`/`allOf`/`anyOf` in `tools[].input_schema`) becomes a PERMANENT entry in the wire-contract suite — the ledger (`WIRE_RULES` in `tests/wire-contract-fakes.ts`) + gates in `tests/wire-contract.test.ts` (provenance cited) + enforcement in the matching fake upstream — INSIDE THE FIXING PR. The ledger never shrinks without owner sign-off. Golden schema snapshots (`tests/golden/wire-contract/*.json`) change only via explicit regeneration (`scripts/update-wire-contract-goldens.ts`) with stated justification; a pin bump or tool-surface change tripping a gate is stop-the-line, not something to loosen.
 - **Honest output.** Never emit misleading messages for degenerate states (#155: export claimed "original conversation" for a 0-block session).
+- **Model-facing text changes are highest priority (提示词改动 = 最高优先级警示).** Every string the MODEL reads as instruction or state is prompt surface: nudge injections, compress receipts/warnings/error wordings, status lines, banners, tool descriptions, system-prompt fragments, and any injected doc excerpt. Such a change — however small the diff — must be surfaced as a TOP-PRIORITY warning in the commit message and at the very top of the PR body (`⚠️ MODEL-FACING TEXT CHANGE`), before any other content, so a reviewer sees the prompt moved even when the diff reads as "just wording".
+  - *Regression inference & judgment (回归推理与研判) is mandatory, not optional.* Walk the consumption chain the way a skeptic would: (a) what does the model DO with each field the new text contains — it copies refs, ceilings, positions, and counts from receipts into its NEXT calls, so ANY number in model-visible text is an anchor it may propagate; (b) after seeing the new text, what does the model record as its current position/state, and what does it issue on the next turn; (c) adversarial pass — can any field be misread, half-copied, or carried past the point where it is still true (the phantom-value class: text stating a number the system never actually produced, e.g. a clamped-away ref echoed in the headline); (d) where the change moves a number/ref/position the model propagates, add a receipt-level test asserting the EXACT model-visible string. Canonical case #6855: a #4521 clamp leniency was correct in the kernel, but the success headline echoed the requested end ref — the model anchored its next call at phantom-end+1 and was refused twice in a row; only a full consumption-chain inference (requested vs effective vs what the model carries forward) justified the receipt fix.
 - **Logs.** Mask secret values in all logs; separate trace/debug/info; keep debug-on by default during bug-convergence phases (#247).
 - **Docs.** Keep zh/en in sync; place content where the actual reader will see it; mirror env-var references into docs/configuration.md, not just one README (#571).
 

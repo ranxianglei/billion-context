@@ -1,4 +1,9 @@
 import assert from "node:assert/strict";
+// trustStampedId is GA-on by default (#7439). This suite pins the legacy
+// |sub: fork behavior — force the feature OFF so it keeps asserting the
+// pre-retirement path (issue2944-neutral-skeleton idiom).
+process.env.BILI_ROLLOUT_TRUST_STAMPED_ID = "0";
+
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
@@ -16,6 +21,8 @@ import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts"
 import { _resetSessionsForTest, listSessions, SPLIT_CANARY_FRESH_MS, splitSessionWarnings, type Session } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
+import { outputBudgetField as budgetFieldFromBudget, readOutputBudget as readFromBudget, writeOutputBudget as writeFromBudget } from "../src/server/budget.ts";
+import { outputBudgetField as budgetFieldFromSide, readOutputBudget as readFromSide, writeOutputBudget as writeFromSide } from "../src/server/side-request.ts";
 
 // #2170 measure 2: behavioral invariants of the #388 side lane, on the dsh
 // plugin wire (the host whose regression started this — #2156/#2157/#2164).
@@ -329,6 +336,17 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
     }
 });
 
+// (#6752 / #1440 P2 cut 2): the output-budget field plumbing moved out of the
+// side-lane engine into budget.ts so the prepare modules can use it without
+// reaching into side-request.js. side-request.ts re-exports it for the existing
+// importers — pin the identity so the re-export and the definition can never
+// silently diverge (a broken re-export would break every importer in one step).
+test("(F2) output-budget plumbing re-export identity (#6752 / #1440 P2 cut 2)", () => {
+    assert.equal(budgetFieldFromSide, budgetFieldFromBudget, "outputBudgetField re-export is identity");
+    assert.equal(readFromSide, readFromBudget, "readOutputBudget re-export is identity");
+    assert.equal(writeFromSide, writeFromBudget, "writeOutputBudget re-export is identity");
+});
+
 // (#1440 P2 cut 3): the extracted pipeline module OWNS the mid-pipeline lane
 // gates, so it legitimately imports side-request.js — unlike (F)'s modules.
 // What must not move or appear: the engine's internals (threshold constants,
@@ -349,12 +367,25 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
 // isDshSingleShotSidecar — same category once more: the generic single-shot
 // dsh sidecar shape predicate (no tools + one-shot body, any system text)
 // consulted to set sideIntent and to keep unknown sidecars off the raw-key
-// anchor before the first main turn can claim it.
+// anchor before the first main turn can claim it. #6548 adds
+// isResponsesServerToolSingleShot — same category once more: the Responses
+// server-tool-only single-shot shape predicate (string input + search tools,
+// no history) consulted by the #286 refusal branch, which forwards that shape
+// verbatim instead of hard-400ing a call that cannot carry an identity.
+// #4774 raw-key anchor race. #5073 adds
+// isStructuredOutputCall — same category once more: a pure toolless
+// structured-output shape predicate (no threshold, no session state) consulted
+// to set sideIntent and to keep the call out of the restoreOutputBudget
+// high-water path, exactly like the #2500 server-tool predicate. #6636 adds
+// isAudioOutputCall — same category once more: a pure toolless audio-output
+// shape predicate (no threshold, no session state) consulted to set sideIntent
+// and to keep the call out of the restoreOutputBudget high-water path,
+// exactly like the #5073 structured-output predicate.
 test("(G) extracted pipeline module keeps the side-lane boundary (#1440 P2 cut 3)", () => {
     const text = readFileSync(fileURLToPath(new URL("../src/server/handle.ts", import.meta.url)), "utf8");
     const laneInternals = /\bSIDE_REQUEST_MAX_TOKENS\b|\bSIDE_REQUEST_AGENTS\b|\bDemoteGateSignals\b|\bSideLaneSignals\b|\bSideLaneDecision\b|\bBILI_TOOL_NAMES\b|\bOutputBudgetField\b|\boutputBudgetField\b|\breadOutputBudget\b|\bwriteOutputBudget\b|\b_resetNoOutputCeilingWarningsForTest\b/;
     assert.doesNotMatch(text, laneInternals, "handle.ts must stay decoupled from the side-lane engine internals");
-    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshSingleShotSidecar", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
+    const allowlist = new Set(["hasLeakedBiliToolsOnly", "hasSingleShotBudget", "isAudioOutputCall", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshSingleShotSidecar", "isDshTitleRequest", "isMcodeOneShotAuxRequest", "isMcodeTitleRequest", "isOpencodeTitleRequest", "isResponsesServerToolSingleShot", "isServerToolUtilityCall", "isSideRequest", "isStructuredOutputCall", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
     let sawImport = false;
     for (const m of text.matchAll(/\{([^}]*)\}\s*from\s*["'][^"']*side-request\.js["']/g)) {
         sawImport = true;
@@ -614,6 +645,108 @@ test("(M) #5135 claude-code title sidecar: no anchor claim in either arrival ord
         });
         assert.equal(r5.status, 200, await r5.text());
         assert.equal(resolveConversation(conv5).session!.stats.requests, 1, "non-CC client evidence gate: full pipeline, counted");
+    } finally {
+        await h.close();
+    }
+});
+
+test("(N) #6104 dsh 0.2.2 review shape: banner-shifted policy + replayed user body ride the side passthrough", async () => {
+    // #2170 duty: a lane-gate edit lands WITH the suite that pins it. The
+    // detector's two bars were host-side FORMAT decisions (policy line offset,
+    // number of user blobs), so both shapes are pinned here end-to-end, plus
+    // the vetoes that must never move.
+    const h = await harness();
+    try {
+        const conv = "rev6104";
+        const POLICY = "REVIEW_POLICY\nYou are the final authorization reviewer for exactly one pending tool call in this conversation.\n\nReply with exactly one JSON verdict.";
+        const BLOBS = [
+            { role: "user", content: "ENVIRONMENT\nprofile: desktop; model: claude-test" },
+            { role: "user", content: "PROJECT_INSTRUCTIONS\n(none)" },
+            { role: "user", content: "FILTERED_HISTORY\nuser: main turn 0\nassistant: answer" },
+            { role: "user", content: "PENDING_ACTION\n{\"tool\":\"bash\",\"args\":{\"command\":\"ls\"}}" },
+        ];
+        // The main turn anchors the raw key.
+        await h.dshSend(conv, [mainMsg(0)], "main", "MAIN OPERATING SYSTEM", 256);
+        assert.equal(resolveConversation(conv).session!.stats.requests, 1, "main turn anchors the raw key");
+        const hits = h.forwarded.length;
+
+        // The 0.2.2 review shape: host-sized budget (past the <=200 heuristic),
+        // no tools, no agent header, banner ABOVE the pinned sentence, and the
+        // whole history replayed as role:"user" blobs.
+        await h.dshSend(conv, BLOBS, undefined, POLICY, 384000);
+        assert.equal(h.forwarded.length, hits + 1, "the review call reaches the upstream");
+        assert.equal(resolveConversation(conv).session!.stats.requests, 1, "the review call counts nowhere (side passthrough, #388)");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv + "|")).length, 0, "the review call mints no |sub lane");
+
+        // The next main turn still resolves to the SAME session and keeps
+        // compressing — the ledger-damage symptom was that it did not.
+        await h.dshSend(conv, [mainMsg(0), { role: "assistant", content: "answer" }, mainMsg(1)], "main", "MAIN OPERATING SYSTEM", 256);
+        assert.equal(resolveConversation(conv).session!.stats.requests, 2, "the next main turn lands on the raw key, not a drifted lane");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv + "|")).length, 0, "no drift on the main leg");
+
+        // Veto A — any tools surface marks an agent turn: full pipeline, counted.
+        // Counted ACROSS the raw key and any design persona child: a tool-carrying
+        // request with a foreign system prompt forks by design (#1916), and the
+        // point here is that it was NOT handed to the verbatim side lane.
+        const countAll = (id: string) => listSessions()
+            .filter((s) => s.id === id || s.id.startsWith(id + "|"))
+            .reduce((n, s) => n + (s.stats?.requests ?? 0), 0);
+        const convTools = "rev6104-tools";
+        await h.dshSend(convTools, [mainMsg(0)], "main", "MAIN OPERATING SYSTEM", 256);
+        const hitsT = h.forwarded.length;
+        await h.dshSend(convTools, BLOBS, undefined, POLICY, 384000, [{ name: "bash", input_schema: { type: "object" } }]);
+        assert.equal(h.forwarded.length, hitsT + 1);
+        assert.equal(countAll(convTools), 2, "tools-shape request rides the full pipeline (unchanged veto)");
+
+        // Veto B — an assistant turn inside the body is a real resend, not the
+        // review (the load-bearing replay veto now that the user count is out).
+        const convReplay = "rev6104-replay";
+        await h.dshSend(convReplay, [mainMsg(0)], "main", "MAIN OPERATING SYSTEM", 256);
+        await h.dshSend(convReplay, [...BLOBS.slice(0, 2), { role: "assistant", content: "earlier answer" }, ...BLOBS.slice(2)], undefined, POLICY, 384000);
+        assert.equal(countAll(convReplay), 2, "an assistant turn keeps the request on the main pipeline");
+    } finally {
+        await h.close();
+    }
+});
+
+test("(O) #7009: the preflight egress-fuse probe block is structurally unreachable from the side lane", async () => {
+    // #2170 duty: a lane-gate edit lands WITH the suite that pins it. The
+    // preflight egress-fuse probe block (#7009) guards on !prepared.sidePassthrough,
+    // but side requests never reach preflight at all — handle.ts forwards them
+    // with a minimal prepared before the preflight call. Pin the exact shape
+    // that WOULD trip the block on the main lane (stuck estimate meter plus a
+    // body above the fuse's 1M floor): on the side lane it is rejected by the
+    // existing side payload guard (413 side_request_payload_too_large, #554) —
+    // NOT forwarded, NOT folded, no summary call, no refusal record, meter
+    // untouched. Teeth: if a future change routes side requests through
+    // preflight, or the new block stops skipping side, this test fails.
+    const h = await harness();
+    try {
+        const conv = "side-probe-fuse";
+        await h.dshSend(conv, [mainMsg(0)], "main", "MAIN OPERATING SYSTEM", 256);
+        const session = resolveConversation(conv).session!;
+        session.stats.lastInputTokens = 7_300_000;
+        session.stats.lastInputTokensSource = "estimate";
+        session.stats.lastInputTokensOrigin = "http://127.0.0.1:1";
+        const requests0 = session.stats.requests;
+        const hits0 = h.forwarded.length;
+
+        // Same shape the main-lane probe block keys on: estimate-only meter,
+        // CJK body above both the side guard's window bar and the fuse's 1M
+        // floor (harness window 400K).
+        const msgs = Array.from({ length: 120 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `turn ${i}: ` + "历史".repeat(6_000) }));
+        const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": conv, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conv, "x-bili-plugin-agent": "title" },
+            body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, system: "You generate short titles.", messages: [...msgs, { role: "user", content: "Generate a title." }] }),
+        });
+        const body = (await response.json()) as { error?: { code?: string } };
+        assert.equal(response.status, 413, "the side payload guard fails fast locally (#554), not the egress fuse");
+        assert.equal(body.error?.code, "side_request_payload_too_large", "the existing side-lane guard owns this rejection — unchanged by #7009");
+        assert.equal(h.forwarded.length, hits0, "nothing is forwarded: no probe, no fold, no retry, no summary call");
+        assert.equal(session.stats.requests, requests0, "the side request counts nowhere (#388)");
+        assert.equal(session.stats.lastInputTokens, 7_300_000, "the meter is untouched by the side rejection");
+        assert.equal(session.metadata.localRefusals, undefined, "no refusal record may be written");
     } finally {
         await h.close();
     }
