@@ -2892,6 +2892,18 @@ const SIDE_LANE_ANCHOR_MIN_ABS_DELTA = 25_000;
 // honest anchors on the fast path while #4805's side-lane sample (anchor request
 // ~3k upper, main payload ~680k upper) is refused with 2-20x margin.
 const SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO = 8;
+// #7444: upstream clipping (agy-cli's 112 KiB replay cap) only bites on
+// multi-MiB sessions — the clip is a fixed byte budget, so the report-vs-payload
+// gap only becomes proof of clipping once the forwarded history is far above it.
+// 500K chars (~125K tokens) is the floor: below it, a dense-code payload can
+// legitimately outrank an honest report by 16x+ (#1820 B e2e: 186K chars over
+// a 5k report = 37x) and the anchor must stay on the fast path.
+const CLIPPED_REPORT_MIN_OUTBOUND = 500_000;
+// #7444: minimum outbound-char-bound / report ratio that proves clipping.
+// 16x sits above the honest dense-code under-report band (#1820 B e2e observed
+// up to ~37x chars-per-token, but only below the 500K floor) and below the
+// agy-cli clip's ~40x gap, so it separates the two without a per-host knob.
+const CLIPPED_REPORT_MIN_RATIO = 16;
 
 // estimator only errs EARLY (char-count upper bound → compress earlier, never
 // later), is active only while lastInputTokens == 0 (a real usage report takes
@@ -2936,6 +2948,22 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
         && payloadUpperNow >= session.stats.lastInputTokens * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
         && payloadUpperNow >= session.stats.lastUsagePayloadUpper! * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
         && payloadUpperNow - session.stats.lastInputTokens > SIDE_LANE_ANCHOR_MIN_ABS_DELTA;
+    // #7444: upstream clipping (agy-cli clips to 112 KiB due to agy.exe's 128 KiB
+    // ACP prompt limit) makes the usage report describe the CLIPPED payload, not
+    // the full payload bili sent. anchorImpossible cannot catch this: condition B
+    // requires the current payload to tower 8x over the producer's snapshot, but
+    // both are at the same scale because bili sent the full history both times.
+    // The distinguishing fact: the outbound char-bound (localInputEstimate) towers
+    // 16x+ over the report AND is itself multi-megabyte (>= 500K chars). An
+    // honest report of a small-to-medium payload can legitimately under-report
+    // by 16x+ on dense code/JSON (chars-per-token up to ~37x observed in #1820
+    // B's e2e harness), but the clipped-payload class only manifests on
+    // multi-MiB sessions where the upstream's byte cap (112–128 KiB) is far
+    // below the forwarded history. The 500K-char floor keeps the #1820 B
+    // honesty margin (186K-char harness) on the fast path.
+    const reportClipped = session.stats.lastInputTokens > 0
+        && (session.stats.localInputEstimate ?? 0) >= session.stats.lastInputTokens * CLIPPED_REPORT_MIN_RATIO
+        && (session.stats.localInputEstimate ?? 0) >= CLIPPED_REPORT_MIN_OUTBOUND;
     // #5135: pending compress credit proves THIS session executed its own fold
     // since the last settle — applyRanges (stream.ts) already netted the
     // savings out of lastInputTokens while lastUsageGradeTokens still carries
@@ -2961,7 +2989,7 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // it (loop/core.ts), so this cannot freeze the meter; zero is a valid
     // drained reading (kernel treats 0 as unknown).
     if (session.stats.lastInputTokensSource === "usage" && (session.stats.compressCreditTokens ?? 0) > 0 && session.stats.lastInputTokens >= 0) return { tokens: session.stats.lastInputTokens, source: "usage" };
-    if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    if (!anchorStale && !anchorImpossible && !reportClipped && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,
     // or the upstream never reports), and every branch below sizes on the
@@ -2994,7 +3022,7 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // upstreams (#553/#728) are unaffected: their anchor stays absent, so the
     // fail-closed upper bounds below still apply.
     const grade = session.stats.lastUsageGradeTokens;
-    if (!anchorStale && grade !== undefined && grade > 0) {
+    if (!anchorStale && !reportClipped && grade !== undefined && grade > 0) {
         // #4383: stale-small retained anchor — the calibrated local estimate
         // of the current outbound is strictly better than the char-count
         // branches below (#1839 inflation), so it wins immediately.
@@ -3804,6 +3832,24 @@ export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?:
     return { tokens: breakdown.total, breakdown };
 }
 
+function responsesPreflightMeter(prepared: Prepared, limit: number) {
+    const projection = prepared.responsesProjection;
+    if (prepared.protocol !== "responses" || !projection) return undefined;
+    const measured = measuredOutbound(prepared);
+    const declared = prepared.session.metadata.effectiveContextLimit;
+    const fuseWindow = Math.max(typeof declared === "number" && declared > 0 ? declared : limit, MIN_ASSUMED_WINDOW_TOKENS);
+    if (!measured) return undefined;
+    const body = prepared.parsedBody ?? JSON.parse(typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8"));
+    return {
+        tokens: measured.tokens,
+        fuseWindow,
+        measure: (view: CoreMessage[]): number => estimateRawBodyTokens({
+            ...body,
+            input: patchResponsesInput(projection, view),
+        }),
+    };
+}
+
 export async function preflightCompressIfNeeded(
     prepared: Prepared,
     runPrepare: () => Promise<Prepared>,
@@ -3822,6 +3868,7 @@ export async function preflightCompressIfNeeded(
     anonymous: boolean,
     log: (level: string, msg: string) => void,
     instanceId: string,
+    v1Meta?: Record<string, unknown>,
 ): Promise<Prepared | PreflightFailFast> {
     const session = prepared.session;
     // #3450: when an upstream-stated overflow proved this provider bills the
@@ -3915,6 +3962,8 @@ export async function preflightCompressIfNeeded(
     // the same quantity so a no-usage failure can't arm lastInputTokens to raw-
     // history scale and fire preflight on a payload that actually fits.
     const { textEstimate, overheadEstimate, imageTokens } = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
+    const measuredWire = responsesPreflightMeter(prepared, limit);
+    const wireMeter = measuredWire && measuredWire.tokens > measuredWire.fuseWindow ? measuredWire : undefined;
     // #553: anonymous requests resolve their session by prefix affinity. After
     // an ACP compression breaks the chain hash, the client's replay mints a NEW
     // session id (a fork) whose lastInputTokens is 0 — yet it carries the full
@@ -3997,7 +4046,7 @@ export async function preflightCompressIfNeeded(
     // Image-dominant payloads keep the original unconditional arm: images are
     // not foldable, so their overage is not "expected benefit" at all.
     const growthWorthIt = !growthArmed || imageTokens >= compressionTarget || decisionTrigger - textBudget >= AUTO_FOLD_MIN_BENEFIT_TOKENS;
-    const triggerFires = growthWorthIt && (imageTokens >= compressionTarget || decisionTrigger >= textBudget);
+    const triggerFires = wireMeter !== undefined || growthWorthIt && (imageTokens >= compressionTarget || decisionTrigger >= textBudget);
     // #2283 sub-defect 2: pair upstream billing with the same-payload local estimate on
     // EVERY request (not only when preflight triggers) — the offline data source for the
     // chars/4 deviation distribution behind the #2273 RC2 calibration decision.
@@ -4064,7 +4113,7 @@ export async function preflightCompressIfNeeded(
     // it never needs upstream evidence and must fold on the FIRST armed
     // request, so the #2313 estimate-only forward-once never skips it.
     const probeForEvidence = !growthArmed && !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
-    if (probeForEvidence) {
+    if (probeForEvidence && !wireMeter) {
         // #2490: mathematically-doomed probe guard. The forward-once below bets
         // one request on "the estimator might be wrong about size"; that bet has
         // positive expected value only while SOME tokenizer could make the
@@ -4131,7 +4180,7 @@ export async function preflightCompressIfNeeded(
     // the char-count bound (tokenCount) is the TRIGGER arm only. Judging fit on
     // it made a fresh session whose real size fits the window read as over-window
     // and fail-fast on the early no-compressible-ranges path below (#3146).
-    const payloadFitsWindow = calibratedPayload < limit;
+    const payloadFitsWindow = calibratedPayload < limit && !wireMeter;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
@@ -4219,7 +4268,7 @@ export async function preflightCompressIfNeeded(
             `and preflight compression could not bring it under: ${detail.replace(/\.\s*$/, "")}.` +
             imageNote +
             shrinkNote +
-            ` The over-window payload was NOT forwarded.`;
+            ` This request's over-window payload was NOT forwarded to the upstream.`;
         log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };
@@ -4301,6 +4350,7 @@ export async function preflightCompressIfNeeded(
         surface: prepared.surface,
         protocol: prepared.protocol,
         billingBlock: prepared.anthropicBillingBlock,
+        v1Meta,
         url: upstreamUrl,
         headers,
         resign: preflightResignCtx !== undefined ? (hdrs: Record<string, string>, bodyStr: string) => {
@@ -4319,6 +4369,7 @@ export async function preflightCompressIfNeeded(
             ? (view) => imageReserveFor(session, "responses", { input: patchResponsesInput(responsesProjection, view) }, opts, upstreamUrl)
             : undefined,
         wireOverhead: overheadEstimate,
+        measureWireTokens: wireMeter?.measure,
         unknownBaseline,
         upstreamOrigin: currentOrigin,
         forceStreamSummary,
@@ -4340,11 +4391,19 @@ export async function preflightCompressIfNeeded(
                 session.stats.lastInputTokens = probeTextSize;
                 session.stats.lastInputTokensSource = "estimate";
             }
-            const probeCalibrated = applyEstimateCalibration(probeTextSize, kFactor, kOrigin, currentOrigin) + imageTokens;
+            const correctiveMeter = wireMeter ? responsesPreflightMeter(probe, limit) : undefined;
+            const probeCalibrated = Math.max(
+                applyEstimateCalibration(probeTextSize, kFactor, kOrigin, currentOrigin) + imageTokens,
+                correctiveMeter?.tokens ?? 0,
+            );
             const divergence = Math.round(probeCalibrated - result.payloadEstimate);
             if (probeCalibrated >= limit && divergence >= Math.max(10_000, Math.round(limit * 0.02))) {
                 log("warn", `[${session.id}] preflight view fits (~${Math.round(result.payloadEstimate)} tok) but the rebuilt body measures ~${Math.round(probeCalibrated)} tok (Δ~${divergence} tok) — running one corrective second pass with the measured divergence as its exit bar (#5974)`);
-                const corrective = await preflightCompress({ ...preflightDeps, viewDeltaCorrection: divergence }, prepared.originalMessages);
+                const corrective = await preflightCompress({
+                    ...preflightDeps,
+                    viewDeltaCorrection: divergence,
+                    measureWireTokens: correctiveMeter?.measure,
+                }, prepared.originalMessages);
                 // Phase 1 exited early-fit (failure undefined), so phase 2's verdicts are strictly newer.
                 result.compressedRanges += corrective.compressedRanges;
                 result.savedTokens += corrective.savedTokens;
@@ -4422,7 +4481,10 @@ export async function preflightCompressIfNeeded(
         // The baseline anchor above stays raw deliberately: it is a floor for
         // future meters, and a deflated (k̂ < 1) value would only delay the
         // next trigger, never advance it.
-        const rebuiltCalibrated = applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + rebuiltImageTokens;
+        const rebuiltCalibrated = Math.max(
+            applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + rebuiltImageTokens,
+            wireMeter ? measuredOutbound(rebuilt)?.tokens ?? Infinity : 0,
+        );
         // #3645: hoist the calibrated post-fold figure so the fail-fast message
         // quotes the same scale as this fit and the pre-fold tokenCount — quoting
         // the raw size there claimed a sub-window number exceeds the window when k̂>1.
