@@ -632,6 +632,10 @@ test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) wi
     assert.equal(openai.window, 131_072);
 });
 
+// #7537: the sideRequestGuard call in src/server/handle.ts was removed —
+// side requests now bypass preflight by design and the upstream's real size
+// error is the authoritative verdict. The guard function itself remains
+// (exported for other call sites and for these unit tests).
 test("sideRequestGuard: raw-body fit against declared ∩ armed window minus output headroom (#554)", () => {
     const txt = "z".repeat(8000);
     const body = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: txt }] };
