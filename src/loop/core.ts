@@ -253,6 +253,10 @@ export interface LoopCtx {
      *  the prefix even for the same model+wire). Distinct from proxyUrl, which
      *  is the routing CONNECT-proxy, not the target. */
     upstreamOrigin?: string;
+    /** #5257: operator strict-echo verdict resolved at the loop-construction
+     *  site (the loop has no route table) — passed to isStrictReasoningEcho
+     *  so a per-provider/per-model opt-out survives into loop re-requests. */
+    strictEchoConfigured?: boolean;
     textProtocol?: boolean;
     debug?: boolean;
     /** #422: host hook that re-runs the kernel fold (processTurn) on the
@@ -779,7 +783,7 @@ export async function* runCompressLoop(
         strictEchoOrigin = undefined;
     }
     const withStrictEchoRepair = (body: Record<string, unknown>): Record<string, unknown> =>
-        normalizeStrictEchoBody(body, isStrictReasoningEcho(ctx.session, strictEchoOrigin, modelIdOf(requestBody)), (level, msg) => loggerLog(level, `[acp-loop] ${msg}`), ctx.session.id ?? "unknown");
+        normalizeStrictEchoBody(body, isStrictReasoningEcho(ctx.session, strictEchoOrigin, modelIdOf(requestBody), ctx.strictEchoConfigured), (level, msg) => loggerLog(level, `[acp-loop] ${msg}`), ctx.session.id ?? "unknown");
 
     // #1766: accumulated across rounds — every upstream terminal frame is
     // replaced by the final synthetic completion, so each round's unmodeled
