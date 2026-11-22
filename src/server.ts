@@ -112,6 +112,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normali
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import type { CommandcodeEnvelopeMeta } from "./commandcode-wire.js";
+import type { ZedEnvelopeMeta } from "./zed-wire.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { emitPreflightError } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
@@ -2129,6 +2130,13 @@ export type Prepared = {
      *  via wireTransform) using this meta. Presence also gates the JSONL
      *  response codecs and disables #371 fake-completion retry. */
     commandcode?: { meta: CommandcodeEnvelopeMeta };
+    /** zed cloud wire: the request came as a cloud.zed.dev /completions
+     *  envelope — the pipeline ran on the UNWRAPPED provider wire body;
+     *  forward() rewraps it into the envelope at the final boundary (and every
+     *  compress-loop re-send via wireTransform) using this meta. Presence also
+     *  forces the NDJSON response to raw byte-passthrough and disables #371
+     *  fake-completion retry (no in-stream loop on this lane). */
+    zed?: { meta: ZedEnvelopeMeta };
     /** #2740: set when a Claude Code auto-mode classifier one-shot was answered
      *  locally (BILI_AUTO_MODE_FORGE, default on). forward() serves `body`
      *  without contacting upstream — zero egress, zero billing for the lane. */

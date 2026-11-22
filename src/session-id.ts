@@ -6,7 +6,7 @@ import type { PromptCacheRouting } from "./config.js";
 
 export type ConversationIdentity = {
     value: string;
-    source: "header" | "body-session" | "metadata-session" | "previous-response" | "prompt-cache-key" | "content-fingerprint" | "generated";
+    source: "header" | "body-session" | "metadata-session" | "previous-response" | "prompt-cache-key" | "zed-thread-id" | "content-fingerprint" | "generated";
     clientProvided: boolean;
 };
 
@@ -452,6 +452,26 @@ export function preferPromptCacheKeyIdentity<T extends ConversationIdentity>(
     const pck = typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.trim() : "";
     if (pck.length === 0) return identity;
     return { ...identity, value: pck, source: "prompt-cache-key", clientProvided: true };
+}
+
+/**
+ * zed cloud wire thread_id promotion (#zed-cloud): cloud.zed.dev carries the
+ * conversation id ONLY in the request envelope (`{thread_id, prompt_id,
+ * provider, model, provider_request}`) — the inner provider body has none and
+ * zed sends no roster conversation header. `thread_id` is zed's stable
+ * per-thread uuid (the agent thread id), so it is exactly the missing signal
+ * the content-fingerprint fallback stands in for. It only replaces the
+ * fingerprint — real conversation headers and body session_ids stay stronger,
+ * so this can never override an identity the client stated more explicitly.
+ */
+export function preferZedThreadIdIdentity<T extends ConversationIdentity>(
+    identity: T | undefined,
+    threadId: unknown,
+): T | undefined {
+    if (!identity || identity.source !== "content-fingerprint") return identity;
+    const tid = typeof threadId === "string" ? threadId.trim() : "";
+    if (tid.length === 0) return identity;
+    return { ...identity, value: tid, source: "zed-thread-id", clientProvided: true };
 }
 
 /**

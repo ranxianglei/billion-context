@@ -17,6 +17,7 @@ import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClient
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { rewrapCommandcodeBody } from "../commandcode-wire.js";
+import { rewrapZedEnvelope } from "../zed-wire.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
 import { builtinCompatRoles, builtinRoleRestorePoints, withRestoredRoles } from "../kiro.js";
@@ -718,6 +719,12 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             wireBody = JSON.stringify(rewrapCommandcodeBody(JSON.parse(wireBody) as Record<string, unknown>, prepared.commandcode.meta));
         } catch { /* malformed flat body — pass through unchanged */ }
     }
+    // zed cloud wire: same final-boundary rewrap for the /completions envelope.
+    if (prepared?.zed && typeof wireBody === "string") {
+        try {
+            wireBody = JSON.stringify(rewrapZedEnvelope(JSON.parse(wireBody) as Record<string, unknown>, prepared.zed.meta));
+        } catch { /* malformed inner body — pass through unchanged */ }
+    }
     // #1421/#1683: outbound chain checkpoint — when egress stamping is enabled
     // (chainEgressStamp, DEFAULT OFF), every request THIS instance actually
     // processed leaves with a request-level stamp, so a downstream bili applies
@@ -778,7 +785,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // retry that dropped it would present flat OpenAI where the client's wire
     // expects the CLI envelope.
     const ccMetaForResend = prepared?.commandcode?.meta;
-    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active || ccMetaForResend !== undefined
+    const zedMetaForResend = prepared?.zed?.meta;
+    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active || ccMetaForResend !== undefined || zedMetaForResend !== undefined
         ? (b: Record<string, unknown>): Record<string, unknown> => {
             let out = b;
             if (compatProtocol && compatRoles) applyCompatRolesJson(out, compatProtocol, compatRoles);
@@ -787,6 +795,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // #3129: re-nest the rebuilt inner request into the CloudCode envelope.
             out = v1Active ? wrapV1Internal(out, v1Meta) : out;
             if (ccMetaForResend !== undefined) out = rewrapCommandcodeBody(out, ccMetaForResend);
+            if (zedMetaForResend !== undefined) out = rewrapZedEnvelope(out, zedMetaForResend);
             return out;
         }
         : undefined;
@@ -2472,7 +2481,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     try {
         // #1295: commandcode streams terminate with their own finish event —
         // no fake-completion shape exists to buffer-and-retry (#371 off).
-        if (prepared !== null && prepared.stream && !prepared.commandcode && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
+        if (prepared !== null && prepared.stream && !prepared.commandcode && !prepared.zed && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
             // #1900: retry from wireBody — the exact bytes this request's main
             // attempt shipped (post wireTransform and any same-request re-send),
             // never the raw client body: upstream may have rejected those raw
@@ -2532,7 +2541,13 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             opencodeLogId: upstream.headers.get("x-opencode-log-id") ?? undefined,
             cfRay: upstream.headers.get("cf-ray") ?? undefined,
         };
-        if (prepared && prepared.resetAfterSuccess) {
+        if (prepared && prepared.zed) {
+            // zed cloud wire: NDJSON response — raw byte passthrough, no
+            // parsing, no usage accounting (request side is the only side bili
+            // rewrites on this lane; an in-stream loop is structurally
+            // unreachable, #3177 reasoning).
+            await pipeThrough(responseBody, res);
+        } else if (prepared && prepared.resetAfterSuccess) {
             const [toClient, toObserve] = responseBody.tee();
             const observed = observeResponsesTerminalState(toObserve, prepared.stream);
             const tagLog = (msg: string) => log("info", `[${prepared.session.id}] ${msg}`);
