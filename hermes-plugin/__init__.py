@@ -1725,6 +1725,16 @@ def on_llm_request(request: Optional[Dict[str, Any]] = None, **context: Any) -> 
                 _state["snapshot_warned"] = True
                 logger.info("billion-context: native tools are not in this session's tool list — "
                             "keeping the plugin identity and compressing in proxy mode")
+        base = _request_base_url(request, context)
+        if base is not None:
+            b = base.strip().lower()
+            if not (b.startswith("http://") or b.startswith("https://")):
+                # #7531: a non-HTTP transport (e.g. the process:// directsdk provider) hands the
+                # turn to a child CLI / loopback relay — the stamped x-bili-* headers can't reach
+                # bili on this route, and a strict provider (directsdk accepts only traceparent in
+                # extra_headers) raises before any request is sent. Stamp nothing; the turn rides
+                # the HTTPS_PROXY MITM path in proxy mode instead.
+                return None
         headers = request.get("extra_headers")
         merged = dict(headers) if isinstance(headers, dict) else {}
         merged["x-bili-plugin"] = AGENT_NAME
@@ -1736,7 +1746,6 @@ def on_llm_request(request: Optional[Dict[str, Any]] = None, **context: Any) -> 
             model_header = _stampable_header_value(model)
             if model_header is not None:
                 merged["x-bili-plugin-model"] = model_header
-        base = _request_base_url(request, context)
         max_output = _state["max_output"].get(str(session_id)) or _host_model_limit(model, base, output=True)
         if isinstance(max_output, (int, float)) and max_output > 0:
             merged["x-bili-plugin-max-output"] = str(int(max_output))

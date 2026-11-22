@@ -1203,6 +1203,43 @@ elif SCENARIO == "ready-unload":
     out["env_routed"] = os.environ.get("HTTPS_PROXY") == ORIGIN
     ctx.run_unload()
     out["env_after_unload_no_proxy"] = os.environ.get("NO_PROXY")
+elif SCENARIO == "non-http-base":
+    # #7531: the process:// directsdk provider hands the turn to a child CLI / loopback relay —
+    # the stamped x-bili-* headers can't reach bili on this route, and a strict provider (directsdk
+    # accepts only traceparent in extra_headers) raises before any request is sent. A non-HTTP
+    # base_url must skip stamping entirely; an http(s) base_url (and an undetermined one) still
+    # stamps the plugin headers (positive controls).
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
+    os.makedirs(ca_dir, exist_ok=True)
+    with open(os.path.join(ca_dir, "root-ca.pem"), "w") as f:
+        f.write("dummy-ca\n")
+    with open(os.path.join(ca_dir, "combined-ca.pem"), "w") as f:
+        f.write("dummy-combined-ca\n")
+    mod.register(ctx)
+    mw = ctx.middlewares["llm_request"]
+    # context-carried base_url (the hook surface) — process:// must skip stamping
+    out["process_none"] = mw(request=mw_request("test-model"), session_id="sess-nh", model="test-model",
+                             base_url="process://claude-subscription-directsdk-experimental",
+                             api_mode="chat") is None
+    # the request itself can carry the base_url too
+    out["process_req_none"] = mw(request=dict(mw_request("test-model"), base_url="process://x"),
+                                 session_id="sess-nh", model="test-model", api_mode="chat") is None
+    # provider config path: config.yaml names a process:// provider resolved by the hook's provider
+    home = os.environ["HERMES_HOME"]
+    with open(os.path.join(home, "config.yaml"), "w") as f:
+        f.write("providers:\n  directsdk:\n    base_url: process://claude-subscription-directsdk-experimental\n")
+    out["process_provider_none"] = mw(request=mw_request("test-model"), session_id="sess-nh",
+                                      model="test-model", provider="directsdk", api_mode="chat") is None
+    # positive control: an http base_url still stamps the plugin headers
+    http = mw(request=mw_request("test-model"), session_id="sess-nh", model="test-model",
+              base_url="http://127.0.0.1:3425", api_mode="chat")
+    out["http_headers"] = http["request"]["extra_headers"] if isinstance(http, dict) else None
+    # positive control: no base_url at all (undetermined) keeps the historical stamp behavior
+    undetermined = mw(request=mw_request("test-model"), session_id="sess-nh", model="test-model",
+                      api_mode="chat")
+    out["undetermined_headers"] = undetermined["request"]["extra_headers"] if isinstance(undetermined, dict) else None
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -1368,6 +1405,11 @@ interface DriverOut {
     rf_none?: unknown;
     sidecar_resolution?: Record<string, { script: string; node: string } | null | string>;
     plugin_dir_unchanged?: boolean;
+    process_none?: boolean;
+    process_req_none?: boolean;
+    process_provider_none?: boolean;
+    http_headers?: Record<string, string> | null;
+    undetermined_headers?: Record<string, string> | null;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -1501,6 +1543,26 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.defer_headers!["x-bili-plugin-compression"], "proxy", "proxy owns compression for this request");
         assert.equal(out!.partial_headers!["x-bili-plugin-compression"], "proxy", "a partial snapshot also runs proxy-side");
         assert.equal(out!.visible_headers!["x-bili-plugin-compression"], undefined, "a visible toolset keeps the pure plugin lane");
+    });
+
+    // #7531: a non-HTTP transport (the process:// directsdk provider) hands the turn to a child
+    // CLI / loopback relay — the stamped x-bili-* headers can't reach bili, and a strict provider
+    // (directsdk accepts only traceparent in extra_headers) raises before any request is sent.
+    // A non-HTTP base_url must skip stamping entirely; http(s) and undetermined base_urls keep
+    // the historical stamp behavior (positive controls).
+    test("non-http base_url: process:// skips the x-bili-* stamp, http(s)/undetermined still stamp (#7531)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("non-http-base");
+        assert.ok(out, err);
+        assert.equal(out!.process_none, true, "context base_url process:// -> no stamp");
+        assert.equal(out!.process_req_none, true, "request base_url process:// -> no stamp");
+        assert.equal(out!.process_provider_none, true, "config.yaml provider process:// -> no stamp");
+        assert.equal(out!.http_headers!["x-bili-plugin"], "hermes", "http base_url still stamps");
+        assert.equal(out!.http_headers!["x-bili-plugin-conversation"], "sess-nh");
+        assert.equal(out!.undetermined_headers!["x-bili-plugin"], "hermes", "undetermined base_url keeps the historical stamp");
     });
 
     // #3261: the host knows the model's window (HERMES_HOME/context_length_cache.yaml) but the
