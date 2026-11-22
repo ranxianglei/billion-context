@@ -728,11 +728,17 @@ export class UnifiedShadow {
                     loggerLog("info", `[storage] egress-active ${legacy.id}: stale drift latch cleared — flow table is the single byte generation, delta fast path restored (#7439 R-C)`);
                 }
             }
-            if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
+            // #7439 item 1: BatchedViewVerification is disabled for egress-on
+            // sessions — its two legs are messages-reconciliation, and keeping
+            // it re-latches the known canonical≠client divergence (the #5677
+            // chronic loop source). The egress probe (client bytes vs flow
+            // sampled rows) is the sole verification for egress-on sessions.
+            const egressOn = legacy.metadata?.egressAuthority === true;
+            if (!egressOn && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
                 if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getCcrEntries(legacy.id), this.sync.getStateFields(legacy.id), this.sync.getOrphanViews(legacy.id) ?? {}, legacy.metadata?.egressAuthority === true);
+                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getCcrEntries(legacy.id), this.sync.getStateFields(legacy.id), this.sync.getOrphanViews(legacy.id) ?? {});
                 for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                     const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                     verifier.addBlocks(rows);
@@ -1516,11 +1522,14 @@ export class UnifiedShadow {
                 phase = "verify-sample";
                 const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
                 this.ingestCounts.set(legacy.id, count);
-                if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
+                // #7439 item 1: BatchedViewVerification disabled for egress-on
+                // sessions (same rationale as the sync path above).
+                const egressOnAsync = legacy.metadata?.egressAuthority === true;
+                if (!egressOnAsync && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
                     this.stats.verifySamples++;
                     const sessionRow = await backend.getSessionRow(legacy.id);
                     if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id), await backend.getCcrEntries(legacy.id), await backend.getStateFields(legacy.id), (await backend.getOrphanViews(legacy.id)) ?? {}, legacy.metadata?.egressAuthority === true);
+                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id), await backend.getCcrEntries(legacy.id), await backend.getStateFields(legacy.id), (await backend.getOrphanViews(legacy.id)) ?? {});
                     for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                         const rows = await backend.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                         verifier.addBlocks(rows);
