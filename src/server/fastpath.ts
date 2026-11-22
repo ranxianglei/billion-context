@@ -678,7 +678,7 @@ function addStripCounts(a: RawStripCounts, b: RawStripCounts): RawStripCounts {
 }
 
 function noteCreditedMiss(sessionId: string, decision: string, log: (level: string, msg: string) => void): void {
-    const cur = readSaved(sessionId) ?? ({ t: 0, m: "", misses: 0 } as PFSavedState);
+    const cur = readSaved(sessionId) ?? { t: 0, m: "", misses: 0 };
     // an EXPIRED hold has already paid its penalty — count fresh from zero,
     // or the very first verified miss after the TTL would instantly re-arm
     // (the persisted counter sits at PF_BREAKER_MISSES from the original trip).
