@@ -156,15 +156,17 @@ test("ranges view: no BLOCKED range rows, no 'refs unresolvable' phantoms", () =
   assert.ok(!report.includes("refs unresolvable"), report);
   // header: 11 numbered raw msgs, 16 pinned halves (8 successful pairs)
   assert.ok(
-    report.includes("| 11 raw message(s) + 16 blocked"),
+    report.includes("| 11 visible messages + 16 unrefed"),
     `header miscounts: ${report.split("\n")[0]}`,
   );
+  // #6936 regression pin: the internal sentinel never reaches the surface
+  assert.ok(!report.includes("BLOCKED"), report);
 });
 
-test("ranges view: BLOCKED section carries the #4348 aged/newest split", () => {
+test("ranges view: UNREFED section carries the #4348 aged/newest split", () => {
   const { state, view, cfg } = fixture();
   const report = ranges(state, view, cfg);
-  assert.match(report, /BLOCKED MESSAGES \u2014 16 msg\(s\)/);
+  assert.match(report, /UNREFED MESSAGES \u2014 16 msg\(s\)/);
   assert.match(
     report,
     /compress: 8 exchange\(s\), \S+ \u2014 pinned compress receipts: 3 newest = working memory; the 5 older exchange\(s\) are consumed by any fold that spans their position/,
@@ -179,12 +181,13 @@ test("ranges view: without config the section is generic, never wrong", () => {
     scope: "uncompressed",
     view: "ranges",
   });
-  assert.match(report, /BLOCKED MESSAGES \u2014 16 msg\(s\)/);
+  assert.match(report, /UNREFED MESSAGES \u2014 16 msg\(s\)/);
   assert.ok(
     report.includes("pinned compress receipts"),
     report,
   );
   assert.ok(!report.includes("working memory"), "no #4348 claim without a config to judge aged/newest");
+  assert.ok(!report.includes("BLOCKED"), report);
 });
 
 test("detail view: BLOCKED compress rows are labeled aged vs newest, like the fold gate sees them", () => {
@@ -200,6 +203,13 @@ test("detail view: BLOCKED compress rows are labeled aged vs newest, like the fo
   const newest = [...report.matchAll(/ \u00b7 newest \u2014 working memory/g)].length;
   assert.equal(aged, 10, `5 aged exchanges \u00d7 2 halves, got: ${report}`);
   assert.equal(newest, 6, `3 newest exchanges \u00d7 2 halves, got: ${report}`);
+  // #6936: unrefed rows render as (unrefed), never as the raw sentinel
+  assert.equal(
+    [...report.matchAll(/  \(unrefed\) \(/g)].length,
+    16,
+    report,
+  );
+  assert.ok(!report.includes("BLOCKED"), report);
   // the failed exchange kept numeric refs and carries no protection suffix
   assert.ok(!/m00008 .*\u00b7/.test(report) && !/m00009 .*\u00b7/.test(report), report);
 });

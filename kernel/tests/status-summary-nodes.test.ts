@@ -151,7 +151,7 @@ test("ranges view: rendered summary nodes are excluded from rows and split the l
   ]);
   assert.ok(!report.includes("m00003  ("), "node ref must not carry a range row");
   assert.ok(
-    report.includes("| 4 raw message(s)"),
+    report.includes("| 4 visible messages"),
     `header counts raw messages only, got: ${report.split("\n")[0]}`,
   );
 });

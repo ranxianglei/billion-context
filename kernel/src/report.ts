@@ -474,15 +474,18 @@ function renderUncompressedRanges(
 ): string {
   const lines: string[] = [];
   const totalTokens = visible.reduce((s, m) => s + m.tokens, 0);
-  // BLOCKED rows (protection-pinned, no numeric ref) cannot end or cite a
-  // range — buildCompressibleRanges (the nudge table) skips them WITHOUT
-  // opening a gap, so range rows are built from the resolvable entries only
-  // and the pinned mass gets its own labeled section below. Same splits,
-  // same mass, no phantom "mX–BLOCKED ⚠ not foldable" rows.
+  // Unrefed rows (protection-pinned, sentinel ref instead of a number) cannot
+  // end or cite a range — buildCompressibleRanges (the nudge table) skips them
+  // WITHOUT opening a gap, so range rows are built from the resolvable entries
+  // only and the pinned mass gets its own labeled section below. Same splits,
+  // same mass, no phantom "mX–BLOCKED ⚠ not foldable" rows (#6936: the
+  // internal sentinel must never reach a model-facing label).
   const blockedRows = visible.filter((m) => m.ref === BLOCKED_REF);
   const rangeable = visible.filter((m) => m.ref !== BLOCKED_REF);
+  // Clean sessions keep the historical header byte-for-byte; pinned rows are
+  // appended as `+ N unrefed` only when present.
   lines.push(
-    `UNCOMPRESSED — ${formatTokens(totalTokens)} | ${rangeable.length} raw message(s)${blockedRows.length > 0 ? ` + ${blockedRows.length} blocked` : ""}`,
+    `UNCOMPRESSED — ${formatTokens(totalTokens)} | ${rangeable.length} visible messages${blockedRows.length > 0 ? ` + ${blockedRows.length} unrefed` : ""}`,
   );
   lines.push("");
   if (visible.length === 0 && summaryNodes.length === 0) {
@@ -669,7 +672,7 @@ function renderUncompressedRanges(
     const blockedTokens = blockedRows.reduce((s, m) => s + m.tokens, 0);
     lines.push("");
     lines.push(
-      `BLOCKED MESSAGES — ${blockedRows.length} msg(s), ${formatTokens(blockedTokens)} (no m-refs — cannot be cited or folded directly)`,
+      `UNREFED MESSAGES — ${blockedRows.length} msg(s), ${formatTokens(blockedTokens)} (protected rows — no m-ref to cite; cannot be folded by name)`,
     );
     const isCompressRow = (m: VisibleMessageInfo) =>
       config ? isCompressToolName(m.tool, config) : m.tool === "compress";
@@ -750,7 +753,7 @@ function renderMessageDrilldown(
       }
     }
     lines.push(
-      `  ${message.ref} (${formatTokens(message.tokens)}) ${message.tool}${suffix}`,
+      `  ${message.ref === BLOCKED_REF ? "(unrefed)" : message.ref} (${formatTokens(message.tokens)}) ${message.tool}${suffix}`,
     );
   }
   if (filtered.length > shown.length) {
