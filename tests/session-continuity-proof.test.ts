@@ -51,6 +51,12 @@ import { createHash } from "node:crypto";
 const testRoot = mkdtempSync(path.join(tmpdir(), "bc-continuity-proof-"));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
 process.env.NODE_ENV = "test";
+// #7439 trustStampedId is GA-on by default, which retires the content-
+// forecasting |sub: forks this proof's "scenario A control" asserts
+// (uncorroborated persona drift must fork). Pin the flag OFF so the proof
+// keeps exercising the legacy fork path (still reachable via the escape
+// hatch), exactly like tests/issue2944-neutral-skeleton.test.ts does.
+process.env.BILI_ROLLOUT_TRUST_STAMPED_ID = "0";
 test.after(() => rmSync(testRoot, { recursive: true, force: true }));
 
 const { defaultConfig } = await import("acp-kernel");
