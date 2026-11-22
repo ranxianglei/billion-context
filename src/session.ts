@@ -554,6 +554,14 @@ export type Session = {
          *  provider says nothing about whether another accepts the payload.
          *  Absent on legacy session files → baseline keeps legacy behavior. */
         lastInputTokensOrigin?: string;
+         /** Identity-fast-path: the REQUEST MODEL that measured lastInputTokens
+          *  — stamped at usage settlement (settleUsageReport / applyUsageSample)
+          *  and at overflow arming, alongside lastInputTokensOrigin. Acceptance
+          *  evidence on one model says nothing about another model's wall on
+          *  the same origin (#2189: 300k billed on claude-big does not bind
+          *  claude-small). Absent on legacy session files → the gate demotes
+          *  conservatively and the protection chain judges. */
+        lastInputTokensModel?: string;
          /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
           *  consistent same-route samples of (upstream-billed input ÷ local
          *  text estimate), clamped to [0.25, 4] — two-way since #2366: the
@@ -1819,6 +1827,7 @@ export function resetSessionCompression(session: Session): void {
     // learned against the pre-compaction content class, and the baseline's
     // measuring route no longer bounds this rebuilt session.
     delete session.stats.lastInputTokensOrigin;
+    delete session.stats.lastInputTokensModel;
     delete session.stats.calibratedEstimate;
     delete session.stats.calibratedEstimateOrigin;
     // #2117 B: same boundary — the factor's model provenance dies with it.

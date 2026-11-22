@@ -37,9 +37,12 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 //
 // Both directions pinned (#3617): the over-headroom-but-natively-fitting
 // payloads forward (tests 1–2), while mathematically doomed bytes (test 3)
-// and a usage-backed payload that exceeds the NATIVE window (test 4) still
-// fail fast 413 with nothing forwarded — the escape hatch must not become a
-// floodgate.
+// still fail fast 413 with nothing forwarded. Test 4 pins the trusted-fast-path
+// bounded form: a usage-backed payload that exceeds the NATIVE window is
+// forwarded ONCE (the experiment the identity fast path authorizes), the
+// overflow 400 stamps the session wall, and the identical resend then fails
+// fast 413 locally with no further upstream call — one guaranteed 400 per
+// wall change, never a floodgate.
 //
 // The mock upstream enforces the model window on a REALISTIC tokenizer (the
 // CJK-aware caliber bili itself estimates with), like the #3146 fixture — so
@@ -233,7 +236,7 @@ test("identified fresh session with mathematically doomed bytes (>2MB core) → 
     });
 });
 
-test("usage-backed session whose payload exceeds the NATIVE window → still fail-fast 413, nothing forwarded (#4185 negative)", async () => {
+test("usage-backed session whose payload exceeds the NATIVE window → forwarded once, the 400 stamps the wall, the resend fails fast 413 locally (#4185 negative)", async () => {
     await withFixture(async (proxyPort, upstreamPort, calls) => {
         const small = await post(proxyPort, upstreamPort, "s-4185-native-over", [
             { role: "user", content: "hello" },
@@ -243,11 +246,21 @@ test("usage-backed session whose payload exceeds the NATIVE window → still fai
         assert.equal(small.status, 200);
 
         // ~45k realistic tokens: over the 40000 NATIVE window itself — no
-        // clamp can make input+output fit, so no arm may open.
-        const r = await post(proxyPort, upstreamPort, "s-4185-native-over", incidentConversation(180_000));
+        // clamp can make input+output fit. Identity fast path: the session's
+        // recorded same-origin reality outranks the local doom-math, so this
+        // payload is forwarded once and the upstream's 400 is the verdict.
+        const giant = incidentConversation(180_000);
+        const r = await post(proxyPort, upstreamPort, "s-4185-native-over", giant);
         const body = await r.text();
-        assert.equal(r.status, 413, `genuinely-unfit payload must still fail fast, got body: ${body.slice(0, 200)}`);
-        assert.ok(body.includes("exceeds the model window"), `over-window diagnostic present: ${body.slice(0, 300)}`);
-        assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 0, "the giant payload was never forwarded");
+        assert.ok(r.status === 400 || r.status === 413, `over-native payload is rejected after the experiment, got ${r.status}: ${body.slice(0, 200)}`);
+        assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 1, "the giant payload was forwarded exactly once");
+
+        // The 400 stamped the session wall (overflowArmTokens) — the identical
+        // resend now fails fast locally: 413, nothing new reaches upstream.
+        const before = calls.length;
+        const r2 = await post(proxyPort, upstreamPort, "s-4185-native-over", giant);
+        const body2 = await r2.text();
+        assert.equal(r2.status, 413, `the resend must fail fast 413 after the wall is stamped, got ${r2.status}: ${body2.slice(0, 200)}`);
+        assert.equal(calls.length, before, "the resented payload was never forwarded again");
     });
 });
