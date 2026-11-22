@@ -186,6 +186,9 @@ CREATE TABLE IF NOT EXISTS blocks (
     created_at          BIGINT NOT NULL,
     covered_hash        VARCHAR(64) NOT NULL,
     payload_json        LONGTEXT NOT NULL,
+    summary_bytes       LONGTEXT NULL,
+    start_msgid         VARCHAR(255) NULL,
+    end_msgid           VARCHAR(255) NULL,
     PRIMARY KEY (session_id, block_id),
     KEY idx_blocks_session (session_id, ord),
     KEY idx_blocks_one_hash (one_hash),
@@ -956,21 +959,25 @@ export class MysqlBackend implements StorageBackend {
                 }
                 await c.query(
                     `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
-                       summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                     ON DUPLICATE KEY UPDATE
-                       ord = VALUES(ord),
-                       /* #4608: keep durable interval evidence when a later batch can no
-                          longer re-derive it (post-fold client resends carry no covered raws).
-                          Double-slash lines are JS comment syntax, not MySQL — they syntax-error
-                          every blocks ingest on this lane, so this note is a block comment. */
-                       start_seq = IF(VALUES(start_seq) >= 0, VALUES(start_seq), start_seq),
-                       end_seq = IF(VALUES(end_seq) >= 0, VALUES(end_seq), end_seq),
-                       start_ref = VALUES(start_ref), end_ref = VALUES(end_ref), tier = VALUES(tier),
-                       summary_hash = VALUES(summary_hash), one_hash = VALUES(one_hash),
-                       supersedes_block_id = VALUES(supersedes_block_id), active = VALUES(active),
-                       created_at = VALUES(created_at), covered_hash = VALUES(covered_hash),
-                       payload_json = VALUES(payload_json)`,
+                       summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json,
+                       summary_bytes, start_msgid, end_msgid)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      ON DUPLICATE KEY UPDATE
+                        ord = VALUES(ord),
+                        /* #4608: keep durable interval evidence when a later batch can no
+                           longer re-derive it (post-fold client resends carry no covered raws).
+                           Double-slash lines are JS comment syntax, not MySQL — they syntax-error
+                           every blocks ingest on this lane, so this note is a block comment. */
+                        start_seq = IF(VALUES(start_seq) >= 0, VALUES(start_seq), start_seq),
+                        end_seq = IF(VALUES(end_seq) >= 0, VALUES(end_seq), end_seq),
+                        start_ref = VALUES(start_ref), end_ref = VALUES(end_ref), tier = VALUES(tier),
+                        summary_hash = VALUES(summary_hash), one_hash = VALUES(one_hash),
+                        supersedes_block_id = VALUES(supersedes_block_id), active = VALUES(active),
+                        created_at = VALUES(created_at), covered_hash = VALUES(covered_hash),
+                        payload_json = VALUES(payload_json),
+                        summary_bytes = COALESCE(VALUES(summary_bytes), summary_bytes),
+                        start_msgid = COALESCE(VALUES(start_msgid), start_msgid),
+                        end_msgid = COALESCE(VALUES(end_msgid), end_msgid)`,
                     [
                         b.blockId,
                         s.sessionId,
@@ -987,6 +994,9 @@ export class MysqlBackend implements StorageBackend {
                         b.createdAt,
                         b.coveredHash,
                         b.payloadJson,
+                        b.summaryBytes ?? b.summary,
+                        b.startMsgid ?? null,
+                        b.endMsgid ?? null,
                     ],
                 );
             }
