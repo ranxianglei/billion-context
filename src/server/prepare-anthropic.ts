@@ -82,7 +82,12 @@ export async function prepareAnthropic(
     const incomingMsgSeqs = (parsed as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
     delete (parsed as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
     ++session.stats.requests;
-    const injectTools = opts.compress.injectTool && !pluginMode;
+    // zed cloud wire: the response is NDJSON byte-passthrough, so an in-stream
+    // acp loop is structurally unreachable (same reasoning as DSH #3177) — the
+    // model-side compress surface (tools + standing prompt + nudge) is off.
+    const zedLane = req.headers["x-bili-zed-lane"] !== undefined;
+    const modelSurfaceOn = opts.compress.injectTool && !zedLane;
+    const injectTools = modelSurfaceOn && !pluginMode;
     // #3417: lane decisions (profile + per-wire observation) own the
     // surface gates; the dsh* alias stays for the remaining reads in this
     // file (Step 3 of #3417 renames the consumers).
@@ -91,7 +96,7 @@ export async function prepareAnthropic(
         pluginMode,
         pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined,
         parsed,
-        shouldInject: opts.compress.injectTool,
+        shouldInject: modelSurfaceOn,
         pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined,
     });
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
@@ -301,14 +306,14 @@ export async function prepareAnthropic(
         // (applyAbsorbView hides regardless of enablement).
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
         const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
-        const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool;
+        const absorbActive = absorbBlock?.enabled === true && modelSurfaceOn;
         // #5765: block-lifecycle tools — one switch, off by default.
         const blockOps = blockOpsTools();
-        const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && opts.compress.injectTool;
+        const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && modelSurfaceOn;
         // acp_rule has no processTurn side effect (no markers/instructions are
         // ever injected into messages), so unlike absorb it needs no loop-
         // config stripping — only tool availability matters.
-        const rulesActive = rulesEnabled(config) && opts.compress.injectTool;
+        const rulesActive = rulesEnabled(config) && modelSurfaceOn;
         // [#1097] the kernel ccr-store node ID-references oversized tool results
         // BEFORE absorb (ID-reference wins over distill); armed policy is
         // stamped per-request — strip `ccr` from the loop config when disarmed
