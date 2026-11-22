@@ -64,6 +64,7 @@ type UpstreamConnectionStatus = {
 };
 
 const dispatcherCache = new Map<string, ProxyAgent>();
+let dispatcherCaIdentity: string | undefined;
 let lastConnection: UpstreamConnectionStatus = {};
 let windowsProxyCache: { at: number; value: WindowsSystemProxy } | undefined;
 
@@ -401,7 +402,14 @@ export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number
     const t = timeoutMs ?? upstreamTimeoutMs();
     const ka = proxyKeepAliveMaxMs();
     // #3776: include the CA identity in the key so a configured/rotated network.caFile rotates the cached agent.
-    const key = `${proxyUrl}\u0000${t}\u0000${ka}\u0000${upstreamCaIdentity()}`;
+    const caIdentity = upstreamCaIdentity();
+    if (caIdentity !== dispatcherCaIdentity) {
+        // Gracefully drain the old trust identity's proxy and target pools; future
+        // requests use only the current identity without retaining every past Agent.
+        closeProxyDispatchers();
+        dispatcherCaIdentity = caIdentity;
+    }
+    const key = `${proxyUrl}\u0000${t}\u0000${ka}\u0000${caIdentity}`;
     let agent = dispatcherCache.get(key);
     if (!agent) {
         const withTimeouts = (options: object): object => {
@@ -432,11 +440,16 @@ export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number
     return agent;
 }
 
-export function resetProxyCache(): void {
+function closeProxyDispatchers(): void {
     for (const agent of dispatcherCache.values()) {
         try { void agent.close().catch(() => undefined); } catch { }
     }
     dispatcherCache.clear();
+    dispatcherCaIdentity = undefined;
+}
+
+export function resetProxyCache(): void {
+    closeProxyDispatchers();
     lastConnection = {};
 }
 
@@ -530,10 +543,12 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
                 if (chunk === null) return;
                 buffer = Buffer.concat([buffer, chunk]);
                 const end = buffer.indexOf("\r\n\r\n");
-                if (end < 0) {
-                    if (buffer.length > 64 * 1024) finishError(new Error("upstream proxy CONNECT response header is too large"));
+                const headerBytes = end < 0 ? buffer.length : end + 4;
+                if (headerBytes > 64 * 1024) {
+                    finishError(new Error("upstream proxy CONNECT response header is too large"));
                     return;
                 }
+                if (end < 0) return;
                 socket.removeListener("readable", onReadable);
                 const head = buffer.subarray(0, end).toString("latin1");
                 const statusLine = head.split("\r\n", 1)[0] ?? "";
