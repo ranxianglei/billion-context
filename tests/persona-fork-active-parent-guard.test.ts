@@ -20,6 +20,10 @@
 // (`fork.lastSeen > parent.lastSeen`, the pre-fix rule, which also matches a
 // STILL-ACTIVE parent whose parallel fork happens to be fresher).
 import test, { after } from "node:test";
+// trustStampedId is GA-on by default (#7439). This suite pins the legacy |sub:
+// fork behavior — force the feature OFF so it keeps asserting the
+// pre-retirement path (issue2944-neutral-skeleton idiom).
+process.env.BILI_ROLLOUT_TRUST_STAMPED_ID = "0";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
