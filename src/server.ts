@@ -2892,6 +2892,18 @@ const SIDE_LANE_ANCHOR_MIN_ABS_DELTA = 25_000;
 // honest anchors on the fast path while #4805's side-lane sample (anchor request
 // ~3k upper, main payload ~680k upper) is refused with 2-20x margin.
 const SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO = 8;
+// #7444: upstream clipping (agy-cli's 112 KiB replay cap) only bites on
+// multi-MiB sessions — the clip is a fixed byte budget, so the report-vs-payload
+// gap only becomes proof of clipping once the forwarded history is far above it.
+// 500K chars (~125K tokens) is the floor: below it, a dense-code payload can
+// legitimately outrank an honest report by 16x+ (#1820 B e2e: 186K chars over
+// a 5k report = 37x) and the anchor must stay on the fast path.
+const CLIPPED_REPORT_MIN_OUTBOUND = 500_000;
+// #7444: minimum outbound-char-bound / report ratio that proves clipping.
+// 16x sits above the honest dense-code under-report band (#1820 B e2e observed
+// up to ~37x chars-per-token, but only below the 500K floor) and below the
+// agy-cli clip's ~40x gap, so it separates the two without a per-host knob.
+const CLIPPED_REPORT_MIN_RATIO = 16;
 
 // estimator only errs EARLY (char-count upper bound → compress earlier, never
 // later), is active only while lastInputTokens == 0 (a real usage report takes
@@ -2936,6 +2948,22 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
         && payloadUpperNow >= session.stats.lastInputTokens * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
         && payloadUpperNow >= session.stats.lastUsagePayloadUpper! * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
         && payloadUpperNow - session.stats.lastInputTokens > SIDE_LANE_ANCHOR_MIN_ABS_DELTA;
+    // #7444: upstream clipping (agy-cli clips to 112 KiB due to agy.exe's 128 KiB
+    // ACP prompt limit) makes the usage report describe the CLIPPED payload, not
+    // the full payload bili sent. anchorImpossible cannot catch this: condition B
+    // requires the current payload to tower 8x over the producer's snapshot, but
+    // both are at the same scale because bili sent the full history both times.
+    // The distinguishing fact: the outbound char-bound (localInputEstimate) towers
+    // 16x+ over the report AND is itself multi-megabyte (>= 500K chars). An
+    // honest report of a small-to-medium payload can legitimately under-report
+    // by 16x+ on dense code/JSON (chars-per-token up to ~37x observed in #1820
+    // B's e2e harness), but the clipped-payload class only manifests on
+    // multi-MiB sessions where the upstream's byte cap (112–128 KiB) is far
+    // below the forwarded history. The 500K-char floor keeps the #1820 B
+    // honesty margin (186K-char harness) on the fast path.
+    const reportClipped = session.stats.lastInputTokens > 0
+        && (session.stats.localInputEstimate ?? 0) >= session.stats.lastInputTokens * CLIPPED_REPORT_MIN_RATIO
+        && (session.stats.localInputEstimate ?? 0) >= CLIPPED_REPORT_MIN_OUTBOUND;
     // #5135: pending compress credit proves THIS session executed its own fold
     // since the last settle — applyRanges (stream.ts) already netted the
     // savings out of lastInputTokens while lastUsageGradeTokens still carries
@@ -2961,7 +2989,7 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // it (loop/core.ts), so this cannot freeze the meter; zero is a valid
     // drained reading (kernel treats 0 as unknown).
     if (session.stats.lastInputTokensSource === "usage" && (session.stats.compressCreditTokens ?? 0) > 0 && session.stats.lastInputTokens >= 0) return { tokens: session.stats.lastInputTokens, source: "usage" };
-    if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    if (!anchorStale && !anchorImpossible && !reportClipped && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,
     // or the upstream never reports), and every branch below sizes on the
@@ -2994,7 +3022,7 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // upstreams (#553/#728) are unaffected: their anchor stays absent, so the
     // fail-closed upper bounds below still apply.
     const grade = session.stats.lastUsageGradeTokens;
-    if (!anchorStale && grade !== undefined && grade > 0) {
+    if (!anchorStale && !reportClipped && grade !== undefined && grade > 0) {
         // #4383: stale-small retained anchor — the calibrated local estimate
         // of the current outbound is strictly better than the char-count
         // branches below (#1839 inflation), so it wins immediately.
