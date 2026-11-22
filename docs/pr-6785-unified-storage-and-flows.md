@@ -11,7 +11,7 @@ It turns the two O(full) paths — "recompute the outbound view from scratch eve
 
 | Block | Proposal / origin | Switch (default) |
 |---|---|---|
-| ① Snapshot base v2 (stage-0 identity ledger + fold journal + outbound prefix cache) | #5874 v2 / #7064 slimming | `storage.snapBase.enabled` (off by default, config-only) |
+| ~~① Snapshot base v2~~ (fold journal + egress-snapshot + scope-rev) | #5874 v2 / #7064 slimming | **RETIRED by this PR** (bc51c9445, 7439 ruling): the plane never shipped — replaced wholesale by the round-2 op log (`egress_state`/`egress_flow`, KDD #22); its stage-0 identity ledger (L1 world / pf pin) stays, but `storage.snapBase.*` is GONE from the config surface — a leftover `snapBase` key in your config is a dead key (ignored) |
 | ② Outbound op-log (egress_state/egress_flow + rebuild-serve + server authority) | Discussion #7398/#7439 | `egressPlane` (0) — ONE switch for the whole new path |
 | ③ Full-resend watermark + delta tail slice | #5403/#5418 + this PR | `pluginFullResendWatermark` (5) / `pluginDeltaResend` (0) |
 | ④ Incremental msgid pin (tail-ids tail form) | #7064 §8 | `pluginMsgIdIncremental` (**100**, on by default from this PR) |
@@ -282,10 +282,7 @@ Fold tx: blocks insert/update + covered rows retired (same tx) + one fold_journa
 
 | Key | Default | Effect |
 |---|---|---|
-| `storage.snapBase.enabled` | off | ① snapshot-base plane (snapBase gate, knobs.ts:1001 fail-closed) |
-| `storage.snapBase.cohorts` | — | protocol allowlist |
-| `storage.snapBase.cutEveryKUserTurns` | 8 | egress_snapshot re-cut cadence (a re-cut = full prefix re-hash + re-serialize + CAS write, hence rate-limited; invalidation-class events always re-cut immediately) |
-| `network.ingestBodyBytes` | 32MiB | inbound body cap (the measured 155MB scenario needs 1GiB; env `BILI_INGEST_BODY_BYTES` takes priority) |
+| ~~`storage.snapBase.*`~~ | — | **RETIRED by this PR** (bc51c9445) — removed from config.ts/knobs.ts; a leftover key is ignored | | `network.ingestBodyBytes` | 32MiB | inbound body cap (the measured 155MB scenario needs 1GiB; env `BILI_INGEST_BODY_BYTES` takes priority) |
 
 ### 4.3 Response/request headers (protocol surface)
 

@@ -13,7 +13,7 @@
 
 | 块 | 提案/来源 | 开关(默认) |
 |---|---|---|
-| ① 快照底座 v2(stage-0 身份账本 + fold 日志 + 出站前缀缓存) | #5874 v2 / #7064 瘦身 | `storage.snapBase.enabled`(默认关,纯配置) |
+| ~~① 快照底座 v2~~(fold 日志 + egress_snapshot + scope-rev) | #5874 v2 / #7064 瘦身 | **本 PR 已退役**(bc51c9445,7439 裁定):平面从未上线——被 round-2 op log(`egress_state`/`egress_flow`,KDD #22)整体取代;stage-0 身份账本(L1 world / pf pin)保留,但 `storage.snapBase.*` 已从配置面**移除**——你配置里残留的 `snapBase` 键是死键(被忽略) |
 | ② 出站 op-log(egress_state/egress_flow + 重建 serve + 服务端权威) | 讨论区 7398/7439 | `egressPlane`(0)——整条新链路的**唯一开关** |
 | ③ 全量重发水位 + delta 尾切片 | #5403/#5418 + 本 PR | `pluginFullResendWatermark`(5)/ `pluginDeltaResend`(0) |
 | ④ 增量 msgid pin(tail-ids 尾形态) | #7064 §8 | `pluginMsgIdIncremental`(**100**,本 PR 起默认开) |
@@ -284,10 +284,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 
 | 键 | 默认 | 作用 |
 |---|---|---|
-| `storage.snapBase.enabled` | 关 | ① 快照底座平面(snapBase 门,knobs.ts:1001 fail-closed) |
-| `storage.snapBase.cohorts` | — | 协议白名单 |
-| `storage.snapBase.cutEveryKUserTurns` | 8 | egress_snapshot 重切节奏(重切=整前缀重哈希+重序列化+写 CAS,故限频;失效类永远立即重切) |
-| `network.ingestBodyBytes` | 32MiB | 入站 body 上限(实测 155MB 场景需调 1GiB;env `BILI_INGEST_BODY_BYTES` 优先) |
+| ~~`storage.snapBase.*`~~ | — | **本 PR 已退役**(bc51c9445)——config.ts/knobs.ts 已移除;残留键被忽略 | | `network.ingestBodyBytes` | 32MiB | 入站 body 上限(实测 155MB 场景需调 1GiB;env `BILI_INGEST_BODY_BYTES` 优先) |
 
 ### 4.3 响应头(协议面)
 
