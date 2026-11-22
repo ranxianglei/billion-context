@@ -12,8 +12,8 @@
 //  - ZERO kernel changes: no version bump, no golden ledger, no kernel source.
 //  - Deterministic: same input bytes → same output bytes AND same annotation
 //    text, so the outbound body is byte-stable across rounds for the same
-//    history (the #3266 75%→28% cache-hit lesson). A process-lifetime hash
-//    cache encodes each unique image once.
+//    history (the #3266 75%→28% cache-hit lesson). A bounded process-wide hash
+//    cache reuses completed encodes and de-duplicates in-flight work.
 //  - Structural loop guard: images carried by a acp_read_original_image tool
 //    result are NEVER re-shrunk (that exemption is what kills the #3266
 //    read→resend→re-shrink cycle). Zero state, survives restarts.
@@ -46,6 +46,8 @@ const KEEP_RATIO = 0.8;
 const JPEG_QUALITY = 80;
 /** Process-lifetime encode cache cap (unique images per process). */
 const ENCODE_CACHE_MAX = 512;
+/** Retained base64 payloads, excluding temporary buffers used by the codec. */
+const ENCODE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 
 type RescaledMime = "image/png" | "image/jpeg" | "image/bmp";
 
@@ -82,7 +84,53 @@ interface RescaledImage {
 
 // hash → pending/finished encoding. A promise map doubles as the in-flight
 // de-duplication: concurrent requests for the same image share one encode.
-const encodeCache = new Map<string, Promise<RescaledImage | null>>();
+interface EncodeCacheEntry {
+    pending: Promise<RescaledImage | null>;
+    bytes: number;
+}
+const encodeCache = new Map<string, EncodeCacheEntry>();
+let encodeCacheBytes = 0;
+let encodeCacheByteLimit = ENCODE_CACHE_MAX_BYTES;
+
+function trimEncodeCache(): void {
+    while (encodeCache.size > ENCODE_CACHE_MAX) {
+        const oldest = encodeCache.entries().next().value;
+        if (oldest === undefined) break;
+        encodeCache.delete(oldest[0]);
+        encodeCacheBytes -= oldest[1].bytes;
+    }
+    // Pending encodes have no retained output yet. Keep their de-duplication
+    // entries while releasing the oldest completed payloads under pressure.
+    for (const [hash, entry] of encodeCache) {
+        if (encodeCacheBytes <= encodeCacheByteLimit) break;
+        if (entry.bytes === 0) continue;
+        encodeCache.delete(hash);
+        encodeCacheBytes -= entry.bytes;
+    }
+}
+
+function cacheEncode(hash: string, pending: Promise<RescaledImage | null>): Promise<RescaledImage | null> {
+    const entry: EncodeCacheEntry = { pending, bytes: 0 };
+    entry.pending = pending.then(result => {
+        // A cleared/evicted encode must not account bytes against a newer
+        // entry with the same key, or resurrect itself after cache reset.
+        if (encodeCache.get(hash) !== entry || result === null) return result;
+        const bytes = result.base64.length; // base64 is ASCII: one byte per character
+        if (bytes > encodeCacheByteLimit) {
+            // Serve the caller but retain no oversized result; smaller useful
+            // entries must not all be evicted to accommodate a single image.
+            encodeCache.delete(hash);
+            return result;
+        }
+        entry.bytes = bytes;
+        encodeCacheBytes += bytes;
+        trimEncodeCache();
+        return result;
+    });
+    encodeCache.set(hash, entry);
+    trimEncodeCache();
+    return entry.pending;
+}
 
 type JimpModule = typeof import("jimp");
 
@@ -101,10 +149,10 @@ function loadJimp(): Promise<JimpModule | null> {
     return jimpLoad;
 }
 
-// force (#3701 byte-shed ladder): skips the 100 KiB trigger gate and adopts ANY
-// strict byte reduction (not just <80%). A within-maxDim image is NOT skipped
-// here — a same-dim re-encode is adopted only if strictly smaller; the byte-shed
-// caller pre-filters maxDim-fitting images before calling (egress-shed rung B).
+// force (#3701 byte-shed ladder): adopts ANY strict byte reduction (not just <80%).
+// The 100 KiB trigger gate applies equally to both; a within-maxDim image is
+// re-encoded only if it exceeds the trigger. The byte-shed caller pre-filters
+// maxDim-fitting images before calling (egress-shed rung B).
 async function doRescale(mime: RescaledMime, b64: string, origBytes: number, maxDim: number, force = false): Promise<RescaledImage | null> {
     try {
         const mod = await loadJimp();
@@ -115,7 +163,7 @@ async function doRescale(mime: RescaledMime, b64: string, origBytes: number, max
         // Re-check the gate against the AUTHORITATIVE dims (the header parse
         // may have failed for exotic containers).
         const scale = Math.min(1, maxDim / Math.max(ow, oh));
-        if (scale >= 1 && (!force || origBytes <= RESCALE_TRIGGER_BYTES)) return null;
+        if (scale >= 1 && origBytes <= RESCALE_TRIGGER_BYTES) return null;
         const tw = Math.max(1, Math.round(ow * scale));
         const th = Math.max(1, Math.round(oh * scale));
         if (tw !== ow || th !== oh) await img.resize({ w: tw, h: th });
@@ -141,8 +189,8 @@ async function doRescale(mime: RescaledMime, b64: string, origBytes: number, max
 
 /** Decide + encode ONE image occurrence. Returns null when the original must
  *  be forwarded untouched (unsupported format, below the gate, low benefit,
- *  or decode failure). Cached per content hash — each unique image encodes
- *  once per process. */
+ *  or decode failure). Cached per content hash while the entry fits within
+ *  the process-wide count and retained-payload limits. */
 async function rescaleImage(mediaType: string, b64: string, maxDim: number): Promise<RescaledImage | null> {
     const mime = normalizeMime(mediaType);
     if (!mime || typeof b64 !== "string" || b64.length === 0) return null;
@@ -150,17 +198,11 @@ async function rescaleImage(mediaType: string, b64: string, maxDim: number): Pro
     const dims = decodeImageDims(b64);
     const gated = (dims !== undefined && Math.max(dims.w, dims.h) > maxDim) || origBytes > RESCALE_TRIGGER_BYTES;
     if (!gated) return null;
-    const hash = createHash("sha256").update(b64, "utf8").digest("hex");
-    let pending = encodeCache.get(hash);
+    const hash = createHash("sha256").update(`${mime}:${maxDim}:${b64}`, "utf8").digest("hex");
+    let pending = encodeCache.get(hash)?.pending;
     const cacheHit = pending !== undefined;
     if (!pending) {
-        pending = doRescale(mime, b64, origBytes, maxDim);
-        encodeCache.set(hash, pending);
-        while (encodeCache.size > ENCODE_CACHE_MAX) {
-            const oldest = encodeCache.keys().next().value;
-            if (oldest === undefined || oldest === hash) break;
-            encodeCache.delete(oldest);
-        }
+        pending = cacheEncode(hash, doRescale(mime, b64, origBytes, maxDim));
     }
     const result = await pending;
     // A cache hit serves the stored encode result again — mark it non-fresh so
@@ -169,9 +211,12 @@ async function rescaleImage(mediaType: string, b64: string, maxDim: number): Pro
     return result;
 }
 
-/** Test seam: drop the process-lifetime encode cache between cases. */
-export function clearRescaleEncodeCache(): void {
+/** Test seam: reset cache state; an optional small budget avoids huge fixtures.
+ *  Calling without arguments restores the production budget. */
+export function clearRescaleEncodeCache(maxBytesForTest = ENCODE_CACHE_MAX_BYTES): void {
     encodeCache.clear();
+    encodeCacheBytes = 0;
+    encodeCacheByteLimit = maxBytesForTest;
 }
 
 /** #3701 byte-shed ladder step: forced re-encode at an explicit longest-edge dim.
@@ -184,15 +229,9 @@ export async function shedDownscaleImage(mediaType: string, b64: string, maxDim:
     if (!mime || typeof b64 !== "string" || b64.length === 0 || !Number.isFinite(maxDim) || maxDim <= 0) return null;
     const dim = Math.floor(maxDim);
     const hash = createHash("sha256").update(`${dim}:${b64}`, "utf8").digest("hex");
-    let pending = encodeCache.get(hash);
+    let pending = encodeCache.get(hash)?.pending;
     if (!pending) {
-        pending = doRescale(mime, b64, b64Bytes(b64), dim, true);
-        encodeCache.set(hash, pending);
-        while (encodeCache.size > ENCODE_CACHE_MAX) {
-            const oldest = encodeCache.keys().next().value;
-            if (oldest === undefined || oldest === hash) break;
-            encodeCache.delete(oldest);
-        }
+        pending = cacheEncode(hash, doRescale(mime, b64, b64Bytes(b64), dim, true));
     }
     const r = await pending;
     return r === null ? null : r.base64;
@@ -528,7 +567,9 @@ export async function refForItemBytes(session: Session, mediaType: string, b64: 
         }
     }
     if (candidates.length === 0) return undefined;
-    if (candidates.length === 1) return candidates[0].ref;
+    // A resized outbound image can share its byte count with a different
+    // original. Size/MIME only narrow the search; even a sole candidate must
+    // still match its readable spill before the model is sent to that ref.
     let matched: string | undefined;
     for (const c of candidates) {
         try {

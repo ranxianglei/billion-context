@@ -4,6 +4,8 @@ import http from "node:http";
 import os from "node:os";
 import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.js";
@@ -198,6 +200,46 @@ test("viewFromParsed: envelope v3, legacy flat, corrupt input", () => {
     assert.equal(viewFromParsed("garbage"), null);
     assert.equal(viewFromParsed({}), null);
     assert.equal(viewFromParsed({ savedAt: -5 }), null);
+});
+
+test("viewFromParsed: malformed compression state and token counts are never treated as empty", () => {
+    for (const extra of [
+        { state: "unreadable state" },
+        { state: { blocks: { b1: { summary: "irreplaceable" } } } },
+        { blockContents: ["irreplaceable"] },
+        { stats: { contextTokens: "large" } },
+        { stats: { contextTokens: -1 } },
+        { metadata: { rawInputTokens: -1 } },
+        { metadata: { rawInputTokens: "large" } },
+    ]) {
+        assert.equal(viewFromParsed(envelope("malformed", 1234, extra)), null, JSON.stringify(extra));
+    }
+});
+
+test("contentStoreTokens: malformed content entries are not silently counted as zero", () => {
+    for (const value of [null, 1, {}, ["preserved bytes"]]) {
+        assert.equal(contentStoreTokens({ version: 1, byHash: { h1: value }, byRef: {} }), null);
+    }
+});
+
+test("gcSessionFiles: keep valid JSON with malformed state or malformed companion content", async () => {
+    const dir = tmpDir("bili-gc-malformed-shapes-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const old = Date.now() - 10 * DAY;
+        const malformed = writeFile(dir, "anthropic/malformed.json", JSON.stringify(envelope("gc-malformed", old, {
+            state: { blocks: { b1: { summary: "preserve this" } } },
+        })), 10);
+        const session = writeFile(dir, "anthropic/companion.json", JSON.stringify(envelope("gc-malformed-companion", old)), 10);
+        const companion = writeFile(dir, "anthropic/companion.content-store.json", JSON.stringify({
+            version: 1, byHash: { h1: { text: "preserve unknown representation" } }, byRef: {},
+        }), 10);
+        const result = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(result.removed, 0);
+        assert.equal(result.companionsRemoved, 0);
+        assert.equal(result.unreadable, 1);
+        for (const file of [malformed, session, companion]) assert.ok(existsSync(file), file);
+    });
 });
 
 test("gcConfigFromEnv: disabled by default, opt-in only", async () => {
@@ -511,6 +553,67 @@ test("gcSessionFiles: unreadable companion next to an eligible session keeps bot
         assert.ok(existsSync(fSess), "never guess at an unreadable companion — keep the session too");
         assert.ok(existsSync(fCmp));
     });
+});
+
+for (const code of ["EIO", "EACCES", "ELOOP"]) {
+    test(`gcSessionFiles: a failed companion stat (${code}) keeps the session and its originals`, async (t) => {
+        const dir = tmpDir("bili-gc-companion-stat-");
+        const originalStat = fsPromises.stat;
+        try {
+            await withEnv({ BILI_SESSION_GC: "1", BILI_SESSION_GC_MAX_TOKENS: "1000" }, async () => {
+                const store = new SessionStore({ dir, debounceMs: 500 });
+                const savedAt = Date.now() - 10 * DAY;
+                const fSess = writeFile(dir, "anthropic/host_guarded.json", JSON.stringify(envelope("gc-stat-guarded", savedAt, { metadata: { rawInputTokens: 500 } })), 10);
+                const fCmp = contentStoreFile(dir, "anthropic/host_guarded.content-store.json", 8000, 10);
+                const fOther = writeFile(dir, "anthropic/host_eligible.json", JSON.stringify(envelope("gc-stat-eligible", savedAt, { metadata: { rawInputTokens: 500 } })), 10);
+                const sessionBytes = readFileSync(fSess);
+                const companionBytes = readFileSync(fCmp);
+                const eligibleBytes = statSync(fOther).size;
+                let failedProbe = false;
+                t.mock.method(fsPromises, "stat", async (...args: Parameters<typeof fsPromises.stat>) => {
+                    if (args[0] === fCmp && !failedProbe) {
+                        failedProbe = true;
+                        throw Object.assign(new Error("companion metadata unavailable"), { code });
+                    }
+                    return originalStat(...args);
+                });
+                syncBuiltinESMExports();
+                const result = await gcSessionFiles({ dir, store, now: Date.now() });
+                assert.equal(failedProbe, true, "the real companion's first metadata probe failed");
+                assert.equal(result.removed, 1, "only the independently eligible session was removed");
+                assert.equal(result.companionsRemoved, 0, "the orphan pass must still see a surviving owner");
+                assert.equal(result.bytesFreed, eligibleBytes);
+                assert.deepEqual(readFileSync(fSess), sessionBytes, "the session remains byte-identical");
+                assert.deepEqual(readFileSync(fCmp), companionBytes, "lossless originals remain byte-identical");
+                assert.equal(existsSync(fOther), false, "one failed metadata read does not stop the sweep");
+            });
+        } finally {
+            t.mock.restoreAll();
+            syncBuiltinESMExports();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+}
+
+test("gcSessionFiles: an unsupported companion file type is not an absent companion", async () => {
+    const dir = tmpDir("bili-gc-companion-type-");
+    try {
+        await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+            const store = new SessionStore({ dir, debounceMs: 500 });
+            const fSess = writeFile(dir, "anthropic/host_foreign.json", JSON.stringify(envelope("gc-foreign-companion", Date.now() - 10 * DAY)), 10);
+            const original = readFileSync(fSess);
+            const companion = path.join(dir, "anthropic/host_foreign.content-store.json");
+            mkdirSync(companion);
+            writeFileSync(path.join(companion, "original.txt"), "retained external content");
+            const result = await gcSessionFiles({ dir, store, now: Date.now() });
+            assert.equal(result.removed, 0);
+            assert.equal(result.companionsRemoved, 0);
+            assert.deepEqual(readFileSync(fSess), original);
+            assert.equal(readFileSync(path.join(companion, "original.txt"), "utf8"), "retained external content");
+        });
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test("records rawInputTokens per turn and persists it (#1082)", async () => {

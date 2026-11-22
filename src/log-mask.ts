@@ -113,13 +113,15 @@ export function maskUrlForLog(url: string): string {
 // carried their inline credentials verbatim into logs / diagnostics / publish
 // blobs. No leading \b on purpose: a word-char-glued URL (xhttps://…) must
 // stay masked exactly as before; over-matching is safe, under-matching leaks.
-const EMBEDDED_URL_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi;
+// Try each scheme-character run once; retain any non-letter prefix outside
+// the URL rather than retrying the same suffix from every letter in the run.
+const EMBEDDED_URL_RE = /(?<![a-z0-9+.-])([0-9+.-]*)([a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+)/gi;
 
 /** Mask every scheme://… URL embedded anywhere in an arbitrary string
  *  (request paths like /bili/http://relay.internal/v1/..., error text,
  *  socks5://user:pass@host forwarding addresses — #4191). */
 export function maskUrlsInText(text: string): string {
-    return text.replace(EMBEDDED_URL_RE, (m) => maskUrlForLog(m));
+    return text.replace(EMBEDDED_URL_RE, (_m, prefix: string, url: string) => prefix + maskUrlForLog(url));
 }
 
 /** #3811: publish-path URL masking for artifacts that land in a PUBLIC GitHub
@@ -145,7 +147,7 @@ function maskUrlForPublish(url: string): string {
  *  wherever they appear in serialized text — object values AND object keys (the
  *  providers table uses upstream URLs as keys). */
 export function maskUrlsForPublish(text: string): string {
-    return text.replace(EMBEDDED_URL_RE, (m) => maskUrlForPublish(m));
+    return text.replace(EMBEDDED_URL_RE, (_m, prefix: string, url: string) => prefix + maskUrlForPublish(url));
 }
 
 function escapeRegExp(s: string): string {
@@ -179,7 +181,10 @@ function publishHomeRoots(): string[] {
 
 export function maskPathsForPublish(text: string): string {
     if (!text) return text;
-    const roots = publishHomeRoots();
+    const roots = [...new Set(publishHomeRoots().flatMap((root) => [
+        root,
+        JSON.stringify(root).slice(1, -1),
+    ]))].sort((a, b) => b.length - a.length);
     if (roots.length === 0) return text;
     const re = new RegExp("(?<![/\\w.\\-])(" + roots.map(escapeRegExp).join("|") + ")(?=[/\\\\\"'\\s]|$)", "g");
     return text.replace(re, "~");
@@ -207,13 +212,15 @@ export function maskUrlForDiagnostics(url: string): string {
     try {
         const u = new URL(url);
         // Node keeps the brackets in hostname for bracketed IPv6 ([::1]).
-        // Loopback is returned VERBATIM (not re-serialized): URL.pathname
-        // normalizes pathless URLs by appending "/", which would drift
-        // byte-pinned local-origin lines for no security benefit — loopback
-        // identifies bili's own proxy, and secrets are scrubbed separately
-        // by redactSecretsInText upstream of every call site.
+        // Keep clean loopback URLs verbatim: URL.pathname would add "/" to
+        // pathless local-origin lines. The exemption covers host visibility,
+        // never userinfo/query/hash; generic text redaction cannot recognize
+        // arbitrary passwords or every query parameter carrying a secret.
         const h = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-        if (h === "localhost" || isLoopbackIp(h)) return url;
+        if (h === "localhost" || isLoopbackIp(h)) {
+            if (!u.username && !u.password && !u.search && !u.hash) return url;
+            return `${u.protocol}//${u.host}${u.pathname}`;
+        }
     } catch {
         // unparseable — fall through to the generic masker
     }
@@ -225,10 +232,10 @@ export function maskUrlForDiagnostics(url: string): string {
  *  unparseable fragments pass through (the IP scrubber neutralizes bare IP
  *  literals separately). */
 export function maskUrlsForDiagnostics(text: string): string {
-    return text.replace(EMBEDDED_URL_RE, (m) => {
+    return text.replace(EMBEDDED_URL_RE, (m, prefix: string, url: string) => {
         try {
-            void new URL(m);
-            return maskUrlForDiagnostics(m);
+            void new URL(url);
+            return prefix + maskUrlForDiagnostics(url);
         } catch {
             return m;
         }
@@ -287,7 +294,20 @@ function isIpv4Literal(s: string): boolean {
 }
 
 function isLoopbackIp(ip: string): boolean {
-    return ip === "::1" || ip === "0:0:0:0:0:0:0:1" || ip === "0.0.0.0" || ip.startsWith("127.");
+    if (ip === "::1" || ip === "0:0:0:0:0:0:0:1" || ip === "0.0.0.0") return true;
+    if (!ip.startsWith("127.")) return false;
+    if (isIpv4Literal(ip)) return true;
+    // The prefix alone also matches private DNS names such as
+    // 127.relay.internal. Preserve numeric aliases accepted by Node URLs
+    // (127.1, 127.0x1, etc.) only when they normalize to an actual IPv4
+    // loopback address; never interpret URL syntax as part of a host.
+    if (!/^[0-9a-fx.]+$/i.test(ip)) return false;
+    try {
+        const normalized = new URL(`http://${ip}`).hostname;
+        return normalized.startsWith("127.") && isIpv4Literal(normalized);
+    } catch {
+        return false;
+    }
 }
 
 /** #4254: is this a loopback host name/address? Loopback identifies a LOCAL
@@ -305,8 +325,10 @@ export function isLoopbackHost(host: string): boolean {
  *  is masked with its port kept. Used by the upstream-failure egress path so one
  *  message never mixes a raw loopback next to a masked <private-host>. */
 export function maskHostPortForDisplay(target: string): string {
-    const i = target.lastIndexOf(":");
-    if (i <= 0) return isLoopbackHost(target) ? target : maskHostForLog(target);
+    // A bracketed address can have no port (new URL("http://[::1]").host).
+    // Only the colon after the closing bracket can delimit its port.
+    const i = target.startsWith("[") ? target.indexOf("]") + 1 : target.lastIndexOf(":");
+    if (i <= 0 || i === target.length) return isLoopbackHost(target) ? target : maskHostForLog(target);
     const host = target.slice(0, i);
     return `${isLoopbackHost(host) ? host : maskHostForLog(host)}${target.slice(i)}`;
 }

@@ -380,6 +380,11 @@ test("integration: tunnel cannot reach the proxy's own management plane (#409 Po
         assert.match(poc.body, /tunnel_destination_denied/);
         const pocPut = await get(selfPort, `/bili/http://127.0.0.1:${selfPort}/__bili/config`);
         assert.equal(pocPut.status, 403);
+        // Every 127/8 address denotes this machine, including aliases that do
+        // not appear in networkInterfaces(). Reject before opening a socket.
+        const alias = await get(selfPort, `/bili/http://127.42.19.8:${selfPort}/v1/models`);
+        assert.equal(alias.status, 403);
+        assert.match(alias.body, /"detail":"self"/);
         // Direct loopback management access still works (marker not present).
         const direct = await get(selfPort, "/__bili/config", { host: `127.0.0.1:${selfPort}` });
         assert.equal(direct.status, 200);

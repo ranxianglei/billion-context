@@ -142,6 +142,35 @@ test("codexCompactGatePre: evidence-grade baseline only (#3008)", () => {
     assert.equal(codexCompactGatePre(mockSession(9_500, [block(true)]), limit), true, "no source, no usage anchor → baseline 0 → forge");
 });
 
+test("codexCompactGatePre: a high estimate from a send without usage cannot veto interception", () => {
+    const limit = 475_000;
+    const lowUsage = mockSession(139_820, [block(true)], { source: "usage", grade: 139_820 });
+    lowUsage.stats.contextTokensSource = "estimate";
+    lowUsage.stats.localInputEstimate = 436_702;
+    assert.equal(codexCompactGatePre(lowUsage, limit), true, "the per-send upper bound cannot veto interception");
+});
+
+test("codexCompactGatePre: low estimates cannot erase usage or overflow evidence", () => {
+    const limit = 475_000;
+    const threshold = 427_500;
+    const highUsage = mockSession(threshold, [block(true)], { source: "usage", grade: threshold });
+    highUsage.stats.contextTokensSource = "estimate";
+    highUsage.stats.localInputEstimate = 139_820;
+    assert.equal(codexCompactGatePre(highUsage, limit), false, "a later estimate cannot erase measured pressure");
+
+    const overflow = mockSession(threshold, [block(true)], { source: "overflow-arm", grade: 139_820 });
+    overflow.stats.contextTokensSource = "estimate";
+    overflow.stats.localInputEstimate = 139_820;
+    assert.equal(codexCompactGatePre(overflow, limit), false, "bounded overflow evidence takes precedence");
+});
+
+test("codexCompactGatePre: the stale-small status fallback cannot replace retained usage", () => {
+    const retainedUsage = mockSession(500_000, [block(true)], { source: "estimate", grade: 100_000 });
+    retainedUsage.stats.contextTokensSource = "estimate";
+    retainedUsage.stats.contextEstimateTokens = 450_000;
+    assert.equal(codexCompactGatePre(retainedUsage, 475_000), true, "the stale-small status fallback is also an estimate");
+});
+
 test("replaceBiliCompactionItems: echo becomes a summary handoff message in place", () => {
     const ours = { type: "compaction", id: `${CODEX_COMPACT_ID_PREFIX}x`, encrypted_content: `${CODEX_COMPACT_SENTINEL}summary text` };
     const real = { type: "compaction", id: "fc_real", encrypted_content: "opaque" };

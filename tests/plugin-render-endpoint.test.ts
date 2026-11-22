@@ -17,7 +17,8 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
-import { _resetSessionsForTest } from "../src/session.ts";
+import { getSession, _resetSessionsForTest } from "../src/session.ts";
+import type { MessageRow } from "../src/storage/store.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
 import { __resetIncrementalLaneForTests } from "../src/incremental-lane.js";
@@ -259,6 +260,38 @@ test("S5 guard rails: poison msgids hard-fail; count mismatch degrades silently"
         const mismatch = await h.turn({ sinceSeq: 1, messages: [assistantMsg(1)], msgIds: ["only-one"] });
         assert.equal(mismatch.status, 200);
         assert.equal(mismatch.headers.get("x-bili-applied-seq"), "2");
+    } finally {
+        await h.close();
+    }
+});
+
+test("render handles a fold covering 150000 rows without a function-argument limit", async (t) => {
+    const h = await harness(true);
+    try {
+        const count = 150_000;
+        const conv = "large-render";
+        let rows: MessageRow[] = Array.from({ length: count + 1 }, (_, i) => ({
+            seq: i * 2, msgId: `raw-${i}`, ref: null, refNum: null, role: "user", kind: "message",
+            content: JSON.stringify({ id: `raw-${i}`, role: "user", contentType: "text", text: i === count ? "uncovered tail" : `covered ${i}` }),
+        }));
+        t.mock.method(h.store, "unifiedTailViewRows", () => rows);
+        t.mock.method(h.store, "unifiedTailSeqs", () => rows.map((row) => row.seq));
+        const session = getSession(conv);
+        (session.state.blocks as unknown[]).push({
+            blockId: "large", active: true,
+            effectiveMessageIds: [...rows.slice(0, count).map((row) => row.msgId).reverse(), "outside-view"],
+        });
+        const rendered = await h.render({ conversationId: conv, untilSeq: count + 1 });
+        assert.equal(rendered.status, 200, JSON.stringify(rendered.body));
+        const output = rendered.body as { appliedSeq: number; messages: { content: { type: string; text?: string }[] }[] };
+        assert.equal(output.appliedSeq, count + 1);
+        assert.deepEqual(output.messages.flatMap((message) => message.content.map((part) => part.text)), ["", "uncovered tail"]);
+
+        rows = [{ ...rows[count]!, seq: 0 }];
+        const unresolved = await h.render({ conversationId: conv, untilSeq: 1 });
+        assert.equal(unresolved.status, 200);
+        const unchanged = unresolved.body as { messages: { content: { text?: string }[] }[] };
+        assert.deepEqual(unchanged.messages.flatMap((message) => message.content.map((part) => part.text)), ["uncovered tail"]);
     } finally {
         await h.close();
     }
