@@ -19,7 +19,7 @@
 //  - kernel-format drift tripwire: test "host harvest tracks kernel-emitted stubs".
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { CompressionState, CoreMessage } from "acp-kernel";
+import type { CompressionBlock, CompressionState, CoreMessage } from "acp-kernel";
 import { assignRefs, createCore, createInitialState, defaultConfig, emptyRefMap, hideConsumedCompressCalls } from "acp-kernel";
 import { applyRanges, findVisibleStubResubmissions, visibleSummaryStubs, type RewriteCtx } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
@@ -257,4 +257,36 @@ test("#2749 host harvest tracks kernel-emitted stubs (format-drift tripwire)", (
     assert.deepEqual(hits, [{ startRef: "m00003", endRef: "m00005" }]);
     // …and stays silent for any other text:
     assert.equal(findVisibleStubResubmissions({ ...ctx, messages: view } as RewriteCtx, parseCompressInput({ content: [{ startId: "m00003", endId: "m00005", summary: "a completely fresh summary" }] }).ranges).length, 0);
+});
+
+test("#2749×#5864: the stub scan mirrors the outbound strand guard — a strand-kept pair's display stub is harvested", () => {
+    // The outbound path keeps a consumed compress pair VISIBLE when its assistant
+    // run still holds a signed thinking block (#5864 strand guard). The #2749 stub
+    // scan must mirror that exact decision: the model CAN see the kept pair's
+    // display stub, so a byte-identical re-submission must be rejected. If the
+    // scan did not carry the guard, this pair would be hidden here, its stub never
+    // harvested, and the self-refold shrink (#2749 worst variant) would slip through
+    // on exactly the #5864 shape.
+    const ctx = makeCtx();
+    ctx.session.state.blocks.push({
+        blockId: "b1", runId: "r1", tier: 1, summary: "s1", directMessageIds: [],
+        effectiveMessageIds: ["h1", "h2"], directBlockIds: [], createdAt: 0,
+        survivedCount: 0, generation: "young", active: false, compressCallId: "c1",
+        compressedTokens: 0,
+    } as CompressionBlock);
+    const LONG = "x".repeat(300); // > 200 ⇒ the kept call's summary is compacted to the display stub
+    const thinking = { id: "mc-think", role: "assistant" as const, contentType: "reasoning" as const, text: "t".repeat(100), thinkingSignature: "sig-abc" } as CoreMessage;
+    const call: CoreMessage = {
+        id: "mc-call", role: "assistant", contentType: "tool-call",
+        toolName: "compress", toolCallId: "c1",
+        text: JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: LONG }] }),
+    };
+    const result: CoreMessage = { id: "mc-result", role: "user", contentType: "tool-result", toolName: "compress", toolCallId: "c1", text: "ok" };
+    const messages: CoreMessage[] = [thinking, call, result];
+    const stubs = visibleSummaryStubs(messages, ctx.session.state);
+    const stub = `${LONG.slice(0, 199)}\u2026`;
+    assert.ok(stubs.has(stub), "strand-kept pair's display stub is harvested by the #2749 scan");
+    // …and a byte-identical re-submission of that stub is flagged:
+    const hits = findVisibleStubResubmissions({ ...ctx, messages } as RewriteCtx, parseCompressInput({ content: [{ startId: "m00003", endId: "m00004", summary: stub }] }).ranges);
+    assert.deepEqual(hits, [{ startRef: "m00003", endRef: "m00004" }], "re-submission of the strand-kept stub is rejected");
 });
