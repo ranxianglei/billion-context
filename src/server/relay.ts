@@ -1,7 +1,7 @@
 import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
 import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
-import { activeBlockCoveredIds, maybeRunInvariantJudge } from "../invariant-judge.js";
+import { maybeRunInvariantJudge } from "../invariant-judge.js";
 import { repairResponsesAssistantOrdering, reanchorSeparatorManifest, separatorManifestAnchored, type SeparatorSlot } from "./responses-ordering.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
@@ -49,7 +49,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { estimateCoreMessages } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -78,7 +78,7 @@ import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferStreamIfFits, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 
 /** Retry the same input when the provider proved only its output reservation overflows. */
 function capOverflowOutput(body: string | Buffer, info: ContextOverflowInfo): { body: string; cap: number } | null {
@@ -1007,33 +1007,17 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         const declaredWindow = typeof prepared.session.metadata.effectiveContextLimit === "number" && prepared.session.metadata.effectiveContextLimit > 0
             ? prepared.session.metadata.effectiveContextLimit
             : 0;
-        // #4079: the declared window can be wrong SMALL (stale config, registry
-        // miss, #3993-style catalog fallback) — never size the catastrophic bar
-        // below the largest common window, or the fuse false-blocks bodies the
-        // real upstream accepts.
-        const fuseWindow = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (declaredWindow > 0) {
             const fuseMsgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
-            // #5000/#4543: the byte floor below prices only m.text — a body whose
-            // mass sits in tools[] / tool arguments / the system prompt clears it
-            // (incident #5000: a 55.2 MiB wire body whose core text cleared the
-            // floor; #4543: a 4.1 MiB CJK body measuring ~1.12M tokens that the
-            // 7.5 B/tok floor cannot see below ~8.4 MB). Price the ACTUAL
-            // outbound body first with the #554 side-request meter (every string
-            // field, CJK-aware) and judge it against the SAME floored bar the
-            // byte floor uses (fuseWindow): the fuse's #4079 contract is
-            // "never block what a largest-common-window upstream might accept",
-            // and that contract binds a measurement just as much as a density
-            // guess — a wrong-small declaration must not false-block a body a
-            // 1M window would take. #4543 still lands: its declared 1,048,580
-            // window sits ABOVE the 1M floor, so floored or not the 1.12M-token
-            // body exceeds it. The byte floor stays as the fallback for
-            // unparseable bodies. No refusal record either way (#3974).
             // #5000 item 2: the COUNT dimension — no window, tokenizer, or byte
             // floor sees the messages[] array length (the 26,903-message #5000
             // session cleared every size gate and died at the upstream). Same
             // per-upstream opt-in as preflight (BILI_MAX_MESSAGES); the fuse is
             // the last line for the no-model lane where preflight never ran.
+            // #7537: the measured-body and byte-floor 413 rejections were
+            // removed — after folding, the payload is ALWAYS forwarded and the
+            // upstream's real size error is the authoritative verdict. Only the
+            // exact count gate (messages[] wire limit) remains.
             const fuseMaxMessages = limitsMaxMessages();
             if (fuseMaxMessages > 0 && fuseMsgs.length > fuseMaxMessages) {
                 const countMessage = `message count ${fuseMsgs.length.toLocaleString("en-US")} exceeds the upstream wire limit ${fuseMaxMessages.toLocaleString("en-US")} (COUNT dimension — a hard upstream constraint on the messages[] array that no byte/token estimate expresses, #5000); the send was stopped at the egress fuse instead of being forwarded. Reduce the session history — restart the session or rewind to an earlier point — and retry.`;
@@ -1044,23 +1028,6 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: countMessage, retryable: false } }));
                 }
                 return;
-            }
-            const fuseMeasured = measuredOutbound(prepared);
-            const fuseRawTokens = fuseMeasured?.tokens;
-            if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
-                // #7537 (owner ruling 2026-11-22): no estimate-based refusal —
-                // the bar here is a local window value that is often wrong-
-                // small. Log the measurement as evidence and forward; the
-                // upstream answers with its own real numbers (annotated in
-                // the upstream size-error branch below, same issue).
-                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; the #554 meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
-                log("info", `[${prepared.session.id}] egress window fuse profile (duplication): ${describeCoreTextDuplication(fuseMsgs)}`);
-            }
-            const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
-            if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
-                // #7537: byte-math profile over the local window bar — log and
-                // forward, same ruling as above.
-                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound core text alone is ~${fuseBytes} bytes (≥ ~${Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN)} tok at the densest observed density, #2122) vs the effective model window ${declaredWindow} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
             }
         }
     }
@@ -1241,9 +1208,6 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // which would accuse the client of an insertion bili itself made.
             ...(separatorOwnershipUnknown ? { separatorOwnershipUnknown: true } : {}),
             ...(renderTailStart !== undefined ? { renderTailStart } : {}),
-            // #4401: active-block coverage — in the plugin carrier regime the
-            // covered cells' absence is the fold itself, not a drop.
-            coveredIds: activeBlockCoveredIds(prepared.session.state),
         });
         const sentSlot = lastForwardedBody(prepared.session);
         if (sentSlot !== undefined && ownedSeparatorCores !== undefined) sentSlot.ownedSeparatorCores = ownedSeparatorCores;
@@ -2164,32 +2128,6 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // here depends on it.
         const terminalCause = rejectionDiagnosticSuffix(bodyText);
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}${terminalCause}`);
-        // #7537 (owner ruling 2026-11-22): local estimate-refusals are gone —
-        // when the UPSTREAM itself rejects the body as too large, its verdict
-        // is authoritative. bili logs its own measurement as evidence and marks
-        // the response non-retryable via HEADERS so status-code-driven hosts
-        // don't retry-loop an unchanged body the upstream already rejected
-        // (burning rate limits). Log always; headers only for non-stream, not-
-        // yet-sent responses. The upstream BODY passes through byte-identical:
-        // verbatim pass-through is a pinned contract (#1195 B,
-        // request-input-lifetime), so no body merge. The anti-loop protection
-        // for the truly-doomed payload lives in preflight's evidence branch
-        // (deterministic exhaustion against a proven wall → local 413 after
-        // the arm stamps, #496/#767/#857).
-        const SIZE_ERROR_RE = /request entity too large|payload.*too (large|big)|body too (large|big)|too many (tokens|messages|bytes)|exceeds? (the |a |your )?(maximum|limit|allowed|context)|context (length|window|size)|input is too long|maximum context length|token (limit|count|budget)|content is too long|message\[?s?\]?.*(too long|exceed)/i;
-        const upstreamSizeVerdict = upstream.status === 413 || (upstream.status === 400 && SIZE_ERROR_RE.test(bodyText));
-        if (prepared && upstreamSizeVerdict) {
-            const sizeMeasured = measuredOutbound(prepared);
-            const declaredWindow = typeof prepared.session.metadata.effectiveContextLimit === "number" && prepared.session.metadata.effectiveContextLimit > 0
-                ? prepared.session.metadata.effectiveContextLimit
-                : 0;
-            const inboundBytes = typeof wireBody === "string" ? wireBody.length : wireBody ? wireBody.length : 0;
-            log("warn", `[${errSid}] upstream size verdict ${upstream.status} (authoritative per #7537): bili measured outbound ~${sizeMeasured?.tokens?.toLocaleString("en-US") ?? "n/a"} TEXT tokens${sizeMeasured?.breakdown ? ` (${measuredBreakdownClause(sizeMeasured.breakdown)})` : ""}, inbound ${inboundBytes.toLocaleString("en-US")} bytes, effective window ${declaredWindow.toLocaleString("en-US")} (model=${prepared.model ?? "unknown"}); marking non-retryable via headers to stop host retry loops — the upstream body passes through verbatim`);
-            if (!res.headersSent && req.method !== "GET" && req.method !== "HEAD") {
-                respHeaders["x-bili-cause"] = "upstream-size";
-                respHeaders["x-bili-retryable"] = "false";
-            }
-        }
         if (prepared?.session && prepared.nudgeStampsBefore && upstream.status >= 400 && upstream.status < 500) rejectNudge(prepared.session, prepared.nudgeStampsBefore, upstream.status);
         // #4204: feed this send's FINAL verdict. A model-scoped KeyRing 429 is
         // selected only by its structured code plus exact request-model match;
@@ -2226,6 +2164,19 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // would leave the client on a broken response.
         delete errHeaders["content-length"];
         delete errHeaders["transfer-encoding"];
+        // #7537: mark upstream size errors (413 / 400-context-overflow) as
+        // non-retryable so host clients do not retry the identical over-window
+        // payload and burn rate limit. The body is relayed byte-exact (wire
+        // fidelity); this header is additive and carries no body mutation.
+        {
+            const errBodyText = errBody ? errBody.toString("utf8") : "";
+            const ovf = inspectContextOverflow(upstream.status, errBodyText);
+            const isSizeError = ovf.isOverflow || isMarkerlessOverflowReject(upstream.status, errBodyText);
+            if (isSizeError) {
+                errHeaders["x-bili-retryable"] = "false";
+                log("warn", `[${errSid}] upstream size error ${upstream.status} relayed with x-bili-retryable:false (#7537); provider evidence: ${ovf.message || "(no body)"}`);
+            }
+        }
         res.writeHead(upstream.status, errHeaders);
         res.end(errBody ?? undefined);
         clearUpstreamTimer();
