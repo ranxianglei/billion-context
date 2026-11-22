@@ -225,6 +225,7 @@
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | セッションレコードごとのGCトークンサイズしきい値。 |
 | `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GCスイープ間隔。 |
 | `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | ネイティブプラグインに配信されるフォークAPIパブリックスナップショットのサイズ上限。 |
+| `plugin.maxToolCallIdLength` | number | 4096 | — | プラグインが受け付ける toolCallId の最大長（既定値: 4096）。 |
 | `snapshot.shadow` | boolean | true (on) | — | スナップショットレンダリングのシャドウ観測可能性（#3756のフォローアップ）: レンダリングレーンがまだロールアウトゲートされている間、すべてのアームされたターンがスナップショットビューを計算し、レガシーアウトバウンドとの差分を分類し、セッションごとのカウンターを記録する（Webパネル行 + /__bili/status の snapshotShadow 集計 + snapshot-shadow 診断トピック）。デフォルトはオン - これはロールアウト切り替えをゲートするエラー率を持つフリートワイドのドライランである。環境変数 BILI_SNAPSHOT_SHADOW が優先される。追加のターンごとの計算を望まない場合は false/0/off でオフにする。 |
 
 **更新 & アドバイズリー**
@@ -1058,8 +1059,8 @@
 
 ### `plugin`
 
-- **Type:** `{ snapshotCapBytes?: number }`
-- **Default:** `{ snapshotCapBytes: 104857600 }`
+- **Type:** `{ snapshotCapBytes?: number, maxToolCallIdLength?: number }`
+- **Default:** `{ snapshotCapBytes: 104857600, maxToolCallIdLength: 4096 }`
 - **Status:** ACTIVE
 - **Description:** プラグインサーフェスのノブ（#2017）。`snapshotCapBytes` は、パブリックフォーク API（`GET /__bili/plugin/snapshot`, `POST /__bili/plugin/fork`）のためにプラグインセッションごとに保持される生ワイヤー履歴スナップショットの上限を定める：シリアライズされたスナップショットが上限を超えると、bili はそれを保持することを拒否する — ディスク上に無制限の生コピーを保持する代わりに、セッションはフォーク可能でなくなる（snapshot/fork が上限理由とともに `409` を返す）。デフォルトは `100 MiB`；`0` で保持を完全に無効化（どのセッションもフォーク不可）；対応する環境変数 `BILI_PUBLIC_SNAPSHOT_CAP_BYTES`。詳細は [env table](#config-file-keys-for-environment-knobs-2030) を参照。
 

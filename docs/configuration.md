@@ -228,6 +228,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC token-size threshold per session record. |
 | `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC sweep interval. |
 | `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | Size cap for fork-API public snapshots served to native plugins. |
+| `plugin.maxToolCallIdLength` | number | 4096 | — | Maximum toolCallId length accepted by the plugin (default: 4096). |
 | `snapshot.shadow` | boolean | true (on) | — | Snapshot-render shadow observability (#3756 follow-up): with the render lane still rollout-gated, every armed turn computes the would-be snapshot view, classifies the diff against the legacy outbound, and records per-session counters (web panel rows + /__bili/status snapshotShadow aggregate + the snapshot-shadow diagnostics topic). Default ON - it is the fleet-wide dry run whose error rate gates the rollout flip. Env BILI_SNAPSHOT_SHADOW wins. Turn off with false/0/off if you do not want the extra per-turn computation. |
 
 **Updates & advisories**
@@ -1059,8 +1060,8 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
 
 ### `plugin`
 
-- **Type:** `{ snapshotCapBytes?: number }`
-- **Default:** `{ snapshotCapBytes: 104857600 }`
+- **Type:** `{ snapshotCapBytes?: number, maxToolCallIdLength?: number }`
+- **Default:** `{ snapshotCapBytes: 104857600, maxToolCallIdLength: 4096 }`
 - **Status:** ACTIVE
 - **Description:** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw wire-history snapshot retained per plugin session for the public fork API (`GET /__bili/plugin/snapshot`, `POST /__bili/plugin/fork`): when the serialized snapshot exceeds the cap, bili refuses to retain it — the session stops being forkable (snapshot/fork answer `409` with the capped reason) instead of retaining an unbounded raw copy on disk. Default `100 MiB`; `0` disables retention entirely (no session is forkable); twins `BILI_PUBLIC_SNAPSHOT_CAP_BYTES`. Details in the [env table](#config-file-keys-for-environment-knobs-2030).
 

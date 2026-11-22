@@ -550,6 +550,15 @@ entries:
     desc_ja: "ネイティブプラグインに配信されるフォークAPIパブリックスナップショットのサイズ上限。"
     site_en: "<code>plugin.snapshotCapBytes</code> — fork API snapshot cap (default 100 MiB; 0 disables snapshots)."
     site_zh: "<code>plugin.snapshotCapBytes</code> —— fork API 快照上限（默认 100 MiB；0 禁用快照）。"
+  - key: plugin.maxToolCallIdLength
+    type: number
+    default: "4096"
+    kind: file-only
+    audience: user
+    group: process
+    desc_en: "Maximum toolCallId length accepted by the plugin (default: 4096)."
+    desc_zh: "插件接受的toolCallId 最大长度，默认4096"
+    desc_ja: "プラグインが受け付ける toolCallId の最大長（既定値: 4096）。"
   - key: snapshot.shadow
     type: boolean
     default: "true (on)"

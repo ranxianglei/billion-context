@@ -228,6 +228,7 @@
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 单会话记录的 token 大小阈值。 |
 | `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC 清扫间隔。 |
 | `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | 提供给原生插件的 fork API 公共快照大小上限。 |
+| `plugin.maxToolCallIdLength` | number | 4096 | — | 插件接受的toolCallId 最大长度，默认4096 |
 | `snapshot.shadow` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：渲染车道仍处灰度关闭时，每轮已折叠会话都现算一次快照视图，与 legacy 实际出站比对分类，逐会话记账（web 面板行 + /__bili/status snapshotShadow 汇总 + snapshot-shadow 诊断主题）。默认开 —— 这是全舰队干跑，其错误率决定灰度翻转。环境变量 BILI_SNAPSHOT_SHADOW 优先。不想要每轮额外计算可用 false/0/off 关闭。 |
 
 **更新与公告**
@@ -1053,8 +1054,8 @@
 
 ### `plugin`
 
-- **类型：** `{ snapshotCapBytes?: number }`
-- **默认：** `{ snapshotCapBytes: 104857600 }`
+- **类型：** `{ snapshotCapBytes?: number, maxToolCallIdLength?: number }`
+- **默认：** `{ snapshotCapBytes: 104857600, maxToolCallIdLength: 4096 }`
 - **状态：** ACTIVE
 - **说明：** 插件面开关（#2017）。`snapshotCapBytes` 限制为公开 fork API（`GET /__bili/plugin/snapshot`、`POST /__bili/plugin/fork`）按插件会话保留的原始 wire 历史快照大小：序列化快照超限时 bili 拒绝留存 —— 该会话不再可 fork（snapshot/fork 返回 `409` 并注明原因），而不是在磁盘上无限保留全量原始副本。默认 `100 MiB`；`0` 完全停用留存；对应环境变量 `BILI_PUBLIC_SNAPSHOT_CAP_BYTES`。详见[环境变量表](#环境变量的配置键对照-2030)。
 
