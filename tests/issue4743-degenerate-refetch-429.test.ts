@@ -42,6 +42,19 @@ function opts(url: string, label: string, signal: AbortSignal = new AbortControl
     };
 }
 
+/** #6639: the 429 governor is OFF by default now — these pins verify the
+ *  ENABLED behavior, so opt in explicitly via env (restored on every exit). */
+function withGovernor<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = process.env.BILI_THROTTLE_429;
+    process.env.BILI_THROTTLE_429 = "1";
+    return Promise.resolve()
+        .then(fn)
+        .finally(() => {
+            if (previous === undefined) delete process.env.BILI_THROTTLE_429;
+            else process.env.BILI_THROTTLE_429 = previous;
+        });
+}
+
 async function recordedServer(status: number, body: string): Promise<{ url: string; hits: () => number; close: () => Promise<void> }> {
     let hitCount = 0;
     const server = http.createServer((_req, res) => {
@@ -59,7 +72,7 @@ async function recordedServer(status: number, body: string): Promise<{ url: stri
     };
 }
 
-test("#4743 A: an armed 429 hold answers the continuation refetch locally — the empty turn passes through and the upstream records ZERO hits", async () => {
+test("#4743 A: an armed 429 hold answers the continuation refetch locally — the empty turn passes through and the upstream records ZERO hits", async () => withGovernor(async () => {
     const srv = await recordedServer(200, "event: message_start\ndata: {}\n\n");
     try {
         // arm the governor for this exact upstream (same streak shape as the
@@ -76,9 +89,9 @@ test("#4743 A: an armed 429 hold answers the continuation refetch locally — th
         await srv.close();
         noteUpstreamThrottleResolved(srv.url, {}, 200);
     }
-});
+}));
 
-test("#4743 B: the refetch's own 429 verdict arms the governor; a resolved retry lifts the hold", async () => {
+test("#4743 B: the refetch's own 429 verdict arms the governor; a resolved retry lifts the hold", async () => withGovernor(async () => {
     const rejected = await recordedServer(429, JSON.stringify({ error: { code: "keyring_all_limited", model: "m", message: "all keys limited" } }));
     const ok = await recordedServer(200, "event: message_start\ndata: {}\n\n");
     try {
@@ -103,9 +116,9 @@ test("#4743 B: the refetch's own 429 verdict arms the governor; a resolved retry
         await rejected.close();
         await ok.close();
     }
-});
+}));
 
-test("#4743 C: a structured KeyRing model refusal holds only the matching model", async () => {
+test("#4743 C: a structured KeyRing model refusal holds only the matching model", async () => withGovernor(async () => {
     const rejected = await recordedServer(
         429,
         JSON.stringify({ error: { code: "keyring_model_temporarily_unavailable", model: "m", message: "model unavailable" } }),
@@ -127,11 +140,11 @@ test("#4743 C: a structured KeyRing model refusal holds only the matching model"
         await rejected.close();
         noteUpstreamThrottleResolved(rejected.url, {}, 200, Date.now(), "m");
     }
-});
+}));
 
 // Real timers are intentional: both concurrent response bodies finish after
 // the former 1s cutoff, while the continuation callbacks stop waiting at 250ms.
-test("#4743 D: concurrent delayed KeyRing bodies over 1s refine their own provisional holds without delaying callbacks", { timeout: 5_000 }, async () => {
+test("#4743 D: concurrent delayed KeyRing bodies over 1s refine their own provisional holds without delaying callbacks", { timeout: 5_000 }, async () => withGovernor(async () => {
     const url = "http://delayed-keyring-429.invalid/v1/chat/completions";
     const host = new URL(url).host;
     const timers: Array<ReturnType<typeof setTimeout>> = [];
@@ -223,9 +236,9 @@ test("#4743 D: concurrent delayed KeyRing bodies over 1s refine their own provis
         noteUpstreamThrottleResolved(url, {}, 200, Date.now(), "m", mProbeToken);
         noteUpstreamThrottleResolved(url, {}, 200, Date.now(), "n", nProbeToken);
     }
-});
+}));
 
-test("#4743 E: an oversized 429 body with a never-settling cancellation promise returns promptly with account scope", { timeout: 1_000 }, async () => {
+test("#4743 E: an oversized 429 body with a never-settling cancellation promise returns promptly with account scope", { timeout: 1_000 }, async () => withGovernor(async () => {
     const url = "http://oversized-keyring-429.invalid/v1/chat/completions";
     let cancelCalled = false;
     const transport = async () => new Response(
@@ -255,7 +268,7 @@ test("#4743 E: an oversized 429 body with a never-settling cancellation promise 
     } finally {
         noteUpstreamThrottleResolved(url, {}, 200, Date.now(), "m");
     }
-});
+}));
 
 test("#4743 F: an aborted retry releases its own probe token without clearing the model hold", { timeout: 5_000 }, async () => {
     const url = "http://aborted-keyring-429.invalid/v1/chat/completions";
