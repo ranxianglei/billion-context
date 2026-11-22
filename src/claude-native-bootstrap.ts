@@ -473,6 +473,13 @@ async function run(payloadJson: string): Promise<void> {
         // host itself; when the walk cannot find it, chooseWatchdogParentPid
         // degrades via the wrapper's parent instead of the wrapper.
         const watchPid = chooseWatchdogParentPid();
+        // #7482: field instrumentation — record which pid the parent watcher
+        // chose (and the direct parent for comparison). On hosts where the
+        // /proc walk and the sh -c fallback both miss the claude host, the
+        // watcher silently points at a long-lived ancestor and the lane
+        // outlives every session; this line makes the chosen target visible
+        // in the hook log so the exact fallback can be pinned.
+        log(`watchdog parent pid=${watchPid} (direct parent=${process.ppid})`);
         // #1660: an EXPLICIT pin stays exact + strict; otherwise pass port 0
         // so the launcher resolves the zone preference and settles the
         // actually-bound port sticky (a pre-resolved port > 0 would skip the
