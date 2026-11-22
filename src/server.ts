@@ -3498,7 +3498,7 @@ export function noteUpstreamSizeVerdict(session: Session, origin: string | undef
 
 /** Preflight-side: true when THIS exact wire body (same origin+model) already
  *  drew an upstream size verdict — the resend must not ride the wire again. */
-export function upstreamSizeVerdictCovers(metadata: Record<string, unknown>, origin: string | undefined, model: string | undefined, body: string | undefined): boolean {
+function upstreamSizeVerdictCovers(metadata: Record<string, unknown>, origin: string | undefined, model: string | undefined, body: string | undefined): boolean {
     if (!origin || !model || typeof body !== "string" || body.length === 0) return false;
     const h = wireBodyHash(body);
     return readSizeVerdicts(metadata).some((r) => r.origin === origin && r.model === model && r.hash === h);
