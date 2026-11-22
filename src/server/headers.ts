@@ -47,6 +47,12 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     // host↔bili bookkeeping like the pf-* handshake above; the real upstream
     // must never see it.
     "x-bili-msg-ids",
+    // zed cloud lane marker: stamped by the /completions envelope classifier in
+    // handle() so the prepare* layers can tell the zed wire apart (its response
+    // is NDJSON byte-passthrough, so the model-side compress surface is off).
+    // Pure bili-internal bookkeeping like the pf-* handshake above; the real
+    // upstream must never see it.
+    "x-bili-zed-lane",
     "te",
     "trailer",
     "upgrade",
