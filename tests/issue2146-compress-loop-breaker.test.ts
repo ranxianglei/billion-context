@@ -72,27 +72,41 @@ test("#2146: distinct-spec failure streak arms the circuit breaker at 3", () => 
     assert.match(f3, /COMPRESS CIRCUIT BREAKER: 3 consecutive/, "third consecutive failure on a THIRD distinct spec arms the breaker");
     assert.match(f3, /STOP calling compress/, "breaker demands a full stop");
 
+    // #7418 Option A: once armed, the 4th call is BLOCKED before execution —
+    // the armed refusal replaces the "4 consecutive" failure receipt. The
+    // blocked call does not call noteCompressLoopFailure, so the streak stays
+    // at 3 (it does not keep climbing on blocked calls).
     const f4 = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx).text;
-    assert.match(f4, /COMPRESS CIRCUIT BREAKER: 4 consecutive/, "count continues while armed");
+    assert.match(f4, /the compress circuit breaker is armed \(3 consecutive failures/, "4th call is blocked while armed (#7418)");
+    assert.match(f4, /NOT because of your range selection/, "refusal states the reason is the streak, not range choice");
+    assert.equal((ctx.session.metadata["compressFailStreak"] as { n: number }).n, 3, "blocked call does not increment the streak");
 
     assert.ok(logs.some((l) => l.includes("[warn: compress-loop] circuit breaker armed after 3 consecutive")), "arm event logged for operator diagnosis");
-    assert.ok(logs.some((l) => l.includes("[warn: compress-loop] failure 4 in armed streak")), "subsequent armed failures logged");
+    assert.ok(logs.some((l) => l.includes("[acp-proxy: compress REFUSED — circuit breaker armed")), "blocked call logged for operator diagnosis");
 });
 
-test("#2146: success clears the streak; later failures start fresh", () => {
+test("#2146: armed breaker blocks the would-be-successful call; streak holds until decay (#7418)", () => {
     const ctx = makeCtx(fixtureMessages());
     applyRanges(parseCompressInput(compressArgs("m00001", "m00001")), ctx);
     applyRanges(parseCompressInput(compressArgs("m00002", "m00002")), ctx);
     const armed = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx).text;
     assert.match(armed, /CIRCUIT BREAKER/, "precondition: streak armed");
 
+    // #7418 Option A: once armed, EVERY model-initiated compress call is
+    // refused before execution — even a large range that would be a substantial
+    // success. The "success disarms while armed" recovery path is removed:
+    // under the #7418 trigger conditions no successful spec exists, so probing
+    // just extends the loop. The breaker disarms on 10 min without a failing
+    // call (a blocked model makes no new failing call, so the quiet window runs
+    // from the last failure — bounded cycle, no deadlock).
     const ok = applyRanges(parseCompressInput(compressArgs("m00003", "m00008")), ctx).text;
-    assert.ok(ok.startsWith("[Compressed "), `large range compresses (got: ${ok.slice(0, 120)})`);
-    assert.equal(ctx.session.metadata["compressFailStreak"], undefined, "loop streak cleared on success");
+    assert.match(ok, /the compress circuit breaker is armed/, "large range is blocked while the breaker is armed (#7418)");
+    assert.match(ok, /NOT because of your range selection/, "refusal states the reason is the streak, not range choice");
+    assert.equal((ctx.session.metadata["compressFailStreak"] as { n: number }).n, 3, "blocked call does not clear the streak");
 
     const after = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx).text;
-    assert.ok(after.startsWith("[Compression FAILED:"), "small range still fails after the successful compress");
-    assert.ok(!after.includes("CIRCUIT BREAKER"), "post-success failure restarts the streak at 1");
+    assert.match(after, /the compress circuit breaker is armed/, "subsequent call still blocked while armed");
+    assert.equal((ctx.session.metadata["compressFailStreak"] as { n: number }).n, 3, "streak unchanged across blocked calls");
 });
 
 test("#2146: streak decays after 10 min quiet but continues within the window", () => {

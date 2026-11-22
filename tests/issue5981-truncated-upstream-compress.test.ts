@@ -84,7 +84,10 @@ test("#5981: repeated lost-in-transit refusals arm the session breaker and colla
         out = runApply(ctx, {});
     }
     const streak = ctx.session.metadata["compressFailStreak"] as { n: number } | undefined;
-    assert.ok(streak !== undefined && streak.n >= 4, `streak advanced (got ${streak?.n})`);
+    // #7418: the breaker arms at n=3; once armed, the 4th+ calls are BLOCKED
+    // before execution (the armed refusal replaces the unbounded re-issue), so
+    // the streak stays at 3 — it does not keep climbing on blocked calls.
+    assert.ok(streak !== undefined && streak.n >= 3, `streak armed (got ${streak?.n})`);
     assert.ok(!out.includes("RE-ISSUE the compress call"), "past the threshold the armed refusal replaces the unbounded re-issue: " + out);
 });
 
