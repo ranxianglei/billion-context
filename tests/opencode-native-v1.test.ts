@@ -176,11 +176,11 @@ describe("createV1ServerHooks", () => {
     const origin = "http://127.0.0.1:19199";
 
     function makeDeps() {
-        const forwarded: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }> = [];
+        const forwarded: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }> = [];
         return {
             z: fakeZ,
-            forward: async (o: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => {
-                forwarded.push({ conversationId, tool, args, ...(nativeCaller === true ? { nativeCaller: true } : {}) });
+            forward: async (o: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean, toolCallId?: string) => {
+                forwarded.push({ conversationId, tool, args, ...(nativeCaller === true ? { nativeCaller: true } : {}), ...(typeof toolCallId === "string" ? { toolCallId } : {}) });
                 assert.equal(o, origin);
                 return { text: `panel:${tool}`, failed: false };
             },
@@ -212,6 +212,27 @@ describe("createV1ServerHooks", () => {
         const out = await compress.execute({ range: "m1-m2" }, { sessionID: "ses_1" });
         assert.equal(out, "panel:compress");
         assert.deepEqual(deps.forwarded, [{ conversationId: "ses_1", tool: "compress", args: { range: "m1-m2" }, nativeCaller: true }]);
+    });
+
+    // #7505: opencode passes the whole Tool.Context to execute — ctx.id is the
+    // CallID the host minted for this call (the same id the host re-sends in
+    // its compress tool-call). Forwarding it lets the server record the
+    // block's compressCallId so the anchor strip adjudication hits: the
+    // summary is billed once, not twice. No id → no field added.
+    it("#7505 forwards the host's per-call id (ctx.id) as toolCallId; absent id adds no field", async () => {
+        const deps = makeDeps();
+        const hooks = createV1ServerHooks(() => origin, {}, deps);
+        const cfg: V1Config = { provider: { o: { options: { baseURL: "https://api.openai.com/v1" } } } };
+        await hooks.config?.(cfg);
+        const compress = hooks.tool?.compress;
+        assert.ok(compress);
+        // host mints a CallID → it rides the forward (forwardTool's 7th arg)
+        const out = await compress.execute({ range: "m1-m2" }, { sessionID: "ses_1", id: "call-7505-op-1" });
+        assert.equal(out, "panel:compress");
+        assert.deepEqual(deps.forwarded, [{ conversationId: "ses_1", tool: "compress", args: { range: "m1-m2" }, nativeCaller: true, toolCallId: "call-7505-op-1" }]);
+        // host without an id → forward has NO toolCallId field at all
+        await compress.execute({ range: "m3-m4" }, { sessionID: "ses_1" });
+        assert.deepEqual(deps.forwarded[1], { conversationId: "ses_1", tool: "compress", args: { range: "m3-m4" }, nativeCaller: true });
     });
 
     it("degrades to proxy mode (no headers, no tools) when zod is unavailable", async () => {

@@ -485,7 +485,7 @@ type NameCall = { conversationId: string; name: string };
 
 type MockAttributionCall = { agent: string; state: string; refusals: number; since: number; error?: string; endpoint?: string };
 
-function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -528,8 +528,8 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
             let body = "";
             req.on("data", (c) => (body += c));
             req.on("end", () => {
-                const parsed = JSON.parse(body) as { conversationId?: string; tool?: string; args?: unknown; nativeCaller?: unknown };
-                toolCalls.push({ conversationId: parsed.conversationId ?? "", tool: parsed.tool ?? "", args: parsed.args, ...(parsed.nativeCaller === true ? { nativeCaller: true } : {}) });
+                const parsed = JSON.parse(body) as { conversationId?: string; tool?: string; args?: unknown; nativeCaller?: unknown; toolCallId?: unknown };
+                toolCalls.push({ conversationId: parsed.conversationId ?? "", tool: parsed.tool ?? "", args: parsed.args, ...(parsed.nativeCaller === true ? { nativeCaller: true } : {}), ...(typeof parsed.toolCallId === "string" ? { toolCallId: parsed.toolCallId } : {}) });
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, result: "compressed 42 tokens" }));
             });
@@ -580,7 +580,7 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
     };
 }
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): Promise<{ origin: string; close: () => void }> {
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): Promise<{ origin: string; close: () => void }> {
     const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus, turnEnabled, attributionCalls, holdManifest));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
@@ -605,7 +605,7 @@ type RegisteredTool = {
     description?: string;
     parameters: unknown;
     output: { schema: unknown; render: (args: unknown, value: unknown) => Array<{ type: string; text: string }> };
-    execute: (args: Record<string, unknown>, exec: { agent?: { session?: { id?: unknown } }; signal?: AbortSignal }) => Promise<unknown>;
+    execute: (args: Record<string, unknown>, exec: { agent?: { session?: { id?: unknown } }; signal?: AbortSignal; callId?: string }) => Promise<unknown>;
 };
 
 // #1785: poll budget raised 5s→15s so a loaded dev host clears a loopback round-trip (fast CI is sub-second).
@@ -769,6 +769,40 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
         proxy.close();
         rmrf(home);
         _resetRegisterForTest(undefined);
+    }
+});
+
+// #7505: dsh passes the host's per-call id (exec.callId) — the same id the
+// model minted on the wire — so the server records the block's
+// compressCallId and the anchor strip hits: the summary is billed once, not
+// twice. No id → no field added (no new surface on the wire).
+test("#7505 apply() forwards the host's per-call id as toolCallId; absent id adds no field", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-7505-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            const calls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }> = [];
+            const cap = await startMockProxy(calls);
+            try {
+                process.env.BILLION_CONTEXT_PROXY = cap.origin;
+                _resetRegisterForTest(cap.origin);
+                const ctx = mockCtx();
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+                const t = ctx.registeredTools[0];
+                // host mints a call id → it rides the forward body
+                const out = await t.execute({ summary: "s" }, { agent: { session: { id: "session-7" } }, callId: "call-7505-1" });
+                assert.equal(out, "compressed 42 tokens");
+                assert.deepEqual(calls, [{ conversationId: "session-7", tool: "compress", args: { summary: "s" }, nativeCaller: true, toolCallId: "call-7505-1" }]);
+                // host without an id → body has NO toolCallId field at all
+                await t.execute({ summary: "s" }, { agent: { session: { id: "session-7" } } });
+                assert.deepEqual(calls[1], { conversationId: "session-7", tool: "compress", args: { summary: "s" }, nativeCaller: true });
+            } finally {
+                cap.close();
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
+        rmrf(home);
     }
 });
 

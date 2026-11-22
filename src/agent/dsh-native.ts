@@ -136,7 +136,12 @@ type CommandInvocation = {
     attachments?: unknown;
     signal?: AbortSignal | undefined;
 };
-type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal };
+// #7505: dsh hands the host's per-call exec object to tool.execute(args, exec)
+// whole — exec.callId is the wire id the model minted for this call (the same
+// id the host re-sends in its compress tool-call). Forwarding it lets the
+// server record the block's compressCallId, so the anchor strip adjudication
+// (visibleCompressCallIds) hits and the summary is billed once, not twice.
+type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal; callId?: string | undefined };
 
 type ToolDefinition = {
     name: string;
@@ -923,7 +928,7 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
             if (typeof sid !== "string" || sid.length === 0) {
                 throw new Error(`bili tool ${tool.name} requires an owning agent session`);
             }
-            const out = await forwardTool(base, sid, tool.name, args, exec.signal, true);
+            const out = await forwardTool(base, sid, tool.name, args, exec.signal, true, exec.callId);
             // #2204: dsh tool results are plain strings — a business failure
             // throws so the host renders an error, not success text.
             if (out.failed) throw new Error(out.text);
