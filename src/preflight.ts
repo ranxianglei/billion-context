@@ -2048,9 +2048,6 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const entryOvershoot = limit > 0 && entryLocal > 0 ? entryLocal / limit : 1;
     const emergencyOvershoot = entryOvershoot > EMERGENCY_FOLD_COVERAGE;
     const emergencyFold = emergencyOvershoot && preflightEmergencyDigestEnabled();
-    if (emergencyOvershoot && !emergencyFold) {
-        deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) but the emergency digest regime is disabled (default off — model-visible hard truncation, #2383; set BILI_PREFLIGHT_EMERGENCY_DIGEST=1 or network.emergencyDigest to restore) — running the LLM fold ladder, which may exhaust its budget and fail fast`);
-    }
     const effectiveRoundCap = emergencyFold ? EMERGENCY_ROUND_CAP : roundBudget;
     // Fresh-session parallel fold gate (owner decision 2026-11-22): a session
     // that has NEVER been forwarded (no usage sample ever landed —
@@ -2071,6 +2068,36 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         && entryLocal <= FRESH_PARALLEL_FOLD_MAX_CHARS;
     if (freshParallelFold) {
         deps.log("info", `[preflight] fresh-session parallel fold armed: ~${entryLocal} chars of verbatim history (≤ ${FRESH_PARALLEL_FOLD_MAX_CHARS} bound), ${FRESH_PARALLEL_FOLDS} concurrent in-model summarization call(s) per round instead of one serial fold`);
+    }
+    // #2383 default-off consequence: beyond the coverage bound with the
+    // digest regime DISABLED, the LLM path cannot converge here — and it
+    // must not even try. The bound is the ladder's own coverage product
+    // (32-call budget × 0.6-window chunks = 19.2x): above it, no
+    // combination of successful folds is guaranteed to land under the
+    // window, and the attempt costs up to 32 large-context summary calls —
+    // minutes of wall clock that no client outlives (#2383's exact
+    // 300s-disconnect loop). For an ESTABLISHED session a payload this size
+    // is additionally the lost-compression-blocks symptom the owner's rule
+    // says to diagnose, not to fold away (a token spend on a possibly-broken
+    // session); the fresh-session parallel lane does not raise the bound
+    // (it spends the same budget concurrently) — it only makes the
+    // convergent band below it faster. Verdict: a STRUCTURAL exhaustion —
+    // deterministic, because nothing about a retry changes it (no digest,
+    // no fold path that fits) — so the caller's existing contract handling
+    // applies unchanged: the identity fast path forwards a trusted session
+    // (upstream reality outranks local doom math), and every other session
+    // gets the terminal non-retryable 413 (#2847) telling the host to
+    // restart/rewind.
+    if (emergencyOvershoot && !emergencyFold) {
+        const why = (baselineKnown || deps.session.state.blocks.length > 0)
+            ? "an established session — a payload this size is the lost-compression-blocks symptom (diagnose and recover the blocks; folding spends up to 32 summary calls for minutes of wall clock the client does not outlive)"
+            : "a fresh resend above the ladder's coverage bound (even a fully successful 32-call budget removes at most 19.2x of text — folding it is a token burn with no guaranteed convergence);";
+        deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) with the emergency digest regime disabled (default off, #2383) — ${why}: failing fast with the structural exhaustion verdict (zero summarization calls) instead of running a ladder that cannot converge inside client patience; set BILI_PREFLIGHT_EMERGENCY_DIGEST=1 or network.emergencyDigest to restore the zero-call digest convergence`);
+        return {
+            ...result,
+            fitsWindow: false,
+            failure: { kind: "exhausted", deterministic: true, detail: `the payload is ~${entryOvershoot.toFixed(1)}x the model window (~${entryLocal} vs ${limit} tokens) — beyond the preflight fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) with the deterministic digest regime disabled (default off, #2383): no combination of folds brings it under the window within this pass. Raise the model context window, restart the session, or set BILI_PREFLIGHT_EMERGENCY_DIGEST=1 to restore digest folding.` },
+        };
     }
     if (emergencyFold) {
         deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) — folding with deterministic digests instead of summarization calls; originals stay restorable via decompress (#2383)`);

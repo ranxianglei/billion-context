@@ -124,15 +124,19 @@ test("default: the #2383 emergency digest regime is OFF — unconvergent extreme
         assert.equal(process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST, undefined, "test premise: the opt-in env is unset (default)");
         // 60 msgs x 32k chars ~= 1.92M chars — deliberately BELOW the 2MB
         // doomed-probe byte floor (src/server.ts: the fail-fast 413 fires at
-        // coreTextBytes > max(2MB, window×7.5)), so preflight actually RUNS
-        // and the default-off gate is what the test pins: the payload is ~20x
-        // the 24k window under the token regime — past the 19.2x coverage
-        // bound — so the ladder runs with REAL summarization calls and NO
-        // digest blocks are minted. (The old 80×32k = 2.56MB size tripped the
-        // byte floor and answered 413 before preflight, pinning nothing about
-        // this gate.) Same size as the e2e scenario A below, which pins the
-        // opt-in side (env=1): zero summarization calls + digest blocks — a
-        // clean A/B of the default flip.
+        // coreTextBytes > max(2MB, window×7.5)) and below the fresh-parallel
+        // bound only via the identified-session gate: this session carries a
+        // header (so it is NOT "fresh" — baselineKnown), no blocks, ~20x the
+        // 24k window under the token regime — past the 19.2x coverage bound.
+        // With digest default-off, that combination is a STRUCTURAL exhaustion:
+        // the ladder cannot converge inside client patience (#2383) and an
+        // established session this size is the lost-blocks symptom — so the
+        // verdict is deterministic with ZERO summarization calls, and the
+        // untrusted session gets the terminal non-retryable 413 (#2847).
+        // (The old 80×32k = 2.56MB size tripped the byte floor and answered 413
+        // before preflight, pinning nothing about this gate.) Same size as the
+        // e2e scenario A below, which pins the opt-in side (env=1): zero
+        // summarization calls + digest blocks — a clean A/B of the default flip.
         const mark = calls.length;
         const r = await fetch(url, {
             method: "POST",
@@ -140,11 +144,11 @@ test("default: the #2383 emergency digest regime is OFF — unconvergent extreme
             body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(60, 32_000) }),
         });
         const body = await r.text();
-        assert.ok(r.status === 200 || r.status === 502,
-            `the extreme-overflow request converges (200) or exhausts the LLM ladder (502) — never a digest fast-path or a 413 (got ${r.status}); body: ${body.slice(0, 400)}`);
-        const step = calls.slice(mark);
-        assert.ok(step.filter((c) => !c.stream).length >= 1,
-            "the LLM fold ladder ran (real summarization calls) instead of the zero-call digest regime");
+        assert.equal(r.status, 413,
+            `structural fast-fail: beyond the coverage bound with digest off, an untrusted session gets the terminal non-retryable 413 (#2847) without burning the ladder (got ${r.status}); body: ${body.slice(0, 400)}`);
+        assert.match(body, /exceeds the window|coverage bound/, "the failure names an over-window structural verdict (the #554 measured-body guard may answer with its own wording ahead of the preflight detail)");
+        assert.ok(!body.includes("\"retryable\":true"), "the 413 is non-retryable (terminal for retry-looping hosts)");
+        assert.ok(calls.length === mark, "zero upstream calls — no summarization, no forward (structural exhaustion, not ladder exhaustion)");
         assert.ok(!body.includes("[deterministic digest"), "no digest artifacts in the answer");
 
         const s = listSessions().find((x) => x.id === "emg-default-off");
