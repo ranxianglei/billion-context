@@ -185,7 +185,7 @@ export interface OrderKvCarrier {
  * the user never has to know the new prompt. Both carriers are rewritten
  * (unified kv row + legacy file, #5753) and every sibling entry is preserved.
  */
-export interface ReattachOrderResult {
+interface ReattachOrderResult {
     before: string;
     after: string;
     file: string;
