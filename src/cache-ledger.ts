@@ -1450,6 +1450,16 @@ export function recordCacheSample(
     // breaks only (a tail append lands lcpBytes near the end -> xMeasured ~= input
     // -> no effect) and never on a client-side inbound rewrite (#3023), whose
     // earlier divergence would understate the fold and mis-credit it.
+    // #7528: a pair clipped at SEAM_BODY_CAP parses to zero messages on BOTH
+    // sides, so the parse-derived msgIndex gate can never fire on clipped
+    // bodies — exactly the large-body stateless-resend population where the
+    // X-space mismatch is worst (DSH desktop: 91 samples / 14.49M tok stuck in
+    // the seam bucket). When BOTH bodies are clipped, the byte position alone
+    // proves a mid-region break: a tail append diverges at the body end, past
+    // the 512 KiB head, and is excluded by lcpBytes < head.byteLength. The
+    // asymmetric clip (one side whole) stays on the parse gate — a clipped
+    // superstring can read as a pure byte prefix of the whole side, where byte
+    // evidence alone cannot rule out an append.
     if (pending.length > 0 && known && s.input > 0) {
         const rawMissed = s.input - effCached;
         if (rawMissed > 8192 && rawMissed > 0.3 * s.input) {
@@ -1460,7 +1470,7 @@ export function recordCacheSample(
             // slot byte-identically.
             const { sentBody: curB, inBody: curIn } = pendingEvidencePair(session);
             const prevB = session.transient?.settledBody;
-            if (curB !== undefined && prevB !== undefined && curB.bytes <= SEAM_BODY_CAP && prevB.bytes <= SEAM_BODY_CAP) {
+            if (curB !== undefined && prevB !== undefined) {
                 const prevIn = session.transient?.settledInBody;
                 const clientBreak = curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP && (() => {
                     const k = firstDivergentInboundMsg(prevIn, curIn);
@@ -1468,7 +1478,9 @@ export function recordCacheSample(
                 })();
                 if (!clientBreak) {
                     const lcp = seamLcp(prevB.head, curB.head);
-                    if (lcp.msgIndex !== null && lcp.prevMsgs > 0 && lcp.msgIndex < lcp.prevMsgs && lcp.lcpBytes > 0 && lcp.lcpBytes < curB.head.byteLength) {
+                    const bothClipped = curB.bytes > SEAM_BODY_CAP && prevB.bytes > SEAM_BODY_CAP;
+                    const midBreak = lcp.lcpBytes > 0 && lcp.lcpBytes < curB.head.byteLength && (bothClipped || (lcp.msgIndex !== null && lcp.prevMsgs > 0 && lcp.msgIndex < lcp.prevMsgs));
+                    if (midBreak) {
                         const xMeasured = Math.round(s.input * (lcp.lcpBytes / curB.bytes));
                         for (const p of pending) p.firstFoldStartTokens = Math.min(p.firstFoldStartTokens ?? Number.POSITIVE_INFINITY, xMeasured);
                     }
