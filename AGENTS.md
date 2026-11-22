@@ -26,6 +26,38 @@
 | GitHub | https://github.com/ranxianglei/billion-context |
 | License | MIT |
 
+### Supported Hosts — Official Source & Binary Locations
+
+When auditing host behavior (plugin APIs, tool-call-id exposure, compaction seams, wire quirks), clone the source repos from THIS table — never guess the location. Lane semantics (launcher / MITM / config seam / native tool lane) are documented per client in docs/clients.md.
+
+| Host (lane name) | Mode | Official source / binary |
+|---|---|---|
+| pi | native tool lane + launcher | [earendil-works/pi](https://github.com/earendil-works/pi) (pi.dev) |
+| omp (oh-my-pi) | native tool lane (pi factory) | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) (omp.sh) |
+| dsh (deepseek-harness) | native tool lane | [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) |
+| opencode | native tool lane (V1 plugin API) | [anomalyco/opencode](https://github.com/anomalyco/opencode) (opencode.ai) |
+| kimi (Kimi Code) | native tool lane + MITM | [MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code) (kimi.com) |
+| hermes (Hermes Agent) | native Python plugin | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
+| zcode (Z.ai) | native tool lane | [zai-org/ZCode](https://github.com/zai-org/ZCode) (z.ai) |
+| claude (Claude Code) | native MCP lane | closed (Anthropic): https://claude.com/product/claude-code |
+| codex (Codex CLI) | launcher + MCP shell | [openai/codex](https://github.com/openai/codex) |
+| gemini (Gemini CLI) | launcher | [google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli) |
+| qwen (Qwen Code) | launcher / MITM | [QwenLM/qwen-code](https://github.com/QwenLM/qwen-code) |
+| copilot (Copilot CLI) | launcher (closed Go binary) | [github/copilot-cli](https://github.com/github/copilot-cli) |
+| aider | MITM | [Aider-AI/aider](https://github.com/Aider-AI/aider) |
+| goose | launcher | [aaif-goose/goose](https://github.com/aaif-goose/goose) |
+| crush (Charm) | MITM | [charmbracelet/crush](https://github.com/charmbracelet/crush) (charm.land/crush) |
+| zed | MITM | [zed-industries/zed](https://github.com/zed-industries/zed) (zed.dev) |
+| jcode (JCode) | MITM (Rust; no plugin seam, #962) | [1jehuang/jcode](https://github.com/1jehuang/jcode) |
+| qoder (Qoder CLI) | MITM / launcher | closed: https://qoder.com · https://download.qoder.com/qoder-app/releases/latest/Qoder-linux-amd64.deb |
+| workbuddy / codebuddy (Tencent) | config seam (workbuddy, #7456) / launcher (codebuddy) | closed: https://workbuddy.ai · https://download.codebuddy.ai · https://codebuddy.cn |
+| trae (Trae CLI) | MITM | closed: https://trae.ai |
+| iflow (iFlow CLI) | launcher | https://iflow.cn |
+| mcode (MiniMax Code) | MITM (event hooks only, #1050) | closed: https://minimax.io |
+| amp (Amp CLI) | MITM (closed Go, #1049) | closed: https://ampcode.com |
+| kiro (AWS Kiro CLI) | MITM | closed (Rust shell + Node agent server) |
+| antigravity (Google) | launcher (closed Go; additive-only plugin surface, #2115) | closed (Google) |
+
 ## 2. Architecture
 
 ### Module Map
