@@ -1199,23 +1199,14 @@ export class UnifiedStore {
     ingestSession(
         input: IngestSessionInput,
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
-        opts?: { completeLog?: boolean; envelopeImport?: boolean; skipMessages?: boolean },
+        opts?: { completeLog?: boolean; envelopeImport?: boolean },
         reanchor?: { trustedTailSeqs: number[] },
     ): boolean {
         const s = input.session;
         const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
-            // #7439 P2: egress-on sessions skip the messages table write —
-            // the flow table is the canonical store, messages is a lazy
-            // projection. State (sessions/blocks/refs/kstate) still writes.
-            if (opts?.skipMessages === true) {
-                messages = [];
-                watermark = this.db
-                    .prepare("SELECT MAX(seq) AS m FROM messages WHERE session_id = ?")
-                    .get(s.sessionId) as { m: number | null };
-                watermark = watermark.m ?? null;
-            } else if (reanchor) {
+            if (reanchor) {
                 // #7474 window re-anchor: the pf-window lane persists a
                 // SLIDING tail window, so the delta planner's strict-append
                 // assumption is structurally false and the full path paid
