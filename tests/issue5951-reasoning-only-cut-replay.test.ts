@@ -339,7 +339,7 @@ test("chat pipe: the host owning truncation recovery suppresses the replay (#595
     };
     const first = failedStream([chatChunk({ role: "assistant", reasoning_content: "reasoning-a" })], new Error("upstream socket reset mid-stream"));
 
-    await pipePluginChatWithStrip(first, makeRes(out), "openai", makeSession(), (line) => logs.push(line), refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true);
+    await pipePluginChatWithStrip(first, makeRes(out), "openai", makeSession(), (line) => logs.push(line), refetch, "http://up", undefined, undefined, undefined, undefined, undefined, undefined, true);
 
     const body = out.join("");
     assert.equal(refetches, 0, "the host's own recovery owns the single retry budget");
@@ -357,7 +357,7 @@ test("chat pipe: the host owning recovery also suppresses the zero-byte replay (
         return Promise.resolve(healedTurn());
     };
 
-    await pipePluginChatWithStrip(eventsStream([]), makeRes(out), "openai", makeSession(), () => {}, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true);
+    await pipePluginChatWithStrip(eventsStream([]), makeRes(out), "openai", makeSession(), () => {}, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, undefined, true);
 
     assert.equal(refetches, 0, "a cut with no client-visible output is still the host's to recover");
     assert.ok(out.join("").includes(ERROR_SENTINEL));

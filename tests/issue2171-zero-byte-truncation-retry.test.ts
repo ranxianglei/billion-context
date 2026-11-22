@@ -237,7 +237,7 @@ test("OMP-owned read error does not spend the proxy reasoning-only retry", async
     const refetch = (): Promise<ReadableStream<Uint8Array> | null> => { refetches++; return Promise.resolve(streamOf([])); };
     await pipePluginChatWithStrip(
         erroredStream([chatChunk({ reasoning_content: "private reasoning" })]),
-        makeRes(out), "openai", makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true,
+        makeRes(out), "openai", makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, undefined, true,
     );
     assert.equal(refetches, 0);
     assert.ok(out.join("").includes(ERROR_SENTINEL));
@@ -247,7 +247,7 @@ test("OMP-owned truncation: chat pipe does not spend a proxy retry and returns t
     const out: string[] = [];
     let refetches = 0;
     const refetch = (): Promise<ReadableStream<Uint8Array> | null> => { refetches++; return Promise.resolve(streamOf([])); };
-    await pipePluginChatWithStrip(streamOf([]), makeRes(out), "openai", makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true);
+    await pipePluginChatWithStrip(streamOf([]), makeRes(out), "openai", makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, undefined, true);
     assert.equal(refetches, 0);
     assert.ok(out.join("").includes(ERROR_SENTINEL));
 });
@@ -256,7 +256,7 @@ test("responses pipe: OMP-owned truncation does not spend a proxy retry and retu
     const out: string[] = [];
     let refetches = 0;
     const refetch = (): Promise<ReadableStream<Uint8Array> | null> => { refetches++; return Promise.resolve(streamOf([])); };
-    await pipePluginResponsesWithStrip(streamOf([]), makeRes(out), makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, true);
+    await pipePluginResponsesWithStrip(streamOf([]), makeRes(out), makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true);
     assert.equal(refetches, 0);
     assert.ok(out.join("").includes(ERROR_SENTINEL));
 });
