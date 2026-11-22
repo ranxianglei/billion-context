@@ -48,7 +48,7 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
+import { evaluateWatermarkFastpath, finalizeWatermarkTurn, stampOnlyWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
@@ -113,7 +113,11 @@ export async function prepareOpenai(
     // system prompt bytes (compress prompt added/removed) — which breaks the
     // provider prefix cache for every subsequent turn.
     const isTitleGen = maxTokens <= 200;
-    const shouldInject = opts.compress.injectTool && !isTitleGen;
+    // zed cloud wire: the response is NDJSON byte-passthrough, so an in-stream
+    // acp loop is structurally unreachable (same reasoning as DSH #3177) — the
+    // model-side compress surface (tools + standing prompt + nudge) is off.
+    const zedLane = req.headers["x-bili-zed-lane"] !== undefined;
+    const shouldInject = opts.compress.injectTool && !isTitleGen && !zedLane;
     const injectTools = shouldInject && !pluginMode;
     // #3177: DSH registers bili's ACP tools host-scope (invisible to the preset
     // agent — 0/3939 request headers carry them), so model-driven compression is
@@ -665,6 +669,14 @@ export async function prepareOpenai(
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
     snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
+    // #7346: on a HIT the pin is this turn's window (the new tail), NOT the
+    // complete raw log. snapshotMessages stamps it raw (folded=false), so the
+    // save presents the window as the full log and the #3285 authoritative-set
+    // sweep retires every verified prefix row the window omits — a 100k-session
+    // ledger drained to the ~2-row window each turn. Mark the pin non-raw so
+    // the save ingests the window through the bounded envelope view and does
+    // NOT sweep the prefix.
+    if (wpHit !== undefined) session.lastMessagesFolded = true;
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
     markDirty(session);
@@ -676,6 +688,13 @@ export async function prepareOpenai(
             rawSystemText: wpHit !== undefined ? wpHit.systemText : wpSeedSystemText,
             turnStripCounts: wpTurnStrip,
         });
+        if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
+    } else if (bodyText !== undefined && pluginMode && !isTitleGen && !featureEnabled("pluginFullResendWatermark")) {
+        // #7367: flag off — the fastpath never evaluates, but the x-bili-pf-seq
+        // heartbeat still must flow or the client's watermark freezes and its
+        // tail-ids grow past the 16 KB header limit. Stamp-only: no seed, no
+        // saved state (the fastpath re-establishes both when it next runs).
+        wpResponseHeaders = stampOnlyWatermarkTurn(bodyText);
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);

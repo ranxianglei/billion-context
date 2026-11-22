@@ -87,6 +87,7 @@ import { log as loggerLog } from "./logger.js";
 // src/order-persist.ts — each side calls the other only inside function
 // bodies, never at module evaluation; see the note on its import).
 import { scheduleOrderPersist } from "./order-persist.js";
+import { featureEnabled } from "./rollout.js";
 
 const TAIL_WINDOW = 8;
 
@@ -342,6 +343,10 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // empty system/instructions verbatim (non-anchoring) — this branch is
         // library defense for direct callers: the corpus census lane.)
         if (!mainShaped(kinds) && tag === "") {
+            if (featureEnabled("trustStampedId")) {
+                record(rawId, turns, tagHash, model);
+                return { key: rawId, action: "claim", reason: "trust-stamped-id: shallow side request rides the verbatim id (no |sub:aux fork)" };
+            }
             return { key: `${rawId}|sub:aux`, action: "derived-aux", reason: "shallow history with no assistant turns" };
         }
         record(rawId, turns, tagHash, model);
@@ -499,6 +504,10 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // headless-subagent call site passes one) widens the key into a
         // three-segment form so distinct same-type runs never share a
         // compression session; empty degrades to the two-segment key.
+        if (featureEnabled("trustStampedId")) {
+            record(rawId, turns, effectiveTagHash, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "trust-stamped-id: persona change rides the verbatim id (no |sub:<fp> fork)" };
+        }
         const laneKey = disc !== "" ? `${rawId}|sub:${fp16(tag)}:${fp16(disc)}` : `${rawId}|sub:${fp16(tag)}`;
         record(laneKey, turns, tagHash, model);
         return { key: laneKey, action: "derived-persona", reason: "persona text changed without continuing history — persona lane" };
@@ -544,6 +553,10 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // subagents under one main id) on distinct compression sessions.
         const taskRescue = tryMsgIdRescue("diverged-order");
         if (taskRescue !== null) return taskRescue;
+        if (featureEnabled("trustStampedId")) {
+            record(rawId, turns, effectiveTagHash, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "trust-stamped-id: diverged order rides the verbatim id (no |sub:task fork)" };
+        }
         return { key: `${rawId}|sub:task:${skel8(kinds)}`, action: "derived-task", reason: "no order+fragment alignment with the recorded skeleton" };
     }
     // Shorter than recorded: either head truncation (dsh native compaction
@@ -564,6 +577,10 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
     }
     const shortRescue = tryMsgIdRescue("shorter-divergent");
     if (shortRescue !== null) return shortRescue;
+    if (featureEnabled("trustStampedId")) {
+        record(rawId, turns, effectiveTagHash, effectiveModel);
+        return { key: rawId, action: "reanchor", reason: "trust-stamped-id: shorter divergent tail rides the verbatim id (no |sub:task fork)" };
+    }
     return {
         key: `${rawId}|sub:task:${skel8(kinds)}`,
         action: "derived-task",

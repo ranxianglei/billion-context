@@ -51,6 +51,117 @@ export interface ShedWireImagesResult {
     stats: ShedStats;
 }
 
+/** Pure byte-space projection of what shedWireImages WOULD do — no jimp, no
+ *  string writes, safe to run in hot estimate paths. The token-space twin of the
+ *  actual shed: preflight must judge the payload the wire will really carry
+ *  (post-shed), not the pre-shed memo — the 2026-11-22 incident measured
+ *  ~948K image tokens that the 10 MiB byte budget would have archived to
+ *  ~30-token placeholder notes before leaving the machine, so the local
+ *  doom-math refused a payload the wire had already carried minutes earlier.
+ *  Note costs are floored at zero: a placeholder note is a few tokens, and
+ *  over-estimating them would re-create the very refusal we are fixing.
+ *  Downscale byte deltas are NOT simulated (jimp decode would defeat the
+ *  purpose): rung B only shrinks the remaining images, so the projection is
+ *  conservative in the forwarding-safe direction (it never reports MORE
+ *  surviving images than the real shed). */
+function simulateShedImages(
+    body: string,
+    protocol: WireProtocol,
+    targetBytes: number,
+): { projectedFinalBytes: number; archived: number; downscaled: number; changed: boolean } {
+    const originalBytes = byteLen(body);
+    if (targetBytes <= 0 || originalBytes <= targetBytes) {
+        return { projectedFinalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(body);
+    } catch {
+        return { projectedFinalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
+    }
+    if (!isObj(parsed)) return { projectedFinalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
+    const occurrences = collectOccurrences(protocol, parsed).filter((o) => !o.exempt);
+    if (occurrences.length === 0) return { projectedFinalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
+
+    const totalEntries = protocol === "google" ? (Array.isArray(parsed.contents) ? parsed.contents.length : 0)
+        : protocol === "responses" ? (Array.isArray(parsed.input) ? parsed.input.length : 0)
+            : Array.isArray(parsed.messages) ? parsed.messages.length : 0;
+    const protectFrom = Math.max(0, totalEntries - PROTECTED_TAIL_ENTRIES);
+    for (const o of occurrences) o.protectedTail = o.entryIndex >= protectFrom;
+
+    let est = originalBytes;
+    let archived = 0;
+    let downscaled = 0;
+    // Rung A (pure): archive oldest non-protected images to placeholder notes until under target.
+    for (const o of occurrences) {
+        if (est <= targetBytes) break;
+        if (o.protectedTail) continue;
+        est -= byteLen(dataUrl(o.mediaType, o.b64));
+        o.archived = true;
+        archived++;
+    }
+    // Rung B (bounded estimate): downscale only when rung A alone cannot fit; the
+    // real pass decodes through jimp, the projection assumes it succeeds.
+    if (est > targetBytes) {
+        const work = occurrences.filter((o) => !o.archived).slice(0, MAX_SHED_IMAGES);
+        outer: for (const dim of DOWNSCALE_DIM_LADDER) {
+            for (const o of work) {
+                if (est <= targetBytes) break;
+                const dims = decodeImageDims(o.b64);
+                if (dims !== undefined && Math.max(dims.w, dims.h) <= dim) continue;
+                est -= byteLen(dataUrl(o.mediaType, o.b64));
+                downscaled++;
+            }
+            if (est <= targetBytes) break outer;
+        }
+    }
+    return { projectedFinalBytes: Math.max(est, 0), archived, downscaled, changed: archived > 0 || downscaled > 0 };
+}
+
+/** #3701: the post-shed token caliber of the body's images — measure
+ *  imageReserve over the body after a rung-A archive projection (the
+ *  placeholder notes are measured as empty). Returns the PRE-shed body when
+ *  the lane would not shed at all (managed-but-not-WS transport, under
+ *  budget, unparseable, no non-exempt images): the caller keeps its usual
+ *  estimate. Pure; never mutates the input. */
+export function postShedImageView(body: string, protocol: WireProtocol): { body: string; sheddable: boolean } {
+    const t = currentFetchTransport();
+    let budget: number;
+    if (isWsLaneTransport(t)) {
+        budget = limitsWsOutboundBytes();
+    } else if (t === undefined) {
+        budget = limitsHttpOutboundBytes();
+    } else {
+        // managed-but-not-WS transport: never shed (#3701 Finding 1).
+        return { body, sheddable: false };
+    }
+    if (budget <= 0) return { body, sheddable: false };
+    const sim = simulateShedImages(body, protocol, budget);
+    if (!sim.changed) return { body, sheddable: false };
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(body);
+    } catch {
+        return { body, sheddable: false };
+    }
+    if (!isObj(parsed)) return { body, sheddable: false };
+    const occurrences = collectOccurrences(protocol, parsed).filter((o) => !o.exempt);
+    if (occurrences.length === 0) return { body, sheddable: false };
+    const totalEntries = protocol === "google" ? (Array.isArray(parsed.contents) ? parsed.contents.length : 0)
+        : protocol === "responses" ? (Array.isArray(parsed.input) ? parsed.input.length : 0)
+            : Array.isArray(parsed.messages) ? parsed.messages.length : 0;
+    const protectFrom = Math.max(0, totalEntries - PROTECTED_TAIL_ENTRIES);
+    let archived = 0;
+    for (const o of occurrences) {
+        if (archived >= sim.archived) break;
+        if (o.protectedTail) continue;
+        o.applyArchive("*");
+        archived++;
+    }
+    if (archived === 0) return { body, sheddable: false };
+    return { body: JSON.stringify(parsed), sheddable: true };
+}
+
 interface ShedOptions {
     /** Best-effort mNNNNN resolver (session incoming-image index); placeholders quote it. */
     resolveRef?: (mediaType: string, b64: string) => Promise<string | undefined>;
@@ -61,6 +172,7 @@ interface Occurrence {
     entryIndex: number;
     b64: string;
     mediaType: string;
+    exempt: boolean;
     protectedTail: boolean;
     /** Set once rung A replaced this occurrence — rung B must never shrink a detached part. */
     archived: boolean;
@@ -140,17 +252,17 @@ function isExemptOutput(protocol: WireProtocol, item: Part, names: Map<string, s
 
 function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
     const occ: Occurrence[] = [];
-    const addAnthropicImages = (parts: unknown[], entryIndex: number, toolOutput: boolean): void => {
+    const addAnthropicImages = (parts: unknown[], entryIndex: number, toolOutput: boolean, exemptOutput = false): void => {
         parts.forEach((part, pos) => {
             if (!isObj(part) || part.type !== "image") return;
             const src = part.source;
             if (!isObj(src) || src.type !== "base64" || typeof src.data !== "string" || src.data.length === 0) return;
-            if (toolOutput && matchesOriginalImageReceipt(src.data, parts)) return;
             const mediaType = typeof src.media_type === "string" ? src.media_type : "image/png";
             occ.push({
                 entryIndex,
                 b64: src.data,
                 mediaType,
+                exempt: exemptOutput || (toolOutput && matchesOriginalImageReceipt(src.data, parts)),
                 protectedTail: false,
                 archived: false,
                 applyArchive: (note) => { parts[pos] = { type: "text", text: note }; },
@@ -169,12 +281,12 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                 const inline = part.inlineData;
                 if (!isObj(inline) || typeof inline.data !== "string" || inline.data.length === 0) return;
                 if (typeof inline.mimeType !== "string" || !/^image\//i.test(inline.mimeType)) return;
-                if (matchesOriginalImageReceipt(inline.data, parts)) return;
                 const mediaType = inline.mimeType;
                 occ.push({
                     entryIndex,
                     b64: inline.data,
                     mediaType,
+                    exempt: matchesOriginalImageReceipt(inline.data, parts),
                     protectedTail: false,
                     archived: false,
                     applyArchive: (note) => { parts[pos] = { text: note }; },
@@ -192,16 +304,17 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
             if (!isObj(item)) return;
             const partsKey = item.type === "message" ? "content" : item.type === "function_call_output" || item.type === "custom_tool_call_output" ? "output" : undefined;
             if (partsKey === undefined || !Array.isArray(item[partsKey])) return;
-            if ((item.type === "function_call_output" || item.type === "custom_tool_call_output") && isExemptOutput(protocol, item, names)) return;
+            const exemptOutput = partsKey === "output" && isExemptOutput(protocol, item, names);
             const parts = item[partsKey] as unknown[];
             parts.forEach((part, pos) => {
                 if (!isObj(part) || part.type !== "input_image" || typeof part.image_url !== "string") return;
                 const d = parseDataUrl(part.image_url);
-                if (!d || (partsKey === "output" && matchesOriginalImageReceipt(d.base64, parts))) return;
+                if (!d) return;
                 occ.push({
                     entryIndex,
                     b64: d.base64,
                     mediaType: d.mediaType,
+                    exempt: exemptOutput || (partsKey === "output" && matchesOriginalImageReceipt(d.base64, parts)),
                     protectedTail: false,
                     archived: false,
                     applyArchive: (note) => { parts[pos] = { type: "input_text", text: note }; },
@@ -217,7 +330,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
     const names = callNameMap(protocol, body);
     messages.forEach((m, entryIndex) => {
         if (!isObj(m)) return;
-        if (protocol === "openai" && m.role === "tool" && isExemptOutput(protocol, m, names)) return;
+        const exemptOutput = protocol === "openai" && m.role === "tool" && isExemptOutput(protocol, m, names);
         if (!Array.isArray(m.content)) return;
         const content = m.content as unknown[];
         if (protocol === "anthropic") addAnthropicImages(content, entryIndex, false);
@@ -235,14 +348,14 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                     entryIndex,
                     b64: d.base64,
                     mediaType: d.mediaType,
+                    exempt: exemptOutput,
                     protectedTail: false,
                     archived: false,
                     applyArchive: (note) => { content[pos] = { type: "text", text: note }; },
                     applyShrink: (b64) => { p.image_url = typeof iu === "string" ? dataUrl(d.mediaType, b64) : { ...(iu ?? {}), url: dataUrl(d.mediaType, b64) }; },
                 });
             } else if (p.type === "tool_result" && Array.isArray(p.content)) {
-                if (isExemptOutput(protocol, p, names)) return;
-                addAnthropicImages(p.content, entryIndex, true);
+                addAnthropicImages(p.content, entryIndex, true, isExemptOutput(protocol, p, names));
             }
         });
     });
@@ -268,7 +381,7 @@ export async function shedWireImages(
         return { body, stats: noop };
     }
     if (!isObj(parsed)) return { body, stats: noop };
-    const occurrences = collectOccurrences(protocol, parsed);
+    const occurrences = collectOccurrences(protocol, parsed).filter((o) => !o.exempt);
     if (occurrences.length === 0) return { body, stats: noop };
 
     const totalEntries = protocol === "google" ? (Array.isArray(parsed.contents) ? parsed.contents.length : 0)
@@ -277,22 +390,25 @@ export async function shedWireImages(
     const protectFrom = Math.max(0, totalEntries - PROTECTED_TAIL_ENTRIES);
     for (const o of occurrences) o.protectedTail = o.entryIndex >= protectFrom;
 
+    // Rung A: archive oldest non-protected images until the byte budget fits —
+    // the exact walk the pure projection (simulateShedImages) runs, so the
+    // token-space caliber preflight judges and the wire path actually carry
+    // agree on WHICH images leave (the two differ only in note size, which
+    // the projection floors at zero). Walks every occurrence (not just the
+    // first MAX_SHED_IMAGES): archiving is a string swap, so the jimp CPU
+    // bound does not apply here — capping it left any session with more than
+    // 64 images permanently over budget (#5745: 582 images shed only 64, the
+    // body stayed over the 10 MiB cap and upstream 400'd every round).
     let est = originalBytes;
     let archived = 0;
     let downscaled = 0;
-    // Rung A: archive oldest non-protected images to placeholder notes until under target.
-    // Walks every occurrence (not just the first MAX_SHED_IMAGES): archiving is a string swap,
-    // so the jimp CPU bound does not apply here — capping it left any session with more than
-    // 64 images permanently over budget (#5745: 582 images shed only 64, the body stayed over
-    // the 10 MiB cap and upstream 400'd every round).
     for (const o of occurrences) {
         if (est <= targetBytes) break;
         if (o.protectedTail) continue;
         const note = await shedNote(o.mediaType, o.b64, opts.resolveRef);
         o.applyArchive(note);
         o.archived = true;
-        // the serialized value being removed is the whole data URL, not the bare base64
-        est += byteLen(JSON.stringify(note)) - byteLen(dataUrl(o.mediaType, o.b64));
+        est -= byteLen(dataUrl(o.mediaType, o.b64));
         archived++;
     }
 
@@ -336,8 +452,8 @@ export async function shedWireImages(
  *   - the protected tail YIELDS to the cap: an upstream count wall is HARD (sending
  *     over it fails the whole request), unlike the WS byte budget which is soft —
  *     once non-tail images are exhausted, tail images are archived too (oldest-first).
- *  Exempt read_original_image occurrences never enter the walk (collectOccurrences
- *  skips them); if exempt images alone exceed the cap the body cannot be brought
+ *  Exempt read_original_image occurrences count toward the cap but never enter the
+ *  archive walk; if exempt images alone exceed the cap the body cannot be brought
  *  under it and the rejection stays visible. Pure on the string; byte-identical
  *  passthrough when the count is already within maxImages or nothing was sheddable. */
 export async function shedWireImagesToCount(
@@ -371,6 +487,7 @@ export async function shedWireImagesToCount(
         if (remaining <= maxImages) break;
         for (const o of occurrences) {
             if (remaining <= maxImages) break;
+            if (o.exempt) continue;
             if (o.archived) continue;
             if (!allowTail && o.protectedTail) continue;
             const note = await shedNote(o.mediaType, o.b64, opts.resolveRef);
