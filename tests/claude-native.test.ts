@@ -700,22 +700,27 @@ test("chooseWatchdogParentPid: no host + transient sh parent → the wrapper's p
     assert.equal(chooseWatchdogParentPid({ read, parentPid: 500 }), 600);
 });
 
-test("chooseWatchdogParentPid: no host + non-transient/unreadable parent → legacy direct parent", () => {
-    // Interactive shell (manual run) — old behavior is the right behavior.
+test("chooseWatchdogParentPid: no host + non-transient/unreadable parent → undefined (#7482)", () => {
+    // #7482: the walk missed the claude host and the direct parent is a
+    // long-lived ancestor (interactive shell, session-holder, etc.). Returning
+    // the parent pid would pin the watcher to a process that outlives the
+    // session — the anti-orphan contract is voided. Return undefined so the
+    // watcher arms without a parent pid and relies on the MCP child.
+    // Interactive shell (manual run / session-holder ancestor).
     const interactive = procTable({
         [process.pid]: { argv: ["node", "hook"], ppid: 500 },
         500: { argv: ["/bin/zsh", "-i"], ppid: 1 },
     });
-    assert.equal(chooseWatchdogParentPid({ read: interactive, parentPid: 500 }), 500);
+    assert.equal(chooseWatchdogParentPid({ read: interactive, parentPid: 500 }), undefined);
     // Wrapper parent whose own parent is init (no grandparent to watch).
     const orphanSh = procTable({
         [process.pid]: { argv: ["node", "hook"], ppid: 500 },
         500: { argv: ["sh", "-c", "node hook"], ppid: 1 },
     });
-    assert.equal(chooseWatchdogParentPid({ read: orphanSh, parentPid: 500 }), 500);
-    // Process table unreadable (hidepid / missing ps) — strictly no worse.
+    assert.equal(chooseWatchdogParentPid({ read: orphanSh, parentPid: 500 }), undefined);
+    // Process table unreadable (hidepid / missing ps) — no better than blind.
     const blind = procTable({ [process.pid]: { argv: ["node", "hook"], ppid: 800 } });
-    assert.equal(chooseWatchdogParentPid({ read: blind, parentPid: 800 }), 800);
+    assert.equal(chooseWatchdogParentPid({ read: blind, parentPid: 800 }), undefined);
 });
 
 test("isClaudeHostArgv: exact matches only — never the hook itself or lookalikes", () => {
