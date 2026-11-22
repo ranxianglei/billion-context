@@ -112,8 +112,10 @@ mkdir -p "$OUT_DIR"
 # ---- docker run --------------------------------------------------------------
 RUN=(docker run --rm "${SRC_ARGS[@]}")
 if [ -n "$GIT_PROXY" ]; then RUN+=(-e GATE_GIT_PROXY="$GIT_PROXY"); fi
-# GATE_SNAPBASE: run the P/R lanes with the candidate's snapBase egress plane
-# ON in the gate's bili.json (value: "all" or openai,responses,anthropic,google).
+# GATE_SNAPBASE: run the P/R lanes with the candidate's egress op-log plane
+# ON (rollout.features.egressPlane in the gate's bili.json; the retired
+# storage.snapBase key no longer exists — ruling 7439, one switch for all
+# protocol lanes). Value: "all" or a cohort list (any on-value = plane on).
 # Must be appended AFTER the RUN=(...) init above — an earlier append is wiped
 # by the reassignment.
 if [ -n "$SNAPBASE" ]; then RUN+=(-e GATE_SNAPBASE="$SNAPBASE"); fi
