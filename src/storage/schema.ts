@@ -209,6 +209,9 @@ CREATE TABLE IF NOT EXISTS blocks (
     created_at          INTEGER NOT NULL,
     covered_hash        TEXT NOT NULL,
     payload_json        TEXT NOT NULL,
+    summary_bytes       BLOB,
+    start_msgid         TEXT,
+    end_msgid           TEXT,
     PRIMARY KEY (session_id, block_id)
 );
 
