@@ -4198,10 +4198,20 @@ export async function preflightCompressIfNeeded(
     // the hatch and #488's 400 loop reopens); an estimate-derived or
     // legacy-unmarked baseline is NOT (#857: preflight used to write image
     // estimates back into lastInputTokens, which permanently closed this
-    // hatch on pixel-billing upstreams). With evidence present we trust the
-    // estimate and fall through to fold / fail-fast below.
-    const noOverflowEvidence = session.stats.lastInputTokens < limit
-        || (session.stats.lastInputTokensSource !== "usage" && session.stats.lastInputTokensSource !== "overflow-arm");
+    // hatch on pixel-billing upstreams). With overflow evidence present we
+    // trust the estimate and fall through to fold / fail-fast below.
+    // #1839 refinement (identity fast path): a usage-grade baseline ≥ limit
+    // is TOLERANCE evidence, not overflow evidence — the upstream BILLED a
+    // payload of that size on this lane (the 2026-11-22 incident lane accepted
+    // 824,944 against a 786,432 window; reading that as overflow closed the
+    // hatch and turned an image-dominated payload into a 413 on the wrong
+    // image estimate). Only an overflow-arm settlement (the upstream's own
+    // 400) is overflow evidence. Estimate-grade and legacy-unmarked baselines
+    // never carry evidence (legacy behavior, #857). Everything under limit
+    // carries none.
+    const baselineSource = session.stats.lastInputTokensSource;
+    const baselineMeetsWindow = session.stats.lastInputTokens >= limit;
+    const noOverflowEvidence = !baselineMeetsWindow || baselineSource !== "overflow-arm";
     // #1800/#1843: the TEXT channel fits the window but `text + imageReserve`
     // does not, and we hold no overflow evidence → the image reserve clears the
     // window on ESTIMATE alone while the real bill may be far smaller (pixel-tile

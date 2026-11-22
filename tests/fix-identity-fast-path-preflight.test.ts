@@ -226,8 +226,12 @@ test("e2e identity fast path: identified sid + same-origin upstream reality outr
         const since = calls.slice(before);
         assert.equal(since.length, 1, `exactly one upstream call for the forward (got ${JSON.stringify(since)})`);
         assert.equal(since[0]!.summary, false);
-        // The conversion is auditable in the log.
-        assert.ok(logs.some((m) => m.includes("identity fast path")), "log carries the identity fast path line");
+        // The conversion is auditable in the log. An image-dominated payload
+        // with a usage baseline ≥ window is now caught EARLIER by the #496/
+        // #1800 image-arbitration forward (opened by the 3c tolerance rule:
+        // usage ≥ window = tolerance evidence, not overflow evidence); both
+        // lines are the "trust recorded reality over local doom-math" family.
+        assert.ok(logs.some((m) => m.includes("identity fast path") || m.includes("arbitrate billing (#496/#1800)")), "log carries the trust-reality forward line");
     } finally {
         setLogCapture(null);
         await close();
