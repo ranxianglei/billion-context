@@ -63,13 +63,19 @@ test("markdown: renders every section heading + key metrics (zh default)", () =>
     assert.ok(!md.includes("⚠ ⚠"), "no doubled warning glyph (i18n string already carries it)");
 });
 
-test("markdown: locale switching changes headings (zh vs en)", () => {
+test("markdown: locale switching changes headings (zh vs en vs ko)", () => {
     const zh = buildSessionReportMd(D, { lang: "zh-CN" });
     const en = buildSessionReportMd(D, { lang: "en" });
+    const ko = buildSessionReportMd(D, { lang: "ko" });
     assert.notEqual(zh, en);
+    assert.notEqual(en, ko);
     assert.ok(zh.includes("基本信息"));
     assert.ok(!en.includes("基本信息"), "en output must not contain the zh identity heading");
     assert.ok(en.includes("api.example.com"), "host kept in en too");
+    assert.ok(ko.includes("신원"), "ko identity heading rendered");
+    assert.ok(!ko.includes("基本信息"), "ko output must not contain the zh identity heading");
+    assert.ok(!ko.includes("Identity"), "ko output must not contain the en identity heading");
+    assert.ok(ko.includes("api.example.com"), "host kept in ko too");
 });
 
 test("markdown: deterministic modulo timestamp", () => {

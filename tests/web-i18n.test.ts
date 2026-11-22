@@ -96,12 +96,19 @@ test("#1024: catalog parity — every key in every locale with matching placehol
     }
     for (const key of zhKeys) {
         assert.deepEqual(placeholders(MESSAGES.en[key]), placeholders(MESSAGES["zh-CN"][key]), `placeholder mismatch for "${key}"`);
+        assert.deepEqual(placeholders(MESSAGES.ko[key]), placeholders(MESSAGES.en[key]), `ko placeholder mismatch for "${key}"`);
     }
 });
 
 test("#1024: no Chinese residue in English translations", () => {
     for (const [key, value] of Object.entries(MESSAGES.en)) {
         assert.ok(!han.test(value), `English value for "${key}" still contains Chinese: ${value}`);
+    }
+});
+
+test("#1024: no Chinese residue in Korean translations", () => {
+    for (const [key, value] of Object.entries(MESSAGES.ko)) {
+        assert.ok(!han.test(value), `Korean value for "${key}" still contains Chinese: ${value}`);
     }
 });
 
