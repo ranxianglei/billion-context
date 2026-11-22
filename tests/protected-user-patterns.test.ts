@@ -15,6 +15,7 @@ import {
   type CoreMessage,
 } from "acp-kernel";
 import { applyCompressSettings, mergeCompress } from "../src/compress-settings.ts";
+import { effectiveConfig, storeEffectiveConfig, type Session } from "../src/session.ts";
 
 function msg(id: string, role: CoreMessage["role"], text: string): CoreMessage {
   return { id, role, contentType: "text", text };
@@ -75,8 +76,31 @@ test("protectedUserPatterns keeps an inherited isMessageProtected predicate", ()
     200_000,
     settings,
   );
-  // The resolver must not silently replace a lane predicate with the new one;
-  // this mirrors durable-message-guards installing its hook before compression.
+  // The resolver must not silently replace a lane predicate with the new one:
+  // a lane that installs Config.isMessageProtected (the kernel's host hook,
+  // #2419) keeps it firing alongside the patterns.
   assert.equal(config.isMessageProtected?.(messages[0]!), true, "inherited predicate still fires");
   assert.equal(config.isMessageProtected?.(messages[1]!), true, "new pattern also fires");
+});
+
+test("protectedUserPatterns survives the session-stamp round-trip (plugin tool path)", () => {
+  // The wire path resolves the predicate in applyCompressSettings, but the
+  // plugin tool path (compress/acp_status) re-reads the session stamp through
+  // effectiveConfig — and storeEffectiveConfig strips function fields for
+  // clone-safety. The predicate must be restored from the clone-safe data
+  // field, or protectedUserPatterns is silently inert in plugin mode.
+  const settings = mergeCompress(undefined, undefined, {
+    protectedUserPatterns: ["【本轮消息】"],
+  });
+  const wireConfig = applyCompressSettings(defaultConfig(200_000), 200_000, settings);
+  const marked = msg("task", "user", "【本轮消息】current task");
+  const plain = msg("old", "user", "old task");
+  assert.equal(wireConfig.isMessageProtected?.(marked), true, "wire path protects the marked prompt");
+
+  const session = { metadata: {} } as unknown as Session;
+  storeEffectiveConfig(session, wireConfig);
+  const pluginPathConfig = effectiveConfig(session, { ...defaultConfig(200_000) });
+
+  assert.equal(pluginPathConfig.isMessageProtected?.(marked), true, "plugin tool path still protects the marked prompt");
+  assert.equal(pluginPathConfig.isMessageProtected?.(plain), false, "ordinary user text stays foldable");
 });
