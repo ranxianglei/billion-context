@@ -1210,6 +1210,16 @@ elif SCENARIO == "non-http-base":
     # base_url must skip stamping entirely; an http(s) base_url (and an undetermined one) still
     # stamps the plugin headers (positive controls).
     install_sidecar(False)
+    # Pin the hermetic mini YAML backend (same pattern as the mitm-* scenarios, #2838): the
+    # windows-latest runner's Python ships neither PyYAML nor ruamel, so the config.yaml
+    # provider leg must not depend on what the host happens to install.
+    libdir = os.path.join(BASE, "lib-mini")
+    os.makedirs(libdir, exist_ok=True)
+    with open(os.path.join(libdir, "_bcminiyaml.py"), "w") as f:
+        f.write(MINI_YAML_PARSER)
+    with open(os.path.join(libdir, "yaml.py"), "w") as f:
+        f.write(YAML_STUB_SRC)
+    sys.path.insert(0, libdir)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
     ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
     os.makedirs(ca_dir, exist_ok=True)
