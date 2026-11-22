@@ -216,6 +216,12 @@ export interface BlockRow {
     coveredHash: string;
     /** Verbatim serialized CompressionBlock (includes summary). */
     payloadJson: string;
+    /** #7439 ruling 2: self-contained summary bytes (inline, no content JOIN). */
+    summaryBytes?: string | null;
+    /** #7439 ruling 2: msgid of the first message in the block. */
+    startMsgid?: string | null;
+    /** #7439 ruling 2: msgid of the last message in the block. */
+    endMsgid?: string | null;
 }
 
 export interface RefRow {
@@ -1656,17 +1662,21 @@ export class UnifiedStore {
             };
             const blocksUpsert = this.db.prepare(
                 `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
-                   summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(session_id, block_id) DO UPDATE SET
-                   ord = excluded.ord,
-                   start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
-                   end_seq = CASE WHEN excluded.end_seq >= 0 THEN excluded.end_seq ELSE blocks.end_seq END,
-                   start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
-                   summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
-                   supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
-                   created_at = excluded.created_at, covered_hash = excluded.covered_hash,
-                   payload_json = excluded.payload_json`,
+                   summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json,
+                   summary_bytes, start_msgid, end_msgid)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  ON CONFLICT(session_id, block_id) DO UPDATE SET
+                    ord = excluded.ord,
+                    start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
+                    end_seq = CASE WHEN excluded.end_seq >= 0 THEN excluded.end_seq ELSE blocks.end_seq END,
+                    start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
+                    summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
+                    supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
+                    created_at = excluded.created_at, covered_hash = excluded.covered_hash,
+                    payload_json = excluded.payload_json,
+                    summary_bytes = COALESCE(excluded.summary_bytes, blocks.summary_bytes),
+                    start_msgid = COALESCE(excluded.start_msgid, blocks.start_msgid),
+                    end_msgid = COALESCE(excluded.end_msgid, blocks.end_msgid)`,
             );
             for (const b of input.blocks) {
                 if (skipIncomingBlocks) continue;
@@ -1730,6 +1740,9 @@ export class UnifiedStore {
                     b.createdAt,
                     b.coveredHash,
                     b.payloadJson,
+                    b.summaryBytes ?? b.summary,
+                    b.startMsgid ?? null,
+                    b.endMsgid ?? null,
                 );
                 if (ex) {
                     if (ex.summary_hash === summaryHash) this.releaseContent(summaryHash);
