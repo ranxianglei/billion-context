@@ -29,6 +29,7 @@ import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
+import { preflightEmergencyDigestEnabled } from "./knobs.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { isCodexClient } from "./codex-compact.js";
 import { describeExternalSummaryFailure, summaryLengthBudgetClause } from "./external-summary.js";
@@ -158,10 +159,13 @@ const FIT_FORWARD_ESTIMATE_ONLY_MARGIN = 0.85;
 // be a VALID block summary (the folded originals stay restorable via
 // decompress — applyRanges caches them like any other preflight fold), so the
 // summarization call is replaced by a CPU-only structural digest
-// (deterministicDigest below). Hard constant by design: no new config surface,
-// and the trigger derives from this loop's own coverage math instead of an
-// arbitrary multiplier — normal sessions (one turn of growth per request)
-// never approach it.
+// (deterministicDigest below). The trigger derives from this loop's own
+// coverage math instead of an arbitrary multiplier — normal sessions (one turn
+// of growth per request) never approach it. The regime itself is DEFAULT OFF
+// (owner decision 2026-11-22: to the downstream model the digest is a hard
+// truncation — set BILI_PREFLIGHT_EMERGENCY_DIGEST=1 / network.emergencyDigest
+// to restore #2383); off, these payloads run the LLM fold ladder and may
+// exhaust into a fail-fast 413.
 const EMERGENCY_FOLD_COVERAGE = MAX_PREFLIGHT_ROUNDS * 2 * CHUNK_FRACTION;
 // Round cap for the emergency regime: every round is CPU-only (kernel walk +
 // digest, no upstream wait), so even the worst case stays at seconds; 512
@@ -2020,7 +2024,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // digest-fold ordinary payloads (caught by the model-switch e2e: its
     // summarization calls vanished under a 300k foreign-model baseline).
     const entryOvershoot = limit > 0 && entryLocal > 0 ? entryLocal / limit : 1;
-    const emergencyFold = entryOvershoot > EMERGENCY_FOLD_COVERAGE;
+    const emergencyOvershoot = entryOvershoot > EMERGENCY_FOLD_COVERAGE;
+    const emergencyFold = emergencyOvershoot && preflightEmergencyDigestEnabled();
+    if (emergencyOvershoot && !emergencyFold) {
+        deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) but the emergency digest regime is disabled (default off — model-visible hard truncation, #2383; set BILI_PREFLIGHT_EMERGENCY_DIGEST=1 or network.emergencyDigest to restore) — running the LLM fold ladder, which may exhaust its budget and fail fast`);
+    }
     const effectiveRoundCap = emergencyFold ? EMERGENCY_ROUND_CAP : roundBudget;
     if (emergencyFold) {
         deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) — folding with deterministic digests instead of summarization calls; originals stay restorable via decompress (#2383)`);

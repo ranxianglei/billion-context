@@ -56,7 +56,111 @@ function conversation(count: number, charsPerMessage: number): Array<{ role: str
     return msgs;
 }
 
+// Default-off behavior (owner decision 2026-11-22): the #2383 CPU digest regime
+// is a model-visible hard truncation, so it no longer arms by default. An
+// unconvergent extreme overflow now runs the LLM fold ladder, exhausts its
+// budget, and fails fast — with NO digest blocks and NO forward.
+test("default: the #2383 emergency digest regime is OFF — unconvergent extreme overflow fails fast, no digests", async () => {
+    const calls: Array<{ stream: boolean; body: string }> = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: { stream?: boolean } = {};
+            try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
+            calls.push({ stream: !!parsed.stream, body: raw });
+            if (parsed.stream) {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(okSse(1000));
+            } else {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({
+                    id: "msg_summary",
+                    type: "message",
+                    role: "assistant",
+                    model: "claude-small",
+                    content: [{ type: "text", text: SUMMARY_TEXT }],
+                    stop_reason: "end_turn",
+                    usage: { input_tokens: 500, output_tokens: 50 },
+                }));
+            }
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: 24_000 } } } },
+        modelContextLimit: 24_000,
+        kernelConfig: defaultConfig(24_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
+
+    try {
+        assert.equal(process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST, undefined, "test premise: the opt-in env is unset (default)");
+        // 80 msgs x 32k chars ~= 2.56M chars — ABOVE the 2MB doomed-probe byte
+        // floor and, under the unknown-baseline char-count upper bound, ~106x
+        // the 24k window (far past the 19.2x coverage bound). NOTE the fresh-
+        // session geometry: the regime's char-based trigger needs >19.2x
+        // window-in-chars (~4.6M at this window), which the byte floor forbids
+        // — so a FRESH session at this size is answered fail-fast (deterministic
+        // can-never-fit, no LLM budget spent) instead of entering the walk.
+        // Either way the user-visible contract under default-off is: NO
+        // digest blocks, NO forward, fail-fast. (A FRESH session below the
+        // byte floor cannot reach the regime at all — see the size math in
+        // EMERGENCY_FOLD_COVERAGE; production #2383's 21.2x case carried a
+        // known baseline, which is why the char floor never applied there.)
+        const mark = calls.length;
+        const r = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "emg-default-off" },
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(80, 32_000) }),
+        });
+        const body = await r.text();
+        assert.ok(r.status === 413 || r.status === 502,
+            `the unconvergent extreme-overflow request fails fast (got ${r.status}); body: ${body.slice(0, 400)}`);
+        assert.ok(!body.includes("[deterministic digest"), "no digest artifacts in the fail-fast answer");
+
+        const step = calls.slice(mark);
+        assert.equal(step.filter((c) => c.stream).length, 0, "the over-window payload was never forwarded");
+
+        const s = listSessions().find((x) => x.id === "emg-default-off");
+        const blocks = (s?.state.blocks ?? []).filter((b) => b.active);
+        assert.ok(blocks.every((b) => !b.summary.startsWith("[deterministic digest")),
+            `no deterministic-digest blocks by default (got: ${blocks[0]?.summary?.slice(0, 80)})`);
+    } finally {
+        proxy.close();
+        upstream.close();
+    }
+});
+
 test("e2e: extreme-overflow fresh session folds with zero summarization calls; moderate overflow keeps the LLM path", async () => {
+    const prevFlag = process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST;
+    process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST = "1"; // #2383 regime is opt-in now (default off)
     const calls: Array<{ stream: boolean; body: string }> = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -175,6 +279,8 @@ test("e2e: extreme-overflow fresh session folds with zero summarization calls; m
         assert.ok(forwardB.body.includes(SUMMARY_TEXT), "the preflight summary is in the rebuilt payload");
         assert.ok(!forwardB.body.includes("[deterministic digest"), "no digest artifacts below the coverage bound");
     } finally {
+        if (prevFlag === undefined) delete process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST;
+        else process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST = prevFlag;
         proxy.close();
         upstream.close();
     }
