@@ -7,6 +7,7 @@ import type { CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap, deactivateBlock } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, compressibleSpanHint, type RewriteCtx } from "../src/stream.ts";
+import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
 import { liveCompressionRanges } from "../src/acp-status.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 
@@ -20,7 +21,7 @@ const MESSAGES = Array.from({ length: 80 }, (_, i) => ({
 
 function makeCtx(): Ctx {
     const logs: string[] = [];
-    return {
+    const ctx: Ctx = {
         core: createCore(),
         config: defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }),
         messages: MESSAGES,
@@ -40,6 +41,10 @@ function makeCtx(): Ctx {
         log: (m: string) => { logs.push(m); },
         logs,
     };
+    // #7318: these tests assert the legacy recommendation tail — opt into
+    // compress.postComPressTail (default is now OFF).
+    storeUnpromptedGate(ctx.session, { nudgeInjected: false, requireNudge: false, requireRecommendation: false, postComPressTail: true });
+    return ctx;
 }
 
 /** refs m00001..m00080 + one ACTIVE kernel block covering m00001..m00020 */

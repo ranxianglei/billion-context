@@ -554,6 +554,14 @@ export type Session = {
          *  provider says nothing about whether another accepts the payload.
          *  Absent on legacy session files → baseline keeps legacy behavior. */
         lastInputTokensOrigin?: string;
+         /** Identity-fast-path: the REQUEST MODEL that measured lastInputTokens
+          *  — stamped at usage settlement (settleUsageReport / applyUsageSample)
+          *  and at overflow arming, alongside lastInputTokensOrigin. Acceptance
+          *  evidence on one model says nothing about another model's wall on
+          *  the same origin (#2189: 300k billed on claude-big does not bind
+          *  claude-small). Absent on legacy session files → the gate demotes
+          *  conservatively and the protection chain judges. */
+        lastInputTokensModel?: string;
          /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
           *  consistent same-route samples of (upstream-billed input ÷ local
          *  text estimate), clamped to [0.25, 4] — two-way since #2366: the
@@ -717,6 +725,18 @@ export type Session = {
      *  model keeps re-fetching. Bounded by trimRetrieveCounts; lost on restart
      *  (advisory signal only). */
     retrieveCountsByRef?: Map<string, number>;
+    /** #6522 in-memory only (NOT persisted): the "Uncovered history remains"
+     *  receipt note has already fired in the current nudge-injection cycle.
+     *  The note fires once per cycle — repeating it after every successful
+     *  fold drove models into an infinite compress→note loop (#6522). Each
+     *  ACTUAL nudge injection (nudgeOutcome === "injected", stamped in
+     *  src/server/handle.ts) re-opens the latch: a fresh nudge is a new
+     *  "big enough, compress while you are at it" moment. The same detail
+     *  stays available on demand via acp_status(scope:"uncompressed").
+     *  Lost on restart (at most one extra note). #7318: only read while
+     *  compress.postComPressTail is on; with the recommendation off the note
+     *  never fires and the latch is inert. */
+    uncoveredReceiptNoted?: boolean;
     /** In-memory only (NOT persisted): request-only injections riding the
      *  nudge channel. Since the GHSA jc6g v2 rework, acp_retrieve delivers its
      *  full text in the tool result itself — this carrier now only serves
@@ -1807,6 +1827,7 @@ export function resetSessionCompression(session: Session): void {
     // learned against the pre-compaction content class, and the baseline's
     // measuring route no longer bounds this rebuilt session.
     delete session.stats.lastInputTokensOrigin;
+    delete session.stats.lastInputTokensModel;
     delete session.stats.calibratedEstimate;
     delete session.stats.calibratedEstimateOrigin;
     // #2117 B: same boundary — the factor's model provenance dies with it.

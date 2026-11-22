@@ -156,6 +156,11 @@ export const LIVE_FILES = [
     // the zone band is irrelevant; the entry is for the tripwire, like
     // #5046/#4612.
     "tests/storage-integrity-cache.test.ts",
+    // #7156: the only child is spawnSync("true") in freshDeadPid() — a
+    // guaranteed-dead pid for the stale-lock fixture; no ports, no servers,
+    // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
+    // for the tripwire, like #5046/#4612.
+    "tests/storage-backup-repair.test.ts",
     // #7540: the kernel-guard declaration gate test spawns ONE bare
     // `node scripts/kernel-guard-declare.mjs` child via execFileSync —
     // synchronous, binds no port, does no network I/O, so no zone band is
