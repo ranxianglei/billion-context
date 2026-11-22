@@ -286,10 +286,11 @@ function growPfLedger(
 ): string[] | undefined {
     // Bootstrap/migration: pre-v6 sessions carry only `l` (last list).
     const base = saved?.lg ?? saved?.l ?? [];
-    const known = new Set(base);
+    const known = new Set<string>();
     const out: string[] = [];
     for (const id of base) {
-        if (!known.has(id)) known.add(id); // defensive dedupe of hand-edited state
+        if (known.has(id)) continue; // defensive dedupe of hand-edited state
+        known.add(id);
         out.push(id);
     }
     for (const id of list) {

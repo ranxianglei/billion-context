@@ -598,6 +598,21 @@ test("v6: a mid-history structural mutation pays ONE conservative legacy pass, t
     assert.ok(h4.headers[PF_SEQ_HEADER] === "7");
 });
 
+test("v6: a hand-edited ledger with duplicate ids is deduped when it first grows (R2 defensive)", () => {
+    LOGS.length = 0;
+    const stub = makeStubStore();
+    const session = freshSession("pf-v6-dedupe");
+    // a hand-edited/corrupted persisted ledger carries a duplicate id
+    stub.ext.set(savedKey("pf-v6-dedupe"), JSON.stringify({ t: 3, m: "m1", misses: 0, lg: ["h-b", "h-b", "h-c"] }));
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp");
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    const r2 = runTurn(session, { [PF_COUNT_HEADER]: "3", ...TAIL(["h-c", "h-d"]) }, b2);
+    assert.equal(r2.out.decision, "hit", LOGS.join("\n"));
+    const lg = readSaved(stub, "pf-v6-dedupe").lg as string[];
+    assert.deepEqual(lg, ["h-b", "h-c", "h-d"], "the duplicate must be collapsed on first growth");
+});
+
 test("v6 knob OFF: rewrite-shaped turns fall back to the pre-v6 identity-only ride (diagnostic warn, no ledger verdict)", () => {
     LOGS.length = 0;
     makeStubStore();
