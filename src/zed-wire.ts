@@ -29,7 +29,7 @@ export interface ZedEnvelopeMeta {
     model?: string;
 }
 
-export interface UnwrappedZedEnvelope {
+interface UnwrappedZedEnvelope {
     innerBody: Record<string, unknown>;
     provider: ZedProvider;
     threadId?: string;
