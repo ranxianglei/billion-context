@@ -2239,8 +2239,9 @@ export const headroomEffectiveLogged = new Set<string>();
 export const armJudgingWallLogged = new Set<string>();
 /** One-shot preflight fold gate — per-session "blocked trigger" log dedupe
  *  (managed sessions re-trigger every turn once growth outruns the fold).
- *  Process-lifetime like armJudgingWallLogged; never cleared. */
-export const preflightGateBlockedLogged = new Set<string>();
+ *  Process-lifetime like armJudgingWallLogged; never cleared. Not exported:
+ *  used only inside preflightCompressIfNeeded (unused-exports gate #1440 P6). */
+const preflightGateBlockedLogged = new Set<string>();
 
 // #1840: best-known OUTPUT ceiling for the request's model, resolved through
 // the SAME source chain (and rank order) the output-headroom fallback uses
