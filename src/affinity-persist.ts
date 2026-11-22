@@ -170,12 +170,9 @@ function persistUnifiedNow(): Promise<void> {
     const store = kvStore();
     if (!store) return kvChain;
     kvChain = kvChain.then(async () => {
-        let live: AffinitySnapshotEntry[] | null = null;
-        try {
-            live = parseStoreDoc(await store.getKvAsync(AFF_NS, AFF_KEY));
-        } catch {
-            live = null;
-        }
+        // A failed read is not an absent snapshot: leave the durable row
+        // untouched and let the outer handler select the legacy fallback.
+        const live = parseStoreDoc(await store.getKvAsync(AFF_NS, AFF_KEY));
         const mine = prefixAffinity.exportSnapshot();
         const merged = live === null ? { entries: mine, forks: 0 } : mergeWithDisk(mine, live);
         const entries = normalizeForWrite(merged.entries);
@@ -192,17 +189,6 @@ function persistUnifiedNow(): Promise<void> {
     return kvChain;
 }
 
-/** Presence check independent of content (an empty-but-present row still
- *  counts as migrated, so we don't re-upload over sibling lanes' empties). */
-async function kvRowPresent(store: ReturnType<typeof kvStore>): Promise<boolean> {
-    try {
-        if (!store) return false;
-        return (await store.getKvAsync(AFF_NS, AFF_KEY)) !== undefined;
-    } catch {
-        return false;
-    }
-}
-
 /** Once per process (wired at cli start): layer the kv snapshot over what the
  *  sync boot hydrate loaded, then migrate legacy-file rows the store lacks.
  *  Never throws. */
@@ -210,14 +196,11 @@ export async function hydrateAffinityUnified(): Promise<void> {
     const store = kvStore();
     if (kvReady || !store) return;
     try {
-        let kvEntries: AffinitySnapshotEntry[] | null = null;
-        try {
-            kvEntries = parseStoreDoc(await store.getKvAsync(AFF_NS, AFF_KEY));
-        } catch {
-            kvEntries = null;
-        }
-        kvEntries ??= [];
-        const hadRow = await kvRowPresent(store);
+        // Read content and presence together. A read failure must leave
+        // hydration retryable, without publishing a partial legacy view.
+        const raw = await store.getKvAsync(AFF_NS, AFF_KEY);
+        const kvEntries = parseStoreDoc(raw) ?? [];
+        const hadRow = raw !== undefined;
         const fileEntries = readDiskEntries() ?? [];
         let merged: { entries: AffinitySnapshotEntry[]; forks: number };
         if (fileEntries.length === 0) merged = { entries: kvEntries, forks: 0 };
