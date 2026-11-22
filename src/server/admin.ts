@@ -779,6 +779,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 const row = await store.createReplica(parsed.sessionId, {
                     label: typeof parsed.label === "string" ? parsed.label : undefined,
                     pinned: parsed.pinned === true,
+                    resident,
                 });
                 res.writeHead(201, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, replica: serializeReplica(row) }));

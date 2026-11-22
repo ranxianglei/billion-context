@@ -2835,20 +2835,29 @@ export class SessionStore {
         }
     }
 
-    async createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): Promise<CheckpointRow> {
+    async createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base"; resident?: Session } = {}): Promise<CheckpointRow> {
         const shadow = this.liveShadow();
-        const view = await shadow.viewForAsync(sessionId);
-        if (!view) throw new Error(`[storage] session ${sessionId} is not in the unified index (unknown, or never persisted under this mode)`);
-        const record = viewToRecord(view);
+        // #7439 P2: egress-on sessions have a frozen messages projection —
+        // viewForAsync returns the arm-time snapshot, not the live content.
+        // When the caller passes the resident session, use it directly
+        // (same pattern as maybeCutForkBaseAsync).
+        let record: PersistedSession;
+        if (opts.resident) {
+            record = this.buildRecordForSave(opts.resident);
+        } else {
+            const view = await shadow.viewForAsync(sessionId);
+            if (!view) throw new Error(`[storage] session ${sessionId} is not in the unified index (unknown, or never persisted under this mode)`);
+            record = viewToRecord(view);
+        }
         // CCR originals must survive the rollback the replica exists for:
         // the live content-store sidecar (not just what the unified index
         // captured) is the authoritative envelope — stamp it into the frozen
         // record (#2690 review blocking 6: "restore without the content-store
         // envelope → CCR cannot fetch originals").
-        const ccr = this.contentStoreById(sessionId, view.meta as { protocol?: string; upstreamOrigin?: string } | undefined);
+        const ccr = this.contentStoreById(sessionId, record.meta as { protocol?: string; upstreamOrigin?: string } | undefined);
         if (ccr) record.forkContentStore = ccr;
         const cpId = `cp-${randomUUID()}`;
-        const activeBlockIds = view.state.blocks
+        const activeBlockIds = record.state.blocks
             .filter((b) => (b as { active?: boolean }).active !== false)
             .map((b) => b.blockId)
             .sort();
