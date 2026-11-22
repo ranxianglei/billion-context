@@ -1273,8 +1273,13 @@ export class UnifiedStore {
                 messages = mapped.map((x) => ({ ...x.m, seq: x.abs }));
                 // tailSeqs = the window's absolute seqs in ENVELOPE order —
                 // exactly the shape the full path writes for a window plan;
-                // the sweep never ran on those (no completeLog claim).
-                s.tailJson = JSON.stringify({ ...tail, tailSeqs: mapped.map((x) => x.abs) });
+                // the sweep never ran on those (no completeLog claim). Base on
+                // the PLAN's tailJson (not the stored one) so tailFolded /
+                // pluginSnapshotSeqs track the current view — the stored copy
+                // is stale for a folded save and would drift the replay header
+                // (#7474 reanchor must be byte-identical to the full path).
+                const planTail = JSON.parse(s.tailJson) as Record<string, unknown>;
+                s.tailJson = JSON.stringify({ ...planTail, tailSeqs: mapped.map((x) => x.abs) });
                 watermark = mapped[mapped.length - 1].abs;
             } else if (delta) {
                 const probe = this.probeIngestBoundary(s.sessionId, delta.trustedSeq);

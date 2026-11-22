@@ -56,6 +56,14 @@ function openStore(): { store: UnifiedStore; adapter: EgressOpLogStore; db: Retu
     return { store, adapter, db, dir };
 }
 
+// Close BOTH SQLite handles before removing the dir — Windows refuses to
+// delete a directory with open file handles (EPERM), unlike POSIX.
+function cleanup(H: { store: UnifiedStore; db: ReturnType<typeof openSqliteDatabase>["db"]; dir: string }): void {
+    try { H.store.close(); } catch { /* best-effort shutdown */ }
+    try { H.db.close(); } catch { /* best-effort shutdown */ }
+    fs.rmSync(H.dir, { recursive: true, force: true });
+}
+
 test("snapPinLiveIds: op-log authority, system row excluded, order = log_seq", () => {
     const H = openStore();
     try {
@@ -64,7 +72,7 @@ test("snapPinLiveIds: op-log authority, system row excluded, order = log_seq", (
         assert.deepEqual(H.store.snapPinLiveIds("s1"), ["m1", "m2"]);
         assert.deepEqual(H.store.snapMsgIdLiveIds("s1"), [], "the messages projection is untouched by egress recording");
     } finally {
-        fs.rmSync(H.dir, { recursive: true, force: true });
+        cleanup(H);
     }
 });
 
@@ -96,7 +104,7 @@ test("snapPinLiveIds: a session without an op log reads the messages ledger unch
         assert.ok(fromMessages.length >= 2, `messages ledger populated (got ${fromMessages.length})`);
         assert.deepEqual(H.store.snapPinLiveIds("plain-sess"), fromMessages, "no op log → byte-identical to the legacy read");
     } finally {
-        fs.rmSync(H.dir, { recursive: true, force: true });
+        cleanup(H);
     }
 });
 
@@ -115,7 +123,7 @@ test("snapPinLiveIds: a corrupt op log degrades to the messages ledger, never th
         assert.throws(() => H.adapter.egressStateView("s3"), /corrupt|egress-state/i);
         assert.deepEqual(H.store.snapPinLiveIds("s3"), H.store.snapMsgIdLiveIds("s3"), "corrupt op log → messages ledger (stale-but-honest, never a pin-path throw)");
     } finally {
-        fs.rmSync(H.dir, { recursive: true, force: true });
+        cleanup(H);
     }
 });
 
