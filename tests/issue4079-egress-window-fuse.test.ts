@@ -203,10 +203,13 @@ test("e2e #5000: a body whose mass rides tools[] — core text clearing the byte
         assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
         assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ TEXT tokens/, "the measured tier names itself (text-only; image payloads are #496 arbitration, never doom)");
         assert.match(parsed.error?.message ?? "", /NOT forwarded/, "the remedy wording is present");
-        // THE behavior under test: the doomed payload NEVER reaches the upstream
-        // (before the measured tier it cleared the byte floor and rode forward
-        // to a guaranteed 400 — incident #5000's 55.2 MiB send).
-        assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);
+        // THE behavior under test: the doomed tools-mass body NEVER reaches the
+        // upstream (before the measured tier it cleared the byte floor and rode
+        // forward to a guaranteed 400 — incident #5000's 55.2 MiB send). With the
+        // #2383 emergency digest default-OFF (#7549) the fresh-parallel fold lane
+        // may spend a few small summarization calls on the (unreducible) core text
+        // before the fail-fast, but none may carry the 4.8MB tools-mass body itself.
+        assert.ok(calls.every((c) => c.bytes < 1_000_000), `the doomed tools-mass body must never reach the upstream (got calls: ${JSON.stringify(calls)})`);
     } finally {
         await close();
         rmrf(root);
