@@ -2352,6 +2352,17 @@ export class UnifiedStore {
         return row ? row.msg_id : null;
     }
 
+    /** #7439 window re-anchor delta: point-lookup the absolute seq for a
+     *  (session_id, msg_id) pair via idx_messages_msg_id. Returns null when
+     *  the row is missing. O(1) index probe. msg_id is unique within a
+     *  session (kernel invariant), so the identity column is not needed. */
+    lookupSeqByMsgId(sessionId: string, msgId: string): number | null {
+        const row = this.db
+            .prepare("SELECT seq FROM messages WHERE session_id = ? AND msg_id = ?")
+            .get(sessionId, msgId) as { seq: number } | undefined;
+        return row ? row.seq : null;
+    }
+
     /** #3301: message rows for the given ids — EVERY seq row matching an id
      *  (edits append; callers keep the latest per id) plus, when
      *  includeNeighbors, the seq±1 rows so split-form rc pairs stay adjacent

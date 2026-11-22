@@ -31,7 +31,7 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import { planIngest, planIngestDelta, planIngestDeltaWindow, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { CcrLedgerRow } from "./slim.ts";
 import { splitMediaContent } from "./identity.js";
 import type { BlockView } from "../session.js";
@@ -861,7 +861,29 @@ export class UnifiedShadow {
                 if (headMsgId === null) return false;
                 head = { msgId: headMsgId };
             }
-            const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail, head);
+            let plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail, head);
+            if (!plan) {
+                // #7439 window re-anchor delta: the pf watermark fast-path HIT
+                // turn persists only the tail window (~56 rows), so
+                // tail.length < trustedLen (shrink) is the structural shape.
+                // Per-row point-lookup the absolute seq of each window row via
+                // idx_messages_identity; all hit → window plan, any miss →
+                // full ingest as before. No invariant loosened.
+                const tail = legacy.lastMessages;
+                const trustedLen = mark.tailSeqs.length;
+                if (tail && trustedLen > 0 && tail.length < trustedLen) {
+                    const windowSeqs: number[] = [];
+                    let allHit = true;
+                    for (let i = 0; i < tail.length; i++) {
+                        const seq = this.sync.lookupSeqByMsgId(legacy.id, tail[i].id);
+                        if (seq === null) { allHit = false; break; }
+                        windowSeqs.push(seq);
+                    }
+                    if (allHit) {
+                        plan = planIngestDeltaWindow(legacy, tail.length, windowSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail, head);
+                    }
+                }
+            }
             if (!plan) return false;
             const applied = this.sync.ingestSession(plan, {
                 trustedSeq: mark.seq,
