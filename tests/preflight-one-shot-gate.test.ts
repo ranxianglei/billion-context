@@ -182,6 +182,40 @@ test("one-shot gate: compression-managed session (committed fold) → forwarded 
     }
 });
 
+// B2 (NEGATIVE, the discriminating one for the managed branch): case B's second
+// request never reaches the gate — after shot 1's fold the reconciled payload
+// FITS the window, so the triggerFires early return fires first. This variant
+// regrows the session over-window with NEW large content, so the trigger
+// genuinely fires and only the gate blocks the fold: without the gate this
+// case re-folds (a new summarization call); with the gate it forwards as-is.
+test("one-shot gate: managed session regrows over-window on new content → trigger fires, still no fold", async () => {
+    const env = await startPair();
+    try {
+        // Shot one commits a fold (the session is now compression-managed).
+        const r1 = await post(env.proxyPort, env.upstreamPort, "oneshot-managed-grow", overWindowPayload());
+        assert.equal(r1.status, 200, r1.body.slice(0, 300));
+        const s = getSession("oneshot-managed-grow");
+        assert.ok((s.state.stats?.compressionCount ?? 0) > 0, "shot one committed (precondition: the session is compression-managed)");
+
+        // Shot two: the SAME conversation plus NEW large content — the outbound
+        // is over-window again, so the trigger fires (not the fits early
+        // return). The gate must block the fold.
+        const summaryCallsBefore = env.calls.filter((c) => !c.stream).length;
+        const r2 = await post(env.proxyPort, env.upstreamPort, "oneshot-managed-grow", [
+            { role: "user", content: "start the task" },
+            { role: "user", content: "A".repeat(24000) },
+            { role: "user", content: "A".repeat(24000) },
+            { role: "user", content: "C".repeat(60000) },
+        ]);
+        assert.equal(r2.status, 200, "the regrown over-window payload is forwarded as-is, not withheld (r.status=" + r2.status + " " + r2.body.slice(0, 300) + ")");
+        assert.equal(env.calls.filter((c) => !c.stream).length, summaryCallsBefore, "NO new summarization call: the gate blocked the regrown trigger (this case re-folds without the gate)");
+        assert.ok(env.calls.some((c) => c.stream && c.body.includes("C".repeat(100))), "the UNFOLDED new content rode the forward");
+        assert.equal(getSession("oneshot-managed-grow").state.blocks.length, s.state.blocks.length, "no new block was committed on the second request");
+    } finally {
+        await env.close();
+    }
+});
+
 // C (NEGATIVE): the log-32 livelock shape — an ABORTED first attempt (flag set,
 // nothing committed) must not re-start the multi-minute summary on the retry:
 // the identical over-window payload is forwarded as-is, zero summary calls.

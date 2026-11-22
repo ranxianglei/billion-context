@@ -4144,7 +4144,10 @@ export async function preflightCompressIfNeeded(
     // One-shot fold gate: proxy-driven preflight folding gets exactly ONE
     // effective attempt per session lifecycle. Once the session has been
     // compressed by bili (a committed fold) or its fold attempt was aborted
-    // by a client disconnect, the trigger forwards as-is. Why: a slow
+    // by a client disconnect, the trigger forwards as-is. (Fork children of a
+    // managed session inherit the committed count — src/plugin.ts
+    // fork-session — so they are born managed and never spend their own shot;
+    // their growth is covered by #1195 + the model-side compress tool.) Why: a slow
     // self-summarizer + a client stream watchdog (~300s) turn repeated
     // triggers into a never-shrinking abort loop (2026-11-22 incident:
     // nine preflight runs of the same ~77K payload, each a 3.5-4 min
