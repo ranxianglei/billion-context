@@ -3957,6 +3957,53 @@ export async function preflightCompressIfNeeded(
         log("info", `[${session.id}] preflight usage-baseline ~${baselineFloor} tok was measured on ${maskUrlForLog(baselineOrigin)}, request now routes to ${maskUrlForLog(currentOrigin)} — demoting to untrusted, judging by this payload's own estimate (#1933)`);
         baselineFloor = 0;
     }
+    // Identity fast path (2026-11-22 opencode 413 incident): when the server
+    // already knows this conversation (identified sid) AND has REAL upstream
+    // reality on record for this exact origin+model — a successful usage bill
+    // or an overflow-arm rejection, both measured on the same route — the
+    // local estimate may no longer VETO a forward. The field incident: the
+    // image channel's pre-shed estimate ran ~4x over the upstream's actual
+    // bill (948,600 estimated vs ~229K billed; the same session's prior turn
+    // was ACCEPTED at 824,944 tokens over the 786,432 window), and the
+    // estimate-driven doom-math answered 413 while the lane was demonstrably
+    // live. Rule: every deterministic doom verdict below is converted into
+    // "forward the outbound as configured" — a genuine upstream 400 is
+    // absorbed by the existing overflow-arm recovery (armOverflowShrink +
+    // post-400 compression), which runs on REAL evidence. The protection
+    // chain keeps judging when: anonymous, no prior reality (first request),
+    // the ORIGIN changed since the last evidence (#1933 F2 demotion
+    // semantics), or the upstream has already stated its overflow wall
+    // (#3450 — that wall IS recorded reality and must keep judging). Model
+    // changes are deliberately NOT a demotion: the "model billed" provenance
+    // is not recoverable at preflight time (prepare re-stamps
+    // metadata.lastModel with the CURRENT request's model before this runs,
+    // and threading a stamped model through all three billing lanes is a
+    // separate change); a model-specific 400 is absorbed by the overflow arm
+    // exactly like any other over-accept, which shrinks the judged wall.
+    const evidenceSource = session.stats.lastInputTokensSource;
+    const hasUpstreamReality = session.stats.lastInputTokens > 0
+        && (evidenceSource === "usage" || evidenceSource === "overflow-arm");
+    const evidenceOriginMatch = hasUpstreamReality && currentOrigin !== undefined && baselineOrigin === currentOrigin;
+    // Acceptance evidence is per MODEL as well as per origin (#2189: 300k
+    // billed on claude-big binds nothing for claude-small on the same lane).
+    // The stamp is written at settlement/arming (settleUsageReport, relay arm)
+    // — NOT metadata.lastModel, which prepare re-covers with the CURRENT
+    // request's model before preflight ever runs. Absent on legacy sessions →
+    // demote and let the protection chain judge.
+    const evidenceModel = typeof session.stats.lastInputTokensModel === "string" && session.stats.lastInputTokensModel !== "" ? session.stats.lastInputTokensModel : undefined;
+    const evidenceModelMatch = evidenceModel !== undefined && typeof model === "string" && model !== "" && evidenceModel === model;
+    // The fast path converts ESTIMATE-based doom verdicts — verdicts judged
+    // against a window the local estimate says the payload overruns. It must
+    // NOT touch sessions where the upstream already declared an overflow wall
+    // (statedWall > 0): against a proven wall the protection chain is exact.
+    // A payload that genuinely cannot fit costs at most ONE guaranteed 400 —
+    // every overflow 400 stamps overflowArmTokens (relay.ts window branch or
+    // the unparseable-window fallback), which demotes the next request back
+    // to the evidence-judged chain (#4185 test 4 pins this bounded form).
+    const trustedForward = !anonymous && hasUpstreamReality && evidenceOriginMatch && evidenceModelMatch && statedWall <= 0;
+    if (hasUpstreamReality && !anonymous && !trustedForward) {
+        log("info", `[${session.id}] identity fast path demoted: upstream reality ~${session.stats.lastInputTokens} tok (${evidenceSource}) exists on ${maskUrlForLog(baselineOrigin ?? "unprovenanced")} (model ${evidenceModel ?? "unknown"}) but this request routes to ${maskUrlForLog(currentOrigin ?? "unknown")} (model ${typeof model === "string" && model !== "" ? model : "unknown"})${statedWall > 0 ? " and the overflow wall is already stated" : ""} — the protection chain judges this payload`);
+    }
     // #1933 F1: scale the local text estimate by the per-route calibration
     // factor k̂ learned from this session's own usage reports (local estimate ÷
     // what upstream actually billed; clamped 0.25–4, two-way since #2366 — see
@@ -4094,6 +4141,10 @@ export async function preflightCompressIfNeeded(
         // path instead, without recording a persistent route refusal.
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
+            if (trustedForward) {
+                log("warn", `[${session.id}] identity fast path: local doom-math says core text alone (~${coreTextBytes} bytes ≥ ~${Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN)} tok at the densest observed density) can never fit window ${limit}, but upstream reality (~${session.stats.lastInputTokens} tok, ${evidenceSource}) exists for this origin+model — forwarding as configured; a genuine 400 is handled by the overflow arm`);
+                return prepared;
+            }
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
             log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(prepared.processedMessages)}`);
             const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
@@ -4567,6 +4618,10 @@ export async function preflightCompressIfNeeded(
         // so `outboundRawTokens` is text-only by construction.
         const armMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
         if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
+            if (trustedForward) {
+                log("warn", `[${session.id}] identity fast path: rebuilt outbound measures ~${outboundRawTokens.toLocaleString("en-US")} text tokens over window ${armMeasuredBar.toLocaleString("en-US")} — upstream reality (~${session.stats.lastInputTokens} tok, ${evidenceSource} on this origin+model) outranks the local meter; forwarding instead of 413`);
+                return outbound;
+            }
             const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
             log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
             const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
@@ -4656,7 +4711,11 @@ export async function preflightCompressIfNeeded(
     const outboundCalibrated = foldedCalibratedSize ?? calibratedPayload;
     const nativeFitAfterClamp = statedWall <= 0 && outboundBudgetTokens !== undefined && typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0
         && outboundCalibrated + outboundBudgetTokens <= resolvedNativeWindow;
-    if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp) && !growthArmed) {
+    // trustedForward joins the #3146/#4185 arms: for an identified session
+    // with same-origin+model upstream reality, "still over window after
+    // maximum folding" forwards the outbound instead of failing fast (the
+    // doom gates inside this block are bypassed for it, below).
+    if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp || trustedForward) && !growthArmed) {
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
         // #5000/#4543: the measured body is the stronger reading — if it exceeds
         // the window no upstream can accept it, whatever the byte floor says
@@ -4670,6 +4729,10 @@ export async function preflightCompressIfNeeded(
         // belongs to the #496/#1800 billing arbitration, never to a local doom.
         const gateMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
         if (outboundRawTokens !== undefined && outboundRawTokens > gateMeasuredBar) {
+            if (trustedForward) {
+                log("warn", `[${session.id}] identity fast path: outbound measures ~${outboundRawTokens.toLocaleString("en-US")} text tokens over window ${gateMeasuredBar.toLocaleString("en-US")} after ${result.compressedRanges} fold(s) — upstream reality (~${session.stats.lastInputTokens} tok, ${evidenceSource} on this origin+model) outranks the local meter; forwarding instead of 413`);
+                return outbound;
+            }
             log("error", `[${session.id}] preflight 413 measured-body profile: ${describeCoreTextDuplication(outMsgs)}`);
             const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
@@ -4678,6 +4741,10 @@ export async function preflightCompressIfNeeded(
         }
         const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
         if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
+            if (trustedForward) {
+                log("warn", `[${session.id}] identity fast path: core text alone is ~${doomBytes} bytes even after ${result.compressedRanges} fold(s) — upstream reality (~${session.stats.lastInputTokens} tok, ${evidenceSource} on this origin+model) outranks the local byte math; forwarding instead of 413`);
+                return outbound;
+            }
             const byteFloorTokens = Math.ceil(doomBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
             log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(outMsgs)}`);
             const doomedMessage = `payload core text alone is ~${doomBytes} bytes even after preflight compression — at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
@@ -4685,10 +4752,15 @@ export async function preflightCompressIfNeeded(
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
         }
-        if (localRefusalHere) {
+        if (localRefusalHere && !trustedForward) {
             // #3846: bili already refused this scope locally — do not re-bet on
-            // the estimator; fall through to the fail-fast below.
+            // the estimator; fall through to the fail-fast below. A trusted
+            // forward overrides a stale local refusal: that refusal was an
+            // ESTIMATOR verdict, and recorded upstream reality outranks it.
             log("warn", `[${session.id}] payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for size arbitration (#3846/#4185)`);
+        } else if (trustedForward) {
+            log("warn", `[${session.id}] identity fast path: local verdict says over-window (~${Math.round(result.payloadEstimate)} tok est after ${result.compressedRanges} fold(s), window ${limit}) — upstream reality (~${session.stats.lastInputTokens} tok, ${evidenceSource} on this origin+model) outranks the local estimate; forwarding the outbound as configured`);
+            return outbound;
         } else {
             const viaNativeFit = nativeFitAfterClamp && !noUpstreamEvidence && !unknownBaseline;
             log("info", `[${session.id}] payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) ${viaNativeFit ? `but the outbound view (~${Math.round(outboundCalibrated)} tok) + clamped output budget ${outboundBudgetTokens ?? 0} fits the native window ${resolvedNativeWindow}` : "with no upstream evidence"} — forwarding once for the upstream to arbitrate size before failing fast (#3146/#4185)`);
@@ -4713,6 +4785,17 @@ export async function preflightCompressIfNeeded(
     // byte-relay lanes) — bili must not declare structural doom for it; those
     // lanes keep their 502 fail-fast contract where NOT re-forwarding IS the
     // protection, not a client spin.
+    // Identity fast path, final net: a DETERMINISTIC exhaustion (futile-round
+    // math — no combination of folds closes the gap, #3461 problem 2) would
+    // answer 413 by the mapping below. For an identified session with
+    // same-origin+model upstream reality, that local doom-math is exactly the
+    // judgment the incident showed unreliable — forward the outbound instead.
+    // Relay-dependent (non-deterministic) exhaustion keeps its 502: that is
+    // bili's own summary relay failing, not a payload verdict.
+    if (trustedForward && f?.kind === "exhausted" && f.deterministic) {
+        log("warn", `[${session.id}] identity fast path: fold walk exhausted deterministically — upstream reality (~${session.stats.lastInputTokens} tok, ${evidenceSource} on this origin+model) outranks the local doom-math; forwarding the outbound as configured (a genuine 400 arms the overflow recovery)`);
+        return outbound;
+    }
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : f?.kind === "exhausted" && f.deterministic && !payloadFitsWindow ? 413 : 502;
     // #3918: non-deterministic exhaustion WITH committed progress is not terminal —
     // the folds persist in the session, so the next attempt starts from a smaller
