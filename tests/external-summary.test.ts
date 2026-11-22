@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { ExternalSummaryExecutor, externalSummaryFailureAdvice, type SummaryBudget, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
 import { setLogCapture } from "../src/logger.ts";
 
@@ -109,37 +109,51 @@ test("external summary: a target timeout aborts transport and tries the next can
     assert.equal(result.status, "success");
 });
 
-test("external summary: the batch deadline is a shared pot — the next candidate gets the remaining budget instead of starving (#6885)", async () => {
+function summaryClock(t: TestContext): (ms: number) => Promise<void> {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    t.mock.method(performance, "now", () => Date.now());
+    return async (ms) => {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        t.mock.timers.tick(ms);
+    };
+}
+
+test("external summary: the batch deadline is a shared pot — the next candidate gets the remaining budget instead of starving (#6885)", async (t) => {
+    const advance = summaryClock(t);
     let backup = 0;
-    const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async (_request, signal) => new Promise<string>((_resolve, reject) => {
+    const job = new ExternalSummaryExecutor(1).execute(work, [{ summarize: async (_request, signal) => new Promise<string>((_resolve, reject) => {
         signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
     }) }, { summarize: async () => { backup++; return "backup"; } }], { ...budget, totalTimeoutMs: 15 });
+    await advance(7);
+    const result = await job;
     assert.equal(result.status, "success");
     assert.equal(backup, 1, "the remaining candidate gets the remaining budget instead of starving to zero");
     assert.deepEqual(result.attempts.map((item) => item.outcome), ["timeout", "success"]);
 });
 
-test("external summary: a shrunk target window reports the actual budget, not the nominal one (#6885)", async () => {
-    const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async (_request, signal) => new Promise<string>((_resolve, reject) => {
+test("external summary: a shrunk target window reports the actual budget, not the nominal one (#6885)", async (t) => {
+    const advance = summaryClock(t);
+    const job = new ExternalSummaryExecutor(1).execute(work, [{ summarize: async (_request, signal) => new Promise<string>((_resolve, reject) => {
         signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
     }) }, successful("backup")], { ...budget, totalTimeoutMs: 15 });
+    await advance(7);
+    const result = await job;
     assert.equal(result.status, "success");
     const reported = Number((result.attempts[0].detail ?? "").match(/^target-timeout (\d+)ms/)?.[1]);
-    assert.ok(Number.isFinite(reported) && reported < 500, `the reported budget is the shrunk window (${reported}ms), not the nominal 500ms`);
+    assert.equal(reported, 7, "the reported budget is the shrunk window");
 });
 
-test("external summary: the total deadline still bounds the chain when every candidate is slow (#6885)", async () => {
+test("external summary: the total deadline still bounds the chain when every candidate is slow (#6885)", async (t) => {
+    const advance = summaryClock(t);
     const hang: SummaryCandidate = { summarize: async (_request, signal) => new Promise<string>((_resolve, reject) => {
         signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
     }) };
-    const started = performance.now();
-    const result = await new ExternalSummaryExecutor(1).execute(work, [hang, { ...hang }], { ...budget, totalTimeoutMs: 15 });
-    assert.ok(performance.now() - started < 150, "the chain stops at the total deadline, not after both nominal windows");
+    const job = new ExternalSummaryExecutor(1).execute(work, [hang, { ...hang }], { ...budget, totalTimeoutMs: 15 });
+    await advance(7);
+    await advance(8);
+    const result = await job;
     assert.deepEqual(result.attempts.map((item) => item.outcome), ["timeout", "timeout"], "every candidate got a real share of the pot");
-    // The last target's timer and the total deadline land on the same mark, so
-    // the verdict is whichever clock the loop observes first.
-    assert.ok(result.status === "deadline" || result.status === "failed");
-    if (result.status === "failed") assert.equal(result.reason, "exhausted");
+    assert.equal(result.status, "deadline");
 });
 
 test("external summary: aggregate concurrency bounds distinct operations", async () => {

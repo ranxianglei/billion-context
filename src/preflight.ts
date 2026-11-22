@@ -1830,6 +1830,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         return Math.max(0, imageReserve - deps.measureImageReserve(view.filter(message => !removed.has(message.id))));
     };
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true, hadFoldableCandidates: false };
+    const adoptMeasuredTurn = (turn: ReturnType<CompressionCore["processTurn"]>): void => {
+        turn.state.nudge.estimateHoldStreak = deps.session.state.nudge.estimateHoldStreak;
+        deps.session.state = turn.state;
+        adoptContentStore(deps.session, turn.contentStore);
+    };
     // #4288: set when the round-top fit exit fired — the walk ended in a
     // forward decision, and no later verdict may override it (see the final
     // failure stamp below).
@@ -2038,8 +2043,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 tokenCount: currentTokens, renderTags: "text-only", contentStore: contentStoreOf(deps.session),
             });
             measuredNudge = turn.nudge;
-            deps.session.state = turn.state;
-            adoptContentStore(deps.session, turn.contentStore);
+            adoptMeasuredTurn(turn);
             const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
             refreshImages(view);
             const est = applyEstimateCalibration(estimateCoreMessages(view) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve;
@@ -2280,8 +2284,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             renderTags: "text-only",
             contentStore: contentStoreOf(deps.session),
         });
-        deps.session.state = turn.state;
-        adoptContentStore(deps.session, turn.contentStore);
+        adoptMeasuredTurn(turn);
         // Absorbed pairs are hidden on the wire, so the fit check must see the
         // same reduced payload prepare* will actually forward.
         turn.messages = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);

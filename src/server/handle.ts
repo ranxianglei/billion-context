@@ -3185,7 +3185,11 @@ async function handleRequest(
                 respondFailFast: boolean,
                 overflowWindow?: number,
             ) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = async (respondFailFast, overflowWindow) => {
-                const runPrepareInner = async (): Promise<Prepared> => {
+                const runPrepareInner = async (recoverOverflow: boolean): Promise<Prepared> => {
+                    const failureShrinkArmed = session.stats.lastInputTokensSource === "estimate" && session.stats.emergencyShrinkAt !== undefined;
+                    const prepareConfig = recoverOverflow || failureShrinkArmed
+                        ? { ...reqConfig, nudge: { ...reqConfig.nudge, requireUsageSampleForPressure: false } }
+                        : reqConfig;
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
                     tickPostRebuildAnchor(session);
@@ -3286,18 +3290,18 @@ async function handleRequest(
                         // v1internal dialect the model rides in the envelope meta
                         // instead of the path — fall back to it so Prepared carries
                         // a real model (the loop's synthetic frames read it back).
-                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
+                        return await prepareGoogle(work as GoogleRequestBody, opts, core, prepareConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
                     }
                     const preparedOut = protocol === "anthropic"
-                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
+                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, prepareConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
-                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText)
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, prepareConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText)
                           : responsesCompact
                             // #618: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer —
                             // forward it unchanged (byte-identical passthrough).
                             ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide);
+                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, prepareConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide);
                     // The resolved model rides with the prepared request: on the
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
@@ -3306,8 +3310,8 @@ async function handleRequest(
                 };
                 // #1295: stamp the envelope meta onto every Prepared for this
                 // request (initial AND preflight re-prepares both flow through).
-                const runPrepare = async (): Promise<Prepared> => {
-                    const p = await runPrepareInner();
+                const runPrepare = async (recoverOverflow = false): Promise<Prepared> => {
+                    const p = await runPrepareInner(recoverOverflow);
                     if (ccMeta !== undefined) p.commandcode = { meta: ccMeta };
                     return p;
                 };
