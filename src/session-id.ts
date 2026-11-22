@@ -95,8 +95,12 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // rides the transcript.jsonl harvest in src/identity-codebuddy.ts).
     // Client-specific name; placed AFTER every stricter client header and the
     // affinity tier, before the bare generic `session-id` names.
+    // x-agent-task-id: GitHub Copilot — every model request (main + each
+    // subagent) carries its own agent-task id; placed before the bare
+    // `x-session-id` so a subagent task keys itself apart from its parent
+    // conversation (#7439 worklist). Client-specific name, low collision risk.
     const pluginMarker = typeof headers["x-bili-plugin"] === "string";
-    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "agent-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-conversation-id", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "agent-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-conversation-id", "x-agent-task-id", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];
