@@ -70,7 +70,7 @@ import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
-import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
+import { compactionCoverageText, declareDshCompactionActive, detectCompactionOverlayGap } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
@@ -136,7 +136,11 @@ type CommandInvocation = {
     attachments?: unknown;
     signal?: AbortSignal | undefined;
 };
-type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal };
+// #7505: exec carries the host's tool-call id — the SAME wire id the model minted
+// (deepseek-harness translate.ts brands native.id into ToolCallId and resends it
+// verbatim; pipeline.ts hands the whole exec to tool.execute). Forward it so the
+// server can key the fold block on it and drop the redundant inline anchor.
+type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal; callId?: string };
 
 type ToolDefinition = {
     name: string;
@@ -294,12 +298,7 @@ export { DSH_BUILD_CHECK } from "./client-build-note.js";
  * the gate rows' fate implied. Best-effort by necessity: preset configs
  * resolve lazily, so "so far" is the honest frame. */
 function gateCoverageSuffix(): string {
-    const t = dshCompactionGateTelemetry();
-    if (t === null || t.covered.length === 0) {
-        return " Overlay coverage so far: no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later).";
-    }
-    const entries = t.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
-    return ` Overlay coverage so far: ${t.covered.length} preset ${t.covered.length === 1 ? "entry" : "entries"} rewritten (${entries}).`;
+    return ` Overlay coverage so far: ${compactionCoverageText()}.`;
 }
 
 /** #1590/#1809: origin of the proxy as currently reachable — register.base
@@ -928,7 +927,7 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
             if (typeof sid !== "string" || sid.length === 0) {
                 throw new Error(`bili tool ${tool.name} requires an owning agent session`);
             }
-            const out = await forwardTool(base, sid, tool.name, args, exec.signal, true);
+            const out = await forwardTool(base, sid, tool.name, args, exec.signal, true, exec.callId);
             // #2204: dsh tool results are plain strings — a business failure
             // throws so the host renders an error, not success text.
             if (out.failed) throw new Error(out.text);
@@ -1221,7 +1220,11 @@ function registerArmed(): Promise<void> {
 // log line each. Three states + per-endpoint cumulative counts make the
 // "dozens refused, one passed" distribution diagnosable at a glance.
 type GateAttribution =
-    | { state: "ok"; sid: string }
+    // #6880: `purpose` rides the dispatch's own options (GenerateOptions.purpose,
+    // dsh contract: set ONLY on auxiliary calls — ordinary conversation leaves
+    // it unset). Stamped as x-bili-plugin-purpose so the server classifies the
+    // request BY DECLARATION instead of content-guessing (#6880).
+    | { state: "ok"; sid: string; purpose?: string }
     | { state: "none"; initiatorPresent: boolean }
     | { state: "threw"; message: string };
 
@@ -1247,10 +1250,17 @@ type GateAttribution =
 interface LlmDispatchScope {
     sid: string;
     msgIds: string[] | undefined;
+    purpose?: string;
 }
 const dispatchScope = new AsyncLocalStorage<LlmDispatchScope>();
 
 let noticedScopedAttribution = false;
+// #6770: the #3962 coverage readout only ever rode the profile-bundle note,
+// which stays silent wherever profileContext.startedBundles cannot be read
+// (observed on both a desktop dsh build and the dsh-go runtime), so the
+// coverage reading had no reachable exit. Emit it once per process on the
+// first routed request instead.
+let compactionCoverageNoted = false;
 
 /** #4491: extract the host message ids from llm/stream `options.messages`,
  *  all-or-nothing. Mirrors validateMsgIds in src/msgid-pin.ts (the 400-class
@@ -1335,13 +1345,22 @@ function attributionOf(ctx: PluginContext): GateAttribution {
     // driving), and it survives exactly the shapes the ambient reading does
     // not (agentless compaction/title lanes, disposed scopes, retried
     // re-sends whose initiator scope went away between attempts).
+    // #6770: first routed request is the earliest point where the overlay's
+    // structural rewrites can have happened (preset configs resolve lazily),
+    // so the coverage reading goes out here — the durable profile note that
+    // used to carry it never fires when profileContext.startedBundles cannot
+    // be read, which is the observed state on every host we checked.
+    if (!compactionCoverageNoted) {
+        compactionCoverageNoted = true;
+        persistClientEvent(`bili-native-dsh: compaction overlay coverage — ${compactionCoverageText()} (#6770)`);
+    }
     const scoped = dispatchScope.getStore();
     if (scoped !== undefined && scoped.sid.length > 0) {
         if (!noticedScopedAttribution) {
             noticedScopedAttribution = true;
             persistClientEvent("bili-native-dsh: llm/stream attribution active — session id rides the request object (#4082)");
         }
-        return { state: "ok", sid: scoped.sid };
+        return { state: "ok", sid: scoped.sid, purpose: scoped.purpose };
     }
     try {
         const init = ctx.agents?.currentInitiator?.();
@@ -2079,13 +2098,17 @@ export async function apply(ctx: PluginContext): Promise<void> {
     if (typeof ctx.inject === "function" && typeof ctx.on === "function") {
         const onEvent = ctx.on.bind(ctx);
         ctx.inject(["llm"], () => {
-            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown }, next: () => AsyncIterable<unknown>) => {
+            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown; purpose?: unknown }, next: () => AsyncIterable<unknown>) => {
                 const sid = typeof options?.sessionId === "string" && options.sessionId.length > 0 ? options.sessionId : undefined;
                 if (sid === undefined) return next();
                 // #4491: capture the host message ids riding the same options
                 // — undefined (all-or-nothing) when any message lacks a usable
                 // id, so sidecar shapes degrade to id-less turns.
-                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
+                // #6880: capture the dispatch's declared purpose the same way
+                // (dsh sets it on every auxiliary call; conversation leaves it
+                // unset). Absent/odd values simply stay off the turn.
+                const purpose = typeof options?.purpose === "string" && options.purpose.length > 0 && options.purpose.length <= 64 && /^[\x21-\x7e]+$/.test(options.purpose) ? options.purpose : undefined;
+                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages), purpose };
                 // #5403/#5418 v3: feed the per-slot id sequence into the
                 // watermark channel (the fetch chokepoint emits count +
                 // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
@@ -2600,6 +2623,18 @@ export async function apply(ctx: PluginContext): Promise<void> {
         const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
         refreshModelInfo(register.base, target);
         const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
+        // #6880: the declared purpose rides its own header (ASCII-gated like
+        // the model header below — an odd value degrades to no header, and
+        // the server falls back to its content heuristics). Post-#6883 this is
+        // stamped on EVERY dispatch: the real dsh purpose for auxiliary
+        // calls, or the "conversation" sentinel for main turns (dsh leaves
+        // GenerateOptions.purpose unset for ordinary conversation). PRESENCE
+        // is therefore the v2 declaration — the server routes declared aux by
+        // the header alone and keys declared main traffic on the raw session
+        // id (no persona-order ladder); the sentinel itself is not a side.
+        const declaredPurpose = attr.purpose ?? "conversation";
+        const purposeHeader = asciiHeaderValue(declaredPurpose);
+        if (purposeHeader !== undefined) headers["x-bili-plugin-purpose"] = purposeHeader;
         // #3370: the incremental-turn marker (and, since #3329, the turn id)
         // is no longer stamped here — a closure-level armed flag shared by
         // every session raced concurrent requests across the awaited
@@ -3096,6 +3131,12 @@ export function _resetNonWebTraceForTest(): void {
 /** Test hook: reset the once-per-process unverified-dsh-build note flag. */
 export function _resetDshNewerBuildNoteForTest(): void {
     dshNewerBuildNoted = false;
+}
+
+/** Test hook (#6770): reset the once-per-process compaction-coverage readout
+ *  flag so a test can pin the emit wiring, not just the formatter. */
+export function _resetCompactionCoverageNoteForTest(): void {
+    compactionCoverageNoted = false;
 }
 
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed

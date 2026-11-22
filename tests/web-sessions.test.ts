@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInitialState, defaultConfig } from "acp-kernel";
@@ -903,6 +903,56 @@ withSessionsDir("#1937: warm scans decode zero files; detail decodes only its ow
     assert.equal(afterUnknown.decodedTotal, d2.decodedTotal, "unknown id decodes nothing");
     assert.equal(afterUnknown.detailDecodes, d2.detailDecodes);
 });
+
+for (const tieSavedAt of [false, true]) {
+    withSessionsDir(`disk summaries select the freshest duplicate (${tieSavedAt ? "mtime tie-break" : "savedAt priority"})`, async (dir) => {
+        const id = "duplicate-summary";
+        const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        await store.writeNow(makeSession(id, { protocol: "openai", title: "Current history" }, { requests: 12, inputTokens: 900 }));
+        const relative = (readdirSync(dir, { recursive: true }) as string[]).find((file) => file.endsWith(".json"))!;
+        const currentDir = path.join(dir, "a-current");
+        const staleDir = path.join(dir, "z-stale");
+        mkdirSync(currentDir);
+        mkdirSync(staleDir);
+        const currentPath = path.join(currentDir, path.basename(relative));
+        const stalePath = path.join(staleDir, path.basename(relative));
+        renameSync(path.join(dir, relative), currentPath);
+        const current = JSON.parse(readFileSync(currentPath, "utf8"));
+        const stale = structuredClone(current);
+        const savedAt = Date.parse("2026-11-01T00:00:00Z");
+        current.savedAt = current.payload.savedAt = savedAt;
+        stale.savedAt = stale.payload.savedAt = tieSavedAt ? savedAt : savedAt - 60_000;
+        stale.payload.meta.title = "Old history";
+        stale.payload.stats.requests = 2;
+        stale.payload.stats.inputTokens = 50;
+        writeFileSync(currentPath, JSON.stringify(current));
+        writeFileSync(stalePath, JSON.stringify(stale));
+        utimesSync(currentPath, savedAt / 1000, savedAt / 1000);
+        // A later filesystem timestamp must not override a newer savedAt.
+        const staleMtime = (savedAt + (tieSavedAt ? -30_000 : 30_000)) / 1000;
+        utimesSync(stalePath, staleMtime, staleMtime);
+        _resetSessionsForTest();
+        _resetDiskCacheForTest();
+        _setStoreForTest(new SessionStore({ enabled: false }));
+
+        const list = await buildSessionList();
+        assert.equal(list.length, 1, "duplicate files represent one session");
+        assert.equal(list[0].title, "Current history");
+        assert.equal(list[0].requests, 12);
+        assert.equal(list[0].inputTokens, 900);
+        assert.equal((await buildOverview()).requests, 12);
+        const page = await buildSessionPage({ q: "Current history", pageSize: 20 });
+        assert.equal(page.total, 1, "search uses the same selected summary");
+        assert.equal(page.sessions[0].requests, 12);
+        const cold = _diskScanStatsForTest();
+        await buildSessionList();
+        assert.equal(_diskScanStatsForTest().decodedTotal, cold.decodedTotal, "warm duplicate selection needs no extra decoding");
+
+        const live = getSession(id, { protocol: "openai" });
+        live.stats.requests = 30;
+        assert.equal((await buildSessionList())[0].requests, 30, "live summaries still override disk twins");
+    });
+}
 
 withSessionsDir("#1937: corrupt and content-store files never block or poison the endpoints", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });

@@ -1,6 +1,7 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { renderNudgeText, viableRanges } from "acp-kernel";
+import { recordNudgeInject } from "../cache-ledger.js";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
@@ -108,7 +109,11 @@ export async function prepareGoogle(
     // Title-generation requests (tiny budget) get no compress tooling — same
     // heuristic and same prefix-cache rationale as prepareOpenai.
     const isTitleGen = maxTokens <= 200;
-    const shouldInject = opts.compress.injectTool && !isTitleGen;
+    // zed cloud wire: the response is NDJSON byte-passthrough, so an in-stream
+    // acp loop is structurally unreachable (same reasoning as DSH #3177) — the
+    // model-side compress surface (tools + standing prompt + nudge) is off.
+    const zedLane = req.headers["x-bili-zed-lane"] !== undefined;
+    const shouldInject = opts.compress.injectTool && !isTitleGen && !zedLane;
     const injectTools = shouldInject && !pluginMode;
     // #3417: surface gating lives in lane-decisions (observed reachability
     // overrides the dsh default, #3401); alias kept for the remaining reads.
@@ -393,12 +398,6 @@ export async function prepareGoogle(
         } else if (emergencyPressureHeld) {
             nudgeOutcome = "gated";
         }
-        // #4521: armed-but-silent window — same carrier + rationale as the
-        // anthropic lane (ephemeral trailing user message, current refs
-        // instead of model-guessed ones).
-        if (turn.statusLine) {
-            rebuiltContents = [...rebuiltContents, { role: "user", parts: [{ text: turn.statusLine }] }];
-        }
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
@@ -426,6 +425,7 @@ export async function prepareGoogle(
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
     markDirty(session);
+    if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, processedMessages, originalMessages, judgeBaseline, protocol: "google", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
 }
 

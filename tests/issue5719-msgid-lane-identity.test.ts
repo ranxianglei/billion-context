@@ -39,6 +39,11 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+// Pin the legacy |sub: ladder: trustStampedId is GA-on by default (#7439); this
+// suite characterizes the OLD msgid-lane guard-rail forks (T2/T3/T4) — force the
+// feature OFF to keep asserting the pre-retirement behavior (issue2944 idiom).
+process.env.BILI_ROLLOUT_TRUST_STAMPED_ID = "0";
+
 
 const {
     resolveSessionOrder,
