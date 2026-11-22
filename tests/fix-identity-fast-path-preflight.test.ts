@@ -16,13 +16,24 @@
 //
 // Pinned here:
 //   A. identified sid + same-origin+model usage evidence ≥ window + a
-//      deterministically-doomed payload (image mass alone clears the window;
-//      no combination of folds closes the gap — the incident's exact walk
-//      verdict) → 200 forwarded, log carries the identity fast path line.
-//   B. same seed but the session last ran on ANOTHER model (evidence stale by
-//      the #2117 model gate) → protection chain judges: deterministic 413
-//      retryable:false, log carries the demotion line. The #2847 status
-//      contract is untouched.
+//      deterministically-doomed IMAGE payload (image mass alone clears the
+//      window; no combination of folds closes the gap — the incident's exact
+//      walk verdict) → 200 forwarded. An image-dominated payload is caught
+//      EARLIER by the #496/#1800 image-arbitration forward (opened by the
+//      3c tolerance rule: usage ≥ window = tolerance evidence, not overflow
+//      evidence), so the trust-reality family line is the #496/#1800 one.
+//   A2. same seed but a TEXT-dominated doomed payload (no images, so the
+//      #496/#1800 image hatch cannot intercept) → the identity fast path
+//      itself converts the post-fold doom verdict: 200 forwarded, log carries
+//      the "identity fast path" line specifically (not the arbitration line).
+//   B. same seed but the usage-grade reality is on a FOREIGN origin (#1933 F2
+//      demotion: a bill from another provider is not evidence for this lane)
+//      → protection chain judges: deterministic 413 retryable:false, log
+//      carries the demotion line. The #2847 status contract is untouched.
+//   B2. same seed but the session last ran on ANOTHER model (#2117 model gate
+//      — a bill on claude-big binds nothing for claude-small) → fast path
+//      demoted: deterministic 413 retryable:false, log carries the demotion
+//      line, zero new upstream calls.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -239,6 +250,40 @@ test("e2e identity fast path: identified sid + same-origin upstream reality outr
     }
 });
 
+test("e2e identity fast path fires: a TEXT doom verdict (no images) is converted by the fast path itself, not the #496/#1800 hatch", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-identity-"));
+    const { ctx, calls, close } = await setup();
+    const logs: string[] = [];
+    setLogCapture((_lvl, msg) => { logs.push(msg); });
+    try {
+        await seedTrusted(ctx, "s-id-text-fp");
+        const before = calls.length;
+
+        // TEXT-dominated doomed shape (issue2847: 500 msgs × 4.4K chars ≈ 2.2MB
+        // — past BOTH doom bars; NO images, so the #496/#1800 image-arbitration
+        // hatch cannot intercept). This is the shape that reaches the doom-math
+        // sites and is converted by the identity fast path itself (test A's
+        // image payload is caught earlier by the image hatch, so it does NOT
+        // pin this gate — #3617: the positive direction needs its own row).
+        const r = await post(ctx, bigMessages());
+        const body = await r.text();
+
+        assert.equal(r.status, 200, `trusted same-origin+model TEXT doom must forward (got ${r.status}); body=${body.slice(0, 300)}`);
+        assert.match(body, /forwarded answer/, "the payload actually reached the upstream");
+        const since = calls.slice(before);
+        assert.equal(since.length, 1, `exactly one upstream call for the forward (got ${JSON.stringify(since)})`);
+        assert.equal(since[0]!.summary, false);
+        // THE fast path line specifically — the #496/#1800 arbitration line is
+        // image-only and must NOT be the carrier for a text payload.
+        assert.ok(logs.some((m) => m.includes("identity fast path") && !m.includes("demoted")), "log carries the identity fast path conversion line");
+        assert.ok(!logs.some((m) => m.includes("arbitrate billing (#496/#1800)")), "the text payload did not ride the image-arbitration hatch");
+    } finally {
+        setLogCapture(null);
+        await close();
+        rmrf(root);
+    }
+});
+
 test("e2e identity fast path demotion: usage-grade reality on ANOTHER origin stays demoted — the 413 veto holds (#1933, #2847)", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-identity-"));
     const { ctx, calls, close } = await setup();
@@ -266,6 +311,45 @@ test("e2e identity fast path demotion: usage-grade reality on ANOTHER origin sta
         assert.ok(since.every((c) => c.summary), "the doomed payload was not forwarded (only summary calls, if any)");
         assert.ok(logs.some((m) => m.includes("identity fast path demoted")), "log carries the demotion line");
         assert.ok(!logs.some((m) => /identity fast path(?! demoted)/.test(m)), "no fast-path conversion line for stale-origin evidence");
+    } finally {
+        setLogCapture(null);
+        await close();
+        rmrf(root);
+    }
+});
+
+test("e2e identity fast path demotion: a MODEL change since the last evidence keeps the 413 veto (#2117 model gate)", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-identity-"));
+    const { ctx, calls, close } = await setup();
+    const logs: string[] = [];
+    setLogCapture((_lvl, msg) => { logs.push(msg); });
+    try {
+        // Same origin, usage-grade reality ≥ window — but the session last ran
+        // on a DIFFERENT model. Acceptance evidence is per model (#2117: a bill
+        // on claude-big binds nothing for claude-small), so the fast path must
+        // stay closed and the local doom-math keeps its #2847 veto. This is the
+        // model-mismatch negative direction of the gate — #3617 requires it to
+        // be pinned (the PR body's "regression-covered by #2189" claim does not
+        // hold: #2189's cross-model turns never exercise this gate).
+        await seedTrusted(ctx, "s-id-stale-model");
+        const s = getSession("s-id-stale-model");
+        assert.ok(s, "session exists after seed");
+        s.stats.lastInputTokensModel = "gpt-other"; // a model the session never billed
+        const before = calls.length;
+
+        // Text-only doomed shape (NO images, so the #496/#1800 image
+        // arbitration cannot intercept — the model gate is what must judge).
+        const r = await post(ctx, bigMessages());
+        const body = await r.text();
+        const parsed = JSON.parse(body) as { error?: { code?: string; retryable?: boolean; message?: string } };
+
+        assert.equal(r.status, 413, `stale-model reality must NOT open the fast path (got ${r.status}); body=${body.slice(0, 300)}`);
+        assert.equal(parsed.error?.code, "preflight_compress_failed");
+        assert.equal(parsed.error?.retryable, false);
+        const since = calls.slice(before);
+        assert.ok(since.every((c) => c.summary), "the doomed payload was not forwarded (only summary calls, if any)");
+        assert.ok(logs.some((m) => m.includes("identity fast path demoted")), "log carries the demotion line");
+        assert.ok(!logs.some((m) => /identity fast path(?! demoted)/.test(m)), "no fast-path conversion line for stale-model evidence");
     } finally {
         setLogCapture(null);
         await close();
