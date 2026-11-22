@@ -176,6 +176,14 @@ async function seedAndRefuse(ctx: Ctx, sessionId: string, model: string): Promis
     const rSeed = await post(ctx, { model, stream: true, messages: [{ role: "user", content: "hello" }] });
     assert.equal(rSeed.status, 200, "the fitting seed forwards");
     await rSeed.text();
+    // Identity-fast-path guard: the seed settles a genuine same-origin usage
+    // baseline, which alone would open the trusted fast path (recorded
+    // upstream reality outranks local doom-math). These fixtures pin the
+    // evidence-judged contract, so declare the overflow wall — statedWall > 0
+    // demotes the fast path; the wall equals the configured window, so every
+    // other number in the fixture (the judge's limit, the doom bars) is
+    // unchanged.
+    getSession(sessionId)!.stats.overflowArmTokens = WINDOW;
 
     const rBig = await post(ctx, { model, stream: true, messages: [{ role: "system", content: bigSystem() }, { role: "user", content: "q" }] });
     assert.equal(rBig.status, 413, "oversized non-foldable payload is refused locally");

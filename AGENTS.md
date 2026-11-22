@@ -26,6 +26,38 @@
 | GitHub | https://github.com/ranxianglei/billion-context |
 | License | MIT |
 
+### Supported Hosts — Official Source & Binary Locations
+
+When auditing host behavior (plugin APIs, tool-call-id exposure, compaction seams, wire quirks), clone the source repos from THIS table — never guess the location. Lane semantics (launcher / MITM / config seam / native tool lane) are documented per client in docs/clients.md.
+
+| Host (lane name) | Mode | Official source / binary |
+|---|---|---|
+| pi | native tool lane + launcher | [earendil-works/pi](https://github.com/earendil-works/pi) (pi.dev) |
+| omp (oh-my-pi) | native tool lane (pi factory) | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) (omp.sh) |
+| dsh (deepseek-harness) | native tool lane | [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) |
+| opencode | native tool lane (V1 plugin API) | [anomalyco/opencode](https://github.com/anomalyco/opencode) (opencode.ai) |
+| kimi (Kimi Code) | native tool lane + MITM | [MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code) (kimi.com) |
+| hermes (Hermes Agent) | native Python plugin | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
+| zcode (Z.ai) | native tool lane | [zai-org/ZCode](https://github.com/zai-org/ZCode) (z.ai) |
+| claude (Claude Code) | native MCP lane | closed (Anthropic): https://claude.com/product/claude-code |
+| codex (Codex CLI) | launcher + MCP shell | [openai/codex](https://github.com/openai/codex) |
+| gemini (Gemini CLI) | launcher | [google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli) |
+| qwen (Qwen Code) | launcher / MITM | [QwenLM/qwen-code](https://github.com/QwenLM/qwen-code) |
+| copilot (Copilot CLI) | launcher (closed Go binary) | [github/copilot-cli](https://github.com/github/copilot-cli) |
+| aider | MITM | [Aider-AI/aider](https://github.com/Aider-AI/aider) |
+| goose | launcher | [aaif-goose/goose](https://github.com/aaif-goose/goose) |
+| crush (Charm) | MITM | [charmbracelet/crush](https://github.com/charmbracelet/crush) (charm.land/crush) |
+| zed | MITM | [zed-industries/zed](https://github.com/zed-industries/zed) (zed.dev) |
+| jcode (JCode) | MITM (Rust; no plugin seam, #962) | [1jehuang/jcode](https://github.com/1jehuang/jcode) |
+| qoder (Qoder CLI) | MITM / launcher | closed: https://qoder.com · https://download.qoder.com/qoder-app/releases/latest/Qoder-linux-amd64.deb |
+| workbuddy / codebuddy (Tencent) | config seam (workbuddy, #7456) / launcher (codebuddy) | closed: https://workbuddy.ai · https://download.codebuddy.ai · https://codebuddy.cn |
+| trae (Trae CLI) | MITM | closed: https://trae.ai |
+| iflow (iFlow CLI) | launcher | https://iflow.cn |
+| mcode (MiniMax Code) | MITM (event hooks only, #1050) | closed: https://minimax.io |
+| amp (Amp CLI) | MITM (closed Go, #1049) | closed: https://ampcode.com |
+| kiro (AWS Kiro CLI) | MITM | closed (Rust shell + Node agent server) |
+| antigravity (Google) | launcher (closed Go; additive-only plugin surface, #2115) | closed (Google) |
+
 ## 2. Architecture
 
 ### Module Map
@@ -43,7 +75,7 @@ Tier A entries are every-session rules and stay in full below. Tier B entries ca
 5. **The kernel lives in-repo; determinism comes from git, not a registry pin (#2092) (Tier B)** — consumed via `"acp-kernel": "file:./kernel"`; a commit IS the pin. Any kernel source change MUST bump `version` in `kernel/package.json` (CI-enforced — see Kernel Boundary); `pi-subagents/` follows the same pattern. Full text: design-decisions.md #5.
 6. **Single-writer plugin copies (#991)** — every bili presence has exactly ONE writer; mixing writers is what the guard forbids. The canonical statement is the Install-Lane & Update-Ownership Contract below.
 7. **Two compression modes with different summary carriers** (CRITICAL — reason in BOTH, see §6):
-   - **pluginMode** (the `x-bili-plugin` header / registered agent, e.g. `bili pi`): the ACP-native agent OWNS compression — it executes `compress` locally, the call+result live in its own re-sent history, and the wire summary carrier is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`).
+   - **pluginMode** (the `x-bili-plugin` header / registered agent, e.g. `bili pi`): the ACP-native agent OWNS compression **on the wire** — the `compress` call+result live in its own re-sent history (the computation still runs server-side under the session lock — docs/plugin-protocol.md Why-table; do NOT read "owns" as "executes locally"), and the wire summary carrier is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`).
    - **proxy mode** (plain client, no header): the proxy executes `compress` server-side; the tool call is ephemeral (never enters the client's history) and preflight blocks have none, so the carrier is the **`acp_summary` message** — the kernel renders it role `system`, but `systemToUser` (`src/util.ts`) re-voices it as a **`user` message** (leaving it at its anchor) so strict backends (SGLang: exactly one system at index 0, #377) accept it and the head system message stays byte-stable for the prefix cache.
    - The mode is decided per request and bound per session (`session.metadata.pluginAgent`, sticky, upgrade-only). See docs/technical-notes.md "Two compression modes".
 8. **Nudge cadence is flat 50K by design (kernel contract)** — acp-kernel pins the growth interval at 50000 for every window size (`nudge.growthFloor == nudge.growthCap == 50000`; window-percentage scaling was deliberately removed — #379/#380 settled "growth-driven, no usage/count proxy gates"). Do NOT re-scale the interval with the context window or reintroduce percentage gates; a 1M-window session folding every 50K of growth is intended lean-context behavior. User escape hatch: `compress.nudgeGrowthTokens` (flattens `growthFloor`+`growthCap` to a fixed step) — big-window users who want a lazier cadence set it explicitly. Prompt wording is kernel-owned (`src/nudge-text.ts`).
