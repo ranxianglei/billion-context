@@ -30,6 +30,30 @@ test("qoder side task keys its own |aux: lane off body metadata.business_type", 
     assert.equal(qoderSideTaskConversation("q", { metadata: { business_type: "hook_prompt" } }), "q|aux:qoder-hook_prompt");
 });
 
+test("qoder side task of the SAME business_type disambiguates by body metadata.task_id", () => {
+    // Two same-type side tasks under one parent are distinct conversations; with
+    // GA-on (which retires the in-lane content-guessed split) the per-task id
+    // keeps them apart (zcode x-query-id pattern). Without it they'd merge +
+    // cross-bleed compression state.
+    assert.equal(
+        qoderSideTaskConversation("q", { metadata: { business_type: "agent_summary", task_id: "t-1" } }),
+        "q|aux:qoder-agent_summary:t-1",
+    );
+    assert.equal(
+        qoderSideTaskConversation("q", { metadata: { business_type: "agent_summary", task_id: "t-2" } }),
+        "q|aux:qoder-agent_summary:t-2",
+    );
+    assert.notEqual(
+        qoderSideTaskConversation("q", { metadata: { business_type: "agent_summary", task_id: "t-1" } }),
+        qoderSideTaskConversation("q", { metadata: { business_type: "agent_summary", task_id: "t-2" } }),
+    );
+    // Malformed task_id (path-traversal charset) is ignored → type-only lane.
+    assert.equal(
+        qoderSideTaskConversation("q", { metadata: { business_type: "agent_summary", task_id: "../evil" } }),
+        "q|aux:qoder-agent_summary",
+    );
+});
+
 test("non-qoder type / missing marker / non-object body → no sidecar", () => {
     assert.equal(qoderSideTaskConversation("q", { metadata: { business_type: "main" } }), undefined);
     assert.equal(qoderSideTaskConversation("q", { metadata: {} }), undefined);

@@ -109,8 +109,10 @@ Notes:
 2. **add a header to the roster** — copilot (`x-agent-task-id` before `x-session-id`,
    `src/session-id.ts:99`).
 3. **launcher env + roster header + split** — claude-code: launcher sets
-   `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`, add a `claudeTaskClass` reader, split
-   `subagent|…` → `|sub:`/`|aux:` (keep #5095 token as fallback for non-bili-launched processes).
+   `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`; the split reads `x-claude-code-request-class`
+   and acts only on `subagent` (force the `|sub:` agent split) and `main` (suppress it);
+   `workflow`/`compaction`/`auxiliary`/`side_reply` are validated but fall through to the
+   legacy system-prefix heuristic (keep #5095 token as fallback for non-bili-launched processes).
 4. **consume body lineage** — qoder side-tasks (`metadata.task_id`/`business_type` → `|aux:`,
    zcode pattern), kiro (`kiro:root_conversation_id` after a live capture).
 5. **server-side heuristic (no client fix exists)** — grok (turn-idx absence), omp (fork key mirror).

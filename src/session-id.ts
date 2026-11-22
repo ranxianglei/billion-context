@@ -132,11 +132,19 @@ const QODER_SIDE_TASK_TYPES = new Set(["agent_summary", "webfetch_summary", "hoo
 export function qoderSideTaskConversation(parent: string, body: unknown): string | undefined {
     const metadata = (body as { metadata?: unknown } | undefined)?.metadata;
     if (typeof metadata !== "object" || metadata === null) return undefined;
-    const bt = (metadata as Record<string, unknown>).business_type;
-    if (typeof bt === "string" && QODER_SIDE_TASK_TYPES.has(bt)) {
-        return `${parent}|aux:qoder-${bt}`;
+    const m = metadata as Record<string, unknown>;
+    const bt = m.business_type;
+    if (typeof bt !== "string" || !QODER_SIDE_TASK_TYPES.has(bt)) return undefined;
+    // Two side tasks of the SAME business_type under one parent are distinct
+    // logical conversations. Disambiguate with the per-task id from the body
+    // (same pattern as zcodeMemoryConversation's x-query-id) so GA-on (which
+    // retires the in-lane content-guessed split) does not merge them; fall back
+    // to the type-only lane when the id is absent or malformed.
+    const taskId = m.task_id;
+    if (typeof taskId === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(taskId)) {
+        return `${parent}|aux:qoder-${bt}:${taskId}`;
     }
-    return undefined;
+    return `${parent}|aux:qoder-${bt}`;
 }
 
 /** #1106/#1102: whether the Responses-wire instructions fingerprint should
