@@ -37,6 +37,7 @@ import { describeExternalSummaryFailure, summaryLengthBudgetClause } from "./ext
 export { describeExternalSummaryFailure };
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { newExternalCallId } from "./external-summary-marker.js";
+import { wrapV1Internal } from "./v1internal.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -259,6 +260,8 @@ export interface PreflightDeps {
     imageReserve?: number;
     /** Rebuild the protocol image view after folds; archived images no longer consume the window. */
     measureImageReserve?: (messages: CoreMessage[]) => number;
+    /** Measure the final Responses projection after each fold, including opaque items that core text estimates omit. */
+    measureWireTokens?: (messages: CoreMessage[]) => number;
     /** Constant wire overhead for this request (system prompt + tool definitions, #470). Folding never removes it, so every fit decision must add it — otherwise the loop stops with "text fits" while the billed input still overflows. */
     wireOverhead?: number;
     /** #553: the caller knows this session's input size is unmeasured AND its
@@ -279,6 +282,8 @@ export interface PreflightDeps {
     streamSummaryOff?: boolean;
     /** #2189: the client's billing-attribution block from the INBOUND anthropic system (extractBillingAttributionBlock). Carried into every summary call as system[0]; absent → legacy string system unchanged. */
     billingBlock?: { type: "text"; text: string };
+    /** CloudCode / Antigravity v1internal outer envelope metadata (project, requestId, model, userAgent, requestType). When present, in-channel summary calls are wrapped in `{ ...v1Meta, request: inner }`. */
+    v1Meta?: Record<string, unknown>;
     /** #5974: tokens by which this pass's blind view (processTurn on the client re-send) understates the ACTUAL outbound body, measured by the caller against a fresh full-pipeline rebuild (#4543-① — fold-reconcile id churn re-enters unfolded mass the two pipelines disagree about). When > 0, every fit judgment in this pass runs on the corrected scale (exit bar, futility deficit, relax triggers, tier-distillation funnel, final fitsWindow), so the walk keeps folding until the reconstruction is predicted to fit too. Absent/0 → byte-identical legacy behavior; only the bounded corrective second pass sets it. */
     viewDeltaCorrection?: number;
 }
@@ -464,10 +469,27 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // the #496/#1800 billing arbitration. OpenAI chat `image_url.url`, Anthropic
 // `source.data` and Gemini `inline_data.data` were already excluded.
 const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
+// DSH official-API extension plugins attach transport-only top-level sibling fields
+// (such as `dsh_session_log` up to 8 MiB and `dsh_plugin_packages`) that consume 0 model
+// tokens and are stripped/ignored before inference, whereas nested fields inside
+// `messages[]` remain model-visible and must still be counted.
+const NON_MODEL_TOP_LEVEL_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
+
+function isNonModelTopLevelKey(key: string): boolean {
+    return NON_MODEL_TOP_LEVEL_KEYS.has(key) || key.startsWith("dsh_");
+}
 
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
-    const pending: [unknown, string | undefined][] = [[parsed, undefined]];
+    const pending: [unknown, string | undefined][] = [];
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (isNonModelTopLevelKey(k)) continue;
+            pending.push([v, k]);
+        }
+    } else {
+        pending.push([parsed, undefined]);
+    }
     while (pending.length > 0) {
         const [value, key] = pending.pop()!;
         if (typeof value === "string") {
@@ -503,8 +525,9 @@ export interface RawBodyBreakdown {
 export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
     const pending: [unknown, string | undefined, number][] = [];
-    if (parsed && typeof parsed === "object") {
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (isNonModelTopLevelKey(k)) continue;
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
             pending.push([v, k, bucket]);
         }
@@ -917,8 +940,23 @@ function summaryHeaders(deps: PreflightDeps): Record<string, string> {
 // output, so it is skipped; several candidates only occur when n>1 is
 // requested, which the summary call never is — first candidate wins, mirroring
 // the OpenAI/Anthropic extractors.
+function unwrapGoogleResponseChunk(chunk: Record<string, unknown>): Record<string, unknown> {
+    if (
+        chunk.response &&
+        typeof chunk.response === "object" &&
+        !Array.isArray(chunk.response) &&
+        !("candidates" in chunk) &&
+        !("usageMetadata" in chunk) &&
+        !("promptFeedback" in chunk)
+    ) {
+        return chunk.response as Record<string, unknown>;
+    }
+    return chunk;
+}
+
 function googleChunkText(chunk: Record<string, unknown>): string {
-    const candidates = chunk.candidates;
+    const inner = unwrapGoogleResponseChunk(chunk);
+    const candidates = inner.candidates;
     if (!Array.isArray(candidates) || candidates.length === 0) return "";
     const first = candidates[0];
     if (!first || typeof first !== "object") return "";
@@ -1549,8 +1587,17 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
 // fail-fasts with "context exceeds the model window" instead of compressing.
 const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
 
+function wrapV1SummaryPayload(payload: Record<string, unknown>, meta: Record<string, unknown>): Record<string, unknown> {
+    const cleanMeta: Record<string, unknown> = { ...meta };
+    delete cleanMeta.continuationToken;
+    delete cleanMeta.continuation_token;
+    return wrapV1Internal(payload, cleanMeta);
+}
+
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock, isCodexClient(deps.headers))), stream);
+    const rawPayload = summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock, isCodexClient(deps.headers));
+    const wirePayload = deps.v1Meta ? wrapV1SummaryPayload(rawPayload, deps.v1Meta) : rawPayload;
+    const text = await requestSummaryBody(deps, JSON.stringify(wirePayload), stream);
     let json: unknown;
     try {
         json = JSON.parse(text);
@@ -1772,17 +1819,24 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const calibrateFoldMass = (rawMass: number): number => applyEstimateCalibration(rawMass, kFactor, kOrigin, deps.upstreamOrigin);
     // #5974: measured view-vs-reconstruction divergence (see PreflightDeps.viewDeltaCorrection).
     // Every fit judgment in this pass runs on the corrected scale; 0 keeps legacy behavior.
-    const viewDeltaCorrection = Math.max(0, deps.viewDeltaCorrection ?? 0);
+    let viewDeltaCorrection = Math.max(0, deps.viewDeltaCorrection ?? 0);
+    let reconstructionCorrection: number | undefined;
     let foldTarget = Math.min(limit, deps.compressionTarget ?? limit);
     let textTarget = Math.max(0, foldTarget - imageReserve - viewDeltaCorrection);
     const refreshImages = (view: CoreMessage[]): void => {
         if (deps.measureImageReserve) imageReserve = deps.measureImageReserve(view);
+        if (deps.measureWireTokens) {
+            const coreEstimate = calibrateFoldMass(estimateCoreMessages(view) + wireOverhead);
+            const projectedDifference = Math.max(0, deps.measureWireTokens(view) - coreEstimate);
+            reconstructionCorrection ??= Math.max(0, viewDeltaCorrection - projectedDifference);
+            viewDeltaCorrection = reconstructionCorrection + projectedDifference;
+        }
         textTarget = Math.max(0, foldTarget - imageReserve - viewDeltaCorrection);
     };
     // Removing every nominated source gives an upper bound on image savings.
     // This is only a futility bound: the real post-fold view decides fit.
     const imageSavingBound = (ranges: Array<{ startRef: string; endRef: string }>, view: CoreMessage[]): number => {
-        if (!deps.measureImageReserve || imageReserve <= 0) return 0;
+        if (!deps.measureWireTokens && (!deps.measureImageReserve || imageReserve <= 0)) return 0;
         const { refToIdx } = refMaps(messages, deps.session.state);
         const removed = new Set<string>();
         for (const range of ranges) {
@@ -1790,7 +1844,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (start === undefined || end === undefined || start > end) continue;
             for (let i = start; i <= end; i++) removed.add(messages[i]!.id);
         }
-        return Math.max(0, imageReserve - deps.measureImageReserve(view.filter(message => !removed.has(message.id))));
+        const remaining = view.filter(message => !removed.has(message.id));
+        return Math.max(
+            0,
+            deps.measureImageReserve ? imageReserve - deps.measureImageReserve(remaining) : 0,
+            deps.measureWireTokens ? deps.measureWireTokens(view) - deps.measureWireTokens(remaining) : 0,
+        );
     };
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true, hadFoldableCandidates: false };
     // #4288: set when the round-top fit exit fired — the walk ended in a
@@ -1812,7 +1871,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // pass through, and the latch clears only after a turn is forwarded, so a
     // paused over-window session was refused on every turn. Fold it instead.
     if (epochConfirmPending(deps.session)) {
-        if (result.payloadEstimate + viewDeltaCorrection < limit) {
+        if (Math.max(result.payloadEstimate + viewDeltaCorrection, deps.measureWireTokens?.(messages) ?? 0) < limit) {
             deps.log("debug", `[preflight] fold epoch confirmation pending for ${deps.session.id} — compression paused (verbatim passthrough) until the resent history realigns (#3641)`);
             return result;
         }
