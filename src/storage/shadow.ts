@@ -664,6 +664,18 @@ export class UnifiedShadow {
             const tIngestStart = performance.now();
             let ingestPath = "delta";
             phase = "ingest-delta";
+            // #7439 P2: egress-on sessions skip the messages table write entirely —
+            // the flow table is the canonical store. Only state (blocks/refs/kstate)
+            // is persisted per turn. The messages table becomes a lazy projection,
+            // rebuilt from flow replay on demand (web read / replica / rollback).
+            const egressOn = legacy.metadata?.egressAuthority === true;
+            if (egressOn) {
+                ingestPath = "egress-state-only";
+                phase = "plan-ingest";
+                const plan = planIngest(legacy);
+                phase = "ingest-session";
+                this.sync.ingestSession(plan, undefined, { skipMessages: true });
+            } else {
             // #5677: while drift-latched the sampled digest has PROVEN the
             // stored view diverges from the live one — vouching for a trusted
             // prefix is exactly the trust that sample just voided. A host that
@@ -695,6 +707,7 @@ export class UnifiedShadow {
                 // 8h on exactly this shape).
                 const completeLog = hasRawTail || this.driftedSessions.has(legacy.id);
                 this.sync.ingestSession(plan, undefined, { completeLog });
+            }
             }
             this.stats.ingests++;
             const ingestMs = Math.round(performance.now() - tIngestStart);
