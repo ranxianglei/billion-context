@@ -32,9 +32,10 @@ export const NOTICES: readonly NoticeEntry[] = [
         keys: { on: "pckoff.on", desc: "pckoff.desc", hint: "pckoff.hint", dismiss: "pckoff.dismiss_btn" },
         active: () => pckNoticeActive(effectivePromptCacheRouting(loadConfigFile().promptCache)),
     },
-    // #5403: watermark fastpath experimental-grey intro — visible to every
-    // install until closed or an explicit rollout override exists (users who
-    // wrote their own percent/enabled made the call themselves).
+    // #5403: watermark fastpath GA intro (default ON since the owner ruling
+    // 2026-11-22) — visible to every install until closed or an explicit
+    // rollout override exists (users who wrote their own percent/enabled made
+    // the call themselves).
     {
         id: WM_FASTPATH_INTRO_ID,
         tone: "ok",

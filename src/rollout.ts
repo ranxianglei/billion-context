@@ -59,12 +59,11 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // stamped by the previous response) the server stops re-parsing and
     // re-materializing the identical prefix and decodes only head + new tail.
     // Every verification miss degrades to the legacy full-parse path
-    // byte-identically. EXPERIMENTAL grey rollout at 5% (owner ruling
-    // 2026-11-02: default off, small cohort first, web switch + one-time
-    // intro notice ship alongside); force it per install with
-    // `rollout.features.pluginFullResendWatermark: true|false` (or a percent)
-    // / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1|0`.
-    pluginFullResendWatermark: { percent: 5 },
+    // byte-identically. GA: default ON (owner ruling 2026-11-22, PR #6785:
+    // ran the 5% grey since 2026-11-02 with no issues); opt out per install
+    // with `rollout.features.pluginFullResendWatermark: false` (or a percent)
+    // / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=0`.
+    pluginFullResendWatermark: { percent: 100 },
     // #4804 WS delta continuation: codex/opencode WebSocket clients that keep a
     // previous_response_id checkpoint stop reconstructing full history on every
     // turn — the session augments the delta with the server-committed previous
