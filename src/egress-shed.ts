@@ -64,7 +64,7 @@ export interface ShedWireImagesResult {
  *  purpose): rung B only shrinks the remaining images, so the projection is
  *  conservative in the forwarding-safe direction (it never reports MORE
  *  surviving images than the real shed). */
-export function simulateShedImages(
+function simulateShedImages(
     body: string,
     protocol: WireProtocol,
     targetBytes: number,
