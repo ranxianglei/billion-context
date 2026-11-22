@@ -17,11 +17,19 @@ import { normalizeUpstreamOrigin } from "../src/util.ts";
 // exhaustion now forwards once for upstream arbitration instead of failing
 // fast locally. This pin asserts the LOCAL futility-skip contract, so it
 // carries a settled usage baseline to keep testing the evidence-driven path.
+// Identity-fast-path update: a bare CURRENT-ORIGIN usage baseline would open
+// the fast path ("trust upstream reality over local doom-math") and forward,
+// so the seed additionally arms a stated upstream wall (overflowArmTokens) —
+// the upstream has declared the window is HARD, which demotes the fast path
+// and restores the 413 futility contract under test. (An estimate-grade or
+// foreign-origin baseline instead demotes the floor to 0 and opens the #2313
+// forward-once evidence probe — also not the contract this pin targets.)
 function seedEvidence(upstreamPort: number, sessionId: string): void {
     const s = getSession(sessionId);
     s.stats.lastInputTokens = 100;
     s.stats.lastInputTokensSource = "usage";
     s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(`http://127.0.0.1:${upstreamPort}`);
+    s.stats.overflowArmTokens = 30_000; // stated wall → fast path demoted (#3450)
 }
 
 // #1841: when the cumulative mass of ALL foldable content cannot close the gap

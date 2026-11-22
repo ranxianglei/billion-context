@@ -31,6 +31,56 @@ export function finalizeSseLineEndings(buf: string): string {
     return buf.replace(/\r\n|\r/g, "\n");
 }
 
+/** Frame newly decoded chunks without repeatedly scanning an unfinished
+ *  event. Normalize only the new chunk plus a possible split CR, and join
+ *  incomplete line fragments once when that line ends. Frames preserve the
+ *  existing LF-normalized `split("\n\n")` semantics, including EOF residuals. */
+export function createSseFramer(): {
+    push(chunk: string): Generator<string>;
+    finish(): Generator<string>;
+} {
+    let pendingCr = "";
+    let lineParts: string[] = [];
+    let frameParts: string[] = [];
+
+    function* push(chunk: string): Generator<string> {
+        let text = normalizeSseLineEndings(pendingCr + chunk);
+        pendingCr = text.endsWith("\r") ? "\r" : "";
+        if (pendingCr) text = text.slice(0, -1);
+        let start = 0;
+        let end: number;
+        while ((end = text.indexOf("\n", start)) !== -1) {
+            if (end > start) lineParts.push(text.slice(start, end));
+            if (lineParts.length === 0 && frameParts.length > 0) {
+                // The preceding line's LF and this blank line's LF are the
+                // separator; neither belongs to the returned raw frame.
+                frameParts.pop();
+                const frame = frameParts.join("");
+                frameParts = [];
+                yield frame;
+            } else {
+                if (lineParts.length > 0) frameParts.push(lineParts.join(""));
+                frameParts.push("\n");
+            }
+            lineParts = [];
+            start = end + 1;
+        }
+        if (start < text.length) lineParts.push(text.slice(start));
+    }
+
+    function* finish(): Generator<string> {
+        // A final lone CR is one terminator. Resolving it with an LF uses
+        // the same split-CRLF path and contributes exactly one normalized LF.
+        if (pendingCr) yield* push("\n");
+        const tail = [...frameParts, ...lineParts].join("");
+        frameParts = [];
+        lineParts = [];
+        if (tail.length > 0) yield tail;
+    }
+
+    return { push, finish };
+}
+
 /** Data fields of one already-framed, LF-normalized SSE event form ONE
  * payload, joined by LF. Remove only the optional first space after `:`;
  * indentation and empty fields are part of the payload. */

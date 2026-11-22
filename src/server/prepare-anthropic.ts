@@ -33,7 +33,7 @@ import { detectGenerationBoundary } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper, extractBillingAttributionBlock } from "../preflight.js";
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
-import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
+import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, countAnthropicSystemCacheControls, countAnthropicToolsCacheControls, pinClientMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
@@ -82,7 +82,12 @@ export async function prepareAnthropic(
     const incomingMsgSeqs = (parsed as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
     delete (parsed as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
     ++session.stats.requests;
-    const injectTools = opts.compress.injectTool && !pluginMode;
+    // zed cloud wire: the response is NDJSON byte-passthrough, so an in-stream
+    // acp loop is structurally unreachable (same reasoning as DSH #3177) — the
+    // model-side compress surface (tools + standing prompt + nudge) is off.
+    const zedLane = req.headers["x-bili-zed-lane"] !== undefined;
+    const modelSurfaceOn = opts.compress.injectTool && !zedLane;
+    const injectTools = modelSurfaceOn && !pluginMode;
     // #3417: lane decisions (profile + per-wire observation) own the
     // surface gates; the dsh* alias stays for the remaining reads in this
     // file (Step 3 of #3417 renames the consumers).
@@ -91,7 +96,7 @@ export async function prepareAnthropic(
         pluginMode,
         pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined,
         parsed,
-        shouldInject: opts.compress.injectTool,
+        shouldInject: modelSurfaceOn,
         pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined,
     });
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
@@ -301,14 +306,14 @@ export async function prepareAnthropic(
         // (applyAbsorbView hides regardless of enablement).
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
         const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
-        const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool;
+        const absorbActive = absorbBlock?.enabled === true && modelSurfaceOn;
         // #5765: block-lifecycle tools — one switch, off by default.
         const blockOps = blockOpsTools();
-        const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && opts.compress.injectTool;
+        const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && modelSurfaceOn;
         // acp_rule has no processTurn side effect (no markers/instructions are
         // ever injected into messages), so unlike absorb it needs no loop-
         // config stripping — only tool availability matters.
-        const rulesActive = rulesEnabled(config) && opts.compress.injectTool;
+        const rulesActive = rulesEnabled(config) && modelSurfaceOn;
         // [#1097] the kernel ccr-store node ID-references oversized tool results
         // BEFORE absorb (ID-reference wins over distill); armed policy is
         // stamped per-request — strip `ccr` from the loop config when disarmed
@@ -497,15 +502,27 @@ export async function prepareAnthropic(
         anthropicCacheMarks = cacheControls.size > 0 || anthropicToolsCarryCacheControl(parsed.tools)
             ? undefined
             : computeAnthropicMessageMarks(processedMessages as { id?: string }[], attachedRetrievals.length, session);
-        // #2499: hand the round-2 adapter the SAME marks source the steady path
-        // uses — `anthropicCacheMarks ?? cacheControls`. The client's harvested
-        // map is the fallback the rebuild applies when bili adds no marks of its
-        // own (a client-managed session), so its trigger-turn breakpoint survives.
-        clientCacheControls = cacheControls;
+        // #6861: a client-managed session's moving breakpoints are pinned
+        // cumulatively (same discipline as our own marks) so the outbound
+        // history stays append-stable: without pinning, the client's last-
+        // message breakpoint moves every turn and the old message's bytes
+        // rewrite mid-history on every request. The pinned map is what the
+        // round-2 adapter rebuilds from too (#2499). Proxy mode ONLY: in
+        // plugin mode the host owns the rolling marks (opencode retouch
+        // channel, "no accumulation" contract) — pinning there breaks the
+        // host's latest-only discipline (opencode-rolling-cache-marks).
+        const clientManaged = anthropicCacheMarks === undefined && !pluginMode;
+        if (clientManaged) {
+            const messageCap = Math.max(0, 4 - countAnthropicSystemCacheControls(parsed.system) - countAnthropicToolsCacheControls(parsed.tools));
+            const liveIds = new Set(processedMessages.map((m) => m.id).filter((id): id is string => typeof id === "string" && id.length > 0));
+            clientCacheControls = pinClientMessageMarks(cacheControls, liveIds, session, messageCap);
+        } else {
+            clientCacheControls = cacheControls;
+        }
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
-        rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? cacheControls);
+        rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? clientCacheControls);
         if (sysNotes.length > 0) {
             rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, sysNotes.map((text) => ({ role: "user" as const, content: text })));
         }

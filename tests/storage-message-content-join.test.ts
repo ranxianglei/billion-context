@@ -73,17 +73,16 @@ function countSelects(t: TestContext, store: UnifiedStore) {
 }
 
 for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
-    for (const read of ["all", "pointers", "uncovered", "uncovered-full"] as const) {
+    for (const read of ["all", "uncovered", "uncovered-full"] as const) {
         test(`${engine}: ${read} message reads fetch base content in bounded statements`, (t) => {
             const fixture = setup(t, engine, 1003);
             if (!fixture) return;
             const { store } = fixture;
             const count = countSelects(t, store);
             const rows = read === "all" ? store.getMessages("target")
-                : read === "pointers" ? store.getMessagesAt("target", Array.from({ length: 1003 }, (_, i) => 1002 - i))
                 : store.uncoveredRows("target", read === "uncovered-full" ? [] : Array.from({ length: 502 }, (_, i) => [i * 2, i * 2] as [number, number]));
             assert.equal(rows.length, read === "uncovered" ? 501 : 1003);
-            assert.equal(count().count, read === "pointers" ? 3 : read === "uncovered" ? 5 : 4);
+            assert.equal(count().count, read === "uncovered" ? 5 : 4);
             assert.ok(count().maxPayloadRows <= 500, "body batches must not grow with the whole history");
         });
     }
@@ -101,12 +100,9 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
         assert.deepEqual(store.getMessages("target", { includeRetired: true }), rows.map((row) => row.seq === 2 ? { ...row, retiredAt: 5000 } : row));
         assert.deepEqual(store.getMessages("target", { seqs: [7, 2, 1, 7, 99], fromSeqExclusive: 6 }), [rows[1], rows[7]]);
         assert.deepEqual(store.getMessages("target", { fromSeqExclusive: 4 }), rows.slice(5));
-        assert.deepEqual(store.getMessagesAt("target", [7, 2, 1, 7, 99]), withoutRetired([rows[1]!, rows[7]!]));
         assert.deepEqual(store.uncoveredRows("target", [[5, 7], [2, 0], [0, 1], [1, 2]]), withoutRetired(rows.slice(3, 5)));
-        assert.deepEqual(store.sessionViewRows("target")!.messages, withoutRetired(live));
         assert.deepEqual(store.getMessages("missing"), []);
         assert.deepEqual(store.getMessages("target", { seqs: [] }), []);
-        assert.deepEqual(store.getMessagesAt("target", []), []);
         assert.deepEqual(store.getMessages("other"), expected(input(8, "other")));
     });
 
@@ -122,7 +118,6 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
         writer.prepare("UPDATE content SET bytes = ?, byte_len = ? WHERE hash = ?").run(invalid, invalid.length, hashes[2]);
         const wanted = ["", "", invalid.toString("utf8")];
         assert.deepEqual(store.getMessages("target").slice(0, 3).map((row) => row.content), wanted);
-        assert.deepEqual(store.getMessagesAt("target", [0, 1, 2]).map((row) => row.content), wanted);
         assert.deepEqual(store.uncoveredRows("target", [[3, 7]]).map((row) => row.content), wanted);
     });
 
@@ -140,7 +135,6 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
         });
         store.ingestSession(value);
         assert.deepEqual(store.getMessages("target").map((row) => row.content), originals);
-        assert.deepEqual(store.getMessagesAt("target", [0, 1]).map((row) => row.content), originals);
         assert.deepEqual(store.uncoveredRows("target", []).map((row) => row.content), originals);
         writer.exec("PRAGMA foreign_keys=OFF");
         writer.prepare("DELETE FROM content WHERE hash = ?").run(sha256Hex(payload));
@@ -165,15 +159,13 @@ function mysqlWithSqlite(t: TestContext, count = 8) {
     return { ...fixture, backend, calls };
 }
 
-for (const read of ["all", "pointers"] as const) {
-    test(`mysql ${read} readers execute SQL against SQLite without per-message CAS queries`, async (t) => {
-        const { backend, calls } = mysqlWithSqlite(t, 1003);
-        const rows = read === "all" ? await backend.getMessages("target") : (await backend.sessionViewRows("target"))!.messages;
-        assert.equal(rows.length, 1003);
-        assert.equal(calls.filter((call) => /FROM messages\b|FROM content\b/.test(call.sql)).length, read === "all" ? 4 : 3);
-        assert.ok(calls.every((call) => (call.payloadRows ?? 0) <= 500), "body batches must stay bounded on the SQL backend");
-    });
-}
+test("mysql all readers execute SQL against SQLite without per-message CAS queries", async (t) => {
+    const { backend, calls } = mysqlWithSqlite(t, 1003);
+    const rows = await backend.getMessages("target");
+    assert.equal(rows.length, 1003);
+    assert.equal(calls.filter((call) => /FROM messages\b|FROM content\b/.test(call.sql)).length, 4);
+    assert.ok(calls.every((call) => (call.payloadRows ?? 0) <= 500), "body batches must stay bounded on the SQL backend");
+});
 
 test("mysql joined reads preserve row shapes, filters, media and the snapshot connection", async (t) => {
     const { store, writer, backend, calls } = mysqlWithSqlite(t);
@@ -181,7 +173,6 @@ test("mysql joined reads preserve row shapes, filters, media and the snapshot co
     for (const opts of [undefined, { includeRetired: true }, { seqs: [7, 2, 1, 99, 7] }, { seqs: [] }]) {
         assert.deepEqual(await backend.getMessages("target", opts), store.getMessages("target", opts));
     }
-    assert.deepEqual((await backend.sessionViewRows("target"))!.messages, store.sessionViewRows("target")!.messages);
     const value = input(1, "media");
     const payload = "YWJj".repeat(600);
     const original = JSON.stringify({ imageBase64: payload, text: "kept", rawOpenaiContent: { url: `data:image/png;base64,${payload}` } });
@@ -206,5 +197,4 @@ test("mysql message reads keep missing/empty CAS fallbacks and Buffer decoding",
     const invalid = Buffer.from([0x66, 0x80, 0x00, 0x6f]);
     writer.prepare("UPDATE content SET bytes = ?, byte_len = ? WHERE hash = ?").run(invalid, invalid.length, hashes[2]);
     assert.deepEqual(await backend.getMessages("target"), store.getMessages("target"));
-    assert.deepEqual((await backend.sessionViewRows("target"))!.messages, store.sessionViewRows("target")!.messages);
 });

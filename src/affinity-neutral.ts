@@ -138,7 +138,7 @@ function sortKeys(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(sortKeys);
     if (value !== null && typeof value === "object") {
         const record = value as Record<string, unknown>;
-        const out: Record<string, unknown> = {};
+        const out: Record<string, unknown> = Object.create(null);
         for (const key of Object.keys(record).sort()) out[key] = sortKeys(record[key]);
         return out;
     }

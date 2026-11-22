@@ -148,6 +148,12 @@ test("#4205 #3900-class: doomed body fails fast locally on the reserving route, 
         const w1 = await post(rig, "wrap-sess", "deepseek-flash", [{ role: "user", content: "hi" }]);
         assert.equal(w1.status, 200);
         await w1.text();
+        // Identity-fast-path guard: turn 1 settles a genuine same-origin usage
+        // baseline, which alone would open the trusted fast path and forward the
+        // doomed body. This pin targets the local fail-fast contract, so declare
+        // the overflow wall — statedWall > 0 demotes the fast path; the wall
+        // equals the reserved window R, so the judge's limit is unchanged.
+        listSessions().find((s) => s.id === "wrap-sess")!.stats.overflowArmTokens = RESERVED_WINDOW;
         // Usage report from turn 1 settles a usage-grade baseline, so an
         // over-band turn 2 is judged locally instead of forwarded for
         // evidence (#3146 forward-once only covers unknown baselines).
