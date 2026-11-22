@@ -60,7 +60,7 @@ test("the word 'import' inside a string literal is not an import (the #5636 fals
     // ref — pinning both directions (#3617): no ref here, and a real
     // side-effect import on the next line is still caught.
     const text =
-        'if(!rec)throw new Error("representative file changed between scan and import");decodedBytes=parsed.bytes;\n' +
+        'if(!rec)throw new Error("representative file changed between scan and import");decodedBytes=parsed.bytes;const s="y";\n' +
         'import"left-pad";';
     const refs = findExternalRefs(text);
     assert.equal(refs.length, 1);
