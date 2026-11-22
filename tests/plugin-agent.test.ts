@@ -413,6 +413,41 @@ test("#535/#519: no proxy at factory time → cancel inert until a proxy appears
     }
 });
 
+test("pi-claude-code routed to this proxy counts as opted in for compaction ownership", async () => {
+    // pi-claude-code's models carry baseUrl `process://claude-code`; its turn relay
+    // reaches bili only when PI_CLAUDE_CODE_UPSTREAM_URL names a /bili/ lane on
+    // this proxy. That routing is the opt-in; carriage evidence still decides.
+    const ccCtx = (sid: string) => ({
+        sessionManager: { getSessionId: () => sid },
+        model: { contextWindow: 1000000, baseUrl: "process://claude-code", provider: "claude-code" },
+        cwd: "/tmp",
+    });
+    const knownProxy = await startFakeProxy({ statusOk: true });
+    const unknownProxy = await startFakeProxy({ statusOk: false });
+    try {
+        const run = async (proxy: { origin: string }, env: Record<string, string | undefined>, ctx: ReturnType<typeof ccCtx>) => {
+            let got: unknown;
+            await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILI_NON_HTTP_PROVIDERS: undefined, ...env }, async () => {
+                const pi = makeFakePi();
+                createBiliPlugin("pi")(pi as never);
+                got = await pi.events.get("session_before_compact")!({ reason: "threshold" }, ctx);
+            });
+            return got;
+        };
+        const lane = (origin: string) => `${origin}/bili/https://api.anthropic.com`;
+        assert.deepEqual(await run(knownProxy, { PI_CLAUDE_CODE_UPSTREAM_URL: lane(knownProxy.origin) }, ccCtx("sess-cc")), { cancel: true }, "relay routed here + proxy carries it → bili owns compaction");
+        assert.equal(await run(knownProxy, {}, ccCtx("sess-cc")), undefined, "no upstream override → still vetoed");
+        assert.equal(await run(knownProxy, { PI_CLAUDE_CODE_UPSTREAM_URL: lane(unknownProxy.origin) }, ccCtx("sess-cc")), undefined, "routed to ANOTHER proxy → vetoed");
+        assert.equal(await run(knownProxy, { PI_CLAUDE_CODE_UPSTREAM_URL: "https://api.anthropic.com" }, ccCtx("sess-cc")), undefined, "override that is not a /bili/ lane → vetoed");
+        assert.equal(await run(unknownProxy, { PI_CLAUDE_CODE_UPSTREAM_URL: lane(unknownProxy.origin) }, ccCtx("sess-cc")), undefined, "routed here but proxy never saw the conversation → native compaction proceeds");
+        const otherCtx = { ...ccCtx("sess-other"), model: { contextWindow: 1000000, baseUrl: "claude-bridge", provider: "claude-bridge" } };
+        assert.equal(await run(knownProxy, { PI_CLAUDE_CODE_UPSTREAM_URL: lane(knownProxy.origin) }, otherCtx), undefined, "another non-http provider is not opted in by this override");
+    } finally {
+        await knownProxy.close();
+        await unknownProxy.close();
+    }
+});
+
 test("#1382: compaction cancel requires evidence the proxy carries this conversation", async () => {
     // Native mode sets BILLION_CONTEXT_PROXY for the whole process, but a
     // provider like pi-claude-bridge runs its own child process against

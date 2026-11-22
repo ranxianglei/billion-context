@@ -105,6 +105,26 @@ export function nonHttpProvidersFromEnv(env: NodeJS.ProcessEnv = process.env): S
     return out;
 }
 
+/** pi-claude-code's provider id. Its models carry baseUrl `process://claude-code`:
+ *  each turn runs Claude Code, whose loopback turn relay forwards the Messages
+ *  request upstream with node:https — outside the fetch intercept. */
+export const PI_CLAUDE_CODE_PROVIDER = "claude-code";
+
+/** True iff pi-claude-code's turn relay is pointed at THIS proxy: its upstream
+ *  override (PI_CLAUDE_CODE_UPSTREAM_URL) is a /bili/ lane on `proxyBase`'s
+ *  origin. Then the bridge's traffic provably reaches bili, so the provider is
+ *  opted in without BILI_NON_HTTP_PROVIDERS. Like that opt-in, this only widens
+ *  the candidate set: carriage evidence still decides compaction ownership. */
+export function piClaudeCodeRoutedTo(proxyBase: string, env: NodeJS.ProcessEnv = process.env): boolean {
+    const upstream = proxyBaseFromUrl(env.PI_CLAUDE_CODE_UPSTREAM_URL?.trim());
+    if (upstream === undefined) return false;
+    try {
+        return new URL(upstream).origin === new URL(proxyBase).origin;
+    } catch {
+        return false;
+    }
+}
+
 /** True iff requests to baseUrl will be SEEN by the bili proxy (and thus its
  *  stamped prompt_cache_key consumed + stripped): a /bili/-wrapped URL, the
  *  BILLION_CONTEXT_PROXY origin itself, or a host on the exported MITM
