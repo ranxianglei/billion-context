@@ -107,9 +107,11 @@ function nonNegNumStrict(v: unknown): number | undefined | typeof REJECT {
  *  reload path funnels through it) and by nothing else. Keeps deep settle
  *  sites free of options plumbing, mirroring the registry costCache pattern. */
 let overridePrices: Record<string, BillingPrice> = {};
+let overrideCostRows: CostsShape | null = null;
 
 export function setBillingOverrides(prices: Record<string, BillingPrice> | undefined): void {
     overridePrices = prices ?? {};
+    overrideCostRows = overrideCosts();
 }
 
 export function billingOverrides(): Record<string, BillingPrice> {
@@ -130,9 +132,8 @@ function overrideCosts(): CostsShape | null {
 
 export function resolveBillingPrice(model: string | undefined, host?: string): ResolvedBillingPrice | undefined {
     if (!model) return undefined;
-    const costs = overrideCosts();
-    if (costs !== null) {
-        const hit = scanRegistryCostRow(costs, model, host, { conflictHint: "billing.prices" });
+    if (overrideCostRows !== null) {
+        const hit = scanRegistryCostRow(overrideCostRows, model, host, { conflictHint: "billing.prices" });
         if (hit) return finalize(hit.row, "config");
     }
     const row = peekRegistryCostRow(model, host);
