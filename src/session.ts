@@ -554,17 +554,20 @@ export type Session = {
          *  provider says nothing about whether another accepts the payload.
          *  Absent on legacy session files → baseline keeps legacy behavior. */
         lastInputTokensOrigin?: string;
-        /** #6430: model id that measured lastInputTokens — written by
-         *  settleUsageReport (and the overflow-arm paths) alongside the
-         *  origin. The preflight gate demotes a usage-grade baseline to
-         *  untrusted when the CURRENT request runs on a different model:
-         *  tokenizers bill differently across models, so a cross-model
-         *  baseline (e.g. a 282K opus reading on a fable lane) is not
-         *  authoritative for this request's size. The k̂ read gate
-         *  (currentCalibrationFactor) already demotes on model mismatch;
-         *  the baseline floor must match it, or a stale cross-model
-         *  baseline keeps arming preflight on the same route. Absent on
-         *  legacy session files → baseline keeps legacy behavior. */
+        /** #6430 / identity-fast-path: the REQUEST MODEL that measured
+         *  lastInputTokens — stamped at usage settlement (settleUsageReport /
+         *  applyUsageSample) and at overflow arming, alongside
+         *  lastInputTokensOrigin. Two gates demote on model mismatch: the
+         *  preflight baseline floor (tokenizers bill differently across
+         *  models, so a cross-model baseline — e.g. a 282K opus reading on a
+         *  fable lane — is not authoritative for this request's size; the k̂
+         *  read gate (currentCalibrationFactor) already demotes on model
+         *  mismatch and the baseline floor must match it) and the identity
+         *  fast path (acceptance evidence on one model says nothing about
+         *  another model's wall on the same origin, #2189: 300k billed on
+         *  claude-big does not bind claude-small). Absent on legacy session
+         *  files → the baseline keeps legacy behavior and the fast path
+         *  demotes conservatively. */
         lastInputTokensModel?: string;
          /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
           *  consistent same-route samples of (upstream-billed input ÷ local

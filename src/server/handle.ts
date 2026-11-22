@@ -3492,6 +3492,7 @@ async function handleRequest(
                         anonAffinity !== null,
                         log,
                         instanceId,
+                        v1Meta,
                     );
                     if (isPreflightFailFast(outcome)) {
                         // #301: the payload still overflows the window and

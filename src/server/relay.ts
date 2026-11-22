@@ -1758,7 +1758,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl);
             // #6430: model provenance for the armed baseline — the preflight gate
             // demotes it when the current request runs on a different model.
-            if (reqModel !== undefined) s.stats.lastInputTokensModel = reqModel;
+            if (typeof reqModel === "string" && reqModel !== "") s.stats.lastInputTokensModel = reqModel;
             // #1110: record the arm SEPARATELY so the side-request guard
             // can read it without ever touching the nudge baseline. The guard
             // keeps the CEILING even when the baseline books a measured or
@@ -1835,7 +1835,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 s.stats.lastInputTokensSource = "overflow-arm";
                 s.stats.overflowArmTokens = arm; // #1110: guard reads this, not the baseline
                 s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl); // #2313: same-route evidence, see the window branch above
-                if (reqModel !== undefined) s.stats.lastInputTokensModel = reqModel; // #6430: model provenance, see the window branch above
+                if (typeof reqModel === "string" && reqModel !== "") s.stats.lastInputTokensModel = reqModel; // #6430: model provenance, see the window branch above
             }
             log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of judging window ${judging} and payload estimate), nothing learned (#987): ${info.message}`);
         }
@@ -2945,7 +2945,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 const billed = typeof total === "number" ? total : 0;
                 if (billed > 0 || reportedCached !== null) {
                     // Use the send-time capture; settlement is not another send.
-                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation });
+                    // Model stamp (identity fast path): prepared.model is only
+                    // populated on some lanes — fall back to the same
+                    // body-derived derivation the throttle uses.
+                    const settleModel = typeof prepared.model === "string" && prepared.model !== "" ? prepared.model
+                        : typeof prepared.google?.model === "string" && prepared.google.model !== "" ? prepared.google.model
+                        : typeof requestModelFromBody(wireBody, req) === "string" && requestModelFromBody(wireBody, req) !== "" ? requestModelFromBody(wireBody, req)
+                        : undefined;
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation, model: settleModel });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);
