@@ -751,6 +751,56 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             return;
         }
     }
+    // #7574: outbound op-log latch visibility + operator escape hatch. A
+    // session whose log is this session's content authority fails EVERY turn
+    // (500 egress_flow_unreadable) once the log does not replay. The latch is
+    // saved with the session, so it survives restarts, and before this there
+    // was no way to see which sessions are stuck or to unstick one. Same
+    // shape as the R3 latch routes above: loopback-gated, 501 in legacy mode.
+    if (req.method === "GET" && (req.url === "/__bili/egress/latches" || req.url?.startsWith("/__bili/egress/latches?"))) {
+        const latched = listSessions()
+            .filter((s) => s.metadata?.["egressFlowUnreadable"] === true)
+            .map((s) => ({ sessionId: s.id, lastSeen: s.lastSeen }));
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, count: latched.length, latched }));
+        return;
+    }
+    if (req.method === "POST" && req.url === "/__bili/egress/reset") {
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown };
+            if (typeof parsed.sessionId !== "string" || parsed.sessionId.length === 0) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected { sessionId: string } — take the id from GET /__bili/egress/latches" }));
+                return;
+            }
+            const store = getStore()?.egressOpLogStore() ?? null;
+            if (!store) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+                return;
+            }
+            // Drop the whole log of this session. The next turn starts a fresh
+            // one from what the client sends (the turn is recorded, never
+            // swapped, until the log has caught up). A session that is not
+            // loaded right now clears its latch on its next turn: "latched +
+            // no rows" is what the lane reads as "was reset".
+            const hadLog = store.egressStateMaxSeq(parsed.sessionId) > 0;
+            store.deleteEgressOps(parsed.sessionId);
+            const live = peekSession(parsed.sessionId);
+            if (live) {
+                delete live.metadata["egressFlowUnreadable"];
+                delete live.metadata["egressAuthority"];
+            }
+            log("info", `[admin] POST /__bili/egress/reset session=${parsed.sessionId.slice(0, 12)}… hadLog=${hadLog} sessionLoaded=${live !== undefined}`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, hadLog, sessionLoaded: live !== undefined }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
     // #2671 Phase 2: replica/checkpoint management over the unified store.
     // Loopback-gated like every /__bili/ route; 501 in legacy mode so the
     // operator knows the knob, not the URL, is what is missing.

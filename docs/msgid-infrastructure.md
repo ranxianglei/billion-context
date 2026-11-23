@@ -46,7 +46,7 @@ One-off closure from the review: `parseTailIds` alone lacked the reserved-prefix
 
 ## 5. Persistence single source of truth
 
-The unified-store `messages.msg_id` column is the ONLY id truth: ingestion pins validated ids into rows (T5 ruling: no parallel ledger; skeleton rows carry no ids). Ledger primary key `(session_id, msg_id, content_hash)`; canonical rows key on **MSGID, not content hash** (#4491); fork clones preserve numbers (#4316 L3 PR3/3 `cloneSessionRows`). **KDD #23 carve-out (egress-on sessions only):** the op log is the canonical message authority (`egress_flow.msgid` + `log_seq`); the messages rows become a LAZY projection rebuilt one-time on plane rollback / web read / restore, and the pin channel (KDD #21/#21) resolves the op log's I rows instead of this ledger for those sessions — all other consumers unchanged.
+The unified-store `messages.msg_id` column is the ONLY id truth: ingestion pins validated ids into rows (T5 ruling: no parallel ledger; skeleton rows carry no ids). Ledger primary key `(session_id, msg_id, content_hash)`; canonical rows key on **MSGID, not content hash** (#4491); fork clones preserve numbers (#4316 L3 PR3/3 `cloneSessionRows`). **KDD #23 carve-out (egress-on sessions only):** the op log is the canonical message authority (`egress_flow.msgid` + `log_seq`); the messages rows become a LAZY projection rebuilt one-time on plane rollback / web read / restore, and the pin channel (KDD #21/#22) resolves the op log's I rows instead of this ledger for those sessions — all other consumers unchanged.
 
 ## 6. Consumers (six; what question each one asks of the ids)
 

@@ -29,7 +29,8 @@ import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
-import { CcrLedgerRow, hydrateSlimCcrStore, slimCcrEnvelope, splitKstate } from "./slim.js";
+import { CcrLedgerRow, hydrateSlimCcrStore, isEmptyStateValue, slimCcrEnvelope, splitKstate } from "./slim.js";
+import { log as loggerLog } from "../logger.js";
 import { splitMediaContent, identityOfStoredContent } from "./identity.js";
 
 /**
@@ -733,6 +734,10 @@ export class LegacyViewBuilder {
     private ccrRows: readonly CcrLedgerRow[] = [];
     private orphanViews?: Record<string, { one: unknown; full: unknown }>;
     private stateFieldsRows: Record<string, string> | null = null;
+    /** The kstate column as stored — needed by applyStateFieldsRows to
+     *  tell an older build's default from a value written after the rows
+     *  (#7574 rollback). */
+    private columnKstate: Record<string, unknown> = {};
 
     constructor(
         private readonly session: LegacyViewRows["session"],
@@ -740,6 +745,7 @@ export class LegacyViewBuilder {
         deadRefs: LegacyViewRows["deadRefs"],
     ) {
         const kstate = JSON.parse(session.kstateJson) as Record<string, unknown>;
+        this.columnKstate = kstate;
         this.tail = JSON.parse(session.tailJson);
         this.messageSeqs = [...new Set([...(this.tail.tailSeqs ?? []), ...(this.tail.pluginSnapshotSeqs ?? [])])];
 
@@ -794,13 +800,27 @@ export class LegacyViewBuilder {
     }
 
     /** #6785 step 8: apply the row-backed state fields OVER the column
-     *  values (rows win; corrupt row → column value, if any, stays). */
+     *  values (rows win; corrupt row → column value, if any, stays).
+     *  #7574 (rollback): a build that predates the rows does not know the
+     *  nine fields moved out of the column — it loads a session WITHOUT
+     *  them and writes the column back. When this build returns, a column
+     *  that carries one of the fields means "written by the older build
+     *  after the rows": a NON-EMPTY column value is newer than the row
+     *  (something was added while the older build ran) and stays; an EMPTY
+     *  one (the older build's default) gives way to the row, which still
+     *  holds the value from before. Every row used to win unconditionally,
+     *  so a rule or a token-snapshot entry added while the older build ran
+     *  silently vanished on the next load. */
     private applyStateFieldsRows(): void {
         if (this.stateFieldsRows === null) return;
         for (const [field, valueJson] of Object.entries(this.stateFieldsRows)) {
+            let value: unknown;
             try {
-                this.state[field] = JSON.parse(valueJson);
-            } catch { /* corrupt row → column value (if any) stays */ }
+                value = JSON.parse(valueJson);
+            } catch { continue; /* corrupt row → column value (if any) stays */ }
+            const column = this.columnKstate[field];
+            if (column !== undefined && !isEmptyStateValue(column)) continue;
+            this.state[field] = value;
         }
     }
 
@@ -869,7 +889,7 @@ export class LegacyViewBuilder {
             lastMessagesFolded: tail.tailFolded,
         };
         if (pluginSnapshot) out.pluginSnapshot = pluginSnapshot;
-        out.contentStore = resolveCcrContentStore(s.ccrJson, this.ccrRows);
+        out.contentStore = resolveCcrContentStore(s.ccrJson, this.ccrRows, s.sessionId);
         return out;
     }
 }
@@ -882,16 +902,32 @@ export class LegacyViewBuilder {
  * row whose ledger is empty or still carries legacy NULL-orig rows is an
  * inconsistency: no store (the file lane still has it), never a partial one.
  * Full (pre-step-6) envelopes parse verbatim. Corrupt JSON → undefined.
+ *
+ * #7574: no longer a SILENT degradation. The one way this shape arises in
+ * practice is a rollback: an older build (everything before the unified
+ * storage) parses the slim column as if it were the old full envelope, so
+ * its save rewrites the ledger rows to the bare `{ hash }` stubs it saw and
+ * drops the link to the original text. Those texts cannot be linked back —
+ * the session loads without its content store and the log says why (the
+ * nine row-backed state fields DO come back, see applyStateFieldsRows).
  */
 export function resolveCcrContentStore(
     ccrJson: string | null,
     ccrRows: readonly CcrLedgerRow[],
+    sessionId = "?",
 ): LegacyView["contentStore"] {
     if (ccrJson === null) return undefined;
     try {
-        const parsed = JSON.parse(ccrJson) as { ccrSlim?: number; orphanByHash?: unknown };
-        if (parsed.ccrSlim === 1) {
-            return hydrateSlimCcrStore(parsed, ccrRows) ?? undefined;
+        const head = JSON.parse(ccrJson) as { ccrSlim?: number };
+        if (head.ccrSlim === 1) {
+            const store = hydrateSlimCcrStore(JSON.parse(ccrJson) as Parameters<typeof hydrateSlimCcrStore>[0], ccrRows);
+            if (store === null && ccrRows.length > 0) {
+                const linkDropped = ccrRows.some((r) => r.origContent === null);
+                loggerLog("warn", `[storage] session=${sessionId}: the content store could not be rebuilt from its ${ccrRows.length} ledger row(s) (${linkDropped
+                    ? "the rows carry no original text — this is what an older build leaves behind after it saved this session; those tool-output and file-read texts cannot be restored"
+                    : "a body the content table no longer has, or a key the ledger no longer lists"}) — the session is loaded without it`);
+            }
+            return store ?? undefined;
         }
         return JSON.parse(ccrJson) as LegacyView["contentStore"];
     } catch {

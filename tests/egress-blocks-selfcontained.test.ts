@@ -32,6 +32,8 @@ process.env.BILI_PERSIST_ZSTD = "0";
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-egress-blocks-selfcontained-hermetic-"));
 process.env.BILI_CONFIG_FILE = path.join(hermetic, "no-config.json");
 process.env.BILI_STORAGE_UNIFIED = "legacy";
+// msgid coordinates are taken from the op log only while the plane is on (#7574)
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
 
 const SUMMARY_TEXT = "self-contained summary body " + "z".repeat(48);
 const SENTINEL = "content table corrupted sentinel";
@@ -101,9 +103,8 @@ function blockRowRaw(db: Db, sessionId: string): { summary_bytes: unknown; start
 
 function opsFor(store: UnifiedStore): EgressOpLogStore {
     return {
-        egressStateAppendOps: (s, o, nowMs) => store.egressStateAppendOps(s, o, nowMs),
+        egressAppendTurn: (s, o, baseSeq, nowMs) => store.egressAppendTurn(s, o, baseSeq, nowMs),
         egressStateView: (s) => store.egressStateView(s),
-        egressStateCompactView: (s, v, nowMs) => store.egressStateCompactView(s, v, nowMs),
         egressStateViewAt: (s, x) => store.egressStateViewAt(s, x),
         egressStateMaxSeq: (s) => store.egressStateMaxSeq(s),
         egressStateTruncateAfter: (s, x) => store.egressStateTruncateAfter(s, x),

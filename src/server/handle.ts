@@ -760,6 +760,7 @@ async function handleRequest(
     let parsed: unknown = null;
     let bodyText: string | undefined;
     let bodyParseDeferred = false;
+    let deferredMsgCount = 0;
     if (protocol && bodyBuffer.length > 0) {
         bodyText = bodyBuffer.toString("utf8");
         // #7398 perf: a multi-MiB OpenAI body on the pf handshake is a
@@ -770,11 +771,16 @@ async function handleRequest(
         // the null marker). prepareOpenai re-parses the full body exactly once
         // if — and only if — the lanes miss. No pf header / small body /
         // unscannable shape / any field-span parse failure = legacy parse,
-        // byte-for-byte the old behavior.
+        // byte-for-byte the old behavior. materializeDeferredBody
+        // (prepare-openai) puts the array back with every OTHER field exactly
+        // as handle.ts left it. The rollout flag is part of the condition:
+        // with it off the fastpath gate in prepareOpenai can never open, so
+        // deferring would only move the same parse later.
         const pfProto = req.headers["x-bili-pf-count"] !== undefined || req.headers["x-bili-pf-delta"] !== undefined || req.headers["x-bili-pf-tail-ids"] !== undefined;
-        if (protocol === "openai" && pfProto && bodyBuffer.length >= 1048576) {
-            const synth = synthesizeTopLevel(bodyText);
-            if (synth !== null) { parsed = synth; bodyParseDeferred = true; }
+        if (protocol === "openai" && wireFamily === null && pfProto && bodyBuffer.length >= 1048576 && featureEnabled("pluginFullResendWatermark")) {
+            const scanCounts = { total: 0 };
+            const synth = synthesizeTopLevel(bodyText, scanCounts);
+            if (synth !== null) { parsed = synth; bodyParseDeferred = true; deferredMsgCount = scanCounts.total; }
         }
         if (!bodyParseDeferred) {
             try {
@@ -894,11 +900,15 @@ async function handleRequest(
     // the raw body text. #4753 released it unconditionally, which silently disabled
     // the fastpath (its bodyText !== undefined gate could never fire). Keep the text
     // only on the wire+flag slice where the fastpath can fire; the strict gate in
-    // prepare-openai (pluginMode + !titleGen) remains authoritative.
-    if (!(protocol === "openai" && featureEnabled("pluginFullResendWatermark"))) bodyText = undefined;
+    // prepare-openai (pluginMode + !titleGen) remains authoritative. A deferred
+    // parse keeps the text regardless: the conversation array exists nowhere
+    // else, and the gate in prepare-openai may still be closed for this request.
+    if (!(protocol === "openai" && featureEnabled("pluginFullResendWatermark")) && !bodyParseDeferred) bodyText = undefined;
     // #903: inbound message count for the per-request cost line — messages
     // (anthropic/openai) or input (responses); null when the body has neither.
+    // A deferred body carries the count the span scan measured.
     const inboundMsgs: number | null = (() => {
+        if (bodyParseDeferred) return deferredMsgCount;
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
         const p = parsed as Record<string, unknown>;
         if (Array.isArray(p.messages)) return p.messages.length;

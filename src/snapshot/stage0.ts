@@ -209,13 +209,27 @@ export function runStage0(opts: Stage0Input): Stage0Result {
                 } catch {
                     liveIds = [];
                 }
-                // EXCEPTION: a short array on an EMPTY ledger is not drift —
-                // there is no frontier to anchor against, so it is a failed
-                // collection on an unknown session: the legacy R3 fault
-                // applies (B1/D2 semantics: 400 for a non-bound sid).
+                // EXCEPTION: a BROKEN short array on an EMPTY ledger is a
+                // collection fault (B1/D2 semantics: 400 for a non-bound sid).
+                // #7574: a WELL-FORMED short array on an empty ledger is not.
+                // With the incremental form on by default it is what an
+                // incremental client sends on its first turn after the
+                // server lost the ledger (restored or recreated database,
+                // session removed while the host kept its conversation) —
+                // and it used to cost that client a failed turn (400, three
+                // of them latched the session to the unpinned path for
+                // good). There is nothing to anchor against, so the turn
+                // runs without the pin (content-derived ids) and the
+                // response asks for the full list, which rebuilds the ledger
+                // on the next turn exactly like a new session. Only entries
+                // that are broken themselves (empty, too long, reserved
+                // prefix, whitespace/control characters, duplicates) stay a
+                // fault — a real client's tail never contains those.
                 if (liveIds.length === 0 && bodyTail !== null) {
-                    const v = validateMsgIds(bodyTail, msgs.length);
-                    if (!v.ok && armed) {
+                    const v = validateMsgIds(bodyTail, bodyTail.length);
+                    if (v.ok) {
+                        log("warn", `[${sessionId}] [msgid] ${lane}-wire tail form on an empty ledger — nothing to anchor against: the turn runs without the pin, the response asks for the full list (#7574)`);
+                    } else if (armed) {
                         const convBound = (() => {
                             try {
                                 return getStore()?.snapConvBound(sessionId) ?? false;

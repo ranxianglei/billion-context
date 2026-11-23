@@ -632,7 +632,49 @@ async function withProxyT(
 
 const PLUGIN_HEADERS = { "content-type": "application/json", "x-bili-plugin": "e2e-agent", "x-acp-session": "e2e-sess" } as Record<string, string>;
 
-test("B1: a declared host that fails to collect msgids (count mismatch) → 400 + x-bili-snapshot: identity, no upstream forward", async () => {
+test("B1: a declared host that collects broken msgids (empty entry in the array) → 400 + x-bili-snapshot: identity, no upstream forward", async () => {
+    await withProxyT(
+        () => ({ status: 200, payload: sseDone() }),
+        async (url, bodies) => {
+            const res = await fetch(url, {
+                method: "POST",
+                headers: PLUGIN_HEADERS,
+                body: JSON.stringify({
+                    model: "gpt-e2e",
+                    stream: true,
+                    input: [
+                        { type: "message", role: "user", content: "first" },
+                        { type: "message", role: "user", content: "second" },
+                        { type: "message", role: "user", content: "third" },
+                    ],
+                    // a short array (the tail form) whose entries are broken:
+                    // an empty id is never something a real client sends —
+                    // this is the collection fault the B1 channel is for
+                    biliMsgIds: ["b1m1", ""],
+                }),
+            });
+            assert.equal(res.status, 400, "the identity fault is a 400 (the B1 control channel — not the generic 503)");
+            assert.equal(res.headers.get("x-bili-snapshot"), "identity");
+            // #7574 item 5: the refusal also says "no pin this turn — resend in
+            // full form", the same contract as the msgid delta re-anchor 400.
+            assert.equal(res.headers.get("x-bili-msgid-mode"), "full");
+            const err = JSON.parse(await res.text()) as { error: { type: string; message: string } };
+            assert.equal(err.error.type, "snapshot_identity_fault");
+            assert.ok(err.error.message.includes("R3"), "the error names the fault class");
+            assert.equal(bodies.length, 0, "zero side effects: the upstream was never contacted");
+        },
+        { env: { BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY: "1" } },
+    );
+});
+
+test("#7574: a well-formed short id array on an empty ledger no longer fails the turn — it is served and the response asks for the full list", async () => {
+    // Before #7574 this was the B1 "count mismatch" case: a short array on a
+    // session the server has no ledger for was answered with 400 (three of
+    // them latched the session to the unpinned path). With the incremental
+    // form on by default, this is simply an incremental client on its first
+    // turn after the server lost the ledger (restored / recreated database,
+    // removed session) — nothing is broken, nothing can be anchored, so the
+    // turn runs without the pin and the client rebuilds the ledger next turn.
     await withProxyT(
         () => ({ status: 200, payload: sseDone() }),
         async (url, bodies) => {
@@ -646,15 +688,13 @@ test("B1: a declared host that fails to collect msgids (count mismatch) → 400 
                         { type: "message", role: "user", content: "first" },
                         { type: "message", role: "user", content: "second" },
                     ],
-                    biliMsgIds: ["b1m1"], // 1 declared vs 2 elements — the R3 fault
+                    biliMsgIds: ["tail-anchor"], // 1 well-formed id for 2 elements = the tail form
                 }),
             });
-            assert.equal(res.status, 400, "the identity fault is a 400 (the B1 control channel — not the generic 503)");
-            assert.equal(res.headers.get("x-bili-snapshot"), "identity");
-            const err = JSON.parse(await res.text()) as { error: { type: string; message: string } };
-            assert.equal(err.error.type, "snapshot_identity_fault");
-            assert.ok(err.error.message.includes("R3"), "the error names the fault class");
-            assert.equal(bodies.length, 0, "zero side effects: the upstream was never contacted");
+            assert.equal(res.status, 200, "the turn is served");
+            await res.text();
+            assert.equal(bodies.length, 1, "the upstream was contacted");
+            assert.equal(res.headers.get("x-bili-msgid-mode"), "full", "and the client is told to send the full list next turn");
         },
         { env: { BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY: "1" } },
     );
@@ -747,12 +787,14 @@ test("#7064 D2: a conversation-bound sid never takes the R3 fault path", async (
     const log = (level: string, msg: string) => logs.push({ level, msg });
     try {
         assert.ok(store.snapConvBound(sid), "the conversations row makes the sid conversation-bound");
-        // a non-bound sid with the SAME fault 400s (control):
+        // a non-bound sid with a BROKEN array 400s (control; #7574: only a
+        // broken entry is a collection fault — a well-formed short array is
+        // the tail form, see the test below):
         assert.throws(() => runStage0({
             sessionId: "d2-sid-nobound",
             lane: "openai",
             msgs: dMsgs(5),
-            incomingMsgIds: ["a", "b"], // 2 ids for 6 messages
+            incomingMsgIds: ["a", ""], // 2 ids for 6 messages, one of them empty
             incomingSeqs: null,
             pluginMode: true,
             log,
@@ -761,7 +803,7 @@ test("#7064 D2: a conversation-bound sid never takes the R3 fault path", async (
             sessionId: sid,
             lane: "openai",
             msgs: dMsgs(5),
-            incomingMsgIds: ["a", "b"], // the same fault — bound: no throw
+            incomingMsgIds: ["a", ""], // the same broken array — bound: no throw
             incomingSeqs: null,
             pluginMode: true,
             log,
@@ -774,7 +816,7 @@ test("#7064 D2: a conversation-bound sid never takes the R3 fault path", async (
             sessionId: sid,
             lane: "openai",
             msgs: dMsgs(5),
-            incomingMsgIds: ["a"], // worse: 1 id for 6
+            incomingMsgIds: [" "], // worse: 1 id for 6, and it is whitespace
             incomingSeqs: null,
             pluginMode: true,
             wpHit: { view: [] as BiliMessage[], lastSeq: 5 },
@@ -793,6 +835,38 @@ test("#7064 D2: a conversation-bound sid never takes the R3 fault path", async (
     } finally {
         r3FaultTracker.clearLatched(sid);
         r3FaultTracker.clearLatched("d2-sid-nobound");
+    }
+});
+
+test("#7574: a well-formed tail on an empty ledger is not a fault — no throw, no strike, the full signal, and the full list rebuilds the ledger next turn", async (t) => {
+    const { store } = d23Harness(t);
+    const sid = "d7574-sid";
+    const logs: DLog[] = [];
+    const log = (level: string, msg: string): void => { logs.push({ level, msg }); };
+    try {
+        assert.equal(store.snapConvBound(sid), false, "a plain sid (not conversation-bound) — the case that used to 400");
+        // the client is in incremental mode and sends its tail; the server has no ledger
+        const r1 = runStage0({
+            sessionId: sid, lane: "openai", msgs: dMsgs(5),
+            incomingMsgIds: ["anchor", "new-1"], incomingSeqs: null,
+            pluginMode: true, log,
+        });
+        assert.equal(r1.pinned, null, "nothing to anchor against — the turn runs on content-derived ids");
+        assert.equal(r1.pinMode, "full", "the response asks for the full list");
+        assert.ok(!r3FaultTracker.isLatched(sid), "no fault, no latch");
+        assert.ok(logs.some((l) => l.level === "warn" && l.msg.includes("tail form on an empty ledger")), `the reason is logged: ${logs.map((l) => l.msg).join(" | ")}`);
+        // next turn the client sends the full list: the pin applies and the ledger is rebuilt
+        const ids = ["u1", "a1", "u2", "a2", "u3"];
+        const core = dMsgs(5);
+        const r2 = runStage0({
+            sessionId: sid, lane: "openai", msgs: core.map((m, i) => ({ ...m, id: `h-${i}` })),
+            incomingMsgIds: ids, incomingSeqs: null,
+            pluginMode: true, log,
+        });
+        assert.deepEqual(r2.pinned?.map((m) => m.id), ids, "the full list pins every element");
+        assert.equal(r2.pinMode, "incremental");
+    } finally {
+        r3FaultTracker.clearLatched(sid);
     }
 });
 

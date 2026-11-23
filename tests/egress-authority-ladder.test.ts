@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
-import { egressStateAppend, egressStateAt, egressStateView } from "../src/storage/egress-state.ts";
+import { egressAppendTurn, egressStateAt, egressStateView } from "../src/storage/egress-state.ts";
 import { recordEgressTurn, recoverEgressBase, type EgressOpLogStore } from "../src/storage/egress-record.ts";
 import { EgressAuthorityRejectError } from "../src/storage/egress-record.ts";
 import { egressAuthorityProbe, recordAuthorityTurn, resolveEgressAuthority } from "../src/server/egress-lane-io.ts";
@@ -20,14 +20,13 @@ function open() {
     const { db } = openSqliteDatabase(path.join(dir, "index.db"));
     migrateSchema(db);
     const store: EgressOpLogStore = {
-        egressStateAppendOps: (sid, ops, nowMs) => egressStateAppend(db, sid, ops, nowMs),
+        egressAppendTurn: (sid, ops, baseSeq, nowMs) => egressAppendTurn(db, sid, ops, nowMs, { baseSeq }),
         egressStateView: (sid) => egressStateView(db, sid),
-        egressStateCompactView: (sid, view, nowMs) => db.prepare(`SELECT 1`).get() ? 0 : 0,
         egressStateViewAt: (sid, seq) => egressStateAt(db, sid, seq),
-        egressStateMaxSeq: (sid) => (db.prepare(`SELECT COALESCE(MAX(log_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
+        egressStateMaxSeq: (sid) => (db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
         egressStateTruncateAfter: (sid, seq) => {
-            const a = db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND log_seq > ?`).run(sid, seq);
-            const b = db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND log_seq > ?`).run(sid, seq);
+            const a = db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
+            const b = db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
             return Number(a.changes) + Number(b.changes);
         },
     };
@@ -118,10 +117,10 @@ test("egress-lane-io: authority seam records first, then serves the written view
     try {
         const c1 = [M("m1", "alpha"), M("m2", "beta")];
         // turn 1 (bootstrap): empty flow → client bytes are recorded once
-        const a1 = resolveEgressAuthority({ session, st: H.store, sessionId: S, core: c1, log: quiet });
+        const a1 = resolveEgressAuthority({ session, st: H.store, sessionId: S, core: c1, log: quiet, armed: true });
         assert.equal(a1.bootstrapping, true, "row-less session is the turn-1 bootstrap");
         assert.equal(a1.swappedCore, null);
-        const t1 = recordAuthorityTurn(H.store, S, a1, c1, "sys", quiet);
+        const t1 = recordAuthorityTurn(H.store, S, a1, "sys", quiet);
         assert.ok(t1 !== null, "a bootstrap turn serves the client core");
         assert.deepEqual(t1.map((m) => m.id), ["m1", "m2"], "core rows only — the system row stays out");
         assert.equal(t1[0].text, "alpha");
@@ -132,10 +131,10 @@ test("egress-lane-io: authority seam records first, then serves the written view
         // the flow must keep appending (pre-fix serve-before-record dropped
         // it and froze the flow on a zero-op diff)
         const c2 = [M("m1", "alpha"), M("m2", "beta"), M("m3", "gamma")];
-        const a2 = resolveEgressAuthority({ session, st: H.store, sessionId: S, core: c2, log: quiet });
+        const a2 = resolveEgressAuthority({ session, st: H.store, sessionId: S, core: c2, log: quiet, armed: true });
         assert.equal(a2.bootstrapping, false, "a non-empty flow is never bootstrap again");
         assert.ok(a2.swappedCore !== null, "a healthy flow with a passing probe swaps");
-        const t2 = recordAuthorityTurn(H.store, S, a2, c2, "sys", quiet);
+        const t2 = recordAuthorityTurn(H.store, S, a2, "sys", quiet);
         assert.ok(t2 !== null, "turn 2 serves");
         assert.deepEqual(t2.map((m) => m.id), ["m1", "m2", "m3"], "the served core contains THIS turn's new message");
         const rowsAfter = H.db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(S) as { n: number };
@@ -154,14 +153,14 @@ test("egress-lane-io: probe failure degrades to legacy — flow NOT advanced (#3
         const rowsBefore = H.db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(S) as { n: number };
         void view;
         // reordered client rows → probe fails → legacy: no swap, no record
-        const a = resolveEgressAuthority({ session, st: H.store, sessionId: S, core: [M("m2", "beta"), M("m1", "alpha")], log: quiet });
+        const a = resolveEgressAuthority({ session, st: H.store, sessionId: S, core: [M("m2", "beta"), M("m1", "alpha")], log: quiet, armed: true });
         assert.equal(a.bootstrapping, false);
         assert.equal(a.swappedCore, null, "probe failure keeps the client core");
-        assert.equal(recordAuthorityTurn(H.store, S, a, [M("m2", "beta"), M("m1", "alpha")], "sys", quiet), null, "legacy serves nothing from the seam");
+        assert.equal(recordAuthorityTurn(H.store, S, a, "sys", quiet), null, "legacy serves nothing from the seam");
         const rowsAfter = H.db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(S) as { n: number };
         assert.equal(rowsAfter.n, rowsBefore.n, "the flow did NOT advance on untrusted bytes");
         // ...and the re-attempt with a well-formed echo DOES swap (gate opens again)
-        const ok = resolveEgressAuthority({ session, st: H.store, sessionId: S, core: [M("m1", "alpha"), M("m2", "beta"), M("m3", "gamma")], log: quiet });
+        const ok = resolveEgressAuthority({ session, st: H.store, sessionId: S, core: [M("m1", "alpha"), M("m2", "beta"), M("m3", "gamma")], log: quiet, armed: true });
         assert.ok(ok.swappedCore !== null, "a conforming next turn swaps again");
     } finally {
         H.db.close();
@@ -177,9 +176,12 @@ test("egress-lane-io: no healthy point → hard fail + egressFlowUnreadable latc
         void view;
         H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND row_type != 'D'`).run('{"x":1}', S);
         H.db.prepare(`UPDATE egress_state SET payload = ? WHERE session_id = ? AND row_type != 'D'`).run('{"x":1}', S);
-        assert.throws(() => resolveEgressAuthority({ session, st: H.store, sessionId: S, core: [M("m1", "alpha")], log: quiet }), EgressAuthorityRejectError, "unreadable flow never degrades to client bytes");
+        assert.throws(() => resolveEgressAuthority({ session, st: H.store, sessionId: S, core: [M("m1", "alpha")], log: quiet, armed: true }), EgressAuthorityRejectError, "unreadable flow never degrades to client bytes");
         assert.equal(session.metadata["egressFlowUnreadable"], true, "the operator-recovery latch is set");
-        assert.equal(session.metadata["egressAuthority"], true, "the authority latch precedes the recovery attempt");
+        // #7574: a retry of the latched session fails at once — the 17 replay
+        // scans are not repeated on every request.
+        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND row_type != 'D'`).run('{"x":2}', S);
+        assert.throws(() => resolveEgressAuthority({ session, st: H.store, sessionId: S, core: [M("m1", "alpha")], log: quiet, armed: true }), EgressAuthorityRejectError, "a latched session keeps failing until an operator resets the log");
     } finally {
         H.db.close();
         fs.rmSync(H.dir, { recursive: true, force: true });

@@ -52,7 +52,7 @@ import { tryIncrementalPin } from "../snapshot/stage0.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { yieldToEventLoop } from "../yield-loop.js";
-import { recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -587,11 +587,17 @@ export async function prepareAnthropic(
         // carry flow bytes, fresh rows stay client bytes; probe failure =
         // legacy (flow NOT advanced, re-attempts next turn). Unreadable
         // flow → hard fail.
-        if (featureEnabled("egressPlane")) {
+        // #7574: the swap (server authority) is armed by the ONE shared rule
+        // (egressAuthorityArmed — same as the OpenAI lane: plugin turn, ids
+        // pinned, not a title request). Every other main turn is only
+        // recorded, and an unreadable log then means "not recorded", not a
+        // failed request.
+        if (featureEnabled("egressPlane") && !anthropicTitleGen) {
             const st = getStore().egressOpLogStore();
             if (st) {
-                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log });
-                const served = recordAuthorityTurn(st, sessionId, auth, laneCoreForRecord, extractSystem(systemOut) ?? "", log);
+                const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinMode === "incremental", sideRequest: anthropicTitleGen });
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
+                const served = recordAuthorityTurn(st, sessionId, auth, extractSystem(systemOut) ?? "", log);
                 if (served !== null) {
                     rebuiltMessages = coreToAnthropic(served, anthropicCacheMarks ?? clientCacheControls);
                 }
