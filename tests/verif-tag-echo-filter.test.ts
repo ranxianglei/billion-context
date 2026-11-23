@@ -218,21 +218,6 @@ test("P5 residue duality: strip removes every detectable artifact", () => {
     // detectors keep firing on the preserved close: log-signals, not strip
     // guarantees). When strip acted, nothing strict may remain.
     const acted = stripAcpTags(t) !== t;
-    // #4106 family (single-sweep gated pass ordering): a refs run against an
-    // UNTERMINATED acplike close dies only via DEAD_REF_CLOSE, whose "an
-    // earlier pass already acted" gate is still closed when the sole other
-    // artifact is a marker line removed by a LATER pass — the unit then
-    // survives the sweep. Known open (C#4106 pins the sibling idempotence
-    // gap). While #4106 is open, exclude exactly this shape — and no
-    // iteration carrying any OTHER surviving render-tag evidence.
-    const gatedUnit = /(?<![\w>])m\d{4,}(?:\s*[\u2013\u2014,\-]?\s*m\d{4,})*\s*<\/[a-zA-Z]{1,32}(?![^<>]{0,32}>)/;
-    if (
-      acted &&
-      gatedUnit.test(out) &&
-      /\[ACP\]/.test(t) &&
-      !/\[ACP\]/.test(out) &&
-      !containsRenderTagText(out.replace(new RegExp(gatedUnit.source, "g"), ""))
-    ) continue;
     if (acted && containsRenderTagText(out)) why.push("render-tag");
     if (acted && /(?<![\w>])m\d{4,}\s*<\/[a-zA-Z]/.test(out)) why.push("echo-residue");
     if (acted && /(^|\n)[\u{1F300}-\u{1FAFF}\u2600-\u27BF}\u2B00-\u2BFF] ?\[ACP\]/u.test(out)) why.push("marker-line-at-line-start");
