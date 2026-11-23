@@ -53,10 +53,11 @@ clones from — keeps container egress at zero and works behind host git
 proxies), `gitProxy`, `npmRegistry` (deps mirror for the build; unrelated to
 the in-container lane registry), `turnTimeoutMs`, `agents` (Lane P set),
 `agentsR` (Lane R set; default `dsh,pi`, add `claude` for the anthropic-wire lane),
-`snapBase` (P/R lanes only: run the candidate's snapBase egress plane ON in the
-gate's bili.json — `"all"` = every protocol cohort, `"openai,responses,anthropic,google"`
-subset = explicit cohorts, absent/`"off"` = off, byte-identical gate; for
-candidate-branch verification, e.g. #6785), `laneScript` (P lanes only: force a
+`snapBase` (P/R lanes only: run the candidate's EGRESS op-log plane ON in the
+gate's bili.json — writes `rollout.features.egressPlane=true`; `storage.snapBase`
+was retired in bc51c9445 and the plane has no per-protocol cohort, so any
+on-value turns the whole plane on; absent/`"off"` = off, byte-identical gate;
+for candidate-branch verification, e.g. #6785), `laneScript` (P lanes only: force a
 specific harness-script copy, e.g. the bundled `/gate-tools/plugin-lanes.mjs` —
 needed when the candidate checkout predates a harness fix; default is the
 candidate's OWN `scripts/gate/plugin-lanes.mjs`, bundled copy as fallback),

@@ -376,7 +376,7 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)
  *  diverges) and D2 (conversation-bound sessions skip the verdict) made the
  *  full canon unnecessary. Pre-slimming rows migrate on first open
  *  (probe below). */
-const SNAPBASE_DDL_V12 = `-- #5874 snapshot foundation v2 (P0 schema, l1_world identity ledger).
+const L1WORLD_DDL_V12 = `-- #5874 snapshot foundation v2 (P0 schema, l1_world identity ledger).
 CREATE TABLE IF NOT EXISTS l1_world (
     sess_raw       TEXT PRIMARY KEY,
     ledger_id      TEXT NOT NULL,
@@ -501,7 +501,7 @@ export function migrateSchema(db: {
     const hasL1World = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'l1_world'")
         .get();
-    if (!hasL1World) db.transaction(() => db.exec(SNAPBASE_DDL_V12));
+    if (!hasL1World) db.transaction(() => db.exec(L1WORLD_DDL_V12));
     // #6785 step 7: orphan blocks — own probe (a db written between the
     // egress_snapshot and orphan_blocks landings picks it up here; fresh dbs
     // pass through — same discipline, no version bump).

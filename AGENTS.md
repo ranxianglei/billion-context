@@ -95,7 +95,7 @@ Tier A entries are every-session rules and stay in full below. Tier B entries ca
 
 ### #20 — id 存储去重与 msgid 生命周期梳理（#7064, owner 裁定 2026-11-17） (Tier B)
 
-msgid 真身只有 `messages.msg_id` 一处，`l1_world`/`fold_journal`/`egress_snapshot` 里的 id 清单 JSON 全是投影，已全部降级为「区间引用 + 防伪指纹」：l1_world = 尾 512/头 32 id 窗 + count + max_pos（身份闸门→记账游标，中段不可见）；fold_journal = [start_seq,end_seq] + input_hash（原文行防伪指纹，按区间重扫重推）；egress_snapshot = 水位线以下存活行聚合指纹。**D1 永不判分叉**（判决最强动作是 reanchor 一条 UPDATE，永不 reject/400/reset）；**D2 conversation-bound 跳过 id 判定**（宿主身份行的 sid 游标纯记账，R3 故障永不触发，短/缺 msgid 只降级 + 日志）；**D3 尾锚常活**（水位命中轮同样 pin + 刷新游标；stage-0 推进 bump revisionEpoch，snapFlush epoch 证明看见推进——fork 拿不到过期父 revision）。改 l1/fold_journal/egress 任何一处前先读 discussion #7064 与本条目——三表回答的是同一个问题（「我缓存的和账本还对得上吗」），不需要 id 清单本身。Full text: design-decisions.md #20.
+msgid 真身只有 `messages.msg_id` 一处，`l1_world`/`fold_journal`/`egress_snapshot` 里的 id 清单 JSON 全是投影，已全部降级为「区间引用 + 防伪指纹」：l1_world = 尾 512/头 32 id 窗 + count + max_pos（身份闸门→记账游标，中段不可见）；fold_journal = [start_seq,end_seq] + input_hash（原文行防伪指纹，按区间重扫重推）；egress_snapshot = 水位线以下存活行聚合指纹。（本 PR 后续：`fold_journal`/`egress_snapshot` 两表在合入前整体退役（bc51c9445，7439 裁定）——v2 基座最终只剩 `l1_world`，egress 状态由 `egress_state`/`egress_flow` op log 承担；上句对两表的形态描述是退役前的中间形态，留作历史。）**D1 永不判分叉**（判决最强动作是 reanchor 一条 UPDATE，永不 reject/400/reset）；**D2 conversation-bound 跳过 id 判定**（宿主身份行的 sid 游标纯记账，R3 故障永不触发，短/缺 msgid 只降级 + 日志）；**D3 尾锚常活**（水位命中轮同样 pin + 刷新游标；stage-0 推进 bump revisionEpoch，snapFlush epoch 证明看见推进——fork 拿不到过期父 revision）。改 l1/fold_journal/egress 任何一处前先读 discussion #7064 与本条目——三表回答的是同一个问题（「我缓存的和账本还对得上吗」），不需要 id 清单本身。Full text: design-decisions.md #20.
 
 ### #21 — msgid pin 通道增量化：稳态只发尾部，快照轮才发全量（#7064 §8, owner 裁定 2026-11-18） (Tier B)
 

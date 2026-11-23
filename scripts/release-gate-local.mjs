@@ -32,8 +32,9 @@
 //                  tree — run `npm run build` first, as the release
 //                  pre-flight already does).
 //   --with-update  also run Lane U (needs verdaccio + GATE_VERDACCIO_NPMRC).
-//   --snapbase-full  run the #5874 snapshot plane (P0+P1+P2) fully ON for this
-//                  invocation (all four wire cohorts); default = plane off.
+//   --snapbase-full  run the egress op-log plane (ruling 7439, successor of
+//                  the retired #5874 snapBase v2 plane) fully ON for this
+//                  invocation (rollout.features.egressPlane); default = plane off.
 //   --keep         keep the scratch dir (default: remove on success, keep on
 //                  failure for post-mortem).
 //   --reuse-base-dir  accept a NON-EMPTY --base-dir (default: refuse — a
@@ -183,11 +184,11 @@ const G = {
   keep: !!arg("keep"),
   skip: String(arg("skip", "")).split(",").filter(Boolean),
   withUpdate: !!arg("with-update"),
-  // #5874 snapshot-plane validation: turn the plane's four config-file flags
-  // ON for this run only (master + shadow-write lane + direct egress
-  // authority, all four wire cohorts). The gate's storage default is
-  // pure-sqlite — the only path the plane operates on. Without the flag the
-  // gate runs the plane fully OFF (its shipped default).
+  // Egress op-log plane validation (ruling 7439; the retired #5874 snapBase
+  // v2 plane's successor — `storage.snapBase` left the config surface in
+  // bc51c9445, `rollout.features.egressPlane` is the one switch): ON for this
+  // run only. Without the flag the gate runs the plane fully OFF (its shipped
+  // default).
   snapbaseFull: process.argv.includes("--snapbase-full"),
 };
 
@@ -381,19 +382,13 @@ async function main() {
           },
           // Lane U reads `latest` from here (a dsh-managed proxy must NOT self-update in place).
           ...(verdaccioOk ? { update: { registry: G.verdaccio } } : {}),
-          // --snapbase-full: run the #5874 v2 snapshot-base plane fully ON
-          // for this gate invocation — egress stable-prefix cache for all
-          // four wire cohorts. Absent flag = plane off (the shipped
-          // default), so a normal gate run is byte-identical to pre-plane.
+          // --snapbase-full: run the egress op-log plane fully ON for this
+          // gate invocation (rollout.features.egressPlane — the retired
+          // snapBase v2 key would be a silent no-op now). Absent flag = plane
+          // off (the shipped default), so a normal gate run is byte-identical
+          // to pre-plane.
           ...(G.snapbaseFull
-            ? {
-                storage: {
-                  snapBase: {
-                    enabled: true,
-                    cohorts: ["openai", "anthropic", "google", "responses"],
-                  },
-                },
-              }
+            ? { rollout: { features: { egressPlane: true } } }
             : {}),
         },
         null,
