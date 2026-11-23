@@ -487,7 +487,21 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // body "measure" ~10M tokens and doom-gates 413'd image turns that belong in
 // the #496/#1800 billing arbitration. OpenAI chat `image_url.url`, Anthropic
 // `source.data` and Gemini `inline_data.data` were already excluded.
-const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
+// Opaque cryptographic thinking signatures (`signature`, `thoughtSignature`,
+// `thought_signature`) are excluded alongside media blobs so multi-megabyte
+// signature payloads never masquerade as ~1M+ prompt tokens. OpenAI Responses
+// `encrypted_content` stays counted because it carries encrypted reasoning
+// token mass that counts toward the context window and must trigger preflight.
+const NON_TEXT_BODY_KEYS = new Set([
+    "data",
+    "url",
+    "b64_json",
+    "file_data",
+    "image_url",
+    "signature",
+    "thoughtSignature",
+    "thought_signature",
+]);
 // DSH official-API extension plugins attach transport-only top-level sibling fields
 // (such as `dsh_session_log` up to 8 MiB and `dsh_plugin_packages`) that consume 0 model
 // tokens and are stripped/ignored before inference, whereas nested fields inside
