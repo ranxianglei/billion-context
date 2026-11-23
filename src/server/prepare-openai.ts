@@ -113,7 +113,11 @@ export async function prepareOpenai(
     // system prompt bytes (compress prompt added/removed) — which breaks the
     // provider prefix cache for every subsequent turn.
     const isTitleGen = maxTokens <= 200;
-    const shouldInject = opts.compress.injectTool && !isTitleGen;
+    // zed cloud wire: the response is NDJSON byte-passthrough, so an in-stream
+    // acp loop is structurally unreachable (same reasoning as DSH #3177) — the
+    // model-side compress surface (tools + standing prompt + nudge) is off.
+    const zedLane = req.headers["x-bili-zed-lane"] !== undefined;
+    const shouldInject = opts.compress.injectTool && !isTitleGen && !zedLane;
     const injectTools = shouldInject && !pluginMode;
     // #3177: DSH registers bili's ACP tools host-scope (invisible to the preset
     // agent — 0/3939 request headers carry them), so model-driven compression is
