@@ -93,6 +93,8 @@ Tier A entries are every-session rules and stay in full below. Tier B entries ca
 
 身份信号来源只有三类：**宿主写入**（msgid body 字段 / 信封 `msgIds` / pf 头）、**宿主盖戳头**（opencode V2 `x-bili-msg-ids`）、**自包含采集器**（`src/identity-harvest.ts` 注册表 + `src/identity-<client>.ts` 适配器；双门：env `BILI_IDENTITY_HARVEST` 或灰度键 `rollout.features.identityChannelHarvest`，均默认关 × 仅回环来源）。**消费者（#5719 归属档 / pin-行链路 / membership / 水位）只从统一缝取数**：handle 入口每请求按「body 字段 > 盖戳头 > 采集」取一次快照——绝不新增「逐调用点单独取数」。新车道 = 新适配器文件 + barrel 一行登记 + 文档一行；适配器自包含、整轮退化（任一环节不判定 ⇒ 该轮整体回退接线前路径，绝不做部分映射）。车道状态表与信任边界：docs/identity-channels.md；身份判定逻辑：docs/session-identity-resolution.md。Full text: design-decisions.md #18.
 
+19. **不用本地估算拒发:超窗一律转发,上游的大小判决才是权威 (no estimate-based size refusal — #7537, owner 裁定 2026-11-22) (Tier A)** — bili 本地判「这个包超过模型窗口 → 413 拒发」的整条机制已废除:本地窗口值本身就常常错(fallback 窗口,#7205),估算 × 错窗口 = 乘性误差,拒掉的往往是上游本来能收的包(#7167/#7382/#2490/#2847 家族);被拒绝的字节没有进过任何上游,错误信息只有本地估算、没有上游的真实号码。新契约:**该折的照折(fold-first 不变),折完一律转发;上游以真实号码拒绝时(413 / 大小类 400),bili 把自己的实测证据(出站 token 数+分维度 breakdown+入站字节+有效窗口)打进日志并在响应上标记 `x-bili-retryable: false`(JSON 体可解析时并入 `bili_evidence` + `error.retryable=false`),防止按状态码驱动的重试循环烧配额**。**保留的本地拒发只有两种:非估算类**——消息条数门(`BILI_MAX_MESSAGES`,真实 wire 约束)与 5GiB 纯字节 sanity cap(资源保护)。实现:src/server.ts 四处 413 拒发点 + src/server/relay.ts 出口熔丝两道大小门(计数门保留);测试钉在 tests/issue7537-preflight-passthrough.test.ts 及既有 preflight 套件的重钉。Full text: design-decisions.md #20.
+
 ### Install-Lane & Update-Ownership Contract (#1196)
 
 Every bili presence on a machine follows ONE contract — decide changes against it, not ad hoc:
