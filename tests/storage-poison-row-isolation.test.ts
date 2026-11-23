@@ -131,39 +131,40 @@ test("appendBlockContents: corrupt summary/one CAS rows are skipped and returned
     assert.equal((contents.get("missing-one") as { one: unknown }).one, null);
 });
 
-test("reader: one unparseable block summary CAS row degrades the full view instead of aborting", (t) => {
+test("reader: one unparseable block summary row degrades the full view instead of aborting", (t) => {
     const { store, db, dir } = fixture(t);
     const plan = planIngest(seed("target"));
     assert.equal(store.ingestSession(plan, undefined, { completeLog: true }), true);
 
-    // Poison the block summary's CAS bytes (the full/one content — NOT payload_json).
-    const row = db.prepare("SELECT summary_hash FROM blocks WHERE session_id = ? AND block_id = ?").get("target", "b0") as { summary_hash: string };
-    db.prepare("UPDATE content SET bytes = X'7b6f6f7073' WHERE hash = ?").run(row.summary_hash);
+    // Poison the block summary's stored bytes — the denormalized summary_bytes
+    // column (NOT payload_json) is what getBlocks reads after #6785's
+    // COALESCE(summary_bytes, content.bytes).
+    db.prepare("UPDATE blocks SET summary_bytes = X'7b6f6f7073' WHERE session_id = ? AND block_id = ?").run("target", "b0");
 
     const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" });
     assert.ok(shadow);
     t.after(() => shadow.close());
     const view = shadow.viewFor("target") as LegacySessionLike & { tailGaps?: number } | null;
-    assert.ok(view, "the session must still load with one corrupt block summary CAS row");
-    assert.equal(view!.state.blocks!.length, 4, "block metadata survives a corrupt summary CAS row");
-    assert.equal(view!.lastMessages!.length, 4, "messages survive a corrupt summary CAS row");
+    assert.ok(view, "the session must still load with one corrupt block summary row");
+    assert.equal(view!.state.blocks!.length, 4, "block metadata survives a corrupt summary row");
+    assert.equal(view!.lastMessages!.length, 4, "messages survive a corrupt summary row");
     assert.equal(view!.blockContents.size, 3, "the corrupt block's content row is skipped");
     assert.ok(!view!.blockContents.has("b0"), "the corrupt block's content is dropped");
 });
 
-test("reader: one unparseable block summary CAS row degrades the resident-field read instead of aborting", (t) => {
+test("reader: one unparseable block summary row degrades the resident-field read instead of aborting", (t) => {
     const { store, db, dir } = fixture(t);
     const plan = planIngest(seed("target"));
     assert.equal(store.ingestSession(plan, undefined, { completeLog: true }), true);
 
-    const row = db.prepare("SELECT summary_hash FROM blocks WHERE session_id = ? AND block_id = ?").get("target", "b0") as { summary_hash: string };
-    db.prepare("UPDATE content SET bytes = X'7b6f6f7073' WHERE hash = ?").run(row.summary_hash);
+    // Same denormalized-column poison as the full-view test above.
+    db.prepare("UPDATE blocks SET summary_bytes = X'7b6f6f7073' WHERE session_id = ? AND block_id = ?").run("target", "b0");
 
     const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" });
     assert.ok(shadow);
     t.after(() => shadow.close());
     const fields = shadow.readResidentFieldsFor("target", { blockContents: true });
-    assert.ok(fields, "the resident fields must still load with one corrupt block summary CAS row");
+    assert.ok(fields, "the resident fields must still load with one corrupt block summary row");
     assert.equal(fields!.blockContents!.size, 3, "the corrupt block's content row is skipped");
     assert.ok(!fields!.blockContents!.has("b0"), "the corrupt block's content is dropped");
     assert.ok(fields!.blockContents!.has("b1"), "the other blocks' content survives");
