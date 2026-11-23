@@ -519,7 +519,17 @@ export function migrateSchema(db: {
     const hasEgressState = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_state'")
         .get();
-    if (!hasEgressState) db.exec(EGRESS_STATE_DDL);
+    // #7574 item 10: the group is TWO tables + TWO indexes, so it is applied
+    // inside ONE transaction. Executed bare (the driver autocommits each
+    // statement of the batch separately) a crash after the first CREATE left
+    // egress_state without egress_flow, and this table probe then said
+    // "already there" on every later open — the half-built pair stayed
+    // half-built forever. The probe now asks for BOTH tables, so a library
+    // interrupted by the old code converges on its next open.
+    const hasEgressFlow = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_flow'")
+        .get();
+    if (!hasEgressState || !hasEgressFlow) db.transaction(() => db.exec(EGRESS_STATE_DDL));
     // 7439 ruling (canonical message number): a dev DB created with the
     // pre-numbering row shape (log_seq primary key, no op_seq column) is
     // replaced in place — the two tables NEVER shipped in any release, so
@@ -528,9 +538,12 @@ export function migrateSchema(db: {
     const egressCols = (db.prepare("PRAGMA table_info(egress_state)").all() as unknown as { name?: unknown }[])
         .map((c) => c.name);
     if (egressCols.length > 0 && !egressCols.includes("op_seq")) {
-        db.exec("DROP TABLE IF EXISTS egress_flow");
-        db.exec("DROP TABLE IF EXISTS egress_state");
-        db.exec(EGRESS_STATE_DDL);
+        // #7574 item 10: drop + recreate is one step (same transaction rule).
+        db.transaction(() => {
+            db.exec("DROP TABLE IF EXISTS egress_flow");
+            db.exec("DROP TABLE IF EXISTS egress_state");
+            db.exec(EGRESS_STATE_DDL);
+        });
     }
     // 2×2 (#5874 brief, element-level world): the L1 world carries the
     // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
@@ -753,6 +766,19 @@ export function migrateSchema(db: {
     });
     if (needV8Backfill) migrateV8Identities(db);
     db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
+    // #7574: idx_conversations_session ships inside STORAGE_DDL_V1, so only
+    // a database BORN on a current build ever had it — a library that
+    // climbed to its user_version from an earlier release took the versioned
+    // steps above and never the v1 DDL, so every conversations(session_id)
+    // lookup stayed a full scan. Probe the index itself and create it on the
+    // first open that misses it (the table exists on every path: v1 DDL on a
+    // fresh file, the `from < 3` step, or already).
+    const hasConversationsIndex = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_session'")
+        .get();
+    if (hasConversationsIndex === undefined) {
+        db.exec("CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id)");
+    }
     return { from, to: STORAGE_SCHEMA_VERSION };
 }
 
