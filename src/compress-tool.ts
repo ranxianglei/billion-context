@@ -561,8 +561,10 @@ export function normalizeCompressInput(input: unknown): unknown {
 // #4252 hole-closure (false-advertising audit, incident shape
 // {"content":"{\"startId\":\"m04707\",…}"}): post-narrowing, models whose
 // muscle memory says “content is JSON” encode a range OBJECT or ARRAY AS THE
-// STRING — exactly what the parameter description’s “a valid JSON string… a
-// JSON-encoded array as that string is also accepted” invites. Neither layer
+// STRING — the pre-2026-11-23 parameter descriptions advertised exactly this
+// (“a valid JSON string… a JSON-encoded array as that string is also
+// accepted”); the invitation was removed 2026-11-23 (session 01a2040e), but
+// muscle memory outlives prompts, so the salvage path stays. Neither layer
 // used to salvage it (object-typed content was wrapped; a STRING-typed content
 // only got line-form/flat treatment) ⇒ refused with kind=content-not-array.
 // Decode once and adopt only when the result is strictly ENTRIES-shaped:

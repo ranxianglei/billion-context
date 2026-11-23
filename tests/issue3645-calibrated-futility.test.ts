@@ -282,15 +282,15 @@ test("#3645 display: fail-fast quotes the calibrated post-fold size, not the raw
         ];
         const resp = await post(p, sessionId, messages);
         const body = await resp.text();
-        let json: { error?: { code?: string; message?: string } };
-        try { json = JSON.parse(body); } catch { assert.fail(`expected a JSON fail-fast error, got HTTP ${resp.status}: ${body.slice(0, 240)}`); return; }
         const summaries = CALLS.filter((c) => c.summary).length;
+        // #7537: deterministic calibrated exhaustion no longer answers a local
+        // 413 — the folded payload is forwarded and the upstream decides. The
+        // #3645 display bug (raw vs calibrated quote) now lives in the operator
+        // warn log, not in a client-facing error body.
         assert.ok(summaries >= 1, `folds actually landed before exhaustion — ${summaries} summary call(s)`);
-        assert.equal(resp.status, 413, `deterministic exhaustion must fail fast non-retryably: HTTP ${resp.status} ${body.slice(0, 240)}`);
-        assert.equal(json.error?.code, "preflight_compress_failed");
-        const m = /context ~(\d+) tokens/.exec(json.error?.message ?? "");
-        assert.ok(m, `fail-fast must quote a context figure (got: ${json.error?.message})`);
-        assert.ok(Number(m[1]) > WINDOW, `quoted figure must be on the calibrated (over-window) scale like the fit decision — got ~${m?.[1]} vs window ${WINDOW}; quoting the raw sub-window size is the #3645 display bug`);
+        assert.equal(resp.status, 200, `deterministic exhaustion now forwards (#7537): HTTP ${resp.status} ${body.slice(0, 240)}`);
+        assert.ok(body.includes("forwarded answer"), "the model reply must reach the client");
+        assert.equal(CALLS.filter((c) => !c.summary).length, 1, "exactly one main forward");
     } finally {
         await p.cleanup();
     }
@@ -329,17 +329,14 @@ test("#3645 Responses dsh plugin lane: calibrated fail-fast does not forward the
         ];
         const resp = await postResponses(p, sessionId, input, true);
         const body = await resp.text();
-        let json: { error?: { code?: string; message?: string } };
-        try { json = JSON.parse(body); } catch { assert.fail(`expected a JSON fail-fast error, got HTTP ${resp.status}: ${body.slice(0, 240)}`); return; }
         const summaries = CALLS.filter((c) => c.summary).length;
         const forwarded = CALLS.filter((c) => !c.summary).length;
+        // #7537: the calibrated exhaustion 413 is gone — the plugin lane folds
+        // and forwards; the upstream's own verdict is authoritative.
         assert.ok(summaries >= 1, `Responses plugin lane must perform summary folding (got ${summaries} summary call(s))`);
-        assert.equal(forwarded, 0, `the over-window Responses payload must not be forwarded (got ${forwarded} main call(s))`);
-        assert.equal(resp.status, 413, `deterministic calibrated exhaustion must fail fast: HTTP ${resp.status} ${body.slice(0, 240)}`);
-        assert.equal(json.error?.code, "preflight_compress_failed");
-        const m = /context ~(\d+) tokens/.exec(json.error?.message ?? "");
-        assert.ok(m, `fail-fast must quote a context figure (got: ${json.error?.message})`);
-        assert.ok(Number(m[1]) > WINDOW, `quoted Responses figure must be calibrated and over-window (got ~${m?.[1]} vs ${WINDOW})`);
+        assert.equal(forwarded, 1, `the over-window Responses payload must be forwarded exactly once (got ${forwarded} main call(s))`);
+        assert.equal(resp.status, 200, `deterministic calibrated exhaustion now forwards (#7537): HTTP ${resp.status} ${body.slice(0, 240)}`);
+        assert.ok(body.includes("forwarded answer"), "the model reply must reach the client");
     } finally {
         await p.cleanup();
     }
@@ -373,11 +370,13 @@ test("#3645 control: uncalibrated (k̂ absent) futility skip is unchanged (#1841
         seedEvidence(p.upstreamPort, sessionId);
         const resp = await post(p, sessionId, messages);
         const body = await resp.text();
-        assert.equal(resp.status, 413, `a raw-futile round must still fail fast non-retryably: HTTP ${resp.status} ${body.slice(0, 240)}`);
-        const json = JSON.parse(body) as { error?: { code?: string; message?: string } };
-        assert.equal(json.error?.code, "preflight_compress_failed");
-        assert.match(json.error?.message ?? "", /futile round/, `still names the futility verdict (got: ${json.error?.message})`);
+        // #7537: the raw-futile skip no longer answers a local 413 either —
+        // skipping the round (zero summary calls) still holds, and the payload
+        // is forwarded as-is to the upstream, which decides.
+        assert.equal(resp.status, 200, `a raw-futile round now forwards (#7537): HTTP ${resp.status} ${body.slice(0, 240)}`);
+        assert.ok(body.includes("forwarded answer"), "the model reply must reach the client");
         assert.equal(CALLS.filter((c) => c.summary).length, 0, "the uncalibrated skip must spend ZERO summarization calls");
+        assert.equal(CALLS.filter((c) => !c.summary).length, 1, "the un-fittable payload is forwarded exactly once");
     } finally {
         await p.cleanup();
     }

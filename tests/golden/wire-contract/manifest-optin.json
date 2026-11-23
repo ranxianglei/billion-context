@@ -19,13 +19,13 @@
     "anthropic": [
       {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
         "input_schema": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -98,7 +98,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -220,13 +220,13 @@
         "type": "function",
         "function": {
           "name": "compress",
-          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
+          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
           "parameters": {
             "type": "object",
             "properties": {
               "content": {
                 "type": "string",
-                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
               }
             }
           }
@@ -308,7 +308,7 @@
               },
               "view": {
                 "type": "string",
-                "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+                "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
               },
               "tool": {
                 "type": "string",
@@ -445,13 +445,13 @@
       {
         "type": "function",
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
         "parameters": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -519,7 +519,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
