@@ -1618,7 +1618,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "summary.key_delete": "Key 삭제",
         "summary.key_set": "설정됨",
         "summary.key_missing": "설정 안 됨",
-        "summary.key_invalid": "사용할 수 없는 값 (비어 있음, 공백/제어 문자 포함, 또는 너무 길다)",
+        "summary.key_invalid": "사용할 수 없는 값 (비어 있음, 공백/제어 문자 포함, 또는 너무 김)",
         "summary.key_unreadable": "자격 증명 저장소를 읽을 수 없음 (권한 또는 내용 문제)",
         "summary.key_bad_ref": "잘못된 참조 형식",
         "summary.key_saved": "Key 저장됨",
