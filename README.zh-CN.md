@@ -501,9 +501,6 @@ bili --no-auto-update        # 本次启动禁用自动更新
 ```bash
 bili sessions ls                 # id、label、解码后大小、最后更新时间、存储状态(active/archived)
 bili sessions rm <id>            # 完整删除(释放内容引用计数,含媒体);随后收缩 index.db(--no-vacuum 跳过)
-bili sessions reattach <rawId> <laneKey>
-                                 # (#5844) 把 persona fork 的父会话指回孤儿 lane 记录的新 persona tag(离线、原子、双载体);
-                                 # 运行中的 proxy 回滚编辑会显式失败(fork 警告日志里有现成命令)
 bili sessions archive <id>       # 导出到 archive/archive.jsonl + 清行;tombstone 保留 label 与身份
 bili sessions restore <id>       # 从日志行恢复已归档的会话
 bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]

@@ -13,9 +13,8 @@ export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { withExitDeadline } from "./exit-deadline.js";
-import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
+import { effectivePromptCacheRouting, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
-import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { buildProxyFailureResponse, isExpectedFailFast, type SkippedProxyInfo } from "./upstream-fail.js";
@@ -53,6 +52,7 @@ import { prepareOpenai } from "./server/prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./server/prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./server/prepare-responses.js";
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER } from "./msgid-pin.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
@@ -122,7 +122,6 @@ import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConver
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, reconcileDerivedLineage } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { flushOrderSkeletons, hydrateOrderSkeletons } from "./order-persist.js";
 import { setSimhashAdoptionEnabled } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, hydratePluginConversationsUnified, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
@@ -168,6 +167,8 @@ import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
 import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
 import { SnapshotAnchorFallbackError, WS_ANCHORED_REQ_PROP } from "./server/snapshot-render.js";
+import { FoundationRejectError } from "./snapshot/plane.js";
+import { EgressAuthorityRejectError } from "./storage/egress-record.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -788,6 +789,40 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // The rethrow rides ONLY the request the WS session stamped
             // (WS_ANCHORED_REQ_PROP); plain-HTTP lanes keep the 503 shape.
             if (err instanceof SnapshotAnchorFallbackError && (req as unknown as Record<symbol, unknown>)[WS_ANCHORED_REQ_PROP] !== undefined) throw err;
+            // #6181 B1/B2: an R3 identity fault (the client declared a
+            // snapshot envelope that fails the identity gates) is a HARD 400
+            // with the identity marker — NOT the generic 503, NOT a silent
+            // raw forward: the host must learn that the envelope is broken.
+            // Both lanes rethrow FoundationRejectError into this funnel; it
+            // throws before processTurn, so the session is untouched.
+            // #7574 item 5: the answer also carries x-bili-msgid-mode: full —
+            // the same contract as the msgid delta re-anchor 400 in handle.ts:
+            // a rejected identity envelope means "no pin this turn, resend in
+            // full form". Clients recover from the status alone today; the
+            // header keeps the two refusals one protocol.
+            if (err instanceof FoundationRejectError) {
+                if (!res.headersSent) {
+                    res.writeHead(400, { "content-type": "application/json", "x-bili-snapshot": "identity", [MSGID_MODE_HEADER]: "full" });
+                    res.end(JSON.stringify({ error: { message: err.message, type: "snapshot_identity_fault" } }));
+                } else {
+                    res.end();
+                }
+                return;
+            }
+            // #6785 ruling 7439-5: a pinned session whose op-log has no
+            // healthy point fails the turn — a 500 with the unreadable
+            // marker, never the generic forward-on-client-bytes degrade.
+            // The session latches metadata.egressFlowUnreadable, so retries
+            // hit the same error until session-level recovery.
+            if (err instanceof EgressAuthorityRejectError) {
+                if (!res.headersSent) {
+                    res.writeHead(500, { "content-type": "application/json", "x-bili-egress": "unreadable" });
+                    res.end(JSON.stringify({ error: { message: err.message, type: "egress_flow_unreadable" } }));
+                } else {
+                    res.end();
+                }
+                return;
+            }
             const msg = String(err);
             const e = err as { name?: string; message?: string };
             // #411: a client cancel aborts the upstream fetch via
@@ -1319,7 +1354,6 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             //  restores the pre-#2265 exact-hash-only resolution (hot kill-switch).
             setSimhashAdoptionEnabled(opts.affinitySimhash ?? true);
             hydratePrefixAffinity();
-            hydrateOrderSkeletons();
             // #2941: never clobber a live pointer on this port — a foreign
             // instance health-verified as serving here keeps it; our registry
             // entry below still records us for lane-aware discovery.
@@ -1757,13 +1791,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     let shuttingDown = false;
     const finishShutdown = (): void => {
         void (async () => {
-            // #5753: affinity/order now settle into sqlite — await their queued
+            // #5753: affinity now settles into sqlite — await its queued
             // writes so a graceful exit loses nothing recorded this run.
             // #5757: the await is deadline-bounded — a wedged volume must not
             // hold the exit hostage (see src/exit-deadline.ts).
-            await withExitDeadline("unified-store flushes (affinity/order/resign)", (async () => {
+            await withExitDeadline("unified-store flushes (affinity/resign)", (async () => {
                 await flushPrefixAffinity();
-                await flushOrderSkeletons();
                 await flushResignPending();
             })());
             servedWriter?.dispose();
@@ -3088,6 +3121,35 @@ export function scrubAnthropicPck(protocol: WireProtocol | null, bodyBuffer: Buf
     return Buffer.from(JSON.stringify(p), "utf8");
 }
 
+// #6539: protocol-neutral egress scrub for the bili-owned msgid transport
+// fields (biliMsgIds / biliLedgerSeqs, src/msgid-pin.ts). Same contract as
+// prompt_cache_key (#1403): the four fully-processed prepares strip them
+// unconditionally, but every VERBATIM forward branch (side-request passthrough,
+// hop-marker chain, bypass/passthrough marks, route/global passthrough #661,
+// decode-fail fallback, count_tokens) bypasses the prepares — a stamped
+// full-resend body would otherwise ship biliMsgIds to a real model endpoint
+// (strict-schema upstreams 400 'Extra inputs are not permitted'; #661 body
+// fingerprinting breaks). A body WITHOUT the fields passes back
+// byte-identical, so #661's contract is untouched in the normal case.
+export function scrubMsgIdFields(bodyBuffer: Buffer, log: (level: string, msg: string) => void): Buffer {
+    if (bodyBuffer.length === 0) return bodyBuffer;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(bodyBuffer.toString("utf8"));
+    } catch {
+        return bodyBuffer;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return bodyBuffer;
+    const p = parsed as Record<string, unknown>;
+    const hasIds = Object.prototype.hasOwnProperty.call(p, MSG_IDS_BODY_FIELD);
+    const hasSeqs = Object.prototype.hasOwnProperty.call(p, MSG_SEQS_BODY_FIELD);
+    if (!hasIds && !hasSeqs) return bodyBuffer;
+    if (hasIds) delete p[MSG_IDS_BODY_FIELD];
+    if (hasSeqs) delete p[MSG_SEQS_BODY_FIELD];
+    log("debug", "stripped biliMsgIds/biliLedgerSeqs from verbatim forward (#6539)");
+    return Buffer.from(JSON.stringify(p), "utf8");
+}
+
 // #1757: protocol-neutral companion to scrubAnthropicPck for opt-in
 // compat.dropFields — client-fixed fields some strict-schema gateways reject
 // (SenseNova Responses 400 'json: unknown field "summary"' on pi-ai's fixed
@@ -3136,6 +3198,8 @@ export function prepareCountTokens(
         log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages };
         delete (rebuilt as Record<string, unknown>).prompt_cache_key;
+        delete (rebuilt as Record<string, unknown>)[MSG_IDS_BODY_FIELD]; // #6539: egress hygiene
+        delete (rebuilt as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
         return {
             body: JSON.stringify(rebuilt),
             session,
@@ -3149,6 +3213,8 @@ export function prepareCountTokens(
         log("warn", `[${sessionId}] count_tokens prune failed, forwarding unchanged: ${String(err)}`);
         const fallback: AnthropicRequestBody = { ...parsed };
         delete (fallback as Record<string, unknown>).prompt_cache_key;
+        delete (fallback as Record<string, unknown>)[MSG_IDS_BODY_FIELD]; // #6539: egress hygiene
+        delete (fallback as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
         return {
             body: JSON.stringify(fallback),
             session,
