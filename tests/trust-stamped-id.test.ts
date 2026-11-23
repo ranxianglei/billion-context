@@ -72,6 +72,18 @@ test("trust-stamped-id ON: a divergent/shorter stranger order rides the verbatim
     assert.equal(r.key, "task-id");
 });
 
+test("trust-stamped-id ON: a persona tag+shape drift re-anchors the verbatim id (no |sub:<fp> persona fork)", () => {
+    resetSessionOrderForTest();
+    const claim = resolveSessionOrder("persona-id", msgs(6, "a"), "You are the pre-upgrade assistant persona.");
+    assert.equal(claim.action, "claim", "old persona claims the raw id");
+    // "Upgrade": the host now replays fewer turns AND sends a different tag —
+    // the legacy ladder forks this onto `persona-id|sub:<fp>` (the #5844
+    // incident shape); trusted, it re-anchors to the stamped id.
+    const r = resolveSessionOrder("persona-id", msgs(4, "b"), "You are the post-upgrade assistant persona, with a completely different system prompt.");
+    assert.equal(r.key, "persona-id");
+    assert.equal(r.action, "reanchor");
+});
+
 test("trust-stamped-id ON: the #5095 lane-token tail STILL forks (the declared-lane survivor)", () => {
     resetSessionOrderForTest();
     // The token value the resolver sees is the BARE 12-hex (handle.ts extracts
