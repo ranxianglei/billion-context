@@ -141,7 +141,7 @@ test("ccr: shadow parity — live store ingest keeps both digest legs equal (#29
                 blocks: unified.getBlocks("ccr-shadow-1"),
                 deadRefs: unified.getDeadRefs("ccr-shadow-1"),
                 refs: unified.getRefs("ccr-shadow-1"),
-            });
+            }, unified.getCcrEntries("ccr-shadow-1"), unified.getStateFields("ccr-shadow-1"));
             assert.equal((view.contentStore?.byRef["m00002"] as { hash?: string } | undefined)?.hash, "sha256-ccr-original", "replayed view lost the CCR ref entry");
             assert.equal(view.contentStore?.byHash["sha256-ccr-original"], "ORIGINAL-BODY-XYZ", "replayed view lost the CCR original");
         } finally {

@@ -212,31 +212,36 @@ test("usage-backed session: over the headroom limit, zero compressible → forwa
     });
 });
 
-test("identified fresh session whose MEASURED body exceeds the native window but clears the 2MB byte floor → still fail-fast 413, nothing forwarded (#5000/#4185 measured tier)", async () => {
+test("identified fresh session whose MEASURED body exceeds the native window but clears the 2MB byte floor → forwarded, the upstream's 400 passes through annotated (#7537)", async () => {
     await withFixture(async (proxyPort, upstreamPort, calls) => {
         // 300K chars of tool-result text ≈ ~75K measured tokens: over the 40K
-        // native window, but only ~300KB — ~7× under the 2MB core-text byte
-        // floor, which the old path alone let ride to a guaranteed 400.
+        // native window. Pre-#7537 the measured tier answered a local 413; now
+        // it measures, logs, forwards — the upstream's own 400 is the verdict,
+        // passed through with the bili evidence annotation.
         const r = await post(proxyPort, upstreamPort, "s-4185-measured", incidentConversation(300_000));
         const body = await r.text();
-        assert.equal(r.status, 413, `measured-over body must fail fast: ${body.slice(0, 300)}`);
-        assert.match(body, /outbound body measures ~[\d,]+ TEXT tokens even after preflight compression/, `measured diagnostic present: ${body.slice(0, 300)}`);
-        assert.ok(body.includes("the body ITSELF exceeds the window"), `doom wording present: ${body.slice(0, 300)}`);
-        assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 0, "the giant payload was never forwarded");
+        assert.equal(r.status, 400, `measured-over body is now forwarded and the upstream decides: ${body.slice(0, 300)}`);
+        assert.match(body, /context_length_exceeded/, `the upstream's own size verdict rides through: ${body.slice(0, 300)}`);
+        assert.equal(r.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
+        assert.equal(r.headers.get("x-bili-retryable"), "false", "non-retryable — the mass won't change on retry");
+        const json = JSON.parse(body) as { error?: { message?: string }; bili_evidence?: unknown };
+        assert.equal(json.bili_evidence, undefined, "no bili merge into the upstream body (header-only annotation)");
+        assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 1, "the giant payload WAS forwarded (the upstream is the size authority, #7537)");
     });
 });
 
-test("identified fresh session with mathematically doomed bytes (>2MB core) → still fail-fast 413, nothing forwarded (#4185 negative)", async () => {
+test("identified fresh session with mathematically doomed bytes (>2MB core) → forwarded, the upstream decides (#7537)", async () => {
     await withFixture(async (proxyPort, upstreamPort, calls) => {
         const r = await post(proxyPort, upstreamPort, "s-4185-doomed", incidentConversation(2_100_000));
         const body = await r.text();
-        assert.equal(r.status, 413, "doomed bytes must still fail fast");
-        assert.ok(body.includes("the body ITSELF exceeds the window"), `doom diagnostic present: ${body.slice(0, 300)}`);
-        assert.equal(calls.length, 0, "nothing forwarded and no summarization spent");
+        const json = JSON.parse(body) as { error?: { message?: string } };
+        assert.ok(r.status === 400 || r.status === 413, `doomed bytes are forwarded; the upstream's size verdict answers (${r.status}): ${body.slice(0, 300)}`);
+        assert.match(json.error?.message ?? "", /context_length_exceeded|too large/i, `the verdict is the upstream's, not a local refusal: ${body.slice(0, 300)}`);
+        assert.equal(calls.length, 1, "one forward, no summarization");
     });
 });
 
-test("usage-backed session whose payload exceeds the NATIVE window → forwarded once, the 400 stamps the wall, the resend fails fast 413 locally (#4185 negative)", async () => {
+test("usage-backed session whose payload exceeds the NATIVE window → forwarded; the byte-identical RESEND hits the evidence 413 (deterministic exhaustion against a proven wall) (#7537/#496)", async () => {
     await withFixture(async (proxyPort, upstreamPort, calls) => {
         const small = await post(proxyPort, upstreamPort, "s-4185-native-over", [
             { role: "user", content: "hello" },
@@ -248,19 +253,23 @@ test("usage-backed session whose payload exceeds the NATIVE window → forwarded
         // ~45k realistic tokens: over the 40000 NATIVE window itself — no
         // clamp can make input+output fit. Identity fast path: the session's
         // recorded same-origin reality outranks the local doom-math, so this
-        // payload is forwarded once and the upstream's 400 is the verdict.
+        // payload is forwarded and the upstream's 400 is the verdict.
         const giant = incidentConversation(180_000);
         const r = await post(proxyPort, upstreamPort, "s-4185-native-over", giant);
         const body = await r.text();
-        assert.ok(r.status === 400 || r.status === 413, `over-native payload is rejected after the experiment, got ${r.status}: ${body.slice(0, 200)}`);
+        assert.equal(r.status, 400, `over-native payload is rejected BY THE UPSTREAM after the experiment, got ${r.status}: ${body.slice(0, 200)}`);
         assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 1, "the giant payload was forwarded exactly once");
 
-        // The 400 stamped the session wall (overflowArmTokens) — the identical
-        // resend now fails fast locally: 413, nothing new reaches upstream.
+        // #7537: the resend is not an ESTIMATE refusal — it is the surviving
+        // evidence branch: r1's 400 stamped the wall (statedWindow), the
+        // futile-round math proves no fold combination closes the gap against
+        // it, and the meter agrees the payload is over the window → local 413,
+        // retryable=false, never re-burned on the wire (#496 loop stays broken).
+        // Payloads with NO proven wall on record still forward (#7537).
         const before = calls.length;
         const r2 = await post(proxyPort, upstreamPort, "s-4185-native-over", giant);
         const body2 = await r2.text();
-        assert.equal(r2.status, 413, `the resend must fail fast 413 after the wall is stamped, got ${r2.status}: ${body2.slice(0, 200)}`);
-        assert.equal(calls.length, before, "the resented payload was never forwarded again");
+        assert.equal(r2.status, 413, `the resend is refused by the EVIDENCE branch (proven wall + nothing more can fold), got ${r2.status}: ${body2.slice(0, 200)}`);
+        assert.equal(calls.length, before, "the resend was NEVER forwarded (the #496 loop stays broken)");
     });
 });
