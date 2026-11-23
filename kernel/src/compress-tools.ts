@@ -66,6 +66,14 @@ export const ACP_DECOMPRESS_CLOSE = "</acp_decompress>";
  *  call, summary-as-plain-text with top-level refs, top-level topic) —
  *  narrowing is advertise-side only.
  *
+ *  2026-11-23 (session 01a2040e, weak qwen3.8-27b): the "a valid JSON
+ *  string … a JSON-encoded array as that string is also accepted" invitation
+ *  is REMOVED from the descriptions — the dual-format prose primed the model
+ *  into a JSON array in the string, and after the first rejection it stopped
+ *  emitting compress altogether (two advertised shapes = no trusted shape).
+ *  Line form is now the ONLY advertised format; parser acceptance of the
+ *  legacy shapes is unchanged — acceptance was never to be advertised.
+ *
  *  Contract (#374, still holds for the object shell): the schema stays an
  *  OPEN object schema — no top-level `required`, no
  *  `additionalProperties: false` — so a flat single-range call
@@ -89,7 +97,7 @@ export const COMPRESS_PARAMETERS = {
     content: {
       type: "string",
       description:
-        "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
+        "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range.",
     },
   },
 };
@@ -97,7 +105,7 @@ export const COMPRESS_PARAMETERS = {
 export const COMPRESS_TOOL = {
   name: COMPRESS_TOOL_NAME,
   description:
-    "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+    "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
   input_schema: COMPRESS_PARAMETERS,
 };
 
@@ -211,7 +219,7 @@ const FUNCTION_PROMPT_SECTIONS: ReadonlyArray<
 
 You have four context-management tools:
 
-- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Never split a batch into one call per range.
+- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary. A single range is the same shape with one block. Never split a batch into one call per range.
 - decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages); a leaf block has no lower tier, so the default already returns its content. Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
 - search_context — Search stored compressed-block summaries and folded-away originals by keyword — NOT your currently visible messages. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
 - acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.
