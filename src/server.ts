@@ -123,7 +123,6 @@ import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConver
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, reconcileDerivedLineage } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { flushOrderSkeletons, hydrateOrderSkeletons } from "./order-persist.js";
 import { setSimhashAdoptionEnabled } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, hydratePluginConversationsUnified, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
@@ -1351,7 +1350,6 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             //  restores the pre-#2265 exact-hash-only resolution (hot kill-switch).
             setSimhashAdoptionEnabled(opts.affinitySimhash ?? true);
             hydratePrefixAffinity();
-            hydrateOrderSkeletons();
             // #2941: never clobber a live pointer on this port — a foreign
             // instance health-verified as serving here keeps it; our registry
             // entry below still records us for lane-aware discovery.
@@ -1789,13 +1787,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     let shuttingDown = false;
     const finishShutdown = (): void => {
         void (async () => {
-            // #5753: affinity/order now settle into sqlite — await their queued
+            // #5753: affinity now settles into sqlite — await its queued
             // writes so a graceful exit loses nothing recorded this run.
             // #5757: the await is deadline-bounded — a wedged volume must not
             // hold the exit hostage (see src/exit-deadline.ts).
-            await withExitDeadline("unified-store flushes (affinity/order/resign)", (async () => {
+            await withExitDeadline("unified-store flushes (affinity/resign)", (async () => {
                 await flushPrefixAffinity();
-                await flushOrderSkeletons();
                 await flushResignPending();
             })());
             servedWriter?.dispose();

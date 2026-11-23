@@ -143,7 +143,7 @@ billion-context/
 │   ├── session.ts                # Session model + in-memory store (bounded, MAX_SESSIONS)
 │   ├── session-id.ts             # Session identity: client value verbatim + persona fork fingerprint
 │   ├── claude-lane-token.ts      # SubagentStart lane-token grammar (mint/extract, #5095)
-│   ├── session-resolve.ts        # #2944 order-primary persona resolver (skeleton + fork lanes)
+│   ├── session-resolve.ts        # #2944/#7525-GA order resolver: stamped id rides verbatim; #5095 lane-token fork
 │   ├── session-gc.ts             # Session-file GC, opt-in (sessions.gc.* / BILI_SESSION_GC*) (#1082)
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── persist-eperm.ts          # EPERM/EACCES write-failure alert layer (#362)
@@ -305,11 +305,9 @@ billion-context/
 │   ├── nudge-decide.ts           # Model-decided nudge timing over the already-cached prefix (#2228)
 │   ├── nudge-debug.ts            # Nudge-injection bus: mirrors the exact wire nudge text to the pi lane's debug terminal notify (transient, never in LLM context, never persisted)
 │   ├── opencode-fork-lineage.ts # Fork lineage from opencode's local SQLite DB (session_v2.fork_session_id) (#7421)
-│   ├── order-persist.ts          # Persists session-order skeletons across restarts (#3397)
 │   ├── pack-install.ts           # bili pack install|remove|list: npm-distributable prompt packs (#5319)
 │   ├── pck-notice.ts             # One-time notice for the prompt_cache.routing default flip (#5079)
 │   ├── pck-probe.ts              # Probe-and-remember ablation of prompt_cache_key-rejecting origins (#2645)
-│   ├── persona-anchor.ts         # Continuity-aware persona fork trigger: system drift + chain break (#2241)
 │   ├── phantom-attachment.ts     # Detects fabricated attachment identifiers in model output (#3456)
 │   ├── plugin-compress-salvage.ts # Rescues strict-JSON-failing compress args on the verbatim lane (#2580)
 │   ├── plugin-render.ts          # POST /__bili/plugin/render: outbound prefix from server transcript (#4491)

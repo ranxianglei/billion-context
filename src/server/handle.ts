@@ -35,20 +35,16 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, preferZedThreadIdIdentity, qoderSideTaskConversation, zcodeMemoryConversation } from "../session-id.js";
+import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, preferZedThreadIdIdentity, qoderSideTaskConversation, zcodeMemoryConversation } from "../session-id.js";
 import { preferKiroConversationIdentity } from "../kiro.js";
 import { personaConversationOrder, type SessionOrderResolution } from "../session-resolve.js";
 
-/** #5686: fork/migration visibility on the server side. personaConversation
- *  used to throw away every outcome but the key, so a production fork
- *  (derived-*) or migration (reanchor) left NO durable line — the entire
- *  dsh |sub:-drift cluster had to be reconstructed from user screenshots.
- *  Log the state-changing outcomes; claim/continue stay silent (they are the
- *  steady state and would flood the log). derived lanes are the incident
+/** #5686: fork visibility on the server side. The raw stamped id is the
+ *  steady state (silent); a #5095 lane-token derived lane is the incident
  *  class → warn level. */
 function onSessionResolveEvent(rawId: string, r: SessionOrderResolution): void {
-    if (r.action !== "reanchor" && !r.action.startsWith("derived-")) return;
-    loggerLog(r.action.startsWith("derived-") ? "warn" : "info", `[session-resolve] ${r.action}: ${rawId} -> ${r.key}${r.reason !== undefined ? ` (${r.reason})` : ""}`);
+    if (!r.action.startsWith("derived-")) return;
+    loggerLog("warn", `[session-resolve] ${r.action}: ${rawId} -> ${r.key}${r.reason !== undefined ? ` (${r.reason})` : ""}`);
 }
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
@@ -1557,13 +1553,13 @@ async function handleRequest(
                 ? googleSystemText(parsed as GoogleRequestBody)
                 : "";
         const zcodeParentIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
-        // #5719: host-stamped message ids riding this request (`biliMsgIds`,
-        // #4491 pipeline). Fed to every persona-order lane as the LAST-RESORT
-        // identity rung: when byte-level evidence was destroyed in the same
-        // turn the system text changed (full compaction ∩ volatile-field
-        // drift), an id overlap proves same-conversation and re-anchors the
-        // raw lane instead of forking a zero-state |sub: child.
-        // undefined = absent → exactly the pre-change path.
+        // Host-stamped message ids riding this request (`biliMsgIds`,
+        // #4491 pipeline) — the PIN side of the #4491/#5719 identity channel:
+        // prepare-anthropic/prepare-openai pin them onto canonical message
+        // rows (messages.msg_id) behind the rollout gate, and foreign-block
+        // sweep reads them back. (The resolver's msgid-rescue RUNG retired
+        // with the #7525 GA fork ladder — the stamped id rides verbatim now,
+        // nothing to rescue onto.) undefined = absent → nothing to pin.
         const stampedInboundMsgIds = incomingMsgIdsOf(parsed);
         // #5825 identity-channel sources fill only the absent case. Precedence:
         // (1) body-field stamps (dsh/opencode/pi host rewrites) — always win;
@@ -1605,16 +1601,6 @@ async function handleRequest(
         if (stampedInboundMsgIds === undefined && inboundMsgIds !== undefined) {
             (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD] = [...inboundMsgIds];
         }
-        // #5719: the RECORDED side of the msgid identity rung lives in the
-        // UNIFIED STORE — stamped requests pin these very ids onto canonical
-        // message rows (messages.msg_id, #4491), so no parallel JSON ledger
-        // is kept. #5312's view returns the FULL historical id set (live AND
-        // retired rows — retire-don't-delete, #4390), identity-only, no
-        // content hydration. Lazy by contract: resolveSessionOrder invokes
-        // it at most once, and only at a fork exit with non-empty inbound
-        // ids; null = store unavailable → byte-evidence-only path.
-        const storedMsgIdsOf = (rawKey: string): readonly string[] | null =>
-            getStore().unifiedAllMessageIds(rawKey);
         const zcodeMemory = zcodeParentIdentity?.clientProvided
             ? zcodeMemoryConversation(zcodeParentIdentity.value, req.headers)
             : undefined;
@@ -1636,25 +1622,20 @@ async function handleRequest(
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
             // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google
             // paths), so a review persona would otherwise merge into the main
-            // session exactly like #1916/#2203 did on the other wires. #3134:
-            // the same v2 order resolver as the other lanes since #3060 (fork
-            // keys are byte-compatible, so persisted fork lanes survive). An
-            // empty systemInstruction is non-anchoring (kernel anchor
-            // semantics): ride the verbatim id — never route empty-tag
-            // traffic through the order resolver.
+            // session exactly like #1916/#2203 did on the other wires. The
+            // same order resolver as the other lanes; #7525 GA: the stamped
+            // id rides verbatim (no fork lanes left to route into). An empty
+            // systemInstruction is non-anchoring (kernel anchor semantics):
+            // ride the verbatim id — never route empty-tag traffic through
+            // the order resolver.
             ? (!dshDeclaredPersona && dshPersona && !sideRequestLike
                 ? (personaSystemText === ""
                       ? (googleIdentity?.value ?? googleSignal)
                       : personaConversationOrder(
                           googleIdentity?.value ?? googleSignal,
-                          (parsed as GoogleRequestBody).contents,
                           personaSystemText,
-                          pluginReportedModel(req.headers),
-                          undefined,
                           undefined,
                           onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
                       ))
                   : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
@@ -1668,11 +1649,10 @@ async function handleRequest(
               (claudeSub !== undefined && opts.subagentSplit !== false
                   ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
                   : !dshDeclaredPersona && dshPersona && !sideRequestLike
-                    // #2241: continuity-aware anchor — a system change whose
-                    // history continues the raw key's prefix-affinity chain
-                    // (model switch) MIGRATES the anchor instead of forking
-                    // the main lane off the raw key; only history-discontinuous
-                    // requests (review blobs) still fork onto `|sub:<fp>`.
+                    // #2241: continuity-aware anchor (pre-GA name) — #7525 GA:
+                    // the stamped id rides verbatim; the resolver is consulted
+                    // only so a lane token could carve its own lane (none on
+                    // this wire).
                     ? (personaSystemText === ""
                           // An empty system is non-anchoring (kernel anchor
                           // semantics): ride the verbatim id — never route
@@ -1681,61 +1661,37 @@ async function handleRequest(
                            ? (anthropicIdentity?.value ?? anthropicSignal)
                            : personaConversationOrder(
                                anthropicIdentity?.value ?? anthropicSignal,
-                               (parsed as AnthropicRequestBody).messages,
                                personaSystemText,
-                               pluginReportedModel(req.headers),
-                               undefined,
                                undefined,
                                onSessionResolveEvent,
-                               inboundMsgIds,
-                               storedMsgIdsOf,
                            ))
                      : claudeAnthropicPersonaOrderApplies(req.headers) && opts.subagentSplit !== false
                        && !sideRequestLike && personaSystemText !== ""
                        // #4352: header-less claude code subagents (VS Code
-                       // build) ride the raw parent id; route them through the
-                       // continuity-aware order resolver so a history-disjoint
-                       // ride forks onto its own |sub:<fp> lane while a
-                       // continuing main conversation keeps the raw key on
-                       // order+content evidence (#2944).
+                       // build) ride the raw parent id; the resolver is
+                       // consulted only so a #5095 lane token can carve the
+                       // dispatch onto its own lane (#2944; the |sub:<fp>
+                       // fork retired with the #7525 GA content ladder).
                        // #5095 D1-C: when the bili SubagentStart hook's token
                        // rides the first user message, the resolver keys the
                        // dispatch per-TOKEN — parallel same-type dispatches
                        // stop merging on the persona fingerprint (token wins:
                        // uniqueness by construction, no prompt-collision bet).
-                       // #5095 D1-B fallback: when NO valid token rides the
-                       // wire (un-upgraded installs, disabled hook, post-fold
-                       // head loss), fall back to the dispatch task prompt
-                       // (first user message fragment) as the per-run
-                       // discriminator so the fork key widens to
-                       // |sub:<fp>:<userFp> — a self-lane isolation strictly
-                       // better than the two-segment shared key; empty
-                       // fragment degrades to it. NO other call site passes
-                       // either.
+                       // Without a token the stamped id rides verbatim.
                        ? personaConversationOrder(
                            anthropicIdentity?.value ?? anthropicSignal,
-                           (parsed as AnthropicRequestBody).messages,
                            personaSystemText,
-                           pluginReportedModel(req.headers),
                            claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
-                           anthropicFirstUserFrag((parsed as AnthropicRequestBody).messages),
                            onSessionResolveEvent,
-                           inboundMsgIds,
-                           storedMsgIdsOf,
                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
               ? (!dshDeclaredPersona && dshPersona && !sideRequestLike && personaSystemText !== ""
                     ? personaConversationOrder(
                           openaiIdentity?.value ?? openaiSignal,
-                          (parsed as OpenAIRequestBody).messages,
                           personaSystemText,
-                          pluginReportedModel(req.headers),
-                          undefined,
                           undefined,
                           onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -1745,24 +1701,18 @@ async function handleRequest(
                 // untouched for metadata-less clients).
                 ? codexTurn.value
                  : !dshDeclaredPersona && dshPersona && !sideRequestLike && ((parsed as ResponsesRequestBody).instructions ?? "") !== ""
-                   // #2203/#2241: parity with the anthropic/openai lanes —
-                   // dsh-over-Responses rides the same continuity-aware persona
-                   // anchor: a model switch (history continues the raw key's
-                   // chain) migrates the anchor on the raw key; a history-
-                   // discontinuous auto-review blob forks onto `|sub:<fp>`.
-                   // Must sit BEFORE the stableSystemAnchor branch below so a
-                   // plugin request never takes the plain-proxy verbatim anchor.
+                   // #2203: parity with the anthropic/openai lanes —
+                   // dsh-over-Responses consults the same resolver; #7525 GA:
+                   // the stamped id rides verbatim (the |sub:<fp> auto-review
+                   // fork retired with the content ladder). Must sit BEFORE the
+                   // stableSystemAnchor branch below so a plugin request never
+                   // takes the plain-proxy verbatim anchor.
                    // Empty instructions = non-anchoring (verbatim id).
                     ? personaConversationOrder(
                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                          (parsed as ResponsesRequestBody).input,
                           (parsed as ResponsesRequestBody).instructions ?? "",
-                          pluginReportedModel(req.headers),
-                          undefined,
                           undefined,
                           onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
@@ -1787,27 +1737,19 @@ async function handleRequest(
                      // not a new persona. See instructionsFingerprintApplies
                      // in src/session-id.ts.
                       ? (!sideRequestLike
-                          ? // #2250: same continuity resolver as the dsh lanes
-                            // — an instructions drift whose history continues
-                            // the raw key's chain (model switch / AGENTS.md
-                            // edit / -c override / upgrade reassembly) MIGRATES
-                            // the anchor instead of forking the main lane off
-                            // its compression state; a genuinely fresh task
-                            // reusing the id (#150) still forks `|sub:<fp>`.
-                            // Empty instructions = non-anchoring: ride the
-                            // verbatim id (codex turn-1 / metadata-less roots).
+                          ? // #2250: same resolver as the dsh lanes — #7525 GA:
+                            // the stamped id rides verbatim regardless of
+                            // instructions drift (the |sub:<fp> fork retired
+                            // with the content ladder). Empty instructions =
+                            // non-anchoring: ride the verbatim id (codex
+                            // turn-1 / metadata-less roots).
                             ((parsed as ResponsesRequestBody).instructions ?? "") === ""
                               ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
                               : personaConversationOrder(
                                 responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                                (parsed as ResponsesRequestBody).input,
                                 (parsed as ResponsesRequestBody).instructions ?? "",
-                                pluginReportedModel(req.headers),
-                                undefined,
                                 undefined,
                                 onSessionResolveEvent,
-                                inboundMsgIds,
-                                storedMsgIdsOf,
                           )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));

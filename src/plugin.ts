@@ -1606,9 +1606,9 @@ function holdsRefs(s: Session): boolean {
     return Object.keys(s.state.messageRefs?.byRef ?? {}).length > 0;
 }
 
-/** #2601: persona-fork descendants of a raw host id — sessions minted by the
- *  persona-anchor fork branch (`${rawId}|sub:${fp}`, persona-anchor.ts) that
- *  actually carried traffic, are fresh, AND hold refs (#2948: freshness alone
+/** #2601: persona-fork descendants of a raw host id — sessions on a
+ *  `${rawId}|sub:` persona lane (the #5095 lane-token fork or the #970 split)
+ *  that actually carried traffic, are fresh, AND hold refs (#2948: freshness alone
  *  selected ref-less aux lanes — see holdsRefs). Grouping by
  *  `id.split("|sub:")[0]` is the house idiom (splitSessionWarnings, #2170
  *  canary). Sorted by lastSeen descending (listSessions order). */
