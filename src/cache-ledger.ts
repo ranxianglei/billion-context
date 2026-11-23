@@ -1932,7 +1932,7 @@ export function noteOutboundContextEstimates(
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number; model?: string },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
@@ -1980,6 +1980,17 @@ export function settleUsageReport(
         // it to demote the baseline when the current request routes elsewhere.
         const settleOrigin = normalizeUpstreamOrigin(s.upstream);
         if (settleOrigin !== undefined) session.stats.lastInputTokensOrigin = settleOrigin;
+        // Identity-fast-path: stamp which MODEL measured this baseline — the
+        // gate refuses to trust acceptance evidence across a model switch.
+        // Lanes that settle without an explicit model (streamed plugin pipes)
+        // fall back to metadata.lastModel: prepare re-covers it with the
+        // CURRENT request's model on every request, so in the normal case it
+        // is exactly this request's model (a concurrent interleaving can only
+        // produce one conservative demotion — the safe direction).
+        const stampedModel = typeof s.model === "string" && s.model !== "" ? s.model
+            : typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel
+            : undefined;
+        if (stampedModel !== undefined) session.stats.lastInputTokensModel = stampedModel;
         // #1933 F1: consume the pending pair — the local text estimate of the
         // payload THIS report bills, recorded at prepare time. Same route
         // required. Admitted samples (plausibility band) accumulate in a

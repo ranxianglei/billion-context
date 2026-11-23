@@ -1,6 +1,7 @@
 import { clampPrefix } from "./truncate.js";
 import { BLOCKED_REF } from "./refs.js";
 import { COMPRESS_TOOL_NAME } from "./compress-tools.js";
+import { parseCompressArgs } from "./parse-compress-input.js";
 import type { CompressionState, CoreMessage } from "./types.js";
 
 // Orphaned compress calls (no matching block — failed attempts, or historical
@@ -35,54 +36,18 @@ function rangeKey(startRef: string, endRef: string): string {
 // #3769: does this call's args quote the folded range of an ACTIVE block? Such a
 // re-sent pair IS that block's summary carrier — the host strips the in-place
 // anchor only while it rides the history (stripKernelSummaries, #1567/#2042) —
-// so the fold-gated sweep must leave it alone. Both arg shapes are accepted to
-// mirror the host index ({content:[…]} AND the flat {startId,endId} models emit
-// natively); parseCallText alone misses the flat form. Unparseable args fail
-// safe as NOT a carrier (under-sweep is safe, over-sweep is not).
+// so the fold-gated sweep must leave it alone. Recognition delegates to
+// quotedRangeKeys, whose canonical-parser leg covers the current line form
+// ("m00150–m00220 topic\n<summary>") that the legacy field extraction cannot
+// see — a call the kernel will execute is a call the sweep recognizes.
+// Unparseable args fail safe as NOT a carrier (under-sweep is safe,
+// over-sweep is not).
 function quotesActiveBlock(
   text: string | undefined,
   activeRangeKeys: Set<string>,
 ): boolean {
-  const raw = text ?? "";
-  const start = raw.indexOf("{");
-  if (start < 0) return false;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw.slice(start));
-  } catch {
-    return false;
-  }
-  if (!parsed || typeof parsed !== "object") return false;
-  const obj = parsed as Record<string, unknown>;
-  let entries: unknown[];
-  if (Array.isArray(obj.content)) {
-    entries = obj.content;
-  } else if (typeof obj.content === "string") {
-    try {
-      const inner: unknown = JSON.parse(obj.content);
-      entries = Array.isArray(inner) ? inner : [];
-    } catch {
-      return false;
-    }
-  } else {
-    entries = [obj];
-  }
-  for (const entry of entries) {
-    if (!entry || typeof entry !== "object") continue;
-    const e = entry as Record<string, unknown>;
-    const s =
-      typeof e.startId === "string"
-        ? e.startId
-        : typeof e.messageId === "string"
-          ? e.messageId
-          : "";
-    const end =
-      typeof e.endId === "string"
-        ? e.endId
-        : typeof e.messageId === "string"
-          ? e.messageId
-          : "";
-    if (s && end && activeRangeKeys.has(rangeKey(s, end))) return true;
+  for (const key of quotedRangeKeys(text)) {
+    if (activeRangeKeys.has(key)) return true;
   }
   return false;
 }
@@ -142,29 +107,47 @@ function parseCallText(text: string | undefined): ParsedCallText | null {
   return { prefix: raw.slice(0, start), obj, content, contentWasString };
 }
 
-// Range keys a compress call's args quote, using the same startId/endId
-// (messageId fallback) extraction as rewriteCompressText so identity-by-range
-// resolves against exactly what the live-range compaction compares.
+// Range keys a compress call's args quote. Two recognizers, unioned:
+// the field extraction (startId/endId, messageId fallback) covers exactly
+// what rewriteCompressText consumes, and the canonical compress-args parser
+// covers every wire shape applyCompression accepts — including the current
+// line form ("m00150–m00220 topic\n<summary>") that field extraction cannot
+// see. Reusing the eligibility grammar keeps quote recognition from drifting
+// off what the kernel will actually execute (#7487: the dsh line-form call
+// was invisible here, so a carrier could be swept into a zero-carrier fold).
 function quotedRangeKeys(text: string | undefined): Set<string> {
-  const parsed = parseCallText(text);
-  if (!parsed) return new Set<string>();
   const out = new Set<string>();
-  for (const entry of parsed.content) {
-    if (!entry || typeof entry !== "object") continue;
-    const e = entry as Record<string, unknown>;
-    const s =
-      typeof e.startId === "string"
-        ? e.startId
-        : typeof e.messageId === "string"
-          ? e.messageId
-          : "";
-    const end =
-      typeof e.endId === "string"
-        ? e.endId
-        : typeof e.messageId === "string"
-          ? e.messageId
-          : "";
-    if (s && end) out.add(rangeKey(s, end));
+  const parsed = parseCallText(text);
+  if (parsed) {
+    for (const entry of parsed.content) {
+      if (!entry || typeof entry !== "object") continue;
+      const e = entry as Record<string, unknown>;
+      const s =
+        typeof e.startId === "string"
+          ? e.startId
+          : typeof e.messageId === "string"
+            ? e.messageId
+            : "";
+      const end =
+        typeof e.endId === "string"
+          ? e.endId
+          : typeof e.messageId === "string"
+            ? e.messageId
+            : "";
+      if (s && end) out.add(rangeKey(s, end));
+    }
+  }
+  if (text !== undefined && text.length > 0) {
+    try {
+      // Adapters (pi) persist the rendered ref tag in front of the tool-call
+      // text; the args start at the first "{".
+      const start = text.indexOf("{");
+      const { ranges } = parseCompressArgs(start >= 0 ? text.slice(start) : text);
+      for (const range of ranges) out.add(rangeKey(range.startRef, range.endRef));
+    } catch {
+      // Unparseable: the field extraction above already ran; recognizing
+      // nothing more keeps the fail-safe direction (under-sweep).
+    }
   }
   return out;
 }
