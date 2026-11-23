@@ -258,8 +258,8 @@ export type RuntimeInfoReport = {
 // #2943: SessionStart hooks (zcode/kimi/claude) are short-lived child processes the
 // client waits on. The old tail `void main().finally(() => process.exit(0))`
 // force-exited while an async handle was still open/mid-close — on Windows
-// early Node 24.x (24.14.x/24.15.x confirmed) that races libuv's win
-// async-handle close path and aborts with
+// Node 24.x before the libuv restructure (24.14.x–24.18.x confirmed) that
+// races libuv's win async-handle close path and aborts with
 // `assert(!(handle->flags & UV_HANDLE_CLOSING))` (src/win/async.c) BEFORE any
 // stdout is written, silently killing the whole integration (newer Node ships
 // the libuv endgame restructure that removed this race; 24.21+ is clean).
