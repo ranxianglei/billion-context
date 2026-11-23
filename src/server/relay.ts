@@ -1099,7 +1099,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // image mass = billed total - textSide. Retries within this forward
     // (#5708/#5835 refolds) re-send near-identical image sets — first-send
     // facts stay the pairing source, same as noteForwardedBody's semantics.
-    if (prepared && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
+    if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
         // parsedBody (the pre-serialization object) avoids re-parsing the
         // whole wire body here; a body that fails to parse carries no image
         // facts to learn — skip exactly like the old raw-probe miss. When a
