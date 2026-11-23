@@ -668,7 +668,7 @@ test("watermark: v4 database migrates to v11 additively; newer user_version no-o
     }
 });
 
-test("watermark: restart handoff — the previous writer's rows and watermark do not survive (#3285)", () => {
+test("watermark: restart handoff — a foreign writer's trust is never inherited (#3285, per-session prime)", () => {
     const dir = tmpdir("bili-wm-handoff-");
     try {
         // Live saves carry the raw tail (persist.ts guardedBuild) — that is
@@ -694,7 +694,15 @@ test("watermark: restart handoff — the previous writer's rows and watermark do
         assert.ok(b, "second process must open");
         const storeB = UnifiedStore.open(path.join(dir, "index.db"));
         try {
-            assert.equal(storeB.ingestWatermark("handoff"), null, "a foreign writer's watermark must not be inherited");
+            // 2026-11-21 per-session rework: open no longer clears watermarks
+            // (the global reset made OPEN a write — the #7156 first-write
+            // hazard). The foreign watermark is still on disk right after
+            // open; the new process's FIRST touch of the session primes its
+            // trust (drops exactly that session's foreign watermark) before
+            // reading it — so the first save still takes the full path, which
+            // the assertions below pin (deltaIngests stays 0, A's rows are
+            // replaced, no drift).
+            assert.ok(storeB.ingestWatermark("handoff"), "the foreign watermark is still on disk after open (open performs no write)");
             const view = [msg(0), msg(1), msg(2)];
             b.record(...withRaw("handoff", view));
             const s = stats(b);
