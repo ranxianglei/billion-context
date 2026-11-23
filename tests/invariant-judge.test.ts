@@ -753,6 +753,25 @@ test("#4401 follow-up teeth: unbounded fake-carrier volume still trips with host
   assert.ok(v.violations.some((x) => x.kind === "exemption-overflow"));
 });
 
+test("#4401 follow-up teeth: unbounded fake-carrier volume still trips WITHOUT host state (full pair volume counts)", () => {
+  // The no-host-state fallback must count the FULL pair volume toward the cap
+  // (over-warn direction only) — a ceiling of pairVolume would make pairExcess
+  // 0 and let a defect mass-producing fake compress pairs escape the guard.
+  const head = mk("user", "text", "preamble");
+  const tail = mk("user", "text", "new question");
+  const entry: CoreMessage[] = [head];
+  const exit: CoreMessage[] = [head];
+  for (let k = 0; k < 80; k++) {
+    entry.push(...compressPair(`call_n${k}`));
+    exit.push(...compressPair(`call_n${k}`));
+  }
+  entry.push(tail);
+  exit.push(tail);
+  const v = judgeInboundOutbound(entry, exit); // NO coveredIds
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "exemption-overflow"));
+});
+
 test("#4401 follow-up: MCP-dialect pair (mcp__bili__compress) marks the regime like the bare form", () => {
   const head = mk("user", "text", "preamble");
   const c1 = mk("assistant", "text", "old-1");

@@ -694,7 +694,7 @@ export function judgeInboundOutbound(
   // over-warn, never under-warns), so a defect mass-producing fake carriers
   // still trips the guard.
   const pairVolume = exit.filter(isCompressToolMsg).length;
-  const pairCeiling = coveredIds ? 2 * coveredIds.size : pairVolume;
+  const pairCeiling = coveredIds ? 2 * coveredIds.size : 0;
   const pairExcess = Math.max(0, pairVolume - pairCeiling);
   const reasoningExempt = exit.filter(isReasoning).length;
   const crushExempt = exit.filter(isCrushedToolResult).length;
