@@ -147,6 +147,17 @@ entries:
     desc_ja: "範囲外のモデル主導圧縮の禁止 (#5683)：提出されたすべての範囲は、bili が現在折りたたみを推奨している範囲内に留まらなければならない — ナッジテキストと acp_status が示すのと同じライブ折りたたみ可能セット（存在する場合、このリクエストの準備時オファー、それ以外の場合はライブ再計算）。判定はカバレッジによる：推奨スパンの細分化は合格し、アクティブなブロックにすでに折りたたまれたメッセージ（既存のサマリーを更新する再折りたたみ）は免除される。他のライブメッセージを含む範囲は、問題のあるスパンを特定するエラーレシートとともに全体として拒否される。明示的に有効化されない限りオフ。"
     site_en: "Forbid out-of-bounds compression (off by default): only ranges bili currently recommends may be folded; subdividing a listed span or refolding an existing block stays legal."
     site_zh: "禁止越界压缩（默认关闭）：只允许折叠 bili 当前推荐的范围；拆分推荐跨度、重折已有块更新摘要仍合法。"
+  - key: compress.postComPressTail
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    id: cw.ptail
+    render: compress-row
+    desc_en: "Recommend 'fold more' inside the SUCCESS compress receipt (#7318): the remaining-offer range list and the 'Uncovered history remains' audit note are printed only when enabled; off by default the receipt carries neither (the context-minimum stop signal is unaffected). When enabled, the uncovered-history note fires at most once per nudge-injection cycle and a fresh injection re-opens it (#6522/#6526). Off because per-receipt re-recommendation drove models into endless fold loops against explicit stop requests."
+    desc_zh: "在压缩成功回执里推荐「继续压缩」（#7318）：剩余可折叠范围列表与「Uncovered history remains」审计提示仅在开启时打印；默认关闭时两者都不出现（上下文已到底的停止信号不受影响）。开启后，未覆盖历史提示每个 nudge 注入周期最多发一次，新注入会重新打开（#6522/#6526）。之所以默认关闭：回执里反复推荐曾驱使模型无视用户停止指令无限折叠。"
+    desc_ja: "圧縮成功レシート内での「続けて折りたたむ」推奨 (#7318)：残り折りたたみ可能範囲リストと『Uncovered history remains』監査ノートを印刷するのは有効化時のみ；デフォルト OFF では両方とも出ない（コンテキスト最小停止シグナルには影響なし）。有効化時は、未カバー履歴ノットはナッジ注入サイクルごとに最大 1 回のみ発火し、新しい注入が再オープンする (#6522/#6526)。レシート毎の再推奨が明示的な停止要求を無視した無限折りたたみループを誘発したためデフォルト OFF。"
+    site_en: "Off by default: the success receipt stops re-advising remaining foldable ranges and the uncovered-history note. Enable compress.postComPressTail to restore the recommendation (then at most once per nudge cycle)."
+    site_zh: "默认关闭：成功回执不再推荐剩余可折叠范围、不再发未覆盖历史提示。开启 compress.postComPressTail 可恢复推荐（开启后每个 nudge 周期最多一次）。"
   - key: compress.streamSummary
     type: boolean
     default: "false (unset)"
@@ -350,16 +361,16 @@ entries:
     site_en: "Send growth nudges as the window fills (on by default; global level only)."
     site_zh: "窗口填满过程中发送增长提醒（默认开；仅全局层级生效）。"
   - key: compress.reasoning
-    type: "{ drop?, threshold? }"
-    default: "drop true · threshold 2048"
+    type: "{ drop?, threshold?, tail? }"
+    default: "drop true · threshold 2048 · tail false"
     group: compress
     id: ct.rz
     render: compress-row
     desc_en: "Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
     desc_zh: "丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
     desc_ja: "2048文字を超える完了ラウンドの推論実行を破棄する（デフォルトで drop: true）；厳格な推論を要求するアップストリームでは drop: false が必要。"
-    site_en: "{ drop?, threshold? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
-    site_zh: "{ drop?, threshold? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
+    site_en: "{ drop?, threshold?, tail? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default; tail: false keeps it scoped to compress turns only); strict-reasoning upstreams need drop:false."
+    site_zh: "{ drop?, threshold?, tail? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true；tail 默认 false，只限 compress 轮次）；严格推理上游需设 drop:false。"
   - key: compress.absorb
     type: object
     default: "opt-in (disabled)"
@@ -698,6 +709,13 @@ entries:
     desc_en: "Character threshold above which finished reasoning runs are dropped."
     desc_zh: "已结束推理块被丢弃的字符阈值。"
     desc_ja: "完了推論実行を破棄する文字数閾値。"
+  - key: compress.reasoning.tail
+    type: boolean
+    default: "false"
+    group: compress
+    desc_en: "(#7144 follow-up) Also drop reasoning from any CLOSED round in the protected tail, not only compress turns — a tool call whose result arrived with at least one message after it, or an assistant text turn that is no longer the last message. Those rounds leave the protected window at the next fold anyway, so dropping early reclaims the tokens now; the in-flight round is never touched. Strict-echo upstreams are unaffected: #762/#2169 blank-echo normalization runs after the drop."
+    desc_zh: "（#7144 后续）保护尾内不止 compress 轮次、任意已关闭轮次的推理块也丢弃——工具调用结果已到且其后还有消息，或助手文本不再是最后一条。这些轮次下次折叠时反正会连推理一起离开窗口，提前丢即回收 token；进行中的轮次绝不触碰。严格推理上游不受影响：#762/#2169 空回显归一化跑在丢弃之后。"
+    desc_ja: "(#7144 フォローアップ) 保護テール内では compress ラウンド以外に、任意のクローズ済みのラウンド（結果到着後メッセージがあるツール呼び出し、または最後のメッセージでなくなったアシスタントテキスト）の推論実行も破棄する。進行中のラウンドには一切触れない。厳格な推論アップストリームには影響なし：#762/#2169 の空白エコー正規化は破棄後に実行される。"
   - key: compress.minCompressRange
     type: number
     default: "same as minCompressRangeChars"

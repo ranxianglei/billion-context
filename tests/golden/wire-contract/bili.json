@@ -3,13 +3,13 @@
     "anthropic": [
       {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
         "input_schema": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -72,7 +72,7 @@
       },
       {
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings; protectedMass:true adds the attribution-only protected-mass line (off by default).",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -82,7 +82,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -99,6 +99,10 @@
             "archiveDetail": {
               "type": "boolean",
               "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            },
+            "protectedMass": {
+              "type": "boolean",
+              "description": "Off by default. Adds the PROTECTED MASS attribution line: token mass metered into usage but reachable by no compress offer (hard protection + the protected recent window). It explains, it does not offer work — pass it when asked where the uncompressible mass is."
             }
           }
         }
@@ -126,13 +130,13 @@
         "type": "function",
         "function": {
           "name": "compress",
-          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
           "parameters": {
             "type": "object",
             "properties": {
               "content": {
                 "type": "string",
-                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
               }
             }
           }
@@ -204,7 +208,7 @@
         "type": "function",
         "function": {
           "name": "acp_status",
-          "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
+          "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings; protectedMass:true adds the attribution-only protected-mass line (off by default).",
           "parameters": {
             "type": "object",
             "properties": {
@@ -214,7 +218,7 @@
               },
               "view": {
                 "type": "string",
-                "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+                "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
               },
               "tool": {
                 "type": "string",
@@ -231,6 +235,10 @@
               "archiveDetail": {
                 "type": "boolean",
                 "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+              },
+              "protectedMass": {
+                "type": "boolean",
+                "description": "Off by default. Adds the PROTECTED MASS attribution line: token mass metered into usage but reachable by no compress offer (hard protection + the protected recent window). It explains, it does not offer work — pass it when asked where the uncompressible mass is."
               }
             }
           }
@@ -261,13 +269,13 @@
       {
         "type": "function",
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
         "parameters": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -333,7 +341,7 @@
       {
         "type": "function",
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings; protectedMass:true adds the attribution-only protected-mass line (off by default).",
         "parameters": {
           "type": "object",
           "properties": {
@@ -343,7 +351,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -360,6 +368,10 @@
             "archiveDetail": {
               "type": "boolean",
               "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            },
+            "protectedMass": {
+              "type": "boolean",
+              "description": "Off by default. Adds the PROTECTED MASS attribution line: token mass metered into usage but reachable by no compress offer (hard protection + the protected recent window). It explains, it does not offer work — pass it when asked where the uncompressible mass is."
             }
           }
         }
@@ -386,13 +398,13 @@
     "google": [
       {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
         "parameters": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -455,7 +467,7 @@
       },
       {
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings; protectedMass:true adds the attribution-only protected-mass line (off by default).",
         "parameters": {
           "type": "object",
           "properties": {
@@ -465,7 +477,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -482,6 +494,10 @@
             "archiveDetail": {
               "type": "boolean",
               "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            },
+            "protectedMass": {
+              "type": "boolean",
+              "description": "Off by default. Adds the PROTECTED MASS attribution line: token mass metered into usage but reachable by no compress offer (hard protection + the protected recent window). It explains, it does not offer work — pass it when asked where the uncompressible mass is."
             }
           }
         }
@@ -566,7 +582,7 @@
       {
         "type": "function",
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings; protectedMass:true adds the attribution-only protected-mass line (off by default).",
         "parameters": {
           "type": "object",
           "properties": {
@@ -576,7 +592,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -593,6 +609,10 @@
             "archiveDetail": {
               "type": "boolean",
               "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            },
+            "protectedMass": {
+              "type": "boolean",
+              "description": "Off by default. Adds the PROTECTED MASS attribution line: token mass metered into usage but reachable by no compress offer (hard protection + the protected recent window). It explains, it does not offer work — pass it when asked where the uncompressible mass is."
             }
           }
         }

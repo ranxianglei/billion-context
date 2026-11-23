@@ -69,6 +69,9 @@ const MAX_IMAGE_CANDIDATES = 50;                // deduped relative targets per 
 type TextFileMap = Map<string, string>;                            // repo-relative path → raw text
 type BinaryAssetMap = Map<string, { buf: Buffer; type: string }>;  // repo-relative path → bytes
 
+/** A confirmed missing source is distinct from a failed download. */
+class TextFileNotFound extends Error {}
+
 let lastRoundStartedAt = 0;
 let inflight: Promise<void> | undefined;
 let warmAttempted = false;
@@ -203,13 +206,23 @@ async function runRound(): Promise<void> {
         //    kept in `files` under MANIFEST_REL — buildRemoteBlogPosts re-reads
         //    it by that key when assembling the article section.
         let entries: ArticleEntry[] = [];
+        let manifestText: string | undefined;
         try {
-            const manifestText = await getTextChain(MANIFEST_REL, chain, account);
+            manifestText = await getTextChain(MANIFEST_REL, chain, account);
+        } catch (error) {
+            // Only a clean absence can remove the previous article set. A
+            // failed read must keep the last complete overlay, like a post.
+            if (!(error instanceof TextFileNotFound)) throw error;
+        }
+        if (manifestText !== undefined) {
             files.set(MANIFEST_REL, manifestText);
-            const parsed = JSON.parse(manifestText) as { articles?: unknown };
-            if (Array.isArray(parsed.articles)) entries = parsed.articles.filter(isArticleEntry);
-        } catch {
-            entries = [];
+            try {
+                const parsed = JSON.parse(manifestText) as { articles?: unknown };
+                if (Array.isArray(parsed.articles)) entries = parsed.articles.filter(isArticleEntry);
+            } catch {
+                // A completely downloaded but malformed manifest retains the
+                // existing posts-only behavior; it is not a transport failure.
+            }
         }
         const wanted: string[] = [];
         for (const e of entries) {
@@ -307,7 +320,8 @@ async function getJsonList(url: string): Promise<ContentsEntry[]> {
         if (!Array.isArray(raw)) throw new Error("contents listing is not a JSON array");
         return raw as ContentsEntry[];
     } finally {
-        result.stopIdleTimer(); // body fully consumed (fetch-util #552 contract)
+        await releaseUnreadBody(result.response);
+        result.stopIdleTimer();
     }
 }
 
@@ -317,16 +331,18 @@ async function getJsonList(url: string): Promise<ContentsEntry[]> {
 async function fetchPlainText(url: string, account?: (bytes: number) => void): Promise<string> {
     const result = await fetchWithTimeout(url, ghHeaders(), FETCH_TIMEOUT_MS);
     try {
+        if (result.response.status === 404) throw new TextFileNotFound(`plain GET ${url} → HTTP 404`);
         if (!result.response.ok) throw new Error(`plain GET ${url} → HTTP ${result.response.status}`);
         const declared = contentLengthOf(result.response.headers);
         if (declared !== undefined && declared > MAX_TEXT_BYTES) {
             throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes (content-length ${declared}): ${url}`);
         }
-        const buf = Buffer.from(await result.response.arrayBuffer());
-        if (buf.byteLength > MAX_TEXT_BYTES) throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${url}`);
+        const buf = await readCappedBytes(result.response.body, MAX_TEXT_BYTES);
+        if (buf === undefined) throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${url}`);
         account?.(buf.byteLength);
         return buf.toString("utf8");
     } finally {
+        await releaseUnreadBody(result.response);
         result.stopIdleTimer();
     }
 }
@@ -338,20 +354,18 @@ async function fetchApiText(rel: string, account?: (bytes: number) => void): Pro
     const url = `${GITHUB_CONTENTS_URL}/${encRelPath(rel)}?ref=${BRANCH}`;
     const result = await fetchWithTimeout(url, ghHeaders("application/json"), FETCH_TIMEOUT_MS);
     try {
+        if (result.response.status === 404) throw new TextFileNotFound(`contents GET ${url} → HTTP 404`);
         if (!result.response.ok) throw new Error(`contents GET ${url} → HTTP ${result.response.status}`);
         const data = (await result.response.json()) as { content?: unknown; encoding?: unknown };
         if (typeof data.content !== "string") {
             throw new Error(`contents API omitted the body (>1 MiB cap): ${rel}`);
         }
-        // Size gate BEFORE decoding: base64 inflates payloads by ~4/3.
-        if (Math.ceil(data.content.length * 3 / 4) > MAX_TEXT_BYTES) {
-            throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${rel}`);
-        }
-        const buf = Buffer.from(data.content, "base64");
-        if (buf.byteLength > MAX_TEXT_BYTES) throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${rel}`);
+        const buf = decodeCappedBase64(data.content, MAX_TEXT_BYTES);
+        if (buf === undefined) throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${rel}`);
         account?.(buf.byteLength);
         return buf.toString("utf8");
     } finally {
+        await releaseUnreadBody(result.response);
         result.stopIdleTimer();
     }
 }
@@ -359,11 +373,14 @@ async function fetchApiText(rel: string, account?: (bytes: number) => void): Pro
 /** Text fetch through the fallback chain for ONE repo-relative path. Any
  *  per-source failure (network, HTTP, oversize, omitted body) walks to the
  *  next member; the round only fails when EVERY member fails, and then with
- *  the last error — half-fetched trees never render. On success the walk
+ *  the last hard error (or a confirmed absence if all attempts are 404s) —
+ *  half-fetched trees never render. On success the walk
  *  point advances so later files skip already-proven-dead sources. */
 async function getTextChain(rel: string, chain: ChainState, account?: (bytes: number) => void): Promise<string> {
     const sources = sourceChainFor(rel);
     let lastError: unknown = new Error(`all sources failed for ${rel}`);
+    let lastHardError: unknown;
+    let hadHardError = false;
     for (let i = Math.min(chain.start, sources.length - 1); i < sources.length; i++) {
         try {
             const text = i === 1 ? await fetchApiText(rel, account)
@@ -373,9 +390,13 @@ async function getTextChain(rel: string, chain: ChainState, account?: (bytes: nu
             return text;
         } catch (e) {
             lastError = e; // walk to the next fallback source
+            if (!(e instanceof TextFileNotFound)) {
+                lastHardError = e;
+                hadHardError = true;
+            }
         }
     }
-    throw lastError;
+    throw hadHardError ? lastHardError : lastError;
 }
 
 /** Download ONE image from the PLAIN source (raw host); 404/oversize are
@@ -394,11 +415,12 @@ async function fetchPlainImage(url: string, account?: (bytes: number) => void): 
         if (!result.response.ok) throw new Error(`image GET ${url} → HTTP ${result.response.status}`);
         const declared = contentLengthOf(result.response.headers);
         if (declared !== undefined && declared > MAX_IMAGE_BYTES) return undefined; // never download the body
-        const buf = Buffer.from(await result.response.arrayBuffer());
-        if (buf.byteLength === 0 || buf.byteLength > MAX_IMAGE_BYTES) return undefined;
+        const buf = await readCappedBytes(result.response.body, MAX_IMAGE_BYTES);
+        if (buf === undefined || buf.byteLength === 0) return undefined;
         account?.(buf.byteLength);
         return { buf, type };
     } finally {
+        await releaseUnreadBody(result.response);
         result.stopIdleTimer();
     }
 }
@@ -419,14 +441,48 @@ async function fetchApiImage(rel: string, account?: (bytes: number) => void): Pr
         if (!result.response.ok) throw new Error(`contents image GET ${url} → HTTP ${result.response.status}`);
         const data = (await result.response.json()) as { content?: unknown };
         if (typeof data.content !== "string") return undefined; // >1 MiB omission → next source
-        if (Math.ceil(data.content.length * 3 / 4) > MAX_IMAGE_BYTES) return undefined;
-        const buf = Buffer.from(data.content, "base64");
-        if (buf.byteLength === 0 || buf.byteLength > MAX_IMAGE_BYTES) return undefined;
+        const buf = decodeCappedBase64(data.content, MAX_IMAGE_BYTES);
+        if (buf === undefined || buf.byteLength === 0) return undefined;
         account?.(buf.byteLength);
         return { buf, type };
     } finally {
+        await releaseUnreadBody(result.response);
         result.stopIdleTimer();
     }
+}
+
+async function releaseUnreadBody(response: Response): Promise<void> {
+    if (!response.bodyUsed) await response.body?.cancel().catch(() => {});
+}
+
+function decodeCappedBase64(content: string, maxBytes: number): Buffer | undefined {
+    const compact = content.replace(/\s/g, "");
+    if (Buffer.byteLength(compact, "base64") > maxBytes) return undefined;
+    const buf = Buffer.from(compact, "base64");
+    return buf.byteLength > maxBytes ? undefined : buf;
+}
+
+async function readCappedBytes(body: Response["body"], maxBytes: number): Promise<Buffer | undefined> {
+    if (body === null) return Buffer.alloc(0);
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value.byteLength === 0) continue;
+            if (value.byteLength > maxBytes - total) {
+                await reader.cancel().catch(() => {});
+                return undefined;
+            }
+            total += value.byteLength;
+            chunks.push(value);
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    return Buffer.concat(chunks, total);
 }
 
 /** Image fetch through the fallback chain. Misses (true 404s / >1 MiB API

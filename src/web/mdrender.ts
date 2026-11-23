@@ -34,6 +34,46 @@ export function makeMdRender(): MdRenderApi {
             .replace(/"/g, "&quot;");
     }
 
+    function inlineLinks(s: string, image: boolean): string {
+        const marker = image ? "![" : "[";
+        const parts: string[] = [];
+        let copied = 0;
+        let search = 0;
+        let urlEnd = 0;
+        while (search < s.length) {
+            const start = s.indexOf(marker, search);
+            if (start < 0) break;
+            const labelStart = start + marker.length;
+            const labelEnd = s.indexOf("]", labelStart);
+            if (labelEnd < 0) break;
+            // Every opening marker before this first ']' has the same closing delimiter.
+            // Skip that whole label on failure instead of retrying all of its suffixes.
+            search = labelEnd + 1;
+            if (s[labelEnd + 1] !== "(" || (!image && labelEnd === labelStart)) continue;
+            const urlStart = labelEnd + 2;
+            search = urlStart;
+            // Reuse the next URL terminator when nested starts share one long invalid URL.
+            // Both cursors only move forward, even for "[x]([x](... invalid".
+            if (urlEnd < urlStart) {
+                urlEnd = urlStart;
+                while (urlEnd < s.length && s[urlEnd] !== ")" && !/\s/.test(s[urlEnd])) urlEnd += 1;
+            }
+            if (urlEnd === s.length) break;
+            if (urlEnd === urlStart || s[urlEnd] !== ")") continue;
+            const label = s.slice(labelStart, labelEnd);
+            const url = s.slice(urlStart, urlEnd);
+            parts.push(s.slice(copied, start));
+            if (image) {
+                parts.push(/^(?:https?:\/\/|\/__bili\/blog-assets\/)/i.test(url) ? `<img class="md-img" src="${url}" alt="${label}" />` : "");
+            } else {
+                parts.push(/^(https?:\/\/|\/)/i.test(url) ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>` : label);
+            }
+            copied = search = urlEnd + 1;
+        }
+        parts.push(s.slice(copied));
+        return parts.join("");
+    }
+
     function inlineMd(s: string): string {
         let out = escape(s);
         out = out.replace(/`([^`]+)`/g, (_m, code: string) =>
@@ -43,18 +83,12 @@ export function makeMdRender(): MdRenderApi {
         // panel's own bundled-asset route (/__bili/blog-assets/*, see
         // web/blogfeed.ts). Quotes are already escaped by escape, so attribute
         // injection is impossible.
-        out = out.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_m, alt: string, url: string) => {
-            if (/^(?:https?:\/\/|\/__bili\/blog-assets\/)/i.test(url)) return `<img class="md-img" src="${url}" alt="${alt}" />`;
-            return "";
-        });
+        out = inlineLinks(out, true);
         out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
         out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
         // [text](url) — only http/https/relative URLs survive; anything else
         // degrades to plain bracketed text (no javascript: vectors).
-        out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, text: string, url: string) => {
-            if (/^(https?:\/\/|\/)/i.test(url)) return `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`;
-            return text;
-        });
+        out = inlineLinks(out, false);
         return out;
     }
 

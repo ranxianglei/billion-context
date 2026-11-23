@@ -27,7 +27,7 @@ import * as path from "node:path";
 /** #1420/#1937: read-only session browsing for the web UI. Merges the LIVE
  *  in-memory pool (bounded — evicted sessions are gone) with the on-disk
  *  corpus. #1937: the disk side is a BOUNDED SUMMARY INDEX — a directory walk
- *  over metadata only, per-file summaries cached by (mtime,size), and
+ *  over metadata only, per-file summaries cached by (mtime,size,price), and
  *  sequential decode of changed/new files whose parsed records are discarded
  *  right after extraction. List/overview paths never construct or retain full
  *  Session objects, so resident memory stays O(#sessions × ~1KB) regardless of
@@ -361,6 +361,8 @@ type DiskEntry = {
     savedAt: number;
     /** null = undecodable/corrupt or renamed file — skipped (logged), never fatal. */
     summary: WebSessionSummary | null;
+    /** Resolved rates used to derive this summary's dollar fields. */
+    priceKey?: string;
 };
 
 // #4990: read surface rides the persist process singleton (getStore) — a
@@ -497,8 +499,9 @@ function isPristineSessionsRoot(error: unknown): boolean {
     return entries.every((entry) => DATA_DIR_INFRA_ENTRIES.has(entry));
 }
 
-/** Single-flight index refresh. Steady-state cost is one stat per file; only
- *  new/changed files (mtime OR size moved) are decoded, one at a time with a
+/** Single-flight index refresh. Steady-state cost is one stat per file and
+ *  one price lookup per distinct model/origin; new/changed files or summaries
+ *  whose resolved prices changed are decoded, one at a time with a
  *  GC checkpoint between files, and the parsed record is dropped immediately
  *  after summary extraction. Top-level walk failure: serve the previous
  *  snapshot when one exists, else propagate (→ HTTP 500, visible in UI) —
@@ -524,6 +527,17 @@ async function refreshIndex(): Promise<void> {
         }
         const prev = byFile ?? new Map<string, DiskEntry>();
         const next = new Map<string, DiskEntry>();
+        const prices = new Map<string, string>();
+        const priceKey = (summary: WebSessionSummary, fresh = false): string => {
+            const modelKey = JSON.stringify([summary.model, summary.upstreamOrigin]);
+            let key = prices.get(modelKey);
+            if (fresh || key === undefined) {
+                const price = livePriceForModel(summary.model, summary.upstreamOrigin);
+                key = JSON.stringify(price ? [price.input, price.output, price.cacheRead, price.cacheWrite] : null);
+                prices.set(modelKey, key);
+            }
+            return key;
+        };
         const covered = liveCoveredPaths(dir);
         // #3199: shadow mode adopts fresh unified rows instead of decoding the
         // files they describe — cold-start cost drops from "decode the whole
@@ -538,13 +552,14 @@ async function refreshIndex(): Promise<void> {
         for (const f of files) {
             if (covered.has(f.abs)) continue;
             const p = prev.get(f.abs);
-            if (p && p.mtimeMs === f.mtimeMs && p.size === f.size) {
+            if (p && p.mtimeMs === f.mtimeMs && p.size === f.size && (!p.summary || p.priceKey === priceKey(p.summary))) {
                 next.set(f.abs, p);
                 continue;
             }
             const claim = claims?.get(path.basename(f.abs));
             if (claim && f.mtimeMs - claim.updatedAt <= SHADOW_ROW_STALE_WINDOW_MS) {
-                next.set(f.abs, { abs: f.abs, mtimeMs: f.mtimeMs, size: f.size, savedAt: claim.updatedAt, summary: summaryFromRow(claim) });
+                const summary = summaryFromRow(claim);
+                next.set(f.abs, { abs: f.abs, mtimeMs: f.mtimeMs, size: f.size, savedAt: claim.updatedAt, summary, priceKey: priceKey(summary, true) });
                 continue;
             }
             decodeCount++;
@@ -561,6 +576,9 @@ async function refreshIndex(): Promise<void> {
                     if (fileNameMatchesId(path.basename(f.abs), rec.id, proto, origin)) {
                         entry.savedAt = typeof rec.savedAt === "number" ? rec.savedAt : Date.now();
                         entry.summary = summaryFromRecord(rec);
+                        // A config reload can run during the file read. Stamp the
+                        // rates used now, not a memo from before that await.
+                        entry.priceKey = priceKey(entry.summary, true);
                     } else {
                         log("warn", `[acp-web] skipping ${relName}: filename does not match record id`);
                     }
@@ -663,10 +681,14 @@ function str(v: unknown): string | undefined {
  *  Host-aware like the pricing editor (`handlePricingGet`). */
 function livePriceForSummary(s: SummarySource): LivePrice | undefined {
     const model = typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? s.metadata.lastModel : undefined;
+    return livePriceForModel(model, s.meta.upstreamOrigin);
+}
+
+function livePriceForModel(model: string | undefined, upstreamOrigin: string | undefined): LivePrice | undefined {
     if (!model) return undefined;
     let host: string | undefined;
-    if (s.meta.upstreamOrigin) {
-        try { host = new URL(s.meta.upstreamOrigin).host; } catch { host = undefined; }
+    if (upstreamOrigin) {
+        try { host = new URL(upstreamOrigin).host; } catch { host = undefined; }
     }
     return resolveBillingPrice(model, host);
 }
@@ -1056,7 +1078,12 @@ async function mergedSummaries(): Promise<WebSessionSummary[]> {
     }
     if (!fromRows) {
         const files = await ensureIndex();
-        for (const e of files.values()) if (e.summary) out.set(e.summary.id, e.summary);
+        // The index already chooses each id's freshest savedAt, then mtime.
+        // Replaying every file here would let directory order pick a stale twin.
+        for (const abs of byId?.values() ?? []) {
+            const summary = files.get(abs)?.summary;
+            if (summary) out.set(summary.id, summary);
+        }
     }
     for (const s of listSessions()) out.set(s.id, summaryOf(s, true));
     return [...out.values()].sort((a, b) => b.lastSeen.localeCompare(a.lastSeen));

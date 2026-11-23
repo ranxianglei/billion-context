@@ -268,7 +268,9 @@ describe("honesty gates survive the doctrine (no wholesale silencing)", () => {
         const result = await preflightCompress({
             core: {} as never, // untouched on the gated path
             config: { modelContextLimit: 1000 } as never,
-            session: session as never,
+            // #6069: the gate now judges window fit on the calibrated scale,
+            // so the session carries (empty) stats like a real one.
+            session: { ...session, stats: {} } as never,
             prompts: defaultPrompts,
             protocol: "responses",
             url: "http://127.0.0.1:1/summary-must-not-be-called",
