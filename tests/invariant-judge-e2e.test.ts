@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { defaultConfig, type CoreMessage } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
@@ -82,7 +83,7 @@ async function harness(opts: { context?: number } = {}) {
   const addr = upstream.address();
   assert(addr && typeof addr === "object");
   const upstreamUrl = `http://127.0.0.1:${addr.port}`;
-  const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "model-test": { context: ctx }, "model-alt": { context: ctx } } } }, modelContextLimit: ctx, kernelConfig: defaultConfig(ctx), compress: { injectTool: false, injectNudge: false, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100 }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
+  const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "model-test": { context: ctx }, "model-alt": { context: ctx } } } }, modelContextLimit: ctx, kernelConfig: { ...defaultConfig(ctx), minFoldBenefitTokens: 0 } as ResolvedKernelConfig, compress: { injectTool: false, injectNudge: false, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100 }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
   await once(proxy, "listening");
   const paddr = proxy.address();
   assert(paddr && typeof paddr === "object");

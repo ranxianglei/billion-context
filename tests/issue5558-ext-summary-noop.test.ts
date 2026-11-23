@@ -12,6 +12,7 @@ import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap 
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 import { applyConfiguredCompression } from "../src/external-summary-compress.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 
@@ -25,7 +26,7 @@ function makeCtx(preserveRecentMessages: number): Ctx {
     const logs: string[] = [];
     const ctx: Ctx = {
         core: createCore(),
-        config: defaultConfig(200000, { preserveRecentMessages, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(200000, { preserveRecentMessages, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages: MESSAGES,
         session: {
             id: "issue5558-test",
@@ -52,6 +53,7 @@ function withExternalSummary(ctx: Ctx, preserveRecentMessages: number): Ctx {
     // payer call the batch would fail and the outcome could not be "applied".
     ctx.config = {
         ...defaultConfig(200000, { preserveRecentMessages, preserveRecentTokens: 0 }),
+        minFoldBenefitTokens: 0,
         externalSummary: { enabled: true, targets: [{ name: "sum-sm", protocol: "openai", url: "https://summary.example.test/v1/chat/completions", model: "sm", apiKey: "sk-test-5558", contextWindow: 128000, outputTokens: 8192, stream: false }] },
     } as typeof ctx.config;
     return ctx;

@@ -7,6 +7,7 @@ import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 import { handleAcpStatus } from "../src/acp-status.ts";
 import { buildContextView } from "../src/context-view.ts";
 import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import {
   PROTECTED_MASS_RENDER_FLOOR,
   formatProtectedMass,
@@ -35,7 +36,7 @@ function makeCtx(messages: CoreMessage[], overrides?: Record<string, unknown>): 
     const logs: string[] = [];
     const ctx: Ctx = {
         core: createCore(),
-        config: defaultConfig(200000, overrides as never),
+        config: { ...defaultConfig(200000, overrides as never), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages,
         session: {
             id: "issue7463-test",
