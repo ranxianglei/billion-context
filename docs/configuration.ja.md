@@ -168,6 +168,7 @@
 | `network.exposureLogIntervalMs` | number | 3600000 (0 disables the log) | BILI_EXPOSURE_LOG_INTERVAL_MS | バインドアドレス公開の警告がログに繰り返し表示される間隔；0 で完全に無効化。 |
 | `network.streamKeepAliveMs` | number | 15000 (0 disables) | BILI_STREAM_KEEPALIVE_MS | モデルチャンク間の下流ストリームキープアライブピン間隔；0 でピンを無効化。 |
 | `network.preflightHoldMs` | number | 30000 | BILI_PREFLIGHT_HOLD_MS | 失敗したプリフライトが、リクエストが未調整のまま許可されるまで保持される時間。 |
+| `network.emergencyDigest` | boolean | false (env BILI_PREFLIGHT_EMERGENCY_DIGEST=1 overrides) | BILI_PREFLIGHT_EMERGENCY_DIGEST | #2383 の緊急ダイジェスト regime（ペイロードがウィンドウの19.2倍超えで決定的ダイジェスト折畳み）を復帰させる。PR #7549 以降デフォルト OFF：収束しない極端なオーバーフローは、履歴をモデル可視のダイジェストブロックに置き換える代わりにリクエストを失敗させる。true で旧動作を復帰。 |
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 行き止まりのプリフライト後、同じセッションの調整を再試行するまでのクールダウン。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | エラーを表面化させる前に、同一リクエストの最大トランスポート失敗リプレイ回数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | リプレイ間のベースバックオフ遅延（指数関数的）。 |
@@ -2014,6 +2015,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_PI_INLINE` | `pi.inline` | true (unset env+file runs inline) |
 | `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
+| `BILI_PREFLIGHT_EMERGENCY_DIGEST` | `network.emergencyDigest` | false (env BILI_PREFLIGHT_EMERGENCY_DIGEST=1 overrides) |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
 | `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | 55000 (0 = one-shot connections) |
 | `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 104857600 (0 disables snapshots) |
