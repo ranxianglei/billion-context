@@ -110,7 +110,7 @@ async function run(s: Scenario) {
             rebuilds++;
             return prepared;
         }, req, Buffer.from(prepared.body), res, opts, core, config, limit,
-        "test-model", route, undefined, s.anonymous ?? false,
+        "test-model", undefined, undefined, route, undefined, s.anonymous ?? false,
         (_level: string, msg: string) => logs.push(msg), "zero-fold-test");
         assert.equal(rebuilds, 0, "a rejected or unnecessary summary cannot rebuild the payload");
         assert.equal(session.state.blocks.length, 0, "no growing summary may land");
