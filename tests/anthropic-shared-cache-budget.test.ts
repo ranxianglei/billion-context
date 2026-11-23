@@ -119,4 +119,47 @@ describe("Anthropic shared 4-breakpoint cache budget", () => {
         assert.equal(Array.isArray(unstamped) && unstamped.some((b) => Boolean(b.cache_control)), false);
         assert.equal((stampAnthropicSystemCacheControl([{ type: "text", text: "Sys" }], true, 0) as { cache_control?: unknown }[])[0]?.cache_control, undefined);
     });
+
+    it("harvests message-level cache_control onto the last non-reasoning block and counts it in the shared budget", () => {
+        const parsed: AnthropicRequestBody = {
+            model: "claude-opus-4-6",
+            max_tokens: 4096,
+            system: [{ type: "text", text: "System prompt" }],
+            messages: [
+                { role: "user", content: "u1 message-level mark" },
+                {
+                    role: "assistant",
+                    content: [
+                        { type: "text", text: "a1 before trailing thinking" },
+                        { type: "thinking", thinking: "t", signature: "sig" },
+                    ],
+                },
+                { role: "user", content: [{ type: "text", text: "u2 block-level mark", cache_control: { type: "ephemeral" } }] },
+            ],
+        };
+        (parsed.messages[0] as { cache_control?: unknown }).cache_control = { type: "ephemeral" };
+        (parsed.messages[1] as { cache_control?: unknown }).cache_control = { type: "ephemeral" };
+
+        const conv = anthropicToCore(parsed);
+        assert.equal(conv.clientMessageControls.size, 2, "Expected both message-level controls harvested");
+        assert.equal(conv.cacheControls.size, 1, "Expected the block-level control harvested separately");
+
+        const combined = new Map<string, unknown>(conv.cacheControls);
+        for (const [id, ctrl] of conv.clientMessageControls) {
+            if (!combined.has(id)) combined.set(id, ctrl);
+        }
+        assert.equal(combined.size, 3, "Expected all 3 client marks to count in the shared budget");
+
+        const wire = coreToAnthropic(conv.msgs, combined);
+        const marked = wire.flatMap((m) => (Array.isArray(m.content) ? m.content : [])).filter((b) => Boolean((b as { cache_control?: unknown }).cache_control));
+        assert.equal(marked.length, 3, "Expected exactly 3 marked blocks on the wire");
+        const a1Blocks = wire[1]!.content as { type?: string; cache_control?: unknown }[];
+        assert.ok(a1Blocks[0]!.cache_control, "Message-level mark must land on the last non-reasoning (text) block");
+        assert.equal(a1Blocks[1]!.cache_control, undefined, "Trailing thinking block must stay unmarked");
+
+        const sysOut = stampSystemWithinAnthropicBudget(parsed.system, parsed.tools, parsed.system, combined, true);
+        const sysMarks = Array.isArray(sysOut) ? sysOut.filter((b) => Boolean(b.cache_control)).length : 0;
+        assert.equal(sysMarks, 1, "System stamp must fit the remaining budget slot");
+        assert.equal(sysMarks + combined.size, 4, "Total WC-010 breakpoints must equal 4");
+    });
 });
