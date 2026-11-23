@@ -1,5 +1,5 @@
 /**
- * #7579: egress block flow/state — the block canonical history + read replica.
+ * #7577: egress block flow/state — the block canonical history + read replica.
  * Tests pin the CONTRACT:
  *   - replay determinism: same op sequence → same block set, always;
  *   - the three row types (I born, U state-change, B compaction base) and

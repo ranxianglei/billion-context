@@ -584,7 +584,7 @@ function finishPlan(
           })
         : [];
 
-    // #7579 D4: egress-on sessions derive tsStamps/tokenSnapshot from the
+    // #7577 D4: egress-on sessions derive tsStamps/tokenSnapshot from the
     // egress flow replay (the I rows carry the wall-clock ts); lastPassIds is
     // a self-heal field. Exclude them from the kstate column to keep it
     // bounded (<2KB residual sidecar).

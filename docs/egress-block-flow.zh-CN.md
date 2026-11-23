@@ -1,6 +1,6 @@
 # Egress 块流/状态：块正史 + checkpoint 退役
 
-> #7579（#7439 / #6785 后续）。新增两张表（`egress_block_flow`、`egress_block_state`），使块集合成为与消息视图（`egress_flow`/`egress_state`）平级的一等 op-log 公民。对 egress-on 会话退役 checkpoint（fork_base/replica/auto），改用点位 fork（4 表拷贝）。对 egress-on 会话裁剪 kstate 列（tsStamps/tokenSnapshot/lastPassIds 可从 flow 回放推导）。
+> #7577（#7439 / #6785 后续）。新增两张表（`egress_block_flow`、`egress_block_state`），使块集合成为与消息视图（`egress_flow`/`egress_state`）平级的一等 op-log 公民。对 egress-on 会话退役 checkpoint（fork_base/replica/auto），改用点位 fork（4 表拷贝）。对 egress-on 会话裁剪 kstate 列（tsStamps/tokenSnapshot/lastPassIds 可从 flow 回放推导）。
 
 ## 表
 
@@ -48,13 +48,14 @@
 
 对 egress-on 会话：
 - `maybeCutForkBaseAsync` / `createReplica` 跳过（不建 fork_base/replica/auto 行）。
-- Admin `/__bili/replicas` 返回 400。
-- `persistForkSession` / `cloneSessionRows` 使用 `egressPointFork`（4 表拷贝：`egress_state`、`egress_flow`、`egress_block_state`、`egress_block_flow` WHERE `op_seq <= wm`）。
-- 状态副本通过回放 flow 表重建（直接按 op_seq 过滤拷贝会漏掉最新行在 wm 之后的块）。
+- Admin `POST /__bili/replicas` 对 egress-on 父会话走点 fork：`201 {ok, pointFork, sessionId, opSeq, restoredFrom}` —— 生成一个全新的独立子会话（父会话永不被改，子会话是快照而非活别名）。egress-off 父保留 checkpoint 行为；低于高水位的 `opSeq` 被拒绝（400），因为它需要点位重构物化器（后续项）。
+- `persistForkSession` / `cloneSessionRows` 使用 `egressPointFork`（四张表 `egress_state`、`egress_flow`、`egress_block_state`、`egress_block_flow`）。fork-to-now（`wm` = 高水位）直接拷贝全部四表（SQL `INSERT…SELECT`）；真点位 fork（`wm` < 高水位）按 `op_seq <= wm` 过滤拷贝 flow 表，再回放这些行重建状态副本（直接按 op_seq 过滤拷贝会漏掉最新行在 wm 之后的块）。
 
 ## kstate 裁剪（D4）
 
-对 egress-on 会话，`tsStamps`、`tokenSnapshot`、`lastPassIds` 从 `sessions.kstate_json` 列中排除（可从 flow 回放推导）。legacy 路径字节级不变。
+对 egress-on 会话，`tsStamps`、`tokenSnapshot`、`lastPassIds` 从 `sessions.kstate_json` 列中排除（可从 egress 日志推导）。legacy 路径字节级不变。
+
+加载时，store 为「列里无值」的 egress-on 会话重新推导 `tsStamps`：每个 I 行的 `msgid` 就是内核 raw id（`tsStamps` 的键），其 `ts` 是首见墙钟。已持久化的值永远优先 —— 推导只补裁剪留下的缺口。
 
 ## 门控
 

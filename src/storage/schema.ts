@@ -470,7 +470,7 @@ CREATE TABLE IF NOT EXISTS egress_flow (
 CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msgid);
 `;
 
-/** #7579 (follow-up to #7439, owner design 2026-11-23): the BLOCK LIFECYCLE
+/** #7577 (follow-up to #7439, owner design 2026-11-23): the BLOCK LIFECYCLE
  *  log — the op-log of the fold blocks, symmetric to the message egress log.
  *  egress_block_flow is append-only (row types B base / I block-born / U
  *  block-state-change; NEVER deleted) and carries the bounded kstate residual
@@ -484,7 +484,7 @@ CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msg
  *  clock as egress_flow (one transaction per turn writes both logs), so any
  *  op_seq aligns the message view and the block set. Probe-first, no version
  *  bump (the tables never shipped, like the egress pair). */
-const EGRESS_BLOCK_DDL = `-- #7579: block lifecycle log (flow + state), self-contained bytes, kstate sidecar.
+const EGRESS_BLOCK_DDL = `-- #7577: block lifecycle log (flow + state), self-contained bytes, kstate sidecar.
 CREATE TABLE IF NOT EXISTS egress_block_flow (
     session_id TEXT NOT NULL,
     op_seq INTEGER NOT NULL,
@@ -583,7 +583,7 @@ export function migrateSchema(db: {
             db.exec(EGRESS_STATE_DDL);
         });
     }
-    // #7579: the block lifecycle log — own probe (same discipline, no bump).
+    // #7577: the block lifecycle log — own probe (same discipline, no bump).
     const hasEgressBlockFlow = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_block_flow'")
         .get();

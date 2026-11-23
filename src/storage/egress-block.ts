@@ -1,6 +1,6 @@
 /**
  * Egress block lifecycle log — the op-log canonical history of the session's
- * compression blocks (#7579, discussion 7577; #7439 follow-up, owner rulings
+ * compression blocks (#7577; #7439 follow-up, owner rulings
  * 2026-11-23).
  *
  * The blocks table (shipped) is a point-in-time replica: a fork copies it, a
@@ -18,7 +18,7 @@
  *                         snapshot); the fast read of the current set.
  *                         PK (session_id, block_id).
  *
- * SHARED CLOCK (#7579): the block rows share the SAME op_seq append clock as
+ * SHARED CLOCK (#7577): the block rows share the SAME op_seq append clock as
  * egress_flow — one turn writes both logs, so any op_seq aligns the message
  * view (egressStateAt) with the block set (egressBlockReplay). The cursor is
  * the MAX over BOTH tables.
@@ -150,7 +150,7 @@ const INSERT_BLOCK_STATE = `INSERT INTO egress_block_state (session_id, block_id
 const INSERT_BLOCK_FLOW = `INSERT INTO egress_block_flow (session_id, op_seq, row_type, block_id, payload, kstate_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`;
 
 /** The shared op_seq cursor: MAX over egress_flow AND egress_block_flow
- *  (#7579 — one turn writes both logs, so the clocks must not diverge). */
+ *  (#7577 — one turn writes both logs, so the clocks must not diverge). */
 function blockNextSeq(db: SqliteDatabase, sessionId: string): number {
     const flow = db
         .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_flow WHERE session_id = ?")
@@ -346,7 +346,7 @@ export function egressBlockCompact(
     return seq;
 }
 
-/** Point fork (#7579 D5): copy the parent's egress + block op logs UP TO (and
+/** Point fork (#7577 D5): copy the parent's egress + block op logs UP TO (and
  *  including) op_seq wm to the child session_id inside ONE transaction.
  *  op_seq/log_seq are preserved verbatim, so the child inherits the parent's
  *  number space (nothing re-issued across the fork). wm = MAX(op_seq) is the

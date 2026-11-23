@@ -1,6 +1,6 @@
 # Egress block flow/state: block canonical history + checkpoint retirement
 
-> #7579 (follow-up to #7439 / #6785). Adds two new tables (`egress_block_flow`, `egress_block_state`) that make the block set a first-class op-log citizen alongside the message view (`egress_flow`/`egress_state`). Retires checkpoints (fork_base/replica/auto) for egress-on sessions in favor of point-fork (4-table copy). Trims the kstate column for egress-on sessions (tsStamps/tokenSnapshot/lastPassIds derivable from flow replay).
+> #7577 (follow-up to #7439 / #6785). Adds two new tables (`egress_block_flow`, `egress_block_state`) that make the block set a first-class op-log citizen alongside the message view (`egress_flow`/`egress_state`). Retires checkpoints (fork_base/replica/auto) for egress-on sessions in favor of point-fork (4-table copy). Trims the kstate column for egress-on sessions (tsStamps/tokenSnapshot/lastPassIds derivable from flow replay).
 
 ## Tables
 
@@ -48,13 +48,14 @@ Replay takes the last sidecar at or before the watermark (else fresh default).
 
 For egress-on sessions:
 - `maybeCutForkBaseAsync` / `createReplica` skip (no fork_base/replica/auto rows).
-- Admin `/__bili/replicas` returns 400.
-- `persistForkSession` / `cloneSessionRows` use `egressPointFork` (4-table copy: `egress_state`, `egress_flow`, `egress_block_state`, `egress_block_flow` WHERE `op_seq <= wm`).
-- The state replicas are rebuilt by replaying the flow tables (a direct copy filtered by op_seq would miss blocks whose latest row is past wm).
+- Admin `POST /__bili/replicas` takes the point-fork path for an egress-on parent: `201 {ok, pointFork, sessionId, opSeq, restoredFrom}` — a fresh, independent child session (the parent is never mutated, and the child is a snapshot, not a live alias). Egress-off parents keep the checkpoint behavior; a below-high-water `opSeq` is rejected (400) because it needs the point-reconstruction materializer (follow-up).
+- `persistForkSession` / `cloneSessionRows` use `egressPointFork` (the four tables `egress_state`, `egress_flow`, `egress_block_state`, `egress_block_flow`). Fork-to-now (`wm` = high water) copies all four directly (SQL `INSERT…SELECT`); a true point fork (`wm` < high water) copies the flow tables filtered by `op_seq <= wm` and rebuilds the state replicas by replaying those rows (a direct copy filtered by op_seq would miss blocks whose latest row is past wm).
 
 ## kstate trim (D4)
 
-For egress-on sessions, `tsStamps`, `tokenSnapshot`, and `lastPassIds` are excluded from the `sessions.kstate_json` column (derivable from flow replay). The legacy path is byte-identical.
+For egress-on sessions, `tsStamps`, `tokenSnapshot`, and `lastPassIds` are excluded from the `sessions.kstate_json` column (derivable from the egress log). The legacy path is byte-identical.
+
+On load, the store re-derives `tsStamps` for an egress-on session whose column has no value: each I row's `msgid` is the kernel raw id (the `tsStamps` key) and its `ts` is the first-seen wall clock. A persisted value always wins — the derive only fills the gap the trim left.
 
 ## Gating
 

@@ -112,9 +112,9 @@ export interface EgressViewRow {
      *  role-only drift is impossible — kernel ids are one-shot). */
     role?: string;
     /** First-observed wall clock (epoch ms) — stamped on the message's I row
-     *  (#7579 D3). A msgid is inserted exactly once (kernel ids are one-shot),
+     *  (#7577 D3). A msgid is inserted exactly once (kernel ids are one-shot),
      *  so the I row IS the first observation; spine rows inherit it. Optional:
-     *  pre-#7579 dev rows (the tables never shipped) lack it. */
+     *  pre-#7577 dev rows (the tables never shipped) lack it. */
     ts?: number;
 }
 
@@ -187,7 +187,7 @@ interface InsertOp {
     bytes: string;
     role?: string;
     /** First-observed wall clock (epoch ms) — stamped by recordEgressTurn
-     *  (#7579 D3); the I row is the message's birth, so this is its ts. */
+     *  (#7577 D3); the I row is the message's birth, so this is its ts. */
     ts?: number;
 }
 interface DeleteOp {

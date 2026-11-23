@@ -1737,7 +1737,7 @@ export class UnifiedStore {
                     start_msgid = COALESCE(excluded.start_msgid, blocks.start_msgid),
                     end_msgid = COALESCE(excluded.end_msgid, blocks.end_msgid)`,
             );
-            // #7579: collect the transcript-resolved coordinates per block so
+            // #7577: collect the transcript-resolved coordinates per block so
             // the egress block recorder (below) can build self-contained
             // snapshots without re-reading the egress flow view.
             const blockCoords = new Map<string, { startSeq: number; endSeq: number; startMsgid: string | null; endMsgid: string | null }>();
@@ -1835,7 +1835,7 @@ export class UnifiedStore {
                 }
             }
 
-            // #7579: EGRESS BLOCK LIFECYCLE LOG — record the block set for
+            // #7577: EGRESS BLOCK LIFECYCLE LOG — record the block set for
             // egress-on sessions (the block flow shares the egress_flow op_seq
             // clock). Snapshots are built from the incoming blocks + the
             // transcript-resolved coordinates collected above. Gated on the
@@ -2343,7 +2343,7 @@ export class UnifiedStore {
         return Math.max(Number(flow.mx) || 0, Number(block.mx) || 0);
     }
 
-    /** #7579 D5: point fork — copy the parent's egress + block op logs up to
+    /** #7577 D5: point fork — copy the parent's egress + block op logs up to
      *  (and including) op_seq wm to the child (one transaction; the child
      *  inherits the parent's number space). wm = egressBlockMaxSeq is the
      *  whole-table copy. */
@@ -4184,7 +4184,7 @@ export class UnifiedStore {
             // space and retired marks, nothing is re-issued across the
             // fork, and no other logic changes. No-op when the parent has
             // no egress rows (proxy-mode / egress-off sessions).
-            // #7579: the point fork copies ALL FOUR tables (egress_state,
+            // #7577: the point fork copies ALL FOUR tables (egress_state,
             // egress_flow, egress_block_state, egress_block_flow) — the
             // block lifecycle log rides on the same op_seq clock, so the
             // child inherits the parent's block set at the same watermark.

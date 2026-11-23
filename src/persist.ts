@@ -2805,7 +2805,7 @@ export class SessionStore {
      *  backend queue. Fire-and-forget from the save paths. */
     private async maybeCutForkBaseAsync(session: Session): Promise<void> {
         if (!this.shadow || this.shadow.stats.disabled) return;
-        // #7579 D5: egress-on sessions fork via point copy (egressPointFork),
+        // #7577 D5: egress-on sessions fork via point copy (egressPointFork),
         // not a fork_base checkpoint — skip the checkpoint cut entirely.
         if (session.metadata["egressAuthority"] === true) return;
         const retained = session.metadata.publicForkReceipt !== undefined
@@ -2841,7 +2841,7 @@ export class SessionStore {
 
     async createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base"; resident?: Session } = {}): Promise<CheckpointRow> {
         const shadow = this.liveShadow();
-        // #7579 D5: egress-on sessions do not use checkpoints — the admin
+        // #7577 D5: egress-on sessions do not use checkpoints — the admin
         // API does a point copy (egressPointFork) instead. Guard here so a
         // stray call cannot create a checkpoint for an egress-on session.
         if (opts.resident && opts.resident.metadata["egressAuthority"] === true) {
