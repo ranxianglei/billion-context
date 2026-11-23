@@ -494,7 +494,7 @@ const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "ima
 // `messages[]` remain model-visible and must still be counted.
 const NON_MODEL_TOP_LEVEL_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
 
-export function isNonModelTopLevelKey(key: string): boolean {
+function isNonModelTopLevelKey(key: string): boolean {
     return NON_MODEL_TOP_LEVEL_KEYS.has(key) || key.startsWith("dsh_");
 }
 
