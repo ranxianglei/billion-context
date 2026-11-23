@@ -270,13 +270,17 @@ test("a state-field value the older build really wrote stays; its empty default 
 
 test("steady state is unchanged: a column without the field always takes the row", () => {
     const dir = mkdtempSync(join(tmpdir(), "rollback-7574-steady-"));
-    const { store } = open(dir);
+    // `load` reads through the raw connection — it must be closed before the
+    // folder goes, Windows refuses to remove a file that is still open
+    // (EBUSY, CI windows-latest node 22 shard 3).
+    const { store, raw } = open(dir);
     try {
         const state = fullState();
         store.ingestSession(planIngest(session(state)), undefined, { completeLog: true });
         const st = load(store, "sess-rb").state as Record<string, unknown>;
         for (const f of ROW_BACKED_KSTATE_FIELDS) assert.deepEqual(st[f], state[f], `"${f}" lost in plain hydration`);
     } finally {
+        raw.db.close();
         store.close();
         rmSync(dir, { recursive: true, force: true });
     }
