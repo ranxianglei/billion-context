@@ -54,6 +54,14 @@ test("persona-tag changes never fork anymore (#2241/#4778/#5686 retired)", () =>
     assert.equal(resolveSessionOrder("conv").key, "conv");
     assert.equal(resolveSessionOrder("conv", "a completely different persona text").key, "conv");
     assert.equal(resolveSessionOrder("conv", undefined).action, "raw");
+    // GA drift pin (master d904b4e1, the #5844 incident shape): a SHORTER
+    // replay under a brand-new persona tag — the legacy ladder forked this
+    // onto persona-id|sub:<fp16(tag)>; under GA the id rides verbatim
+    // (history shape is not a resolver input, tag drift alone never forks).
+    assert.equal(
+        resolveSessionOrder("persona-id", "You are the post-upgrade assistant persona, with a completely different system prompt.").key,
+        "persona-id",
+    );
 });
 
 test("the #5095 lane-token tail STILL forks (the declared-lane survivor)", () => {
