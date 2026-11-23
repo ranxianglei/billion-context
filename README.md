@@ -724,9 +724,6 @@ The same store maintenance the panel exposes over HTTP (`POST /__bili/storage/gc
 ```bash
 bili sessions ls                 # id, label, decoded size, last-updated, storage status (active/archived)
 bili sessions rm <id>            # full delete (content refcount release incl. media); shrinks index.db afterwards (--no-vacuum skips)
-bili sessions reattach <rawId> <laneKey>
-                                 # (#5844) re-point a persona-forked parent at the NEW persona tag the orphan lane recorded
-                                 # (offline, atomic, both storage carriers); fails loudly if a running proxy reverts the edit
 bili sessions archive <id>       # export to archive/archive.jsonl + sweep rows; tombstone keeps label & identity
 bili sessions restore <id>       # bring an archived session back from the log line
 bili sessions foreign-blocks     # (#5312) list fold blocks whose covered messages never belonged to this transcript — dry-run; --apply reversibly archives them, --restore <sid>:<bid> brings one back

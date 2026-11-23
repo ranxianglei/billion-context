@@ -10,7 +10,6 @@ import { SessionStore } from "./persist.js";
 import type { GcPlan } from "./storage/store.js";
 import { fileStorageArchiveAfterDays, resolveArchiveAfterDays } from "./knobs.js";
 import { scanForeignBlocks, applyForeignBlockSweep, type ForeignBlockPlan } from "./foreign-block-sweep.js";
-import { reattachOrderSkeleton, readOrderTagHash, type OrderKvCarrier } from "./order-persist.js";
 
 interface StorageCommandResult {
     code: number;
@@ -306,15 +305,12 @@ async function runForeignBlocks(store: SessionStore, json: boolean, apply: boole
 }
 
 export async function runSessionsCommand(opts: {
-    sub: "ls" | "rm" | "archive" | "restore" | "foreign-blocks" | "reattach";
+    sub: "ls" | "rm" | "archive" | "restore" | "foreign-blocks";
     target?: string;
-    laneKey?: string;
     json?: boolean;
     noVacuum?: boolean;
     apply?: boolean;
     restoreTarget?: string;
-    /** #5844 verify-after-write delay (tests pass 0 or a short value). */
-    verifyDelayMs?: number;
     dir?: string;
 }): Promise<StorageCommandResult> {
     const store = new SessionStore({ dir: opts.dir, enabled: true });
@@ -330,70 +326,9 @@ export async function runSessionsCommand(opts: {
                 return await runRestore(store, opts.target, !!opts.json);
             case "foreign-blocks":
                 return await runForeignBlocks(store, !!opts.json, !!opts.apply, opts.restoreTarget);
-            case "reattach":
-                return await runReattach(store, opts.target, opts.laneKey, !!opts.json, opts.verifyDelayMs);
         }
     } finally {
         store.closeQuietly();
-    }
-}
-
-/** #5844: offline persona-fork reattach — copy the orphan lane's recorded
- *  tagHash onto the PARENT skeleton (both carriers, #5753) so the next
- *  request resolves tagChanged=false and reclaims the parent's blocks. The
- *  verify-after-write catches the §6.2 gotcha: a RUNNING proxy daemon
- *  (it survives the host exit; hosts re-attach to it) rewrites the carriers
- *  from its in-memory skeletons within ~1 minute and silently reverts the
- *  offline edit — we re-read after a short delay and fail loudly instead.
- */
-async function runReattach(
-    store: SessionStore,
-    rawId: string | undefined,
-    laneKey: string | undefined,
-    json: boolean,
-    verifyDelayMs?: number,
-): Promise<StorageCommandResult> {
-    if (!rawId || !laneKey) {
-        return { code: 2, text: "usage: bili sessions reattach <raw-session-id> <lane-key>\n" };
-    }
-    // getKvAsync/setKvAsync exist on every SessionStore but THROW on
-    // legacy-only instances (liveShadow(), #5753) — gate on availability.
-    const kv: OrderKvCarrier | null =
-        store.replicasAvailable() ? { getKvAsync: store.getKvAsync.bind(store), setKvAsync: store.setKvAsync.bind(store) } : null;
-    try {
-        const res = await reattachOrderSkeleton(kv, rawId, laneKey);
-        const delay = verifyDelayMs ?? 1500;
-        let reverted = false;
-        if (delay > 0) {
-            await new Promise((r) => setTimeout(r, delay));
-            const now = await readOrderTagHash(kv, rawId);
-            reverted = now !== null && now !== res.after;
-        }
-        if (reverted) {
-            return {
-                code: 2,
-                text:
-                    `reattach REVERTED: a running proxy rewrote session-order from its in-memory ` +
-                    `skeletons within ${delay}ms after our write (#5844 §6.2). Stop the proxy daemon, ` +
-                    `re-run: bili sessions reattach ${rawId} ${laneKey} — then start the proxy.\n`,
-            };
-        }
-        if (json) {
-            return { code: 0, text: JSON.stringify({ ok: true, rawId, laneKey, before: res.before, after: res.after, file: res.file, fileTouched: res.fileTouched, kvTouched: res.kvTouched }) + "\n" };
-        }
-        const short = (h: string) => (h.length > 20 ? `${h.slice(0, 12)}…` : h || "(none)");
-        const carriers = [res.fileTouched ? "file" : null, res.kvTouched ? "kv row" : null].filter(Boolean).join(" + ");
-        return {
-            code: 0,
-            text:
-                `reattached: parent ${rawId} tagHash ${short(res.before)} → ${short(res.after)} (taken from lane ${laneKey})\n` +
-                `  carriers written: ${carriers || "none"} (${res.file})\n` +
-                `next: restart the proxy so it hydrates the new hash — the next request under ${rawId}\n` +
-                `  then reclaims the parent's inherited blocks. The orphan lane's rows can be freed\n` +
-                `  with: bili sessions rm ${laneKey}\n`,
-        };
-    } catch (e) {
-        return { code: 1, text: `sessions reattach failed: ${e instanceof Error ? e.message : String(e)}\n` };
     }
 }
 

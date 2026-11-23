@@ -62,7 +62,7 @@ function orderEntryOf(e: unknown): OrderSkeletonEntry | undefined {
     return x;
 }
 
-export function orderFile(): string {
+function orderFile(): string {
     return path.join(stateDir(), "session-order.json");
 }
 
@@ -136,131 +136,26 @@ function writeSnapshotLegacy(): void {
         const mine = orderSnapshot();
         const disk = readDiskEntries();
         const merged = disk === null ? mine : mergeWithDisk(mine, disk);
-        writeOrderEntriesTo(normalizeForWrite(merged), file);
+        const entries = normalizeForWrite(merged);
+        const snapshot = { version: 1, entries };
+        const tmp = `${file}.tmp`;
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        // fsync before rename: a crash between write and rename otherwise leaves
+        // a size-correct, VDL=0 zero file (#3157).
+        const fd = fs.openSync(tmp, "w");
+        try {
+            fs.writeFileSync(fd, JSON.stringify(snapshot));
+            fs.fsyncSync(fd);
+        } finally {
+            fs.closeSync(fd);
+        }
+        fs.renameSync(tmp, file);
     } catch (e) {
         log("warn", `[session-order] persist failed (${e instanceof Error ? e.message : String(e)}); skeletons survive in memory`);
     } finally {
         writing = false;
         pendingSince = null;
     }
-}
-
-/** Atomic snapshot write (tmp + fsync + rename — a crash between write and
- *  rename would otherwise leave a size-correct, VDL=0 zero file, #3157).
- *  THROWS on failure: the offline CLI callers (#5844 reattach) must see the
- *  error; the proxy's debounced path catches it in writeSnapshotLegacy. */
-function writeOrderEntriesTo(entries: OrderSkeletonEntry[], file: string): void {
-    const snapshot = { version: 1, entries };
-    const tmp = `${file}.tmp`;
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const fd = fs.openSync(tmp, "w");
-    try {
-        fs.writeFileSync(fd, JSON.stringify(snapshot));
-        fs.fsyncSync(fd);
-    } finally {
-        fs.closeSync(fd);
-    }
-    fs.renameSync(tmp, file);
-}
-
-/** The kv-row read shape reattach needs on a caller-supplied store (the CLI
- *  opens its own SessionStore; the proxy path uses the process global). */
-export interface OrderKvCarrier {
-    getKvAsync(ns: string, key: string): Promise<unknown>;
-    setKvAsync(ns: string, key: string, value: unknown): Promise<unknown>;
-}
-
-/**
- * #5844: OFFLINE reattach — the supported form of the one-field state edit
- * users performed by hand after a host upgrade changed the persona tag AND
- * the replay shape in one upgrade: the resolver forked a fresh
- * `${rawId}|sub:` lane that inherits NO blocks, and the parent's fold state
- * went unclaimed (2.5M tokens re-folded from scratch until the client timed
- * out at 413). Copying the lane's recorded identity — persona tagHash AND,
- * when the lane is the fresher observation, its replay shape (kinds/frags) —
- * onto the PARENT skeleton makes the next request resolve to the parent and
- * reclaim its blocks. Tag-only is not enough: the upgrade moves BOTH the tag
- * and the replay shape, so the fragment rungs fail on the parent's stale
- * shape even with the new tag. The lane key embeds the new fingerprint, so
- * the user never has to know the new prompt. Both carriers are rewritten
- * (unified kv row + legacy file, #5753) and every sibling entry is preserved.
- */
-interface ReattachOrderResult {
-    before: string;
-    after: string;
-    file: string;
-    fileTouched: boolean;
-    kvTouched: boolean;
-    shapeAdopted: boolean;
-}
-
-export async function reattachOrderSkeleton(
-    store: OrderKvCarrier | null,
-    rawId: string,
-    laneKey: string,
-): Promise<ReattachOrderResult> {
-    const lanePrefix = `${rawId}|sub:`;
-    if (!laneKey.startsWith(lanePrefix) || laneKey.length === lanePrefix.length) {
-        throw new Error(`"${laneKey}" is not an orphan lane of "${rawId}" (expected ${rawId}|sub:<fingerprint>)`);
-    }
-    const file = orderFile();
-    const fileEntries = readDiskEntries() ?? [];
-    const kvEntries = store ? (parseStoreDoc(await store.getKvAsync(ORDER_NS, ORDER_KEY)) ?? null) : null;
-
-    const parentInFile = fileEntries.find((e) => e.id === rawId);
-    const parentInKv = kvEntries?.find((e) => e.id === rawId);
-    if (!parentInFile && !parentInKv) {
-        throw new Error(`parent skeleton for "${rawId}" not found in session-order storage — nothing to reattach`);
-    }
-    const laneInFile = fileEntries.find((e) => e.id === laneKey);
-    const laneInKv = kvEntries?.find((e) => e.id === laneKey);
-    // Fresher-wins across carriers (same rule as mergeWithDisk).
-    const lane = laneInKv && (laneInFile === undefined || laneInKv.lastSeen >= laneInFile.lastSeen) ? laneInKv : laneInFile;
-    if (!lane) {
-        throw new Error(`orphan lane skeleton "${laneKey}" not found — the resolver has not recorded it yet (it records on the forked request), or the entry was pruned`);
-    }
-    if (lane.tagHash === "") {
-        throw new Error(`lane "${laneKey}" recorded no persona tagHash — reattach needs the NEW tag the host is now sending`);
-    }
-    const before = (parentInKv ?? parentInFile!).tagHash;
-    // The lane is the freshest observation of what the host sends NOW. When
-    // it post-dates the parent skeleton, adopt its replay shape too —
-    // otherwise the parent keeps the pre-upgrade kinds/frags and the
-    // fragment-verified rungs reject the very request the user is trying to
-    // save (tag fixed, shape still stale).
-    const parentLastSeen = (parentInKv ?? parentInFile!)!.lastSeen;
-    const shapeAdopted = lane.lastSeen >= parentLastSeen;
-    const apply = (entries: OrderSkeletonEntry[]): OrderSkeletonEntry[] =>
-        entries.map((e) => (e.id === rawId
-            ? { ...e, tagHash: lane.tagHash, ...(shapeAdopted ? { kinds: lane.kinds, frags: lane.frags } : {}) }
-            : e));
-
-    let fileTouched = false;
-    if (parentInFile) {
-        writeOrderEntriesTo(normalizeForWrite(apply(fileEntries)), file);
-        fileTouched = true;
-    }
-    let kvTouched = false;
-    if (store && parentInKv && kvEntries !== null) {
-        await store.setKvAsync(ORDER_NS, ORDER_KEY, { version: 1, entries: normalizeForWrite(apply(kvEntries)) });
-        kvTouched = true;
-    }
-    return { before, after: lane.tagHash, file, fileTouched, kvTouched, shapeAdopted };
-}
-
-/** Current tagHash for one skeleton id across both carriers (fresher-wins);
- *  null when the id is absent. #5844: the reattach verify-after-write uses
- *  this to catch a running proxy reverting the edit (#5844 §6.2). */
-export async function readOrderTagHash(store: OrderKvCarrier | null, id: string): Promise<string | null> {
-    const fileEntries = readDiskEntries() ?? [];
-    const kvEntries = store ? (parseStoreDoc(await store.getKvAsync(ORDER_NS, ORDER_KEY)) ?? null) : null;
-    const inFile = fileEntries.find((e) => e.id === id);
-    const inKv = kvEntries?.find((e) => e.id === id);
-    if (!inFile && !inKv) return null;
-    const fresher = inKv && inFile
-        ? (inKv.lastSeen >= inFile.lastSeen ? inKv : inFile)
-        : (inKv ?? inFile!);
-    return fresher.tagHash;
 }
 
 /** #5753: one durable unified-store RMW — read the live row (cross-lane
