@@ -174,6 +174,7 @@ billion-context/
 │   │   ├── store.ts              #   UnifiedStore: index.db (WAL) + content blobs, one txn per mutation
 │   ├── encrypt.ts                # At-rest encoding: AES-256-GCM (#708) + zstd (#1080), independent
 │   ├── export.ts                 # Session export (block summaries + originals)
+│   ├── handoff-export.ts         # #7233: server-side handoff markdown export → Downloads + reveal in the OS file manager (POST /__bili/sessions/<id>/handoff/export)
 │   ├── preflight.ts              # Preflight compression gate (hold grace, dead-end cooldown)
 │   ├── external-summary.ts       # Isolated summary executor (ordered failover, deadlines, capacity)
 │   ├── external-summary-http.ts  # Internal single-attempt HTTP candidates using existing summary codecs

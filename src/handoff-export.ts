@@ -30,7 +30,7 @@ export function uniqueHandoffPath(
 }
 
 /** Downloads is the destination the existing button used; keep it. */
-export function defaultDownloadsDir(): string {
+function defaultDownloadsDir(): string {
     return path.join(os.homedir(), "Downloads");
 }
 
