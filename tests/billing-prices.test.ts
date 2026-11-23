@@ -24,6 +24,7 @@ import {
     setBillingOverrides,
     stampBillingPrice,
     stampedBillingPrice,
+    type BillingPrice,
 } from "../src/billing.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
@@ -123,6 +124,43 @@ test("#4899 resolveBillingPrice: overrides win over the registry, matching model
     // Empty-string / undefined models resolve nothing.
     assert.equal(resolveBillingPrice(undefined), undefined);
     assert.equal(resolveBillingPrice(""), undefined);
+});
+
+test("billing override reloads replace and clear normalized price rows", () => {
+    resetState();
+    setRegistryForTest({}, { "custom/model": { input: 2, output: 8 } });
+    setBillingOverrides({ "custom/model": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } });
+    const initial = resolveBillingPrice("custom/model");
+    assert.deepEqual(initial, { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, source: "config" });
+
+    setBillingOverrides({ "custom/other": { input: 4 } });
+    assert.deepEqual(resolveBillingPrice("custom/model"), { input: 2, output: 8, cacheRead: 2, cacheWrite: 2, source: "registry" });
+    assert.equal(resolveBillingPrice("custom/other")?.input, 4);
+    assert.equal(initial?.input, 3, "reloading leaves previously resolved prices unchanged");
+
+    setBillingOverrides({});
+    assert.equal(resolveBillingPrice("custom/other"), undefined);
+    assert.equal(resolveBillingPrice("custom/model")?.source, "registry");
+    setBillingOverrides({ "custom/model": { input: 6 } });
+    setBillingOverrides(undefined);
+    assert.equal(resolveBillingPrice("custom/model")?.input, 2);
+    assert.deepEqual(billingOverrides(), {});
+});
+
+test("billing override reloads refresh a reused table and optional rates", () => {
+    resetState();
+    const prices: Record<string, BillingPrice> = { "custom/model": { input: 3 } };
+    setBillingOverrides(prices);
+    assert.deepEqual(resolveBillingPrice("CUSTOM/MODEL"), { input: 3, output: 3, cacheRead: 3, cacheWrite: 3, source: "config" });
+
+    prices["custom/model"] = { input: 5, output: 0, cacheRead: 0, cacheWrite: 0 };
+    setBillingOverrides(prices);
+    assert.deepEqual(resolveBillingPrice("CUSTOM/MODEL"), { input: 5, output: 0, cacheRead: 0, cacheWrite: 0, source: "config" });
+    assert.equal(billingOverrides(), prices);
+
+    prices["custom/model"] = { input: 7 };
+    setBillingOverrides(prices);
+    assert.deepEqual(resolveBillingPrice("CUSTOM/MODEL"), { input: 7, output: 7, cacheRead: 7, cacheWrite: 7, source: "config" });
 });
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import { isProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
+import { nextListenPort } from "./listen-policy.js";
 
 /** #2941: post-bind port-ownership verification + pointer-clobber guard for
  *  same-lane double-spawn residuals (#707 follow-ups). Conservative by
@@ -170,7 +171,7 @@ export async function resolvePortClaim(params: {
         return { kind: "die", message: `port ${portOf(params.origin)} is shared with ${who} — refusing to serve a contested port (#2941)` };
     }
     const attempts = params.listenAttempts + 1;
-    const nextPort = attempts >= params.maxListenAttempts ? 0 : portOf(params.origin) + 1;
+    const nextPort = nextListenPort(portOf(params.origin), attempts, params.maxListenAttempts);
     return { kind: "ladder", nextPort, foreign };
 }
 
