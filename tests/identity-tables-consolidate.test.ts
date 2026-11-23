@@ -31,6 +31,10 @@ import type { BiliMessage } from "acp-kernel/wire";
 const { _setStoreForTest, _resetStoreForTest } = await import("../src/persist.ts");
 
 process.env.BILI_PERSIST_ZSTD = "0";
+// egress-on tests drive the op log as the identity authority — snapPinLiveIds
+// only reads the egress view when the egressPlane rollout is on (master's #7583
+// gate); force it on so the stateless stage-0 branch is exercised.
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-identity-consolidate-hermetic-"));
 process.env.BILI_CONFIG_FILE = path.join(hermetic, "no-config.json");
 process.env.BILI_STORAGE_UNIFIED = "legacy";
