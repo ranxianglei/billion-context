@@ -3,7 +3,7 @@ import type { Stats } from "node:fs";
 import path from "node:path";
 import { log as loggerLog } from "./logger.js";
 import { defaultCountTokens } from "acp-kernel";
-import { getStore, type SessionStore } from "./persist.js";
+import { getStore, relPathFor, type SessionStore } from "./persist.js";
 import { sessionsDir } from "./paths.js";
 import { dropSessionForGc, peekSession } from "./session.js";
 import { stateDir } from "./paths.js";
@@ -180,6 +180,31 @@ async function walkSessionFiles(dir: string): Promise<string[]> {
     return out;
 }
 
+/** Preserve arbitrary basename suffixes, including legacy cross-namespace names.
+ *  Build only when a companion needs matching, and retain disk-walk probe order. */
+function sessionSuffixLookup(files: string[]): (stem: string) => string[] {
+    let index: Array<{ reversed: string; file: string; order: number }> | undefined;
+    const reverse = (name: string): string => name.split("").reverse().join("");
+    return (stem) => {
+        if (!index) {
+            index = files.map((file, order) => ({ reversed: reverse(path.basename(file)), file, order }));
+            index.sort((a, b) => a.reversed < b.reversed ? -1 : a.reversed > b.reversed ? 1 : 0);
+        }
+        const prefix = reverse(stem + ".json");
+        let low = 0;
+        let high = index.length;
+        while (low < high) {
+            const middle = low + Math.floor((high - low) / 2);
+            if (index[middle].reversed < prefix) low = middle + 1;
+            else high = middle;
+        }
+        const matches: typeof index = [];
+        for (let i = low; i < index.length && index[i].reversed.startsWith(prefix); i++) matches.push(index[i]);
+        matches.sort((a, b) => a.order - b.order);
+        return matches.map((entry) => entry.file);
+    };
+}
+
 interface GcResult {
     removed: number;
     kept: number;
@@ -214,6 +239,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         if (f.endsWith(companionSuffix)) companions.push(f);
         else sessionFiles.push(f);
     }
+    const matchingSessions = sessionSuffixLookup(sessionFiles);
     const deletedSessions = new Set<string>();
     const coDeleted = new Set<string>();
     for (const file of sessionFiles) {
@@ -238,10 +264,20 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         // deletion loses.
         const companion = file.slice(0, -".json".length) + companionSuffix;
         let compSt: Stats | undefined;
+        let companionStatFailed = false;
         try {
-            const s = await stat(companion);
-            if (s.isFile()) compSt = s;
-        } catch { /* no companion */ }
+            compSt = await stat(companion);
+        } catch (error) {
+            // Only absence proves there are no companion bytes to account
+            // for. A transient failure must not turn them into orphaned data
+            // that the second pass can delete after removing this session.
+            companionStatFailed = (error as NodeJS.ErrnoException)?.code !== "ENOENT";
+        }
+        if (companionStatFailed || (compSt && !compSt.isFile())) {
+            loggerLog("info", `[gc] kept session ${path.relative(dir, file)}: companion ${path.basename(companion)} cannot be inspected as a file`);
+            result.kept++;
+            continue;
+        }
         if (compSt) {
             const stored = contentStoreTokens(await store.readRawFile(companion));
             if (stored === null) {
@@ -286,11 +322,13 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         deletedSessions.add(file);
         // #1995 review ②: the image-restore spill tree
         // (<state>/retrieve/img/<sessionId>/) shares this session's lifecycle —
-        // refs are per-session, so once the file is gone the spills are
+        // refs are per-session, so once its last file is gone the spills are
         // unreachable. Co-delete; anything this deterministic path misses (null
         // id, a pre-salt dir name from an older build) is collected by the
         // stale-mtime pass below.
-        if (view.id !== null) {
+        const hasSurvivingTwin = view.id !== null && matchingSessions(path.basename(relPathFor(view.id), ".json"))
+            .some((candidate) => !deletedSessions.has(candidate));
+        if (view.id !== null && !hasSurvivingTwin) {
             try {
                 const imgDir = opts?.imgRoot !== undefined
                     ? path.join(opts.imgRoot, restoreExportDirName(view.id))
@@ -316,9 +354,8 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             // until the twin is swept, then the orphan pass collects them.
             const stem = path.basename(file, ".json");
             let keepCompanion = false;
-            for (const sf of sessionFiles) {
+            for (const sf of matchingSessions(stem)) {
                 if (sf === file || deletedSessions.has(sf)) continue;
-                if (!path.basename(sf).endsWith(stem + ".json")) continue;
                 let twinHasOwnStore = false;
                 try {
                     const s2 = await stat(sf.slice(0, -".json".length) + companionSuffix);
@@ -370,12 +407,10 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         // would false-orphan (delete live store bytes) across that move.
         const stem = path.basename(companion).slice(0, -companionSuffix.length);
         let referenced = false;
-        for (const sf of sessionFiles) {
+        for (const sf of matchingSessions(stem)) {
             if (deletedSessions.has(sf)) continue;
-            if (path.basename(sf).endsWith(stem + ".json")) {
-                referenced = true;
-                break;
-            }
+            referenced = true;
+            break;
         }
         if (referenced) {
             result.kept++;

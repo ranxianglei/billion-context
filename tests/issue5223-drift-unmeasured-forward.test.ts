@@ -107,17 +107,19 @@ function primeUsageEvidence(f: Fixture) {
     f.session.stats.lastInputTokensSource = "usage";
 }
 
-test("zero-fold preflight fails fast locally instead of forwarding an over-window raw body after a transform failure (#5223)", async () => {
+test("preflight folds then fails fast locally (retryable) instead of forwarding an over-window raw body after a transform failure while epoch confirmation is pending (#5223/#6069)", async () => {
     const f = fixture("http://127.0.0.1:9/v1/chat/completions", 6000, 120_000, "openai");
     // #3641 latch: the drift was total (no anchor match, no word evidence), so
-    // folding is paused and preflight returns instantly with zero ranges.
+    // folding is paused. #6069: an over-window payload no longer pauses — it
+    // folds. The dead relay (port 9) makes the summarization fail, so the fold
+    // is exhausted (non-deterministic) and the fail-fast is retryable.
     f.session.metadata["foldEpochConfirmPending"] = true;
     primeUsageEvidence(f);
-    const result = await gate(f, async () => assert.fail("a zero-progress fold must not rebuild"));
+    const result = await gate(f, async () => assert.fail("the fold must not rebuild the outbound body"));
     assert.ok("failFast" in result, "expected a local fail-fast — the gate returned a forward carrying the raw history");
     assert.equal(result.status, 502);
     assert.equal(result.respond, true);
-    assert.equal(result.retryable, false);
+    assert.equal(result.retryable, true);
     assert.ok(String(result.message).includes("fold-drift epoch confirmation pending"), String(result.message));
 });
 

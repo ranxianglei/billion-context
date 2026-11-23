@@ -11,6 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getUnrecognizedPathStats } from "../src/server/observability.ts";
+import { extractSummaryFromSse, extractSummaryText } from "../src/preflight.ts";
 import {
     extractConversationId,
     isV1BackgroundSideRequest,
@@ -85,7 +86,7 @@ function v1Request(opts: { convId?: string; requestType?: string; model?: string
     };
 }
 
-function makeUpstream(calls: Call[]): http.Server {
+function makeUpstream(calls: Call[], encodeFrame: (data: unknown) => string = sse): http.Server {
     return http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -95,7 +96,7 @@ function makeUpstream(calls: Call[]): http.Server {
             calls.push({ path, raw });
             if (path.includes(":streamGenerateContent") || path.includes(":generateContent")) {
                 res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-                res.write(sse(envelope(gcr("hello from cloudcode"))));
+                res.write(encodeFrame(envelope(gcr("hello from cloudcode"))));
                 res.end();
             } else if (path.includes(":countTokens")) {
                 res.writeHead(200, { "content-type": "application/json" });
@@ -297,6 +298,32 @@ test("#3129 B: a CLI-style request with no Conversation ID still resolves identi
     }
 });
 
+test("multiline CloudCode SSE preserves the model reply through the real proxy", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstream(calls, data =>
+        JSON.stringify(data, null, 2).split("\n").map(line => `data: ${line}`).join("\n") + "\n\n");
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        const { status, text } = await drive(proxyPort, upstreamPort, "/v1internal:streamGenerateContent?alt=sse",
+            v1Request({ convId: "b29caf80-933b-40c7-8e15-089ab49d2774", tools: true }));
+        assert.equal(status, 200);
+        const frames = ssePayloads(text) as Array<{ response?: { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> } }>;
+        const texts = frames.flatMap(frame => frame.response?.candidates ?? [])
+            .flatMap(candidate => candidate.content?.parts ?? []).map(part => part.text ?? "").join("");
+        assert.equal(texts, "hello from cloudcode", "the inner model text must reach the client exactly once");
+        assert.equal(calls.length, 1, "a complete reply must not trigger a continuation request");
+        assert.doesNotMatch(text, /upstream_stream_truncated/);
+    } finally {
+        proxy.close();
+        upstream.close();
+    }
+});
+
 test("#3129 C: background side requests bypass the pipeline and pass through verbatim", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls);
@@ -368,5 +395,142 @@ test("#3129 D: v1internal control-plane paths are exempt from unrecognized-path 
         assert.equal(countOf("fetchUserInfo"), beforeFetch, "fetchUserInfo leaked into unrecognized-path stats");
     } finally {
         proxy.close(); upstream.close();
+    }
+});
+
+test("extractSummaryText and extractSummaryFromSse unwrap v1internal response envelopes while preserving standard Google responses", () => {
+    const summaryText = "TASK AS OF THIS BLOCK: summarized v1internal range with full fidelity and context.";
+    // Enveloped v1internal SSE and JSON responses
+    assert.equal(extractSummaryFromSse("google", sse(envelope(gcr(summaryText)))), summaryText);
+    assert.equal(extractSummaryText("google", envelope(gcr(summaryText))), summaryText);
+    // Negative control: standard unwrapped Google SSE and JSON responses remain intact
+    assert.equal(extractSummaryFromSse("google", sse(gcr(summaryText))), summaryText);
+    assert.equal(extractSummaryText("google", gcr(summaryText)), summaryText);
+});
+
+test("v1internal preflight summarization wraps the summary request in the v1internal envelope and unwraps the enveloped summary response", async () => {
+    const calls: Call[] = [];
+    const summaryReply = "TASK AS OF THIS BLOCK: compressed earlier v1internal turns preserving all technical artifacts, file paths, and decisions.";
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            const path = req.url ?? "";
+            calls.push({ path, raw });
+            const parsed = JSON.parse(raw) as Record<string, unknown>;
+            if (path.startsWith("/v1internal:")) {
+                // Real CloudCode rejects top-level contents / systemInstruction on /v1internal:* with HTTP 400
+                if ("contents" in parsed || "systemInstruction" in parsed || !parsed.request || typeof parsed.request !== "object") {
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({
+                        error: {
+                            code: 400,
+                            message: "Invalid JSON payload received. Unknown name \"contents\": Cannot find field.\nInvalid JSON payload received. Unknown name \"systemInstruction\": Cannot find field.",
+                            status: "INVALID_ARGUMENT",
+                        },
+                    }));
+                    return;
+                }
+                const inner = parsed.request as Record<string, unknown>;
+                const sysText = JSON.stringify(inner.systemInstruction ?? "");
+                res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+                if (sysText.includes("Write a tier-1 compression summary")) {
+                    res.end(sse(envelope(gcr(summaryReply))));
+                    return;
+                }
+                // Main turn: report usage above the 10_000 window so the next turn triggers preflight compression
+                res.end(sse(envelope({
+                    candidates: [{ index: 0, content: { role: "model", parts: [{ text: "hello from cloudcode" }] }, finishReason: "STOP" }],
+                    usageMetadata: { promptTokenCount: 12_000, candidatesTokenCount: 30, totalTokenCount: 12_030 },
+                })));
+                return;
+            }
+            // Standard Google wire negative control (/v1beta/models/...)
+            if ("request" in parsed) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { code: 400, message: "Unexpected v1internal envelope on standard Google endpoint" } }));
+                return;
+            }
+            const sysText = JSON.stringify(parsed.systemInstruction ?? "");
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            if (sysText.includes("Write a tier-1 compression summary")) {
+                res.end(sse(gcr(summaryReply)));
+                return;
+            }
+            res.end(sse({
+                candidates: [{ index: 0, content: { role: "model", parts: [{ text: "hello from standard google" }] }, finishReason: "STOP" }],
+                usageMetadata: { promptTokenCount: 12_000, candidatesTokenCount: 30, totalTokenCount: 12_030 },
+            }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        const preflightConvId = "e4cd2260-fc13-4253-8e5f-894aa8f01449";
+        const bigContents = () => {
+            const out: { role: string; parts: { text: string }[] }[] = [];
+            for (let i = 0; i < 12; i++) {
+                out.push({
+                    role: i % 2 === 0 ? "user" : "model",
+                    parts: [{ text: `Turn ${i}: ` + `detailed payload segment ${i} `.repeat(120) }],
+                });
+            }
+            return out;
+        };
+        const reqBody = {
+            ...v1Request({ convId: preflightConvId, tools: true }),
+            continuationToken: "stale-token-should-not-leak-to-summary",
+            request: {
+                contents: bigContents(),
+                systemInstruction: systemInstruction(preflightConvId),
+                generationConfig: { maxOutputTokens: 1024 },
+                sessionId: -3750763034362895579,
+                tools: [],
+            },
+        };
+        // Turn 1 settles the 12_000-token usage baseline (> 10_000 window).
+        const turn1 = await drive(proxyPort, upstreamPort, "/v1internal:streamGenerateContent?alt=sse", reqBody);
+        assert.equal(turn1.status, 200, `turn 1 must succeed, got HTTP ${turn1.status}: ${turn1.text.slice(0, 300)}`);
+
+        // Turn 2 triggers preflight compression on the v1internal lane.
+        const turn2 = await drive(proxyPort, upstreamPort, "/v1internal:streamGenerateContent?alt=sse", reqBody);
+        assert.equal(turn2.status, 200, `turn 2 preflight on v1internal must succeed without 400/502, got HTTP ${turn2.status}: ${turn2.text.slice(0, 400)}`);
+        assert.match(turn2.text, /hello from cloudcode/);
+
+        // Verify the summarization call itself was wrapped in the v1internal envelope and stripped continuationToken.
+        const summaryCalls = calls.filter((c) => c.path.startsWith("/v1internal:") && c.raw.includes("Write a tier-1 compression summary"));
+        assert.ok(summaryCalls.length >= 1, `expected at least 1 v1internal preflight summary call, saw ${summaryCalls.length}`);
+        const sumParsed = JSON.parse(summaryCalls[0].raw) as Record<string, unknown>;
+        assert.equal(sumParsed.project, "aicode-consumers");
+        assert.equal(sumParsed.model, MODEL);
+        assert.equal(sumParsed.userAgent, "antigravity");
+        assert.equal(sumParsed.continuationToken, undefined, "summary call must not inherit continuationToken from v1Meta");
+        assert.equal(sumParsed.contents, undefined, "top-level contents must not appear on v1internal summary call");
+        assert.ok(sumParsed.request && typeof sumParsed.request === "object", "summary payload must live under .request");
+
+        // Negative control: standard Google endpoint (/v1beta/models/...) must NOT wrap preflight summary calls in v1internal envelope.
+        const stdBody = {
+            contents: bigContents(),
+            systemInstruction: systemInstruction("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"),
+            generationConfig: { maxOutputTokens: 1024 },
+        };
+        const stdPath = `/v1beta/models/${MODEL}:streamGenerateContent?alt=sse`;
+        const stdTurn1 = await drive(proxyPort, upstreamPort, stdPath, stdBody);
+        assert.equal(stdTurn1.status, 200);
+        const stdTurn2 = await drive(proxyPort, upstreamPort, stdPath, stdBody);
+        assert.equal(stdTurn2.status, 200, `standard Google preflight must remain unwrapped, got HTTP ${stdTurn2.status}: ${stdTurn2.text.slice(0, 300)}`);
+        const stdSummaryCalls = calls.filter((c) => c.path.startsWith("/v1beta/") && c.raw.includes("Write a tier-1 compression summary"));
+        assert.ok(stdSummaryCalls.length >= 1, "expected standard Google preflight summary call");
+        const stdSumParsed = JSON.parse(stdSummaryCalls[0].raw) as Record<string, unknown>;
+        assert.equal(stdSumParsed.request, undefined, "standard Google summary call must not carry v1internal .request wrapper");
+        assert.ok(Array.isArray(stdSumParsed.contents), "standard Google summary call must keep top-level contents");
+    } finally {
+        proxy.close();
+        upstream.close();
     }
 });
