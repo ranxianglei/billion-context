@@ -487,9 +487,9 @@ entries:
     default: "4294967296"
     env: BILI_SESSION_RESIDENT_MAX_BYTES
     group: process
-    desc_en: "Soft target for estimated resident session bytes (#2803; raised from 512 MiB to 4 GiB in #5779 — single sessions routinely exceed half a GiB and ping-ponged against the smaller budget forever). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete. Lower it if your machine has little RAM."
-    desc_zh: "驻留会话估算字节的软目标（#2803；#5779 从 512 MiB 提高到 4 GiB——单个会话经常就超过半 GiB，旧预算下会被反复逐出、永远驻留不下来）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。内存小的机器可调低。"
-    desc_ja: "推定リザident セッションバイトのソフトターゲット (#2803; #5779 で 512 MiB から 4 GiB に引き上げ — 単一のセッションは通常 512 MiB を超え、より小さい予算に対して永遠にピンポンしていた)。アクティブ/進行中の状態はそれより上にピン留めされる; ターゲット超過時、アイドル状態はリクエスト完了時にディスクへ排出される。メモリが少ないマシンではこれを下げる。"
+    desc_en: "Soft target for estimated resident session bytes (#2803; raised from 512 MiB to 4 GiB in #5779 — single sessions routinely exceed half a GiB and ping-ponged against the smaller budget forever). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete. If several large sessions stay open at once, size it above their combined weight (e.g. seven ~136 MiB sessions want ≥1 GiB): a saturated pool evicts idle sessions and every touch of one pays a synchronous cold load that can block the event loop for seconds (#4893); the permanent compress-refusal log names the value to raise it above. Lower it if your machine has little RAM."
+    desc_zh: "驻留会话估算字节的软目标（#2803；#5779 从 512 MiB 提高到 4 GiB——单个会话经常就超过半 GiB，旧预算下会被反复逐出、永远驻留不下来）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。若同时保持多个大会话打开，请按它们的合计权重上调（例如七个 ~136 MiB 会话需要 ≥1 GiB）：池子饱和时空闲会话被逐出，每次触碰都要付一次同步冷加载，可阻塞事件循环数秒（#4893）；压缩永久拒绝的日志会给出应上调到的具体值。内存小的机器可调低。"
+    desc_ja: "推定リザident セッションバイトのソフトターゲット (#2803; #5779 で 512 MiB から 4 GiB に引き上げ — 単一のセッションは通常 512 MiB を超え、より小さい予算に対して永遠にピンポンしていた)。アクティブ/進行中の状態はそれより上にピン留めされる; ターゲット超過時、アイドル状態はリクエスト完了時にディスクへ排出される。複数の大容量セッションを同時に開いたままにする場合は、それらの合計重さより大きく設定してください (例: 約 136 MiB のセッション 7 件なら 1 GiB 以上が必要)。プールが飽和するとアイドルセッションが退避され、そのどれかに触れるたびに数秒間イベントループをブロックしうる同期コールドロードが発生します (#4893)。コンプレッションの恒久拒否ログには、超えて設定すべき値が記載されます。メモリが少ないマシンではこれを下げる。"
   - key: sessions.hardMaxBytes
     type: number
     default: "(same as `sessions.residentMaxBytes`)"
