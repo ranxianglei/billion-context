@@ -1568,12 +1568,14 @@ export class UnifiedStore {
                 start_ref: number | null; end_ref: number | null; tier: number;
                 summary_hash: string; one_hash: string | null; supersedes_block_id: string | null;
                 active: number; created_at: number; covered_hash: string; payload_json: string;
+                summary_bytes: Buffer | null; start_msgid: string | null; end_msgid: string | null;
             };
             const storedBlocks = new Map<string, StoredBlockRow>();
             for (const row of this.db
                 .prepare(
                     "SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, " +
-                    "summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json " +
+                    "summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json, " +
+                    "summary_bytes, start_msgid, end_msgid " +
                     "FROM blocks WHERE session_id = ?",
                 )
                 .all(s.sessionId) as StoredBlockRow[]) {
@@ -1660,6 +1662,37 @@ export class UnifiedStore {
                 } catch { /* malformed payload: keep the no-claim sentinel */ }
                 return hi < 0 ? [-1, -1] : [lo, hi];
             };
+            // #7439-2: msgid coordinates — ONE-TIME alignment with the egress
+            // flow view, zero joins thereafter. Only sessions the flow has
+            // recorded have coordinates (every other session stays NULL). The
+            // view (bounded egress_state serving read) is read LAZILY and only
+            // when some block actually needs (re-)stamping — steady-state
+            // saves never pay it. A corrupt/absent flow degrades to NULL
+            // (summary_bytes carries the read); it must never fail the save.
+            let egressPos: Map<string, number> | null = null;
+            const msgidBoundsForCovered = (payloadJson: string): [string | null, string | null] => {
+                if (egressPos === null) {
+                    try {
+                        egressPos = new Map(this.snapEgressPinLiveIds(s.sessionId).map((id, i) => [id, i] as const));
+                    } catch {
+                        egressPos = new Map();
+                    }
+                }
+                let lo = -1;
+                let hi = -1;
+                let loId: string | null = null;
+                let hiId: string | null = null;
+                try {
+                    const cov = JSON.parse(payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                    for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) {
+                        const p = egressPos.get(id);
+                        if (p === undefined) continue;
+                        if (lo < 0 || p < lo) { lo = p; loId = id; }
+                        if (hi < 0 || p > hi) { hi = p; hiId = id; }
+                    }
+                } catch { /* malformed payload: keep the no-claim sentinel */ }
+                return hi < 0 ? [null, null] : [loId, hiId];
+            };
             const blocksUpsert = this.db.prepare(
                 `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
                    summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json,
@@ -1688,6 +1721,20 @@ export class UnifiedStore {
                 // per unchanged block. #4608 bound preservation makes "the
                 // incoming -1 keeps the stored value" part of the equality.
                 const ex = storedBlocks.get(b.blockId);
+                // #7439-2 self-contained columns: a row already stamped with
+                // UNCHANGED coverage carries its stored values forward (no
+                // view read, no rewrite); anything else is (re-)computed.
+                const selfContainedStale = ex !== undefined && ex.payload_json === b.payloadJson
+                    && ex.summary_bytes !== null && ex.start_msgid !== null && ex.end_msgid !== null;
+                let bStartMsgid: string | null;
+                let bEndMsgid: string | null;
+                if (selfContainedStale) {
+                    bStartMsgid = ex.start_msgid;
+                    bEndMsgid = ex.end_msgid;
+                } else {
+                    [bStartMsgid, bEndMsgid] = msgidBoundsForCovered(b.payloadJson);
+                }
+                const incomingSummaryBytes = b.summaryBytes ?? b.summary;
                 if (ex &&
                     ex.ord === b.ord &&
                     (bStartSeq < 0 || bStartSeq === ex.start_seq) &&
@@ -1701,7 +1748,10 @@ export class UnifiedStore {
                     ex.active === (b.active ? 1 : 0) &&
                     ex.created_at === b.createdAt &&
                     ex.covered_hash === b.coveredHash &&
-                    ex.payload_json === b.payloadJson) {
+                    ex.payload_json === b.payloadJson &&
+                    (ex.summary_bytes === null ? null : Buffer.from(ex.summary_bytes).toString("utf8")) === incomingSummaryBytes &&
+                    (ex.start_msgid ?? null) === bStartMsgid &&
+                    (ex.end_msgid ?? null) === bEndMsgid) {
                     continue;
                 }
                 const summaryHash = this.putContent(b.summary, b.summaryHash);
@@ -1740,9 +1790,9 @@ export class UnifiedStore {
                     b.createdAt,
                     b.coveredHash,
                     b.payloadJson,
-                    b.summaryBytes ?? b.summary,
-                    b.startMsgid ?? null,
-                    b.endMsgid ?? null,
+                    incomingSummaryBytes,
+                    bStartMsgid,
+                    bEndMsgid,
                 );
                 if (ex) {
                     if (ex.summary_hash === summaryHash) this.releaseContent(summaryHash);
@@ -3779,8 +3829,8 @@ export class UnifiedStore {
      *  decoding (storage-bounded-load / issue4739-storage-read-snapshot pin
      *  this shape). */
     getBlockContents(sessionId: string, opts: { limit: number; offset?: number }): Pick<BlockRow, "blockId" | "summary" | "one">[] {
-        const rows = this.db.prepare(`SELECT b.block_id, b.one_hash, s.bytes AS summary_bytes, o.bytes AS one_bytes
-            FROM (SELECT block_id, ord, summary_hash, one_hash FROM blocks
+        const rows = this.db.prepare(`SELECT b.block_id, b.one_hash, COALESCE(b.summary_bytes, s.bytes) AS summary_bytes, o.bytes AS one_bytes
+            FROM (SELECT block_id, ord, summary_hash, one_hash, summary_bytes FROM blocks
                 WHERE session_id = ? ORDER BY ord, block_id LIMIT ? OFFSET ?) b
             LEFT JOIN content s ON s.hash = b.summary_hash
             LEFT JOIN content o ON o.hash = b.one_hash
@@ -4137,9 +4187,9 @@ export class UnifiedStore {
             .prepare(
                 `SELECT b.block_id, b.ord, b.start_seq, b.end_seq, b.start_ref, b.end_ref, b.tier, b.summary_hash, b.one_hash,
                         b.supersedes_block_id, b.active, b.created_at, b.covered_hash, b.payload_json,
-                        s.bytes AS summary_bytes, o.bytes AS one_bytes
+                        COALESCE(b.summary_bytes, s.bytes) AS summary_bytes, o.bytes AS one_bytes
                  FROM (SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
-                              supersedes_block_id, active, created_at, covered_hash, payload_json
+                              supersedes_block_id, active, created_at, covered_hash, payload_json, summary_bytes
                        FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}) b
                  LEFT JOIN content s ON s.hash = b.summary_hash
                  LEFT JOIN content o ON o.hash = b.one_hash

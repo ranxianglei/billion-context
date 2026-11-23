@@ -424,6 +424,28 @@ export class MysqlBackend implements StorageBackend {
                 // from the committed sessions on the next boot.
                 await this.migrateV8Identities();
             }
+            // 2026-11-23 (#7439-2, PR #7553): blocks self-contained columns —
+            // probe-FIRST, outside the version gate (a shared db stamped at
+            // the current version early-returns above and must still pick up
+            // new columns; same convention as the sqlite ccr probe). CREATE
+            // TABLE IF NOT EXISTS leaves existing tables untouched, so the
+            // DDL addition alone would never reach them. No version bump.
+            {
+                const [cols] = (await conn.query(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS " +
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'blocks'",
+                )) as unknown as [Row[]];
+                const have = new Set(cols.map((r) => str(r.COLUMN_NAME)));
+                if (!have.has("summary_bytes")) {
+                    await conn.query("ALTER TABLE blocks ADD COLUMN summary_bytes LONGTEXT NULL");
+                }
+                if (!have.has("start_msgid")) {
+                    await conn.query("ALTER TABLE blocks ADD COLUMN start_msgid VARCHAR(255) NULL");
+                }
+                if (!have.has("end_msgid")) {
+                    await conn.query("ALTER TABLE blocks ADD COLUMN end_msgid VARCHAR(255) NULL");
+                }
+            }
             // Stamp advances but never downgrades: a future library stamped
             // higher than this build keeps its stamp.
             await conn.query(
@@ -849,11 +871,13 @@ export class MysqlBackend implements StorageBackend {
                 start_ref: number | null; end_ref: number | null; tier: number | string;
                 summary_hash: string | number; one_hash: string | null; supersedes_block_id: string | null;
                 active: number | string; created_at: number | string; covered_hash: string | number; payload_json: string | number;
+                summary_bytes: string | null; start_msgid: string | null; end_msgid: string | null;
             };
             const storedBlocks = new Map<string, StoredBlockRow>();
             const storedBlockRows = (await c.query(
                 "SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, " +
-                "summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json " +
+                "summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json, " +
+                "summary_bytes, start_msgid, end_msgid " +
                 "FROM blocks WHERE session_id = ?",
                 [s.sessionId],
             )) as unknown as StoredBlockRow[][];
@@ -924,12 +948,23 @@ export class MysqlBackend implements StorageBackend {
             };
             for (const b of input.blocks) {
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
+                // #7439-2 (mirror of store.ts, PR #7553): the msgid coordinate
+                // columns stay NULL on this lane — the egress tables exist
+                // only in the sqlite backend. summary_bytes: a row already
+                // stamped with UNCHANGED coverage carries its stored bytes
+                // forward (equality trivially holds, zero churn); anything
+                // else falls back to the incoming summary text.
+                const ex = storedBlocks.get(b.blockId);
+                const selfContainedStale = ex !== undefined && str(ex.payload_json) === b.payloadJson
+                    && (ex.summary_bytes === null || ex.summary_bytes === undefined ? null : ex.summary_bytes) !== null;
+                const incomingSummaryBytes = selfContainedStale
+                    ? (ex.summary_bytes === null || ex.summary_bytes === undefined ? null : ex.summary_bytes)
+                    : (b.summaryBytes ?? b.summary);
                 // #5744 (mirror of store.ts): skip the whole write + CAS dance
                 // when the effective post-upsert row equals the stored row —
                 // steady-state saves re-send every block byte-identical. The
                 // -1/unknown bound keeps its stored value via the IF(>=0)
                 // guard below, so "incoming < 0" counts as unchanged.
-                const ex = storedBlocks.get(b.blockId);
                 if (ex &&
                     num(ex.ord) === b.ord &&
                     (bStartSeq < 0 || bStartSeq === num(ex.start_seq)) &&
@@ -943,7 +978,10 @@ export class MysqlBackend implements StorageBackend {
                     num(ex.active) === (b.active ? 1 : 0) &&
                     num(ex.created_at) === b.createdAt &&
                     str(ex.covered_hash) === b.coveredHash &&
-                    str(ex.payload_json) === b.payloadJson) {
+                    str(ex.payload_json) === b.payloadJson &&
+                    (ex.summary_bytes === null || ex.summary_bytes === undefined ? null : ex.summary_bytes) === incomingSummaryBytes &&
+                    (ex.start_msgid ?? null) === null &&
+                    (ex.end_msgid ?? null) === null) {
                     continue;
                 }
                 const summaryHash = await this.putContent(c, b.summary, b.summaryHash);
@@ -994,9 +1032,9 @@ export class MysqlBackend implements StorageBackend {
                         b.createdAt,
                         b.coveredHash,
                         b.payloadJson,
-                        b.summaryBytes ?? b.summary,
-                        b.startMsgid ?? null,
-                        b.endMsgid ?? null,
+                        incomingSummaryBytes,
+                        null,
+                        null,
                     ],
                 );
             }
@@ -1823,12 +1861,17 @@ export class MysqlBackend implements StorageBackend {
     private async getBlocksOn(conn: Pool | PoolConnection, sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
         const [rows] = (await conn.query(
             `SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
-                    supersedes_block_id, active, created_at, covered_hash, payload_json
+                    supersedes_block_id, active, created_at, covered_hash, payload_json, summary_bytes
              FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}`,
             [sessionId, ...(opts ? [opts.limit, opts.offset ?? 0] : [])],
         )) as unknown as Row[][];
         const out: (BlockRow & { summaryHash: string; oneHash: string | null })[] = [];
         for (const r of rows) {
+            // #7439-2: the self-contained summary wins when present;
+            // legacy rows (NULL) keep the content-table read.
+            const inlineBytes = (r.summary_bytes ?? null) as string | Buffer | null;
+            const inlineSummary = inlineBytes === null ? null
+                : (typeof inlineBytes === "string" ? inlineBytes : inlineBytes.toString("utf8"));
             out.push({
                 blockId: str(r.block_id),
                 ord: num(r.ord),
@@ -1839,7 +1882,7 @@ export class MysqlBackend implements StorageBackend {
                 tier: num(r.tier),
                 summaryHash: str(r.summary_hash),
                 oneHash: nullableStr(r.one_hash),
-                summary: (await this.getContent(conn, str(r.summary_hash))) ?? "",
+                summary: inlineSummary ?? (await this.getContent(conn, str(r.summary_hash))) ?? "",
                 one: r.one_hash === null || r.one_hash === undefined ? null : ((await this.getContent(conn, str(r.one_hash))) ?? null),
                 supersedesBlockId: nullableStr(r.supersedes_block_id),
                 active: num(r.active) === 1,
