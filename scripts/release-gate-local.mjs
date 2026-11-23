@@ -26,11 +26,15 @@
 // Usage:
 //   node scripts/release-gate-local.mjs [--tarball <path>] [--keep]
 //        [--skip a|b|u[,…]] [--with-update] [--base-dir <dir>] [--reuse-base-dir]
+//        [--snapbase-full]
 //
 //   --tarball      built package tarball (default: `npm pack` on the current
 //                  tree — run `npm run build` first, as the release
 //                  pre-flight already does).
 //   --with-update  also run Lane U (needs verdaccio + GATE_VERDACCIO_NPMRC).
+//   --snapbase-full  run the egress op-log plane (ruling 7439, successor of
+//                  the retired #5874 snapBase v2 plane) fully ON for this
+//                  invocation (rollout.features.egressPlane); default = plane off.
 //   --keep         keep the scratch dir (default: remove on success, keep on
 //                  failure for post-mortem).
 //   --reuse-base-dir  accept a NON-EMPTY --base-dir (default: refuse — a
@@ -180,6 +184,12 @@ const G = {
   keep: !!arg("keep"),
   skip: String(arg("skip", "")).split(",").filter(Boolean),
   withUpdate: !!arg("with-update"),
+  // Egress op-log plane validation (ruling 7439; the retired #5874 snapBase
+  // v2 plane's successor — `storage.snapBase` left the config surface in
+  // bc51c9445, `rollout.features.egressPlane` is the one switch): ON for this
+  // run only. Without the flag the gate runs the plane fully OFF (its shipped
+  // default).
+  snapbaseFull: process.argv.includes("--snapbase-full"),
 };
 
 const results = [];
@@ -372,6 +382,14 @@ async function main() {
           },
           // Lane U reads `latest` from here (a dsh-managed proxy must NOT self-update in place).
           ...(verdaccioOk ? { update: { registry: G.verdaccio } } : {}),
+          // --snapbase-full: run the egress op-log plane fully ON for this
+          // gate invocation (rollout.features.egressPlane — the retired
+          // snapBase v2 key would be a silent no-op now). Absent flag = plane
+          // off (the shipped default), so a normal gate run is byte-identical
+          // to pre-plane.
+          ...(G.snapbaseFull
+            ? { rollout: { features: { egressPlane: true } } }
+            : {}),
         },
         null,
         2,
