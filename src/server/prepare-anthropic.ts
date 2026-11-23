@@ -34,7 +34,15 @@ import { detectGenerationBoundary } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper, extractBillingAttributionBlock } from "../preflight.js";
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
-import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, countAnthropicSystemCacheControls, countAnthropicToolsCacheControls, pinClientMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
+import {
+    anthropicSystemCacheControlCount,
+    anthropicToolsCacheControlCount,
+    anthropicToolsCarryCacheControl,
+    clientCarriesGlobalCacheScope,
+    computeAnthropicMessageMarks,
+    pinClientMessageMarks,
+    stampSystemWithinAnthropicBudget,
+} from "../loop/cache-control.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
@@ -185,7 +193,7 @@ export async function prepareAnthropic(
     let nudgeOutcome: Prepared["nudgeOutcome"];
     let nudgeStampsBefore: Prepared["nudgeStampsBefore"];
     let rebuiltMessages = parsed.messages;
-    let anthropicCacheMarks: Map<string, { type: "ephemeral" }> | undefined;
+    let anthropicCacheMarks: Map<string, unknown> | undefined;
     let clientCacheControls: Map<string, unknown> | undefined;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
@@ -241,6 +249,10 @@ export async function prepareAnthropic(
         const converted = anthropicToCore(parsed);
         let msgs = converted.msgs;
         const cacheControls = converted.cacheControls;
+        const combinedClientControls = new Map<string, unknown>(cacheControls);
+        for (const [id, ctrl] of converted.clientMessageControls) {
+            if (!combinedClientControls.has(id)) combinedClientControls.set(id, ctrl);
+        }
         originalMessages = msgs;
         // #4491: pin identity to client-supplied ids (plugin lanes only — pure
         // proxy traffic has no msgid channel and stays on snapshot render D).
@@ -549,25 +561,32 @@ export async function prepareAnthropic(
         // STABLE message — ephemeral tails (retrievals/sysNotes/nudge/id note)
         // never carry a breakpoint. Client-managed controls (message blocks,
         // tools entries — WC-010's combined budget) pass through untouched.
-        anthropicCacheMarks = cacheControls.size > 0 || anthropicToolsCarryCacheControl(parsed.tools)
+        const clientSystemMarks = anthropicSystemCacheControlCount(parsed.system);
+        const clientToolMarks = anthropicToolsCacheControlCount(parsed.tools);
+        const reservedNonMsgMarks = clientSystemMarks + clientToolMarks;
+        const globalScopePresent = clientCarriesGlobalCacheScope(parsed.tools, parsed.system, combinedClientControls);
+        const pureClientManaged = !pluginMode && (combinedClientControls.size > 0 || anthropicToolsCarryCacheControl(parsed.tools));
+        const hasActiveFold = session.state.blocks.some((b) => b.active);
+        anthropicCacheMarks = pureClientManaged
             ? undefined
-            : computeAnthropicMessageMarks(processedMessages as { id?: string }[], attachedRetrievals.length, session);
-        // #6861: a client-managed session's moving breakpoints are pinned
-        // cumulatively (same discipline as our own marks) so the outbound
-        // history stays append-stable: without pinning, the client's last-
-        // message breakpoint moves every turn and the old message's bytes
-        // rewrite mid-history on every request. The pinned map is what the
-        // round-2 adapter rebuilds from too (#2499). Proxy mode ONLY: in
-        // plugin mode the host owns the rolling marks (opencode retouch
-        // channel, "no accumulation" contract) — pinning there breaks the
-        // host's latest-only discipline (opencode-rolling-cache-marks).
+            : computeAnthropicMessageMarks(
+                processedMessages as { id?: string; contentType?: string }[],
+                attachedRetrievals.length,
+                session,
+                combinedClientControls,
+                reservedNonMsgMarks,
+                globalScopePresent,
+                hasActiveFold,
+            );
+        // #6861: pin client-managed rolling breakpoints cumulatively within the
+        // remaining 4-breakpoint budget in proxy mode so mid-history stays stable.
         const clientManaged = anthropicCacheMarks === undefined && !pluginMode;
         if (clientManaged) {
-            const messageCap = Math.max(0, 4 - countAnthropicSystemCacheControls(parsed.system) - countAnthropicToolsCacheControls(parsed.tools));
+            const messageCap = Math.max(0, 4 - reservedNonMsgMarks);
             const liveIds = new Set(processedMessages.map((m) => m.id).filter((id): id is string => typeof id === "string" && id.length > 0));
-            clientCacheControls = pinClientMessageMarks(cacheControls, liveIds, session, messageCap);
+            clientCacheControls = pinClientMessageMarks(combinedClientControls, liveIds, session, messageCap);
         } else {
-            clientCacheControls = cacheControls;
+            clientCacheControls = combinedClientControls;
         }
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
@@ -613,7 +632,13 @@ export async function prepareAnthropic(
         // adapter consumes that frozen head and stamps its own rebuild, so NO
         // write-back here (writing the full systemOut back would double-append
         // the compress prompt on round-2, the exact F2 seam the matrix pins).
-        systemOut = stampAnthropicSystemCacheControl(systemOut, anthropicCacheMarks !== undefined);
+        systemOut = stampSystemWithinAnthropicBudget(
+            systemOut,
+            parsed.tools,
+            parsed.system,
+            anthropicCacheMarks ?? clientCacheControls,
+            anthropicCacheMarks !== undefined,
+        );
         if (injectTools) {
             toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL] : []), ...(blockOpsActive ? blockOps.anthropic : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }

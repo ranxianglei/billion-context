@@ -31,64 +31,151 @@ import { noCacheControl as knobNoCacheControl } from "../knobs.js";
  * BILI_NO_CACHE_CONTROL / compat.noCacheControl disables everything.
  */
 
+const ANTHROPIC_BREAKPOINT_BUDGET = 4;
 const MESSAGE_MARK_CAP = 3;
 
-type AnthropicCacheMarks = Map<string, { type: "ephemeral" }>;
+type AnthropicCacheMarks = Map<string, unknown>;
 
-export function computeAnthropicMessageMarks(
-    processed: { id?: string }[],
-    ephemeralTailCount: number,
-    session: { metadata: Record<string, unknown> },
-): AnthropicCacheMarks {
-    const marks = new Map<string, { type: "ephemeral" }>();
-    if (knobNoCacheControl()) {
-        session.metadata["anthropicCacheMarkIds"] = [];
-        return marks;
+export function anthropicSystemCacheControlCount(system: unknown): number {
+    if (!Array.isArray(system)) return 0;
+    let count = 0;
+    for (const block of system) {
+        if (typeof block === "object" && block !== null && (block as { cache_control?: unknown }).cache_control !== undefined) {
+            count++;
+        }
     }
-    if (processed.length === 0 || processed.length <= ephemeralTailCount) {
-        session.metadata["anthropicCacheMarkIds"] = [];
-        return marks;
+    return count;
+}
+
+export function anthropicToolsCacheControlCount(tools: unknown): number {
+    if (!Array.isArray(tools)) return 0;
+    let count = 0;
+    for (const t of tools) {
+        if (typeof t === "object" && t !== null && (t as { cache_control?: unknown }).cache_control !== undefined) {
+            count++;
+        }
     }
-    const liveIds = new Set(processed.map((m) => m.id).filter((id): id is string => typeof id === "string" && id.length > 0));
-    // Retire marks whose messages folded away; keep the survivors' order.
-    const kept = ((session.metadata["anthropicCacheMarkIds"] as string[] | undefined) ?? []).filter((id) => liveIds.has(id));
-    const lastIndex = processed.length - 1 - ephemeralTailCount;
-    const currentId = processed[lastIndex]?.id;
-    if (typeof currentId === "string" && currentId.length > 0 && !kept.includes(currentId) && kept.length < MESSAGE_MARK_CAP) {
-        kept.push(currentId);
-    }
-    session.metadata["anthropicCacheMarkIds"] = kept;
-    for (const id of kept) marks.set(id, { type: "ephemeral" });
-    return marks;
+    return count;
 }
 
 /** WC-010: Anthropic's 4-breakpoint budget spans system blocks + tools entries
- *  + message blocks COMBINED; anthropicToCore only harvests messages, so a
- *  tools-only client mark must suppress ours too or the 5th breakpoint 400s. */
+ *  + message blocks COMBINED. */
 export function anthropicToolsCarryCacheControl(tools: unknown): boolean {
-    if (!Array.isArray(tools)) return false;
-    return tools.some((t) => typeof t === "object" && t !== null && (t as { cache_control?: unknown }).cache_control !== undefined);
+    return anthropicToolsCacheControlCount(tools) > 0;
 }
 
-/** Count the cache_control breakpoints on a tools array (WC-010's combined
- *  budget counts every one, not just whether any exist). */
-export function countAnthropicToolsCacheControls(tools: unknown): number {
-    if (!Array.isArray(tools)) return 0;
-    let n = 0;
-    for (const t of tools) {
-        if (typeof t === "object" && t !== null && (t as { cache_control?: unknown }).cache_control !== undefined) n++;
-    }
-    return n;
+function isGlobalScopeControl(cc: unknown): boolean {
+    return typeof cc === "object" && cc !== null && (cc as { scope?: unknown }).scope === "global";
 }
 
-/** Count the cache_control breakpoints on a top-level system field. */
-export function countAnthropicSystemCacheControls(system: unknown): number {
-    if (!Array.isArray(system)) return 0;
-    let n = 0;
-    for (const b of system) {
-        if (typeof b === "object" && b !== null && (b as { cache_control?: unknown }).cache_control !== undefined) n++;
+/** WC-016: Anthropic rejects any `cache_control` with `scope: "global"` after a
+ *  narrower breakpoint in request order (`tools` -> `system` -> `messages`). */
+export function clientCarriesGlobalCacheScope(
+    tools: unknown,
+    system: unknown,
+    clientCacheControls?: Map<string, unknown>,
+): boolean {
+    if (Array.isArray(tools)) {
+        for (const t of tools) {
+            if (typeof t === "object" && t !== null && isGlobalScopeControl((t as { cache_control?: unknown }).cache_control)) {
+                return true;
+            }
+        }
     }
-    return n;
+    if (Array.isArray(system)) {
+        for (const block of system) {
+            if (typeof block === "object" && block !== null && isGlobalScopeControl((block as { cache_control?: unknown }).cache_control)) {
+                return true;
+            }
+        }
+    }
+    if (clientCacheControls) {
+        for (const ctrl of clientCacheControls.values()) {
+            if (isGlobalScopeControl(ctrl)) return true;
+        }
+    }
+    return false;
+}
+
+export function computeAnthropicMessageMarks(
+    processed: { id?: string; contentType?: string }[],
+    ephemeralTailCount: number,
+    session: { metadata: Record<string, unknown> },
+    clientCacheControls?: Map<string, unknown>,
+    reservedNonMessageBreakpoints = 0,
+    globalScopePresent = false,
+    allowSupplementalClientAnchor = true,
+): AnthropicCacheMarks | undefined {
+    const hasClientMsgMarks = (clientCacheControls?.size ?? 0) > 0;
+    if (knobNoCacheControl() || globalScopePresent) {
+        session.metadata["anthropicCacheMarkIds"] = [];
+        return hasClientMsgMarks ? new Map(clientCacheControls) : (globalScopePresent ? undefined : new Map());
+    }
+    if (processed.length === 0 || processed.length <= ephemeralTailCount) {
+        session.metadata["anthropicCacheMarkIds"] = [];
+        return hasClientMsgMarks ? new Map(clientCacheControls) : new Map();
+    }
+
+    if (hasClientMsgMarks && !allowSupplementalClientAnchor) {
+        session.metadata["anthropicCacheMarkIds"] = [];
+        return new Map(clientCacheControls);
+    }
+
+    const clientMsgCount = clientCacheControls?.size ?? 0;
+    const availableForBiliMessages = hasClientMsgMarks
+        ? Math.max(0, ANTHROPIC_BREAKPOINT_BUDGET - reservedNonMessageBreakpoints - clientMsgCount)
+        : Math.min(MESSAGE_MARK_CAP, Math.max(0, ANTHROPIC_BREAKPOINT_BUDGET - Math.max(1, reservedNonMessageBreakpoints)));
+
+    const markableIds = new Set(
+        processed
+            .filter((m) => m.contentType !== "reasoning")
+            .map((m) => m.id)
+            .filter((id): id is string => typeof id === "string" && id.length > 0 && !clientCacheControls?.has(id)),
+    );
+    const kept = ((session.metadata["anthropicCacheMarkIds"] as string[] | undefined) ?? [])
+        .filter((id) => markableIds.has(id))
+        .slice(0, availableForBiliMessages);
+
+    if (kept.length < availableForBiliMessages) {
+        let searchStart = processed.length - 1 - ephemeralTailCount;
+        if (hasClientMsgMarks) {
+            let earliestClientIdx = -1;
+            for (let i = 0; i < processed.length; i++) {
+                const id = processed[i]?.id;
+                if (typeof id === "string" && clientCacheControls!.has(id)) {
+                    earliestClientIdx = i;
+                    break;
+                }
+            }
+            if (earliestClientIdx > 0) {
+                searchStart = Math.min(searchStart, earliestClientIdx - 1);
+            }
+        }
+        let currentId: string | undefined;
+        for (let i = searchStart; i >= 0; i--) {
+            const m = processed[i];
+            if (
+                m &&
+                m.contentType !== "reasoning" &&
+                typeof m.id === "string" &&
+                m.id.length > 0 &&
+                !clientCacheControls?.has(m.id)
+            ) {
+                currentId = m.id;
+                break;
+            }
+        }
+        if (currentId !== undefined && !kept.includes(currentId)) {
+            kept.push(currentId);
+        }
+    }
+    session.metadata["anthropicCacheMarkIds"] = kept;
+    const marks: AnthropicCacheMarks = new Map();
+    if (clientCacheControls) {
+        for (const [id, ctrl] of clientCacheControls) marks.set(id, ctrl);
+    }
+    for (const id of kept) marks.set(id, { type: "ephemeral" });
+    return marks;
 }
 
 const CLIENT_MARK_IDS_KEY = "anthropicClientCacheMarks";
@@ -165,9 +252,13 @@ export function pinClientMessageMarks(
     return merged;
 }
 
-export function stampAnthropicSystemCacheControl(systemOut: AnthropicRequestBody["system"], ours = true): AnthropicRequestBody["system"] {
+export function stampAnthropicSystemCacheControl(
+    systemOut: AnthropicRequestBody["system"],
+    ours = true,
+    remainingBudget = 1,
+): AnthropicRequestBody["system"] {
     if (knobNoCacheControl()) return systemOut;
-    if (!ours) return systemOut;
+    if (!ours || remainingBudget <= 0) return systemOut;
     if (typeof systemOut === "string" && systemOut.length > 0) {
         // Deterministic string→block conversion (semantically identical for
         // Anthropic; stable across turns). A string system can carry no
@@ -184,4 +275,21 @@ export function stampAnthropicSystemCacheControl(systemOut: AnthropicRequestBody
     const last = systemOut.length - 1;
     systemOut[last] = { ...systemOut[last], cache_control: { type: "ephemeral" } };
     return systemOut;
+}
+
+/** Stamp bili's system breakpoint only while the shared 4-breakpoint budget
+ *  (tools + system + messages) has room and no client global-scope control
+ *  precedes it. Single source of truth for steady egress and round-2 rebuilds. */
+export function stampSystemWithinAnthropicBudget(
+    systemOut: AnthropicRequestBody["system"],
+    tools: unknown,
+    originalSystem: unknown,
+    effectiveMarks: Map<string, unknown> | undefined,
+    enableBiliSystemStamp: boolean,
+): AnthropicRequestBody["system"] {
+    if (!enableBiliSystemStamp) return systemOut;
+    if (clientCarriesGlobalCacheScope(tools, originalSystem, effectiveMarks)) return systemOut;
+    const reservedNonMsg = anthropicSystemCacheControlCount(originalSystem) + anthropicToolsCacheControlCount(tools);
+    const remainingBudget = Math.max(0, ANTHROPIC_BREAKPOINT_BUDGET - reservedNonMsg - (effectiveMarks?.size ?? 0));
+    return stampAnthropicSystemCacheControl(systemOut, true, remainingBudget);
 }
