@@ -46,7 +46,7 @@ import { SessionStore } from "../persist.js";
 import { FoundationRejectError } from "../snapshot/plane.js";
 import { runStage0 } from "../snapshot/stage0.js";
 import { applyImageRescalePass } from "../image-rescale.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, outputBudgetField, readOutputBudget, writeOutputBudget } from "./budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
@@ -65,6 +65,36 @@ import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
 import { resolveEgressAuthority } from "./egress-lane-io.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
+
+/** #7398: put the conversation array back into a body whose parse handle.ts
+ *  deferred. Everything else is kept EXACTLY as it stands on `parsed`.
+ *
+ *  Under the deferral gate `parsed` is the span-scan synthesis (every
+ *  top-level field decoded, `messages` = null marker), and handle.ts has
+ *  since mutated it in place: the dsh client-extension strip (#7168/#7439),
+ *  stale chain-carrier removal, the leaked-tool veto, the #6752 output-budget
+ *  restore, and — at the top of prepareOpenai — the bili msg-id/seqs body
+ *  fields deleted so the real upstream never sees them. Rebuilding the
+ *  top-level object from the raw wire text (what this function replaced)
+ *  resurrected every one of those: a watermark hit forwarded a stripped
+ *  `dsh_session_log` again and a starved max_tokens until #6752 special-cased
+ *  the budget. Taking the fields from `parsed` and only `messages` from the
+ *  wire covers all of them, present and future.
+ *
+ *  `wireOrder` is the wire key order (JSON.parse order, duplicate keys keep
+ *  their first position) so the re-serialized body stays byte-identical to
+ *  the non-deferred path — a moved `messages` key would cost the upstream
+ *  prefix cache the whole conversation. A key `parsed` no longer carries was
+ *  removed on purpose and stays removed. */
+function materializeDeferredBody(parsed: OpenAIRequestBody, wireOrder: Iterable<string>, messages: unknown): OpenAIRequestBody {
+    const top = parsed as unknown as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of wireOrder) {
+        if (key === "messages") out[key] = messages;
+        else if (key in top) out[key] = top[key];
+    }
+    return out as unknown as OpenAIRequestBody;
+}
 
 export async function prepareOpenai(
     parsed: OpenAIRequestBody,
@@ -205,41 +235,25 @@ export async function prepareOpenai(
             wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
             log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
         }
-        // #7398 perf: the deferral gate skipped the full JSON.parse in handle.ts
-        // (150-600ms on a 155MiB resend). The lanes above only consumed the span
-        // scan + window fragments; a miss — or the gates staying closed — means
-        // the legacy path needs the whole conversation array, so parse it exactly
-        // once, here. A throw is equivalent to the legacy parse failure (same
-        // catch in handle.ts).
-        if (bodyParseDeferred && !wpOutcome?.hit && !Array.isArray(parsed.messages) && bodyText !== undefined) {
-            parsed = JSON.parse(bodyText) as OpenAIRequestBody;
-        }
-        if (wpOutcome.hit) {
-            wpHit = wpOutcome.hit;
-            // #6752: handle.ts already ran restoreOutputBudget on `parsed` —
-            // the rebind below re-parses scalar fields from the raw wire text,
-            // which would silently discard the restored budget (the log claims
-            // the restore while the wire still carries the client's shrunk
-            // value). Carry the restored budget across the rebind.
-            const budgetField = outputBudgetField(parsed);
-            const restoredBudget =
-                budgetField !== null
-                    ? readOutputBudget(parsed as Record<string, unknown>, budgetField)
-                    : undefined;
-            const fields: Record<string, unknown> = {};
-            for (const [key, span] of wpHit.fieldSpans) {
-                // "messages" keeps its WIRE POSITION (the scanner records it
-                // position-only); every other field is re-parsed from its own
-                // span so no bytes of the prefix are ever decoded.
-                if (key === "messages") fields[key] = wpHit.windowMessages;
-                else fields[key] = JSON.parse(bodyText.slice(span.start, span.end));
-            }
-            if (budgetField !== null && restoredBudget !== undefined) {
-                writeOutputBudget(fields, budgetField, restoredBudget);
-            }
-            parsed = fields as OpenAIRequestBody;
-            inboundMessageCount = wpHit.totalT;
-        }
+    }
+    // #7398 perf: the deferral gate in handle.ts skipped the full JSON.parse
+    // (150-600ms on a 155MiB resend), so `parsed` is still the span-scan
+    // synthesis — every top-level field decoded, the conversation array left
+    // as the null marker. Two ways to materialize it, both keeping every
+    // OTHER field exactly as it stands on `parsed` (see materializeDeferredBody):
+    //   hit   — the window view; no prefix byte is ever decoded;
+    //   else  — the gate stayed closed (non-plugin lane, title-gen, rollout
+    //           flag off) or the lanes missed: the legacy path needs the whole
+    //           array, parsed exactly once here. A throw equals the legacy
+    //           parse failure (same catch in handle.ts).
+    if (wpOutcome?.hit) {
+        wpHit = wpOutcome.hit;
+        parsed = materializeDeferredBody(parsed, wpHit.fieldSpans.keys(), wpHit.windowMessages);
+        inboundMessageCount = wpHit.totalT;
+    } else if (bodyParseDeferred && !Array.isArray(parsed.messages) && bodyText !== undefined) {
+        const full = JSON.parse(bodyText) as OpenAIRequestBody;
+        parsed = materializeDeferredBody(parsed, Object.keys(full), full.messages);
+        inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
     }
     // Full-body text for the whole-wire image accounting (window-only bodies
     // would under-count pre-existing images).
