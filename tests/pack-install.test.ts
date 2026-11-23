@@ -5,6 +5,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -72,3 +73,38 @@ test("packDirFor distinguishes project vs user targets", () => {
     assert.equal(packDirFor(false), userPacksDir);
     assert.equal(packDirFor(true), path.join(process.cwd(), ".billion-context", "packs"));
 });
+
+for (const dependencyIsPack of [false, true]) {
+    test(`install selects the requested package when a newer dependency ${dependencyIsPack ? "also contains a pack" : "has no pack"}`, () => {
+        const dependency = fixturePkg(dependencyIsPack, { name: "zz-decoy-pack", promptSections: { philosophy: "dependency" } });
+        writeFileSync(path.join(dependency, "package.json"), JSON.stringify({ name: "zz-pack-helper", version: "1.0.0" }));
+        const requested = fixturePkg(true, { name: "zz-requested-pack", promptSections: { philosophy: "requested" } });
+        writeFileSync(path.join(requested, "package.json"), JSON.stringify({
+            name: "zz-requested-package",
+            version: "1.0.0",
+            dependencies: { "zz-pack-helper": `file:${dependency}` },
+            scripts: { postinstall: "node touch-dependency.cjs" },
+        }));
+        writeFileSync(path.join(requested, "touch-dependency.cjs"), `
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const future = new Date(Date.now() + 60_000);
+            fs.utimesSync(path.join(__dirname, "..", "zz-pack-helper"), future, future);
+        `);
+        const npm = process.platform === "win32"
+            ? path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")
+            : undefined;
+        execFileSync(npm ? process.execPath : "npm", [
+            ...(npm ? [npm] : []), "pack", requested, "--pack-destination", requested, "--ignore-scripts",
+        ], { stdio: "pipe", timeout: 30_000 });
+        const tarball = path.join(requested, "zz-requested-package-1.0.0.tgz");
+        const installed = installPackFromNpm(tarball);
+        try {
+            assert.equal(installed.name, "zz-requested-pack");
+            assert.match(readFileSync(installed.file, "utf8"), /requested/);
+            assert.ok(!existsSync(path.join(userPacksDir, "zz-decoy-pack.json")));
+        } finally {
+            removePackFile(installed.name);
+        }
+    });
+}

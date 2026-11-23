@@ -83,6 +83,19 @@ interface LedgerFold {
     bid?: string;
 }
 
+// #6729: nudge-vs-fold recovery ledger (#6720 ratchet). A nudge lists the
+// recommended compressible ranges (pendingT1 = their token sum); the model
+// often folds only part of it, so the post-fold floor climbs turn over turn.
+// Nothing visualized the recommended-vs-actually-folded gap until now, so the
+// session panel and the downloadable report render both per event.
+const RECOVERY_BURST_MS = 10 * 60_000;
+const RECOVERY_STALE_MS = 30 * 60_000;
+const RECOVERY_CAP = 500;
+
+type RecoveryEvent =
+    | { kind: "n"; at: number; p: number; tier: number | null }
+    | { kind: "f"; at: number; S: number; seq: number; p: number; mode: "n" | "a"; pct?: number };
+
 interface LedgerLine {
     captureId?: string;
     captureRound?: number;
@@ -212,6 +225,9 @@ interface LedgerLine {
 interface CacheLedger {
     v: 1;
     lastBlockId: number;
+    /** #6729: nudge-injection / fold recovery events (sqlite-persisted with
+     *  the rest of the ledger; sparse — absent on pre-#6729 ledgers). */
+    recovery?: RecoveryEvent[];
     /** #3769: high-water of session.state.sweptOrphanCallIds length — detects a
      *  proactive failed-compress cleanup between samples so detectSeam can
      *  attribute a mid-history break to the cleanup instead of "unexplained". */
@@ -658,7 +674,8 @@ export const CREDENTIAL_HEADER_NAMES = ["authorization", "x-api-key", "api-key",
  *  returns undefined when the lane sent no recognized credential header. */
 export function credentialFingerprint(headers: Record<string, string> | undefined | null): string | undefined {
     if (!headers) return undefined;
-    let cred: string | undefined;
+    const values = new Set<string>();
+    const fields = new Set<string>();
     for (const [name, value] of Object.entries(headers)) {
         const n = name.toLowerCase();
         if ((CREDENTIAL_HEADER_NAMES as readonly string[]).includes(n)) {
@@ -677,12 +694,18 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
                 // per request. The STABLE credential on that line is the
                 // Access key id — fingerprint only that.
                 const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
-                cred = m !== null ? `sdk-hmac:${m[1]!}` : v;
-                break;
+                const credential = m !== null ? `sdk-hmac:${m[1]!}` : v;
+                values.add(credential);
+                fields.add(JSON.stringify([n, credential]));
             }
         }
     }
-    if (cred === undefined) return undefined;
+    if (values.size === 0) return undefined;
+    // Keep existing single-key identities, including aliases carrying the
+    // same key. Distinct credentials form an order-independent identity so
+    // header iteration order cannot bypass or cross-clear a throttle hold.
+    const cred = values.size === 1 ? values.values().next().value!
+        : `credential-set:${JSON.stringify([...fields].sort())}`;
     return "sha256:" + createHash("sha256").update(cred, "utf8").digest("hex").slice(0, 12);
 }
 
@@ -747,10 +770,19 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
     // sharing a 512 KiB prefix apart. Re-noting a byte-identical payload (the
     // non-streaming settle path) reuses the prior slot's count/full instead of
     // re-deriving them.
+    // #7149 batch3-1 (delta anchoring): the byte-identical re-note inherits the
+    // prior digest via a pure byte compare — ZERO hashing on the common path.
+    // Changed/new bodies keep the full-body digest: `bd` is the ground-truth
+    // equality proof (#2131) and the ONLY equality proof once the payload
+    // exceeds BODY_FULL_CAP (nothing is retained), so a delta descriptor cannot
+    // replace it without breaking settle's be decision. View-ID anchoring is
+    // not available here — the send chokepoints hold the wire string, not the
+    // stored canonical views (those live in the storage layer).
     const buf = Buffer.from(body, "utf8");
-    const digest = createHash("sha256").update(buf).digest("hex");
     const transient = pendingCapture(session);
     const prior = transient.sentBody;
+    const sameBytes = prior !== undefined && prior.bytes === buf.byteLength && prior.full !== null && prior.full.equals(buf);
+    const digest = sameBytes ? prior.digest : createHash("sha256").update(buf).digest("hex");
     const samePayload = prior !== undefined && prior.digest === digest;
     transient.sentBody = {
         order: ++captureOrder,
@@ -1017,14 +1049,9 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
                 i++;
                 continue;
             }
-            // String content: hop to the next quote or backslash (native
-            // scans) instead of branching per byte — the bulk of any body.
-            let m = n;
-            const q = body.indexOf(34, i + 1);
-            if (q !== -1 && q < m) m = q;
-            const b = body.indexOf(92, i + 1);
-            if (b !== -1 && b < m) m = b;
-            i = m;
+            // Advance once per byte. Separate delimiter searches would each
+            // rescan the whole remaining body when a delimiter is absent.
+            i++;
             continue;
         }
         if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; i++; continue; }
@@ -1035,14 +1062,8 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
             i++;
             continue;
         }
-        // Inter-token filler (whitespace/commas/colons/literals): hop to the
-        // next structural byte, again natively.
-        let m = n;
-        for (const code of [34, 123, 125, 91, 93]) {
-            const p = body.indexOf(code, i + 1);
-            if (p !== -1 && p < m) m = p;
-        }
-        i = m;
+        // Whitespace, commas, colons and literals need no separate search.
+        i++;
     }
     return null;
 }
@@ -1257,16 +1278,69 @@ export function getCacheLedger(session: Session): CacheLedger {
     return led;
 }
 
-function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "requestsAfter" | "k">): void {
+function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "requestsAfter" | "k">, closeFrom: number): void {
     // Freeze k = samples since each open fold (#1286): samples arrive in
     // order, so at this instant the count equals the batch-path
     // turnsToNextFold window (f.at < s.at <= nextFold.at); requestsAfter
     // keeps growing afterward to the full post-fold total.
-    for (const open of led.folds) {
+    for (let i = closeFrom; i < led.folds.length; i++) {
+        const open = led.folds[i];
         if (open.k === null) open.k = open.requestsAfter;
     }
     led.foldSeqCounter += 1;
     led.folds.push({ ...f, seq: led.foldSeqCounter, T: 0, hPct: null, requestsAfter: 0, k: null });
+    recordFoldRecovery(led, f.at, f.S, led.foldSeqCounter);
+}
+
+/** #6729: book a nudge that ACTUALLY reached the upstream payload (call from
+ *  the prepare return when nudgeOutcome === "injected" — vetoed/skipped/armed-
+ *  suppressed arms never landed, so they never arm attribution). p is the
+ *  recommended token sum (pendingT1, T1 only); higher tiers pass 0. */
+export function recordNudgeInject(session: Session, nudge: { tier?: number | null; breakdown?: Record<string, number> } | null | undefined): void {
+    if (!nudge) return;
+    const led = getCacheLedger(session);
+    const evs = led.recovery ?? (led.recovery = []);
+    if (evs.length === 0) {
+        // First real injection: backfill the folds that already happened —
+        // they all predate any injection, so every one of them is an active
+        // compression. (Backfilling here instead of at fold time keeps the
+        // persisted metadata byte-identical for sessions that never get a
+        // nudge — the storage-render goldens hash metadata_json.)
+        for (const f of led.folds) {
+            evs.push({ kind: "f", at: f.at, S: f.S, seq: f.seq, p: 0, mode: "a" });
+        }
+    }
+    evs.push({ kind: "n", at: Date.now(), p: nudge.breakdown?.["pendingT1"] ?? 0, tier: typeof nudge.tier === "number" ? nudge.tier : null });
+    if (evs.length > RECOVERY_CAP) evs.splice(0, evs.length - RECOVERY_CAP);
+    markDirty(session);
+}
+
+/** #6729: pair a fold with the nudge that armed it. Owner attribution ruling
+ *  (2026-11-14): a fold in the same or next round after an injection, plus the
+ *  consecutive burst that follows it (≤ RECOVERY_BURST_MS between folds), all
+ *  belong to that nudge; a fold whose preceding message carried no injection
+ *  (and is not in a burst chain) is an ACTIVE (model-initiated) compression. */
+function recordFoldRecovery(led: CacheLedger, at: number, S: number, seq: number): void {
+    // The field is only ever created by the FIRST real nudge injection (which
+    // backfills every earlier fold as active) — otherwise no-injection sessions
+    // would grow an empty field and drift the persisted metadata byte-for-byte.
+    if (led.recovery === undefined) return;
+    const evs = led.recovery;
+    let lastF: RecoveryEvent | undefined;
+    let lastN: RecoveryEvent | undefined;
+    for (const ev of evs) {
+        if (ev.kind === "f") lastF = ev;
+        else if (ev.at <= at) lastN = ev;
+    }
+    const gapArmed = lastN !== undefined && lastN.at > (lastF?.at ?? 0);
+    const chainArmed = lastF !== undefined && at - lastF.at <= RECOVERY_BURST_MS;
+    const nudgeFresh = lastN !== undefined && at - lastN.at <= RECOVERY_STALE_MS;
+    const mode = lastN && nudgeFresh && (gapArmed || chainArmed) ? ("n" as const) : ("a" as const);
+    // A stale nudge's pending must not label a newer fold — the report would
+    // compare this fold against a recommendation the fold predates nothing of.
+    const p = lastN && nudgeFresh ? lastN.p : 0;
+    evs.push({ kind: "f", at, S, seq, p, mode, pct: mode === "n" && p > 0 ? Math.round((S / p) * 1000) / 10 : undefined });
+    if (evs.length > RECOVERY_CAP) evs.splice(0, evs.length - RECOVERY_CAP);
 }
 
 /** Record compression folds materialized as new kernel blocks. Proxy mode
@@ -1275,6 +1349,7 @@ function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "
 export function recordCacheFoldsFromBlocks(session: Session, blocks: CompressionBlock[], geo?: { V?: number; Vp?: number }): void {
     if (blocks.length === 0) return;
     const led = getCacheLedger(session);
+    let closeFrom = 0;
     for (const b of blocks) {
         const id = refNum(b.blockId);
         if (id <= led.lastBlockId) continue;
@@ -1286,7 +1361,10 @@ export function recordCacheFoldsFromBlocks(session: Session, blocks: Compression
             V: geo?.V,
             Vp: geo?.Vp,
             bid: b.blockId,
-        });
+        }, closeFrom);
+        // The first new fold closes every older open record. Within this
+        // synchronous batch, only the just-appended record can remain open.
+        closeFrom = led.folds.length - 1;
         led.lastBlockId = Math.max(led.lastBlockId, id);
     }
 }
@@ -1854,12 +1932,13 @@ export function noteOutboundContextEstimates(
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number; model?: string },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
+        if (session.transient?.nudgeHeldAfterReject) delete session.transient.nudgeHeldAfterReject;
         session.stats.inputTokens += s.total;
         // #4899: USD spend ledger — input/cache-read/cache-write billed at the
         // per-request stamped price, in lockstep with the token counters above
@@ -1901,6 +1980,17 @@ export function settleUsageReport(
         // it to demote the baseline when the current request routes elsewhere.
         const settleOrigin = normalizeUpstreamOrigin(s.upstream);
         if (settleOrigin !== undefined) session.stats.lastInputTokensOrigin = settleOrigin;
+        // Identity-fast-path: stamp which MODEL measured this baseline — the
+        // gate refuses to trust acceptance evidence across a model switch.
+        // Lanes that settle without an explicit model (streamed plugin pipes)
+        // fall back to metadata.lastModel: prepare re-covers it with the
+        // CURRENT request's model on every request, so in the normal case it
+        // is exactly this request's model (a concurrent interleaving can only
+        // produce one conservative demotion — the safe direction).
+        const stampedModel = typeof s.model === "string" && s.model !== "" ? s.model
+            : typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel
+            : undefined;
+        if (stampedModel !== undefined) session.stats.lastInputTokensModel = stampedModel;
         // #1933 F1: consume the pending pair — the local text estimate of the
         // payload THIS report bills, recorded at prepare time. Same route
         // required. Admitted samples (plausibility band) accumulate in a
@@ -2001,12 +2091,16 @@ export function settleUsageReport(
                         // side would misread the pair as mid. No array locatable
                         // (unparseable body) keeps the conservative pre-fix class.
                         const shorterFull = prevSlot.full.length <= curSlot.full.length ? prevSlot.full : curSlot.full;
-                        const arrClose = messagesArrayCloseOffset(shorterFull);
-                        // #3476: a growing logical unit (single giant message whose interior
-                        // container extends in place) is byte-wise a mid-body insertion but
-                        // semantically an append — recognize it in the would-be-mid slot.
-                        const midInsert = isMidInsertionAppend(prevSlot.full, curSlot.full, lcp);
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : midInsert ? "append" : "mid";
+                        if (lcp >= shorterFull.length - 64) curLine.bs = "append";
+                        else if (lcp < 1024) curLine.bs = "head";
+                        else {
+                            const arrClose = messagesArrayCloseOffset(shorterFull);
+                            // #3476: a growing logical unit (single giant message whose interior
+                            // container extends in place) is byte-wise a mid-body insertion but
+                            // semantically an append — recognize it in the would-be-mid slot.
+                            curLine.bs = arrClose !== null && lcp >= arrClose ? "tail"
+                                : isMidInsertionAppend(prevSlot.full, curSlot.full, lcp) ? "append" : "mid";
+                        }
                     } else {
                         curLine.bs = "unknown";
                     }
@@ -2121,7 +2215,24 @@ interface BodyStability {
     gapSplit: { lowHitMedGapMs: number | null; highHitMedGapMs: number | null };
 }
 
+/** #6729: nudge-recommended vs actually-folded per event, plus the session
+ *  average recovery rate (Σ folded / Σ recommended over all nudge arms, a
+ *  never-folded arm counting as 0 recovered). */
+interface RecoveryReport {
+    events: Array<{ at: number; kind: "n" | "f"; tier?: number | null; pending: number; folded: number | null; foldSeq: number | null; mode: "n" | "a" | null; pct: number | null; paired: boolean }>;
+    summary: { nudges: number; folds: number; nudgeFolds: number; activeFolds: number; totalPending: number; totalFolded: number; pct: number | null };
+    /** #6729 follow-up: one point PER NUDGE ROUND for the recovery line
+     *  chart — a round is the nudge plus every fold until the next nudge,
+     *  so several partial folds in one round sum up (the demo's 4×25% folds
+     *  are ONE 100% point, the ratchet's single-folds stay low). pct is null
+     *  when the nudge carried no measurable pending (non-T1 tiers). */
+    episodes: Array<{ at: number; tier: number | null; pending: number; folded: number; pct: number | null; credited: number; extra: number; activeFolds: number }>;
+}
+
 interface BiliCacheReport extends CacheReport {
+    /** #6729: recommended-vs-folded recovery (absent when the session has no
+     *  recovery events yet — pre-upgrade ledgers or no injections so far). */
+    recovery?: RecoveryReport;
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
     lines: Array<CacheReportLine & { captureId?: string; captureRound?: number; evidence?: "out-of-order"; bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; efp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep" }>;
@@ -2269,7 +2380,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             else byLo.set(lo, [l.hitPct]);
         }
         for (const [lo, hits] of [...byLo.entries()].sort((x, y) => x[0] - y[0]).slice(0, 24)) {
-            sizeBuckets.push({ lo, hi: lo + SIZE_BUCKET_TOK, n: hits.length, hitMedian: median(hits) ?? 0, hitMin: Math.min(...hits) });
+            sizeBuckets.push({ lo, hi: lo + SIZE_BUCKET_TOK, n: hits.length, hitMedian: median(hits) ?? 0, hitMin: hits.reduce((min, hit) => Math.min(min, hit), Infinity) });
         }
     }
     const lowGaps: number[] = [];
@@ -2294,6 +2405,108 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         sizeBuckets,
         gapSplit: { lowHitMedGapMs: median(lowGaps), highHitMedGapMs: median(highGaps) },
     };
+    // #6729: pair each nudge arm with the NEXT nudge-attributed fold it armed
+    // (one fold can answer only one arm); an arm with no follow-on fold is the
+    // ratchet's direct signal. totalFolded counts EVERY nudge-attributed fold
+    // (burst folds included) — pairing is per-arm bookkeeping, not a filter.
+    let recovery: RecoveryReport | undefined;
+    // No injection ever landed → the persisted field stays absent (metadata
+    // golden parity), but the report still lists every fold as an active
+    // compression — that view exists independently of the nudge stream.
+    const recSource: RecoveryEvent[] = (led.recovery && led.recovery.length > 0)
+        ? led.recovery
+        : led.folds.map((f) => ({ kind: "f" as const, at: f.at, S: f.S, seq: f.seq, p: 0, mode: "a" as const }));
+    if (recSource.length > 0) {
+        const paired = new Set<number>();
+        const recEvents = recSource.map((ev, i) => ({
+            at: ev.at,
+            kind: ev.kind,
+            ...(ev.kind === "n" ? { tier: ev.tier } : {}),
+            pending: ev.p,
+            folded: ev.kind === "f" ? ev.S : null,
+            foldSeq: ev.kind === "f" ? ev.seq : null,
+            mode: (ev.kind === "f" ? ev.mode : null) as "n" | "a" | null,
+            pct: ev.kind === "f" ? (ev.pct ?? null) : null,
+            paired: false,
+            i,
+        }));
+        for (let i = 0; i < recEvents.length; i++) {
+            if (recEvents[i].kind !== "n") continue;
+            for (let j = i + 1; j < recEvents.length; j++) {
+                const f = recEvents[j];
+                if (f.kind === "n") break;
+                // A model-active fold (mode "a") is NOT the answer to a nudge
+                // arm — pairing is nudge-attributed by design (#6729), else the
+                // "not folded" ratchet flag is silently lost when the model
+                // happens to self-compress after a nudge.
+                if (f.mode !== "n") continue;
+                if (paired.has(j)) continue;
+                paired.add(j);
+                recEvents[i].paired = true;
+                break;
+            }
+        }
+        let nudges = 0;
+        let folds = 0;
+        let nudgeFolds = 0;
+        let activeFolds = 0;
+        let totalPending = 0;
+        let totalFolded = 0;
+        for (const [j, f] of recEvents.entries()) {
+            if (f.kind === "n") {
+                nudges += 1;
+                totalPending += f.pending;
+            } else {
+                folds += 1;
+                if (f.mode === "n") {
+                    nudgeFolds += 1;
+                    totalFolded += f.folded ?? 0;
+                } else {
+                    activeFolds += 1;
+                }
+            }
+        }
+        // Round aggregation: nudge i owns every fold until nudge i+1 (or the
+        // end). Active folds inside the window ride along as a marker count —
+        // they never count toward the round's recovery. credited/extra split
+        // the round's folded mass against the OUTSTANDING recommended pool
+        // (the client re-derives the same split per zoom window):
+        // what came from recommended stock vs older stock the model cleaned
+        // on its own — so a 370% round reads as "list + 182K old stock",
+        // not 370K of phantom recovery.
+        const episodes: RecoveryReport["episodes"] = [];
+        let recPool = 0;
+        for (let j = 0; j < recEvents.length; j++) {
+            const ev = recEvents[j];
+            if (ev.kind === "n") {
+                recPool += ev.pending;
+                let epFolded = 0;
+                let epActive = 0;
+                for (let k = j + 1; k < recEvents.length && recEvents[k].kind !== "n"; k++) {
+                    const f = recEvents[k];
+                    if (f.mode === "n") epFolded += f.folded ?? 0;
+                    else epActive += 1;
+                }
+                const credited = Math.min(epFolded, recPool);
+                recPool = Math.max(0, recPool - epFolded);
+                episodes.push({
+                    at: ev.at,
+                    tier: ev.tier ?? null,
+                    pending: ev.pending,
+                    folded: epFolded,
+                    pct: ev.pending > 0 ? Math.round((epFolded / ev.pending) * 1000) / 10 : null,
+                    credited,
+                    extra: epFolded - credited,
+                    activeFolds: epActive,
+                });
+            }
+        }
+        recovery = {
+            events: recEvents.map(({ i: _i, ...ev }) => ev),
+            summary: { nudges, folds, nudgeFolds, activeFolds, totalPending, totalFolded, pct: totalPending > 0 ? Math.round((totalFolded / totalPending) * 1000) / 10 : null },
+            episodes,
+        };
+    }
     return {
         generatedAt: Date.now(),
         profile: effective,
@@ -2338,6 +2551,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         stability,
+        recovery,
         seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed }, orphanSweep: { count: a.orphanSweepSeams, missed: a.orphanSweepMissed } },
     };
 }

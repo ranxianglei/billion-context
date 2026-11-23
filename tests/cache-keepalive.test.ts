@@ -590,3 +590,86 @@ noteSuccessfulForward({
     fs.rmSync(tmp, { recursive: true, force: true });
     assert.equal(exitCode, 0, `an armed keepalive must not hold the event loop open (got ${exitCode === null ? "TIMEOUT — the cadence timer kept the process alive" : `exit code ${exitCode}`})\n--- child output ---\n${out}`);
 });
+
+for (const reply of [
+    { label: "rate limit", status: 429, body: { error: "slow down" } },
+    { label: "cache miss", status: 200, body: MISS_BODY },
+    { label: "cache hit", status: 200, body: HIT_BODY },
+]) {
+    test(`ping: a stale ${reply.label} body cannot change a replacement snapshot`, async (t) => {
+        let finishBody!: (text: string) => void;
+        let startedBody!: () => void;
+        const body = new Promise<string>((resolve) => { finishBody = resolve; });
+        const started = new Promise<void>((resolve) => { startedBody = resolve; });
+        const response = new Response(null, { status: reply.status });
+        t.mock.method(response, "text", () => {
+            startedBody();
+            return body;
+        });
+        t.mock.method(globalThis, "fetch", async () => response);
+
+        noteSuccessfulForward(armInput());
+        timers.advance(270_000);
+        await started;
+        noteSuccessfulForward(armInput({ wireBody: BODY_1H }));
+        const replacement = _keepaliveEntryForTest(sid);
+        assert.equal(replacement?.tierLabel, "1h");
+
+        finishBody(JSON.stringify(reply.body));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepEqual(_keepaliveEntryForTest(sid), replacement);
+        assert.equal(timers.pendingCount(), 1, "only the replacement snapshot stays scheduled");
+    });
+}
+
+for (const [tier, wireBody] of [["5m", BODY_5M], ["1h", BODY_1H]] as const) {
+    test(`arm: rotating credentials without a replacement ${tier} snapshot cancels its timer`, () => {
+        noteSuccessfulForward(armInput({ wireBody, headers: { "x-api-key": "rotation-old" } }));
+        assert.equal(timers.pendingCount(), 1);
+        noteSuccessfulForward(armInput({ wireBody: BODY_NO_BP, headers: { "x-api-key": "rotation-new" } }));
+        assert.equal(keepaliveStatusFor(sid), undefined, "the old credential's snapshot is ineligible");
+        assert.equal(timers.pendingCount(), 0, "no callback should retain the dropped snapshot until its old cadence");
+    });
+}
+
+test("arm: repeated credential rotation cannot retain snapshots outside the concurrent cap", () => {
+    process.env.BILI_CACHE_KEEPALIVE_MAX_PINGS = "1";
+    for (let round = 0; round < 20; round++) {
+        noteSuccessfulForward(armInput({ wireBody: BODY_1H, headers: { "x-api-key": `old-${round}` } }));
+        noteSuccessfulForward(armInput({ wireBody: BODY_NO_BP, headers: { "x-api-key": `new-${round}` } }));
+        assert.equal(keepaliveStatusFor(sid), undefined);
+    }
+    assert.equal(timers.pendingCount(), 0, "all unregistered snapshots release their timer-held references");
+});
+
+test("arm: dropping one rotated snapshot leaves another session's timer intact", () => {
+    const other = `${sid}-other`;
+    noteSuccessfulForward(armInput({ sessionId: other, wireBody: BODY_1H }));
+    const otherStatus = keepaliveStatusFor(other);
+    noteSuccessfulForward(armInput({ headers: { "x-api-key": "rotation-old" } }));
+    noteSuccessfulForward(armInput({ wireBody: BODY_NO_BP, headers: { "x-api-key": "rotation-new" } }));
+    assert.equal(keepaliveStatusFor(sid), undefined);
+    assert.deepEqual(keepaliveStatusFor(other), otherStatus);
+    assert.equal(timers.pendingCount(), 1);
+});
+
+test("arm: unchanged credentials preserve the prior eligible snapshot when no new breakpoint exists", () => {
+    noteSuccessfulForward(armInput());
+    const previous = keepaliveStatusFor(sid);
+    noteSuccessfulForward(armInput({ wireBody: BODY_NO_BP }));
+    assert.deepEqual(keepaliveStatusFor(sid), previous);
+    assert.equal(timers.pendingCount(), 1);
+});
+
+test("arm: an eligible replacement after rotation keeps one live timer and sends the new credential", async () => {
+    noteSuccessfulForward(armInput({ wireBody: BODY_1H, headers: { "x-api-key": "rotation-old" } }));
+    noteSuccessfulForward(armInput({ headers: { "x-api-key": "rotation-new" } }));
+    assert.equal(timers.pendingCount(), 1);
+    assert.equal(keepaliveStatusFor(sid)?.tierLabel, "5m");
+    timers.advance(270_000);
+    await settle(() => keepaliveStatusFor(sid)?.pingCount === 1);
+    assert.equal(upstreamRequests.length, 1);
+    assert.equal(upstreamRequests[0].headers["x-api-key"], "rotation-new");
+    assert.equal(upstreamRequests[0].body, PING_5M);
+    assert.equal(timers.pendingCount(), 1);
+});

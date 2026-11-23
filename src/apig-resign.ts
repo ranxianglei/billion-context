@@ -19,10 +19,10 @@ import { kvStore } from "./persist.js";
  * refold, compress-loop rounds, degenerate continuation refetch) is
  * re-signed here before it hits the wire.
  *
- * The signer is a byte-exact port of the CodeArts plugin's signRequestHuawei
- * (dsh codearts plugin src/sign.ts — itself aligned with the Rust reference
- * implementation `sign_request_huawei`): same canonical-request layout, same
- * date format, same header set. Verified by the hermetic mock upstream in
+ * The signer follows the SDK-HMAC-SHA256 canonical-request contract, using
+ * the CodeArts plugin's date format and header set. Query parameters use the
+ * ordering and RFC 3986 encoding required by Huawei's signing guide.
+ * Verified by the hermetic mock upstream in
  * tests/apig-resign.test.ts which validates signatures with the ak/sk it
  * issued.
  *
@@ -237,9 +237,21 @@ interface ApigSignOptions {
     now?: Date;
 }
 
-/** Sign `body` for `urlStr` into `target` (mutated in place). Byte-exact
- *  port of the plugin's signRequestHuawei: canonical request over the
- *  sorted signed-header set, `SDK-HMAC-SHA256\n<date>\n<canonical-hash>`
+function canonicalApigQuery(url: URL): string {
+    const encode = (value: string): string => encodeURIComponent(value)
+        .replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+    // UTF-8 byte order matches the SDK's Unicode scalar order, including
+    // non-BMP characters that JavaScript's UTF-16 string order misorders.
+    const compare = (a: string, b: string): number => Buffer.compare(Buffer.from(a), Buffer.from(b));
+    return [...url.searchParams]
+        .sort(([ak, av], [bk, bv]) => compare(ak, bk) || compare(av, bv))
+        .map(([key, value]) => `${encode(key)}=${encode(value)}`)
+        .join("&");
+}
+
+/** Sign `body` for `urlStr` into `target` (mutated in place). Canonical request
+ *  over the sorted signed-header set and query parameters,
+ *  `SDK-HMAC-SHA256\n<date>\n<canonical-hash>`
  *  string-to-sign, HMAC-SHA256 with the secret key. Always includes
  *  `x-security-token` (empty for permanent keys — the plugin does the same)
  *  and `content-type: application/json` on non-GET requests. */
@@ -254,7 +266,7 @@ export function signApigHeaders(
     const url = new URL(urlStr);
     let uri = url.pathname;
     if (!uri.endsWith("/")) uri += "/";
-    const query = url.search.slice(1);
+    const query = canonicalApigQuery(url);
     const dateStamp = apigDateStamp(opts.now ?? new Date());
     const payloadHash = sha256Hex(body);
 

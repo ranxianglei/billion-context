@@ -13,6 +13,8 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { closeLogger, configureLogger, log as loggerLog, setLogCapture } from "../src/logger.ts";
 import { formatUpstreamError } from "../src/upstream-proxy.ts";
+import { logHostEvent } from "../src/agent/host-log.js";
+import { defaultLogFile } from "../src/paths.js";
 import {
     isMaskHostsEnabled,
     isPublicApiHost,
@@ -138,6 +140,43 @@ test("maskUrlsForDiagnostics: text-level twin — loopback URLs kept, others mas
         "probe https://<private-host>/v1/chat/completions http://127.0.0.1:18788/bili/x https://api.deepseek.com/v1/messages",
     );
     assert.equal(maskUrlsForDiagnostics("junk http:// trailing stays"), "junk http:// trailing stays");
+});
+
+for (const origin of ["http://localhost:9090", "ws://127.0.0.1:9000", "socks5://[::1]:1080"]) {
+    test(`loopback URL visibility never exposes credentials: ${origin}`, () => {
+        const u = new URL(origin);
+        const sensitive = `${u.protocol}//alice:local-secret@${u.host}/proxy?q=private-query#private-fragment`;
+        const safe = `${u.protocol}//${u.host}/proxy`;
+        assert.equal(maskUrlForDiagnostics(sensitive), safe);
+        assert.equal(maskUrlsForDiagnostics(`dial ${sensitive} failed`), `dial ${safe} failed`);
+        assert.equal(maskUrlForDiagnostics(origin), origin, "clean pathless local origins remain byte-identical");
+        const prev = isMaskHostsEnabled();
+        try {
+            setMaskHostsEnabled(false);
+            assert.equal(maskUrlForDiagnostics(sensitive), safe, "host visibility cannot disable credential masking");
+        } finally {
+            setMaskHostsEnabled(prev);
+        }
+    });
+}
+
+test("host-event file output drops loopback URL secrets while retaining the local endpoint", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-loopback-log-"));
+    const prev = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = dir;
+    try {
+        logHostEvent("info", "[test-host]", "dial http://alice:local-secret@localhost:9090/proxy?q=private-query#private-fragment failed");
+        logHostEvent("info", "[test-host]", "healthy http://localhost:9090");
+        const output = fs.readFileSync(defaultLogFile(), "utf8");
+        assert.match(output, /dial http:\/\/localhost:9090\/proxy failed/);
+        assert.match(output, /healthy http:\/\/localhost:9090\n/);
+        for (const secret of ["alice", "local-secret", "private-query", "private-fragment"]) {
+            assert.ok(!output.includes(secret), `${secret} must not reach the paste-able log`);
+        }
+    } finally {
+        if (prev === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = prev;
+        await rmrf(dir);
+    }
 });
 
 test("maskHostPortForLog: CONNECT targets", () => {

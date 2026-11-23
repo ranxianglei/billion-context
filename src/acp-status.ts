@@ -20,7 +20,7 @@ import { pckAblations } from "./pck-probe.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
-import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
+import { describeUncoveredRuns, formatProtectedMass, shortTokenCount, uncoveredAudit } from "./uncovered.js";
 import { withoutTurnSeparators } from "./turn-separator.js";
 import { forkAdoptionSkippedOf } from "./fork-adoption.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
@@ -173,8 +173,16 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const view = typeof args.view === "string" ? (args.view as "ranges" | "messages") : undefined;
     const tool = typeof args.tool === "string" ? args.tool : undefined;
     const sort = typeof args.sort === "string" ? (args.sort as "size" | "time" | "tool" | "age") : undefined;
-    const limit = typeof args.limit === "number" ? args.limit : undefined;
-    const base = buildStatusReport(ctx.session.state, ctx.messages, defaultCountTokens, {
+        const limit = typeof args.limit === "number" ? args.limit : undefined;
+    // #7463 (re-scoped by owner ruling 2026-11-21): the protected-mass ledger
+    // is OPT-IN on this surface. acp_status is the model's everyday read and
+    // the mass — metered into usage, reachable by no compress offer — is an
+    // explanation, not an action; defaulting it on would ship "uncompressible
+    // garbage" on every call. Attribution rides the log + /acp panel + the
+    // structured context view by default; pass protectedMass:true for the
+    // on-demand ledger here.
+    const wantProtectedMass = args.protectedMass === true;
+    let base = buildStatusReport(ctx.session.state, ctx.messages, defaultCountTokens, {
         scope,
         view,
         tool,
@@ -189,6 +197,23 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             host: `billion-context ${VERSION} (${BUILD_COMMIT})`,
         },
     });
+    if (wantProtectedMass) {
+        try {
+            const audit = uncoveredAudit({
+                core: ctx.core,
+                messages: ctx.messages,
+                state: ctx.session.state,
+                config: ccrLoopConfig(ctx.session, ctx.config),
+                tokenCount: statusInputBaseline(ctx.session),
+                contentStore: contentStoreOf(ctx.session),
+                applyView: ctx.compressMessages,
+            });
+            const line = formatProtectedMass(audit.mass);
+            if (line) base = `${base}\n\n${line}`;
+        } catch {
+            // Advisory ledger; never break the status report.
+        }
+    }
     if (scope) return toolOk(base);
     const extra: string[] = [];
     // #4975: eviction/cold-load leaves refs+blocks but NO readable message
@@ -343,7 +368,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     // They keep going upstream raw while no surface names them; additive
     // section, rendered only when non-trivial. Advisory: any failure skips it.
     try {
-        const runs = uncoveredHistoryRuns({
+        const audit = uncoveredAudit({
             core: ctx.core,
             messages: ctx.messages,
             state: ctx.session.state,
@@ -354,6 +379,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             actionableSpans: offeredSpans ?? [],
             normalRanges: offeredSpans,
         });
+        const runs = audit.runs;
         if (runs.length > 0) {
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
             const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
@@ -395,9 +421,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     }
     if (breaker) {
         extra.push("");
-        extra.push(`COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: ${breaker.n} / ${breaker.threshold}. Disarms on one successful compress or ${breaker.decayMinutes} min without further failures.`);
+        extra.push(`COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: ${breaker.n} / ${breaker.threshold}. Disarms on one substantial compress (a trivial one that saves almost nothing does not count) or ${breaker.decayMinutes} min without further failures.`);
         if (substrateDestroyed) {
-            extra.push("Last failures were attributed to substrate-destruction (an out-of-band history rewrite). The Compressible-ranges list above was re-derived from the CURRENT resent view: per the receipt, compress ONLY a range listed there — one success clears this breaker. If no ranges are listed, continue the task without compressing.");
+            extra.push("Last failures were attributed to substrate-destruction (an out-of-band history rewrite). The Compressible-ranges list above was re-derived from the CURRENT resent view: per the receipt, compress ONLY a range listed there — one substantial success clears this breaker. If no ranges are listed, continue the task without compressing.");
         } else {
             extra.push("The Compressible-ranges list above was re-derived from the current view — the table is live; it is the earlier attempts that failed, not these ranges. Per the failure receipt: do not attempt to compress now; continue the task.");
         }

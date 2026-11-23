@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -25,7 +25,7 @@ process.env.XDG_STATE_HOME = `${import.meta.dirname ?? "."}/.billing-web-state-$
 process.env.BILI_SESSIONS_DIR = mkdtempSync(path.join(tmpdir(), "bili-billing-web-sessions-"));
 
 import { handleConfigPut, handlePricingGet } from "../src/web/api.js";
-import { buildOverview, buildSessionList, _resetDiskCacheForTest } from "../src/web/sessions-data.ts";
+import { buildOverview, buildSessionList, _resetDiskCacheForTest, _diskScanStatsForTest } from "../src/web/sessions-data.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, getSession } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -50,6 +50,108 @@ function seedSession(id: string, model: string | undefined): void {
 
 /** Display-precision rounding the panel applies at the summary boundary. */
 const r4 = (x: number): number => Math.round(x * 1e4) / 1e4;
+
+for (const mode of ["legacy", "shadow"] as const) {
+    test(`cached ${mode} disk summaries follow current billing prices`, async (t) => {
+        resetState();
+        const previousDir = process.env.BILI_SESSIONS_DIR;
+        const previousMode = process.env.BILI_STORAGE_UNIFIED;
+        const dir = mkdtempSync(path.join(tmpdir(), "bili-disk-prices-"));
+        process.env.BILI_SESSIONS_DIR = dir;
+        process.env.BILI_STORAGE_UNIFIED = mode;
+        _resetDiskCacheForTest();
+        t.after(() => {
+            _resetSessionsForTest();
+            _resetDiskCacheForTest();
+            process.env.BILI_SESSIONS_DIR = previousDir;
+            process.env.BILI_STORAGE_UNIFIED = previousMode;
+            setBillingOverrides(undefined);
+            rmrf(dir);
+        });
+        const store = new SessionStore({ dir, enabled: true, debounceMs: 0 });
+        if (mode === "shadow") assert.ok(store.replicasAvailable(), "exercise real shadow rows");
+        _setStoreForTest(store);
+        const decodedFiles = new Map<string, string>();
+        const readRawFile = store.readRawFile.bind(store);
+        let editPriceDuringRead = false;
+        t.mock.method(store, "readRawFile", async (file: string) => {
+            const raw = await readRawFile(file);
+            const record = raw as { id: string };
+            decodedFiles.set(file, record.id);
+            if (editPriceDuringRead) {
+                editPriceDuringRead = false;
+                setBillingOverrides({ "claude-bill": { input: 6, output: 20, cacheRead: 0.5, cacheWrite: 7 } });
+            }
+            return raw;
+        });
+        for (const id of ["disk-estimated", "disk-stamped", "disk-unrelated"]) {
+            const s = getSession(id, { protocol: "anthropic", upstreamOrigin: "http://api.somehost.com" });
+            s.metadata.lastModel = id === "disk-unrelated" ? "unrelated-unpriced" : "claude-bill";
+            s.stats.requests = 2;
+            s.stats.inputTokens = 1_000_000;
+            s.stats.cachedTokens = 500_000;
+            s.stats.outputTokens = 10_000;
+            s.metadata.cacheLedger = { folds: [{ S: 50000, sigma: 5000, T: 3000, requestsAfter: 10 }] };
+            if (id === "disk-stamped") s.stats.costUsd = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 };
+            await store.writeNow(s);
+        }
+        _resetSessionsForTest();
+        const first = await buildSessionList();
+        assert.equal(first.length, 3);
+        assert.ok(first.every((row) => !row.live));
+        assert.equal(r4(first.find((row) => row.id === "disk-estimated")!.costUsd!.total), 1.8);
+        const decoded = _diskScanStatsForTest().decodedTotal;
+        await buildSessionList();
+        assert.equal(_diskScanStatsForTest().decodedTotal, decoded, "unchanged prices keep the warm index");
+
+        setBillingOverrides({ "claude-bill": { input: 6, output: 20, cacheRead: 0.5, cacheWrite: 7 } });
+        const updated = await buildSessionList();
+        const estimated = updated.find((row) => row.id === "disk-estimated")!;
+        assert.equal(r4(estimated.costUsd!.total), 3.45, "price edit reaches unchanged disk files");
+        assert.equal(updated.find((row) => row.id === "disk-stamped")!.costUsd!.total, 10, "stamped spend stays exact");
+        assert.deepEqual(estimated.rates, { w: 7, r: 0.5, q: 20 });
+        assert.ok(Math.abs(estimated.savedUsd! - 0.1305) < 1e-12);
+        assert.equal(estimated.payback!.spentUsd, 0.0945);
+        assert.equal(estimated.payback!.normalOutputUsd, 0.1);
+        const overview = await buildOverview();
+        assert.equal(r4(overview.costUsdTotal), 13.45);
+        assert.deepEqual(overview.moneyRates, { w: 7, r: 0.5, q: 20 });
+
+        const repricedDecodes = _diskScanStatsForTest().decodedTotal;
+        if (mode === "legacy") assert.equal(repricedDecodes, decoded + 2, "only the two affected models are decoded again");
+        setBillingOverrides({ "claude-bill": { input: 6, output: 20, cacheRead: 0.5, cacheWrite: 7 } });
+        await buildSessionList();
+        assert.equal(_diskScanStatsForTest().decodedTotal, repricedDecodes, "equal replacement prices retain the cache");
+        if (mode === "shadow") assert.equal(repricedDecodes, 0, "fresh SQL rows avoid envelope decoding even after repricing");
+
+        setBillingOverrides(undefined);
+        setRegistryForTest({}, {});
+        const unpriced = (await buildSessionList()).find((row) => row.id === "disk-estimated")!;
+        assert.equal(unpriced.costUsd, undefined, "removed prices do not leave cached dollars");
+        assert.equal(unpriced.rates, undefined);
+        setRegistryForTest({}, { "somehost/claude-bill": { input: 8, output: 20, cache_read: 0.5 } });
+        const registry = (await buildSessionList()).find((row) => row.id === "disk-estimated")!;
+        assert.equal(r4(registry.costUsd!.total), 4.45, "registry reload can price a previously unpriced disk row");
+        if (mode === "legacy") {
+            // Leave the first priced file cached, then change prices while the
+            // second is being decoded. Its new summary must not inherit an old
+            // price key memoized before the asynchronous read.
+            const pricedFiles = [...decodedFiles].filter(([, id]) => id !== "disk-unrelated");
+            assert.equal(pricedFiles.length, 2);
+            const target = pricedFiles[1][0];
+            const st = statSync(target);
+            utimesSync(target, st.atime, new Date(st.mtimeMs + 1000));
+            editPriceDuringRead = true;
+            await buildSessionList();
+            assert.equal(editPriceDuringRead, false, "the changed file was actually decoded");
+            setBillingOverrides(undefined);
+            const reverted = await buildSessionList();
+            for (const row of reverted.filter((item) => item.id !== "disk-unrelated")) {
+                assert.deepEqual(row.rates, { w: 8, r: 0.5, q: 20 }, "a price rollback cannot retain a mislabelled summary");
+            }
+        }
+    });
+}
 
 async function getPricing(): Promise<{ status: number; payload: Record<string, unknown> }> {
     let status = 0;

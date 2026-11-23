@@ -19,7 +19,7 @@
 
 import { execFileSync } from "node:child_process";
 import { safePrefix } from "./text-safe.js";
-import { closeSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -69,34 +69,21 @@ function atomicWriteFile(file: string, content: string): void {
     }
 }
 
-/** Find the package directory npm just installed under prefix/node_modules. */
+/** Find the directly requested package, never a hoisted dependency. */
 function findInstalledPkg(prefix: string): { dir: string; manifest: Record<string, unknown> } | undefined {
-    const nmRoot = path.join(prefix, "node_modules");
-    if (!existsSync(nmRoot)) return undefined;
-    const candidates: string[] = [];
-    const push = (dir: string) => candidates.push(dir);
-    for (const entry of readdirSync(nmRoot)) {
-        if (entry.startsWith(".")) continue;
-        const full = path.join(nmRoot, entry);
-        if (!statSync(full).isDirectory()) continue;
-        if (entry.startsWith("@")) {
-            for (const sub of readdirSync(full)) {
-                push(path.join(full, sub));
-            }
-        } else {
-            push(full);
-        }
+    try {
+        const root = JSON.parse(readFileSync(path.join(prefix, "package.json"), "utf8")) as { dependencies?: unknown };
+        const dependencies = root?.dependencies;
+        if (!dependencies || typeof dependencies !== "object" || Array.isArray(dependencies)) return undefined;
+        const names = Object.keys(dependencies);
+        if (names.length !== 1) return undefined;
+        const dir = path.join(prefix, "node_modules", names[0]);
+        const manifest: unknown = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"));
+        if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return undefined;
+        return { dir, manifest: manifest as Record<string, unknown> };
+    } catch {
+        return undefined;
     }
-    let best: { dir: string; mtimeMs: number; manifest: Record<string, unknown> } | undefined;
-    for (const dir of candidates) {
-        const manifestPath = path.join(dir, "package.json");
-        if (!existsSync(manifestPath)) continue;
-        let manifest: Record<string, unknown>;
-        try { manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>; } catch { continue; }
-        const mtimeMs = statSync(dir).mtimeMs;
-        if (!best || mtimeMs > best.mtimeMs) best = { dir, mtimeMs, manifest };
-    }
-    return best ? { dir: best.dir, manifest: best.manifest } : undefined;
 }
 
 /**
@@ -126,7 +113,7 @@ export function installPackFromNpm(spec: string, options: PackInstallOptions = {
             const npmExec = resolveNpmExec();
             execFileSync(npmExec.file, [
                 ...npmExec.argsPrefix,
-                "install", "--prefix", tmp, "--no-save", "--no-audit", "--no-fund", trimmed,
+                "install", "--prefix", tmp, "--save", "--save-prod", "--no-audit", "--no-fund", trimmed,
             ], { timeout: NPM_TIMEOUT_MS, stdio: ["ignore", "pipe", "pipe"] });
         } catch (error) {
             const err = error as { stderr?: unknown; message?: string };

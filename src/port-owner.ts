@@ -1,4 +1,5 @@
 import { isProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
+import { nextListenPort } from "./listen-policy.js";
 
 /** #2941: post-bind port-ownership verification + pointer-clobber guard for
  *  same-lane double-spawn residuals (#707 follow-ups). Conservative by
@@ -170,7 +171,7 @@ export async function resolvePortClaim(params: {
         return { kind: "die", message: `port ${portOf(params.origin)} is shared with ${who} — refusing to serve a contested port (#2941)` };
     }
     const attempts = params.listenAttempts + 1;
-    const nextPort = attempts >= params.maxListenAttempts ? 0 : portOf(params.origin) + 1;
+    const nextPort = nextListenPort(portOf(params.origin), attempts, params.maxListenAttempts);
     return { kind: "ladder", nextPort, foreign };
 }
 
@@ -226,7 +227,8 @@ export const HOLDER_PROBE_TIMEOUT_MS = 2_000;
 /** Wildcard bind hosts are probed through loopback instead. */
 export function holderProbeOrigin(host: string, port: number): string {
     const h = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-    return `http://${h}:${port}`;
+    const authority = h.includes(":") && !h.startsWith("[") ? `[${h}]` : h;
+    return `http://${authority}:${port}`;
 }
 
 /** Pure hint composition for the terminal EADDRINUSE log line — the probe

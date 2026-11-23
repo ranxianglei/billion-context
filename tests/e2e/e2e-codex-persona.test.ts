@@ -218,7 +218,7 @@ type UrlCtx = {
 	work: string;
 	codexCwd: string;
 	codexHome: string;
-	xdg: { config: string; cache: string; state: string };
+	xdg: { config: string; cache: string; state: string; data: string };
 	port: number;
 	fakePort: number;
 	reqLog: string;
@@ -234,14 +234,14 @@ async function startUrlCtx(contextWindow: number): Promise<UrlCtx> {
 		work,
 		codexCwd: fs.mkdtempSync(path.join(CWD_ROOT, "url-cwd-")),
 		codexHome: path.join(work, "codex-home"),
-		xdg: { config: path.join(work, "xdg-config"), cache: path.join(work, "xdg-cache"), state: path.join(work, "xdg-state") },
+		xdg: { config: path.join(work, "xdg-config"), cache: path.join(work, "xdg-cache"), state: path.join(work, "xdg-state"), data: path.join(work, "xdg-data") },
 		port: await freePort(),
 		fakePort: await freePort(),
 		reqLog: path.join(work, "fake-requests.jsonl"),
 		resumed: false,
 		turnCount: 0,
 	};
-	for (const d of [ctx.codexHome, ctx.xdg.config, ctx.xdg.cache, ctx.xdg.state]) fs.mkdirSync(d, { recursive: true });
+	for (const d of [ctx.codexHome, ctx.xdg.config, ctx.xdg.cache, ctx.xdg.state, ctx.xdg.data]) fs.mkdirSync(d, { recursive: true });
 
 	await assertPortDead(ctx.fakePort);
 	const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
@@ -272,6 +272,7 @@ async function startUrlCtx(contextWindow: number): Promise<UrlCtx> {
 			XDG_CONFIG_HOME: ctx.xdg.config,
 			XDG_CACHE_HOME: ctx.xdg.cache,
 			XDG_STATE_HOME: ctx.xdg.state,
+			XDG_DATA_HOME: ctx.xdg.data,
 			BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
 			...windowEnv(contextWindow),
 		},
@@ -375,7 +376,7 @@ type LaunchCtx = {
 	work: string;
 	codexCwd: string;
 	codexHome: string;
-	xdg: { config: string; cache: string; state: string };
+	xdg: { config: string; cache: string; state: string; data: string };
 	fakePort: number;
 	reqLog: string;
 	fakePid?: number;
@@ -389,13 +390,13 @@ async function startLaunchCtx(contextWindow: number): Promise<LaunchCtx> {
 		work,
 		codexCwd: fs.mkdtempSync(path.join(CWD_ROOT, "launch-cwd-")),
 		codexHome: path.join(work, "codex-home"),
-		xdg: { config: path.join(work, "xdg-config"), cache: path.join(work, "xdg-cache"), state: path.join(work, "xdg-state") },
+		xdg: { config: path.join(work, "xdg-config"), cache: path.join(work, "xdg-cache"), state: path.join(work, "xdg-state"), data: path.join(work, "xdg-data") },
 		fakePort: await freePort(),
 		reqLog: path.join(work, "fake-requests.jsonl"),
 		resumed: false,
 		turnCount: 0,
 	};
-	for (const d of [ctx.codexHome, ctx.xdg.config, ctx.xdg.cache, ctx.xdg.state]) fs.mkdirSync(d, { recursive: true });
+	for (const d of [ctx.codexHome, ctx.xdg.config, ctx.xdg.cache, ctx.xdg.state, ctx.xdg.data]) fs.mkdirSync(d, { recursive: true });
 
 	await assertPortDead(ctx.fakePort);
 	const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
@@ -450,6 +451,7 @@ async function launchTurn(ctx: LaunchCtx, prompt: string, extraArgs: string[] = 
 			XDG_CONFIG_HOME: ctx.xdg.config,
 			XDG_CACHE_HOME: ctx.xdg.cache,
 			XDG_STATE_HOME: ctx.xdg.state,
+			XDG_DATA_HOME: ctx.xdg.data,
 			BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
 			BILI_CLIENT_BIN: CODEX_BIN,
 			E2E_UPSTREAM_KEY: "fake",

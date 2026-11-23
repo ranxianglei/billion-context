@@ -158,7 +158,7 @@ describe("#5173 end-to-end anchor geometry", () => {
             const block = res.state.blocks.find((b) => b.active)!;
             assert.deepEqual([...block.effectiveMessageIds].sort(), ["p2"], "only pre-anchor content folds; #3953 keeps everything at/after the live request visible");
             assert.ok(
-                res.result.warnings.some((w) => w.startsWith("Excluded") && w.includes("Last-user anchor: m00003")),
+                res.result.warnings.some((w) => w.startsWith("Excluded") && w.includes("Last-user anchor (historical quote, NOT a new user message): m00003")),
                 `receipt names the anchor ref, got: ${JSON.stringify(res.result.warnings)}`,
             );
         }

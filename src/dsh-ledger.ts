@@ -82,6 +82,18 @@ function unquote(v: string): string {
     return v.replace(/^["']|["']$/g, "");
 }
 
+/** Split a pnpm lockfile `version:` value into the resolved version and the
+ *  peer-resolution suffix pnpm appends when the package (or something it
+ *  depends on) has peers — `1.2.3(@types/node@16.9.1)` → ["1.2.3",
+ *  "(@types/node@16.9.1)"]. The suffix names which peer set this install was
+ *  resolved against; it is NOT part of the version, so every comparison with
+ *  the on-disk copy must ignore it, and a rewrite must carry it over (the
+ *  `snapshots:` key it points at carries the same suffix). */
+function splitPeerSuffix(v: string): [version: string, peerSuffix: string] {
+    const at = v.indexOf("(");
+    return at > 0 ? [v.slice(0, at), v.slice(at)] : [v, ""];
+}
+
 /** Plain-YAML-safe scalar: quote anything that could be misread (leading
  *  indicators like `>` or the alias indicator `*`, whitespace, …). Versions
  *  and ^/~ specs stay bare; a leading `*` is quoted because YAML would parse
@@ -125,6 +137,8 @@ interface LockResolution {
  *   - flat (lockfile ≤5.4): same-line values — under the top-level
  *     `specifiers:` section the value is the declared spec, under the flat
  *     `dependencies:` map it is the RESOLVED version.
+ * The resolved version is returned WITHOUT pnpm's peer suffix
+ * (`1.2.3(@types/node@16.9.1)` reads as `1.2.3`) — see splitPeerSuffix.
  * Returns undefined when no lockfile exists or records no entry. */
 function readPnpmLockResolution(profileDir: string): LockResolution | undefined {
     let text: string;
@@ -158,7 +172,7 @@ function readPnpmLockResolution(profileDir: string): LockResolution | undefined 
             const spec = inner.match(/^\s*specifier:\s*(\S+)/);
             if (spec && out.specifier === undefined) out.specifier = unquote(spec[1]);
             const ver = inner.match(/^\s*version:\s*(\S+)/);
-            if (ver && out.version === undefined) out.version = unquote(ver[1]);
+            if (ver && out.version === undefined) out.version = splitPeerSuffix(unquote(ver[1]))[0];
         }
     }
     return out.specifier !== undefined || out.version !== undefined ? out : undefined;
@@ -295,9 +309,18 @@ function patchNestedEntries(lines: string[], from: number, to: number, spec: str
             const vm = inner.match(/^([ \t]*)version:[ \t]*(\S.*)?$/);
             if (vm !== null) {
                 sawVersion = true;
-                if (unquote(vm[2] ?? "") !== version) {
-                    lines[j] = `${vm[1]}version: ${yamlScalar(version)}`;
-                    details.push({ file: "pnpm-lock.yaml", field: "version", before: unquote(vm[2] ?? ""), after: version });
+                // Compare and swap the version part only: a peer suffix
+                // (`1.2.3(@types/node@16.9.1)`) is kept verbatim, in the
+                // quoting style the line already has (pnpm writes it bare;
+                // yamlScalar would quote it and churn the line).
+                const raw = (vm[2] ?? "").trimEnd();
+                const cur = unquote(raw);
+                const [curVersion, peerSuffix] = splitPeerSuffix(cur);
+                if (curVersion !== version) {
+                    const quote = /^["']/.test(raw) ? raw[0] : "";
+                    const next = peerSuffix === "" ? yamlScalar(version) : `${quote}${version}${peerSuffix}${quote}`;
+                    lines[j] = `${vm[1]}version: ${next}`;
+                    details.push({ file: "pnpm-lock.yaml", field: "version", before: cur, after: `${version}${peerSuffix}` });
                 }
             }
         }

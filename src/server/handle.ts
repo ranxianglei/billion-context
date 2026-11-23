@@ -14,7 +14,7 @@ import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { stampBillingPrice } from "../billing.js";
 import { recordClientUa } from "../client-ua-registry.js";
-import { codexAlignedWindow } from "../codex-models.js";
+import { codexAlignedWindow, codexWindowNetsOutputHeadroom } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
@@ -35,47 +35,49 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
+import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, preferZedThreadIdIdentity, qoderSideTaskConversation, zcodeMemoryConversation } from "../session-id.js";
 import { preferKiroConversationIdentity } from "../kiro.js";
 import { personaConversationOrder, type SessionOrderResolution } from "../session-resolve.js";
 
-/** #5686: fork/migration visibility on the server side. personaConversation
- *  used to throw away every outcome but the key, so a production fork
- *  (derived-*) or migration (reanchor) left NO durable line — the entire
- *  dsh |sub:-drift cluster had to be reconstructed from user screenshots.
- *  Log the state-changing outcomes; claim/continue stay silent (they are the
- *  steady state and would flood the log). derived lanes are the incident
+/** #5686: fork visibility on the server side. The raw stamped id is the
+ *  steady state (silent); a #5095 lane-token derived lane is the incident
  *  class → warn level. */
 function onSessionResolveEvent(rawId: string, r: SessionOrderResolution): void {
-    if (r.action !== "reanchor" && !r.action.startsWith("derived-")) return;
-    loggerLog(r.action.startsWith("derived-") ? "warn" : "info", `[session-resolve] ${r.action}: ${rawId} -> ${r.key}${r.reason !== undefined ? ` (${r.reason})` : ""}`);
+    if (!r.action.startsWith("derived-")) return;
+    loggerLog("warn", `[session-resolve] ${r.action}: ${rawId} -> ${r.key}${r.reason !== undefined ? ` (${r.reason})` : ""}`);
 }
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
-import { executeThreadsReforge } from "./threads-lane.js";
+import { executeThreadsReforge, threadsBetaToDecline } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { opencodeForkParent } from "../opencode-fork-lineage.js";
+import { consumePluginRegisterFor, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
+import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
+import { ZED_PROVIDER_PROTOCOL, ZED_PROVIDERS, unwrapZedEnvelope, type ZedEnvelopeMeta, type ZedProvider } from "../zed-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
-import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { matchModelEndpoint } from "../model-endpoints.js";
+import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
-import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
+import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
-import { MSG_IDS_BODY_FIELD, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSGID_MODE_HEADER, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { DeltaReanchorError } from "./fastpath.js";
+import { synthesizeTopLevel } from "./fastpath-scan.js";
 import { harvestIdentity } from "../identity-harvest.js";
 import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
@@ -89,7 +91,8 @@ import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape
 import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { featureEnabled } from "../rollout.js";
+import { BodyTooLargeError, buildForwardTarget, declPinConflictWarned, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, scrubMsgIdFields, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { logRequestCost } from "./request-cost.js";
 import { normalizeVertexModelId } from "../vertex.js";
 import { CREDENTIAL_HEADER_NAMES } from "../cache-ledger.js";
@@ -108,9 +111,54 @@ function earlyHoldCredHeaders(req: http.IncomingMessage): Record<string, string>
     return out;
 }
 
+// #7168/#7439: DSH rides top-level `dsh_*` client extensions on every request —
+// `dsh_session_log` (the 8 MiB lossless session-log upload for the official
+// DeepSeek API; the model never reads it) plus the sibling `dsh_plugin_packages`.
+// During the transition bili INTERCEPTS them: this drops every TOP-LEVEL `dsh_*`
+// key so the 8 MiB is never forwarded upstream (no bandwidth waste, no unknown-
+// field risk on a non-DeepSeek upstream). Nested `dsh_*` (inside messages, etc.)
+// is untouched — only top-level keys go. Returns the same reference when there is
+// nothing to drop (fast path). Gated by the `passDshExtensions` rollout flag
+// (default OFF = strip). RELEASE the intercept by flipping the flag to 100% once
+// the client-extension sideband ships (#6785 / discussion #7439). Exported for tests.
+export function withoutDshClientExtensions(parsed: unknown): unknown {
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return parsed;
+    const rec = parsed as Record<string, unknown>;
+    if (!Object.keys(rec).some((k) => k.startsWith("dsh_"))) return parsed;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(rec)) if (!k.startsWith("dsh_")) out[k] = v;
+    return out;
+}
+
 // #5243: warn-once per model when the live codex model table is unavailable and
 // window sizing falls back to config.toml model_context_window.
 const codexConfigWindowWarned = new Set<string>();
+
+// #6220: BILI_PLUGIN_BYPASS forces the bypass decision for EVERY request, and
+// both forced states carry an approved risk that must not be silent (decision
+// thread #6220): force-on with the in-process compressor absent sends all
+// traffic out uncompressed; force-off sends legacy in-process sessions through
+// the full bili pipeline, and their acp-store history degrades to a read-only
+// archive. Warn once per process per state — a line per request would be noise
+// on a stream that re-sends the same posture every turn.
+let bypassOverrideOnWarned = false;
+let bypassOverrideOffWarned = false;
+
+// #5608 v3: weakest VERIFIED common-prefix ratio (verifiedPrefix / chainDepth)
+// at which a byte-exact MISS may still weakly adopt the closest tracked chain.
+// Floor set just below the lowest production telemetry reading in #5608's
+// maintainer comments (dsh desktop restart LCP 632/760 ≈ 0.83; others 827/955
+// ≈ 0.87, 1395/1523 ≈ 0.92) and far above every measured CI misfire shape
+// (head breaks at cell 0–8 of short chains: 0.0–0.67). Only the strictly-
+// deeper prefix-break kind is eligible; equal-depth replays (#1486) and
+// truncated subviews never adopt weakly regardless of ratio.
+const WEAK_ADOPT_MIN_PREFIX_RATIO = 0.8;
+
+// #6088: warn-once per (pre-fork) session when a request negotiates Anthropic
+// message threads — every turn then carries only the newest message(s), so the
+// session silently never compresses. Keyed by the base id so `|sub:` forks of
+// the same conversation do not repeat the line.
+const messageThreadsWarned = new Set<string>();
 
 // #2986: the derivedFromSessionId link is what keeps a kind child session
 // reachable along its parent chain after a restart — without it the shared
@@ -293,6 +341,17 @@ function memProbe(debug: boolean, log: (level: string, msg: string) => void, ses
     log("debug", `[${sessionId}] mem-probe ${stage}: heap=${mi(mu.heapUsed)} external=${mi(mu.external)} rss=${mi(mu.rss)}${payloadBytes !== undefined ? ` payload=${payloadBytes}B` : ""}`);
 }
 
+// #6884: non-empty header presence, proto-agnostically over Node's header map
+// (string values, string[] tolerated for folded multi-values; anything else
+// counts as absent). Lane evidence for the wire-client sidecar clauses in
+// handleRequest — same trust tier as the verbatim session-id roster
+// (src/session-id.ts): the header is client-stamped, not bili-derived.
+function hasNonEmptyHeader(h: Record<string, unknown>, name: string): boolean {
+    const v = h[name];
+    if (typeof v === "string") return v.length > 0;
+    if (Array.isArray(v)) return v.some((x) => typeof x === "string" && x.length > 0);
+    return false;
+}
 async function handleRequest(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -338,6 +397,11 @@ async function handleRequest(
      *  there so config resolves identically across all request forms. */
     let providerDestUrl: string;
     let protocol: WireProtocol | null;
+    /** #1295: wire family of a declared custom endpoint (currently only
+     *  "commandcode"); plus the zed cloud envelope wire (POST /completions,
+     *  body-classified). Undefined for built-in families; drives the envelope
+     *  unwrap/rewrap + JSONL codec selection further down the pipeline. */
+    let wireFamily: "commandcode" | "zed" | null = null;
     /** Gemini's model, resolved from the request path (its body never carries
      *  one). Undefined for every other protocol. */
     let googleModel: string | undefined;
@@ -402,20 +466,96 @@ async function handleRequest(
                 route ? route.rewrittenUrl : /^https?:\/\//i.test(url) ? url : `${opts.upstream}${url}`,
             )
             : undefined;
-        protocol =
-            route?.explicitProtocol
-            ?? declaredProtocol
-            ?? (req.method === "POST" && bodyBuffer.length > 0
-                ? urlPath.endsWith("/chat/completions") || urlPath.endsWith("/llm_raw_chat")
+        // #1295: declared endpoints are checked BEFORE the built-in path tables —
+        // one config source (src/model-endpoints.ts) feeds both this classifier
+        // and the client-side fetch claim, so the two gates can no longer drift.
+        // The target URL mirrors buildForwardTarget's derivation exactly.
+        const declaredTarget = (route ? route.rewrittenUrl : /^https?:\/\//i.test(url) ? url : `${opts.upstream}${urlPath}`)
+            .replace(/^mitm:\/\//, "https://");
+        const declared = matchModelEndpoint(opts.modelEndpoints, declaredTarget);
+        if (req.method !== "POST" || bodyBuffer.length === 0) {
+            protocol = null;
+        } else if (route?.explicitProtocol !== undefined) {
+            if (declared !== undefined && route.explicitProtocol !== (declared.wire === "commandcode" ? "openai" : declared.wire)) {
+                const key = `${declared.match}|${route.explicitProtocol}`;
+                if (!declPinConflictWarned.has(key)) {
+                    declPinConflictWarned.add(key);
+                    if (declPinConflictWarned.size > NON_CONVERSATION_RELAY_WARN_CAP) {
+                        declPinConflictWarned.delete(declPinConflictWarned.values().next().value as string);
+                    }
+                    loggerLog("warn", `modelEndpointPatterns declares ${declared.match} as ${declared.wire} but the request URL pins explicit protocol ${route.explicitProtocol}; the URL pin wins — check for a stale declaration or a client baseUrl that pins the other family`);
+                }
+            }
+            protocol = route.explicitProtocol;
+        } else if (declaredProtocol !== undefined) {
+            // #1909 providers-table declaration outranks the global pattern list
+            // (per-route specificity beats global patterns); both still beat the
+            // built-in suffix heuristics.
+            protocol = declaredProtocol;
+        } else if (declared !== undefined) {
+            if (declared.wire === "commandcode") {
+                // openai-completions request shape inside a nested CLI envelope:
+                // the internal protocol stays "openai" so kernel/loop pipelines
+                // run unchanged — wireFamily selects the envelope + JSONL codecs.
+                wireFamily = "commandcode";
+                protocol = "openai";
+            } else {
+                protocol = declared.wire;
+            }
+        } else {
+            // zed cloud wire: cloud.zed.dev POSTs the provider request nested in a
+            // `{thread_id, prompt_id, provider, model, provider_request}` envelope
+            // to /completions. The ENVELOPE is the classifier (commandcode
+            // precedent) — but it must be PROBED BEFORE the suffix chain claims
+            // the path, because urlPath.endsWith("/completions") lands "/completions"
+            // on "anthropic". The probe is classification ONLY on the raw
+            // pre-decode bytes; the strict codec re-validates after the decode
+            // below and anything it rejects relays verbatim. The marker header
+            // lets the prepare* layers suppress the model-side compress surface
+            // (the response is NDJSON byte-passthrough — an in-stream acp loop is
+            // structurally unreachable, #3177 reasoning).
+            // The probe keys off the DESTINATION path: /bili/ tunnel URLs keep
+            // req.url wrapper-shaped, so urlPath is the embedded path only via
+            // route.rewrittenUrl.
+            let zedPath = urlPath;
+            if (route?.rewrittenUrl !== undefined) {
+                try {
+                    zedPath = new URL(route.rewrittenUrl).pathname;
+                } catch {
+                    zedPath = "";
+                }
+            }
+            let zedProtocol: WireProtocol | null = null;
+            if ((zedPath === "/completions" || (route?.rewrittenUrl !== undefined && urlPath === "/completions")) && zedPath !== "/completions/compact") {
+                let probe: Record<string, unknown> | undefined;
+                try {
+                    const raw: unknown = JSON.parse(bodyBuffer.toString("utf8"));
+                    if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+                        const r = raw as Record<string, unknown>;
+                        if (typeof r.provider === "string" && (ZED_PROVIDERS as readonly string[]).includes(r.provider)
+                            && r.provider_request !== null && typeof r.provider_request === "object" && !Array.isArray(r.provider_request)) {
+                            probe = r;
+                        }
+                    }
+                } catch {
+                    probe = undefined;
+                }
+                if (probe !== undefined) {
+                    wireFamily = "zed";
+                    zedProtocol = ZED_PROVIDER_PROTOCOL[probe.provider as ZedProvider];
+                    req.headers["x-bili-zed-lane"] = "1";
+                }
+            }
+            protocol = zedProtocol ?? (zedPath.endsWith("/chat/completions") || zedPath.endsWith("/llm_raw_chat")
                     ? "openai"
-                    : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
+                    : zedPath.endsWith("/v1/messages") || zedPath.endsWith("/messages")
                       ? "anthropic"
-                      : urlPath.endsWith("/responses") || responsesCompact
+                      : zedPath.endsWith("/responses") || responsesCompact
                         ? "responses"
-                        : googlePathKind(urlPath) !== null
+                        : googlePathKind(zedPath) !== null
                           ? "google"
-                          : null
-                : null);
+                          : null);
+        }
         // Gemini carries the model in the PATH, not the body — resolve it here so
         // the window/config block below and every later model-keyed decision see
         // it on a request whose body has no `model` field (#google).
@@ -445,8 +585,10 @@ async function handleRequest(
                 // session). Any TEXT-dominated parseable body above the ingest
                 // cost band is already ≥ ~8M tokens — beyond every real model
                 // window — so refuse it HERE, after decode (which can balloon
-                // 10:1) but before the sweep that costs the seconds. 0 disables
-                // the cap (legacy parse-everything).
+                // 10:1) but before the sweep that costs the seconds. DISABLED
+                // by default for all lanes (#7426: on the re-send lanes the raw
+                // inbound byte count is not a valid "beyond model window"
+                // proxy); set a byte value to re-enable.
                 //
                 // Image-bearing bodies are exempt on EVERY lane: base64 pixels
                 // are excluded from the token meter by design ("images billed
@@ -536,7 +678,7 @@ async function handleRequest(
             return;
         }
         log("debug", `passthrough: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — unattributed in-process caller (#1117), relaying verbatim`);
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
     // #5795: pre-ingest 429-hold fast path — while the egress governor holds
@@ -588,9 +730,25 @@ async function handleRequest(
     // plugin stamps this header per request for sessions with acp state on
     // disk; acp owns their context in-process, so binding/injecting/compressing
     // here would double-manage it. Raw forward, zero state touched.
-    if (headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1") {
-        log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (legacy in-process compression)`);
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+    // #6220: BILI_PLUGIN_BYPASS overrides this decision per request —
+    //   "on"  → force bypass (every request forwarded verbatim)
+    //   "off" → never bypass (ignore the header)
+    //   unset → current behavior (the header decides)
+    const bypassOverride = pluginBypassOverride();
+    const headerBypass = headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1";
+    if (bypassOverride === "on" && !bypassOverrideOnWarned) {
+        bypassOverrideOnWarned = true;
+        log("warn", "BILI_PLUGIN_BYPASS=on — every inbound request is forwarded verbatim (no tool injection, no nudge, no session binding); if the in-process compressor is not loaded, traffic goes out with NO compression (#6220)");
+    }
+    if (bypassOverride === "off" && headerBypass && !bypassOverrideOffWarned) {
+        bypassOverrideOffWarned = true;
+        log("warn", "BILI_PLUGIN_BYPASS=off — inbound x-bili-plugin-bypass header ignored; legacy in-process compression sessions now run the full bili pipeline (their acp-store history degrades to a read-only archive) (#6220)");
+    }
+    const bypass = bypassOverride === "on" || (bypassOverride === "auto" && headerBypass);
+    if (bypass) {
+        const reason = bypassOverride === "on" ? "forced by BILI_PLUGIN_BYPASS=on" : "legacy in-process compression";
+        log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (${reason})`);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
@@ -601,13 +759,56 @@ async function handleRequest(
     // Parse body once and reuse everywhere (fixes duplicate JSON.parse).
     let parsed: unknown = null;
     let bodyText: string | undefined;
+    let bodyParseDeferred = false;
+    let deferredMsgCount = 0;
     if (protocol && bodyBuffer.length > 0) {
         bodyText = bodyBuffer.toString("utf8");
-        try {
-            parsed = JSON.parse(bodyText);
-        } catch {
-            parsed = null;
+        // #7398 perf: a multi-MiB OpenAI body on the pf handshake is a
+        // plugin-lane resend whose conversation array the fastpath/delta lane
+        // never needs whole (byte span scan + window-only parse). The full
+        // JSON.parse costs 150-600ms here for nothing on a hit, so synthesize
+        // `parsed` from the span scan (top-level fields only; messages stays
+        // the null marker). prepareOpenai re-parses the full body exactly once
+        // if — and only if — the lanes miss. No pf header / small body /
+        // unscannable shape / any field-span parse failure = legacy parse,
+        // byte-for-byte the old behavior. materializeDeferredBody
+        // (prepare-openai) puts the array back with every OTHER field exactly
+        // as handle.ts left it. The rollout flag is part of the condition:
+        // with it off the fastpath gate in prepareOpenai can never open, so
+        // deferring would only move the same parse later.
+        const pfProto = req.headers["x-bili-pf-count"] !== undefined || req.headers["x-bili-pf-delta"] !== undefined || req.headers["x-bili-pf-tail-ids"] !== undefined;
+        if (protocol === "openai" && wireFamily === null && pfProto && bodyBuffer.length >= 1048576 && featureEnabled("pluginFullResendWatermark")) {
+            const scanCounts = { total: 0 };
+            const synth = synthesizeTopLevel(bodyText, scanCounts);
+            if (synth !== null) { parsed = synth; bodyParseDeferred = true; deferredMsgCount = scanCounts.total; }
         }
+        if (!bodyParseDeferred) {
+            try {
+                parsed = JSON.parse(bodyText);
+            } catch {
+                parsed = null;
+            }
+        }
+    }
+    // #7168/#7439: intercept DSH client extensions (default) — strip top-level
+    // `dsh_*` so the 8 MiB `dsh_session_log` is never forwarded upstream. Gated by
+    // the `passDshExtensions` rollout flag (default OFF = strip); release it once
+    // the client-extension sideband ships (#6785 / #7439). See
+    // withoutDshClientExtensions + src/rollout.ts.
+    if (!featureEnabled("passDshExtensions")) parsed = withoutDshClientExtensions(parsed);
+    // Capture the raw-wire verdict before unwrapping or preparing can mutate
+    // parsed. Only these scalars are needed for the post-forward bookkeeping.
+    const rawWireMetadata = protocol ? preparePluginWireMetadata(bodyBuffer, parsed) : undefined;
+    // Only Claude Code answers the decline by dropping threads. It defers MCP tools behind tool
+    // search, so its bili MCP registration (keyed by its session id) counts when the tools are off the wire.
+    const ccSessionId = req.headers["x-claude-code-session-id"];
+    const biliCompressesThis = typeof ccSessionId === "string" && (declaresMcpBiliToolsOnWire(parsed) || consumePluginRegisterFor(ccSessionId) !== undefined);
+    const declinedThreadsBeta = protocol === "anthropic" ? threadsBetaToDecline(parsed, req.headers["anthropic-beta"], biliCompressesThis) : undefined;
+    if (declinedThreadsBeta !== undefined) {
+        log("info", `[threads] declined ${declinedThreadsBeta} for a session bili compresses — the client retries without threads and sends full history (#2701)`);
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `Unexpected value(s) \`${declinedThreadsBeta}\` for the \`anthropic-beta\` header. Please consult our documentation at docs.claude.com or try again without the header.` } }));
+        return;
     }
     // #3129: CloudCode/Antigravity v1internal dialect — unwrap the outer envelope
     // so the pipeline sees a standard GoogleRequest, and decide identity. The
@@ -625,19 +826,89 @@ async function handleRequest(
         v1ConvId = extractConversationId(unwrapped.inner) ?? undefined;
         if (isV1BackgroundSideRequest(unwrapped.meta, unwrapped.inner)) {
             log("info", `v1internal background utility call (requestType=${typeof unwrapped.meta.requestType === "string" ? unwrapped.meta.requestType : "micro"}) — verbatim passthrough, ACP state machine bypassed (#3129)`);
-            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, v1Model ?? googleModel ?? vertexModel);
+            await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, v1Model ?? googleModel ?? vertexModel);
             return;
         }
         log("debug", `v1internal envelope unwrapped (model=${v1Model ?? "?"} convId=${v1ConvId ?? "none"})`);
+    }
+    // #1295: declared commandcode endpoints wrap an openai-completions-shaped
+    // conversation in a nested CLI envelope ({params{...}}). Unwrap it here so
+    // everything below — inbound count, #1284 disambiguation, model/window
+    // resolution, session binding, kernel prepare — sees flat OpenAI.
+    // rewrapCommandcodeBody restores the envelope at the final forward boundary.
+    // Strict fidelity (#1284 precedent): a body that is not a convertible
+    // STREAMING CLI conversation relays verbatim with a one-time loud warning —
+    // never a partial conversion (docs/wire-contracts.md).
+    let ccMeta: CommandcodeEnvelopeMeta | undefined;
+    if (wireFamily === "commandcode" && protocol !== null) {
+        const unwrapped = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+            ? unwrapCommandcodeBody(parsed as Record<string, unknown>)
+            : undefined;
+        if (!unwrapped) {
+            const relayKey = `cc:${upstreamOrigin}${urlPath}`;
+            if (!nonConversationRelayWarned.has(relayKey)) {
+                nonConversationRelayWarned.add(relayKey);
+                if (nonConversationRelayWarned.size > NON_CONVERSATION_RELAY_WARN_CAP) {
+                    nonConversationRelayWarned.delete(nonConversationRelayWarned.values().next().value as string);
+                }
+                log("warn", `[commandcode] declared endpoint body is not a convertible streaming CLI conversation — relaying verbatim to ${maskUrlsInText(upstreamOrigin)} (#1295) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
+            }
+            await forward(req, res, opts, scrubMsgIdFields(bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
+            return;
+        }
+        parsed = unwrapped.body;
+        ccMeta = unwrapped.meta;
+    }
+    // zed cloud envelope: unwrap the `{thread_id, prompt_id, provider, model,
+    // provider_request}` wrapper so everything below — #1284 disambiguation,
+    // model/window resolution, session binding, kernel prepare — sees the
+    // standard provider wire. rewrapZedEnvelope restores the envelope at the
+    // final forward boundary. Strict fidelity (#1284 precedent): a body the
+    // classifier promised but the codec cannot convert relays verbatim with a
+    // one-time loud warning — never a partial conversion.
+    let zedMeta: ZedEnvelopeMeta | undefined;
+    let zedThreadId: string | undefined;
+    if (wireFamily === "zed" && protocol !== null) {
+        const unwrapped = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+            ? unwrapZedEnvelope(parsed as Record<string, unknown>)
+            : undefined;
+        if (!unwrapped) {
+            const relayKey = `zed:${upstreamOrigin}${urlPath}`;
+            if (!nonConversationRelayWarned.has(relayKey)) {
+                nonConversationRelayWarned.add(relayKey);
+                if (nonConversationRelayWarned.size > NON_CONVERSATION_RELAY_WARN_CAP) {
+                    nonConversationRelayWarned.delete(nonConversationRelayWarned.values().next().value as string);
+                }
+                log("warn", `[zed] /completions envelope body is not a convertible zed cloud request — relaying verbatim to ${maskUrlsInText(upstreamOrigin)} — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
+            }
+            await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+            return;
+        }
+        parsed = unwrapped.innerBody;
+        zedMeta = unwrapped.meta;
+        zedThreadId = unwrapped.threadId;
+        // The google arm's inner body carries no model (Gemini's is path-based);
+        // the ENVELOPE's `model` is the only source on this wire.
+        if (protocol === "google" && googleModel === undefined) googleModel = zedMeta.model;
     }
     // #2824: one cheap raw-text pass decides whether the incoming-image index
     //  (#1995/#2607) can find anything — a provably image-free body skips BOTH
     //  index builds (each one re-converts the full history wire→core). The
     //  predicate over-approximates by design; see bodyMightCarryImages.
     const bodyMayCarryImages = protocol !== null && bodyText !== undefined ? bodyMightCarryImages(bodyText, protocol) : false;
+    // #5403/#5418: the plugin full-resend watermark fastpath (prepare-openai) needs
+    // the raw body text. #4753 released it unconditionally, which silently disabled
+    // the fastpath (its bodyText !== undefined gate could never fire). Keep the text
+    // only on the wire+flag slice where the fastpath can fire; the strict gate in
+    // prepare-openai (pluginMode + !titleGen) remains authoritative. A deferred
+    // parse keeps the text regardless: the conversation array exists nowhere
+    // else, and the gate in prepare-openai may still be closed for this request.
+    if (!(protocol === "openai" && featureEnabled("pluginFullResendWatermark")) && !bodyParseDeferred) bodyText = undefined;
     // #903: inbound message count for the per-request cost line — messages
     // (anthropic/openai) or input (responses); null when the body has neither.
+    // A deferred body carries the count the span scan measured.
     const inboundMsgs: number | null = (() => {
+        if (bodyParseDeferred) return deferredMsgCount;
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
         const p = parsed as Record<string, unknown>;
         if (Array.isArray(p.messages)) return p.messages.length;
@@ -709,7 +980,7 @@ async function handleRequest(
     const throttleModel = v1Model ?? googleModel ?? vertexModel ?? bodyModel;
     if ((protocol === "anthropic" || protocol === "openai") && parsed !== null) {
         const p = typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
-        if (!p || !Array.isArray(p.messages)) {
+        if (!p || (p.messages !== null && !Array.isArray(p.messages))) {
             const relayKey = `${upstreamOrigin}${urlPath}`;
             if (!nonConversationRelayWarned.has(relayKey)) {
                 nonConversationRelayWarned.add(relayKey);
@@ -718,7 +989,7 @@ async function handleRequest(
                 }
                 log("warn", `[${protocol}] body has no "messages" array — not a model conversation; relaying verbatim to ${maskUrlsInText(upstreamOrigin)} instead of rejecting (#1284) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
             }
-            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, throttleModel);
+            await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, throttleModel);
             return;
         }
     }
@@ -754,6 +1025,10 @@ async function handleRequest(
     // operator that their own setting, not the upstream, is the wall they hit.
     let resolvedNativeWindow: number | undefined;
     let windowShrinkReason: "operator" | "codex" | undefined;
+    // The window was clamped to a codex live-table value that already reserves
+    // codex's own output headroom (effective_context_window_percent) — see
+    // codexWindowNetsOutputHeadroom. Gates the default output reservation below.
+    let codexWindowNetsOutput = false;
     // True when the resolved native window came from a low-confidence fallback
     // (built-in table / env default) instead of an authoritative source — such
     // windows get an effective-floor after output-headroom reservation (see
@@ -929,6 +1204,7 @@ async function handleRequest(
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
                 windowShrinkReason = "codex";
+                codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
                 log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
                 windowShrinkReason = "operator";
@@ -964,7 +1240,7 @@ async function handleRequest(
     // this request — skip the whole pipeline (prepared stays null) so the
     // passthrough path below forwards it verbatim. #1421: `chainSkip` is the
     // content-level twin of the same decision (verifiable checkpoint present).
-    if (!opts.passthrough && !routePassthrough && !chainSkip && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
+    if (!opts.passthrough && !routePassthrough && !chainSkip && hopMarker === undefined && protocol && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         const sessionHeader = headerValue(req, opts.sessionHeader);
         // Plugin mode (issue #1, "内外呼应"): a cooperative agent-side plugin
         // announces itself with x-bili-plugin. The proxy then treats the
@@ -1016,16 +1292,19 @@ async function handleRequest(
                   : [];
         const claudeSub = protocol === "anthropic" ? claudeSubagentAgentId(req.headers, systemTextsForSplit) : undefined;
         const responsesIdentity = protocol === "responses"
-            ? (codexTurn
-                ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
-                : preferKiroConversationIdentity(
-                      preferPromptCacheKeyIdentity(
-                          conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
-                          parsed as ResponsesRequestBody,
-                      ),
-                      parsed,
-                      req.headers,
-                  ))
+            ? preferZedThreadIdIdentity(
+                  codexTurn
+                      ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
+                      : preferKiroConversationIdentity(
+                            preferPromptCacheKeyIdentity(
+                                conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
+                                parsed as ResponsesRequestBody,
+                            ),
+                            parsed,
+                            req.headers,
+                        ),
+                  zedThreadId,
+              )
             : undefined;
         // OpenAI chat mirrors the responses pck promotion: clients that replay
         // full history statelessly (omp chat-completions via a relay) send NO
@@ -1039,11 +1318,14 @@ async function handleRequest(
             ? conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader)
             : "";
         const openaiIdentity = protocol === "openai"
-            ? preferPromptCacheKeyIdentity(
-                  convHeader
-                    ? { value: openaiSignal, source: "header" as const, clientProvided: true }
-                    : { value: openaiSignal, source: "content-fingerprint" as const, clientProvided: false },
-                  parsed as { prompt_cache_key?: unknown },
+            ? preferZedThreadIdIdentity(
+                  preferPromptCacheKeyIdentity(
+                      convHeader
+                          ? { value: openaiSignal, source: "header" as const, clientProvided: true }
+                          : { value: openaiSignal, source: "content-fingerprint" as const, clientProvided: false },
+                      parsed as { prompt_cache_key?: unknown },
+                  ),
+                  zedThreadId,
               )
             : undefined;
         // Anthropic mirrors the openai pck promotion (#268): the omp plugin
@@ -1055,11 +1337,14 @@ async function handleRequest(
             ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
             : "";
         const anthropicIdentity = protocol === "anthropic"
-            ? preferPromptCacheKeyIdentity(
-                  convHeader
-                    ? { value: anthropicSignal, source: "header" as const, clientProvided: true }
-                    : { value: anthropicSignal, source: "content-fingerprint" as const, clientProvided: false },
-                  parsed as { prompt_cache_key?: unknown },
+            ? preferZedThreadIdIdentity(
+                  preferPromptCacheKeyIdentity(
+                      convHeader
+                          ? { value: anthropicSignal, source: "header" as const, clientProvided: true }
+                          : { value: anthropicSignal, source: "content-fingerprint" as const, clientProvided: false },
+                      parsed as { prompt_cache_key?: unknown },
+                  ),
+                  zedThreadId,
               )
             : undefined;
         // Gemini native wire: no conversation-header convention, and no
@@ -1075,11 +1360,14 @@ async function handleRequest(
         // Without this, every Antigravity window shares the anonymous branch and
         // collides on the constant FNV-1a sessionId / empty-prefix affinity.
         const googleIdentity = protocol === "google"
-            ? {
-                  value: v1ConvId ?? googleSignal,
-                  source: v1ConvId || convHeader ? ("header" as const) : ("content-fingerprint" as const),
-                  clientProvided: !!v1ConvId || !!convHeader,
-              }
+            ? preferZedThreadIdIdentity(
+                  {
+                      value: v1ConvId ?? googleSignal,
+                      source: v1ConvId || convHeader ? ("header" as const) : ("content-fingerprint" as const),
+                      clientProvided: !!v1ConvId || !!convHeader,
+                  },
+                  zedThreadId,
+              )
             : undefined;
         // #2156: a request that will ride the #388 side passthrough further
         // down must NEVER participate in persona namespace resolution.
@@ -1116,8 +1404,87 @@ async function handleRequest(
         // resolver — never opened globally.
         const ccTitleSidecar = sideAgent !== "main" && claudeAnthropicPersonaOrderApplies(req.headers)
             && isClaudeCodeTitleRequest(protocol, parsed);
+        // #6880: normalize the declared purpose for the SIDE classification
+        // (and the lane log below) — one parse, marker-gated. The
+        // "conversation" sentinel the post-#6883 plugin stamps on MAIN turns
+        // means "no declared auxiliary purpose", so it is indistinguishable
+        // from the absent header here (an aux dispatch never carries the
+        // sentinel: dsh leaves purpose unset for ordinary conversation and
+        // the plugin only stamps the real value).
+        const rawDeclaredPurpose = pluginPurposeHeader(req.headers);
+        const declaredPurpose = rawDeclaredPurpose === PLUGIN_PURPOSE_CONVERSATION ? undefined : rawDeclaredPurpose;
+        // #6884 (pi's leg of the #6880 declaration; cross-agent session-id
+        // audit in discussions/6884): the "conversation" sentinel means
+        // DIFFERENT things per client. dsh derives it ("dsh left
+        // GenerateOptions.purpose unset on this dispatch" — possibly a brand-
+        // new aux feature the KNOWN_AUXILIARY_PURPOSES documentation set does
+        // not know yet), so for dsh it stays ≡ absent: the body heuristics
+        // classify, byte-for-byte as before #6884. pi has NO auxiliary-call
+        // concept at all (no title-gen, no compaction summarizer, no
+        // auto-review; subagents/forks mint FRESH session ids, so their turns
+        // ride their own ids) — its sentinel is a FACT about the dispatch:
+        // "this is the session's main conversation turn". A declared pi main
+        // turn therefore rides the #1699 explicit-"main" intent rung inside
+        // isSideRequest: it outranks every body heuristic (the budget <= 200
+        // demotion, the single-shot shapes) instead of being demoted to the
+        // #388 side passthrough by a shape guess — a `pi -p` one-shot with a
+        // small maxTokens and no tools must enter the kernel pipeline.
+        const declaredPiMainTurn = rawDeclaredPurpose === PLUGIN_PURPOSE_CONVERSATION
+            && pluginAgentHeader(req.headers) === "pi";
+        // #6884 wire-client legs (the cross-agent session-identity audit;
+        // follow-on to #7077): every client on the verbatim roster
+        // (src/session-id.ts) mints ONE id per logical conversation and
+        // source review confirmed the lifecycles are healthy — but each fires
+        // auxiliary LLM calls (titles, compaction, suggestions, memory,
+        // naming) UNDER THE SAME id, and those shapes defeat isSideRequest,
+        // so they enter the main session's kernel pipeline as conversation
+        // turns. Each clause is gated on the client's OWN wire signal (its
+        // session header / its compaction header / its constant User-Agent) —
+        // the same trust tier as the roster itself; no clause identifies a
+        // client from body shape alone. Upstream evidence per client:
+        //  - grok-shell: main turns ALWAYS stamp x-grok-turn-idx
+        //    (turn.rs:3002-3003); every auxiliary path (/btw, compaction,
+        //    title refresh, recap, memory, ...) stamps x-grok-session-id
+        //    WITHOUT the turn index — grok's own test-support contract
+        //    (README:32): "a non empty x-grok-turn-idx makes it foreground,
+        //    else a non empty x-grok-req-id makes it auxiliary". One header
+        //    clause covers every present AND future auxiliary path.
+        //  - mcode: title-gen's entire tool surface is the single
+        //    submit_session_title tool; the prompt suggestion (default on,
+        //    every accepted answer) and the Goal evaluator are tool-less,
+        //    budget-less single user messages reusing the main turn's
+        //    headers (prompt-suggestion-service.ts:655-692).
+        //  - goose: every auxiliary (naming, compaction, tool-pair summaries,
+        //    labels, adversarial review, apps, summarize) is the dsh
+        //    single-shot shape — no tools + exactly one user + a system
+        //    carrier holding the context — so isDshSingleShotSidecar covers
+        //    it as-is; the lane evidence is the roster header
+        //    agent-session-id. Residual, accepted: the permission judge
+        //    carries one tool (#546 main rung) and a user who configures
+        //    zero tools loses the first turn only (#5687 class).
+        //  - CodeBuddy: the compaction request itself carries x-compaction
+        //    on the wire (identity-codebuddy.ts) — consume it. Deliberately
+        //    NOT x-context-compacted: that marks "context already compacted"
+        //    and appears on ordinary POST-compaction MAIN turns; consuming
+        //    it would demote the real mainline.
+        //  - opencode: the built-in title agent fires concurrently with the
+        //    first main turn of every root session, under the root's own id,
+        //    no tools, no budget, single user framed by a fixed template
+        //    (session/title.ts:37-41); the User-Agent (app.ts:22 constant
+        //    format) is the lane evidence and the template text the shape.
+        const grokAuxSidecar = hasNonEmptyHeader(req.headers, "x-grok-session-id")
+            && !hasNonEmptyHeader(req.headers, "x-grok-turn-idx");
+        const mcodeLane = hasNonEmptyHeader(req.headers, "x-mavis-session-id");
+        const mcodeTitleSidecar = mcodeLane && isMcodeTitleRequest(parsed);
+        const mcodeOneShotSidecar = mcodeLane && isMcodeOneShotAuxRequest(protocol, parsed);
+        const gooseSingleShotSidecar = hasNonEmptyHeader(req.headers, "agent-session-id")
+            && isDshSingleShotSidecar(protocol, parsed);
+        const codebuddyCompactionSidecar = hasNonEmptyHeader(req.headers, "x-compaction");
+        const opencodeTitleSidecar = isOpencodeTitleRequest(protocol, parsed)
+            && (typeof req.headers["user-agent"] === "string"
+                && req.headers["user-agent"].startsWith("opencode/"));
         const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
-            && (isSideRequest(parsed, sideAgent)
+            && (isSideRequest(parsed, declaredPiMainTurn ? "main" : sideAgent, declaredPurpose)
                 // #2503: dsh title sidecar — its output budget grew past the
                 // <=200 heuristic on dsh 0.2.1-alpha.2 (preset 64 -> 4096);
                 // recognize it by system text so it keeps the raw key instead
@@ -1141,10 +1508,19 @@ async function handleRequest(
                  // anchor before the first main turn and exile the real
                  // conversation onto a persisted `|sub:<fp>` ghost.
                  || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
+                     && hasSingleShotBudget(parsed)
                      && isDshSingleShotSidecar(protocol, parsed))
                  // #5135: the claude code title sidecar stays off the raw-key
                  // anchor claim and off the kernel pipeline entirely.
                  || ccTitleSidecar
+                 // #6884: the wire-client auxiliary sidecars (clause evidence
+                 // above) — same raw-key/anchor discipline as ccTitleSidecar:
+                 // verbatim passthrough, kernel state untouched, no |sub: fork.
+                 || grokAuxSidecar
+                 || mcodeTitleSidecar || mcodeOneShotSidecar
+                 || gooseSingleShotSidecar
+                 || codebuddyCompactionSidecar
+                 || opencodeTitleSidecar
                  || (pluginAgentHeader(req.headers) !== undefined && sideAgent !== "main"
                      && req.headers["x-bili-ws-lane"] === undefined
                      && hasLeakedBiliToolsOnly(parsed)
@@ -1166,6 +1542,19 @@ async function handleRequest(
         // reviews fork; an empty system is non-anchoring (verbatim key), so
         // system-less auxiliary calls keep riding the main session.
         const dshPersona = dshPersonaFingerprintApplies(req.headers);
+        // #6880 terminal state: a request that CARRIES the purpose header in
+        // any value is from a conversation whose plugin declares every
+        // dispatch's purpose (post-#6883 dsh). For those, the persona-order
+        // ladder (claim races, fork rungs) is dead weight — dsh mints one
+        // UUID per session and never recycles an id (SESSION_ALREADY_EXISTS
+        // in its store), so the raw session id IS the complete identity and
+        // the main turn must key it verbatim. All auxiliary traffic from
+        // such a plugin is declared side above and never reaches the
+        // persona branches below. Pre-#6883 plugins stamp no header at all,
+        // so they keep the ladder byte-for-byte (rollout safety). The
+        // already-persisted |sub:<fp> lanes of old traffic become orphan
+        // history: new declared traffic simply never resolves onto them.
+        const dshDeclaredPersona = dshPersona && rawDeclaredPurpose !== undefined;
         const personaSystemText = protocol === "openai"
             ? openaiSystemTextForPersona(parsed as OpenAIRequestBody)
             : protocol === "anthropic"
@@ -1174,13 +1563,13 @@ async function handleRequest(
                 ? googleSystemText(parsed as GoogleRequestBody)
                 : "";
         const zcodeParentIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
-        // #5719: host-stamped message ids riding this request (`biliMsgIds`,
-        // #4491 pipeline). Fed to every persona-order lane as the LAST-RESORT
-        // identity rung: when byte-level evidence was destroyed in the same
-        // turn the system text changed (full compaction ∩ volatile-field
-        // drift), an id overlap proves same-conversation and re-anchors the
-        // raw lane instead of forking a zero-state |sub: child.
-        // undefined = absent → exactly the pre-change path.
+        // Host-stamped message ids riding this request (`biliMsgIds`,
+        // #4491 pipeline) — the PIN side of the #4491/#5719 identity channel:
+        // prepare-anthropic/prepare-openai pin them onto canonical message
+        // rows (messages.msg_id) behind the rollout gate, and foreign-block
+        // sweep reads them back. (The resolver's msgid-rescue RUNG retired
+        // with the #7525 GA fork ladder — the stamped id rides verbatim now,
+        // nothing to rescue onto.) undefined = absent → nothing to pin.
         const stampedInboundMsgIds = incomingMsgIdsOf(parsed);
         // #5825 identity-channel sources fill only the absent case. Precedence:
         // (1) body-field stamps (dsh/opencode/pi host rewrites) — always win;
@@ -1212,54 +1601,51 @@ async function handleRequest(
                 }
             }
         }
-        // The pin-consumers are prepare-anthropic AND prepare-openai (#5825
-        // parity): both read + strip MSG_IDS_BODY_FIELD unconditionally before
-        // it can reach the real upstream, then pin behind the rollout gate.
-        // So a non-body source (header / harvest) stamps the parsed body on
-        // BOTH wires now — nothing extra is ever forwarded either way;
-        // response-ish protocols keep feeding the resolve rung below via this
-        // local alone.
-        if (stampedInboundMsgIds === undefined && inboundMsgIds !== undefined &&
-            (protocol === "openai" || protocol === "anthropic")) {
+        // The pin-consumers are prepare-openai, prepare-anthropic AND
+        // prepare-google/prepare-responses (#6525): all four read + strip
+        // MSG_IDS_BODY_FIELD unconditionally before it can reach the real
+        // upstream, then pin behind the rollout gate. So a non-body source
+        // (header / harvest) stamps the parsed body on EVERY wire now —
+        // nothing extra is ever forwarded either way, and a length/shape
+        // mismatch is rejected (bail) at the pin, never leaked or mis-pinned.
+        if (stampedInboundMsgIds === undefined && inboundMsgIds !== undefined) {
             (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD] = [...inboundMsgIds];
         }
-        // #5719: the RECORDED side of the msgid identity rung lives in the
-        // UNIFIED STORE — stamped requests pin these very ids onto canonical
-        // message rows (messages.msg_id, #4491), so no parallel JSON ledger
-        // is kept. #5312's view returns the FULL historical id set (live AND
-        // retired rows — retire-don't-delete, #4390), identity-only, no
-        // content hydration. Lazy by contract: resolveSessionOrder invokes
-        // it at most once, and only at a fork exit with non-empty inbound
-        // ids; null = store unavailable → byte-evidence-only path.
-        const storedMsgIdsOf = (rawKey: string): readonly string[] | null =>
-            getStore().unifiedAllMessageIds(rawKey);
         const zcodeMemory = zcodeParentIdentity?.clientProvided
             ? zcodeMemoryConversation(zcodeParentIdentity.value, req.headers)
             : undefined;
-        const conversation = zcodeMemory !== undefined ? zcodeMemory : protocol === "google"
+        // #7439 worklist — Qoder side tasks (agent/webfetch/hook summary) reuse
+        // the parent x-session-id and are tagged only in body
+        // metadata.business_type; give each its own |aux: lane (zcode-memory
+        // pattern) so they don't merge into the parent conversation. Responses
+        // wire only; plain Task subagents carry no wire marker.
+        const qoderSideTask = protocol === "responses"
+            ? qoderSideTaskConversation(
+                (responsesIdentity?.value
+                    ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)) ?? "",
+                parsed,
+            )
+            : undefined;
+        const auxSidecar = zcodeMemory ?? qoderSideTask;
+        const conversation = auxSidecar !== undefined ? auxSidecar : protocol === "google"
             // #2730: the google lane is persona-aware too — dsh stamps its one
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
             // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google
             // paths), so a review persona would otherwise merge into the main
-            // session exactly like #1916/#2203 did on the other wires. #3134:
-            // the same v2 order resolver as the other lanes since #3060 (fork
-            // keys are byte-compatible, so persisted fork lanes survive). An
-            // empty systemInstruction is non-anchoring (kernel anchor
-            // semantics): ride the verbatim id — never route empty-tag
-            // traffic through the order resolver.
-            ? (dshPersona && !sideRequestLike
+            // session exactly like #1916/#2203 did on the other wires. The
+            // same order resolver as the other lanes; #7525 GA: the stamped
+            // id rides verbatim (no fork lanes left to route into). An empty
+            // systemInstruction is non-anchoring (kernel anchor semantics):
+            // ride the verbatim id — never route empty-tag traffic through
+            // the order resolver.
+            ? (!dshDeclaredPersona && dshPersona && !sideRequestLike
                 ? (personaSystemText === ""
                       ? (googleIdentity?.value ?? googleSignal)
                       : personaConversationOrder(
                           googleIdentity?.value ?? googleSignal,
-                          (parsed as GoogleRequestBody).contents,
                           personaSystemText,
-                          pluginReportedModel(req.headers),
-                          undefined,
                           undefined,
                           onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
                       ))
                   : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
@@ -1272,12 +1658,11 @@ async function handleRequest(
               // across main and subagent sessions.
               (claudeSub !== undefined && opts.subagentSplit !== false
                   ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
-                  : dshPersona && !sideRequestLike
-                    // #2241: continuity-aware anchor — a system change whose
-                    // history continues the raw key's prefix-affinity chain
-                    // (model switch) MIGRATES the anchor instead of forking
-                    // the main lane off the raw key; only history-discontinuous
-                    // requests (review blobs) still fork onto `|sub:<fp>`.
+                  : !dshDeclaredPersona && dshPersona && !sideRequestLike
+                    // #2241: continuity-aware anchor (pre-GA name) — #7525 GA:
+                    // the stamped id rides verbatim; the resolver is consulted
+                    // only so a lane token could carve its own lane (none on
+                    // this wire).
                     ? (personaSystemText === ""
                           // An empty system is non-anchoring (kernel anchor
                           // semantics): ride the verbatim id — never route
@@ -1286,61 +1671,37 @@ async function handleRequest(
                            ? (anthropicIdentity?.value ?? anthropicSignal)
                            : personaConversationOrder(
                                anthropicIdentity?.value ?? anthropicSignal,
-                               (parsed as AnthropicRequestBody).messages,
                                personaSystemText,
-                               pluginReportedModel(req.headers),
-                               undefined,
                                undefined,
                                onSessionResolveEvent,
-                               inboundMsgIds,
-                               storedMsgIdsOf,
                            ))
                      : claudeAnthropicPersonaOrderApplies(req.headers) && opts.subagentSplit !== false
                        && !sideRequestLike && personaSystemText !== ""
                        // #4352: header-less claude code subagents (VS Code
-                       // build) ride the raw parent id; route them through the
-                       // continuity-aware order resolver so a history-disjoint
-                       // ride forks onto its own |sub:<fp> lane while a
-                       // continuing main conversation keeps the raw key on
-                       // order+content evidence (#2944).
+                       // build) ride the raw parent id; the resolver is
+                       // consulted only so a #5095 lane token can carve the
+                       // dispatch onto its own lane (#2944; the |sub:<fp>
+                       // fork retired with the #7525 GA content ladder).
                        // #5095 D1-C: when the bili SubagentStart hook's token
                        // rides the first user message, the resolver keys the
                        // dispatch per-TOKEN — parallel same-type dispatches
                        // stop merging on the persona fingerprint (token wins:
                        // uniqueness by construction, no prompt-collision bet).
-                       // #5095 D1-B fallback: when NO valid token rides the
-                       // wire (un-upgraded installs, disabled hook, post-fold
-                       // head loss), fall back to the dispatch task prompt
-                       // (first user message fragment) as the per-run
-                       // discriminator so the fork key widens to
-                       // |sub:<fp>:<userFp> — a self-lane isolation strictly
-                       // better than the two-segment shared key; empty
-                       // fragment degrades to it. NO other call site passes
-                       // either.
+                       // Without a token the stamped id rides verbatim.
                        ? personaConversationOrder(
                            anthropicIdentity?.value ?? anthropicSignal,
-                           (parsed as AnthropicRequestBody).messages,
                            personaSystemText,
-                           pluginReportedModel(req.headers),
                            claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
-                           anthropicFirstUserFrag((parsed as AnthropicRequestBody).messages),
                            onSessionResolveEvent,
-                           inboundMsgIds,
-                           storedMsgIdsOf,
                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
-              ? (dshPersona && !sideRequestLike && personaSystemText !== ""
+              ? (!dshDeclaredPersona && dshPersona && !sideRequestLike && personaSystemText !== ""
                     ? personaConversationOrder(
                           openaiIdentity?.value ?? openaiSignal,
-                          (parsed as OpenAIRequestBody).messages,
                           personaSystemText,
-                          pluginReportedModel(req.headers),
-                          undefined,
                           undefined,
                           onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -1349,25 +1710,19 @@ async function handleRequest(
                 // kernel's empty-instructions non-anchoring path is left
                 // untouched for metadata-less clients).
                 ? codexTurn.value
-                 : dshPersona && !sideRequestLike && ((parsed as ResponsesRequestBody).instructions ?? "") !== ""
-                   // #2203/#2241: parity with the anthropic/openai lanes —
-                   // dsh-over-Responses rides the same continuity-aware persona
-                   // anchor: a model switch (history continues the raw key's
-                   // chain) migrates the anchor on the raw key; a history-
-                   // discontinuous auto-review blob forks onto `|sub:<fp>`.
-                   // Must sit BEFORE the stableSystemAnchor branch below so a
-                   // plugin request never takes the plain-proxy verbatim anchor.
+                 : !dshDeclaredPersona && dshPersona && !sideRequestLike && ((parsed as ResponsesRequestBody).instructions ?? "") !== ""
+                   // #2203: parity with the anthropic/openai lanes —
+                   // dsh-over-Responses consults the same resolver; #7525 GA:
+                   // the stamped id rides verbatim (the |sub:<fp> auto-review
+                   // fork retired with the content ladder). Must sit BEFORE the
+                   // stableSystemAnchor branch below so a plugin request never
+                   // takes the plain-proxy verbatim anchor.
                    // Empty instructions = non-anchoring (verbatim id).
                     ? personaConversationOrder(
                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                          (parsed as ResponsesRequestBody).input,
                           (parsed as ResponsesRequestBody).instructions ?? "",
-                          pluginReportedModel(req.headers),
-                          undefined,
                           undefined,
                           onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
@@ -1392,27 +1747,19 @@ async function handleRequest(
                      // not a new persona. See instructionsFingerprintApplies
                      // in src/session-id.ts.
                       ? (!sideRequestLike
-                          ? // #2250: same continuity resolver as the dsh lanes
-                            // — an instructions drift whose history continues
-                            // the raw key's chain (model switch / AGENTS.md
-                            // edit / -c override / upgrade reassembly) MIGRATES
-                            // the anchor instead of forking the main lane off
-                            // its compression state; a genuinely fresh task
-                            // reusing the id (#150) still forks `|sub:<fp>`.
-                            // Empty instructions = non-anchoring: ride the
-                            // verbatim id (codex turn-1 / metadata-less roots).
+                          ? // #2250: same resolver as the dsh lanes — #7525 GA:
+                            // the stamped id rides verbatim regardless of
+                            // instructions drift (the |sub:<fp> fork retired
+                            // with the content ladder). Empty instructions =
+                            // non-anchoring: ride the verbatim id (codex
+                            // turn-1 / metadata-less roots).
                             ((parsed as ResponsesRequestBody).instructions ?? "") === ""
                               ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
                               : personaConversationOrder(
                                 responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                                (parsed as ResponsesRequestBody).input,
                                 (parsed as ResponsesRequestBody).instructions ?? "",
-                                pluginReportedModel(req.headers),
-                                undefined,
                                 undefined,
                                 onSessionResolveEvent,
-                                inboundMsgIds,
-                                storedMsgIdsOf,
                           )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
@@ -1502,6 +1849,19 @@ async function handleRequest(
         if (!clientProvided) {
             anonAffinity = prefixAffinity.resolve(affinityMessageList());
             if (!anonAffinity) {
+                // #6548: a single-shot server-tool-only Responses call (the
+                // pi-web-access xAI web search: string input, web_search /
+                // x_search tools, no history) is not a conversation turn — it
+                // carries no history to fingerprint and creates no session
+                // state, so the #286 refusal's rationale does not apply to
+                // it, and the client cannot carry an identity here. Forward
+                // it verbatim (same raw relay as the #1117 passthrough) so
+                // the search backend keeps working instead of hard-400ing.
+                if (protocol === "responses" && isResponsesServerToolSingleShot(parsed)) {
+                    log("info", `single-shot server-tool Responses call — no conversation identity possible; forwarding verbatim (#6548): ${maskUrlForLog(req.url ?? "")}`);
+                    await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+                    return;
+                }
                 log("warn", `400: no stable conversation identity on ${protocol} request → ${maskUrlsInText(upstreamOrigin)}; refusing to create a content-fingerprint session (#286)`);
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(JSON.stringify(protocol === "anthropic"
@@ -1549,6 +1909,13 @@ async function handleRequest(
         // embed the id manually. One statement, runs in this request's own
         // async context, so concurrent requests never cross-contaminate.
         enterSessionContext(sessionId);
+        if (protocol === "anthropic" && anthropicBetaMessageThreads(req.headers)) {
+            const baseId = sessionId.split("|sub:")[0];
+            if (!messageThreadsWarned.has(baseId)) {
+                messageThreadsWarned.add(baseId);
+                loggerLog("warn", `[${baseId}] Anthropic message threads are on (anthropic-beta message-threads-*): the upstream holds the history and each request carries only the newest message(s), so bili cannot compress this session; for OMP set PI_ANTHROPIC_MESSAGE_THREADS=0 (#6088)`);
+            }
+        }
         // #1086/#1357: content-fallback chain observation, now that identity is known.
         // Artifacts + processed local state ⇒ self-produced: process normally.
         // Artifacts + NO local state ⇒ ADVISORY observation (#1357 Phase 1): the
@@ -1894,6 +2261,17 @@ async function handleRequest(
         // as before — no deferral, no timing change).
         if (clientProvided && !anonAffinity && session.stats.requests === 0 && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined && opts.resumeInheritance !== false) {
             const loadParent = (id: string): Session | undefined => peekSession(id) ?? getStore().loadSync(id, { protocol, upstreamOrigin }) ?? undefined;
+            // #5608-B: where the honest-NULL arm actually lives — the PROVEN
+            // identity paths only: weak/strong resume adoptions (maybeAdoptResume,
+            // armBoundaryNull) and derived-fork/manual-fork sites (fork-adoption.ts,
+            // plugin.ts). Deliberately NOT armed here on any "starting fresh"
+            // fallback: below-threshold or unloadable matches do not prove the
+            // incoming bytes are OLD history (the same false-positive zone v3's
+            // gate rejects adoption for — cross-lane boilerplate prefixes match
+            // at cell 0 for genuinely new conversations, #554 e2e), and a lane
+            // that never runs a kernel pass (side requests are pure passthrough,
+            // #388) could never self-clear the flag, poisoning its persisted
+            // kernel state. Unproven identity keeps brand-new semantics: mint.
             // Claude Code records its fork parent in the transcript
             // (forkedFrom) — authoritative where the byte-exact prefix match
             // below fails: equal-length resumes and re-decorated tails (a
@@ -1915,6 +2293,28 @@ async function handleRequest(
                     log("warn", `[${sessionId}] [resume-inheritance] transcript lineage lookup failed (${String(err)}); falling back to prefix match (#1486)`);
                 }
             }
+            // #7421: opencode records its fork parent in the local SQLite DB
+            // (session_v2.fork_session_id); the host plugin only learns it from
+            // session.created's parentID, which some builds do not emit on fork.
+            // Declaring the true parent here scopes the prefix match below to
+            // that chain (findResumeParentWithin) instead of the unscoped scan
+            // a mid-chain fork can't satisfy — the unscoped miss then weak-adopts
+            // a globally-closest chain, which can be an UNRELATED session
+            // (crosstalk). Loopback only (the DB is a local file); opencode lane
+            // only (ses_ ids are opencode-specific). A parent this proxy doesn't
+            // know still degrades safely: the scoped match misses, the weak-adopt
+            // stays scoped to it, and the derived-fork link below reports the miss.
+            if (!resume && derivedParent === undefined && pluginAgent === "opencode" && isLoopbackAddress(req.socket.remoteAddress)) {
+                try {
+                    const parent = opencodeForkParent(sessionId);
+                    if (parent !== undefined) {
+                        derivedParent = parent;
+                        log("info", `[${sessionId}] [resume-inheritance] opencode fork lineage from session_v2.fork_session_id -> ${parent} (#7421)`);
+                    }
+                } catch (err) {
+                    log("warn", `[${sessionId}] [resume-inheritance] opencode fork lineage lookup failed (${String(err)}); falling back to prefix match (#7421)`);
+                }
+            }
             if (!resume) {
                 const affinityList = affinityMessageList();
                 const matched = derivedParent !== undefined
@@ -1931,6 +2331,95 @@ async function handleRequest(
                         ? prefixAffinity.diagnoseResumeMiss(affinityList, sessionId, derivedParent)
                         : prefixAffinity.diagnoseResumeMiss(affinityList, sessionId);
                     log(miss.best !== undefined ? "info" : "debug", `[${sessionId}] [resume-inheritance] miss: ${describeResumeMiss(miss)} (#4264)`);
+                    // #5608: a miss starts FRESH state, so the first replay renders
+                    // tags with new ref numbers, minted "now" times (or no times),
+                    // and RAW ranges where the old process sent FOLDED carriers —
+                    // every tagged byte flips vs the provider-cached prefix and
+                    // the whole history re-bills for one generation (the 1–12%
+                    // hit events). Adopt from the CLOSEST tracked chain instead of
+                    // starting bare: refs/blocks/latches/timestamps are all raw-id
+                    // (content-hash) keyed, so every carried value denotes the
+                    // exact bytes the model saw, and set-semantics adoption
+                    // self-defends against the deep divergence that broke the
+                    // byte-exact gate — a block whose sources were mutated is
+                    // simply straddled and left out. Honest ceiling: the true
+                    // common prefix; 100% needs a byte-faithful reload.
+                    // #5608 v3: content similarity alone cannot PROVE same-conversation
+                    // identity, so a miss must not adopt the closest chain unconditionally.
+                    // The v2 unconditional adoption shipped and immediately misfired on
+                    // three measured shapes (local CI reproduction, all cross-session
+                    // false positives inside one proxy process):
+                    //   equal-depth   two unrelated sessions resending the SAME
+                    //                 conversation bytes under new ids (#3686: a pi
+                    //                 subtest replayed the codex control's 15K-token
+                    //                 fixture verbatim — the foreign lane's fold block
+                    //                 landed on the declared-pi session)
+                    //   truncated     one session resending a SHORTER subview of another
+                    //                 session's live chain
+                    //   head break    near-duplicate boilerplate conversations that
+                    //                 already diverge at cell 0/8 of the window
+                    // Adopting in those cases smuggles foreign blocks/latches across
+                    // lanes: host-policy pins broke (#3686 "no fold may land"), fail-
+                    // fast paths started seeing inherited token budgets (#3450/#3645),
+                    // ref numbering shifted (fix-1001). Equal-depth replays were also
+                    // ruled out by design since #1486 ("duplicate conversation or
+                    // tail-branch replay… linking would adopt foreign blocks") — v2
+                    // overrode that stance without proof; v3 restores it for the weak
+                    // path. The legitimate production shape (#5608 telemetry, maintainer
+                    // comments: dsh desktop restarts with a NEW id resending full
+                    // history) is CONTINUATION-shaped: strictly deeper than the tracked
+                    // chain, divergence only in the recent tail (observed LCP floor
+                    // ≈ 632/760 = 0.83; other readings 827/955 ≈ 0.87, 1395/1523 ≈ 0.92).
+                    const b = miss.best;
+                    if (b && b.kind === "prefix-break") {
+                        // Conservative verified common-prefix: per-item hashes cover the
+                        // stored trailing window, so firstDivergence (absolute index of
+                        // the first disagreeing cell) lower-bounds the true LCP, and a
+                        // null means every VERIFIED cell of the parent agrees — treat
+                        // that as the whole stored chain sharing.
+                        const verifiedPrefix = b.firstDivergence === null ? b.chainDepth : b.firstDivergence;
+                        const ratio = verifiedPrefix / Math.max(b.chainDepth, 1);
+                        if (ratio < WEAK_ADOPT_MIN_PREFIX_RATIO) {
+                                // #5608-B: no honest-NULL arm on this fallback (see the
+                            // decision note at armHonestNull removal above) — strangers
+                            // and boilerplate-only overlap start brand-new: their ids
+                            // mint normally.
+                            log("info", `[${sessionId}] [resume-inheritance] miss: starting fresh — closest chain ${b.sessionId} breaks at cell ${b.firstDivergence}/${b.chainDepth} (verified prefix ${(ratio * 100).toFixed(0)}% < ${(WEAK_ADOPT_MIN_PREFIX_RATIO * 100).toFixed(0)}%); not a verified continuation (#5608)`);
+                        } else {
+                            const best = b.sessionId;
+                            try {
+                                const bestParent = loadParent(best);
+                                if (bestParent && bestParent !== session) {
+                                    maybeAdoptResume({
+                                        session,
+                                        parent: bestParent,
+                                        sharedDepth: 0,
+                                        protocol,
+                                        parsed,
+                                        upstreamOrigin,
+                                        blocksEnabled: true,
+                                        via: "weakly resumed closest chain after byte-exact miss (#5608)",
+                                        // #5608-B: the miss path is exactly the
+                                        // re-rendered-drift shape — uncovered ids
+                                        // may be OLD content, so the boundary
+                                        // batch yields honest NULL.
+                                        armBoundaryNull: true,
+                                        log,
+                                    });
+                                } else {
+                                    log("info", `[${sessionId}] [resume-inheritance] miss: closest chain ${best} is not loadable — starting fresh (#5608)`);
+                                }
+                            } catch (err) {
+                                log("warn", `[${sessionId}] [resume-inheritance] miss: weak adoption from closest chain ${best} failed (${String(err)}); continuing fresh (#5608)`);
+                            }
+                        }
+                    } else if (b) {
+                        // truncated / equal-depth shapes: classification proves
+                        // overlap, but again no honest-NULL arm here — see the
+                        // decision note above (unproven identity = brand-new mint;
+                        // lanes without a kernel pass can never clear the flag).
+                        log("info", `[${sessionId}] [resume-inheritance] miss: starting fresh — closest chain ${b.sessionId} is a ${b.kind} shape (incoming ${b.incomingDepth} vs chain ${b.chainDepth}); only strictly-deeper verified continuations may be adopted weakly (#5608/#1486)`);
+                    }
                 }
             }
             if (resume) {
@@ -1988,7 +2477,13 @@ async function handleRequest(
         // derivedFromSessionId set and skips this link.
         if (derivedParent !== undefined && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined) {
             try {
-                const parentSession = resolveConversation(derivedParent)?.session;
+                // #7421: resolveConversation is memory-only (conversations map +
+                // peekSession), so after a proxy restart even a corrected parent
+                // id was dropped ("unknown to this proxy"). For plugin lanes the
+                // conversation id IS the session id (opencode ses_…), so a disk
+                // load by that id recovers the parent; a non-session id safely
+                // returns undefined and keeps the miss path below.
+                const parentSession = resolveConversation(derivedParent)?.session ?? getStore().loadSync(derivedParent, { protocol, upstreamOrigin }) ?? undefined;
                 if (parentSession) {
                     session.metadata.derivedFrom = derivedParent;
                     session.metadata.derivedFromSessionId = parentSession.id;
@@ -2182,6 +2677,22 @@ async function handleRequest(
         // not a main turn, and seeding outputBudgetHighWater from it would
         // poison the first starved restore (same class as the #1897 skip).
         const serverToolUtility = isServerToolUtilityCall(parsed);
+        // #5073: a toolless structured-output request (Hindsight fact extraction)
+        // is the same category — a host-internal utility call under the main
+        // session id. It rides the #388 side passthrough via isSideRequest, and
+        // must ALSO skip restoreOutputBudget here: its max_tokens (64000) sizes
+        // the extraction response, not a main turn, and seeding
+        // outputBudgetHighWater from it would poison the first starved restore
+        // (same class as the #1897/#2500 skip).
+        const structuredOutputUtility = isStructuredOutputCall(parsed);
+        // #6636: a tool-less audio-output request (TTS on the chat wire) is
+        // the same category — a one-shot utility call under the main session
+        // id. It rides the #388 side passthrough via isSideRequest, and must
+        // ALSO skip restoreOutputBudget here: its max_tokens sizes the
+        // spoken reply, not a main turn, and seeding
+        // outputBudgetHighWater from it would poison the first starved
+        // restore (same class as the #1897/#2500/#5073 skip).
+        const audioOutputUtility = isAudioOutputCall(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism). #1665/#1840: the
@@ -2193,7 +2704,7 @@ async function handleRequest(
         // outputBudgetHighWater from it would poison the first starved restore
         // (title requests arrive FIRST, at session start). Starved all-bili requests
         // never reach here demoted: stripLeakedBiliTools vetoes them per #546.
-        if (!demotedSide && !serverToolUtility) {
+        if (!demotedSide && !serverToolUtility && !structuredOutputUtility && !audioOutputUtility) {
             // #3438: the dsh host contract (pi-ai buildBaseOptions) stamps the model-declared
             // maxTokens on every main turn, so on this lane a below-ceiling tool-carrying
             // budget is a raw-history collapse, not intent — arm the mid-band rescue.
@@ -2206,7 +2717,8 @@ async function handleRequest(
         // three-level merge; default 0.25, aligned with billion-context-pi).
         // Resolved once here so the side-request guard below AND the main-path
         // reservation measure against the SAME capped window.
-        const headroomCap = resolveOutputHeadroomCap(resolveCompress(opts.routes, providerDestUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct);
+        const resolvedHeadroomCompress = resolveCompress(opts.routes, providerDestUrl, (parsed as { model?: string }).model, opts.compress);
+        const headroomCap = resolveOutputHeadroomCap(resolvedHeadroomCompress.outputHeadroomMaxPct);
         // #1729: dsh native compaction guard — a compaction summarize call
         // (replayed prefix + COMPACTION_INSTRUCTION as the final user message)
         // is refused BEFORE any pipeline work: not forwarded, kernel state
@@ -2223,7 +2735,24 @@ async function handleRequest(
         // is dsh-side, caught, and recoverable. Runs before the #388
         // side-request lane: the compaction call is a full-budget request, so
         // only this guard can catch it.
-        if (protocol !== null && isDshCompactionCall(protocol, parsed)) {
+        // #6880: declaration-first compaction recognition. The post-#6880 dsh
+        // plugin stamps x-bili-plugin-purpose: compaction from the dispatch
+        // options itself, so the guard no longer depends on the INSTRUCTION
+        // text still matching the tracked template (the #2193 lesson — a
+        // stale shape goes silent and permanently loses the substrate). The
+        // marker-DECISIVE text check remains as the fallback for pre-#6880
+        // installs; dsh-only, like the text path's trust domain.
+        const declaredDshCompaction = pluginAgentHeader(req.headers) === "dsh"
+            && declaredPurpose === "compaction";
+        if (protocol !== null && (isDshCompactionCall(protocol, parsed) || declaredDshCompaction)) {
+            // #6880: the log must state the ACTUAL identification basis — a
+            // declared compaction is recognized by declaration even when the
+            // INSTRUCTION text has drifted (the exact case this declaration
+            // exists for), so claiming the text match there misleads the
+            // operator reading the lane.
+            const identifiedAs = declaredDshCompaction
+                ? "declared purpose=compaction (#6880)"
+                : "final user message = COMPACTION_INSTRUCTION";
             // #3733: AUTHORED compaction — when the knob is on and the session
             // holds active fold blocks, answer the call LOCALLY with our folded
             // snapshot instead of refusing: zero egress (autoModeForge #2740
@@ -2247,11 +2776,11 @@ async function handleRequest(
                 ? buildDshCompactionForgeBody(protocol as "openai" | "anthropic" | "responses", forgeText, { inputTokens: Math.max(1, estimateCjkTokens(forgeText)), outputTokens: 0 }, (parsed as { stream?: unknown }).stream === true)
                 : null;
             if (authored !== null) {
-                log("info", `[${session.id}] dsh compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs) — ANSWERED LOCALLY with the bili snapshot (#3733 authored checkpoint): upstream not contacted, dsh records our tagged checkpoint; originals stay recoverable via CCR/export`);
+                log("info", `[${session.id}] dsh compaction call identified (${identifiedAs}, ${inboundMsgs} msgs) — ANSWERED LOCALLY with the bili snapshot (#3733 authored checkpoint): upstream not contacted, dsh records our tagged checkpoint; originals stay recoverable via CCR/export`);
             } else if (session.metadata.dshCompactionRefused !== true) {
                 session.metadata.dshCompactionRefused = true;
                 const shapeDrift = inboundMsgs !== null && inboundMsgs > DSH_COMPACTION_SHAPE_MSGS ? `, shape drifted from the ≤${DSH_COMPACTION_SHAPE_MSGS}-msg rc.1 envelope — rc.2 replays the full shadowed region (#2193)` : "";
-                log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs${shapeDrift}) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
+                log("warn", `[${session.id}] dsh native compaction call identified (${identifiedAs}, ${inboundMsgs} msgs${shapeDrift}) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
             }
             // #2490: remember the replayed envelope SIZE. The host's raw ledger is
             // invisible to bili's folded view (folds never shrink what dsh itself
@@ -2337,7 +2866,7 @@ async function handleRequest(
                     autoModeForge: { variant, body: forgeBody, contentType },
                 };
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
-                await forward(req, res, opts, bodyBuffer, amPrepared, core, reqConfig, log, route, instanceId, affinity);
+                await forward(req, res, opts, scrubMsgIdFields(bodyBuffer, log), amPrepared, core, reqConfig, log, route, instanceId, affinity);
                 return;
             }
         }
@@ -2363,13 +2892,15 @@ async function handleRequest(
         // prompt-enhance-class calls ride the #388 passthrough (kernel
         // no-touch) instead of claiming the raw-key anchor; the sticky-bound leg
         // mirrors #4438 — the extension client can arrive unstamped.
-        const dshSingleShotSidecar = requestAgent !== "main" && isDshSingleShotSidecar(protocol, parsed)
+        const dshSingleShotSidecar = requestAgent !== "main" && hasSingleShotBudget(parsed)
+            && isDshSingleShotSidecar(protocol, parsed)
             && (pluginAgentHeader(req.headers) === "dsh"
                 || (typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent === "dsh"));
         // #5135: ccTitleSidecar joins the intent set so the title call rides
         // the #388 passthrough (kernel state untouched) like every other
         // recognized side request.
-        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar;
+        const sideIntent = isSideRequest(parsed, declaredPiMainTurn ? "main" : requestAgent, declaredPurpose) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar
+            || grokAuxSidecar || mcodeTitleSidecar || mcodeOneShotSidecar || gooseSingleShotSidecar || codebuddyCompactionSidecar || opencodeTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request check above
         // has already accepted this request (inherited prefix matched, or live
@@ -2393,7 +2924,7 @@ async function handleRequest(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : dshSingleShotSidecar ? "dsh single-shot sidecar (#5656)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: declaredPurpose !== undefined ? `declared purpose=${declaredPurpose} (#6880)` : serverToolUtility ? "server-tool utility call (#2500)" : structuredOutputUtility ? "structured-output utility call (#5073)" : audioOutputUtility ? "audio-output utility call (#6636)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : dshSingleShotSidecar ? "dsh single-shot sidecar (#5656)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : grokAuxSidecar ? "grok auxiliary sidecar (#6884)" : mcodeTitleSidecar ? "mcode title sidecar (#6884)" : mcodeOneShotSidecar ? "mcode one-shot aux sidecar (#6884)" : gooseSingleShotSidecar ? "goose single-shot sidecar (#6884)" : codebuddyCompactionSidecar ? "codebuddy compaction sidecar (#6884)" : opencodeTitleSidecar ? "opencode title-gen sidecar (#6884)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
@@ -2439,6 +2970,7 @@ async function handleRequest(
                 }
             }
             sideBody = scrubCompatDrop(sideBody, compatDropPaths, log);
+            sideBody = scrubMsgIdFields(sideBody, log);
             // Gemini and Vertex encode stream mode in the path rather than the body.
             const requestStream = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
                 && "stream" in parsed && parsed.stream === true;
@@ -2515,7 +3047,21 @@ async function handleRequest(
             headroomOrigin,
             (parsed as { model?: string }).model,
         );
-        if (shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) || provenReserve > 0) {
+        // A codex live-table window already nets out codex's own output
+        // headroom; reserving bili's default share on top double-counts it and
+        // walls the session below codex's own auto-compact point. An explicit
+        // operator outputHeadroomMaxPct and a proven completion share still apply.
+        const operatorHeadroomCap = resolvedHeadroomCompress.outputHeadroomMaxPct !== undefined;
+        const skipForCodexWindow = codexWindowNetsOutput && !operatorHeadroomCap;
+        const reserveByProtocol = shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) && !skipForCodexWindow;
+        if (skipForCodexWindow && provenReserve === 0) {
+            const skipModel = String(requestModel ?? "?");
+            if (!headroomFallbackLogged.has(`${skipModel}|codex-netted`)) {
+                headroomFallbackLogged.add(`${skipModel}|codex-netted`);
+                log("info", `[headroom] model=${skipModel}: no output reservation — the codex-aligned window ${reqConfig.modelContextLimit} already nets out codex's own output headroom (effective_context_window_percent); set compress.outputHeadroomMaxPct to reserve anyway`);
+            }
+        }
+        if (reserveByProtocol || provenReserve > 0) {
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
             let maxOutput = typeof rawMax === "number" ? rawMax : 0;
@@ -2589,7 +3135,7 @@ async function handleRequest(
                     }
                 }
             }
-            if (provenReserve > 0 && !shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel)) {
+            if (provenReserve > 0 && !reserveByProtocol) {
                 // Proven share outranks the client-side fallbacks: it is what
                 // the upstream already counted into a rejection on this exact
                 // origin+model, so window − proven share is the input it accepts.
@@ -2597,7 +3143,7 @@ async function handleRequest(
                 const proofModel = (parsed as { model?: string }).model ?? "?";
                 if (!headroomFallbackLogged.has(`${proofModel}|proven-completion`)) {
                     headroomFallbackLogged.add(`${proofModel}|proven-completion`);
-                    log("info", `[headroom] model=${proofModel}: reserving the PROVEN completion share ${provenReserve} although protocol ${protocol ?? "unknown"} is exempt (#3450) — this origin+model billed completion inside the wall in an earlier rejection; judging input against ${nativeWindow} - ${provenReserve}`);
+                    log("info", `[headroom] model=${proofModel}: reserving the PROVEN completion share ${provenReserve} although ${skipForCodexWindow ? "the codex-aligned window already nets out codex's own output headroom" : `protocol ${protocol ?? "unknown"} is exempt`} (#3450) — this origin+model billed completion inside the wall in an earlier rejection; judging input against ${nativeWindow} - ${provenReserve}`);
                 }
             }
             // #2283 sub-defect 1: emit [window-change] when the per-session resolution
@@ -2705,11 +3251,14 @@ async function handleRequest(
             // #5683: this round's merged three-level compress settings, captured
             // so the post-prepare gate stamp below can read the policy knobs.
             let preparedCs: CompressSettings | undefined;
-            const runPreparedPipeline = async (
+            // #4753: `let` + `| undefined` so releaseRequestInput below can drop
+            // the closure (and with it its captured input-only state) once the
+            // upstream response boundary is reached.
+            let runPreparedPipeline: ((
                 respondFailFast: boolean,
                 overflowWindow?: number,
-            ): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
-                const runPrepare = async (): Promise<Prepared> => {
+            ) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = async (respondFailFast, overflowWindow) => {
+                const runPrepareInner = async (): Promise<Prepared> => {
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
                     tickPostRebuildAnchor(session);
@@ -2812,11 +3361,39 @@ async function handleRequest(
                         // a real model (the loop's synthetic frames read it back).
                         return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
                     }
+                    // #6181 B3: a PLUGIN-lane chained round whose input
+                    // carries no ARRAY content (absent or empty — a
+                    // bare-string input is admitted too: the provider
+                    // concatenates it to its retained chain, the same
+                    // outcome the kernel path would produce, with none of
+                    // its side effects) is a pure chain continuation — the
+                    // provider
+                    // already has the full world via its retained chain. The
+                    // kernel path for such a round is HARMFUL: it injects the
+                    // standing dev message into an otherwise-empty input and
+                    // (on the no-delta egress path) strips the chain id, so
+                    // the provider answers from nothing and the host then
+                    // chains from that BLIND response → permanent context
+                    // loss. Forward the client's bytes verbatim instead (the
+                    // same passthrough the /responses/compact endpoint
+                    // already owns: no kernel, no dev injection, no plane
+                    // side effects — the response-side ingest still updates
+                    // the session from the answer).
+                    const pureChainContinuation =
+                        protocol === "responses" &&
+                        !responsesCompact &&
+                        !wsLaneEnvelope &&
+                        pluginMode &&
+                        typeof (work as ResponsesRequestBody).previous_response_id === "string" &&
+                        (work as ResponsesRequestBody).previous_response_id!.length > 0 &&
+                        (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0);
                     const preparedOut = protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
-                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText)
-                          : responsesCompact
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText, bodyParseDeferred)
+                          : pureChainContinuation
+                            ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
+                            : responsesCompact
                             // #618: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer —
                             // forward it unchanged (byte-identical passthrough).
@@ -2826,7 +3403,26 @@ async function handleRequest(
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
                     preparedOut.model = requestModel;
+                    // #6181 B3: the compact-passthrough base hard-codes
+                    // resetAfterSuccess — which schedules a native-compaction
+                    // REBASE for the next Responses turn (reconcileNative-
+                    // CompactionBoundary → resetSessionCompression). A pure
+                    // chain-continuation round compacts nothing: honoring the
+                    // marker would wipe this session's compression state on
+                    // the next turn with no compaction ever having happened.
+                    // Drop it for the B3 route (the next turn's stage-0
+                    // resync already converges the plane when the host
+                    // resends a genuinely-compact world).
+                    if (pureChainContinuation) preparedOut.resetAfterSuccess = false;
                     return preparedOut;
+                };
+                // #1295: stamp the envelope meta onto every Prepared for this
+                // request (initial AND preflight re-prepares both flow through).
+                const runPrepare = async (): Promise<Prepared> => {
+                    const p = await runPrepareInner();
+                    if (ccMeta !== undefined) p.commandcode = { meta: ccMeta };
+                    if (wireFamily === "zed" && zedMeta !== undefined) p.zed = { meta: zedMeta };
+                    return p;
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -2967,8 +3563,23 @@ async function handleRequest(
                     nudgeInjected: prepared.nudgeOutcome === "injected",
                     requireNudge: preparedCs?.requireNudge === true,
                     requireRecommendation: preparedCs?.requireRecommendation === true,
+                    postComPressTail: preparedCs?.postComPressTail === true,
                     modelRound: !countTokens && !responsesCompact && !prepared.codexForge && !prepared.threadsLane,
                 });
+                // #6522: an ACTUAL injection re-opens the uncovered-history note
+                // latch (postCompressTail, src/stream.ts). A fresh nudge is a new
+                // "context is big enough — compress while you are at it" moment,
+                // so the receipt may note the uncovered runs once more in this
+                // cycle; folds without a new injection stay silent (anti-nag,
+                // #6522 loop). Only the post-gate delivery fact "injected"
+                // resets — the same fact that mints the nudge credit above;
+                // "gated"/"vetoed"/"skipped" never reached the model and never
+                // re-open the note. The note itself only exists while
+                // compress.postComPressTail is on (#7318) — with it off this
+                // latch is inert.
+                if (prepared.nudgeOutcome === "injected") {
+                    session.uncoveredReceiptNoted = false;
+                }
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
                 // reply that is already forged (#3008 prompt form).
@@ -2994,11 +3605,23 @@ async function handleRequest(
                         anonAffinity !== null,
                         log,
                         instanceId,
+                        v1Meta,
                     );
                     if (isPreflightFailFast(outcome)) {
                         // #301: the payload still overflows the window and
                         // preflight could not fix it — answer with a
                         // structured error instead of forwarding.
+                        // #7376: this is the only egress decision point for the
+                        // main payload. preflightCompressIfNeeded (above) runs
+                        // to completion BEFORE forward() is ever reached (below,
+                        // only when this branch is NOT taken) — it is a local
+                        // token-estimate + fold computation with no upstream I/O
+                        // for the MAIN body, so a fail-fast verdict means the
+                        // main payload was never sent upstream. The only egress
+                        // during preflight is the separate, smaller
+                        // summarization call (external summary chain) — a
+                        // different request, not the fail-fasted payload. The
+                        // "NOT forwarded" wording is therefore always true.
                         if (respondFailFast && outcome.respond && !res.destroyed) {
                             if (res.headersSent) {
                                 // #568: the hold already committed 200 early — the status
@@ -3006,7 +3629,7 @@ async function handleRequest(
                                 // (protocol error event for SSE, identical JSON body for
                                 // non-stream) instead of a status code we lost.
                                 if (prepared!.stream) {
-                                    emitPreflightError(res, prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
+                                    emitPreflightError(res, prepared!.commandcode ? "commandcode" : prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
                                 } else {
                                     try {
                                         res.end(JSON.stringify({
@@ -3117,6 +3740,13 @@ async function handleRequest(
                     clearSignedRefusal(guardScheme);
                     log("warn", `[signed-passthrough] built-in-scheme request without a working re-sign arm forwarded byte-untouched, no compression (#1884 escape hatch via resign["sdk-hmac-sha256"].passthrough / BILI_RESIGN_PASSTHROUGH — the user has acknowledged this link runs uncompressed)`);
                     forwarded = true;
+                    // #6539: no msgid-field scrub here on purpose — this is the #1884
+                    // signed-passthrough escape hatch with a body-covering signature
+                    // (sdk-hmac-sha256); mutating the body would break the signature
+                    // the client already shipped. The byte-untouched contract wins;
+                    // a stamped body on this lane rides as-is (bounded: the lane is an
+                    // explicit user opt-in, and the kernel is bypassed on this lane,
+                    // so no bili pin ever consumes the field).
                     await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
                     return;
                 }
@@ -3131,7 +3761,23 @@ async function handleRequest(
             if (guardScheme !== undefined && !resignArmable && !guardResign.enabled) {
                 clearSignedRefusal(guardScheme);
             }
-            const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
+            // #5403 family delta arm: a prefix-less tail-slice body cannot be
+            // processed by the legacy path — the re-anchor is a 400 the client
+            // answers by resending THIS turn in full form (one-round
+            // convergence, the same contract as every pf miss). No pf-seq
+            // stamp; mode relearned as "full" via the header.
+            let pendingForward;
+            try {
+                pendingForward = await withSessionLock(session, () => runPreparedPipeline!(true));
+            } catch (err) {
+                if (err instanceof DeltaReanchorError && !res.destroyed && !res.writableEnded) {
+                    log("warn", `[${session.id}] watermark delta re-anchor 400 (${err.reason}) — client resends in full form`);
+                    res.writeHead(400, { "content-type": "application/json", [MSGID_MODE_HEADER]: "full" });
+                    res.end(JSON.stringify({ error: { type: "pf_delta_reanchor", message: err.reason } }));
+                    return;
+                }
+                throw err;
+            }
             if (pendingForward) {
                 forwarded = true;
                 // #1195: wire clients (omp/pi on the plain proxy path) treat an
@@ -3146,23 +3792,39 @@ async function handleRequest(
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
                     ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
-                          const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
+                          const next = await withSessionLock(session, () => runPreparedPipeline!(false, realWindow));
                           if (!next || String(next.body) === String(pendingForward.body)) return null;
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;
                           return next;
                       }
                     : undefined;
-                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta, throttleModel, (outbound) => {
-                    logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, outbound);
-                });
+                const releaseRequestInput = () => {
+                    // #4753: refolding is finished before streaming starts. Drop
+                    // the input-only bindings even if forward's wrapper retains
+                    // the callback; accepted outbound bodies still support
+                    // retries.
+                    bodyBuffer = Buffer.alloc(0);
+                    parsed = null;
+                    affinityMessagesCache = null;
+                    runPreparedPipeline = undefined;
+                };
+                try {
+                    await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta, throttleModel, (outbound) => {
+                        logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, outbound);
+                    }, releaseRequestInput);
+                } finally {
+                    // Transport failures and locally forged replies can return
+                    // before the upstream response boundary.
+                    releaseRequestInput();
+                }
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
                 // and need the nudge/breakdown sections too; locked so a racing
                 // plugin tool call sees a consistent window.
                 if (pendingForward.prepared) {
                     const preparedToRemember = pendingForward.prepared;
-                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge, bodyBuffer));
+                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge, rawWireMetadata));
                 }
             }
         } finally {
@@ -3177,8 +3839,18 @@ async function handleRequest(
     }
     if (!prepared && !forwarded) {
         if (protocol === null && !opts.passthrough && !routePassthrough && !isModelDiscoveryPath(urlPath) && !isV1InternalControlPlanePath(urlPath)) {
-            logUnrecognizedPath(log, req.url ?? "");
+            // A declared model endpoint (src/model-endpoints.ts) is by definition
+            // a recognized URL — GET/HEAD probes or empty-body POSTs against it
+            // are health checks, not misrouted model traffic; "unrecognized
+            // path" warnings here would be pure noise (#1295 review F6). This
+            // mirrors buildForwardTarget's URL derivation exactly.
+            const rawUrl = req.url ?? "";
+            const probeTarget = (route ? route.rewrittenUrl : /^https?:\/\//i.test(rawUrl) ? rawUrl : `${opts.upstream}${urlPath}`)
+                .replace(/^mitm:\/\//, "https://");
+            if (!matchModelEndpoint(opts.modelEndpoints, probeTarget)) {
+                logUnrecognizedPath(log, req.url ?? "");
+            }
         }
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
     }
 }
