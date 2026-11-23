@@ -1057,7 +1057,7 @@ export class UnifiedShadow {
         if (this.sync === null) return null;
         const sessionRow = this.sync.getSessionRow(legacy.id);
         if (!sessionRow) throw new Error(`session row missing after import: ${legacy.id}`);
-        const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id));
+        const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getCcrEntries(legacy.id), this.sync.getStateFields(legacy.id), this.sync.getOrphanViews(legacy.id) ?? {});
         for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
             const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
             verifier.addBlocks(rows);
