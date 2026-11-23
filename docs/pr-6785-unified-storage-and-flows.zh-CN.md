@@ -27,7 +27,7 @@
 
 - `STORAGE_SCHEMA_VERSION = 12`(schema.ts:105,本 PR 从 11 提到 12)。
 - v12 **probe-first**(查表存在与否,不靠版本号门):因为兄弟分支 #5855 已把 pf 平面表当 "v12/v13" 落进过共享库(2026-11-08 现场:user_version 13 + 有 pf 表无 l1_world),版本门会让那些库跳过。
-- 所有新表都是**追加式**:旧构建打开新文件忽略多余表;新构建打开旧文件 probe 后补齐。
+- 所有新表都是**追加式**:旧构建打开新文件 probe 后补齐;旧构建打开新文件忽略多余表。表还在,但会话那一行回不来原样——旧构建打开过的会话会变成什么样,见 §7.1。
 - 每库打开时 pragma(auto_vacuum=INCREMENTAL 必须第一个):`journal_mode=WAL, synchronous=NORMAL, busy_timeout=5000, foreign_keys=ON, journal_size_limit=8MiB`。
 
 ### 1.2 本 PR 新增的 8 张表(DDL 均在 schema.ts)
@@ -117,7 +117,7 @@ PRIMARY KEY (session_id, log_seq)
 ```
 
 - `egress_state` = serve 读 + 压实物理裁剪(水位以下删);
-- `egress_flow` = append-only **永不删**(任意 log_seq 可重建,回滚以此表为据,不靠客户端重发)。
+- `egress_flow` = append-only **永不删**(任意 log_seq 可重建,回滚以此表为据,不靠客户端重发)。#7574 起有变化(§7.3):压缩时这张表也一起裁——只留最新一条基线行及其之后的行。
 
 行 payload 契约(egress-state.ts):
 - `I`: `{"after": msgid|null, "ref", "tokens", "type", "content_hash", "role"?, "cas_ref"?}`
@@ -164,7 +164,7 @@ PRIMARY KEY (session_id, log_seq)
 
 - `diffEgressView`(153-204):骨架 = `next` 中 msgid 在 `prev` 里**升序出现**的最长子序列(双指针扫描);骨架行 contentHash 变 ⇒ `U`;prev 非骨架 ⇒ 按 prev 顺序发最大连续 `D` 段;next 非骨架 ⇒ 按 next 顺序发 `I`(锚 = 前行);**移动 = D+I,无 M op**;op 顺序 D→U→I;不变式 `replay(prev, diff(prev,next)) === next`。
 - `nextLogSeq` 从 **flow** 取 MAX(state 被压实裁剪过,flow 是超集)。
-- `egressStateAt(db, sid, x)`(264-274):flow 重放到 `log_seq <= x` = 任意历史点重建(回滚)。
+- `egressStateAt(db, sid, x)`(264-274):flow 重放到 `log_seq <= x` = 任意历史点重建(回滚)。#7574 起(§7.3):只能重建最新基线行之后的点。
 - `egressStateCompact`(278-292):重放结果写成一条 `B` 行(两表)+ 物理删 state 水位以下(flow 不动)。
 - 任何锚点/端点/重复/畸形违例 ⇒ 抛 `EgressStateCorruptError`(36-42)⇒ 调用方**整会话降级 legacy**,永不模糊兜底。
 
@@ -201,7 +201,7 @@ PRIMARY KEY (session_id, log_seq)
 
 ### 2.9 增量 msgid pin(#7064 §8,默认 100)
 
-稳态轮用有界 `x-bili-pf-tail-ids`(锚点+新增,≤2048 个,`?` 占位)或短 body id 数组申报;服务端**从账本 live 行重盖前缀**(ingest INSERT OR IGNORE on (session_id,seq)——位置上的 msg_id 只写一次)。接受规则(2026-11-19 定型):声明尾段 [T-L,T-1] 与账本重叠段**逐行相等**,任一行漂移 ⇒ 降级 full,永不 400;超长会话(>2048)截断尾清单同样可 pin(重叠段更长=证明更强)。快照轮(账本空/折叠后重锚)发全量;全量优先。响应盖 `x-bili-msgid-mode: incremental|full`(4xx 即清,与 pf-seq 同一学习点 pfLearnStamp)。失配一轮自愈。
+稳态轮用有界 `x-bili-pf-tail-ids`(锚点+新增,≤2048 个,`?` 占位)或短 body id 数组申报;服务端**从账本 live 行重盖前缀**(ingest INSERT OR IGNORE on (session_id,seq)——位置上的 msg_id 只写一次)。接受规则(2026-11-19 定型):声明尾段 [T-L,T-1] 与账本重叠段**逐行相等**,任一行漂移 ⇒ 降级 full,永不 400;超长会话(>2048)截断尾清单同样可 pin(重叠段更长=证明更强)。快照轮(账本空/折叠后重锚)发全量;全量优先。响应盖 `x-bili-msgid-mode: incremental|full`(4xx 即清,与 pf-seq 同一学习点 pfLearnStamp)。失配一轮自愈。条目正常的短数组打在**空**账本上——增量客户端在服务端丢了账本之后(数据库恢复/重建、会话被删)的第一轮——照常处理(不 pin)并回 `full`,下一轮全量重建账本;只有条目本身坏掉的数组(空串/超长/保留前缀/空白控制字符/重复)仍然 400(#7574,owner 2026-11-23 改判;此前空账本上的任何短数组都 400)。
 
 ### 2.10 admin 面
 
@@ -380,3 +380,49 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 ### 6.5 常驻性能门(裁定:e2e bench ×3,不超基线 +20%)
 
 `tests/egress-bench.test.ts`(gate `ACP_TEST_EG_BENCH=1`;专属 CI 车道 `.github/workflows/ci-e2e-egbench.yml`,master 触发):hermetic 进程内代理(port 0、临时 XDG),3w 行增长的 pinned 会话(宿主侧折叠 + pf 水位通道),3 次中位稳态 p50/max 不超 `tests/e2e/bench/egress-bench.baseline.json`(校准值 201/300 ms;基线缺失时打印 CALIBRATION 并放行)。把单轮成本钉在 O(存活窗口):任何退回全表路径的回归会红。上面的 10w 增长矩阵留作深查参照;bench 是常驻守卫。
+
+## 7. 评审之后的跟进(#7574)
+
+本 PR 的评审(issue #7574)发现了落地内容里的几处缺口。之后改了什么,统一记在这里。上文引用的行号都指本 PR 落地时的代码。
+
+### 7.1 回退到旧构建
+
+「所有新表都是追加式」对表成立,对会话不成立。旧构建(本 PR 之前的任何版本)只读 `sessions` 这一行,保存时也不认识新表,所以它运行期间:
+
+- 工具输出、文件读取显示成 `{ hash }` 占位(`ccr_json` 列现在只存哈希,原文在 `ccr_entries` 后面);
+- 已回收的块看不到(内容在 `orphan_blocks`);
+- 搬到 `state_fields` 的 9 个状态字段缺失。
+
+重新升级后,会话加载时自己修复:原文从账本行取回(旧构建没碰过它们),状态字段从各自的行取回,已回收的块从它的表取回。
+
+**修不回来的**:
+
+- 旧构建自己写过非空值的那个状态字段——以它的值为准(它加的规则还在,它删的规则还是删了);
+- 内容表里已经没有正文的条目——记日志,会话不带这个内容库加载。
+
+留给 owner 的问题:这个限制可以接受,还是应该让旧构建拒绝打开 v12 的库?
+
+### 7.2 带水位握手头的大请求
+
+1 MiB 以上且带 `x-bili-pf-*` 头的请求,JSON 是延迟解码的(`messages` 先留占位)。以前只有插件通道和水位开关同时打开才会把占位补回真实内容;否则请求直接 `502 wireMessages is not iterable`,而且命中水位快速路径时,handle.ts 已经剥掉的顶层字段(`dsh_*` 等)会重新被转发给上游。现在请求体总会在转发前解码回来,转发的顶层字段和不走延迟解码的路径完全一致,键顺序也一致。
+
+### 7.3 出站操作日志(egress)
+
+- **谁以服务端日志为准——四条线一条规则。** 只有「插件通道 + msgid 钉住成功 + 不是旁路请求 + 开关打开」的轮次,会话才可以被服务端日志替换。其余轮次照常记录,但按原样下发。(之前:三条后置内核的线还会把未钉住的插件轮次、普通代理会话也当成以服务端为准;anthropic 线连标题请求也算。)
+- **日志坏了。** 只有上面那些「以服务端为准」的会话才失败一轮(和以前一样是 500)。只做镜像的会话照常应答,每轮记一条日志。`GET /__bili/egress/latches` 列出失败的会话;`POST /__bili/egress/reset { sessionId }` 丢掉坏掉的日志,下一轮从客户端的对话重建。已经标记的会话不再每个请求都重扫一遍日志。
+- **回退到最后一个健康点**(并删掉之后的行)只在日志确实无法重放时发生,而且只针对「以服务端为准」的会话。数据库忙/锁住/IO 错误原样抛出,不删任何东西。
+- **同一会话两个请求。** 开始时基于旧日志的那个写入会被拒绝(`EgressConcurrentWriteError`),它的轮次照常下发、只是不记录。会把日志写坏的批次在写入之前就被拒绝。
+- **压缩。** 带删除的轮次在同一次写入里完成压缩,而且两张表**一起**裁。`egress_flow` 不再是「只追加、永不删」:它保留最新一条基线行及其之后的行,`egressStateAt` 能重建最新基线之后的任意点。(之前:flow 保留所有行,每次折叠多存一份完整快照。)
+- **服务副本**(`egress_state`)每次读取都和日志比对;副本坏了就从日志重新拷贝,日志有洞会被报出来。
+- **非空视图上的 `after: null` 表示「新的第一行」**,两个重放一致。(之前:校验放第一、存储放最后,下一轮要付出一次删除+插入的重写。)
+- **开关关闭** = 什么都不读操作日志,哪怕会话已经有日志:钉住的 id 从 `messages` 读,漂移检查关闭。
+
+### 7.4 msgid
+
+- msgid 校验失败的 400 也带 `x-bili-msgid-mode: full`,和增量重锚一致,客户端知道下一轮要发全量。
+- **空**账本上收到格式正常的短 id 数组(客户端的数据库被恢复或重建过),不再让这一轮失败:照常处理、不钉住,响应要求下一轮发全量。只有条目本身坏掉的尾段才算身份故障。这推翻了 2026-11-18 的空账本例外(AGENTS.md 的 KDD #22)。
+- pi 只在 OpenAI 这一种线上省略全量 `biliMsgIds`(只有这条线的服务端会读 `x-bili-pf-tail-ids` 头)。`/model` 切到 anthropic / responses 线的模型后,全量 id 列表重新随请求发出;以前这类请求完全没有 id,直到尾段超过字节上限。
+
+### 7.5 迁移
+
+迁移在两张 egress 表之间被打断的,下次启动会补完;从更早版本升级上来的库会补上 `conversations(session_id)` 索引(以前只有新版本新建的库才有)。
