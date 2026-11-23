@@ -27,7 +27,8 @@ import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
-import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
+import { applyEstimateCalibration, currentCalibrationFactor, type WireProtocol } from "./util.js";
+import { formatBytes } from "./server/request-cost.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 import { preflightEmergencyDigestEnabled } from "./knobs.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
@@ -574,6 +575,43 @@ export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
         system: buckets[2],
         other: buckets[3],
     };
+}
+
+// #7589: top-level fields the MODEL reads as its prompt/context, per wire
+// protocol. The forward field-size log marks every other top-level field
+// "(non-prompt)" so a bloated body can be attributed to telemetry the model
+// never reads (DSH's dsh_session_log) vs real model context. A field absent
+// from its protocol's set is reported non-prompt; the sets are intentionally
+// conservative — an unlisted prompt-carrying field is mislabeled non-prompt
+// (a cosmetic diagnostic inaccuracy), never the reverse.
+export const PROMPT_BODY_KEYS: Record<WireProtocol, ReadonlySet<string>> = {
+    openai: new Set(["messages", "tools"]),
+    anthropic: new Set(["messages", "system", "tools"]),
+    responses: new Set(["input", "instructions", "tools"]),
+    google: new Set(["contents", "systemInstruction", "tools"]),
+};
+
+/** #7589: one-line per-top-level-field byte sizes for the forward log, marking
+ *  non-prompt fields (not in PROMPT_BODY_KEYS[protocol]) so a bloated body is
+ *  attributable to telemetry vs real context. Each field's size is the wire
+ *  caliber — Buffer.byteLength(JSON.stringify(value)) (UTF-8 bytes, the same
+ *  measure formatBytes' callers use). Returns null for a non-object body
+ *  (nothing to break down). Pure — safe to unit-test. */
+export function formatForwardFieldSizes(parsed: unknown, protocol: WireProtocol): string | null {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const promptKeys = PROMPT_BODY_KEYS[protocol];
+    const parts: string[] = [];
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        let bytes: number;
+        try {
+            bytes = Buffer.byteLength(JSON.stringify(value) ?? "null", "utf8");
+        } catch {
+            bytes = -1; // defensive — JSON.parse output cannot be cyclic, but never throw from a log line
+        }
+        const marker = promptKeys.has(key) ? "" : " (non-prompt)";
+        parts.push(`${key}=${bytes < 0 ? "n/a" : formatBytes(bytes)}${marker}`);
+    }
+    return parts.length > 0 ? parts.join(", ") : null;
 }
 
 // #553: upper-bound variant of estimateCoreMessages — every character counts

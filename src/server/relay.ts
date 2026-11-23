@@ -49,7 +49,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes, formatForwardFieldSizes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -321,6 +321,11 @@ function answerLocalThrottleReject(
 // this raw-header peek cannot see — those fall through to the post-ingest gate
 // and are refused there exactly as before.
 export const EARLY_HOLD_GATE_MIN_BYTES = 1024 * 1024;
+
+// #7589: below this total outbound size no single top-level field can be a
+// telemetry-bloat problem, so the per-field size log (and its O(body)
+// re-serialization) is skipped — it only earns its cost on large bodies.
+const FIELD_SIZE_LOG_MIN_BYTES = 512 * 1024;
 
 export function tryAnswerEarlyHold(o: {
     method?: string;
@@ -1163,6 +1168,16 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             sentParsed = p && typeof p === "object" && !Array.isArray(p) ? (p as Record<string, unknown>) : null;
         } catch {
             sentParsed = null;
+        }
+        // #7589: per-top-level-field byte sizes for telemetry-bloat diagnosis —
+        // a body bloated by a non-prompt field (DSH's dsh_session_log) 413s with
+        // no log line naming the culprit field. Gated on total size (small bodies
+        // have no bloat to attribute, and the per-field re-serialization is
+        // O(body) work we don't pay for them); non-prompt fields are marked so
+        // the bloat is attributable to telemetry vs real model context.
+        if (sentParsed !== null && Buffer.byteLength(sentBody, "utf8") >= FIELD_SIZE_LOG_MIN_BYTES) {
+            const fieldSizes = formatForwardFieldSizes(sentParsed, prepared.protocol);
+            if (fieldSizes) log("info", `[${prepared.session.id}] [forward] field sizes: ${fieldSizes}`);
         }
         // Publish this send, not a historical usage baseline with a fresh timestamp.
         const est = outboundContextEstimates(prepared, sentBody, opts, upstreamUrl, sentParsed);
