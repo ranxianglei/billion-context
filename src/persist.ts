@@ -2887,6 +2887,55 @@ export class SessionStore {
         return row;
     }
 
+    /** #7577 D5 / review (c): egress-on sessions have no checkpoint substrate
+     *  (checkpoints are retired for them), so the admin "create replica" path
+     *  FORKS THE SESSION TO NOW instead — a full copy as of the current
+     *  shared high water: the four egress op-log tables (the content
+     *  authority) plus the unified kernel-state rows. The child is a new,
+     *  loadable session; the parent is never mutated. Forking at an EARLIER
+     *  op_seq is deliberately NOT supported: the unified kernel-state rows
+     *  only exist at *now*, so a point below the high water would pair
+     *  content-at-X with kernel-state-at-now (inconsistent). That needs the
+     *  point-reconstruction materializer — a follow-up, not this PR. */
+    async forkEgressSnapshot(sessionId: string, childId?: string): Promise<{ childId: string; opSeq: number }> {
+        await this.ready();
+        // Resident if it is actively loaded; otherwise load the persisted
+        // (idle) session — a point-fork of an egress-on session does not need
+        // the parent to be in-flight, only present.
+        const parent = peekSession(sessionId) ?? (await this.loadAsync(sessionId));
+        if (!parent) throw new Error(`[storage] forkEgressSnapshot: session ${sessionId} does not exist`);
+        if (parent.metadata["egressAuthority"] !== true) throw new Error(`[storage] forkEgressSnapshot: session ${sessionId} is not an egress-on session`);
+        const cid = childId ?? `fork-${randomUUID()}`;
+        if (peekSession(cid) !== undefined || (await this.loadAsync(cid))) throw new Error(`[storage] forkEgressSnapshot: child ${cid} already exists`);
+        // Deep-copy the mutable fields: persistForkSession mutates the child
+        // (fork-base receipt, tail fold, resident drops), so the child must
+        // not alias the parent's state/metadata/lock chain. `transient` is
+        // in-flight request state — never carried into a fork child. The
+        // contentStore is shared by design: saveContentStore snapshots it to
+        // disk under the child's id, and dropResidentContentStore reassigns
+        // the CHILD's field only (the parent keeps its own handle).
+        const child: Session = {
+            ...parent,
+            id: cid,
+            meta: structuredClone(parent.meta),
+            stats: structuredClone(parent.stats),
+            metadata: { ...parent.metadata, derivedFromSessionId: sessionId },
+            state: structuredClone(parent.state),
+            blockContents: new Map([...(parent.blockContents ?? new Map()).entries()].map(([k, v]) => [k, structuredClone(v)])),
+            lastMessages: parent.lastMessages ? structuredClone(parent.lastMessages) : undefined,
+            pluginSnapshot: parent.pluginSnapshot ? structuredClone(parent.pluginSnapshot) : undefined,
+            decompositionLog: parent.decompositionLog ? structuredClone(parent.decompositionLog) : undefined,
+            transient: undefined,
+            lockChain: undefined,
+            persisted: false,
+            inFlight: 0,
+            pendingRetrievals: [],
+        };
+        await this.persistForkSession(sessionId, child);
+        const opSeq = this.egressOpLogStore()?.egressStateMaxSeq(cid) ?? 0;
+        return { childId: cid, opSeq };
+    }
+
     async listReplicas(sessionId?: string): Promise<CheckpointRow[]> {
         await this.ready();
         return this.liveShadow().listCheckpointsAsync(sessionId);
