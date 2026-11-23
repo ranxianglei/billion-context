@@ -724,6 +724,20 @@ export function migrateSchema(db: {
     if (sessionCols.length > 0 && !sessionCols.includes("fork_egress_watermark")) {
         db.exec("ALTER TABLE sessions ADD COLUMN fork_egress_watermark INTEGER");
     }
+    // #7576-10: the conversations(session_id) index — PROBE-FIRST, not
+    // version-gated: the conversations table is created in the v3 migration
+    // (every DB at version >= 3 has it), but the index was added to the
+    // fresh-DB DDL by #6785 and is NOT in the v3 migration, so every
+    // pre-#6785 DB at the current version takes the early return below and
+    // never picks the index up (snapSessRawOf: WHERE session_id = ? would
+    // full-scan). Probe the table first (a fresh DB does not have it yet at
+    // this point — the v3 migration creates it in the transaction below); a
+    // fresh DB already gets the index from the DDL above (idempotent CREATE).
+    const convCols = (db.prepare("PRAGMA table_info(conversations)").all() as unknown as { name?: unknown }[])
+        .map((c) => (typeof c?.name === "string" ? c.name : ""));
+    if (convCols.length > 0) {
+        db.exec("CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id)");
+    }
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;
     db.transaction(() => {
