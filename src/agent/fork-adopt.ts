@@ -496,6 +496,10 @@ export async function tryForkAdoption(opts: {
     parentConversationId: string;
     childConversationId: string;
     body: unknown;
+    // #6262 principle 1: host-stable message ids aligned to the wire, as the lane's
+    // parity-pinned collector yields them. Length-mismatched or absent → byte track
+    // only (exactly today's behavior).
+    msgIds?: string[];
     boundary?: ForkBoundary;
     fetchImpl?: typeof fetch;
     log?: (line: string) => void;
@@ -511,6 +515,11 @@ export async function tryForkAdoption(opts: {
     }
     const core = chatBodyToCore(opts.body);
     if (core === null || core.length === 0) return { outcome: "degraded", reason: "body unmappable" };
+    // #6262 principle 1: the only check this module performs on msgIds is the
+    // core-alignment length lock — host-pinned parents expose the host ids as
+    // snapshot rawIds, so a misaligned array can never match and the byte track
+    // carries the fork (same outcome as absent).
+    const msgIds = opts.msgIds !== undefined && opts.msgIds.length === core.length ? opts.msgIds : undefined;
     const snapshotUrl = `${opts.base}/__bili/plugin/snapshot?conversationId=${encodeURIComponent(opts.parentConversationId)}`;
     for (let attempt = 0; attempt < 2; attempt += 1) {
         let snapshot: Awaited<ReturnType<typeof snapshotOf>>;
@@ -534,10 +543,32 @@ export async function tryForkAdoption(opts: {
         // zero here is terminal by construction (retrying changes nothing).
         const resolved = resolveForkBranchPoint(core, snapshot, opts.boundary);
         if (resolved.count === 0) return { outcome: "degraded", reason: opts.boundary !== undefined ? "boundary unresolved (child replay shares no prefix with the parent snapshot)" : "no prefix match" };
-        const branchPoint = resolved.count;
+        // #6262 principle 1 (msgid identity track, discussion #6262): when the lane
+        // hands us host-stable message ids, identity outranks bytes. A parent whose
+        // messages were host-pinned carries the host ids AS its snapshot rawIds, so
+        // an id match at a slot whose bytes drifted (the host re-rendered that
+        // message after the parent saw it) does not truncate the prefix — the fork
+        // claim extends to the id-stable length, driftFrom marking where the
+        // role+text/byte stop was. The claimed identities stay the PARENT's (copied
+        // verbatim); the server re-gates every claimed id against its own snapshot
+        // before trusting the drift region. The extension never overrides a
+        // host-declared boundary (#5509) — an explicit fork point outranks the
+        // inferred one. No new id validation here: the lane's collector is the
+        // parity-pinned one, and a length mismatch (wire/core misalignment — part
+        // splits, hoisted system) simply falls back to the byte track.
+        let branchPoint = resolved.count;
+        let driftFrom: number | undefined;
+        let nId = 0;
+        if (msgIds !== undefined && !resolved.cappedByBoundary) {
+            while (nId < msgIds.length && nId < snapshot.orderedMessages.length && msgIds[nId] === snapshot.orderedMessages[nId]!.rawId) nId += 1;
+            if (nId > branchPoint) {
+                branchPoint = nId;
+                driftFrom = resolved.count;
+            }
+        }
         const prefix = snapshot.orderedMessages.slice(0, branchPoint);
         const orderHash = branchPoint === snapshot.orderedMessages.length ? snapshot.orderHash : forkOrderHashOf(prefix);
-        const payload = {
+        const payload: Record<string, unknown> = {
             protocolVersion: 1,
             parentConversationId: opts.parentConversationId,
             childConversationId: opts.childConversationId,
@@ -546,6 +577,14 @@ export async function tryForkAdoption(opts: {
             orderedMessages: prefix,
             idempotencyKey: `fork:${opts.childConversationId}`,
         };
+        // #6262: send the host ids for the claimed prefix only when EVERY claimed
+        // cell is id-verified client-side (nId >= branchPoint) — a shorter id run
+        // would put unverified ids in the gate's path for no gain. driftFrom rides
+        // only with an extended prefix.
+        if (msgIds !== undefined && nId >= branchPoint) {
+            payload.prefixMsgIds = msgIds.slice(0, branchPoint);
+            if (driftFrom !== undefined) payload.driftFrom = driftFrom;
+        }
         let res: Response;
         try {
             res = await doFetch(`${opts.base}/__bili/plugin/fork`, {
@@ -607,7 +646,16 @@ export async function manifestForkCapable(base: string, fetchImpl?: typeof fetch
     }
 }
 
-export type ForkAdoptInput = { base: string; parent: string; child: string; body: unknown; boundary?: ForkBoundary };
+export type ForkAdoptInput = {
+    base: string;
+    parent: string;
+    child: string;
+    body: unknown;
+    // #6262 principle 1: lane-collected host msgids for the msgid identity track;
+    // absent → byte track (today's behavior). See tryForkAdoption.
+    msgIds?: string[];
+    boundary?: ForkBoundary;
+};
 
 /** Per-host fork-adoption coordinator (#2399 stage 2): absorbs the bookkeeping
  *  every host needs (done/attempts/single-flight keyed by child id, the
@@ -663,6 +711,7 @@ export function createForkAdopter(log: (line: string) => void, opts?: { maxAttem
             parentConversationId: input.parent,
             childConversationId: input.child,
             body: input.body,
+            msgIds: input.msgIds,
             boundary: input.boundary,
             fetchImpl: opts?.fetchImpl,
             log,

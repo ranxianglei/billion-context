@@ -47,13 +47,13 @@
 
 ## 5. 持久化单一事实源
 
-统一存储 `messages.msg_id` 列是唯一 id 事实源:ingest 时把校验过的 id 钉进行(T5 裁定:无双平行 ledger、skeleton 行不携 id)。账本主键 `(session_id, msg_id, content_hash)`;canonical 行按 **MSGID 而非内容 hash** 键控(#4491);fork 克隆保号(#4316 L3 PR3/3 `cloneSessionRows`)。
+统一存储 `messages.msg_id` 列是唯一 id 事实源:ingest 时把校验过的 id 钉进行(T5 裁定:无双平行 ledger、skeleton 行不携 id)。账本主键 `(session_id, msg_id, content_hash)`;canonical 行按 **MSGID 而非内容 hash** 键控(#4491);fork 克隆保号(#4316 L3 PR3/3 `cloneSessionRows`)。**KDD #23 例外(仅 egress-on 会话):op log 是正史消息权威**(`egress_flow.msgid` + `log_seq`);messages 行降级为**惰性投影**(平面回滚 / web 读 / 恢复时一次性重建),pin 通道(KDD #21/#21)对这些会话改解析 op log 的 I 行而非本账本——其余消费者不变。
 
 ## 6. 消费方(五个,id 各自回答什么问题)
 
 | 消费方 | 位置 | 回答的问题 | id 使用边界 |
 |---|---|---|---|
-| ① 存储列身份 | unified store `messages.msg_id` | settle/reconcile 一切 join 的主键 | 唯一身份空间入口,其余四方的 id 证据最终都折到这里 |
+| ① 存储列身份 | unified store `messages.msg_id`(egress-on:op-log I 行,KDD #23) | settle/reconcile 一切 join 的主键 | 唯一身份空间入口,其余四方的 id 证据最终都折到这里 |
 | ② session-resolve 最后一档 #5719 | tryMsgIdRescue(src/session-resolve.ts ~:324;fork-exit 调用点 ~:432/:481/:501) | 字节/标签证据被压缩或 system 重写摧毁后,这条请求还是不是既有会话? | 同一 raw key 下**任意 id 重叠 ⇒ 认定同会话**;注意它不做 lane 归属判定(§7 边界 B) |
 | ③ 结算 membership 探针 #4805 | probeRequestMembership(src/request-membership.ts;调用点 src/server/prepare-openai.ts:597、prepare-anthropic.ts:640;消费 cache-ledger.ts:1866) | 这个 id 是否已被本会话账本准入?needle = 最近准入 id | **纯证据,永不进身份空间**、永不 re-key/fork;误伤仅致一轮结算未决,自癒 |
 | ④ 增量车道 canonical 行 #4491/#4834 | src/incremental-lane.ts(validateMsgIds :623、认领复用 400 :628、cache-control rekey :631-635;dsh 侧 burned-claim 预筛 ~:2584) | 本轮增量追加了哪些正史行? | 认领语义:已认领 id 再上行=重试风暴信号,整回合 400 |
