@@ -90,7 +90,8 @@ test("e2e #1987: post-fold usage baseline anchors to the shipped payload, not th
     // on-disk config file (fileNetwork) — in-process startServer options
     // don't reach it — so opt in via env for the duration of this test.
     const prevDigest = process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST;
-    process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST = "1";    const calls: Call[] = [];
+    process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST = "1";
+    const calls: Call[] = [];
     const upstream = makeUpstream(calls);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
