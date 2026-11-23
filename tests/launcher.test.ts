@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import type { PathLike } from "node:fs";
 import { rmrf } from "./tmp-rm.ts";
+import { acquireDistFixtureLock } from "./dist-fixture-lock.ts";
 import { supportsFileSymlink } from "./platform-capabilities.ts";
 type SymlinkKind = "dir" | "file" | "junction";
 import net from "node:net";
@@ -469,6 +470,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
     // when running tests from a checkout without a prior build.
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const stubbed = !fs.existsSync(distAgent);
     if (stubbed) {
         fs.mkdirSync(path.dirname(distAgent), { recursive: true });
@@ -553,6 +555,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (stubbed) fs.rmSync(distAgent, { force: true });
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -585,6 +588,7 @@ test("runLaunch pi #5428: -s posture override reaches the child env over a hosti
     // when running tests from a checkout without a prior build.
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const stubbed = !fs.existsSync(distAgent);
     if (stubbed) {
         fs.mkdirSync(path.dirname(distAgent), { recursive: true });
@@ -646,6 +650,7 @@ test("runLaunch pi #5428: -s posture override reaches the child env over a hosti
         if (prevInline === undefined) delete process.env.BILI_PI_INLINE;
         else process.env.BILI_PI_INLINE = prevInline;
         if (stubbed) fs.rmSync(distAgent, { force: true });
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -664,6 +669,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
 
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const distBackup = `${distAgent}.bak-test`;
     const distExisted = fs.existsSync(distAgent);
     if (distExisted) fs.renameSync(distAgent, distBackup);
@@ -724,6 +730,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (distExisted) fs.renameSync(distBackup, distAgent);
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -734,6 +741,8 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
     const prevUserProfile = process.env.USERPROFILE;
     const prevClientBin = process.env.BILI_CLIENT_BIN;
     const prevOmpDir = process.env.PI_CODING_AGENT_DIR;
+    const prevThreads = process.env.PI_ANTHROPIC_MESSAGE_THREADS;
+    delete process.env.PI_ANTHROPIC_MESSAGE_THREADS;
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
@@ -750,9 +759,11 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
     if (distExisted) fs.renameSync(distAgent, distBackup);
 
     const clientArgsSeen: string[][] = [];
-    const spawnImpl: SpawnFn = (cmd, args) => {
+    let childEnv: NodeJS.ProcessEnv | undefined;
+    const spawnImpl: SpawnFn = (cmd, args, options) => {
         if (cmd === process.env.BILI_CLIENT_BIN) {
             clientArgsSeen.push([...args]);
+            childEnv = options.env;
             const child = makeFakeChild(0);
             const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
@@ -793,6 +804,8 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
         assert.ok(!clientArgsSeen[0].includes("-e"), "installed entry loads the plugin — no -e double load");
         assert.equal(fs.existsSync(`${ompHome}-bili`), false, "still no overlay dir");
         assert.deepEqual(exitCalls, [0]);
+        // #6088: OMP message threads would send only the newest message per turn
+        assert.equal(childEnv?.PI_ANTHROPIC_MESSAGE_THREADS, "0", "omp message threads defaulted off");
     } finally {
         process.exit = prevExit;
         if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
@@ -802,6 +815,8 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
         else process.env.USERPROFILE = prevUserProfile;
         if (prevOmpDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevOmpDir;
+        if (prevThreads === undefined) delete process.env.PI_ANTHROPIC_MESSAGE_THREADS;
+        else process.env.PI_ANTHROPIC_MESSAGE_THREADS = prevThreads;
         if (distExisted) fs.renameSync(distBackup, distAgent);
         rmrf(home);
     }
@@ -902,6 +917,7 @@ test("runLaunch pi #535: refuses launch when ONLY https (hand-wrapped) rewrites 
 
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const distBackup = `${distAgent}.bak-test`;
     const distExisted = fs.existsSync(distAgent);
     if (distExisted) fs.renameSync(distAgent, distBackup);
@@ -919,6 +935,7 @@ test("runLaunch pi #535: refuses launch when ONLY https (hand-wrapped) rewrites 
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (distExisted) fs.renameSync(distBackup, distAgent);
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -1593,6 +1610,11 @@ test("ensureProxyRunning: unarmed LANE'D listener is not attached by default —
             },
             sleep: () => new Promise((r) => setTimeout(r, 0)),
             scriptPath: FP_SCRIPT,
+            // #7156: the mock "daemon" never really ran here — nothing is
+            // actually listening on 8787, so the second-writer gate must not
+            // wait out the drain grace for a process that is, for gate
+            // purposes, already gone.
+            isPidAlive: () => false,
         },
     );
     assert.equal(spawnCalls, 1, "self-managed proxy spawned instead of attaching to the unarmed lane'd daemon");
@@ -5845,6 +5867,54 @@ test("runLaunch codex: old binary without --no-daemon launches unchanged (#1867)
         else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
         if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
         else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
+        rmrf(home);
+    }
+});
+
+test("runLaunch claude: the injected --mcp-config does not swallow a positional prompt", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-prompt-"));
+    const prevHome = process.env.HOME;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevPlugin = process.env.BILI_LAUNCHER_PLUGIN;
+    process.env.HOME = home;
+    delete process.env.BILI_LAUNCHER_PLUGIN;
+    const fakeClaude = path.join(home, process.platform === "win32" ? "fake-claude.exe" : "fake-claude");
+    fs.writeFileSync(fakeClaude, "");
+    process.env.BILI_CLIENT_BIN = fakeClaude;
+    const clientArgs: string[][] = [];
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        if (cmd === fakeClaude) {
+            clientArgs.push([...(args ?? [])]);
+            const child = makeFakeChild(0);
+            const orig = child.on!.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+    try {
+        await runLaunch(
+            { client: "claude", clientArgs: ["say hi", "-p"], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgs.length, 1);
+        const args = clientArgs[0]!;
+        // Claude Code's --mcp-config is variadic: a bare flag takes every following word as a config file.
+        assert.equal(args.includes("--mcp-config"), false, `bare --mcp-config would eat the prompt: ${JSON.stringify(args)}`);
+        assert.ok(args.some((a) => a.startsWith("--mcp-config=")), "bili's MCP config is still passed");
+        assert.ok(args.includes("say hi"));
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevPlugin !== undefined) process.env.BILI_LAUNCHER_PLUGIN = prevPlugin;
         rmrf(home);
     }
 });

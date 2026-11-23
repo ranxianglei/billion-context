@@ -16,7 +16,6 @@ import type {
     RefRow,
     CcrEntryRow,
     SessionSummaryRow,
-    SessionViewRows,
     StorageReadView,
 } from "../src/storage/backend.ts";
 import { sha256 } from "../src/storage/canonical.ts";
@@ -101,20 +100,8 @@ class StubMysqlBackend implements StorageBackend {
         this.viewCalls.count++;
         return Promise.resolve(this.rows.get(sessionId)?.session ?? null);
     }
-    // #5198-era interface members (#4739 narrow reads + snapshot facade),
-    // satisfied from the same rows ingestSession captured.
-    sessionViewRows(sessionId: string): Promise<SessionViewRows> {
-        const row = this.rows.get(sessionId);
-        if (!row) return Promise.resolve(null);
-        const view = {
-            session: row.session,
-            messages: row.messages.map((r) => ({ ...r, contentHash: r.contentHash ?? sha256(r.content) })),
-            blocks: row.blocks.map((b) => ({ ...b, summaryHash: sha256(b.summary), oneHash: b.one === null ? null : sha256(b.one) })),
-            deadRefs: row.deadRefs,
-            refs: row.refs,
-        };
-        return Promise.resolve(view as unknown as SessionViewRows);
-    }
+    // #5198-era interface member (snapshot facade), satisfied from the same
+    // rows ingestSession captured.
     readSnapshot<T>(read: (reader: StorageReadView) => Promise<T>): Promise<T> {
         const row = (id: string) => this.rows.get(id);
         const view: StorageReadView = {
@@ -123,6 +110,9 @@ class StubMysqlBackend implements StorageBackend {
             getBlocks: async (id, _opts) => (row(id)?.blocks ?? []).map((b) => ({ ...b, summaryHash: sha256(b.summary), oneHash: b.one === null ? null : sha256(b.one) })),
             getDeadRefs: async (id) => row(id)?.deadRefs ?? [],
             getRefs: async (id) => row(id)?.refs ?? [],
+            getCcrEntries: async () => [],
+            getOrphanViews: async () => null,
+            getStateFields: async () => null,
         };
         return read(view);
     }
@@ -165,6 +155,12 @@ class StubMysqlBackend implements StorageBackend {
     getCcrEntries(sessionId: string): Promise<CcrEntryRow[]> {
         return Promise.resolve(this.rows.get(sessionId)?.ccrEntries ?? []);
     }
+    getOrphanViews(sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null> {
+        return Promise.resolve(null);
+    }
+    getStateFields(sessionId: string): Promise<Record<string, string> | null> {
+        return Promise.resolve(null);
+    }
     // No watermark on the stub → every record takes the full-ingest path
     // (deterministic seeding; the delta probe would need boundary state).
     ingestWatermark(): Promise<null> {
@@ -176,7 +172,7 @@ class StubMysqlBackend implements StorageBackend {
     clearIngestWatermark(): Promise<void> {
         return Promise.resolve();
     }
-    resetAllIngestWatermarks(): Promise<void> {
+    primeIngestTrust(): Promise<void> {
         return Promise.resolve();
     }
     probeIngestBoundary(): Promise<null> {

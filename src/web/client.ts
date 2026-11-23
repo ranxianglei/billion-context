@@ -1,4 +1,5 @@
 import { MESSAGES } from "./i18n.js";
+import { makeMdRender } from "./mdrender.js";
 
 // #3572 (client half): the server accepts JSONC config files (comments +
 // trailing commas) since the parseBiliConfig fix, but the web editor still
@@ -141,6 +142,18 @@ export const WEB_CLIENT = `(function () {
     const parseConfigDraft = ${parseConfigDraft.toString()};
     const adminRelayActiveInDraft = ${adminRelayActiveInDraft.toString()};
     const blogCacheStale = ${blogCacheStale.toString()};
+    // Markdown + syntax-highlight core — the same single implementation the
+    // server uses (web/mdrender.ts), inlined like the JSONC helpers above.
+    // The factory is fully self-contained, so its (minified) source runs
+    // verbatim inside this IIFE.
+    // Dev/transpile note: tsx's esbuild keepNames pass rewrites every NESTED
+    // function inside the factory to call a __name(fn, "name") helper
+    // (name preservation), which only exists at module scope of the dev
+    // bundle. The production tsup/minify output never emits those calls, but
+    // tests run this template through tsx — this one-line shim keeps the
+    // dev-transpiled inlining runnable. It is a no-op in production.
+    var __name = function (fn) { return fn; };
+    const mdApi = (${makeMdRender.toString()})();
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -2054,6 +2067,324 @@ function changelogCatOf(rawLine) {
             + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + fmtDT(lines[lines.length - 1].at) + "</text>" : "");
         return xt + xtTime;
     }
+    // #6729/#6720 follow-up: the recovery view lives in ONE self-contained
+    // time-based chart (the trajectory chart no longer mixes in recovery
+    // marks — they overlapped the existing fold lines and could not be told
+    // apart). Top-down layers, all on a shared time axis:
+    //   • nudge flags (▼ + tier/amount label) — when bili recommended a fold
+    //   • per-call bars — every compress() call; height ∝ folded tokens
+    //     (vs the biggest call), color = its ROUND's recovery (green ≥80 /
+    //     yellow 40–80 / red <40) or blue when the call was active (no nudge)
+    //   • round points — one per nudge round (nudge → next nudge), y = the
+    //     round's recovery clamped to the 0–100 axis, TRUE value labeled
+    //     above the point so >100% rounds (folded older stock too) read
+    //     honestly; purple dashed = running average
+    //   • round brackets under the bars — span, call count, Σfolded/pending
+    //   • header — honest totals: nudges / compressions (split nudge-follows
+    //     vs active) / recommended vs folded, never a blended “recovery %”
+    // #6729: episodes are recomputed HERE from whatever event window is handed in, so the
+    // linked zoom can pass a filtered slice and get correct per-round aggregates for it.
+    // The session-wide summary is always carried through untouched — the header never lies
+    // about a zoomed window.
+    function recoveryEpisodesFromEvents(events) {
+        const nudges = events.filter((ev) => ev.kind === "n");
+        const folds = events.filter((ev) => ev.kind === "f");
+        const roundOf = (ev) => {
+            let r = -1;
+            for (let i = 0; i < nudges.length; i++) { if (nudges[i].at <= ev.at) r = i; else break; }
+            return r;
+        };
+        const eps = [];
+        // #6729 outstanding recommended pool: each nudge adds its pending, and the nudge-mode
+        // folds consume it (floor 0). Anything consumed beyond the pool is older stock the model
+        // cleared on its own (extra) — the true pct is kept, but the two parts are separated so
+        // ">100%" reads as over-compression, never as inflated recovery.
+        let pool = 0;
+        nudges.forEach((nv, i) => {
+            let folded = 0, active = 0;
+            folds.forEach((f) => {
+                if (f.at < nv.at || (i + 1 < nudges.length && f.at >= nudges[i + 1].at)) return;
+                if (f.mode === "a") { active++; return; }
+                folded += f.folded || 0;
+            });
+            pool += nv.pending || 0;
+            const credited = Math.min(folded, pool);
+            const extra = folded - credited;
+            pool -= credited;
+            eps.push({ at: nv.at, tier: nv.tier ?? null, pending: nv.pending || 0, folded, pct: (nv.pending || 0) > 0 ? Math.round((folded / (nv.pending || 0)) * 1000) / 10 : null, credited, extra, activeFolds: active });
+        });
+        return { eps, nudges, folds, roundOf };
+    }
+    // Windowed rendering: when the visible slice starts MIDDLE of a round, the pre-nudge
+    // mode-n folds belong to a round whose nudge is off-screen. Group them into one
+    // synthetic open round so their bars are not mislabeled as "round -1". The open round
+    // has no recommendation (pending 0 → pct null → grey, "?" in tooltips), never a fake %.
+    function recoveryWindowMeta(events) {
+        const built = recoveryEpisodesFromEvents(events);
+        const firstN = built.nudges.length ? built.nudges[0].at : Infinity;
+        let preFolded = 0, preActive = 0;
+        built.folds.forEach((f) => { if (f.at < firstN) { if (f.mode === "a") preActive++; else preFolded += f.folded || 0; } });
+        const open = (preFolded > 0 || preActive > 0) ? { open: { at: Math.min.apply(null, events.map((e) => e.at)), tier: null, pending: 0, folded: preFolded, pct: null, activeFolds: preActive, openRound: true } } : { open: null };
+        return Object.assign({}, built, open);
+    }
+    function recoveryHeadHtml(rec) {
+        const s = rec.summary || {};
+        let head = t("det.rec_head2", { n: s.nudges || 0, f: s.folds || 0, nf: s.nudgeFolds || 0, a: s.activeFolds || 0, p: fmtW(s.totalPending || 0), s: fmtW(s.totalFolded || 0) });
+        if ((s.totalFolded || 0) > (s.totalPending || 0)) head += " · " + t("det.rec_over_stock");
+        return '<div class="hint mono" style="margin:2px 0 4px 2px;font-size:12px">' + escapeHtml(head) + "</div>";
+    }
+    function recoveryRoundSvg(events, lines) {
+  if (!events || !events.length) return "";
+  // Normalize both shapes: the server report carries {pending, folded}, the internal
+  // fixtures {p, S}. Everything below speaks the internal shape.
+  var norm = [];
+  for (var n0 = 0; n0 < events.length; n0++) {
+    var e0 = events[n0];
+    if (!e0 || !(e0.at > 0)) continue;
+    var g = {};
+    for (var kk in e0) g[kk] = e0[kk];
+    if (e0.kind === "n") g.p = e0.pending || 0;
+    else if (e0.kind === "f") {
+      g.S = e0.folded != null ? e0.folded : (e0.S || 0);
+      g.p = e0.p != null ? e0.p : (e0.pending || 0);
+      if (g.mode !== "a") g.mode = "n";
+    }
+    norm.push(g);
+  }
+  var evs0 = norm;
+  if (!evs0.length) return "";
+  // #6729 v7: the line is the COMPRESSIONS — one point per compress() call, y = that
+  // call's recovery (folded ÷ the nudge recommendation outstanding for it). Consecutive
+  // points connect in time order, so every compression sits on the line (「每个压缩都不放过」).
+  // A round's point values sum to that round's recovery (brackets carry the round sums).
+  // >100% = the call also folded older stock beyond the list (true value; axis extends).
+  // Nudges are demoted to ▼ flags (where a list was offered, not data points).
+  // Active compressions have no recommendation → blue ticks on the axis (visible + counted).
+  var W = TRAJ_W, H = 252, PL = 46, PR = 14, PT = 46, PB = 46;
+  var ih = H - PT - PB;
+  var evs = evs0;
+  // A fold whose nudge fell outside a zoom window (the fold stayed inside) is still
+  // inside its round: derive an open round from the preceding visible folds.
+  var openRound = { folded: 0, pending: 0, active: 0, at: null };
+  var openPset = {};
+  for (var o = 0; o < evs.length; o++) {
+    var oe = evs[o];
+    if (oe.kind === "n") break;
+    if (oe.mode === "a") openRound.active++;
+    else {
+      openRound.folded += oe.S;
+      // Each fold's p is the LATEST nudge's list — a burst folding the same list must not
+      // count that list N times: sum only DISTINCT recommendation amounts.
+      if ((oe.p || 0) > 0 && openPset[oe.p] !== true) { openPset[oe.p] = true; openRound.pending += oe.p; }
+      if (oe.at < (openRound.at || oe.at)) openRound.at = oe.at;
+    }
+  }
+  var built = recoveryWindowMeta(evs);
+  var episodes = built.eps || [];
+  var hasOpen = false;
+  if (openRound.folded > 0 || openRound.active > 0) {
+    openRound.at = openRound.at || evs[0].at;
+    hasOpen = true;
+    episodes = [{ at: openRound.at, tier: null, pending: openRound.pending, folded: openRound.folded, activeFolds: openRound.active, credited: openRound.pending, extra: Math.max(0, openRound.folded - openRound.pending), pct: openRound.pending > 0 ? Math.round(1000 * openRound.folded / openRound.pending) / 10 : null, open: true }].concat(episodes);
+  }
+  var t0 = evs[0].at, t1 = evs[evs.length - 1].at;
+  function xx(a) {
+    var frac = (t1 - t0) > 0 ? (a - t0) / (t1 - t0) : 0.5;
+    return PL + frac * (W - PL - PR);
+  }
+  // Per-fold points (need maxPct before yAt can be built).
+  var fPts = [];
+  for (var q0 = 0; q0 < evs.length; q0++) {
+    var qe = evs[q0];
+    if (qe.kind === "f") fPts.push({ at: qe.at, S: qe.S, p: qe.p || 0, mode: qe.mode, pct: (qe.p || 0) > 0 ? Math.round(1000 * qe.S / qe.p) / 10 : null });
+  }
+  // Growth recovery (one point per round): folded ÷ context growth since the previous
+  // round's last fold. The recommendation line answers "did it fold what it was told to";
+  // this answers "did the context actually come back down" — the ratchet meter (#6720).
+  // Needs the request-usage samples (the shared brush window); without them it is off.
+  var uLines = (lines || []).filter(function (l) { return Boolean(l) && l.at > 0; }).sort(function (a, b) { return a.at - b.at; });
+  var gPts = [];
+  var gPrevEnd = null; // previous round's last fold — the floor is measured after it
+  for (var gi = 0; gi < episodes.length; gi++) {
+    var gep = episodes[gi];
+    if (!gep || !(gep.folded || 0)) continue;
+    var gs = gep.at;
+    var nextNud = null;
+    for (var gn = 0; gn < evs.length; gn++) if (evs[gn].kind === "n" && evs[gn].at > gs) { nextNud = evs[gn].at; break; }
+    var ge = null;
+    for (var gf = 0; gf < evs.length; gf++) {
+      var gfe = evs[gf];
+      if (gfe.kind === "f" && gfe.mode === "n" && gfe.at >= gs && (nextNud === null || gfe.at < nextNud) && (ge === null || gfe.at > ge)) ge = gfe.at;
+    }
+    if (ge === null || !uLines.length) continue;
+    // growth = pre-round floor → round peak. The FLOOR is the lowest input BEFORE this
+    // round's nudge, not any in-round sample: a fold is itself a drop, so the min inside
+    // the window can sit right after an earlier fold and make "growth" look 10× larger.
+    // Peak window = [round start, last fold + 2 min]. Two conversations can share one
+    // session UUID (dsh-client #5792): sub-25%-of-peak samples are a different stream
+    // and are dropped before taking the min (applied to both floor and peak sets).
+    var preMin = null;
+    for (var gp = 0; gp < uLines.length; gp++) {
+      var pln = uLines[gp];
+      if (pln.at >= gs) break;
+      if (gPrevEnd !== null && pln.at <= gPrevEnd) continue;
+      var pin = pln.input || 0;
+      if (preMin === null || pin < preMin) preMin = pin;
+    }
+    var wSamples = [];
+    for (var gu = 0; gu < uLines.length; gu++) {
+      var gln = uLines[gu];
+      if (gln.at < gs || gln.at > ge + 120000) continue;
+      wSamples.push(gln.input || 0);
+    }
+    if (!wSamples.length) continue;
+    var gPeakAll = Math.max.apply(null, wSamples);
+    var gPeak = Math.max.apply(null, wSamples.filter(function (v) { return v >= 0.25 * gPeakAll; }));
+    var gBase;
+    if (preMin !== null && preMin >= 0.25 * gPeak) gBase = preMin;
+    else gBase = Math.min.apply(null, wSamples.filter(function (v) { return v >= 0.25 * gPeak; }));
+    var gGrow = Math.max(0, gPeak - gBase);
+    gPts.push({ at: ge, s: gep.folded || 0, g: gGrow, pct: gGrow > 0 ? Math.round(1000 * (gep.folded || 0) / gGrow) / 10 : null });
+    gPrevEnd = ge;
+  }
+  var maxPct = 100;
+  for (var q1 = 0; q1 < fPts.length; q1++) if (fPts[q1].pct !== null && fPts[q1].pct > maxPct) maxPct = fPts[q1].pct;
+  for (var qg = 0; qg < gPts.length; qg++) if (gPts[qg].pct !== null && gPts[qg].pct > maxPct) maxPct = gPts[qg].pct;
+  var axisMax = maxPct <= 100 ? 150 : Math.min(400, Math.ceil((maxPct * 1.1) / 50) * 50);
+  function yAt(pct) {
+    var c = Math.max(0, Math.min(axisMax, pct));
+    return (H - PB) - (c / axisMax) * ih;
+  }
+  function colFor(pct) {
+    if (pct >= 80) return "#2da44e";
+    if (pct >= 40) return "#bf8700";
+    return "#cf222e";
+  }
+  // Round/call numbering for tooltips: round r = folds after nudge r until nudge r+1
+  // (r=0 = open round before the first visible nudge; +1 label offset when hasOpen).
+  var nIn = {}, roundOf = [], kIn = [];
+  var r = 0;
+  for (var m = 0; m < evs.length; m++) {
+    var me = evs[m];
+    if (me.kind === "n") { r++; nIn[r] = 0; continue; }
+    nIn[r] = (nIn[r] || 0) + 1;
+    roundOf.push(r);
+    kIn.push(nIn[r]);
+  }
+  function roundLbl(rnd) { return rnd + (hasOpen ? 1 : 0); }
+  var parts = [];
+  // Grid + y labels
+  var gStep = axisMax > 200 ? 50 : 25;
+  for (var g = 0; g <= axisMax; g += gStep) {
+    var gy = yAt(g);
+    parts.push('<line x1="' + PL + '" y1="' + gy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + gy.toFixed(1) + '" stroke="' + (g === 0 ? "#d0d7de" : "#eaeef2") + '"/>');
+    parts.push('<text x="' + (PL - 6) + '" y="' + (gy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="#6e7781">' + g + "%</text>");
+  }
+  // The 100% baseline (exactly-recovered) — the center reference
+  var baseY = yAt(100);
+  parts.push('<line x1="' + PL + '" y1="' + baseY.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + baseY.toFixed(1) + '" stroke="#57606a" stroke-width="1.3"/>');
+  parts.push('<text x="' + (W - PR) + '" y="' + (baseY - 5).toFixed(1) + '" text-anchor="end" font-size="10" fill="#57606a">' + t("det.rec_line_base") + "</text>");
+  // ① nudge flags (top): ▼ = a list was offered here (marker, not a data point)
+  var nIdx = 0;
+  for (var i = 0; i < evs.length; i++) {
+    var ev = evs[i];
+    if (ev.kind !== "n") continue;
+    nIdx++;
+    var tx = xx(ev.at);
+    var tierL = (ev.tier && ev.tier > 0) ? "T" + ev.tier : "nudge";
+    parts.push('<path d="M' + tx.toFixed(1) + "," + (PT - 8).toFixed(1) + " L" + (tx - 6).toFixed(1) + "," + (PT - 18).toFixed(1) + " L" + (tx + 6).toFixed(1) + "," + (PT - 18).toFixed(1) + ' Z" fill="#d29922"><title>' + escapeHtml(t("det.rec_flag_tip", { tier: tierL, at: fmtDT(ev.at), p: fmtW(ev.p || 0) })) + "</title></path>");
+    parts.push('<text x="' + tx.toFixed(1) + '" y="' + (PT - 22).toFixed(1) + '" text-anchor="middle" font-size="10" fill="#9a6700">' + escapeHtml(tierL + " · " + fmtW(ev.p || 0)) + "</text>");
+  }
+  // ② the main line: every measurable compression, connected in time order
+  var linePts = [];
+  for (var l = 0; l < fPts.length; l++) if (fPts[l].pct !== null) linePts.push(xx(fPts[l].at).toFixed(1) + "," + yAt(fPts[l].pct).toFixed(1));
+  if (linePts.length >= 2) parts.push('<path d="M' + linePts.join(" L") + '" fill="none" stroke="#57606a" stroke-width="1.5"/>');
+  // ③ cumulative recovery (mass-weighted: running Σfolded ÷ Σrecommended)
+  var cumS = 0, cumP = 0, cumPts = [];
+  for (var c = 0; c < fPts.length; c++) {
+    var cp = fPts[c];
+    if (cp.pct === null) continue;
+    cumS += cp.S;
+    cumP += cp.p;
+    cumPts.push(xx(cp.at).toFixed(1) + "," + yAt(100 * cumS / cumP).toFixed(1));
+  }
+  if (cumPts.length >= 2) parts.push('<path d="M' + cumPts.join(" L") + '" fill="none" stroke="#8250df" stroke-width="1.2" stroke-dasharray="5 3"/>');
+  // ④ the points themselves (one per compression; non-measurable ones stay axis ticks)
+  var lastLblX = -1e9;
+  for (var p = 0; p < fPts.length; p++) {
+    var f = fPts[p];
+    var fx = xx(f.at);
+    if (f.pct === null) {
+      // 每个压缩都不放过: no measurable recommendation (active, or a non-T1 nudge with
+      // no pending) → keep it visible on the axis with its own tick + tooltip.
+      var noRec = f.mode !== "a";
+      var atip = noRec ? t("det.rec_norec", { at: fmtDT(f.at), s: fmtW(f.S) }) : t("det.rec_tick_a_tip", { at: fmtDT(f.at), s: fmtW(f.S) });
+      parts.push('<rect x="' + (fx - 2).toFixed(1) + '" y="' + (baseY + 1).toFixed(1) + '" width="4" height="13" rx="1" fill="' + (noRec ? "#6e7781" : "#0969da") + '"><title>' + escapeHtml(atip) + "</title></rect>");
+      continue;
+    }
+    var fy = yAt(f.pct);
+    var tip = t("det.rec_tick_n_tip", { n: roundLbl(roundOf[p]), k: kIn[p], nn: nIn[roundOf[p]], at: fmtDT(f.at), s: fmtW(f.S), p: fmtW(f.p), pct: f.pct });
+    if (f.S > f.p) tip += t("det.rec_line_over_note");
+    var pc = f.pct > 100 ? "#0969da" : colFor(f.pct);
+    if (f.pct > 100) parts.push('<circle cx="' + fx.toFixed(1) + '" cy="' + fy.toFixed(1) + '" r="7" fill="none" stroke="#0969da"/>');
+    parts.push('<circle cx="' + fx.toFixed(1) + '" cy="' + fy.toFixed(1) + '" r="4.5" fill="' + pc + '"><title>' + escapeHtml(tip) + "</title></circle>");
+    var labX = fx;
+    if (labX - lastLblX < 44) labX = lastLblX + 44;
+    if (labX > W - PR - 30) labX = W - PR - 30;
+    lastLblX = labX;
+    parts.push('<text x="' + labX.toFixed(1) + '" y="' + (fy - 9).toFixed(1) + '" text-anchor="middle" font-size="10" font-weight="600" fill="' + pc + '">' + f.pct + "%</text>");
+  }
+  // ④b the growth line: thick TEAL (#1b7c83), one point per round (folded ÷ growth
+  // since last fold). Teal + hollow dots on purpose — blue #0969da belongs to the
+  // active-fold ticks / over-100 fold dots, and a lone blue growth dot read as an
+  // "active compression" on a single-round session (user report, 2026-11-16).
+  if (!uLines.length && episodes.some(function (ep) { return (ep.folded || 0) > 0; })) {
+    parts.push('<text x="' + (W - PR) + '" y="' + (PT - 22) + '" text-anchor="end" font-size="10" fill="#6e7781">' + escapeHtml(t("det.rec_growth_noline")) + "</text>");
+  }
+  var gLine = [];
+  for (var gl = 0; gl < gPts.length; gl++) if (gPts[gl].pct !== null) gLine.push(xx(gPts[gl].at).toFixed(1) + "," + yAt(gPts[gl].pct).toFixed(1));
+  if (gLine.length >= 2) parts.push('<path d="M' + gLine.join(" L") + '" fill="none" stroke="#1b7c83" stroke-width="2"/>');
+  for (var gr = 0; gr < gPts.length; gr++) {
+    var gq = gPts[gr];
+    var gx2 = xx(gq.at);
+    if (gq.pct === null) {
+      // No new growth in the round → pure older-stock cleanup; mark on the 0% axis.
+      parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + (H - PB).toFixed(1) + '" r="5" fill="none" stroke="#1b7c83"><title>' + escapeHtml(t("det.rec_growth_flat", { s: fmtW(gq.s) })) + "</title></circle>");
+      continue;
+    }
+    var gy2 = yAt(gq.pct);
+    if (gq.pct > 100) parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + gy2.toFixed(1) + '" r="8" fill="none" stroke="#1b7c83"/>');
+    parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + gy2.toFixed(1) + '" r="5" fill="#ffffff" stroke="#1b7c83" stroke-width="2"><title>' + escapeHtml(t("det.rec_growth_tip", { at: fmtDT(gq.at), g: fmtW(gq.g), s: fmtW(gq.s), pct: gq.pct })) + "</title></circle>");
+    var glx = gx2 + 10, ganchor = "start";
+    if (glx > W - PR - 40) { glx = gx2 - 10; ganchor = "end"; }
+    parts.push('<text x="' + glx.toFixed(1) + '" y="' + (gy2 + 3).toFixed(1) + '" text-anchor="' + ganchor + '" font-size="10" font-weight="700" fill="#1b7c83">' + gq.pct + "%</text>");
+  }
+  // ⑤ round brackets (bottom): the per-nudge-round sums
+  for (var bi = 0; bi < episodes.length; bi++) {
+    var ep = episodes[bi];
+    var x0 = xx(ep.at);
+    var yb = H - PB + 12 + (bi % 2) * 16;
+    var bx = x0, k = 0;
+    for (var j = 0; j < evs.length; j++) {
+      var e2 = evs[j];
+      if (e2.kind === "f" && e2.mode === "n" && e2.at >= ep.at) {
+        var nextN = null;
+        for (var h = 0; h < evs.length; h++) if (evs[h].kind === "n" && evs[h].at > ep.at) { nextN = evs[h].at; break; }
+        if (nextN === null || e2.at < nextN) {
+          k++;
+          if (xx(e2.at) > bx) bx = xx(e2.at);
+        }
+      }
+    }
+    if (k === 0) bx = x0;
+    var bcol = ep.pct != null ? colFor(ep.pct) : "#6e7781";
+    var epF = ep.folded || 0, epP = ep.pending || 0, extra = ep.extra > 0 ? ep.extra : 0;
+    parts.push('<path d="M' + x0.toFixed(1) + "," + (yb - 4).toFixed(1) + " L" + x0.toFixed(1) + "," + yb.toFixed(1) + " L" + bx.toFixed(1) + "," + yb.toFixed(1) + " L" + bx.toFixed(1) + "," + (yb - 4).toFixed(1) + '" fill="none" stroke="' + bcol + '" stroke-width="1"/>');
+    parts.push('<text x="' + ((x0 + bx) / 2).toFixed(1) + '" y="' + (yb + 10).toFixed(1) + '" text-anchor="middle" font-size="10" fill="' + bcol + '">' + escapeHtml((ep.open || ep.openRound) ? t("det.rec_bracket_open", { k, s: fmtW(epF), p: fmtW(epP), pct: ep.pct != null ? ep.pct + "%" : "-" }) : t("det.rec_bracket", { i: bi + 1, k, s: fmtW(epF), p: fmtW(epP), pct: ep.pct != null ? ep.pct + "%" : "-" })) + (extra > 0 ? t("det.rec_bracket_over", { s: fmtW(extra) }) : "") + "</text>");
+  }
+  return '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img">' + parts.join("") + "</svg>";
+}
+
     function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
         lines = (lines || []).filter((l) => Boolean(l));
         if (!lines.length) return "";
@@ -2226,6 +2557,7 @@ function changelogCatOf(rawLine) {
         return Math.max(0, Math.min(n - 1, Math.round(((x - TRAJ_PL) / iw) * (n - 1))));
     }
     const chartZooms = [];   // live instances — Esc resets any zoomed chart (#2489 behavior)
+
     function makeChartZoom(cfg) {
         // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg, link?: { members } }
         const z = { range: null, drag: null, state: null, cfg };
@@ -2242,13 +2574,18 @@ function changelogCatOf(rawLine) {
             // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
             // the byte-parity acceptance criterion pins). Time-filtering only applies to a
             // ZOOMED window, where a foreign mark would land on the wrong sample.
-            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], offset: a };
+            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], recovery: z.state.recovery || null, offset: a };
             const t0 = lines[0] ? (lines[0].at || 0) : 0;
             const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
             return {
                 lines,
                 folds: (z.state.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
                 seams: (z.state.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
+                // #6729: recovery events follow the zoom window; the session-wide summary
+                // stays global so the header never lies about a zoomed window.
+                recovery: (z.state.recovery && z.state.recovery.events.length)
+                    ? { events: z.state.recovery.events.filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1), summary: z.state.recovery.summary }
+                    : null,
                 offset: a,
             };
         };
@@ -2271,7 +2608,7 @@ function changelogCatOf(rawLine) {
             const wrap = $(cfg.elId);
             const v = z.visible();
             if (!wrap || !v) return;
-            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams) : "";
+            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams, v.recovery) : "";
             updateStatus(v);
         };
         z.setRange = function setRange(r) {
@@ -2358,6 +2695,10 @@ function changelogCatOf(rawLine) {
     const detailChartLink = { members: [] };
     const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", link: detailChartLink, render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
     const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", link: detailChartLink, render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
+    // #6729: the recovery chart joins the same brush link. makeChartZoom's visible()
+    // filters recovery events to the zoomed [t0, t1]; this render callback re-derives the
+    // per-round aggregates for whatever window it is given.
+    const recZoom = makeChartZoom({ elId: "rec-chart", statusId: "rec-status", resetId: "rec-reset", link: detailChartLink, render: (lines, folds, seams, recovery) => (recovery && recovery.events && recovery.events.length) ? recoveryRoundSvg(recovery.events, lines) : "" });
     function bindTrajectoryBrush(d) {
         const ledger = d.ledger || {};
         const lines = (ledger.lines || []).filter((l) => Boolean(l));
@@ -2372,11 +2713,20 @@ function changelogCatOf(rawLine) {
         const seam = detailSeam(ledger);
         hitZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
     }
+    function bindRecoveryChart(d) {
+        const ledger = d.ledger || {};
+        const lines = (ledger.lines || []).filter((l) => Boolean(l));
+        const rec = ledger.recovery && ledger.recovery.events && ledger.recovery.events.length ? ledger.recovery : null;
+        recZoom.bind({ lines, folds: ledger.folds || [], seams: [], recovery: rec });
+    }
     window.bili_trajSvg = trajectorySvg;
     window.bili_hitSvg = hitRateSvg;
+    window.bili_recoveryRoundSvg = recoveryRoundSvg;
+    window.bili_recoveryEpisodes = recoveryEpisodesFromEvents;
     window.bili_causes = classifyLineCauses;
     window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => trajZoom.visible(), range: () => trajZoom.range };
     window.bili_hitZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => hitZoom.visible(), range: () => hitZoom.range };
+    window.bili_recZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => recZoom.visible(), range: () => recZoom.range };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
@@ -2397,7 +2747,7 @@ function changelogCatOf(rawLine) {
         if (name === "bash" || name === "shell" || name === "run_command") return "t-shell";
         if (name === "read" || name === "write" || name === "edit" || name === "ls" || name === "glob" || name === "note") return "t-file";
         if (name === "grep" || name === "search_context" || name === "decompress" || name === "acp_retrieve") return "t-seek";
-        if (name === "compress" || name === "acp_status" || name === "acp_cache") return "t-fold";
+        if (name === "compress" || name === "acp_status" || name === "acp_cache" || name === "acp_retire" || name === "acp_restore" || name === "acp_rewrite") return "t-fold";
         return "";
     }
     function parseToolLine(line) {
@@ -2418,12 +2768,16 @@ function changelogCatOf(rawLine) {
     // marker, so the handoff renderer would otherwise fold the answer that
     // follows into the collapsed thinking box. Mirrored in HANDOFF_THINK_END.
     const HANDOFF_THINK_END = "<!-- /reasoning -->";
-    function splitHandoffBody(bodyLines) {
+    function splitHandoffBody(bodyLines, role) {
         const segs = [];
         let thinkClosed = false;
+        // Tool-role blocks carry whole tool messages; multi-line payloads
+        // (results, multi-line call arguments) must stay attached to the tool
+        // segment so the card renders one highlighted input/output block.
+        const inToolBlock = role === "tool";
         for (let i = 0; i < bodyLines.length; i++) {
             const raw = bodyLines[i];
-            if (raw.trim() === "" && !(segs.length && segs[segs.length - 1].type === "out")) continue;
+            if (raw.trim() === "" && !(segs.length && (segs[segs.length - 1].type === "out" || (inToolBlock && segs[segs.length - 1].type === "tool")))) continue;
             const activeThink = segs[segs.length - 1];
             if (raw.trim() === HANDOFF_THINK_END && activeThink && activeThink.type === "think" && !thinkClosed) {
                 if (bodyLines[i + 1] === raw) { activeThink.lines.push(raw); i++; }
@@ -2440,7 +2794,7 @@ function changelogCatOf(rawLine) {
                 continue;
             }
             const last = segs[segs.length - 1];
-            if (last && (last.type === "out" || (last.type === "think" && !thinkClosed))) last.lines.push(raw);
+            if (last && (last.type === "out" || (inToolBlock && last.type === "tool") || (last.type === "think" && !thinkClosed))) last.lines.push(raw);
             else segs.push({ type: "out", lines: [raw] });
         }
         return segs;
@@ -2505,17 +2859,84 @@ function changelogCatOf(rawLine) {
         fP(); fL(); fQ(); fPr();
         return html.join("");
     }
+    // eWork-grade handoff rendering (2026-11-11): role cards instead of bare
+    // divider lines, Markdown bodies from the shared mdrender core, hand-
+    // highlighted code, and structured tool input/output with language
+    // detection and per-block copy. The old version escaped everything to
+    // plain text — raw backticks, no tables, no highlighting anywhere.
+    const handoffCopyBlobs = [];
+    const HC_ROLE_ICON = { user: "\ud83d\udc64", assistant: "\ud83e\udd16", tool: "\ud83d\udee0" };
+    function hcDetectLang(payload) {
+        const t2 = payload.trim();
+        if (!t2) return "text";
+        const first = t2.charAt(0);
+        const lastCh = t2.charAt(t2.length - 1);
+        if (first === "{" || first === "[") {
+            try { JSON.parse(t2); return "json"; } catch (e) { /* truncated / pretty-printed */ }
+            if (lastCh === "}" || lastCh === "]") return "json";
+        }
+        const ls = t2.split("\\n");
+        let nonempty = 0, mark = 0;
+        for (const l of ls) {
+            const c = l.trim();
+            if (!c) continue;
+            nonempty++;
+            if (c.charAt(0) === "+" || c.charAt(0) === "-" || c.charAt(0) === "@") mark++;
+        }
+        if (nonempty >= 3 && mark / nonempty > 0.5) return "diff";
+        return "text";
+    }
+    function renderHcTool(s) {
+        const payload = s.lines.join("\\n");
+        const lang = hcDetectLang(payload);
+        let shown = payload;
+        if (s.kind === "call" && lang === "json") { try { shown = JSON.stringify(JSON.parse(payload), null, 2); } catch (e) {} }
+        handoffCopyBlobs.push(payload);
+        const idx = handoffCopyBlobs.length - 1;
+        const isRes = s.kind === "res";
+        const open = payload.split("\\n").length <= 20;
+        return '<details class="hc-tool"' + (open ? " open" : "") + '><summary class="hc-tool-sum">'
+            + '<span class="tool-chip ' + toolChipCls(s.name) + '">' + escapeHtml(s.name) + "</span>"
+            + '<span class="tool-cid">' + escapeHtml(s.cid) + "</span>"
+            + (isRes ? '<span class="hc-res">\u2192</span>' : "")
+            + '</summary><div class="hc-tool-body">'
+            + '<div class="hc-io-head"><span class="hc-io-label">' + (isRes ? t("det.io_out") : t("det.io_in")) + (lang !== "text" ? " \u00b7 " + lang : "") + '</span><button type="button" class="hc-copy btn sm" data-hc="' + idx + '">' + t("common.copy") + "</button></div>"
+            + '<pre class="hc-io"><code' + (lang !== "text" ? ' class="hl"' : "") + ">" + mdApi.highlight(shown, lang) + "</code></pre>"
+            + "</div></details>";
+    }
     function renderHandoffMd(md) {
+        handoffCopyBlobs.length = 0; // re-render replaces every .hc-copy button — drop the previous session's payloads
         const lines = md.split("\\n");
         let start = 0;
         for (let i = 0; i < lines.length; i++) if (lines[i].indexOf("## ") === 0 && lines[i].indexOf("Conversation") > -1) { start = i + 1; break; }
         const blocks = [];
+        const sections = []; // post-Conversation ## sections (#845 appends "## Compressed block summaries")
         let cur = null;
+        let section = null;
+        let entry = null;
         // #2065: only known roles open a block — an in-body Markdown heading
         // ("### 7.1 …" inside a user's rules blob) is content, not a divider.
         const KNOWN_ROLE = { user: 1, assistant: 1, tool: 1 };
         for (let i = start; i < lines.length; i++) {
             const l = lines[i];
+            if (start > 0 && l.indexOf("## ") === 0) {
+                // A new ## section closes the role cards. Without this the whole
+                // "## Compressed block summaries" appendix (80+ block entries on
+                // long sessions) lands inside the last assistant card.
+                cur = null;
+                section = { title: l.slice(3).trim(), prologue: [], entries: [] };
+                sections.push(section);
+                entry = null;
+                continue;
+            }
+            if (section) {
+                if (l.indexOf("### Block ") === 0) {
+                    entry = { head: l.slice(10).trim(), lines: [] };
+                    section.entries.push(entry);
+                } else if (entry) entry.lines.push(l);
+                else section.prologue.push(l);
+                continue;
+            }
             let divider = null;
             if (l.indexOf("### ") === 0) { const r = l.slice(4).trim(); if (KNOWN_ROLE[r]) divider = r; }
             if (divider) { cur = { role: divider, lines: [] }; blocks.push(cur); continue; }
@@ -2523,23 +2944,60 @@ function changelogCatOf(rawLine) {
         }
         const html = [];
         if (!blocks.length) return '<span class="dim small">' + escapeHtml(String(md).slice(0, 200)) + "</span>";
+        // Document meta (title, session id, token stats…) sits before the
+        // Conversation heading — the old client skipped it; render it as a
+        // compact key/value box so the handoff keeps its header context.
+        const meta = [];
+        for (let i = 0; i < start - 1; i++) {
+            const l = lines[i];
+            if (l.trim() === "") continue;
+            if (l.indexOf("# ") === 0) meta.push('<div class="hdoc-title">' + escapeHtml(l.slice(2).trim()) + "</div>");
+            else if (l.indexOf("- ") === 0) {
+                const item = l.slice(2);
+                const c = item.indexOf(": ");
+                if (c > -1) meta.push('<div class="hdoc-meta-row"><span class="hdoc-meta-k">' + escapeHtml(item.slice(0, c)) + '</span><span class="hdoc-meta-v">' + escapeHtml(item.slice(c + 2)) + "</span></div>");
+                else meta.push('<div class="hdoc-meta-row"><span class="hdoc-meta-v">' + escapeHtml(item) + "</span></div>");
+            } else meta.push('<div class="hdoc-meta-row"><span class="hdoc-meta-v">' + escapeHtml(l) + "</span></div>");
+        }
+        if (meta.length) html.push('<div class="hdoc-meta">' + meta.join("") + "</div>");
+        if (start > 0 && lines[start - 1] && lines[start - 1].indexOf("## ") === 0) html.push('<div class="hdoc-sub">' + escapeHtml(lines[start - 1].slice(3).trim()) + "</div>");
         for (const b of blocks) {
             const role = b.role === "user" || b.role === "assistant" || b.role === "tool" ? b.role : "assistant";
-            html.push('<h3 class="msg-role ' + role + '">' + role + "</h3>");
-            const segs = splitHandoffBody(b.lines);
-            if (!segs.length) { html.push('<div class="dim small">_(empty)_</div>'); continue; }
+            const segs = splitHandoffBody(b.lines, role);
+            const body = [];
+            if (!segs.length) body.push('<div class="dim small">_(empty)_</div>');
             for (const s of segs) {
                 if (s.type === "think") {
                     const n = s.lines.filter((x) => x.trim() !== "").length;
-                    html.push('<details class="msg-think"><summary>' + t("det.thinking") + " \u00b7 " + n + '</summary><div class="think-box">' + s.lines.map(escapeHtml).join("<br/>") + "</div></details>");
+                    body.push('<details class="hc-think"><summary>\ud83d\udcad ' + t("det.thinking") + " \u00b7 " + n + '</summary><div class="hc-think-body">' + mdApi.render(s.lines.join("\\n")) + "</div></details>");
                 } else if (s.type === "out") {
-                    html.push('<p class="msg-out">' + s.lines.map(escapeHtml).join("<br/>") + "</p>");
+                    body.push('<div class="hc-out">' + mdApi.render(s.lines.join("\\n")) + "</div>");
                 } else {
-                    const txt = s.lines.join("\\n");
-                    let shown = txt;
-                    if (s.kind === "call") { try { shown = JSON.stringify(JSON.parse(txt), null, 2); } catch (e) {} }
-                    html.push('<div class="' + (s.kind === "call" ? "msg-tool" : "msg-result") + '"><span class="tool-chip ' + toolChipCls(s.name) + '">' + escapeHtml(s.name) + '</span><span class="tool-cid">' + escapeHtml(s.cid) + "</span>" + (s.kind === "res" ? '<span class="dim"> \u2192 </span>' : "") + '<pre class="' + (s.kind === "call" ? "tool-args" : "tool-out") + '">' + escapeHtml(shown) + "</pre></div>");
+                    body.push(renderHcTool(s));
                 }
+            }
+            html.push('<div class="hcard hc-' + role + '"><div class="hc-head"><span class="hc-badge hc-badge-' + role + '">' + (HC_ROLE_ICON[role] || "") + " " + role.charAt(0).toUpperCase() + role.slice(1) + '</span></div><div class="hc-body">' + body.join("") + "</div></div>");
+        }
+        for (const sec of sections) {
+            html.push('<div class="hdoc-sub">' + escapeHtml(sec.title) + "</div>");
+            if (sec.prologue.some((x) => x.trim() !== "")) html.push('<div class="hc-section-pro">' + mdApi.render(sec.prologue.join("\\n")) + "</div>");
+            for (const e of sec.entries) {
+                const dash = e.head.indexOf(" \u2014 ");
+                const id = dash > -1 ? e.head.slice(0, dash) : e.head;
+                const topic = dash > -1 ? e.head.slice(dash + 3) : "";
+                let tier = "";
+                let tierAt = -1;
+                for (let k = 0; k < e.lines.length; k++) {
+                    const c = e.lines[k].trim();
+                    if (c === "") continue;
+                    if (c.indexOf("tier ") === 0 && c.indexOf(" tokens compressed") > -1) { tier = c; tierAt = k; }
+                    break;
+                }
+                const bodyLines = tierAt > -1 ? e.lines.slice(tierAt + 1) : e.lines;
+                const card = '<div class="hblock"><div class="hblock-head"><span class="hblock-id">' + escapeHtml(id) + "</span>" + (topic ? '<span class="hblock-topic">' + escapeHtml(topic) + "</span>" : "") + "</div>"
+                    + (tier ? '<div class="hblock-tier">' + escapeHtml(tier) + "</div>" : "")
+                    + '<div class="hblock-body">' + mdApi.render(bodyLines.join("\\n")) + "</div></div>";
+                html.push(card);
             }
         }
         return html.join("");
@@ -2656,8 +3114,8 @@ function changelogCatOf(rawLine) {
             const maxCh = Math.floor((TREE_W - 52) / 7);
             if (topic.length > maxCh) topic = topic.slice(0, Math.max(1, maxCh - 1)) + "...";
             const rr = refRangeOf(b);
-            p.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x * colW + 12).toFixed(1) + "," + (n.y + 6).toFixed(1) + ')">');
-            p.push('<rect width="' + TREE_W + '" height="' + TREE_H + '" rx="9"><title>' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + blockTopic(b)) + "</title></rect>");
+            p.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" aria-label="' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + blockTopic(b)) + '" transform="translate(' + (n.x * colW + 12).toFixed(1) + "," + (n.y + 6).toFixed(1) + ')">');
+            p.push('<rect width="' + TREE_W + '" height="' + TREE_H + '" rx="9"></rect>');
             p.push('<text class="g-id" x="10" y="17">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "")) + "</text>");
             p.push('<text class="g-topic" x="10" y="34">' + escapeHtml(topic) + "</text>");
             if (hidden > 0)
@@ -3072,6 +3530,32 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
         }
         parts.push("</div></div>");
+        // #6729: self-contained recovery view (nudge flags + per-call bars +
+        // round points/brackets). The trajectory chart above stays clean —
+        // its fold lines alone were already busy, and mixing recovery marks
+        // in made them untellable apart.
+        const recLine = ledger.recovery;
+        if (recLine && recLine.events && recLine.events.length) {
+            parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.rec_line_title") + '</span><span class="hint">' + t("det.rec_line_sub") + '</span></div><div class="card-b">');
+            // #6729: the honest header is HTML above the chart (never overlaps the flags),
+            // and the chart is a linked zoom member — drag-select on the trajectory or
+            // hit-rate chart re-renders this one over the same window.
+            parts.push(recoveryHeadHtml(recLine));
+            parts.push('<div id="rec-status" class="chart-status" style="min-height:0"></div>');
+            parts.push('<div id="rec-chart" class="chart-wrap"></div>');
+            parts.push('<div class="chart-legend">');
+            parts.push(legendItem("background:#d29922", t("det.rec_leg_nudge")));
+            parts.push(legendItem("background:#2da44e", t("det.rec_line_g")));
+            parts.push(legendItem("background:#bf8700", t("det.rec_line_y")));
+            parts.push(legendItem("background:#cf222e", t("det.rec_line_r")));
+            parts.push(legendItem("background:#0969da", t("det.rec_leg_active")));
+            parts.push('<span><span class="dot" style="background:none;border-top:2px dashed #8250df;height:0;border-radius:0;width:14px"></span>' + t("det.rec_leg_cum") + "</span>");
+            parts.push(legendItem("background:#57606a", t("det.rec_leg_pt")));
+            parts.push('<span><span class="dot" style="background:none;border-top:3px solid #1b7c83;height:0;border-radius:0;width:14px"></span>' + t("det.rec_leg_growth") + "</span>");
+            parts.push("</div>");
+            parts.push('<div class="hint" style="margin-top:6px">' + escapeHtml(t("det.rec_note_t1")) + "<br>" + escapeHtml(t("det.rec_note_burst")) + "</div>");
+            parts.push("</div></div>");
+        }
         if (seamActive && seam.events.length > 0) {
             const evHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + '</th><th>' + t("det.seam_col_div") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.seam_events_tip")) + '"><b>' + t("det.seam_events", { n: seam.events.length }) + "</b></summary>"
@@ -3274,6 +3758,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
             bindHitRateChart(d);
+            bindRecoveryChart(d);
             const cc = $("session-conflicts-clear");
             if (cc) {
                 cc.addEventListener("click", async () => {
@@ -3580,6 +4065,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     // innerHTML under a pressed finger (same trick as the #4173 live map).
     let treeViewState = null;
     let treeViewRender = null;
+    let treeTipRedraw = null;
     function bindTreeModeActions() {
         const graphView = $("tree-graph");
         const listView = $("tree-list");
@@ -3594,10 +4080,100 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         let mode = "tree";
         try { mode = sessionStorage.getItem("bili-tree-mode") === "list" ? "list" : "tree"; } catch (e) {}
         const st = { mode: mode, selected: "", expanded: {} };
+        st.blocks = blocks;
         treeViewState = st;
+        // Stable hover card — the native SVG <title> tooltip dies the moment
+        // any repaint (expand/collapse, Esc, the #4173 live tick) swaps the
+        // drawing under a stationary cursor, so the tree keeps its own.
+        const tip = document.createElement("div");
+        tip.className = "g-tip";
+        tip.hidden = true;
+        graphView.appendChild(tip);
+        const tipState = { x: 0, y: 0 };
+        function blockAt(x, y) {
+            let el = null;
+            try { el = document.elementFromPoint(x, y); } catch (err) {}
+            if (!el || !el.closest) return null;
+            const n = el.closest("[data-bid]");
+            if (!n || !graphView.contains(n)) return null;
+            const bid = n.getAttribute("data-bid");
+            const srcB = st.blocks || [];
+            for (let i = 0; i < srcB.length; i++) if (srcB[i].blockId === bid) return { b: srcB[i], g: n };
+            return null;
+        }
+        // The box only fits ~20 CJK chars at most, so the on-node label is
+        // truncated hard; hovering widens it in place (the float card beside
+        // the pointer still carries the full topic).
+        const TOPIC_LONG_CH = 20;
+        let tipNodeG = null;
+        let tipNodeB = null;
+        function setNodeTopic(g, b, long) {
+            if (!g || !b) return;
+            const t = g.querySelector("text.g-topic");
+            if (!t) return;
+            let topic = blockTopic(b);
+            const maxCh = long ? TOPIC_LONG_CH : Math.floor((TREE_W - 52) / 7);
+            if (topic.length > maxCh) topic = topic.slice(0, Math.max(1, maxCh - 1)) + "\u2026";
+            t.textContent = topic;
+        }
+        function showTipAt(x, y) {
+            if (st.mode !== "tree" || graphView.hidden) { hideTip(); return; }
+            const hit = blockAt(x, y);
+            const b = hit ? hit.b : null;
+            const g = hit ? hit.g : null;
+            if (g !== tipNodeG) {
+                setNodeTopic(tipNodeG, tipNodeB, false);
+                tipNodeG = g;
+                tipNodeB = b;
+                if (tipNodeG) setNodeTopic(tipNodeG, tipNodeB, true);
+            }
+            if (!b) { tip.hidden = true; return; }
+            tipState.x = x; tipState.y = y;
+            const tierNum = Number(b.tier) || 1;
+            const rr = refRangeOf(b);
+            let html = '<div class="gt-id">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "")) + '</div>';
+            const topic = blockTopic(b);
+            if (topic) html += '<div class="gt-topic">' + escapeHtml(topic) + '</div>';
+            const bits = [];
+            if (b.compressedTokens) bits.push(fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens));
+            if (b.effectiveMessageCount) bits.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
+            if (bits.length) html += '<div class="gt-meta">' + escapeHtml(bits.join(" \u00b7 ")) + '</div>';
+            tip.innerHTML = html;
+            tip.hidden = false;
+            const box = graphView.getBoundingClientRect();
+            let lx = x - box.left + 14;
+            let ly = y - box.top + 16;
+            const tw = tip.offsetWidth;
+            const th = tip.offsetHeight;
+            if (lx + tw > box.width - 4) lx = x - box.left - tw - 14;
+            if (ly + th > box.height - 4) ly = y - box.top - th - 16;
+            if (lx < 4) lx = 4;
+            if (ly < 4) ly = 4;
+            tip.style.left = lx + "px";
+            tip.style.top = ly + "px";
+        }
+        function hideTip() {
+            setNodeTopic(tipNodeG, tipNodeB, false);
+            tipNodeG = null;
+            tipNodeB = null;
+            tip.hidden = true;
+        }
+        // After a repaint the node under a stationary pointer may have moved
+        // or been replaced — re-resolve it so the tip neither dangles over the
+        // wrong node nor vanishes while the cursor is still hovering.
+        treeTipRedraw = function () {
+            if (tip.hidden) return;
+            showTipAt(tipState.x, tipState.y);
+        };
+        graphView.addEventListener("pointermove", function (e) { showTipAt(e.clientX, e.clientY); });
+        graphView.addEventListener("pointerleave", hideTip);
         function renderTree() {
             const inner = graphView.querySelector(".tm-inner");
             if (inner) inner.innerHTML = renderCollapSvg(blocks, st.expanded, st.selected).html;
+            // the redraw replaced the drawing — the widened label died with it
+            tipNodeG = null;
+            tipNodeB = null;
+            if (treeTipRedraw) treeTipRedraw();
         }
         treeViewRender = renderTree;
         function select(bid) {
@@ -3718,6 +4294,18 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         });
     }
     function bindHandoffActions(d) {
+        // Per-tool copy buttons (data-hc indexes handoffCopyBlobs, filled by
+        // renderHandoffMd at render time). Bound before the !handoffMd early
+        // return: the server-rendered fallback pane has no such buttons, so
+        // this is a harmless no-op there.
+        const hcPane = document.querySelector('#session-detail-view .det-pane[data-pane="handoff"]');
+        if (hcPane) hcPane.querySelectorAll(".hc-copy").forEach((btn) => {
+            btn.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                const i = Number(btn.getAttribute("data-hc") || 0);
+                copyText(handoffCopyBlobs[i] || "", btn);
+            });
+        });
         const copyBtn = $("handoff-copy-md");
         const dlBtn = $("handoff-dl");
         if (!d.handoffMd) {
@@ -5383,7 +5971,30 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                     // selection survive the tick (the list is static DOM).
                     const inner = view.querySelector(".tm-inner");
                     const stv = treeViewState || { expanded: {}, selected: "" };
-                    if (inner) inner.innerHTML = renderCollapSvg(r.blocks, stv.expanded, stv.selected).html;
+                    // The /tree tick ships lean nodes (no topic/summary/token
+                    // counts) — merge each over the rich detail block so the
+                    // 5s repaint keeps node titles, tip meta and counts.
+                    const rich = (stv && stv.blocks) || window.__biliDetailBlocks || [];
+                    const richById = {};
+                    for (let ri = 0; ri < rich.length; ri++) {
+                        const rb = rich[ri];
+                        if (rb && rb.blockId) richById[rb.blockId] = rb;
+                    }
+                    const merged = r.blocks.map(function (x) {
+                        const base = richById[x.blockId];
+                        if (!base) return x;
+                        const out = {};
+                        for (const k in base) out[k] = base[k]; // rich: topic/summary/tokens/counts
+                        out.blockId = x.blockId; out.tier = x.tier; out.active = x.active; // tick wins
+                        out.directBlockIds = (x.directBlockIds || []).slice();
+                        if (x.startRef !== undefined) out.startRef = x.startRef;
+                        if (x.endRef !== undefined) out.endRef = x.endRef;
+                        if (x.parentBlockId !== undefined) out.parentBlockId = x.parentBlockId;
+                        return out;
+                    });
+                    if (stv) stv.blocks = merged;
+                    if (inner) inner.innerHTML = renderCollapSvg(merged, stv.expanded, stv.selected).html;
+                    if (treeTipRedraw) treeTipRedraw();
                 }
             }
         } catch (e) {

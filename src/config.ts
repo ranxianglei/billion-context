@@ -339,6 +339,23 @@ export type CompressSettings = {
      *  offending span(s). Host-only; off unless explicitly enabled at some
      *  level. Deepest level wins PER FIELD across global → provider → model. */
     requireRecommendation?: boolean;
+    /** #7318: the model-visible "fold more" recommendation in the SUCCESS
+     *  compress receipt — the remaining-offer range list (with the one-call
+     *  hint) after a partial fold, and the "Uncovered history remains" audit
+     *  note, which fires at most once per nudge-injection cycle (#6522). When
+     *  false or absent (DEFAULT) the success receipt carries no fold
+     *  recommendation at all: only the verbatim "No compressible ranges
+     *  remain" stop signal when the offer is genuinely exhausted (and honest
+     *  silence while material uncovered mass remains, #4331). Off by default
+     *  because per-receipt re-recommendation drove models into endless fold
+     *  loops against explicit user stop requests (#7318: 200+ folds in one
+     *  night; #6522/#5872 same family), each fold rewriting the context
+     *  prefix and re-billing the prompt-cache tail. The per-turn growth nudge
+     *  (KDD #8, `compress.injectNudge`) is a separate channel and is NOT
+     *  affected by this knob. Host-only (never passed to the kernel); opt-in.
+     *  Deepest level wins PER FIELD across global → provider → model, like
+     *  every other compress field. */
+    postComPressTail?: boolean;
     /** Trailing messages never offered for compression
      *  (kernel `preserveRecentMessages`). */
     preserveRecentMessages?: number;
@@ -544,6 +561,18 @@ export type CompressSettings = {
          *  old behavior of marking any result ≥ minToolTokens. */
         mediaOnly?: boolean;
     };
+    /** [#5765] Block-lifecycle tools (kernel `Config.blockOps`,
+     *  acp-kernel >= 0.0.194): acp_retire / acp_restore move compressed
+     *  blocks out of (back into) the resident view; acp_rewrite replaces a
+     *  block's stored summary with supplied text. When `enabled` the three
+     *  tools are advertised, injected and prompted for; when off (default)
+     *  they are absent from every surface and a stray call gets a
+     *  "not enabled" receipt. Off unless explicitly enabled at some level.
+     *  Merged sub-field-wise across the three levels like `absorb`. */
+    blockOps?: {
+        /** Enable the block-lifecycle tools for this scope. Absent/false = off. */
+        enabled?: boolean;
+    };
     /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
      *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
      *  ID-referenced at arrival by the kernel's ccr-store node (prune →
@@ -611,6 +640,11 @@ export type CompressSettings = {
         /** A closed turn's reasoning run must exceed this many chars to be
          *  dropped (default 2048). */
         threshold?: number;
+        /** (#7144 follow-up) Also drop the reasoning of ANY closed round in
+         *  the protected tail, not only compress turns — those rounds leave
+         *  the window (and their reasoning) at the next fold anyway. The
+         *  in-flight round is never touched. Default: false. */
+        tail?: boolean;
     };
     /** [#739] Opt-in guard against gpt-5.x/gpt-6.x "lattice" reasoning truncation
      *  (reasoning stops at exactly base*n+offset tokens, default 518n-2 -> 516,
@@ -1938,6 +1972,13 @@ export interface PiSubagentsFileConfig {
     /** "skip" (default) — suppress the completion notification when the
      *  model already read the result file; "always" — always inject. */
     notifyIfRead?: "skip" | "always";
+    /** Deliver acp_delegate notifications as a typed custom message carrying a
+     *  versioned details envelope (run identity + launch provenance) alongside
+     *  the SAME model-visible text, so third-party UIs tie a notice to its
+     *  launching turn without parsing prose (#5750). Default false — plain
+     *  user-message delivery, byte-identical to before; hosts without
+     *  ExtensionAPI.sendMessage fall back to the plain path automatically. */
+    notifyStructured?: boolean;
     /** TUI shortcut for the fleet inspector (default "ctrl+alt+d"); ""
      *  disables keyboard registration (/acp-fleet still works). */
     fleetShortcut?: string;
@@ -2227,6 +2268,11 @@ type FileConfig = {
      *  edits apply on the next restart, not mid-session. */
     storage?: {
         unified?: string;
+        /** NOTE: `storage.snapBase` (enabled/cohorts/cutEveryKUserTurns, the
+         *  #5874 v2 snapshot-base plane) was RETIRED before merge (bc51c9445,
+         *  ruling 7439) — replaced wholesale by the egress op-log plane,
+         *  switched by `rollout.features.egressPlane`. A leftover `snapBase`
+         *  key in your config is dead and ignored. */
         /** SQLite engine self-download (#2833): when unified storage is
          *  requested but neither builtin node:sqlite nor a host-installed
          *  better-sqlite3 exists, bili downloads a pinned N-API prebuilt at
@@ -2297,14 +2343,25 @@ type FileConfig = {
         streamKeepAliveMs?: number;
         /** Preflight hold grace (was BILI_PREFLIGHT_HOLD_MS; default 30000). */
         preflightHoldMs?: number;
+        /** #2383 emergency digest fold — when the payload's foldable mass exceeds the LLM fold
+         *  path's coverage bound (16 rounds x 2 x 0.6 = 19.2x the window), every fold switches
+         *  from an LLM summary call to a CPU-only structural digest (per-message ref/role/size
+         *  plus a head fragment). DEFAULT OFF (owner decision 2026-11-22): to the downstream
+         *  model the digest is a hard truncation — originals stay restorable via decompress, but
+         *  the content is gone unless the client asks for it back. With the regime off, those
+         *  payloads run the LLM fold ladder instead and may exhaust its budget into a fail-fast
+         *  413. Env BILI_PREFLIGHT_EMERGENCY_DIGEST wins ("1"/"true" restores the #2383 regime). */
+        emergencyDigest?: boolean;
         /** Max replay attempts on transient upstream errors (was BILI_REPLAY_RETRY_MAX; default 3). */
         replayRetryMax?: number;
         /** Replay backoff base delay (was BILI_REPLAY_RETRY_BASE_MS; default 1500). */
         replayRetryBaseMs?: number;
-        /** Egress-side 429 throttle governor master switch (#4204; was env-only BILI_THROTTLE_429; default true).
-         *  After consecutive upstream 429s, further sends to that origin+credential are answered locally
-         *  (429 + Retry-After, then a terminal 424) instead of being forwarded, so host-driven retry loops
-         *  cannot pin a concurrency-style provider limit. false restores the legacy always-forward behavior. */
+        /** Egress-side 429 throttle governor master switch (#4204; was env-only BILI_THROTTLE_429; default false,
+         *  #6639/#5853). OFF by default: upstream 429s are forwarded to the client untouched — the host owns the
+         *  retry decision — and bili only logs a warn per observed 429. Set true for accounts where host-driven
+         *  retry loops would pin a shared concurrency-style provider limit: after consecutive upstream 429s,
+         *  further sends to that origin+credential are then answered locally (429 + Retry-After, then a terminal
+         *  424) instead of being forwarded. */
         throttle429Enabled?: boolean;
         /** Consecutive upstream 429s before the hold turns terminal — local 424 answers outside every known
          *  client-SDK retry set, so hosts stop re-driving (#4204; was env-only BILI_THROTTLE_429_MAX_CONSECUTIVE; default 5). */
@@ -2359,9 +2416,12 @@ type FileConfig = {
          *  guaranteed upstream 400. Count only — it never folds. Env BILI_MAX_MESSAGES wins. */
         maxMessages?: number;
         /** #5794 item 2: cost band (decoded bytes) for the JSON.parse + normalization sweep AFTER
-         *  decode; a body above it is refused with an actionable 413 before the sweep, because any
-         *  parseable body over 32 MiB is ≥ ~8M tokens — beyond every real model window. 0 disables
-         *  the ingest cap (legacy parse-everything). Env BILI_INGEST_BODY_BYTES wins. */
+         *  decode; when re-enabled, a body above it is refused with an actionable 413 before the
+         *  sweep, because any parseable body over 32 MiB is ≥ ~8M tokens — beyond every real model
+         *  window. DISABLED by default for all lanes (#7426): on the re-send lanes (opencode/dsh
+         *  re-send the entire raw ledger every turn and bili folds it) the raw inbound byte count
+         *  is not a valid "beyond model window" proxy. 0 = no ingest cap (the default); set a byte
+         *  value to re-enable. Env BILI_INGEST_BODY_BYTES wins. */
         ingestBodyBytes?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
@@ -2540,13 +2600,13 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
     "nudgeGrowthTokens", "minPressureBenefitTokens", "requireUsageSampleForPressure", "maxEstimateHoldRounds", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
-    "requireNudge", "requireRecommendation",
+    "requireNudge", "requireRecommendation", "postComPressTail",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "messageTimestamps", "rules", "injectTool", "injectNudge",
-    "acknowledgePromptsRisk", "absorb", "ccr", "search",
+    "acknowledgePromptsRisk", "absorb", "blockOps", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary", "externalSummary",
     // #3635: summary-length caps — previously accepted nowhere, silently dropped.
@@ -3319,7 +3379,9 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     }
     // #5683: unprompted/out-of-bounds compression policy gates — plain booleans,
     // off unless explicitly set (an explicit false at a deeper level disables).
-    for (const key of ["requireNudge", "requireRecommendation"] as const) {
+    // #7318: postComPressTail is the same species — plain boolean, off unless
+    // explicitly enabled (default-off recommendation surface).
+    for (const key of ["requireNudge", "requireRecommendation", "postComPressTail"] as const) {
         if (!(key in obj)) continue;
         if (typeof obj[key] !== "boolean") ok = false;
         else out[key] = obj[key];
@@ -3421,6 +3483,22 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 }
             }
             if (ok) out.absorb = cleaned;
+        }
+    }
+    if ("blockOps" in obj && obj.blockOps !== undefined) {
+        const b = obj.blockOps;
+        if (!b || typeof b !== "object" || Array.isArray(b)) {
+            ok = false;
+        } else {
+            const bo = b as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["blockOps"]> = {};
+            for (const key of ["enabled"] as const) {
+                if (!(key in bo)) continue;
+                const v = bo[key];
+                if (typeof v !== "boolean") { ok = false; continue; }
+                cleaned.enabled = v;
+            }
+            if (ok) out.blockOps = cleaned;
         }
     }
     if ("ccr" in obj && obj.ccr !== undefined) {

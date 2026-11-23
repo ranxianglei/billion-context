@@ -95,8 +95,13 @@ test("#1029-③: zero-block rejection inlines the current ref span (stale refs f
         ctx,
     ).text;
     assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
-    assert.match(out, /\[Current context: 3 visible message\(s\), refs m00001–m00003, \d+ active block\(s\)\./, "current span inlined");
-    assert.match(out, /refs inside this span|acp_status/i, "points at actionable refs or acp_status");
+    // The span line is PERSISTED in visible history with every failure receipt,
+    // so it must self-label as a point-in-time snapshot — a long session
+    // otherwise accumulates stale copies with different max refs that a weak
+    // model reads as simultaneously true (2026-11-17, session 01a1e89d:
+    // phantom endpoints m02383/m02489 aimed at a "frontier" that never existed).
+    assert.match(out, /\[Context snapshot at the moment of THIS receipt — point-in-time only: refs are minted continuously, so every earlier copy of this line in the transcript is stale, and the newest copy is the current frontier\. 3 visible message\(s\), refs m00001–m00003, \d+ active block\(s\)\./, "snapshot span inlined and labeled point-in-time");
+    assert.match(out, /newest such snapshot|acp_status/i, "points at actionable refs or acp_status");
 });
 
 test("#1029-①: incoming history resends are stripped of ACP status marker lines", () => {

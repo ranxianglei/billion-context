@@ -1,0 +1,43 @@
+{
+  "_doc": "bili-gate local config. This FILE (and only this file) holds host-specific secrets/ports — it must never be committed. Copy to e.g. ~/system/bili-gate.json and fill in.",
+  "_doc_keys": "Every key except model1.baseUrl and model1.model is optional; defaults shown.",
+
+  "model1": {
+    "baseUrl": "http://HOST.docker.internal:8199",
+    "model": "model-id-on-that-upstream",
+    "apiKey": ""
+  },
+  "model2": {
+    "baseUrl": "",
+    "model": "",
+    "apiKey": ""
+  },
+  "rev": "master",
+  "skip": "",
+
+  "sourceRepo": "https://github.com/ranxianglei/billion-context.git",
+  "mirror": "",
+  "gitProxy": "",
+  "npmRegistry": "https://registry.npmjs.org",
+
+  "turnTimeoutMs": 300000,
+  "agents": ["dsh", "pi", "codex", "opencode", "claude", "dsh-google"],
+  "_doc_agentsR": "restart-lane agents, comma list or array. Default dsh,pi; use dsh,pi,claude to also run the anthropic-wire restart lane (prefix topology, harness-managed proxy).",
+  "agentsR": "dsh,pi",
+  "_doc_snapBase": "P/R lanes only: run the candidate's EGRESS op-log plane ON in the gate's bili.json (writes rollout.features.egressPlane=true — `storage.snapBase` was retired in bc51c9445; the plane has no per-protocol cohort, one switch for all lanes). Any on-value = on; absent or \"off\" = off (byte-identical gate). For candidate-branch verification (e.g. #6785).",
+  "snapBase": "",
+  "_doc_laneScript": "Optional: force the P-lane harness script copy, e.g. \"/gate-tools/plugin-lanes.mjs\". Needed when the candidate checkout predates a harness fix (the gate otherwise prefers the candidate's OWN scripts/gate/plugin-lanes.mjs).",
+  "laneScript": "",
+  "_doc_snapshotRender": "Optional: \"1\" writes rollout.features.snapshotRender=true into the P/R lane bili.json (config tier, beats the 0% rollout default) so the candidate's snapshotRender egress body plane renders live. Plugin-mode lanes (dsh profile bundle, pi native) stay client-authoritative by design.",
+  "snapshotRender": "",
+  "r": {
+    "corpusTokens": 80000,
+    "window": 16384,
+    "capRatio": 0.4,
+    "cacheRatio": 0.5
+  },
+
+  "network": "host",
+  "outDir": "./out",
+  "keep": false
+}

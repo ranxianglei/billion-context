@@ -746,6 +746,63 @@ export function wordBagDigest(text: string): number {
     return acc;
 }
 
+/** Word evidence of the reconcile candidates, derived once per candidate.
+ *  The shape pass and the residual census weigh every unclaimed anchor
+ *  against the candidates; canonicalTextOf + wordBagDigest + simhashHex are
+ *  pure functions of a candidate's text, so recomputing them per (anchor,
+ *  candidate) pair made both passes O(anchors × candidates) full-text
+ *  tokenizations — a resumed session with every fold inactive (9.6k stored
+ *  ids against 1.3k inbound messages) held the event loop past the 300 s
+ *  watchdog. Buckets keep candidate order, so a scan of the bucket finds the
+ *  same first match a scan of every candidate would. */
+function candidateWordEvidence<C extends { message: CoreMessage }>(candidates: readonly C[]) {
+    const canon = new WeakMap<CoreMessage, string>();
+    const bags = new WeakMap<CoreMessage, number>();
+    const sketches = new WeakMap<CoreMessage, string>();
+    const canonicalOf = (m: CoreMessage): string => {
+        let text = canon.get(m);
+        if (text === undefined) canon.set(m, (text = canonicalTextOf(m.text ?? "")));
+        return text;
+    };
+    const wordBag = (m: CoreMessage): number => {
+        let wh = bags.get(m);
+        if (wh === undefined) bags.set(m, (wh = wordBagDigest(canonicalOf(m))));
+        return wh;
+    };
+    const sketch = (m: CoreMessage): string => {
+        let sh = sketches.get(m);
+        if (sh === undefined) sketches.set(m, (sh = simhashHex(canonicalOf(m))));
+        return sh;
+    };
+    const bucketBy = <K>(keyOf: (c: C) => K | undefined): ((key: K) => readonly C[]) => {
+        let buckets: Map<K, C[]> | undefined;
+        return (key) => {
+            if (buckets === undefined) {
+                buckets = new Map();
+                for (const c of candidates) {
+                    const k = keyOf(c);
+                    if (k === undefined) continue;
+                    const bucket = buckets.get(k);
+                    if (bucket === undefined) buckets.set(k, [c]);
+                    else bucket.push(c);
+                }
+            }
+            return buckets.get(key) ?? [];
+        };
+    };
+    const byWordBag = bucketBy((c) => wordBag(c.message));
+    // looseProse's user branch: role user, text content, identity after newline→space unwrap.
+    const byUnwrappedIdentity = bucketBy((c) => (c.message.role === "user" && c.message.contentType === "text"
+        ? normalizedIdentity({ ...c.message, text: (c.message.text ?? "").replace(/\r?\n/g, " ") })
+        : undefined));
+    return {
+        wordBag,
+        sketch,
+        withWordBag: (wh: number): readonly C[] => byWordBag(wh),
+        withUnwrappedIdentity: (n: string | undefined): readonly C[] => (n === undefined ? [] : byUnwrappedIdentity(n)),
+    };
+}
+
 function wordHash(w: string): number {
     let h = 0x811c9dc5;
     for (let i = 0; i < w.length; i++) {
@@ -973,6 +1030,7 @@ export function planReconciliation(
         candidates.push({ id, message, pos: i });
     }
     const claimedCandidates = new Set<string>();
+    const evidence = candidateWordEvidence(candidates);
 
     // Missing covered ids inside the churn region, in previous-pass order.
     const missingMiddle: string[] = [];
@@ -1004,7 +1062,8 @@ export function planReconciliation(
     // claimed. A gap cell is bracketed when verified claims exist on both
     // sides — order ownership that the tiers below may corroborate.
     const gapPairs: { oldIdx: number; oldId: string; newId: string }[] = [];
-    const claimedIdx: number[] = [];
+    let minClaimed = Infinity;
+    let maxClaimed = -Infinity;
     const recordGap = (oldIdx: number, oldId: string, newId: string): void => {
         if (oldId !== newId && missingSet.has(oldId) && !covered.has(newId) && !claimedCandidates.has(newId)) {
             gapPairs.push({ oldIdx, oldId, newId });
@@ -1034,7 +1093,8 @@ export function planReconciliation(
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
-            claimedIdx.push(i);
+            minClaimed = Math.min(minClaimed, i);
+            maxClaimed = Math.max(maxClaimed, i);
             i++;
         }
         const tail = Math.min(oldOrder.length, newOrder.length) - prefix;
@@ -1064,7 +1124,8 @@ export function planReconciliation(
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
-            claimedIdx.push(iOld);
+            minClaimed = Math.min(minClaimed, iOld);
+            maxClaimed = Math.max(maxClaimed, iOld);
             j++;
         }
     }
@@ -1362,7 +1423,7 @@ export function planReconciliation(
     // byTwin / byNorm / byTurn / byImage) run BELOW Pass 0, so by the time
     // this tier sees a gap cell every exact channel has already had its
     // bite — what remains is tiered corroboration, in order of evidence
-    // strength:
+    // strength. User-role messages stay on the exact passes above:
     //   (a) simhash: a re-rendered cell (formatting churn normalization
     //       still misses — key reordering beyond canonical-Json's reach,
     //       template re-stamps) keeps its word-shingle mass, so a 64-bit
@@ -1387,13 +1448,13 @@ export function planReconciliation(
     //   when something verified it.
     if (gapPairs.length > 0) {
         const fenced = plan.byPos > 0 || plan.resyncs > 0;
-        const minClaimed = claimedIdx.length > 0 ? Math.min(...claimedIdx) : -1;
-        const maxClaimed = claimedIdx.length > 0 ? Math.max(...claimedIdx) : -1;
         for (const gap of gapPairs) {
             if (plan.claims.has(gap.oldId) || claimedCandidates.has(gap.newId)) continue;
             const anchor = anchors[gap.oldId];
             const message = byId.get(gap.newId);
             if (anchor === undefined || message === undefined) continue;
+            // Changed user instructions must reach the model, even between unchanged neighbors.
+            if (anchor.r === "user") continue;
             if (anchor.r !== undefined && anchor.r !== message.role) continue;
             const len = message.text?.length ?? 0;
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) continue;
@@ -1439,7 +1500,9 @@ export function planReconciliation(
     // the words still on the wire. Doctrine (order carries, content gates,
     // the id is only a hint): when a MISSING MASSES of cells still carry
     // word evidence, pair them in order instead of diagnosing destruction.
-    //   prose anchors: wordbag equality + simhash ≤ GAP bar (the same
+    //   text user anchors: exact normalizedIdentity after newline→space unwrap
+    //     (line wrap that reconstructs the stored identity; never wordbag/simhash);
+    //   other prose anchors: wordbag equality + simhash ≤ GAP bar (the same
     //     edit-honesty gate as the sim tier) — role-checked, length-guarded;
     //   textless anchors (image families, no sh/wh by construction): k-th
     //     family pairing, only when the anchor/candidate counts per
@@ -1450,22 +1513,30 @@ export function planReconciliation(
     const residualMiddle = missingMiddle.filter((id) => !plan.claims.has(id));
     if (residualMiddle.length >= SHAPE_MASS_MIN) {
         const looseProse = (anchor: FoldAnchor, m: CoreMessage): boolean => {
-            if (anchor.wh === undefined || anchor.sh === undefined) return false;
             if (anchor.r !== undefined && anchor.r !== m.role) return false;
             const len = m.text?.length ?? 0;
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) return false;
-            const wh = wordBagDigest(canonicalTextOf(m.text ?? ""));
-            if (wh !== anchor.wh) return false;
-            const dist = hammingHex(anchor.sh, simhashHex(canonicalTextOf(m.text ?? "")));
+            if (anchor.r === "user") {
+                if (anchor.c !== "text" || m.contentType !== "text") return false;
+                const unwrapped: CoreMessage = { ...m, text: (m.text ?? "").replace(/\r?\n/g, " ") };
+                return normalizedIdentity(unwrapped) === anchor.n;
+            }
+            if (anchor.wh === undefined || anchor.sh === undefined) return false;
+            if (evidence.wordBag(m) !== anchor.wh) return false;
+            const dist = hammingHex(anchor.sh, evidence.sketch(m));
             return dist >= 0 && dist <= GAP_SIMHASH_MAX_HAMMING;
         };
         // prose pairing — order-preserving: walk anchors in conversation
         // order, take the first unclaimed loose candidate (also in order),
         // so pairs never cross when both sides are locally order-stable.
+        // Only candidates that can pass looseProse are scanned (same word bag,
+        // or same unwrapped identity for user text), kept in candidate order,
+        // so the first match is the one a full scan would find.
         for (const oldId of residualMiddle) {
             const anchor = anchors[oldId];
             if (anchor === undefined || anchor.sh === undefined || anchor.wh === undefined) continue;
-            const cand = candidates.find((c) => !claimedCandidates.has(c.id) && looseProse(anchor, c.message));
+            const pool = anchor.r === "user" ? evidence.withUnwrappedIdentity(anchor.n) : evidence.withWordBag(anchor.wh);
+            const cand = pool.find((c) => !claimedCandidates.has(c.id) && looseProse(anchor, c.message));
             if (cand === undefined) continue;
             plan.claims.set(oldId, [cand.id]);
             claimedCandidates.add(cand.id);
@@ -1565,14 +1636,12 @@ export function planReconciliation(
         });
         for (const id of classCarrying) {
             const anchor = anchors[id]!;
-            const loose = candidates.some((c) =>
+            // Word evidence needs an equal bag, so only that bucket can match.
+            const sh = anchor.sh;
+            const loose = anchor.wh !== undefined && sh !== undefined && evidence.withWordBag(anchor.wh).some((c) =>
                 !claimedCandidates.has(c.id)
                 && (anchor.r === undefined || anchor.r === c.message.role)
-                && (
-                    (anchor.wh !== undefined && anchor.sh !== undefined
-                        && wordBagDigest(canonicalTextOf(c.message.text ?? "")) === anchor.wh
-                        && (() => { const d = hammingHex(anchor.sh!, simhashHex(canonicalTextOf(c.message.text ?? ""))); return d >= 0 && d <= GAP_SIMHASH_MAX_HAMMING; })())
-                ));
+                && (() => { const d = hammingHex(sh, evidence.sketch(c.message)); return d >= 0 && d <= GAP_SIMHASH_MAX_HAMMING; })());
             // textless anchors (no sh/wh — image cells, #3588) carry NO
             // evidence channel: claimable families were already claimed by
             // the flanked k-th discipline above, so a textless residual is
@@ -1631,29 +1700,37 @@ function rewriteBlocks(blocks: BlockLike[], claims: Map<string, string[]>): bool
     for (const block of blocks) {
         const lists = [block.effectiveMessageIds, block.directMessageIds] as (string[] | undefined)[];
         for (const list of lists) {
-            if (list === undefined) continue;
-            for (let i = 0; i < list.length; i++) {
-                const replacement = claims.get(list[i]);
-                if (replacement === undefined || replacement.length === 0) continue;
+            if (list === undefined || !list.some((id) => (claims.get(id)?.length ?? 0) > 0)) continue;
+            // Counts include unread originals and already emitted replacements.
+            const present = new Map<string, number>();
+            for (const id of list) present.set(id, (present.get(id) ?? 0) + 1);
+            const rewritten: string[] = [];
+            for (const id of list) {
+                const replacement = claims.get(id);
+                if (replacement === undefined || replacement.length === 0) {
+                    rewritten.push(id);
+                    continue;
+                }
                 // Claims map 1→N (a merged core stands in for a reasoning+text
                 // pair) and N→1 (both pair members claim one merged witness).
-                // Splice the targets in and drop any already present — a
+                // Write the targets in order and drop any already present — a
                 // block must never list the same message id twice. When the
                 // replacement is already in the list (the second member of an
                 // N→1 collapse), the old id is removed, not kept: two covered
                 // ids collapsing onto one live id is exactly the model-switch
                 // pair→merged shape (#2636).
-                const keep = replacement.filter((t) => !list.includes(t));
-                if (keep.length === 0) {
-                    list.splice(i, 1);
-                    i--;
-                    touched = true;
-                    continue;
+                const keep = replacement.filter((target) => !present.has(target));
+                const remaining = present.get(id)! - 1;
+                if (remaining === 0) present.delete(id);
+                else present.set(id, remaining);
+                for (const target of keep) {
+                    rewritten.push(target);
+                    present.set(target, (present.get(target) ?? 0) + 1);
                 }
-                list.splice(i, 1, ...keep);
-                i += keep.length - 1;
-                touched = true;
             }
+            list.length = rewritten.length;
+            for (let i = 0; i < rewritten.length; i++) list[i] = rewritten[i];
+            touched = true;
         }
     }
     return touched;
@@ -2305,14 +2382,21 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                     for (const id of block.directMessageIds ?? []) deadIds.add(id);
                 }
                 for (const id of deadIds) delete nextAnchors[id];
-                for (let i = nextOrder.length - 1; i >= 0; i--) {
-                    if (deadIds.has(nextOrder[i])) nextOrder.splice(i, 1);
-                }
-                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[] } | undefined;
+                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[]; canon?: string[] } | undefined;
                 const positionIds = storedPositions?.ids;
+                const positionCanon = storedPositions?.canon;
+                for (let i = nextOrder.length - 1; i >= 0; i--) {
+                    if (deadIds.has(nextOrder[i])) {
+                        nextOrder.splice(i, 1);
+                        if (positionIds === nextOrder && Array.isArray(positionCanon)) positionCanon.splice(i, 1);
+                    }
+                }
                 if (Array.isArray(positionIds) && positionIds !== nextOrder) {
                     for (let i = positionIds.length - 1; i >= 0; i--) {
-                        if (deadIds.has(positionIds[i])) positionIds.splice(i, 1);
+                        if (deadIds.has(positionIds[i])) {
+                            positionIds.splice(i, 1);
+                            if (Array.isArray(positionCanon)) positionCanon.splice(i, 1);
+                        }
                     }
                 }
                 recordConflict(session, "orphan-reap", `reaped ${reapedCount} zombie fold block(s) [${reaped.join(", ")}]: covered substrate majority-absent for ${FOLD_DRIFT_ESCALATE_PASSES} consecutive passes (#2695)`);
@@ -2428,6 +2512,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             // restore the old one. Either alignment event clears the latch
             // automatically (resetFoldDriftState on the first clean pass).
             session.metadata[METADATA_EPOCH_CONFIRM] = true;
+            // #7545 follow-up: a confirmed epoch replacement is a new
+            // compression lifecycle — re-arm the preflight one-shot gate so
+            // the new epoch gets its own single attempt (an aborted attempt
+            // on the REPLACED epoch must not starve the new one). Successful
+            // folds never set this latch, so the one-shot still holds within
+            // any single epoch.
+            if (session.stats) delete session.stats.preflightRuns;
             if (opts.log !== undefined) {
                 opts.log("error", `${tag}[fold-reconcile] fold epoch confirmation required: ${realUnmatched.length} covered id(s) missing with NO anchor match and NO word evidence for ${streak} consecutive passes${span}${expectedNote} — the resent history shares nothing with the fold substrate (wholesale replacement: host-native compaction outside bili's knowledge #1729/#2193, or a brand-new conversation on the same session id). Folding is paused for this session until the histories realign (old history resent or a fresh fold on the new one starts a new epoch); bili keeps the existing snapshot — nothing is deleted (#3641)${driftTok}`);
             }
@@ -2513,14 +2604,24 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
 export function noteSystemPromptFingerprint(session: Session, system: unknown, opts: ReconcileOptions = {}): void {
     if (!session.metadata) return;
     const text = system === undefined || system === null ? "" : JSON.stringify(system) ?? "";
-    const fp = system === undefined || system === null ? "-" : createHash("sha256").update(text).digest("hex").slice(0, 16);
-    const prev = session.metadata[METADATA_SYSTEM_FP] as { fp: string; size: number } | undefined;
+    // Change probe (#7149 batch2): the probe (size + first 256 chars) is a
+    // detection SIGNAL, not a security boundary — a rewrite that preserves
+    // length AND the first 256 chars stays unobserved, which is acceptable for
+    // a ledger (#1921), and the stored fp is still the true full-hash value
+    // every time it is actually computed. Probe miss / first turn / legacy
+    // stored shape (no head) ⇒ full hash.
+    const prev = session.metadata[METADATA_SYSTEM_FP] as { fp: string; size: number; head?: string } | undefined;
+    const fp = system === undefined || system === null
+        ? "-"
+        : (prev !== undefined && prev.fp !== "-" && prev.size === text.length && prev.head !== undefined && prev.head === text.slice(0, 256)
+            ? prev.fp
+            : createHash("sha256").update(text).digest("hex").slice(0, 16));
     if (prev !== undefined && prev.fp !== fp) {
         if (opts.log !== undefined) {
             opts.log("info", `${opts.sessionId === undefined ? "" : `[${opts.sessionId}] `}[fold-reconcile] system prompt changed (${prev.size} → ${text.length} chars); fold state unaffected (#1921)`);
         }
     }
-    session.metadata[METADATA_SYSTEM_FP] = { fp, size: text.length };
+    session.metadata[METADATA_SYSTEM_FP] = { fp, size: text.length, head: text.slice(0, 256) };
 }
 
 /** #2867: canonical INCOMING system/developer fingerprint — the mode-independent
@@ -2532,6 +2633,12 @@ export function noteSystemPromptFingerprint(session: Session, system: unknown, o
 export function noteCanonicalSystemFingerprint(session: Session, canonical: unknown): void {
     if (!session.metadata) return;
     const text = canonical === undefined || canonical === null ? "" : JSON.stringify(canonical) ?? "";
-    const fp = canonical === undefined || canonical === null ? "-" : createHash("sha256").update(text).digest("hex").slice(0, 16);
-    session.metadata[METADATA_CANONICAL_SYS_FP] = { fp, size: text.length };
+    // Same change-probe tradeoff as noteSystemPromptFingerprint (#7149 batch2).
+    const prev = session.metadata[METADATA_CANONICAL_SYS_FP] as { fp: string; size: number; head?: string } | undefined;
+    const fp = canonical === undefined || canonical === null
+        ? "-"
+        : (prev !== undefined && prev.fp !== "-" && prev.size === text.length && prev.head !== undefined && prev.head === text.slice(0, 256)
+            ? prev.fp
+            : createHash("sha256").update(text).digest("hex").slice(0, 16));
+    session.metadata[METADATA_CANONICAL_SYS_FP] = { fp, size: text.length, head: text.slice(0, 256) };
 }

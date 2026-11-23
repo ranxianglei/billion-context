@@ -379,9 +379,13 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       ? shared.anchorMessage
       : lastUserAnchor(input.messages, coveredMessageIds(input.state), input.config);
     const anchorRef = anchorMsg ? input.state.messageRefs.byRaw[anchorMsg.id] : undefined;
+    // 2026-11-18 (owner): the anchor QUOTES user speech inside a system
+    // receipt that carries no <acp> time tag on the wire — weak models have
+    // read the quote as the user's LATEST message (ti_an incident 2026-11-17).
+    // Label the quote's origin so it cannot pass for a fresh instruction.
     const anchorNote =
       anchorRef && anchorRef !== "BLOCKED"
-        ? ` Last-user anchor: ${anchorRef} "${(anchorMsg!.text ?? "").replace(/\s+/g, " ").slice(0, 40)}".`
+        ? ` Last-user anchor (historical quote, NOT a new user message): ${anchorRef} "${(anchorMsg!.text ?? "").replace(/\s+/g, " ").slice(0, 40)}".`
         : "";
     warnings.push(
       `Excluded ${hitProtectedRaw.length} protected message(s) ${hitRefs.join(
@@ -570,10 +574,56 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
                 return true;
               return hasUnrecoverableMediaPayload(msg);
             };
+            // #6709: `isNeverFoldable5919` lumps two very different cases under
+            // ref === "BLOCKED". One is CONTENT-FREE — the body was removed by
+            // native compression, so there is no live wire content to protect
+            // and the message can never age into foldability. Letting THAT one
+            // doom the merge turns the #5919 no-op into a permanent deadlock:
+            // every merge covering its turn re-hits the same skip and the
+            // session stays stuck at its context ceiling (billion-context#6709,
+            // session-ad47cd30, 6,115 BLOCKED). Such a partner carries nothing
+            // the turn-integrity gate is protecting, so it may flow to rung 2
+            // (folded into the merged block, closing the turn) exactly like a
+            // foldable partner.
+            // The OTHER case is LIVE — a protected tool / unrecoverable media
+            // whose FULL body sits in the wire (assignRefs pins those to ref
+            // "BLOCKED" too). That partner MUST still doom the merge: folding
+            // it in drops protected content from the wire, and leaving it split
+            // emits an orphaned tool_call / tool_result the provider rejects.
+            // So only a BLOCKED ref that is NOT live-protected/media is
+            // content-free; everything else never-foldable keeps dooming.
+            // COUPLING INVARIANT (do not relax one side independently of the
+            // other): the un-doom decision below delegates to
+            // filterProtectedToolMessages with the identical `shared` context
+            // the fresh-fold path uses (unit-projection.ts:250). A partner is
+            // therefore un-doomed ONLY if the fold path itself would fold it —
+            // it can never be un-doomed into a live-body drop or an orphaned
+            // tool_call/tool_result. Pinned by tests/issue5919-shredded-merge.
+            // test.ts ("6709-lockstep"). (Review B risk #1 / review A risk r1.)
+            const isContentFreeBlocked5919 = (id: string): boolean => {
+              const ref = refOf5919(id);
+              if (ref !== "BLOCKED") return false;
+              if (input.protectedMessageIds?.has(ref)) return false;
+              if (
+                filterProtectedToolMessages(
+                  [id],
+                  input.messages,
+                  input.config,
+                  shared,
+                ).length === 0
+              )
+                return false;
+              const msg = msgById(id);
+              if (msg !== undefined && hasUnrecoverableMediaPayload(msg))
+                return false;
+              return true;
+            };
             const visibleStranded = [...current].filter(
               (id) => !survivingCoverage.has(id) && !consumedCoverage.has(id),
             );
-            const doomedStranded = visibleStranded.filter(isNeverFoldable5919);
+            const doomedStranded = visibleStranded.filter(
+              (id) => isNeverFoldable5919(id) && !isContentFreeBlocked5919(id),
+            );
             if (doomedStranded.length > 0) {
               const foldablePartners = visibleStranded.filter(
                 (id) => !isNeverFoldable5919(id),
@@ -598,6 +648,12 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
             // advertised merge stops dead-ending (billion-context#5919).
             let extended5919 = false;
             const tryExtend5919 = (): boolean => {
+              // >16 stranded partners: bail to the actionable fatal below.
+              // Post-#6709 a content-free BLOCKED partner among them no longer
+              // no-ops the merge, so a shape that pre-fix silently no-opped now
+              // surfaces as the actionable fatal (fold the partners via a plain
+              // range compress) — the #5919 ladder's intent: an actionable
+              // error beats a silent no-op deadlock (review A risk r2).
               if (
                 extended5919 ||
                 visibleStranded.length === 0 ||

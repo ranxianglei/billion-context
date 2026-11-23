@@ -218,6 +218,10 @@ function cleanEnv(): NodeJS.ProcessEnv {
     )
       delete env[key];
   }
+  // #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+  // off) — this suite asserts the legacy JSON persistence surface, so pin
+  // the dual-write writer explicitly.
+  env.BILI_STORAGE_JSON_WRITER = "on";
   // NODE_TEST_CONTEXT: set by the node:test runner and inherited by the
   // spawned dsh — dsh-native.ts deliberately stands down inside node:test
   // (unit-test guard), which would silently disable the very bootstrap this
@@ -463,6 +467,10 @@ function dshRun(
     cwd: ctx.dshCwd,
     env: {
       ...cleanEnv(),
+      // Pure-SQLite is the default storage writer now (2026-11-13): this lane
+      // asserts the JSONL session envelopes — pin dual-write so coverage does
+      // not depend on the default (pure-SQLite path: unit tests + gate).
+      BILI_STORAGE_JSON_WRITER: "1",
       HOME: ctx.homeDir,
       TMPDIR: ctx.tmpDir,
       DSH_HOME: ctx.dshHome,

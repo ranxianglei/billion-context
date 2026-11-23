@@ -323,6 +323,38 @@ test("D on: steady state — anchor rendered once, covered rows absent, prefix b
     }, true);
 });
 
+test("D on · #5765: a retired block renders no anchor while its covered rows stay suppressed", async () => {
+    process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
+    await withHarness(async (h) => {
+        const history = conversation();
+        const r1 = await turn(h, h.openaiUrl, "s-ret", history, history);
+        assert.equal(r1.status, 200, r1.body);
+        assert.ok(h.sessionOf("s-ret")!.state.blocks.some((b) => b.active), "block armed");
+        // Same mutation acp_retire performs server-side: view flag only,
+        // coverage and stored content untouched.
+        const sess = listSessions().find((x) => x.meta.label === "s-ret") as unknown as { state: { blocks: Array<{ active: boolean; retired?: boolean }> } };
+        for (const b of sess.state.blocks) if (b.active) b.retired = true;
+        const tail = [{ role: "user", content: "Post-retire question. " + "RET_A_".repeat(80) }];
+        const r2 = await turn(h, h.openaiUrl, "s-ret", [...history, ...tail], history);
+        assert.equal(r2.status, 200, r2.body);
+        const out2 = sent(h.bodies, r2.idx);
+        const joined2 = out2.map(textOf).join("\n");
+        assert.equal(anchorCount(joined2), 0, "retired block's summary anchor is NOT rendered");
+        assert.ok(!joined2.includes(SUMMARY), "retired summary text absent from the view");
+        assert.ok(!joined2.includes("WORK_1_content_"), "covered row 1 stays suppressed");
+        assert.ok(!joined2.includes("WORK_7_content_"), "covered row 7 stays suppressed");
+        assert.ok(joined2.includes("RET_A_"), "live tail present");
+        // one more turn: prefix byte-stable across the retire boundary and the
+        // lane provably rendered (not a silent legacy fallback).
+        const r3 = await turn(h, h.openaiUrl, "s-ret", [...history, ...tail, { role: "user", content: "Post-retire follow-up. " + "RET_C_".repeat(80) }], history);
+        assert.equal(r3.status, 200, r3.body);
+        const out3 = sent(h.bodies, r3.idx);
+        assertPrefixStable(out3, out2, 2, "retired-anchor");
+        assert.equal(anchorCount(out3.map(textOf).join("\n")), 0, "still no anchor on the next turn");
+        assertDActive(h, "s-ret", 2, "#5765 retired-anchor");
+    }, true);
+});
+
 test("D on: identity-seed upgrade — outbound prefix byte-identical, block alive, no destroy verdict", async () => {
     process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
     await withHarness(async (h) => {
