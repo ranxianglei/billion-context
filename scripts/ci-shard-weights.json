@@ -471,7 +471,6 @@
     "tests/issue4147-dsh-overlay-structural.test.ts": 109,
     "tests/issue4159-client-mid-system-verbatim.test.ts": 3538,
     "tests/issue-393-registry-window.test.ts": 12678,
-    "tests/issue3846-local-refusal-evidence.test.ts": 18918,
     "tests/issue411-abort-usage.test.ts": 13408,
     "tests/issue4185-identified-fresh-forward.test.ts": 12740,
     "tests/issue496-forward-once-learn.test.ts": 3571,

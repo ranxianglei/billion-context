@@ -162,28 +162,27 @@ for (const scenario of [
     });
 }
 
-// #5000/#4543 (2e021109, after this PR's base): the measured-body gate now
-// dominates inside the arbitration arm — a measured outbound body over the
-// window is doomed locally for EVERY baseline regime (the original
-// size-arbitration forwarding only remains for measured-fitting bodies, which
-// this fixture's est≈measured regime cannot produce). Pin the current policy.
-test("zero folds: anonymous unknown baseline — measured over-window body is doomed locally", { timeout: 15_000 }, async () => {
+// #7537 (supersedes the #5000/#4543 measured-doom policy): a measured
+// over-window body with NO proven upstream wall is no longer doomed locally
+// — it forwards and the upstream decides. The anonymous baseline is exactly
+// the estimate-only regime, so these now pin the forward contract.
+test("zero folds: anonymous unknown baseline — measured over-window body FORWARDS (#7537)", { timeout: 15_000 }, async () => {
     const f = await run({ windowRatio: 0.6, anonymous: true });
-    assert.ok("failFast" in f.result, JSON.stringify(f.logs));
-    assert.equal(f.result.status, 413);
-    assert.ok(f.logs.some(line => line.includes("body ITSELF exceeds the window")));
+    assert.ok(f.result === f.prepared, JSON.stringify(f.logs));
+    assert.ok(f.summaryCalls > 0, "the over-window payload is forwarded to the upstream");
 });
 
-test("zero folds: a prior scoped refusal keeps the anonymous body locally doomed", { timeout: 15_000 }, async () => {
+test("zero folds: a prior scoped refusal alone does not doom the anonymous body — it forwards (#7537)", { timeout: 15_000 }, async () => {
     const f = await run({ windowRatio: 0.6, anonymous: true, localRefusal: true });
-    assert.ok("failFast" in f.result, JSON.stringify(f.logs));
-    assert.equal(f.result.status, 413);
-    assert.ok(f.logs.some(line => line.includes("body ITSELF exceeds the window")));
+    assert.ok(f.result === f.prepared, JSON.stringify(f.logs));
+    assert.ok(f.summaryCalls > 0, "a scoped refusal is evidence input, not an estimate refusal");
 });
 
-test("zero folds: image reserve is not deflated by text calibration", { timeout: 15_000 }, async () => {
+test("zero folds: image reserve is not deflated by text calibration — but the body still forwards (#7537)", { timeout: 15_000 }, async () => {
     const f = await run({ k: 0.25, windowRatio: 0.6, imageBytes: 60_000 });
     assert.ok(f.imageTokens > 0);
     assert.ok(f.rawText * 0.25 < f.limit && f.rawText * 0.25 + f.imageTokens > f.limit);
-    assert.ok("failFast" in f.result, JSON.stringify(f.logs));
+    // The old pin expected the measured gate's local 413. #7537: calibration
+    // no longer answers a local refusal — the image-bearing body forwards.
+    assert.ok(f.result === f.prepared, JSON.stringify(f.logs));
 });

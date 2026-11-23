@@ -449,7 +449,8 @@ const ACP_STATUS_PARAMETERS = {
     },
     view: {
       type: "string",
-      description: '"messages" for a per-message listing; "ranges" is the default',
+      description:
+        '"ranges" (default) for the compressible-ranges listing; "messages" for a per-message drill-down',
     },
     tool: {
       type: "string",
