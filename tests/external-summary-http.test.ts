@@ -446,3 +446,38 @@ test("external summary HTTP batch: a shared deadline aborts a real stalled respo
     });
     assert.equal(calls, 2);
 });
+
+test("external summary HTTP: the context-budget guard rejects before dispatch and warns with the numbers (#7569)", async () => {
+    const lines: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") lines.push(msg); });
+    let sawRequest = false;
+    await upstream((req, res) => {
+        sawRequest = true;
+        res.writeHead(500);
+        res.end();
+    }, async (url) => {
+        const candidate = createSummaryHttpCandidate({ ...target(url), contextWindow: 300, outputTokens: 100 }, 4096, { targetTimeoutMs: 1500, totalTimeoutMs: 4000 });
+        await assert.rejects(candidate.summarize(work, AbortSignal.timeout(4000)), { message: "External summary input exceeds the target context budget" });
+    });
+    assert.equal(sawRequest, false);
+    const warns = lines.filter((line) => line.includes("rejected before dispatch"));
+    assert.equal(warns.length, 1);
+    assert.match(warns[0], /input exceeds target context budget/);
+    assert.match(warns[0], /input≈\d+tok/);
+    assert.match(warns[0], /window=300tok/);
+    assert.match(warns[0], /outputTokens=100/);
+    assert.match(warns[0], /budget target=1500ms total=4000ms/);
+});
+
+test("external summary HTTP: the context-budget guard does not fire when the input fits the window (#7569)", async () => {
+    let sawRequest = false;
+    await upstream((req, res) => {
+        sawRequest = true;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(completion("responses")));
+    }, async (url) => {
+        const candidate = createSummaryHttpCandidate({ ...target(url), contextWindow: 100000, outputTokens: 50 }, 4096);
+        assert.equal(await candidate.summarize(work, AbortSignal.timeout(4000)), summary);
+    });
+    assert.equal(sawRequest, true);
+});

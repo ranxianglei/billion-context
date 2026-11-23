@@ -284,9 +284,21 @@ test("external summary #6885: a non-fetch rejection keeps its safe cause in the 
     const lines: string[] = [];
     setLogCapture((level, msg) => { if (level === "warn") lines.push(msg); });
     try {
+        const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => { throw new Error("External summary response did not complete"); } }], budget);
+        assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error", detail: "External summary response did not complete" }] });
+        assert.equal(lines.filter((line) => line.includes("External summary response did not complete")).length, 1);
+    } finally { setLogCapture(null); }
+});
+
+test("external summary #7569: the context-budget guard rejection keeps its cause in the attempt without a second warn", async () => {
+    const lines: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") lines.push(msg); });
+    try {
         const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => { throw new Error("External summary input exceeds the target context budget"); } }], budget);
         assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error", detail: "External summary input exceeds the target context budget" }] });
-        assert.equal(lines.filter((line) => line.includes("External summary input exceeds the target context budget")).length, 1);
+        // The HTTP candidate owns this warn — it carries the input/window/output
+        // numbers the executor does not have; the executor must not re-warn it.
+        assert.equal(lines.filter((line) => line.includes("External summary input exceeds the target context budget")).length, 0);
     } finally { setLogCapture(null); }
 });
 

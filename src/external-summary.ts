@@ -110,15 +110,19 @@ function invalidSummaryDetail(value: unknown, limits: SummaryBudget, request: Re
  *  so an unknown provider error stays opaque in the result (the no-leak rule
  *  the executor tests pin). `warnedByCandidate` is true for the upstream
  *  rejection, which the HTTP candidate already warns once per attempt with
- *  status + truncated body; the executor must not warn it a second time. */
+ *  status + truncated body, and for the context-budget guard rejection, which
+ *  the HTTP candidate warns once with the input/window/output numbers (#7569);
+ *  the executor must not warn either a second time. */
 interface SummaryErrorDetail { readonly detail: string; readonly warnedByCandidate: boolean; }
 function summaryErrorDetail(error: unknown): SummaryErrorDetail | undefined {
     const message = error instanceof Error ? error.message : undefined;
     if (message === undefined) return undefined;
     if (message.startsWith("External summary upstream rejected the request with HTTP ")) return { detail: message, warnedByCandidate: true };
+    // #7569: the HTTP candidate owns this warn — it carries the numbers
+    // (input/window/output tokens) that the executor does not have.
+    if (message.startsWith("External summary input exceeds the target context budget")) return { detail: message, warnedByCandidate: true };
     for (const prefix of [
         "Summary attempt cancelled before dispatch",
-        "External summary input exceeds the target context budget",
         "External summary response is empty",
         "External summary response exceeds its byte budget",
         "External summary response did not complete",
