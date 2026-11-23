@@ -214,7 +214,19 @@ function tunnelThrough(
         const dropTunnelCount = () => {
             if (tunnelLive) { tunnelLive = false; blindTunnelLive--; }
         };
-        upstream.once("close", dropTunnelCount);
+        upstream.once("close", () => {
+            dropTunnelCount();
+            // The remote closed first: upstream.pipe(clientSocket) already ended
+            // the client's write side (FIN), and the clientSocket→upstream pipe
+            // is now unpiped, leaving clientSocket paused. A TLS client answers
+            // that FIN with a final close_notify record before its own FIN; the
+            // record sits in the paused buffer, so 'end' never fires and — with
+            // allowHalfOpen — 'close' never fires either. The socket (and its
+            // connRecords entry) then leaks for the life of the process. Re-assert
+            // flowing mode so the trailing record drains, 'end' fires, and
+            // autoDestroy closes the socket.
+            clientSocket.resume();
+        });
         clientSocket.once("close", dropTunnelCount);
         upstream.pipe(clientSocket);
         clientSocket.pipe(upstream);
