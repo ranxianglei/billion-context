@@ -987,17 +987,29 @@ export function staleSmallAnchorFallback(
  *  is nothing fresher to ride and the anchor remains the last real
  *  measurement. overflow-arm never qualifies: the arm is itself a per-send
  *  measurement, window-bounded (#1839). */
+export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
+    if (stats.lastInputTokensSource !== "usage" || stats.contextTokensSource !== "estimate") return false;
+    return (stats.localInputEstimate ?? 0) > 0;
+}
+
+/** #7603: the per-send local estimate for the stale-cycle fallbacks
+ *  (statusInputBaseline, effectiveTokenCount's final branch). The
+ *  billing-caliber contextEstimateTokens (#2117, k̂-scaled where its
+ *  route+model provenance matched) is the honest reading of what this
+ *  route bills for the last send — it wins ONLY when the session carries
+ *  a usage-grade anchor (lastInputTokensSource "usage" or a retained
+ *  lastUsageGradeTokens): a never-reporting upstream has no evidence the
+ *  optimistic rate holds, so it keeps the fail-closed char-count upper
+ *  bound (#553/#728 discipline). Uncalibrated (k̂ absent or
+ *  provenance-mismatched) → the upper bound too. One-directional: the
+ *  upper bound stays the floor for everything the calibration cannot
+ *  vouch for. */
 export function calibratedLocalInputEstimate(stats: Session["stats"]): number {
     const anchored = stats.lastInputTokensSource === "usage" || (stats.lastUsageGradeTokens ?? 0) > 0;
     if (anchored && stats.contextEstimateCalibrated === true && (stats.contextEstimateTokens ?? 0) > 0) {
         return stats.contextEstimateTokens!;
     }
     return stats.localInputEstimate ?? 0;
-}
-
-export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
-    if (stats.lastInputTokensSource !== "usage" || stats.contextTokensSource !== "estimate") return false;
-    return (stats.localInputEstimate ?? 0) > 0;
 }
 
 /** Last measured usage or bounded overflow evidence, before status fallbacks. */
