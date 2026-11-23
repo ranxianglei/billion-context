@@ -72,6 +72,8 @@ test("metadata fold is refused while live metadata diverges from the last commit
         assert.equal((s.metadata as Record<string, unknown>).lateStamp, "unsaved", "the unsaved mutation must stay resident");
         store.closeQuietly(); // dual-write pin opens index.db — close before teardown (Windows cannot unlink an open SQLite file; see persist-zstd.test.ts for the family)
     } finally {
+        // Close before rm: under unified=full the stores hold index.db
+        // handles Windows cannot unlink (#6480 pinned full in this file; #6547).
         closeAll(stores);
         rmrf(dir);
     }
@@ -101,6 +103,8 @@ test("metadata fold proceeds once the divergent mutation has been committed (#55
         store.closeQuietly();
         reloaded.closeQuietly();
     } finally {
+        // Close before rm: under unified=full the stores hold index.db
+        // handles Windows cannot unlink (#6480 pinned full in this file; #6547).
         closeAll(stores);
         rmrf(dir);
     }
@@ -119,6 +123,8 @@ test("metadata fold stays closed for a session with no committed save yet (#5506
         assert.equal((s.metadata as Record<string, unknown>).onlyInMemory, true);
         store.closeQuietly();
     } finally {
+        // Close before rm: under unified=full the stores hold index.db
+        // handles Windows cannot unlink (#6480 pinned full in this file; #6547).
         closeAll(stores);
         rmrf(dir);
     }
