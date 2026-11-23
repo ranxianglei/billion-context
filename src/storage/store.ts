@@ -3691,22 +3691,35 @@ export class UnifiedStore {
      *  one SQL over the sessions table + blocks aggregate — no legacy file
      *  parse, no Session hydration. Parity contract with the legacy walk
      *  (export.ts listSessions): display title = host_title ?? title;
-     *  display time = latest block created_at; blocks = ALL blocks count. */
+     *  display time = latest block created_at; blocks = ALL blocks count.
+     *  The first-block topic/summary lead (#7595) mirrors webSummaryRows'
+     *  filter exactly — only blocks that actually carry a topic or summary
+     *  count, so a leading block with neither defers to the next block
+     *  (the MySQL sibling query carries the same filter). */
     sessionSummaries(): SessionSummaryRow[] {
         const rows = this.db
             .prepare(
-                `SELECT s.session_id AS sessionId, s.host_title AS hostTitle, s.title AS title, s.label AS label,
+                `WITH bl AS (
+                     SELECT b.session_id, b.ord,
+                            CASE WHEN json_valid(b.payload_json) THEN b.payload_json END AS payload
+                     FROM blocks b
+                 )
+                 SELECT s.session_id AS sessionId, s.host_title AS hostTitle, s.title AS title, s.label AS label,
                         s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
                         s.status AS status, s.updated_at AS updatedAt,
-                        (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
+                        (SELECT COUNT(*) FROM bl WHERE bl.session_id = s.session_id) AS blocks,
                         (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt,
-                        (SELECT json_extract(b.payload_json, '$.topic')
-                           FROM blocks b WHERE b.session_id = s.session_id AND json_valid(b.payload_json)
-                           ORDER BY b.ord LIMIT 1) AS firstTopic,
-                        (SELECT json_extract(b.payload_json, '$.summary')
-                           FROM blocks b WHERE b.session_id = s.session_id AND json_valid(b.payload_json)
-                           ORDER BY b.ord LIMIT 1) AS firstSummary
-                  FROM sessions s`,
+                        (SELECT json_extract(bl.payload, '$.topic') FROM bl
+                          WHERE bl.session_id = s.session_id
+                            AND (json_extract(bl.payload, '$.topic') IS NOT NULL
+                                 OR json_extract(bl.payload, '$.summary') IS NOT NULL)
+                          ORDER BY bl.ord LIMIT 1) AS firstTopic,
+                        (SELECT json_extract(bl.payload, '$.summary') FROM bl
+                          WHERE bl.session_id = s.session_id
+                            AND (json_extract(bl.payload, '$.topic') IS NOT NULL
+                                 OR json_extract(bl.payload, '$.summary') IS NOT NULL)
+                          ORDER BY bl.ord LIMIT 1) AS firstSummary
+                   FROM sessions s`,
             )
             .all() as {
             sessionId: string;

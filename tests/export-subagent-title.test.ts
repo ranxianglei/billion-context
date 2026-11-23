@@ -3,12 +3,18 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { SessionStore } from "../src/persist.ts";
 import { Session, cacheBlockContent } from "../src/session.ts";
 import { exportSession, listSessions } from "../src/export.ts";
 import { SUBAGENT_PROMPT_PREFIX } from "../src/session-title.js";
+import { UnifiedStore } from "../src/storage/store.js";
+import { probeBuiltinSqlite, probeHostBetterSqlite3 } from "../src/storage/driver.js";
 import { createInitialState } from "acp-kernel";
 import { rmrf } from "./tmp-rm.ts";
+
+const HAS_ENGINE = probeBuiltinSqlite() || probeHostBetterSqlite3();
+const SKIP = HAS_ENGINE ? undefined : "no SQLite engine available on this host";
 
 // #7595: the export surface (handoff + list) must apply the same display-title
 // fallback as the web — a stored subagent dispatch boilerplate title falls back
@@ -112,4 +118,43 @@ test("#7595 JSONL dump stays as-is: it exports the stored title, not the display
         assert.match(header, new RegExp(`"title":"${BOILER}"`), "JSONL keeps the stored title");
         assert.doesNotMatch(header, new RegExp(`"title":"${TOPIC}"`));
     });
+});
+
+// #7595: the SQLite sessionSummaries first-block lead must mirror
+// webSummaryRows' filter — a leading block that carries NEITHER a topic nor a
+// summary defers to the next block, instead of shadowing it with NULLs (the
+// MySQL sibling query already had the filter; SQLite did not).
+test("#7595 sessionSummaries: a leading block without topic/summary does not shadow later blocks", { skip: SKIP }, () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-export-subagent-sql-"));
+    const p = path.join(dir, "index.db");
+    const s0 = UnifiedStore.open(p);
+    s0.close();
+    const ro = new DatabaseSync(p);
+    ro.prepare("INSERT INTO content (hash, byte_len, refcount, algo, bytes) VALUES ('h1', 1, 1, 'sha256', x'00')").run();
+    const insBlock = ro.prepare(
+        "INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, tier, summary_hash, covered_hash, payload_json, created_at, active) VALUES (?, ?, ?, 0, 1, 1, 'h1', 'h1', ?, 1, 1)",
+    );
+    try {
+        // sess1: ord 1 carries neither topic nor summary; ord 2 is the real lead.
+        ro.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES ('sess1', 1, 1)").run();
+        insBlock.run("b1", "sess1", 1, JSON.stringify({ compressedTokens: 10 }));
+        insBlock.run("b2", "sess1", 2, JSON.stringify({ topic: "later topic", summary: "s", compressedTokens: 10 }));
+        // sess2 control: a valid leading block must still win.
+        ro.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES ('sess2', 1, 1)").run();
+        insBlock.run("b3", "sess2", 1, JSON.stringify({ topic: "first topic", summary: "s", compressedTokens: 10 }));
+    } finally {
+        ro.close();
+    }
+    const s = UnifiedStore.open(p);
+    try {
+        const rows = s.sessionSummaries();
+        const r1 = rows.find((r) => r.sessionId === "sess1")!;
+        assert.equal(r1.firstTopic, "later topic", "the lead comes from the first block that HAS a topic/summary — parity with webSummaryRows");
+        assert.equal(r1.firstSummary, "s");
+        const r2 = rows.find((r) => r.sessionId === "sess2")!;
+        assert.equal(r2.firstTopic, "first topic", "a valid leading block is not skipped");
+    } finally {
+        s.close();
+        rmrf(dir);
+    }
 });
