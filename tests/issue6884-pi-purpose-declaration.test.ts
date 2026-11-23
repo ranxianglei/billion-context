@@ -154,18 +154,21 @@ test("the IDENTICAL body without the x-bili-plugin marker keeps the legacy demot
     }
 });
 
-test("the DSH sentinel stays ≡ absent: a dsh main turn with a side-shaped body is still heuristic-classified (per-client asymmetry pin)", async () => {
+test("the DSH sentinel declares main: a dsh main turn with a side-shaped body rides the full pipeline (#7572)", async () => {
     const h = await harness();
     try {
-        // The sentinel means different things per client (see file header):
-        // from dsh it is "dsh left GenerateOptions.purpose unset" — possibly
-        // an unrecognized new aux feature — so the heuristics keep
-        // classifying it. This is the deliberate asymmetry vs pi, pinned so
-        // a future "just normalize the sentinel" cleanup cannot silently
-        // change dsh behavior (the #6880 byte-for-byte contract).
+        // #7572: the "conversation" sentinel is a FACT about the dispatch for
+        // dsh too — ordinary conversation leaves GenerateOptions.purpose UNSET
+        // (the plugin stamps the sentinel), while every auxiliary call sets a
+        // real purpose value. So the sentinel can only appear on a main turn,
+        // and it rides the #1699 explicit-"main" intent rung (like pi): it
+        // outranks the max_tokens<=200 budget heuristic. Pre-#7572 this body
+        // was demoted to the #388 side passthrough by the budget heuristic and
+        // never entered the kernel pipeline — the long-conversation brick.
         const r = await h.dshSend("pi4", SIDE_SHAPED_BODY, "conversation");
         assert.equal(r.status, 200);
-        assert.equal(resolveConversation("pi4").session?.stats.requests ?? 0, 0, "dsh sentinel + side-shaped body: legacy demotion holds");
+        assert.equal(resolveConversation("pi4").session?.stats.requests ?? 0, 1, "dsh sentinel + side-shaped body: declared main turn rides the full pipeline (#7572)");
+        assert.deepEqual(await h.subSessions("pi4"), [], "no persona fork off a declared dsh main turn");
     } finally {
         await h.close();
     }
@@ -185,6 +188,47 @@ test("a declared pi conversation keys the raw id across system drift (one sessio
         assert.equal(r.status, 200);
         assert.equal(resolveConversation("pi5").session?.stats.requests ?? 0, 2, "both turns live on the raw session");
         assert.deepEqual(await h.subSessions("pi5"), [], "no |sub: lane off declared pi traffic");
+    } finally {
+        await h.close();
+    }
+});
+
+test("a declared dsh main turn with NO tools and a starved budget (16) gets its budget restored (#7572 gate 2)", async () => {
+    const h = await harness();
+    try {
+        // The exact #7572 shape: a dsh main turn (conversation sentinel) whose
+        // history outgrew the window, so the host shrunk the output budget to
+        // 16 to fit. Pre-#7572 the no-tools early return in restoreOutputBudget
+        // swallowed the rescue (the request looked like a side request), so the
+        // 16 budget forwarded verbatim and the model could never emit the
+        // compress call. Post-#7572 the trusted declared-main flag skips the
+        // no-tools early return, so the budget is restored to the ceiling.
+        const starved = { model: "fake-a", max_completion_tokens: 16, stream: false, messages: [{ role: "user", content: "continue the long conversation" }] };
+        const r = await h.dshSend("pi6", starved, "conversation");
+        assert.equal(r.status, 200);
+        assert.equal(resolveConversation("pi6").session?.stats.requests ?? 0, 1, "declared dsh main turn rides the full pipeline");
+        const fwd = h.forwarded.at(-1) as { max_completion_tokens?: number };
+        assert.ok(typeof fwd.max_completion_tokens === "number" && fwd.max_completion_tokens > 16,
+            `starved 16 budget was restored to ${fwd.max_completion_tokens} (above the 16 floor), not forwarded verbatim (#7572 gate 2)`);
+    } finally {
+        await h.close();
+    }
+});
+
+test("a dsh AUXILIARY call (real purpose) with no tools and a small budget keeps the legacy demotion + no restore (#7572 negative)", async () => {
+    const h = await harness();
+    try {
+        // The negative case: a dsh aux call (e.g. session-title) carries a REAL
+        // purpose (not the conversation sentinel), so declaredMainTurn is false.
+        // The no-tools early return in restoreOutputBudget still applies, and
+        // the request is heuristic-classified as a side request. This pins that
+        // the #7572 rescue does NOT leak to auxiliary calls.
+        const aux = { model: "fake-a", max_completion_tokens: 64, stream: false, messages: [{ role: "user", content: "generate a title" }] };
+        const r = await h.dshSend("pi7", aux, "session-title");
+        assert.equal(r.status, 200);
+        assert.equal(resolveConversation("pi7").session?.stats.requests ?? 0, 0, "dsh aux call (real purpose) keeps the legacy side demotion");
+        const fwd = h.forwarded.at(-1) as { max_completion_tokens?: number };
+        assert.equal(fwd.max_completion_tokens, 64, "aux budget forwarded verbatim (no restore) — the rescue is declared-main-only (#7572 negative)");
     } finally {
         await h.close();
     }

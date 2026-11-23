@@ -904,6 +904,8 @@ export function restoreOutputBudget(
     outputCeiling?: number,
     /** #3438: true when this lane's host stamps the model-declared maxTokens onto every main turn by contract (dsh/pi-ai buildBaseOptions default) — see the doc above. */
     dshLane?: boolean,
+    /** #7572: true when this request carries a trusted declared-main purpose (pi/dsh "conversation" sentinel) — a main turn even with no tools, so the no-tools early return must not swallow the starved-budget rescue. */
+    declaredMain?: boolean,
 ): void {
     const field = outputBudgetField(parsed);
     if (!field) return;
@@ -933,7 +935,11 @@ export function restoreOutputBudget(
     }
     // Starved or #3438-collapsed main request (budget + tools present). A side
     // request (no tools) never reaches here — restoring it would break its side status.
-    if (!Array.isArray(p.tools) || p.tools.length === 0) return;
+    // #7572: a TRUSTED declared-main request (pi/dsh "conversation" sentinel) is a
+    // main turn even with no tools — the no-tools early return must not swallow its
+    // starved-budget rescue, or a long dsh conversation whose budget was shrunk to 16
+    // would forward verbatim and never emit the compress call.
+    if (!declaredMain && (!Array.isArray(p.tools) || p.tools.length === 0)) return;
     const highWaterRaw = session.metadata.outputBudgetHighWater;
     const highWater = typeof highWaterRaw === "number" && highWaterRaw > SIDE_REQUEST_MAX_TOKENS ? highWaterRaw : undefined;
     let target = highWater;
