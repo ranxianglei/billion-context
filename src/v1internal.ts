@@ -138,13 +138,9 @@ export function truncateV1ContentsForBudget(contents: unknown, budget: number): 
     }
     const tail = startIdx < list.length ? list.slice(startIdx) : [];
 
-    let result: { role?: unknown }[];
-    if (tail.length > 0 && startIdx <= anchorIdx) {
-        // The anchor is inside the kept tail (short history) — use the tail as-is.
-        result = tail;
-    } else {
-        result = [anchor, ...tail];
-    }
+    // The tail walk stops at anchorIdx+1, so `tail` never contains the anchor —
+    // prepend it to keep the first user instruction + the most recent tail.
+    let result: { role?: unknown }[] = [anchor, ...tail];
 
     // Preserve Gemini's strict role alternation at the join: if the tail head's
     // role matches the anchor's, drop the tail head (NOT the anchor) so the
