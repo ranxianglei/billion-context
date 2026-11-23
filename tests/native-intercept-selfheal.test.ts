@@ -4,7 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
+import { installFetchChain } from "../src/agent/fetch-chain/index.js";
 import { installNativeFetchIntercept, type NativeInterceptState } from "../src/agent/native-intercept.js";
+import { INLINE_ORIGIN } from "../src/inline-engine.js";
 
 // #2827: the fetch-chain diagnostics now land in the shared bili.log instead
 // of the terminal. Keep this whole suite hermetic: point XDG_STATE_HOME at a
@@ -419,6 +421,39 @@ function webAccessProxy() {
     };
 }
 
+// #6829: mirrors pi-web-access >= 0.46 — the install guard AND the marker moved
+// to __piWebAccessSharedProxyFetch; the old __piWebAccessProxyFetch is only
+// propagated onto the wrapper when the wrapped fetch already carries it.
+function piWebAccess046() {
+    const proxy = new AsyncLocalStorage<boolean>();
+    let installs = 0;
+    let calls = 0;
+    return {
+        get installs() { return installs; },
+        get calls() { return calls; },
+        install() {
+            const base = globalThis.fetch;
+            if (Reflect.get(base, "__piWebAccessSharedProxyFetch") === true) return;
+            const wrapper = (async (input: string | URL | Request, init?: RequestInit) => {
+                calls++;
+                const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+                if (proxy.getStore() && url.hostname !== "127.0.0.1") return new Response("via-web-proxy");
+                return base(input, init);
+            }) as typeof fetch;
+            Object.defineProperty(wrapper, "__piWebAccessSharedProxyFetch", { value: true });
+            if (Reflect.get(base, "__piWebAccessProxyFetch") === true) {
+                Object.defineProperty(wrapper, "__piWebAccessProxyFetch", { value: true });
+            }
+            installs++;
+            globalThis.fetch = wrapper;
+        },
+        run<T>(fn: () => T): T {
+            this.install();
+            return proxy.run(true, fn);
+        },
+    };
+}
+
 for (const first of ["bili", "web-access"]) {
     test(`pi-web-access: ${first} installs first, 1000 proxy scopes keep one wrapper and routing`, async () => {
         const nativeSink: string[] = [];
@@ -500,6 +535,63 @@ test("pi-web-access: the marker follows the live downstream after a dead closure
         assert.equal(respawns, 0);
     });
     assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages"]);
+});
+
+// #6829: pi-web-access >= 0.46 renamed its marker, so bili's #2435 coexistence
+// branch went unreachable and EVERY install fell into the generic #1158 re-chain.
+// The re-armed top then hit the #1662 depth-1 cutoff, which handed bili's own
+// INLINE_ORIGIN model URLs to the oldest live anchor (the host's native fetch) —
+// a real DNS lookup for the pseudo-origin → getaddrinfo ENOTFOUND on every model
+// call until the host restarted. Two defects, one repro:
+//   (1) ROUTING — the #1662 cutoff must not truncate INLINE_ORIGIN URLs to the
+//       host anchor; they are served IN-PROCESS by the inline transport link
+//       below, reached via the #4527 chainHop legitimate descent.
+//   (2) STABILITY — the chain must propagate the NEW shared-flag marker so
+//       pi-web-access's own install guard sees "a wrapper is already in the
+//       chain" and does NOT re-wrap on every proxied web tool call (unbounded
+//       (wrapper, bili-link) growth, the #1662 churn shape).
+test("#6829: 0.46+ pi-web-access re-wrap — INLINE_ORIGIN model traffic is served in-process, wrapper stays one", async () => {
+    const nativeSink: string[] = [];
+    const inlineServed: string[] = [];
+    const nativeFetch = fakeFetch(nativeSink);
+    const prevFetch = globalThis.fetch;
+    await withScope(nativeFetch, async () => {
+        // Innermost link: mimic pi-inline.ts — serve INLINE_ORIGIN URLs in-process.
+        installFetchChain((send) => {
+            return async (input: string | URL | Request, init?: RequestInit) => {
+                const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+                if (url !== undefined && url.startsWith(INLINE_ORIGIN)) {
+                    inlineServed.push(url);
+                    return new Response("{}", { status: 200 });
+                }
+                return send(input, init);
+            };
+        }, { inlineOrigin: INLINE_ORIGIN });
+        // Top link: the real intercept with origin = INLINE_ORIGIN — rewrites a
+        // model URL to INLINE_ORIGIN/bili/<upstream> (the pi inline lane shape).
+        installNativeFetchIntercept({ origin: INLINE_ORIGIN, ready: Promise.resolve(INLINE_ORIGIN) });
+        // pi-web-access 0.46.0 shape wraps the top (shared-flag guard + marker).
+        const web = piWebAccess046();
+        web.install();
+        assert.equal(web.installs, 1);
+        // A model request must be served in-process by the inline transport,
+        // NOT reach the host anchor (which would be a real DNS lookup).
+        const res = await globalThis.fetch("https://api.example.invalid/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+        // A second proxied web tool call must NOT re-wrap the top (one wrapper).
+        assert.equal(await web.run(() => globalThis.fetch("https://example.invalid/article")).then(r => r.text()), "via-web-proxy");
+        assert.equal(web.installs, 1);
+    });
+    // This test double-installs (inline transport + intercept, the pi inline
+    // lane shape), so the fetch property is left as an accessor; withScope's
+    // cleanup write re-arms the leftover guard. Restore the plain data property
+    // so the guard is gone and the next test starts from a clean install.
+    Object.defineProperty(globalThis, "fetch", { value: prevFetch, writable: true, configurable: true });
+    // The model URL was served in-process by the inline transport link.
+    assert.deepEqual(inlineServed, [`${INLINE_ORIGIN}/bili/https://api.example.invalid/v1/messages`]);
+    // The host anchor never saw an INLINE_ORIGIN URL (no real DNS lookup).
+    assert.ok(!nativeSink.some((u) => u.startsWith(INLINE_ORIGIN)),
+        `host anchor received an INLINE_ORIGIN URL (would be a real DNS lookup): ${JSON.stringify(nativeSink)}`);
 });
 
 // #2685/#2827: diagnostics-only refinement of the #1158 third-party-install
