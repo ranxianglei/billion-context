@@ -5,7 +5,7 @@ import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
-import { loadConfigFile, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { handoffRevealEnabled, loadConfigFile, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { resetEgressModuleCache } from "../egress-transforms.js";
 import { applyCompressSettings, listResolvedPacks, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
@@ -52,6 +52,7 @@ import { attributionStatusWire } from "./attribution-status.js";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { readLogFileLines, readLogLines } from "../log-file-lines.js";
+import { revealInFileManager, writeHandoffExport } from "../handoff-export.js";
 
 interface AdminCtx {
     opts: ProxyOptions;
@@ -264,6 +265,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
     // #4173: compact fold-edge feed for the live tree thumbnail (5s client poll).
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/tree")) return sendWebSessionTree(res, req.url);
+    // #7233: the existing handoff download button writes through the server
+    // so the file can land in Downloads and get revealed in the OS file manager.
+    if (req.method === "POST" && req.url !== undefined && isHandoffExportPath(req.url)) return await sendHandoffExport(res, req.url);
     // #3917: one block's original text for the 压缩结构 tree — lazy per click, so
     // the detail payload never carries whole originals.
     if (req.method === "GET" && req.url !== undefined && isBlockContentPath(req.url)) return sendWebBlockContent(res, req.url);
@@ -1690,6 +1694,47 @@ async function sendWebSessionTree(res: http.ServerResponse, url: string): Promis
     }
     res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
     res.end(JSON.stringify(tree));
+}
+
+// #7233: `/__bili/sessions/<id>/handoff/export` — write the same Markdown the
+// browser used to download, then best-effort reveal it in the OS file manager.
+const HANDOFF_EXPORT_PATH = "/handoff/export";
+
+function isHandoffExportPath(url: string): boolean {
+    const q = url.indexOf("?");
+    const pathname = q === -1 ? url : url.slice(0, q);
+    return pathname.startsWith("/__bili/sessions/") && pathname.endsWith(HANDOFF_EXPORT_PATH);
+}
+
+async function sendHandoffExport(res: http.ServerResponse, url: string): Promise<void> {
+    const prefix = "/__bili/sessions/";
+    const pathname = url.split("?", 1)[0];
+    let id = "";
+    try {
+        id = decodeURIComponent(pathname.slice(prefix.length, -HANDOFF_EXPORT_PATH.length));
+    } catch {
+        // malformed percent-encoding → unknown session (404 below)
+    }
+    const detail = await buildSessionDetail(id);
+    if (!detail) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown session: ${id}` }));
+        return;
+    }
+    if (!detail.handoffMd) {
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "session has no handoff markdown" }));
+        return;
+    }
+    try {
+        const filePath = writeHandoffExport(id, detail.handoffMd);
+        const revealed = handoffRevealEnabled() && await revealInFileManager(filePath);
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: true, path: filePath, revealed }));
+    } catch (error) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `could not write handoff: ${String(error)}` }));
+    }
 }
 
 // #3917: `/__bili/sessions/<id>/block-content?blockId=bN&view=one|full`.

@@ -2659,6 +2659,12 @@ bili export <id> --full --output handoff.md
 
 Then start a new conversation in the client (direct to upstream) and paste the handoff doc as the opening context.
 
+### Handoff export from the web UI (#7233)
+
+The handoff pane's existing **Download .md** button keeps its position and filename, but the server now writes the same Markdown to the OS Downloads folder and then reveals it in the file manager (`explorer /select,<path>`, `open -R <path>`, or `xdg-open <dir>`). If the reveal cannot run (headless host, permissions), the file is still written and the toast shows its path. Set `handoff.reveal` to `false` in the config file for headless/bot profiles; the default is `true`.
+
+This is the recovery path: export the handoff, open a new session in that workspace, and attach the file — without hunting through Downloads for a UUID name.
+
 ### Codex subagents get their own compression namespace (#150)
 
 Codex subagents (e.g. the `guardian_subagent` approval reviewer) reuse the main conversation's `session_id`, so on the wire they look like the same session. Without care their requests inherit the main conversation's compression state — a subagent turn can get its context folded (losing the verbatim user authorization it must read back) and the two roles' usage estimates pollute each other.

@@ -2617,6 +2617,12 @@ bili export <id> --full --output handoff.md
 
 然后在客户端里开一个新会话（直连上游），把交接文档粘贴为开场上下文。
 
+### 从 Web UI 导出交接文档（#7233）
+
+交接面板里现有的 **下载 .md** 按钮位置和文件名不变，但改由服务端把同一份 Markdown 写到系统 Downloads，并在文件管理器中定位该文件（`explorer /select,<path>`、`open -R <path>` 或 `xdg-open <dir>`）。如果无法打开文件管理器（无头环境、权限不足），文件仍会写入，toast 会显示路径。无头/机器人配置可在配置文件里设 `handoff.reveal: false`；默认是 `true`。
+
+这是故障恢复路径：导出交接文档、在该工作区开新会话、附上文件即可，不用再去 Downloads 里翻 UUID 文件名。
+
 ### Codex 子代理有独立压缩命名空间（#150）
 
 Codex 子代理（如 `guardian_subagent` 审批 reviewer）复用主会话的 `session_id`，在线路上看起来是同一个会话。若不处理，子代理请求会继承主会话的压缩状态 —— 子代理轮次的上下文可能被折叠（丢失它必须逐字读取的用户授权），两个角色的用量估算也会互相污染。
