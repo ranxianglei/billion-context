@@ -87,6 +87,71 @@ function startFakeProxyV2(manifestOpenaiTools?: Array<{ name?: string; descripti
     }));
 }
 
+// #7582: the built-in claude-agent provider stores the session under the Claude Code
+// subprocess UUID, not the OpenCode ses_… id. This fake proxy models the two lookups:
+// `unknownId` (the ses_… id) 404s, `panelId` (the UUID) serves a panel — or, when
+// `redirectPanelId` is set, 302s to /redirect-target so a redirect:"manual" read can be
+// proven NOT to follow it.
+interface ClaudeAgentFakeProxyOptions {
+    unknownId?: string;
+    panelId?: string;
+    panel?: string;
+    redirectPanelId?: boolean;
+}
+
+function startClaudeAgentFakeProxy(options: ClaudeAgentFakeProxyOptions): Promise<{ origin: string; statusQueries: string[]; toolCalls: Array<{ conversationId?: string; tool?: string }>; redirectTargetHits: number; close: () => Promise<void> }> {
+    const statusQueries: string[] = [];
+    const toolCalls: Array<{ conversationId?: string; tool?: string }> = [];
+    let redirectTargetHits = 0;
+    const server = http.createServer((req, res) => {
+        const url = req.url ?? "";
+        if (url === "/redirect-target") {
+            redirectTargetHits++;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, panel: "REDIRECT-TARGET-PANEL" }));
+            return;
+        }
+        if (url.startsWith("/__bili/plugin/status")) {
+            const sid = decodeURIComponent(url.match(/conversationId=([^&]*)/)?.[1] ?? "");
+            statusQueries.push(sid);
+            if (options.redirectPanelId && sid === options.panelId) {
+                res.writeHead(302, { location: "/redirect-target" });
+                res.end();
+                return;
+            }
+            if (sid === options.panelId) {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, panel: options.panel ?? "CLAUDE-PANEL-OK", webUrl: null }));
+                return;
+            }
+            res.writeHead(404, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
+            return;
+        }
+        if (url === "/__bili/plugin/tool" && req.method === "POST") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                const data = JSON.parse(body) as { conversationId?: string; tool?: string };
+                toolCalls.push(data);
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, result: "STATUS-RESULT" }));
+            });
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    return once(server, "listening").then(() => ({
+        origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+        statusQueries,
+        toolCalls,
+        get redirectTargetHits() { return redirectTargetHits; },
+        close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    }));
+}
+
 interface FakeAddedTool {
     name: string;
     description?: string;
@@ -101,7 +166,7 @@ interface FakeAddedCommand {
     execute: (input: Record<string, unknown>) => Promise<void>;
 }
 
-function makeFakeCtx() {
+function makeFakeCtx(context?: unknown) {
     const eventQueue: Array<{ type?: unknown; data?: Record<string, unknown> }> = [];
     let wake: (() => void) | undefined;
     let closed = false;
@@ -113,6 +178,10 @@ function makeFakeCtx() {
     let modelRequestCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
     let wsHandshakeCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
     const disposed: number[] = [];
+    const contextCalls: Array<{ sessionID: string }> = [];
+    const contextFn = context === undefined ? undefined
+        : (typeof context === "function" ? (context as (input: { sessionID: string }) => Promise<unknown> | unknown)
+            : ((_input: { sessionID: string }) => context));
 
     const ctx = {
         session: {
@@ -127,6 +196,12 @@ function makeFakeCtx() {
                 syntheticCalls.push(input);
                 return {};
             },
+            ...(contextFn ? {
+                context: async (input: { sessionID: string }) => {
+                    contextCalls.push(input);
+                    return contextFn(input);
+                },
+            } : {}),
         },
         tool: {
             transform: async (cb: (editor: { add: (t: FakeAddedTool) => void }) => void) => {
@@ -188,6 +263,7 @@ function makeFakeCtx() {
         get addedTools() { return addedTools; },
         get addedCommands() { return addedCommands; },
         get syntheticCalls() { return syntheticCalls; },
+        get contextCalls() { return contextCalls; },
         get disposed() { return disposed; },
     };
 }
@@ -412,6 +488,108 @@ test("v2 setup: env-based activation without /bili/ URL", async () => {
                 const res = await fake.fireModelRequest({ sessionID: "s2", baseURL: "http://real-upstream.example/v1" });
                 assert.equal(res.headers["x-bili-plugin"], "opencode");
                 assert.equal(res.headers["x-bili-plugin-conversation"], "s2");
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#7582: acp_status resolves the claude-agent subprocess UUID for the panel read", async () => {
+    const proxy = await startClaudeAgentFakeProxy({ unknownId: "ses_claude", panelId: "claude-uuid-123" });
+    const fake = makeFakeCtx([
+        { id: "msg_1", type: "assistant", content: [
+            { type: "text", text: "hello" },
+            { type: "text", text: "world", native: { sessionID: "claude-uuid-123", messageID: "msg-uuid-1" } },
+        ] },
+    ]);
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const out = await fake.addedTools.find((t) => t.name === "acp_status")!.execute({}, { sessionID: "ses_claude" });
+                assert.equal(out.content, "CLAUDE-PANEL-OK");
+                // the ses_… lookup 404s first, then the UUID lookup serves the panel
+                assert.deepEqual(proxy.statusQueries, ["ses_claude", "claude-uuid-123"]);
+                // the panel succeeded — no forwardTool fallback
+                assert.equal(proxy.toolCalls.length, 0);
+                // the context API was consulted exactly once, for the OpenCode id
+                assert.deepEqual(fake.contextCalls, [{ sessionID: "ses_claude" }]);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#7582: acp_status degrades to the forwardTool fallback when no part carries the UUID", async () => {
+    const proxy = await startClaudeAgentFakeProxy({ unknownId: "ses_claude", panelId: "claude-uuid-123" });
+    const fake = makeFakeCtx([
+        { id: "msg_1", type: "assistant", content: [
+            { type: "text", text: "hello" },
+        ] },
+    ]);
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const out = await fake.addedTools.find((t) => t.name === "acp_status")!.execute({}, { sessionID: "ses_claude" });
+                // no UUID resolved → the forwardTool fallback runs (the fake proxy serves STATUS-RESULT)
+                assert.equal(out.content, "STATUS-RESULT");
+                // only the ses_… lookup happened — no UUID query
+                assert.deepEqual(proxy.statusQueries, ["ses_claude"]);
+                assert.equal(proxy.toolCalls.at(-1)?.conversationId, "ses_claude");
+                assert.equal(proxy.toolCalls.at(-1)?.tool, "acp_status");
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#7582: acp_status does not resolve the UUID against a non-loopback proxy", async () => {
+    // .invalid is RFC 2606-reserved (never resolves) — the fetch fails fast; the point
+    // is that the context API is never consulted when the proxy base is not loopback.
+    const fake = makeFakeCtx([
+        { id: "msg_1", type: "assistant", content: [
+            { type: "text", text: "hello", native: { sessionID: "claude-uuid-123", messageID: "msg-uuid-1" } },
+        ] },
+    ]);
+    await withEnv({ BILLION_CONTEXT_PROXY: "http://nonloopback.invalid:8787", BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+        const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+        try {
+            await fake.addedTools.find((t) => t.name === "acp_status")!.execute({}, { sessionID: "ses_claude" });
+        } finally {
+            cleanup();
+        }
+    });
+    assert.equal(fake.contextCalls.length, 0, "the UUID resolution is loopback-gated");
+});
+
+test("#7582: acp_status UUID lookup does not follow redirects (redirect: manual)", async () => {
+    const proxy = await startClaudeAgentFakeProxy({ unknownId: "ses_claude", panelId: "claude-uuid-123", redirectPanelId: true });
+    const fake = makeFakeCtx([
+        { id: "msg_1", type: "assistant", content: [
+            { type: "text", text: "hello", native: { sessionID: "claude-uuid-123", messageID: "msg-uuid-1" } },
+        ] },
+    ]);
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const out = await fake.addedTools.find((t) => t.name === "acp_status")!.execute({}, { sessionID: "ses_claude" });
+                // the UUID lookup 302s; redirect:"manual" does not follow it, so the panel
+                // read yields nothing and the fix falls through to the forwardTool fallback.
+                assert.equal(out.content, "STATUS-RESULT");
+                assert.equal(proxy.redirectTargetHits, 0, "the redirect target must never be hit");
+                assert.deepEqual(proxy.statusQueries, ["ses_claude", "claude-uuid-123"]);
+                assert.equal(proxy.toolCalls.at(-1)?.tool, "acp_status");
             } finally {
                 cleanup();
             }

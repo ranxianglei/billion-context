@@ -122,6 +122,13 @@ export interface V2PluginContext {
     session?: {
         hook?: (name: string, cb: (e: V2HttpRequestEvent) => void | Promise<void>) => V2Registration | void | Promise<V2Registration | undefined>;
         synthetic?: (input: { id?: string; sessionID: string; text: string; description?: string; resume?: boolean }) => Promise<unknown>;
+        /** 2.4.0+ (probed @opencode/plugin 2.4.0): returns the session's
+         *  message list; assistant message parts carry the producing
+         *  provider's `native` replay data (for the built-in claude-agent
+         *  provider that is { sessionID, messageID }, the Claude Code
+         *  subprocess UUID the proxy stores the session under, #7582).
+         *  Older builds expose no such method — callers degrade inertly. */
+        context?: (input: { sessionID: string }) => Promise<unknown> | undefined;
     };
     tool?: {
         transform?: (cb: (editor: V2ToolEditor) => void) => V2Registration | void | Promise<V2Registration | undefined>;
@@ -150,6 +157,50 @@ const TOOL_DELTA_RETRY_MS = 15000;
 
 // Kill switch = fully inert (same semantics as detectProxyBase): gates header stamping, tool forwarding, compaction reporting.
 const pluginDisabled = (): boolean => process.env.BILLION_CONTEXT_PLUGIN === "0";
+
+/** #7582: the built-in claude-agent provider drives a local Claude Code
+ *  subprocess whose traffic the proxy stores under the subprocess UUID (the
+ *  x-claude-code-session-id header), not the OpenCode ses_… id — so a status
+ *  lookup with the ses_… id 404s even after model traffic arrived. OpenCode
+ *  2.4.0+ exposes the UUID on assistant message parts via the producing
+ *  provider's `native` replay data (native.sessionID, set from the Claude Code
+ *  SDK message's session_id). Read it from the session context so acp_status
+ *  can query the proxy with the id the session is actually stored under.
+ *  Returns the most recent part's native.sessionID, or undefined when the API
+ *  is absent (older build), throws, or no part carries one. */
+async function resolveClaudeAgentSessionId(ctx: V2PluginContext, sessionID: string): Promise<string | undefined> {
+    const context = ctx.session?.context;
+    if (typeof context !== "function") return undefined;
+    let messages: unknown;
+    try {
+        messages = await context({ sessionID });
+    } catch {
+        return undefined;
+    }
+    if (!Array.isArray(messages)) return undefined;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const content = (messages[i] as { content?: unknown } | null)?.content;
+        if (!Array.isArray(content)) continue;
+        for (let j = content.length - 1; j >= 0; j--) {
+            const native = (content[j] as { native?: unknown } | null)?.native;
+            if (!native || typeof native !== "object") continue;
+            const sid = (native as { sessionID?: unknown }).sessionID;
+            if (typeof sid === "string" && sid.length > 0) return sid;
+        }
+    }
+    return undefined;
+}
+
+/** #7582 gate: the claude-agent UUID retry only ever queries the local
+ *  installer-shaped loopback proxy — never a remote or redirecting origin. */
+function isLoopbackOrigin(origin: string): boolean {
+    try {
+        const host = new URL(origin).hostname;
+        return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+    } catch {
+        return false;
+    }
+}
 
 const V2_BILI_TOOLS = [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map((t) => ({
     name: t.function.name,
@@ -503,6 +554,21 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                     const status = await fetchStatus(base, tctx.sessionID);
                     const panel = status?.["panel"];
                     if (typeof panel === "string" && panel.length > 0) return { content: panel };
+                    // #7582: the built-in claude-agent provider stores the session under the
+                    // Claude Code subprocess UUID, not the OpenCode ses_… id, so the lookup
+                    // above 404s even after model traffic arrived. Resolve the UUID from the
+                    // session context (assistant parts' native.sessionID, OpenCode 2.4.0+) and
+                    // retry the panel read with it. Loopback-only and redirects disabled so the
+                    // id is never sent to a remote or redirecting proxy. Panel-only by design:
+                    // on a miss the forwardTool fallback below keeps its current behavior.
+                    if (isLoopbackOrigin(base)) {
+                        const claudeId = await resolveClaudeAgentSessionId(ctx, tctx.sessionID);
+                        if (claudeId && claudeId !== tctx.sessionID) {
+                            const retry = await fetchStatus(base, claudeId, { redirect: "manual" });
+                            const retryPanel = retry?.["panel"];
+                            if (typeof retryPanel === "string" && retryPanel.length > 0) return { content: retryPanel };
+                        }
+                    }
                 }
                 const result = await forwardTool(base, tctx.sessionID, toolName, args, undefined, true);
                 // #2204: the V2 tool shape carries no error flag — a business failure rides the "[decompress FAILED:" receipt text the model reads.
