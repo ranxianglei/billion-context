@@ -510,13 +510,6 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         }
         const laneKey = disc !== "" ? `${rawId}|sub:${fp16(tag)}:${fp16(disc)}` : `${rawId}|sub:${fp16(tag)}`;
         record(laneKey, turns, tagHash, model);
-        // #5844: make the fork VISIBLE with a recovery command. When a host
-        // upgrade changes the persona tag AND the replay shape at once, this
-        // lane starts with ZERO inherited blocks and the parent's fold state
-        // goes unclaimed (a 2.5M-token conversation gets re-folded from
-        // scratch until the client times out at 413). The one-field fix is an
-        // offline command — the user never needs to know the new prompt.
-        loggerLog("warn", `[session-order] persona fork: parent ${rawId} → lane ${laneKey} (replay ${turns.length} turns vs recorded ${recorded.kinds.length}; tag changed without a continuing shape) — the new lane starts with NO inherited fold state; if a host upgrade changed the prompt, reclaim the parent's blocks with: bili sessions reattach ${rawId} ${laneKey} (#5844)`);
         return { key: laneKey, action: "derived-persona", reason: "persona text changed without continuing history — persona lane" };
     }
     if (!mainShaped(kinds)) {
