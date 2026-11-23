@@ -26,22 +26,28 @@ function setEnv(cap: string | undefined, band: string | undefined): void {
 
 test("#7277: admission budget knobs — defaults, env cap, env band, status (sequential: module-global slots)", () => {
     const saved = saveEnv();
-    const band = LARGE_DECODED_ADMISSION_BYTES; // 32 MiB shipped default
-    assert.ok(band < 104857600, "band sits below the pinned 100 MiB receive cap");
+    const band = LARGE_DECODED_ADMISSION_BYTES; // 1 GiB shipped default (owner ruling 2026-11-24: effectively-off)
+    const receiveCap = 104857600; // pinned above via BILI_RECEIVE_BODY_BYTES
     const large = band + 1;
+    // (the 1 GiB shipped band sits ABOVE the pinned 100 MiB receive cap — the
+    //  effective band is min() of the two, asserted below in Phase 0)
     try {
-        // Phase 0 — shipped defaults: 2 slots, 32 MiB band.
+        // Phase 0 — shipped defaults: 64 slots, 1 GiB band (owner ruling
+        // 2026-11-24: raise to effectively-off — only >1 GiB bodies occupy
+        // a slot, which real traffic does not reach).
         setEnv(undefined, undefined);
-        assert.equal(maxLargeDecodedRequests(), 2);
+        assert.equal(maxLargeDecodedRequests(), 64);
         assert.equal(largeDecodedAdmissionBytes(), band);
+        assert.equal(band, 1024 * 1024 * 1024, "shipped band is 1 GiB");
         let st = largeDecodedBudgetStatus();
         assert.equal(st.held, 0);
-        assert.equal(st.cap, 2);
-        assert.equal(st.bandBytes, band); // min(100MiB cap, 32MiB band)
+        assert.equal(st.cap, 64);
+        assert.equal(st.bandBytes, receiveCap); // min(100MiB pinned receive cap, 1GiB band)
         assert.equal(st.oldestHeldMs, undefined);
 
-        // Phase 1 — default cap: two over-band bodies admitted, third busy;
+        // Phase 1 — explicit cap=2: two over-band bodies admitted, third busy;
         // status reports the hold while it lasts and clears on release.
+        setEnv("2", undefined);
         const a = new DecodedRequestAdmission(), b = new DecodedRequestAdmission(), c = new DecodedRequestAdmission();
         try {
             a.observe(large);
@@ -58,7 +64,7 @@ test("#7277: admission budget knobs — defaults, env cap, env band, status (seq
         assert.equal(largeDecodedBudgetStatus().held, 0, "all slots released");
 
         // Phase 2 — cap override: BILI_MAX_LARGE_DECODED_REQUESTS=1 admits ONE
-        // over-band body; the second is busy even though the old default was 2.
+        // over-band body; the second is busy even though the default is 64.
         setEnv("1", undefined);
         assert.equal(maxLargeDecodedRequests(), 1);
         const d = new DecodedRequestAdmission(), e = new DecodedRequestAdmission();
@@ -70,9 +76,9 @@ test("#7277: admission budget knobs — defaults, env cap, env band, status (seq
         } finally { d.release(); e.release(); }
 
         // Phase 3 — band override: a 32 KiB cost band makes a 64 KiB body
-        // LARGE (it used to sail through the 32 MiB band), and in-band bodies
+        // LARGE (it used to sail through the 1 GiB band), and in-band bodies
         // stay free. 0 is rejected as a band (must be > 0 → default).
-        setEnv(undefined, String(32 * 1024));
+        setEnv("2", String(32 * 1024)); // cap back to 2 so the 3rd admission is busy
         assert.equal(largeDecodedAdmissionBytes(), 32 * 1024);
         const f = new DecodedRequestAdmission(), g = new DecodedRequestAdmission();
         try {

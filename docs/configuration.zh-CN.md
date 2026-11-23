@@ -183,9 +183,9 @@
 | `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | 经出站代理的连接最大存活时长，到期强制重建（规避陈旧 NAT 映射）。 |
 | `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | 代理主动发起的响应后关闭的优雅关闭预算：socket 挂起等待对端 FIN/TLS close_notify，到点销毁（reason=linger-backstop）。 |
 | `network.allowPrivateHttpProviders` | boolean | false | BILI_ALLOW_PRIVATE_HTTP_PROVIDERS | 可选开关（#2984）：允许私网（RFC1918、127/8、link-local、ULA、*.local/.lan/.internal）明文 HTTP provider 进入 agent-registry 接收与摘要端点守卫。默认关——明文仅回环受信；公网 IP/域名与 CGNAT（100.64/10）无论如何都拒。1/true 启用。 |
-| `network.receiveBodyBytes` | number | 5368709120 | BILI_RECEIVE_BODY_BYTES | 单请求读入内存的入站 wire 字节上限，超限在 receive 阶段返回 413。由硬编码 100 MiB 提升到 5 GiB（#3128 owner 决定），使多 GB 单请求被接受而非断连。同时也是解码请求占用两个共享大解码准入槽位的阈值。WebSocket lane 保持固定 100 MiB 表面。 |
-| `network.maxLargeDecodedRequests` | number | 2 | BILI_MAX_LARGE_DECODED_REQUESTS | 同时最多允许多少个超带解码请求——即 503 request_body_busy 的预算（#5794 分带，#7277 可配置）。解码体超过 min(network.receiveBodyBytes, network.largeDecodedAdmissionBytes) 就占一个槽位直到该请求结束，之后的请求拿到 503 retry-after。默认 2；0 = 拒绝一切超带体。当超长流式上游请求（几分钟的 6M-token 会话）占满全部槽位、后续大请求 503 且无从恢复时（#7277 第三条大请求必 503 的症状），调大它。 |
-| `network.largeDecodedAdmissionBytes` | number | 33554432 | BILI_LARGE_DECODED_ADMISSION_BYTES | 解码字节数超过该值即占用一个大解码准入槽位（#5794；原硬编码 32 MiB，#7277 起可配置）。这个量级的体要花数秒的单线程摄入口+解析时间，正是槽位预算要保护的对象。同时受 network.receiveBodyBytes 约束——两者取小（运维调小的接收上限保持更严格）。 |
+| `network.receiveBodyBytes` | number | 5368709120 | BILI_RECEIVE_BODY_BYTES | 单请求读入内存的入站 wire 字节上限，超限在 receive 阶段返回 413。由硬编码 100 MiB 提升到 5 GiB（#3128 owner 决定），使多 GB 单请求被接受而非断连。同时也是解码请求占用共享大解码准入槽位的阈值（实际带 = 本值与 network.largeDecodedAdmissionBytes 取小）。WebSocket lane 保持固定 100 MiB 表面。 |
+| `network.maxLargeDecodedRequests` | number | 64 | BILI_MAX_LARGE_DECODED_REQUESTS | 同时最多允许多少个超带解码请求——即 503 request_body_busy 的预算（#5794 分带，#7277 可配置）。解码体超过 min(network.receiveBodyBytes, network.largeDecodedAdmissionBytes) 就占一个槽位直到该请求结束，之后的请求拿到 503 retry-after。默认 64（2026-11-24 owner 拍板：实际放开——只有超过 1GiB 带的 body 才计数）；0 = 拒绝一切超带体。当超长流式上游请求（几分钟的 6M-token 会话）占满全部槽位、后续大请求 503 且无从恢复时（#7277 第三条大请求必 503 的症状），调大它。 |
+| `network.largeDecodedAdmissionBytes` | number | 1073741824 | BILI_LARGE_DECODED_ADMISSION_BYTES | 解码字节数超过该值即占用一个大解码准入槽位（#5794；原硬编码 32 MiB，#7277 起可配置；默认值经 2026-11-24 owner 拍板提到 1GiB，实际效果是只有 >1GiB 的 body 才计数）。这个量级的体要花数秒的单线程摄入口+解析时间，正是槽位预算要保护的对象。同时受 network.receiveBodyBytes 约束——两者取小（运维调小的接收上限保持更严格）。 |
 | `network.decodedBodyBytes` | number | 10737418240 | BILI_DECODED_BODY_BYTES | content-encoding 解压（gzip/deflate/br/zstd）后的解码字节上限，解码过程中增量检查（decode 阶段 413）。默认为接收预算的 2 倍，沿用旧的 decode=2×wire 关系；用于防解压炸弹。 |
 | `network.outboundBodyBytes` | number | 5368709120 | BILI_OUTBOUND_BODY_BYTES | 转发到上游的重建请求字节上限（forward 阶段 413），按最终 body 字符串的 UTF-8 字节计。在 fetch 之前检查，超预算的重建不会触发上游看门狗分配。 |
 | `network.wsOutboundBytes` | number | 10485760 | BILI_WS_OUTBOUND_BYTES | 仅针对 WebSocket 通道的软字节预算（#3701）：当最终序列化的 Responses WS 帧超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复——仅限注册了 bili 工具的通道；拒绝注入工具的 codex 类通道只有尺寸备注），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。若帧仍超出限制且上游在任何事件发出前即以 1009 关闭连接，则在同一请求内尝试一次严格更小的重发。设为 0 可禁用裁减（即恢复此前的原样发送行为）。HTTP 通道不受影响——硬性拒绝上限仍为 network.outboundBodyBytes。 |
@@ -1979,11 +1979,11 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_INGEST_BODY_BYTES` | `network.ingestBodyBytes` | 0 |
 | `BILI_INVARIANT_JUDGE` | `diagnostics.invariantJudge` | true |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
-| `BILI_LARGE_DECODED_ADMISSION_BYTES` | `network.largeDecodedAdmissionBytes` | 33554432 |
+| `BILI_LARGE_DECODED_ADMISSION_BYTES` | `network.largeDecodedAdmissionBytes` | 1073741824 |
 | `BILI_LOG_BUDGET_BYTES` | `diagnostics.logBudgetBytes` | 268435456 (256 MiB, floor 1 MiB) |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_LOG_RETENTION_HOURS` | `diagnostics.logRetentionHours` | 48 (floor 1) |
-| `BILI_MAX_LARGE_DECODED_REQUESTS` | `network.maxLargeDecodedRequests` | 2 |
+| `BILI_MAX_LARGE_DECODED_REQUESTS` | `network.maxLargeDecodedRequests` | 64 |
 | `BILI_MAX_MESSAGES` | `network.maxMessages` | 0 |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |

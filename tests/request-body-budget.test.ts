@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { gzipSync, deflateRawSync, brotliCompressSync } from "node:zlib";
 import { decodeRequestBody, DecompressedTooLargeError } from "../src/content-encoding.ts";
-import { checkOutboundBody, DecodedRequestAdmission, DecodedRequestBusyError, LARGE_DECODED_ADMISSION_BYTES, MAX_REQUEST_BYTES, MAX_DECODED_REQUEST_BYTES, OutboundBodyTooLargeError } from "../src/request-body-budget.ts";
+import { checkOutboundBody, DecodedRequestAdmission, DecodedRequestBusyError, MAX_REQUEST_BYTES, MAX_DECODED_REQUEST_BYTES, OutboundBodyTooLargeError } from "../src/request-body-budget.ts";
 import { fetchWithTimeout, _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 
 // #3128: assert the LEGACY byte-budget behavior at the old 100/200/100 MiB caps. Pin the
@@ -12,6 +12,12 @@ import { fetchWithTimeout, _liveUpstreamTimersForTest } from "../src/fetch-util.
 process.env.BILI_RECEIVE_BODY_BYTES = "104857600";
 process.env.BILI_DECODED_BODY_BYTES = "209715200";
 process.env.BILI_OUTBOUND_BODY_BYTES = "104857600";
+// The #7277 slot count now defaults to 64 (owner ruling 2026-11-24: effectively-off);
+// these legacy-shape pins exercise the two-slot behavior explicitly.
+process.env.BILI_MAX_LARGE_DECODED_REQUESTS = "2";
+// The #7277 cost band now defaults to 1 GiB; these pins exercise the #5794
+// 32 MiB cost-band shape explicitly.
+process.env.BILI_LARGE_DECODED_ADMISSION_BYTES = "33554432";
 
 test("large decoded admission: normal requests free, two large slots, third busy — at both the receive cap and the #5794 32MiB cost band", () => {
     // The slot counter is module-global, so the whole budget's behavior is
@@ -19,8 +25,8 @@ test("large decoded admission: normal requests free, two large slots, third busy
     // concurrently; two tests each grabbing two slots would starve each
     // other regardless of release hygiene).
     //
-    // Phase 1 — legacy receive-cap shape (pinned 100MiB above). Under the
-    // #5794 cost band the 100MiB-class body is itself LARGE (the band is
+    // Phase 1 — legacy receive-cap shape (pinned 100MiB above). Under the pinned
+    // 32MiB #5794 cost band the 100MiB-class body is itself LARGE (the band is
     // below it), so "normal requests stay free" is pinned at a genuinely
     // normal size and the two-slot/behind-it semantics keep their shape.
     const a = new DecodedRequestAdmission(), b = new DecodedRequestAdmission(), c = new DecodedRequestAdmission();
@@ -39,13 +45,17 @@ test("large decoded admission: normal requests free, two large slots, third busy
     // Phase 2 — #5794 cost band: the 51.2 MiB incident body (29,619 messages,
     // ~6s of event loop per round, 747s FATAL → self-restart → every session's
     // cache cold) sits BELOW the 100MiB receive cap pinned above — the old
-    // threshold let it through the slot budget entirely. The cost band closes
-    // that gap without touching the operator's receive limit:
-    // min(receive cap, 32MiB) is monotonic, so a smaller operator cap still
+    // threshold let it through the slot budget entirely. The pinned 32MiB cost
+    // band (the shipped default is now 1 GiB per the 2026-11-24 owner ruling)
+    // closes that gap without touching the operator's receive limit:
+    // min(receive cap, band) is monotonic, so a smaller operator cap still
     // binds (the same expression the legacy phase already exercises at
     // 100MiB > 32MiB — here the band itself is the binding side).
-    const band = LARGE_DECODED_ADMISSION_BYTES;
-    assert.ok(band < MAX_REQUEST_BYTES, "the band sits below the pinned 100MiB receive cap");
+    // (The shipped default is now 1 GiB per the 2026-11-24 owner ruling; this
+    //  suite pins the #5794 32 MiB cost-band shape explicitly via the env above
+    //  and a local literal — the knobs.js export is a constant, not env-aware.)
+    const band = 33554432;
+    assert.ok(band < MAX_REQUEST_BYTES, "the pinned band sits below the 100MiB receive cap");
     const f = new DecodedRequestAdmission(), g = new DecodedRequestAdmission(), h = new DecodedRequestAdmission();
     try {
         // Exactly at the band: free (same >-not-≥ convention as the receive cap).
