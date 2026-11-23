@@ -704,9 +704,6 @@ WAL の SQLite を持つローカルディスクは多くの書き手を許容�
 ```bash
 bili sessions ls                 # id, label, decoded size, last-updated, storage status (active/archived)
 bili sessions rm <id>            # full delete (content refcount release incl. media); shrinks index.db afterwards (--no-vacuum skips)
-bili sessions reattach <rawId> <laneKey>
-                                 # (#5844) persona fork で分岐した親セッションを、孤児 lane が記録した新しい persona tag へ再指向
-                                 # (オフライン・アトミック・両キャリア);実行中のプロキシが編集を巻き戻すと明示的に失敗
 bili sessions archive <id>       # export to archive/archive.jsonl + sweep rows; tombstone keeps label & identity
 bili sessions restore <id>       # bring an archived session back from the log line
 bili sessions foreign-blocks     # (#5312) list fold blocks whose covered messages never belonged to this transcript — dry-run; --apply reversibly archives them, --restore <sid>:<bid> brings one back
