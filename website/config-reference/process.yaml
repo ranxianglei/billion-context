@@ -77,6 +77,14 @@ entries:
     desc_en: "How long a failed preflight holds before the request is allowed through unreconciled."
     desc_zh: "preflight 失败后，允许请求未校准放行的持有时长。"
     desc_ja: "失敗したプリフライトが、リクエストが未調整のまま許可されるまで保持される時間。"
+  - key: network.emergencyDigest
+    type: boolean
+    default: "false (env BILI_PREFLIGHT_EMERGENCY_DIGEST=1 overrides)"
+    env: BILI_PREFLIGHT_EMERGENCY_DIGEST
+    group: process
+    desc_en: "Restores the #2383 emergency digest regime (deterministic digest folds when the payload is >19.2x the window). Default OFF since PR #7549: an unconvergent extreme overflow now fails the request instead of replacing the history with model-visible digest blocks. Set true to bring the old behavior back."
+    desc_zh: "恢复 #2383 紧急摘要 regime（超窗 19.2× 以上时用确定性摘要块折叠）。自 PR #7549 起默认关闭：无法收敛的极端超窗现在会拒绝请求，而不是用模型可见的摘要块替换历史。设为 true 恢复旧行为。"
+    desc_ja: "#2383 の緊急ダイジェスト regime（ペイロードがウィンドウの19.2倍超えで決定的ダイジェスト折畳み）を復帰させる。PR #7549 以降デフォルト OFF：収束しない極端なオーバーフローは、履歴をモデル可視のダイジェストブロックに置き換える代わりにリクエストを失敗させる。true で旧動作を復帰。"
   - key: network.preflightDeadEndCooldownMs
     type: number
     default: "300000"
