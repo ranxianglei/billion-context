@@ -105,11 +105,6 @@ Usage:
   bili sessions rm <id>             delete one session outright — files + index.db rows,
                                     shared-content refs released; VACUUMs afterwards
                                     (--no-vacuum skips the shrink)
-  bili sessions reattach <rawId> <laneKey>
-                                    re-point a persona-forked parent at the NEW persona tag the
-                                    orphan lane recorded (offline, atomic, both storage carriers);
-                                    catches a running proxy reverting the edit — see the fork
-                                    warning in the proxy log for the exact command (#5844)
   bili sessions archive <id>        move one session out of index.db into the single
                                     append-only archive log (rows swept, restorable)
    bili sessions restore <id>        bring an archived session back into index.db
@@ -252,9 +247,8 @@ type Parsed = {
     acpCacheLog?: string;
     acpCacheNoLog?: boolean;
     acpCacheSession?: string;
-    sessionsSub?: "ls" | "rm" | "archive" | "restore" | "foreign-blocks" | "reattach";
+    sessionsSub?: "ls" | "rm" | "archive" | "restore" | "foreign-blocks";
     sessionsTarget?: string;
-    sessionsLaneKey?: string;
     sessionsNoVacuum?: boolean;
     sessionsApply?: boolean;
     sessionsRestoreTarget?: string;
@@ -295,7 +289,6 @@ export function parseArgs(argv: string[]): Parsed {
     let acpCacheSession: string | undefined;
     let sessionsSub: Parsed["sessionsSub"];
     let sessionsTarget: string | undefined;
-    let sessionsLaneKey: string | undefined;
     let sessionsNoVacuum = false;
     let sessionsApply = false;
     let sessionsRestoreTarget: string | undefined;
@@ -602,16 +595,8 @@ export function parseArgs(argv: string[]): Parsed {
                     console.error(`bili sessions ${sub}: <id> is required (try "bili sessions ${sub} <session-id>")`);
                     process.exit(2);
                 }
-            } else if (sub === "reattach") {
-                sessionsSub = sub;
-                sessionsTarget = positional[2];
-                sessionsLaneKey = positional[3];
-                if (sessionsTarget === undefined || sessionsLaneKey === undefined) {
-                    console.error(`bili sessions reattach: <raw-session-id> <lane-key> are both required (the proxy's persona-fork warning logs the exact command)`);
-                    process.exit(2);
-                }
             } else {
-                console.error(`bili sessions: unknown action "${sub ?? ""}" (try "bili sessions ls|rm|archive|restore|foreign-blocks|reattach")`);
+                console.error(`bili sessions: unknown action "${sub ?? ""}" (try "bili sessions ls|rm|archive|restore|foreign-blocks")`);
                 process.exit(2);
             }
         } else if (cmd === "pack" || cmd === "packs") {
@@ -675,7 +660,7 @@ export function parseArgs(argv: string[]): Parsed {
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsLaneKey, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
     // -c/--config fail-fast: a bare NAME that resolves to a missing
     // <configDir>/NAME.json names the typo + the available siblings instead of
     // silently starting on an empty config (see paths.ts for path behavior).
@@ -838,7 +823,7 @@ export async function main(): Promise<void> {
         // carry their own exit codes (1 = operation failed, 2 = usage).
         try {
             const r = command === "sessions"
-                ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, laneKey: sessionsLaneKey, json: jsonOutput, noVacuum: sessionsNoVacuum, apply: sessionsApply, restoreTarget: sessionsRestoreTarget })
+                ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum, apply: sessionsApply, restoreTarget: sessionsRestoreTarget })
                 : storageSub === "backup"
                     ? await runStorageBackupCommand({ keep: storageKeep, json: jsonOutput })
                     : storageSub === "repair"
