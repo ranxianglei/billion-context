@@ -85,3 +85,49 @@ test("pre-hydration mutations fall back to the file, which hydration then import
     assert.ok(row.entries.some((e) => e.id === "early-bird"), "late import covered the early file write");
     assert.ok(orderSnapshot().some((e) => e.id === "early-bird"));
 });
+
+// #6255: the KV carrier rejects extension values over 4 MiB, but the producer
+// used its 8 MiB legacy-file budget for KV writes — so a large snapshot made
+// the one-time migration throw, demoted the process to the legacy file path
+// forever, and the byte budget (unsorted) dropped the newest conversations.
+// Pin both directions: migration AND steady-state writes stay within the KV
+// ceiling and keep the newest skeletons.
+test("unified order migration and writes keep newest skeletons within the KV byte budget", async (t) => {
+    _resetOrderPersistForTest();
+    resetSessionOrderForTest();
+    const kinds = Array.from({ length: 4_000 }, (_, i) => i % 2 === 0 ? "user" : "assistant");
+    const frags = Array.from({ length: 4_000 }, () => "a".repeat(64));
+    const entries = Array.from({ length: 40 }, (_, i) => ({
+        id: `unified-byte-budget-${i}`, kinds, frags, tagHash: "b".repeat(64), lastSeen: 1_000 + i,
+    }));
+    fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+    fs.writeFileSync(legacyFile, JSON.stringify({ version: 1, entries }));
+    await getStore().setKvAsync("session-order", "v1", { version: 1, entries: [] });
+    await hydrateOrderUnified();
+    const row = await kvRow();
+    assert.ok(Buffer.byteLength(JSON.stringify(row)) <= 4 * 1024 * 1024, "migrated KV row respects the store ceiling");
+    assert.ok(row.entries.length > 0 && row.entries.length < entries.length);
+    const expected = [...entries].reverse().slice(0, row.entries.length).map((e) => e.id);
+    assert.deepEqual(row.entries.map((e) => e.id), expected);
+    _resetOrderPersistForTest();
+    resetSessionOrderForTest();
+    fs.rmSync(legacyFile, { force: true });
+    await hydrateOrderUnified();
+    assert.deepEqual(orderSnapshot().map((e) => e.id), expected, "newest chains survive with only the KV carrier remaining");
+
+    const { applyOrderSnapshot } = await import("../src/session-resolve.js");
+    applyOrderSnapshot([{ ...entries[0], id: "newest-after-migration", lastSeen: 2_000 }]);
+    const store = getStore();
+    const write = store.setKvAsync.bind(store);
+    let written!: () => void;
+    const completed = new Promise<void>((resolve) => { written = resolve; });
+    t.mock.method(store, "setKvAsync", async (namespace: string, key: string, value: unknown) => {
+        await write(namespace, key, value);
+        if (namespace === "session-order" && key === "v1") written();
+    });
+    await flushOrderSkeletons();
+    await completed;
+    const updated = await kvRow();
+    assert.equal(updated.entries[0]?.id, "newest-after-migration");
+    assert.ok(Buffer.byteLength(JSON.stringify(updated)) <= 4 * 1024 * 1024, "steady-state KV write stays under the ceiling");
+});

@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { flushOrderSkeletons, scheduleOrderPersist } from "../src/order-persist.ts";
+import { flushOrderSkeletons, hydrateOrderSkeletons, scheduleOrderPersist, _resetOrderPersistForTest } from "../src/order-persist.ts";
+import { applyOrderSnapshot, orderSnapshot, resetSessionOrderForTest, type OrderSkeletonEntry } from "../src/session-resolve.ts";
 
 // #6058: the session-order snapshot writer had its quiesce/max-delay windows
 // hardcoded (500ms / 5s) and never read the persist.* knobs — while the main
@@ -78,5 +79,52 @@ test("persist.maxDelayMs knob is honored — a small cap beats a huge debounce u
         delete process.env.BILI_PERSIST_DEBOUNCE_MS;
         delete process.env.BILI_PERSIST_MAX_DELAY_MS;
         flushOrderSkeletons();
+    }
+});
+
+// #6255: the byte budget used to bind in array order (write order), so with
+// fewer than 1,024 entries — where the recency sort was skipped — the OLDEST
+// records were kept and the newest conversations were silently dropped. Pin
+// both directions: the budget keeps the newest, and sorting a write never
+// reorders the resident in-memory records.
+test("the order snapshot byte budget keeps newest conversations below the entry-count cap", async () => {
+    _resetOrderPersistForTest();
+    resetSessionOrderForTest();
+    const kinds = Array.from({ length: 4_000 }, (_, i) => i % 2 === 0 ? "user" : "assistant");
+    const frags = Array.from({ length: 4_000 }, () => "a".repeat(64));
+    const entries = Array.from({ length: 40 }, (_, i): OrderSkeletonEntry => ({
+        id: `byte-budget-${i}`, kinds, frags, tagHash: "b".repeat(64), lastSeen: 1_000 + i,
+    }));
+    applyOrderSnapshot(entries);
+    const idsBefore = orderSnapshot().map((e) => e.id);
+    await flushOrderSkeletons();
+    const bytes = fs.readFileSync(orderFile());
+    const saved = JSON.parse(bytes.toString("utf8")) as { entries: OrderSkeletonEntry[] };
+    assert.ok(bytes.length <= 8 * 1024 * 1024);
+    assert.ok(saved.entries.length > 0 && saved.entries.length < entries.length, "byte budget, not the 1024-entry cap, truncated the snapshot");
+    const expected = [...entries].reverse().slice(0, saved.entries.length).map((e) => e.id);
+    assert.deepEqual(saved.entries.map((e) => e.id), expected);
+    assert.deepEqual(orderSnapshot().map((e) => e.id), idsBefore, "sorting a write does not reorder resident records");
+    resetSessionOrderForTest();
+    hydrateOrderSkeletons();
+    assert.deepEqual(orderSnapshot().map((e) => e.id), expected, "newest skeletons survive an actual file round trip");
+});
+
+test("order snapshot budget preserves all small entries and stable timestamp ties", async () => {
+    _resetOrderPersistForTest();
+    resetSessionOrderForTest();
+    const entries: OrderSkeletonEntry[] = [
+        { id: "tie-a", kinds: ["user"], frags: ["a"], tagHash: "", lastSeen: 2 },
+        { id: "older", kinds: ["assistant"], frags: ["b"], tagHash: "", lastSeen: 1 },
+        { id: "tie-b", kinds: ["user"], frags: ["c"], tagHash: "", lastSeen: 2 },
+    ];
+    applyOrderSnapshot(entries);
+    await flushOrderSkeletons();
+    const saved = JSON.parse(fs.readFileSync(orderFile(), "utf8")) as { entries: OrderSkeletonEntry[] };
+    assert.equal(saved.entries.length, entries.length);
+    assert.deepEqual(saved.entries.filter((e) => e.lastSeen === 2).map((e) => e.id), ["tie-a", "tie-b"]);
+    const savedById = new Map(saved.entries.map((e) => [e.id, e]));
+    for (const e of entries) {
+        assert.deepEqual(savedById.get(e.id), e, `entry ${e.id} preserved verbatim`);
     }
 });
