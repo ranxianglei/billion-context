@@ -30,6 +30,7 @@ import {
     type EgressBlockOp,
     type EgressBlockSnapshot,
 } from "../src/storage/egress-block.ts";
+import { egressAppendTurn } from "../src/storage/egress-state.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-egress-block-hermetic-"));
@@ -162,6 +163,67 @@ test("point fork: 4-table copy preserves op_seq, child inherits parent number sp
         ], null, 3_000);
         const childView2 = egressBlockView(H.db, C);
         assert.equal(childView2.size, 2);
+    } finally { close(H); }
+});
+
+test("fork-to-now: the child inherits the parent's four tables verbatim (a)", () => {
+    const H = open();
+    try {
+        const P = "parent-a";
+        // two message turns on the shared clock (op 1, 2)
+        egressAppendTurn(H.db, P, [
+            { type: "I", msgid: "m00001", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "hello" },
+        ], 1_000, { baseSeq: 0 });
+        egressAppendTurn(H.db, P, [
+            { type: "I", msgid: "m00002", after: "m00001", ref: "m00002", tokens: 4, typeTag: "text", bytes: "there" },
+        ], 2_000, { baseSeq: 1 });
+        // a block birth (op 3 on the shared clock)
+        egressBlockAppend(H.db, P, [{ type: "I", blockId: "blk_1", snapshot: snap() }], null, 3_000);
+        // a fold: delete both messages → compaction in the same write
+        egressAppendTurn(H.db, P, [
+            { type: "D", start: "m00001", end: "m00002" },
+        ], 4_000, { baseSeq: 3 });
+
+        const parentMax = Math.max(
+            (H.db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(P) as { m: number }).m,
+            (H.db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_block_flow WHERE session_id = ?").get(P) as { m: number }).m,
+        );
+        const C = "child-a";
+        egressPointFork(H.db, P, C, parentMax);
+
+        // every one of the four tables is byte-identical to the parent's
+        for (const [table, cols] of [
+            ["egress_flow", "op_seq, log_seq, row_type, msgid, payload, bytes, created_at"],
+            ["egress_block_flow", "op_seq, row_type, block_id, payload, kstate_json, created_at"],
+            ["egress_state", "op_seq, log_seq, row_type, msgid, payload, bytes, created_at"],
+            ["egress_block_state", "block_id, op_seq, payload, created_at"],
+        ] as const) {
+            const q = (id: string) => H.db.prepare(`SELECT ${cols} FROM ${table} WHERE session_id = ? ORDER BY 1, 2`).all(id);
+            assert.deepEqual(q(C), q(P));
+        }
+        // the child continues the shared clock past the parent's high water
+        egressAppendTurn(H.db, C, [
+            { type: "I", msgid: "m00009", after: null, ref: "m00009", tokens: 2, typeTag: "text", bytes: "after fork" },
+        ], 9_000, { baseSeq: parentMax });
+        const childMax = (H.db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(C) as { m: number }).m;
+        assert.equal(childMax, parentMax + 1);
+        assert.equal(egressBlockView(H.db, C).get("blk_1")!.active, true);
+
+        // a TRUE point fork (wm < high water) replays: tables truncated at wm.
+        // A separate NON-compacted parent, so rows 1,2 still exist to truncate at
+        // (the fold above already truncated P's flow to its B base row).
+        const P2 = "parent-a2";
+        egressAppendTurn(H.db, P2, [
+            { type: "I", msgid: "m00001", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "hello" },
+        ], 1_000, { baseSeq: 0 });
+        egressAppendTurn(H.db, P2, [
+            { type: "I", msgid: "m00002", after: "m00001", ref: "m00002", tokens: 4, typeTag: "text", bytes: "there" },
+        ], 2_000, { baseSeq: 1 });
+        egressBlockAppend(H.db, P2, [{ type: "I", blockId: "blk_1", snapshot: snap() }], null, 3_000);
+        const C2 = "child-a-point";
+        egressPointFork(H.db, P2, C2, 2); // before the block birth (op 3)
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?").get(C2) as { c: number }).c, 2);
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_block_flow WHERE session_id = ?").get(C2) as { c: number }).c, 0, "the block was born at op 3, past wm");
     } finally { close(H); }
 });
 

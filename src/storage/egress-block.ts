@@ -356,14 +356,48 @@ export function egressBlockCompact(
 export function egressPointFork(db: SqliteDatabase, fromSessionId: string, toSessionId: string, wm: number): number {
     if (fromSessionId === toSessionId) throw new Error("egressPointFork: conflicting fork lineage (child equals parent)");
     return db.transaction(() => {
+        // #7577 (a): fork-to-now fast path. When wm covers the parent's
+        // shared high water, BOTH state replicas are already the correct
+        // child state (egress_state compacted as base + window, block state
+        // one row per live block) — copy all four tables straight by SQL.
+        // The replay below would instead materialize the child's egress_state
+        // as the FULL uncompacted flow (every historical B base row is a
+        // whole-view snapshot — ~8MB at 100k messages), making the fork
+        // transaction O(total history) and every later turn's prev-read a
+        // full-history JS replay until the child's first fold. Only a true
+        // point fork (wm < high water) needs the replay.
+        const parentFlowMax = (db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(fromSessionId) as { m: number }).m;
+        const parentBlockMax = (db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_block_flow WHERE session_id = ?").get(fromSessionId) as { m: number }).m;
+        const forkToNow = wm >= Math.max(parentFlowMax, parentBlockMax);
         const n = db
-            .prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND op_seq <= ?")
-            .get(fromSessionId, wm) as { c: number };
+            .prepare(forkToNow
+                ? "SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?"
+                : "SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND op_seq <= ?")
+            .get(...(forkToNow ? [fromSessionId] : [fromSessionId, wm])) as { c: number };
         db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(toSessionId);
         db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(toSessionId);
         db.prepare("DELETE FROM egress_block_state WHERE session_id = ?").run(toSessionId);
         db.prepare("DELETE FROM egress_block_flow WHERE session_id = ?").run(toSessionId);
-        // Copy the FLOW tables (append-only, op_seq <= wm).
+        if (forkToNow) {
+            db.prepare(
+                `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+                 SELECT ?, op_seq, log_seq, row_type, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ?`,
+            ).run(toSessionId, fromSessionId);
+            db.prepare(
+                `INSERT INTO egress_block_flow (session_id, op_seq, row_type, block_id, payload, kstate_json, created_at)
+                 SELECT ?, op_seq, row_type, block_id, payload, kstate_json, created_at FROM egress_block_flow WHERE session_id = ?`,
+            ).run(toSessionId, fromSessionId);
+            db.prepare(
+                `INSERT INTO egress_state (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+                 SELECT ?, op_seq, log_seq, row_type, msgid, payload, bytes, created_at FROM egress_state WHERE session_id = ?`,
+            ).run(toSessionId, fromSessionId);
+            db.prepare(
+                `INSERT INTO egress_block_state (session_id, block_id, op_seq, payload, created_at)
+                 SELECT ?, block_id, op_seq, payload, created_at FROM egress_block_state WHERE session_id = ?`,
+            ).run(toSessionId, fromSessionId);
+            return Number(n.c);
+        }
+        // True point fork: copy the FLOW tables (append-only, op_seq <= wm).
         db.prepare(
             `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
              SELECT ?, op_seq, log_seq, row_type, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ? AND op_seq <= ?`,
