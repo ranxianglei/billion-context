@@ -53,7 +53,7 @@ import { prepareOpenai } from "./server/prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./server/prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./server/prepare-responses.js";
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
-import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD } from "./msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER } from "./msgid-pin.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
@@ -796,9 +796,14 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // raw forward: the host must learn that the envelope is broken.
             // Both lanes rethrow FoundationRejectError into this funnel; it
             // throws before processTurn, so the session is untouched.
+            // #7574 item 5: the answer also carries x-bili-msgid-mode: full —
+            // the same contract as the msgid delta re-anchor 400 in handle.ts:
+            // a rejected identity envelope means "no pin this turn, resend in
+            // full form". Clients recover from the status alone today; the
+            // header keeps the two refusals one protocol.
             if (err instanceof FoundationRejectError) {
                 if (!res.headersSent) {
-                    res.writeHead(400, { "content-type": "application/json", "x-bili-snapshot": "identity" });
+                    res.writeHead(400, { "content-type": "application/json", "x-bili-snapshot": "identity", [MSGID_MODE_HEADER]: "full" });
                     res.end(JSON.stringify({ error: { message: err.message, type: "snapshot_identity_fault" } }));
                 } else {
                     res.end();

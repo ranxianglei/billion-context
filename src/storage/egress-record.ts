@@ -25,7 +25,8 @@
  * row — content identity is bytes, position/identity is the msgid).
  */
 
-import { diffEgressView, egressReplay, type EgressOp, type EgressViewRow } from "./egress-state.js";
+import { diffEgressView, EgressStateCorruptError, type EgressOp, type EgressViewRow } from "./egress-state.js";
+import { log as loggerLog } from "../logger.js";
 
 /** #6785 ruling 7439-5: a pinned (server-authoritative) session whose op-log
  * has NO healthy point must FAIL the turn — never run on client bytes, never
@@ -95,13 +96,20 @@ export function buildEgressViewRows(
 
 /** The storage seam (UnifiedStore today; keeps the recorder testable). */
 export interface EgressOpLogStore {
-    egressStateAppendOps(sessionId: string, ops: EgressOp[], nowMs: number): number[];
+    /** Record one turn: guarded, validated, appended, compacted — in ONE
+     *  transaction (see egressAppendTurn). Throws EgressConcurrentWriteError
+     *  when the log moved past `baseSeq` (nothing written) and
+     *  EgressStateCorruptError when the log or the batch does not replay.
+     *  Returns the stamped view the tables now hold. */
+    egressAppendTurn(sessionId: string, ops: EgressOp[], baseSeq: number, nowMs: number): EgressViewRow[];
     egressStateView(sessionId: string): EgressViewRow[];
-    egressStateCompactView(sessionId: string, view: EgressViewRow[], nowMs: number): number;
-    /** Rollback reconstruction at any op_seq (flow table is total). */
+    /** Rollback reconstruction at any op_seq at or above the newest base. */
     egressStateViewAt(sessionId: string, opSeq: number): EgressViewRow[];
     /** Highest op_seq in the flow (0 = no rows). */
     egressStateMaxSeq(sessionId: string): number;
+    /** op_seq of the newest base row (0 = none). Optional: a store without
+     *  it limits the recovery walk to the fixed distance below. */
+    egressStateBaseSeq?(sessionId: string): number;
     /** Recovery (ruling 7439-5): delete rows past `opSeq` in BOTH tables —
      *  rows beyond a corrupt point are unusable by definition (no replay can
      *  ever include them), so recovery = flow back to the last healthy point.
@@ -113,40 +121,42 @@ export interface EgressOpLogStore {
  * this turn's starting point — the previous turn's view when present,
  * otherwise a one-shot hydrate from the tables (owner ruling 7439-3: the
  * tables are the only state; there is no long-lived in-memory view cache).
- * Compacts when the batch carries a -D (the fold shape: cancellation is the
- * trigger, per the proposal). Any EgressStateCorruptError propagates — the
- * caller handles it per the degrade ladder (no fuzzy fallback, KDD
- * discipline).
+ * The append, the compaction it may trigger (a batch with a -D — the fold
+ * shape; cancellation is the trigger, per the proposal) and the guard
+ * against a log that moved since `baseSeq` was read are ONE transaction
+ * (egressAppendTurn). Any EgressStateCorruptError / EgressConcurrentWriteError
+ * propagates — the caller handles it per the degrade ladder (no fuzzy
+ * fallback, KDD discipline).
  *
- * Returns the STAMPED view — egressReplay(prev, ops), whose rows carry the
- * canonical numbers (I rows: the number their append assigned; spine rows:
- * inherited). The client-built `next` (num 0 everywhere) is diff input only;
- * nothing unnumbered ever leaves this function. */
+ * Returns the STAMPED view — the replay of the log as the tables now hold
+ * it, whose rows carry the canonical numbers (I rows: the number their
+ * append assigned; spine rows: inherited). The client-built `next` (num 0
+ * everywhere) is diff input only; nothing unnumbered ever leaves this
+ * function. `baseSeq` belongs with a caller-supplied `prev` (the op_seq that
+ * view was read at); without it the guard is off (single-writer callers). */
 export function recordEgressTurn(args: {
     store: EgressOpLogStore;
     sessionId: string;
     prev: EgressViewRow[] | undefined;
+    /** op_seq `prev` was read at (enables the moved-log guard). */
+    baseSeq?: number;
     conversation: readonly EgressSourceMsg[];
     systemText: string | undefined;
     nowMs: number;
 }): EgressViewRow[] {
     const { store, sessionId, conversation, systemText, nowMs } = args;
-    const prev = args.prev ?? store.egressStateView(sessionId);
+    let prev = args.prev;
+    let baseSeq = args.baseSeq;
+    if (prev === undefined) {
+        // Cursor first, view second: a writer landing in between makes the
+        // guard refuse this turn instead of stacking ops on a moved log.
+        baseSeq = store.egressStateMaxSeq(sessionId);
+        prev = store.egressStateView(sessionId);
+    }
     const next = buildEgressViewRows(conversation, systemText);
     const ops = diffEgressView(prev, next);
-    if (ops.length > 0) {
-        store.egressStateAppendOps(sessionId, ops, nowMs);
-        // The replay (not the client-built `next`) is the stamped view: its
-        // I rows carry the exact numbers the append assigned (same
-        // high-water + dense rule), so compaction below sees numbered
-        // entries and the caller's prev for the next turn is complete.
-        const view = egressReplay(prev, ops);
-        if (ops.some((o) => o.type === "D")) {
-            store.egressStateCompactView(sessionId, view, nowMs);
-        }
-        return view;
-    }
-    return prev;
+    if (ops.length === 0) return prev;
+    return store.egressAppendTurn(sessionId, ops, baseSeq ?? store.egressStateMaxSeq(sessionId), nowMs);
 }
 
 
@@ -171,24 +181,48 @@ const EGRESS_HEALTHY_WALK_MAX = 16;
 export function recoverEgressBase(
     store: EgressOpLogStore,
     sessionId: string,
+    options: { walk?: boolean } = {},
 ): { view: EgressViewRow[]; seq: number; degraded: boolean; truncated: number } | null {
     const maxSeq = store.egressStateMaxSeq(sessionId);
+    let damage: string;
     try {
         const view = store.egressStateView(sessionId);
         return { view, seq: maxSeq, degraded: false, truncated: 0 };
-    } catch {
-        const floor = Math.max(0, maxSeq - EGRESS_HEALTHY_WALK_MAX);
-        for (let x = maxSeq - 1; x >= floor; x--) {
-            try {
-                const view = store.egressStateViewAt(sessionId, x);
-                if (view.length > 0) {
-                    const truncated = store.egressStateTruncateAfter(sessionId, x);
-                    return { view, seq: x, degraded: true, truncated };
-                }
-            } catch {
-                // keep walking
-            }
-        }
-        return null;
+    } catch (err) {
+        // #7574: only a log that does not replay is corruption. Any other
+        // failure (busy, locked, I/O) is rethrown and the rows stay as they
+        // are — this ladder's next step DELETES rows, so it must never run
+        // on a guess. It used to start on every error.
+        if (!(err instanceof EgressStateCorruptError)) throw err;
+        damage = err.reason;
     }
+    // #7574: a session whose log is only a mirror (no authority) never
+    // loses rows over it — no walk-back, no truncation. The turn is served
+    // unrecorded until an operator resets the log (POST /__bili/egress/reset).
+    if (options.walk === false) return null;
+    // Walk back to the NEWEST healthy op_seq: at most EGRESS_HEALTHY_WALK_MAX
+    // steps, but never stop above the newest base row — the base is a full
+    // view on its own, so it is always a healthy point and the walk must be
+    // able to reach it (a busy folding session compacts every few ops).
+    const walkFloor = Math.max(0, maxSeq - EGRESS_HEALTHY_WALK_MAX);
+    const baseSeq = store.egressStateBaseSeq?.(sessionId) ?? 0;
+    const floor = baseSeq > 0 ? Math.min(walkFloor, baseSeq) : walkFloor;
+    for (let x = maxSeq - 1; x >= floor; x--) {
+        let view: EgressViewRow[];
+        try {
+            view = store.egressStateViewAt(sessionId, x);
+        } catch (err) {
+            if (err instanceof EgressStateCorruptError) continue; // keep walking
+            throw err;
+        }
+        if (view.length > 0) {
+            const truncated = store.egressStateTruncateAfter(sessionId, x);
+            loggerLog(
+                "error",
+                `[storage] egress session=${sessionId}: the outbound log did not replay (${damage}) — ${truncated} row(s) after op_seq ${x} were removed and the session continues from op_seq ${x} (${view.length} rows)`,
+            );
+            return { view, seq: x, degraded: true, truncated };
+        }
+    }
+    return null;
 }
