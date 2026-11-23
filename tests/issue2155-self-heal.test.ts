@@ -96,10 +96,14 @@ test("unit: degrade unavailable falls back to suppress-nudge", () => {
     assert.equal((s.metadata.selfHeal as { action: string }).action, "suppress-nudge");
 });
 
-test("unit: healthy plugin lane (header present) never arms", () => {
+test("unit: healthy plugin lane (header present, compression working) never arms", () => {
     const s = mkSession();
     s.metadata.pluginAgent = "zcode";
     for (let i = 0; i < SELF_HEAL_WINDOW + 4; i++) {
+        // A working lane lands a reduction regularly — advance the block id so
+        // the reduction resets the streaks (a lane that calls compress but
+        // NEVER reduces is the compress-failing bug, covered below, not healthy).
+        s.state.nextBlockId += 1;
         evaluateSelfHealRound(
             s,
             { pluginHeaderPresent: true, biliToolsDeclared: true, nudgeActive: true, biliToolUses: 1, degradeAvailable: true },
@@ -107,6 +111,49 @@ test("unit: healthy plugin lane (header present) never arms", () => {
         );
     }
     assert.equal(s.metadata.selfHeal, undefined);
+});
+
+test("unit: compress-failing (agent calls compress but no reduction lands) suppresses the nudge after the window", () => {
+    const s = mkSession();
+    s.metadata.pluginAgent = "zcode";
+    const logs: string[] = [];
+    for (let i = 0; i < SELF_HEAL_WINDOW - 1; i++) {
+        evaluateSelfHealRound(
+            s,
+            { pluginHeaderPresent: true, biliToolsDeclared: true, nudgeActive: true, biliToolUses: 1, degradeAvailable: true },
+            noop,
+        );
+        assert.equal(nudgeSuppressed(s), false, `round ${i + 1}: not yet`);
+    }
+    evaluateSelfHealRound(
+        s,
+        { pluginHeaderPresent: true, biliToolsDeclared: true, nudgeActive: true, biliToolUses: 1, degradeAvailable: true },
+        (level: string, msg: string) => logs.push(`${level}:${msg}`),
+    );
+    assert.equal(nudgeSuppressed(s), true, "armed at exactly the window");
+    const sh = s.metadata.selfHeal as { detected: string; action: string };
+    assert.equal(sh.detected, "compress-failing");
+    assert.equal(sh.action, "suppress-nudge");
+    assert.ok(logs.some((l) => l.includes("compress failing")), "detection is logged");
+});
+
+test("unit: compress-failing suppression lifts only on a real reduction, not on further failed calls", () => {
+    const s = mkSession();
+    s.metadata.pluginAgent = "zcode";
+    for (let i = 0; i < SELF_HEAL_WINDOW; i++) {
+        evaluateSelfHealRound(s, { pluginHeaderPresent: true, biliToolsDeclared: true, nudgeActive: true, biliToolUses: 1, degradeAvailable: true }, noop);
+    }
+    assert.equal(nudgeSuppressed(s), true);
+    // Further failed calls (still calling compress, still no reduction) must NOT
+    // lift the suppression — that would oscillate (lift on the next broken round
+    // and re-arm).
+    evaluateSelfHealRound(s, { pluginHeaderPresent: true, biliToolsDeclared: true, nudgeActive: true, biliToolUses: 1, degradeAvailable: true }, noop);
+    assert.equal(nudgeSuppressed(s), true, "continued failed calls do not lift");
+    // A real reduction lifts it.
+    s.state.nextBlockId += 1;
+    evaluateSelfHealRound(s, { pluginHeaderPresent: true, biliToolsDeclared: true, nudgeActive: true, biliToolUses: 1, degradeAvailable: true }, noop);
+    assert.equal(nudgeSuppressed(s), false, "a real reduction lifts the suppression");
+    assert.equal(s.metadata.selfHeal, undefined, "state cleared");
 });
 
 test("unit: bili tool uses reset the streaks — no arm on intermittent health", () => {

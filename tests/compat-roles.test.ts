@@ -292,6 +292,22 @@ test("detectRoleRejection: serde deserialization shape on 400 and 422 (#6063 Dee
     assert.equal(detectRoleRejection(500, serde), null);
 });
 
+test("detectRoleRejection: 'X is not one of [...]' shape on 400/422 (#7567 Qwen/DashScope)", () => {
+    // The exact error shape from the field report: the offending role name
+    // comes FIRST, no "role" word anywhere, so patterns 1–3 never matched.
+    const qwen = JSON.stringify({ code: "invalid_parameter_error", param: null, message: "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']", type: "invalid_request_error" });
+    assert.deepEqual(detectRoleRejection(400, qwen), { role: "developer" });
+    assert.deepEqual(detectRoleRejection(422, qwen), { role: "developer" });
+    // Unquoted list variant.
+    assert.deepEqual(detectRoleRejection(400, "developer is not one of [system, user]"), { role: "developer" });
+    // Stopword capture stays conservative (the token is not a role name).
+    assert.equal(detectRoleRejection(400, "value is not one of [a, b]"), null);
+    // Unrelated bodies stay out.
+    assert.equal(detectRoleRejection(400, '{"error":{"message":"insufficient quota"}}'), null);
+    // Non-validation statuses never enter the detector.
+    assert.equal(detectRoleRejection(500, qwen), null);
+});
+
 test("detectSystemPlacementError: flags #377-class placement 400s, ignores role-name/quota/overflow/auth", () => {
     const positive = [
         "Only one 'system' message is allowed and it must be at the beginning",

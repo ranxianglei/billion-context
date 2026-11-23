@@ -85,6 +85,13 @@ const ROLE_REJECTION_PATTERNS = [
     // order of pattern 1, so it needs its own rule:
     //   messages[0].role: unknown variant `developer`, expected one of ...
     /role\s*:\s*(?:unknown|invalid|unsupported)\s+variant\s*["'`]?([a-z][a-z0-9_-]{1,31})["'`]?/i,
+    // OpenAI-compatible gateways (Qwen/DashScope, #7567): the offending role
+    // name comes FIRST, followed by "is not one of [supported list]" — there
+    // is no "role" word anywhere in the message, so patterns 1–3 never match:
+    //   developer is not one of ['system', 'assistant', 'user', 'tool', 'function']
+    // A non-role capture (e.g. "temperature is not one of …") is harmless: the
+    // ladder's hop() rewrites 0 messages and passes the original 400 through.
+    /["'`]?([a-z][a-z0-9_-]{1,31})["'`]?\s+is not one of\s*\[/i,
 ];
 
 /** Detect an upstream 400/422 that exists only because of a message role the

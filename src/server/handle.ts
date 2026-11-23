@@ -3000,11 +3000,19 @@ async function handleRequest(
                 }
             }
             sideBody = scrubCompatDrop(sideBody, compatDropPaths, log);
+            // #7567: the learn-on-failure compat-roles ladder in forwardCaptured
+            // only runs on STRING bodies (its compat setup is gated on
+            // `typeof body === "string"`). The side lane built sideBody as a
+            // Buffer, so a DSH auto-review sidecar 400'd on an unsupported role
+            // (e.g. "developer" on a Qwen/DashScope gateway) was forwarded
+            // verbatim with no auto-rewrite. Normalize to a utf8 string
+            // (byte-identical round-trip for a JSON body) so the ladder applies.
+            const sideBodyStr = sideBody.toString("utf8");
             // Gemini and Vertex encode stream mode in the path rather than the body.
             const requestStream = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
                 && "stream" in parsed && parsed.stream === true;
             const sidePrepared: Prepared = {
-                body: sideBody,
+                body: sideBodyStr,
                 session,
                 processedMessages: [],
                 originalMessages: [],
@@ -3019,7 +3027,7 @@ async function handleRequest(
                 sidePassthrough: true,
             };
             logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
-            await forward(req, res, opts, sideBody, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
+            await forward(req, res, opts, sideBodyStr, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
             return;
         }
         // #2170 measure 4 (runtime canary): every legitimately side-shaped
