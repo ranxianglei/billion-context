@@ -4286,7 +4286,24 @@ export class UnifiedStore {
             // A slim row with an empty ledger degrades to the file path.
             if (parsed.ccrSlim === 1) {
                 const entries = this.getCcrEntries(sessionId);
-                return hydrateSlimCcrStore(parsed, entries);
+                const store = hydrateSlimCcrStore(parsed, entries);
+                if (requireValid) {
+                    if (store === null) throw new Error("Index commit refused: unreadable CCR mirror (slim hydration failed)");
+                    if (Array.isArray(store.byHash) || Array.isArray(store.byRef)) throw new Error("unreadable CCR shape");
+                    for (const [hash, text] of Object.entries(store.byHash)) {
+                        if (typeof text !== "string" || createHash("sha256").update(text).digest("hex") !== hash) {
+                            throw new Error("unreadable CCR original body checksum");
+                        }
+                    }
+                    for (const entry of Object.values(store.byRef)) {
+                        if (!entry || typeof entry.hash !== "string" || typeof entry.rawId !== "string"
+                            || !Object.hasOwn(store.byHash, entry.hash)) throw new Error("unreadable CCR original body binding");
+                    }
+                    for (const entry of entries) {
+                        if (!store.byRef[entry.key]) throw new Error("unreadable CCR binding content");
+                    }
+                }
+                return store;
             }
             if (parsed && typeof parsed === "object" && parsed.version === 1
                 && parsed.byHash && typeof parsed.byHash === "object"

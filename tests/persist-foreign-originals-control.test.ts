@@ -168,18 +168,14 @@ test(`a fresh writer refuses an unreadable originals mirror with durable binding
         if (kind === 'binding') {
             assert.ok(corrupt);
             const changed = JSON.parse(corrupt);
-            changed.byRef.m00001.head = 'different durable entry metadata';
-            corrupt = JSON.stringify(changed);
-        }
-        if (kind === 'body') {
-            assert.ok(corrupt);
-            const changed = JSON.parse(corrupt);
-            changed.byHash[Object.keys(changed.byHash)[0]!] = 'Different original body under its unchanged hash';
+            changed.byRef.m00099 = { hash: '0000000000000000000000000000000000000000000000000000000000000000' };
             corrupt = JSON.stringify(changed);
         }
         db.prepare('UPDATE sessions SET ccr_json=? WHERE session_id=?').run(corrupt, pending.id);
         if (kind === 'CAS') db.prepare(`UPDATE content SET bytes=? WHERE hash IN
             (SELECT content_hash FROM ccr_entries WHERE session_id=?)`).run(Buffer.from('changed binding bytes'), pending.id);
+        if (kind === 'body') db.prepare(`UPDATE content SET bytes=? WHERE hash IN
+            (SELECT orig_hash FROM ccr_entries WHERE session_id=?)`).run(Buffer.from('changed original bytes'), pending.id);
         const bindings = db.prepare('SELECT * FROM ccr_entries WHERE session_id=?').all(pending.id);
         const bodies = db.prepare(`SELECT c.hash, c.bytes FROM content c JOIN ccr_entries e
             ON c.hash=e.content_hash WHERE e.session_id=?`).all(pending.id);
