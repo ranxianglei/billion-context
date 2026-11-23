@@ -651,6 +651,9 @@ test("B1: a declared host that fails to collect msgids (count mismatch) → 400 
             });
             assert.equal(res.status, 400, "the identity fault is a 400 (the B1 control channel — not the generic 503)");
             assert.equal(res.headers.get("x-bili-snapshot"), "identity");
+            // #7574 item 5: the refusal also says "no pin this turn — resend in
+            // full form", the same contract as the msgid delta re-anchor 400.
+            assert.equal(res.headers.get("x-bili-msgid-mode"), "full");
             const err = JSON.parse(await res.text()) as { error: { type: string; message: string } };
             assert.equal(err.error.type, "snapshot_identity_fault");
             assert.ok(err.error.message.includes("R3"), "the error names the fault class");
