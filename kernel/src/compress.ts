@@ -286,7 +286,10 @@ function coveringBlockIds(
 // Block-ID-boundary advice is only actionable when tier distillation is ready;
 // emitting it otherwise sends the model to retry bN..bM ranges that cannot
 // fire yet (the misleading hint behind ranxianglei/billion-context-pi#470).
-function tierActionHint(config: Config, state: CompressionState): string {
+// Exported so the uncompressed status view (report.ts) can advertise the
+// byte-identical tier-distillation action the nudge and the compress
+// failure receipts use — one wording, every surface.
+export function tierActionHint(config: Config, state: CompressionState): string {
   if (!config.tiers.enabled) return "";
   // #5765: retired blocks are excluded from distillation targets — a hint
   // spanning one would point the model at a range apply refuses (#5765 guard
@@ -383,7 +386,12 @@ export function createCore(ports: Ports = {}): CompressionCore {
         countTokens,
       );
 
-    const preExistingCoverage = collectCoverage(state);
+    // This snapshot is refreshed at the top of the apply loop below (each
+    // sibling range claims against what earlier siblings in the SAME batch
+    // already cover — a frozen pre-batch snapshot let two adjacent ranges
+    // both claim the tool pair on their shared seam, breaking the
+    // no-overlapping-active-siblings invariant at the top of this file).
+    let preExistingCoverage = collectCoverage(state);
 
     // Classify every requested range ONCE. The result feeds overlap
     // skipSpecs, the minCompressRange pre-check, and the per-range loop —
@@ -801,6 +809,15 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
 
     for (const spec of input.ranges) {
+      // The batch applies every range to ONE shared state in order, so each
+      // projection must judge "already covered" against the siblings that
+      // landed EARLIER in this same batch, not only the pre-batch snapshot:
+      // without the refresh, two adjacent ranges whose spans share the seam
+      // tool pair both claimed it (two active sibling blocks directly owning
+      // the same messages). First-come-first-served: the earlier range keeps
+      // the seam; the later one shrinks to its own new messages or becomes
+      // the #4521 idempotent no-op. Cheap: active blocks × their id sets.
+      preExistingCoverage = collectCoverage(state);
       if (skipSpecs.has(spec)) continue;
       const resolution = classifications.get(spec);
       if (resolution === undefined) continue;
@@ -1879,11 +1896,22 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     // reason (e.g. a merge skipped because its turn cannot be closed now) —
     // surface those before the generic explanation.
     const highest = highestUsedIndex(input.state.messageRefs);
+    // Every resolvable message in the range is covered by an active block
+    // that is not fully inside the range — a same-batch sibling that claimed
+    // the seam tool pair, or a pre-existing block straddling the range edge.
+    // Name that class instead of the generic "protected or filtered" one.
+    // The wording must NOT claim same-batch involvement: the pre-existing
+    // straddling case lands here too, with no block created in this batch.
+    const allCovered =
+      effectiveMessageIds.size > 0 &&
+      [...effectiveMessageIds].every((id) => input.preExistingCoverage.has(id));
     return {
       tokens: 0,
       warnings: [
         ...warnings,
-        `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
+        allCovered
+          ? `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — every message in it is already covered by active block(s). Nothing failed; do not resend this range. To rewrite or merge those blocks, reference them by block ID instead.`
+          : `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
       ],
       noop: true,
     };
