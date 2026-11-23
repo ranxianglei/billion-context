@@ -146,7 +146,11 @@ export async function prepareResponses(
     const markerCounts = stripRawStage(parsed, "responses");
     logRawStripCounts(markerCounts, log, sessionId);
 
-    const shouldInject = opts.compress.injectTool;
+    // zed cloud wire: the response is NDJSON byte-passthrough, so an in-stream
+    // acp loop is structurally unreachable (same reasoning as DSH #3177) — the
+    // model-side compress surface (tools + standing prompt + nudge) is off.
+    const zedLane = req.headers["x-bili-zed-lane"] !== undefined;
+    const shouldInject = opts.compress.injectTool && !zedLane;
     const injectTools = shouldInject && !pluginMode;
     // #3417: surface gating lives in lane-decisions (observed reachability
     // overrides the dsh default, #3401).

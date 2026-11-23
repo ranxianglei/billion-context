@@ -1,4 +1,9 @@
 import assert from "node:assert/strict";
+// trustStampedId is GA-on by default (#7439). This suite pins the legacy
+// |sub: fork behavior — force the feature OFF so it keeps asserting the
+// pre-retirement path (issue2944-neutral-skeleton idiom).
+process.env.BILI_ROLLOUT_TRUST_STAMPED_ID = "0";
+
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
@@ -16,6 +21,8 @@ import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts"
 import { _resetSessionsForTest, listSessions, SPLIT_CANARY_FRESH_MS, splitSessionWarnings, type Session } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
+import { outputBudgetField as budgetFieldFromBudget, readOutputBudget as readFromBudget, writeOutputBudget as writeFromBudget } from "../src/server/budget.ts";
+import { outputBudgetField as budgetFieldFromSide, readOutputBudget as readFromSide, writeOutputBudget as writeFromSide } from "../src/server/side-request.ts";
 
 // #2170 measure 2: behavioral invariants of the #388 side lane, on the dsh
 // plugin wire (the host whose regression started this — #2156/#2157/#2164).
@@ -327,6 +334,17 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
     for (const f of ["prepare-anthropic.ts", "prepare-openai.ts", "prepare-google.ts", "prepare-responses.ts", "inject.ts"]) {
         assert.doesNotMatch(mod(f), laneInternals, `${f} must stay decoupled from the side-lane engine`);
     }
+});
+
+// (#6752 / #1440 P2 cut 2): the output-budget field plumbing moved out of the
+// side-lane engine into budget.ts so the prepare modules can use it without
+// reaching into side-request.js. side-request.ts re-exports it for the existing
+// importers — pin the identity so the re-export and the definition can never
+// silently diverge (a broken re-export would break every importer in one step).
+test("(F2) output-budget plumbing re-export identity (#6752 / #1440 P2 cut 2)", () => {
+    assert.equal(budgetFieldFromSide, budgetFieldFromBudget, "outputBudgetField re-export is identity");
+    assert.equal(readFromSide, readFromBudget, "readOutputBudget re-export is identity");
+    assert.equal(writeFromSide, writeFromBudget, "writeOutputBudget re-export is identity");
 });
 
 // (#1440 P2 cut 3): the extracted pipeline module OWNS the mid-pipeline lane
