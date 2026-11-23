@@ -371,6 +371,13 @@ test("#300 regression (was #726 cooldown side-pin): fitting payload under a stal
         assert.equal(seed.status, 200, `seed request must forward, got ${seed.status}`);
         let sess = listSessions().find((s) => s.id.includes("s726-stale"));
         assert.ok(sess && sess.stats.lastInputTokens >= 10_000, `seed must leave a high baseline, got ${sess?.stats.lastInputTokens}`);
+        // Identity-fast-path guard: the seed settles a genuine same-origin usage
+        // baseline, which alone would open the trusted fast path and convert the
+        // systemic-failure 502 into a forward. This pin targets the fail-fast
+        // contract, so declare the overflow wall — statedWall > 0 demotes the
+        // fast path; the wall equals the configured window, so the judge's
+        // limit is unchanged.
+        sess!.stats.overflowArmTokens = 10_000;
 
         const r1 = await driveResponses(proxyPort, upstreamPort, "s726-stale", "gpt-7-sol", longResponsesInput(12));
         assert.equal(r1.status, 502, `systemic failure must fail-fast, got ${r1.status}`);
