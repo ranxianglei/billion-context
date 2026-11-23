@@ -987,6 +987,14 @@ export function staleSmallAnchorFallback(
  *  is nothing fresher to ride and the anchor remains the last real
  *  measurement. overflow-arm never qualifies: the arm is itself a per-send
  *  measurement, window-bounded (#1839). */
+export function calibratedLocalInputEstimate(stats: Session["stats"]): number {
+    const anchored = stats.lastInputTokensSource === "usage" || (stats.lastUsageGradeTokens ?? 0) > 0;
+    if (anchored && stats.contextEstimateCalibrated === true && (stats.contextEstimateTokens ?? 0) > 0) {
+        return stats.contextEstimateTokens!;
+    }
+    return stats.localInputEstimate ?? 0;
+}
+
 export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
     if (stats.lastInputTokensSource !== "usage" || stats.contextTokensSource !== "estimate") return false;
     return (stats.localInputEstimate ?? 0) > 0;
@@ -1001,7 +1009,7 @@ export function evidenceInputBaseline(stats: Session["stats"]): number {
 
 export function statusInputBaseline(session: Session): number {
     const stats = session.stats;
-    if (usageAnchorCycleStale(stats)) return stats.localInputEstimate ?? 0;
+    if (usageAnchorCycleStale(stats)) return calibratedLocalInputEstimate(stats);
     const baseline = evidenceInputBaseline(stats);
     return staleSmallAnchorFallback(stats, baseline) ?? baseline;
 }

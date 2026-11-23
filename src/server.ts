@@ -56,7 +56,7 @@ import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER } from "./msgid-pin.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
+import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, calibratedLocalInputEstimate, staleSmallAnchorFallback } from "./session.js";
 import type { SeparatorManifest } from "./server/responses-ordering.js";
 import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
@@ -3083,7 +3083,7 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // mints/forks/reloads) fall back to the raw-history upper bound — see the
     // function header for why feeding 0 blinds them.
     if (session.metadata.anonymousPrefixAffinity) return { tokens: raw, source: "estimate" };
-    const est = session.stats.localInputEstimate ?? 0;
+    const est = calibratedLocalInputEstimate(session.stats);
     if (est <= 0) return { tokens: 0, source: "estimate" };
     return { tokens: Math.min(est, raw), source: "estimate" };
 }
