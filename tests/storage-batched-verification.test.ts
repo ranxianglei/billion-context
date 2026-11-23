@@ -130,8 +130,13 @@ test("later block batches detect changed, missing and extra block contents", (t)
         const { store, shadow, dbPath, view } = fixture(t);
         changeBeforeRead(t, store, dbPath, (db) => {
             if (kind === "changed") {
-                const row = db.prepare("SELECT summary_hash FROM blocks WHERE session_id = ? AND block_id = ?").get(view.id, "b69") as { summary_hash: string };
-                db.prepare("UPDATE content SET bytes = ? WHERE hash = ?").run(Buffer.from(JSON.stringify({ text: "changed original", count: 2 })), row.summary_hash);
+                // Ruling 7439-2: fresh rows are self-contained — readers prefer
+                // blocks.summary_bytes over the content table, so the tamper must
+                // land on the inline bytes (a content-row tamper only matters for
+                // legacy NULL-inline rows).
+                const row = db.prepare("SELECT summary_bytes FROM blocks WHERE session_id = ? AND block_id = ?").get(view.id, "b69") as { summary_bytes: Uint8Array | null };
+                assert.ok(row.summary_bytes, "b69 is self-contained before the read");
+                db.prepare("UPDATE blocks SET summary_bytes = ? WHERE session_id = ? AND block_id = ?").run(Buffer.from(JSON.stringify({ text: "changed original", count: 2 })), view.id, "b69");
             } else if (kind === "missing") {
                 db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(view.id, "b69");
             } else {
