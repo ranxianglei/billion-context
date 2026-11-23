@@ -2510,7 +2510,17 @@ export class MysqlBackend implements StorageBackend {
                     s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
                     s.updated_at AS updatedAt, s.status AS status,
                     (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
-                    (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
+                    (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt,
+                    (SELECT JSON_UNQUOTE(JSON_EXTRACT(b.payload_json, '$.topic')) FROM blocks b
+                       WHERE b.session_id = s.session_id
+                         AND (JSON_EXTRACT(b.payload_json, '$.topic') IS NOT NULL
+                              OR JSON_EXTRACT(b.payload_json, '$.summary') IS NOT NULL)
+                       ORDER BY b.ord LIMIT 1) AS firstTopic,
+                    (SELECT JSON_UNQUOTE(JSON_EXTRACT(b.payload_json, '$.summary')) FROM blocks b
+                       WHERE b.session_id = s.session_id
+                         AND (JSON_EXTRACT(b.payload_json, '$.topic') IS NOT NULL
+                              OR JSON_EXTRACT(b.payload_json, '$.summary') IS NOT NULL)
+                       ORDER BY b.ord LIMIT 1) AS firstSummary
               FROM sessions s`,
         )) as unknown as Row[][];
         return rows.map((r) => {
@@ -2533,6 +2543,11 @@ export class MysqlBackend implements StorageBackend {
                 contextTokens,
                 updatedAt: num(r.updatedAt),
                 status: str(r.status ?? "active"),
+                // #7595: raw fields for the display-title fallback (merged
+                // `title` above is unchanged for existing consumers).
+                hostTitle: r.hostTitle !== null && r.hostTitle !== undefined ? str(r.hostTitle) : undefined,
+                firstTopic: nullableStr(r.firstTopic),
+                firstSummary: nullableStr(r.firstSummary),
             };
         });
     }

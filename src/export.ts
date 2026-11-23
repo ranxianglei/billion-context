@@ -6,6 +6,7 @@ import { SessionStore } from "./persist.js";
 import { SqliteBackend, backendSelectionNotice, listBackendNames, openBackend, resolveBackendName, resolveMysqlDsn, selectedBackendRaw, type StorageBackend } from "./storage/backend.js";
 import { fileStorageBackend, fileStorageMysqlDsn } from "./knobs.js";
 import { UnifiedStore } from "./storage/store.js";
+import { displaySessionTitle, firstBlockTopicLead, topicLeadFrom } from "./session-title.js";
 
 interface ExportOptions {
     dir?: string;
@@ -86,7 +87,9 @@ export async function listSessions(opts: ExportOptions = {}): Promise<SessionSum
         return fast
             .map((r) => ({
                 id: r.sessionId,
-                title: r.title,
+                // #7595: display fallback — a stored subagent dispatch boilerplate
+                // title falls back to the first block topic (host name wins).
+                title: displaySessionTitle(r.hostTitle, r.title, topicLeadFrom(r.firstTopic, r.firstSummary)),
                 label: r.label,
                 protocol: r.protocol,
                 upstreamOrigin: r.origin,
@@ -100,7 +103,9 @@ export async function listSessions(opts: ExportOptions = {}): Promise<SessionSum
     sessions.sort((a, b) => latestBlockTime(b) - latestBlockTime(a));
     return sessions.map((s) => ({
         id: s.id,
-        title: s.meta.hostTitle ?? s.meta.title,
+        // #7595: display fallback — a stored subagent dispatch boilerplate
+        // title falls back to the first block topic (host name wins).
+        title: displaySessionTitle(s.meta.hostTitle, s.meta.title, firstBlockTopicLead(s.state.blocks)),
         label: s.meta.label,
         protocol: s.meta.protocol,
         upstreamOrigin: s.meta.upstreamOrigin,
@@ -151,7 +156,9 @@ export function renderHandoff(s: Session, full: boolean): string {
             full,
             folded,
             meta: {
-                title: s.meta.hostTitle ?? s.meta.title,
+                // #7595: display fallback — a stored subagent dispatch boilerplate
+                // title falls back to the first block topic (host name wins).
+                title: displaySessionTitle(s.meta.hostTitle, s.meta.title, firstBlockTopicLead(s.state.blocks)),
                 label: s.meta.label,
                 sessionId: s.id,
                 contextTokens: s.stats.contextTokens,
@@ -170,7 +177,9 @@ export function renderHandoff(s: Session, full: boolean): string {
     const lines: string[] = [];
     lines.push(`# billion-context session handoff`);
     lines.push("");
-    lines.push(`- title: ${s.meta.hostTitle ?? s.meta.title ?? "(untitled)"}`);
+    // #7595: display fallback — a stored subagent dispatch boilerplate title
+    // falls back to the first block topic (host name wins).
+    lines.push(`- title: ${displaySessionTitle(s.meta.hostTitle, s.meta.title, firstBlockTopicLead(s.state.blocks)) ?? "(untitled)"}`);
     if (s.meta.label) lines.push(`- label: ${s.meta.label}`);
     lines.push(`- session id: ${s.id}`);
     if (s.meta.protocol) lines.push(`- protocol: ${s.meta.protocol}`);

@@ -282,6 +282,14 @@ export interface CheckpointRow {
      /** #3928: 'active' or 'archived' — archived rows are tombstones kept for
       *  restore (see archiveSession); the CLI surfaces both. */
      status: string;
+     /** #7595: raw stored fields for the display-title fallback (the export
+      *  list + handoff need hostTitle separately from the merged `title`, and
+      *  the first block's topic/summary to fall back to when `title` is the
+      *  subagent dispatch boilerplate). `title` stays the merged
+      *  `hostTitle ?? title` for existing consumers. */
+     hostTitle?: string | null;
+     firstTopic?: string | null;
+     firstSummary?: string | null;
  }
 
 /** #2960 R2.2: row backing the WEB session list in full mode. Carries the
@@ -3691,7 +3699,13 @@ export class UnifiedStore {
                         s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
                         s.status AS status, s.updated_at AS updatedAt,
                         (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
-                        (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
+                        (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt,
+                        (SELECT json_extract(b.payload_json, '$.topic')
+                           FROM blocks b WHERE b.session_id = s.session_id AND json_valid(b.payload_json)
+                           ORDER BY b.ord LIMIT 1) AS firstTopic,
+                        (SELECT json_extract(b.payload_json, '$.summary')
+                           FROM blocks b WHERE b.session_id = s.session_id AND json_valid(b.payload_json)
+                           ORDER BY b.ord LIMIT 1) AS firstSummary
                   FROM sessions s`,
             )
             .all() as {
@@ -3707,6 +3721,8 @@ export class UnifiedStore {
             updatedAt: number;
             blocks: number;
             latestBlockAt: number | null;
+            firstTopic: string | null;
+            firstSummary: string | null;
         }[];
         return rows.map((r) => {
             let contextTokens: number | undefined;
@@ -3728,6 +3744,11 @@ export class UnifiedStore {
                 contextTokens,
                 status: r.status,
                 updatedAt: r.updatedAt,
+                // #7595: raw fields for the display-title fallback (merged
+                // `title` above is unchanged for existing consumers).
+                hostTitle: r.hostTitle ?? undefined,
+                firstTopic: r.firstTopic ?? undefined,
+                firstSummary: r.firstSummary ?? undefined,
             };
         });
     }

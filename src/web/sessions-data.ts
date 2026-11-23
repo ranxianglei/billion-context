@@ -16,7 +16,7 @@ type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
-import { isSubagentPrompt } from "../session-title.js";
+import { displaySessionTitle, firstBlockTopicLead } from "../session-title.js";
 import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
@@ -952,12 +952,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             ? { w: livePrice.cacheWrite, r: livePrice.cacheRead, q: livePrice.output }
             : undefined;
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
-    let firstBlockHint = "";
-    const fb = s.state.blocks.find((b) => b.topic || b.summary);
-    if (fb && (fb.topic || fb.summary)) {
-        firstBlockHint = String(fb.topic || fb.summary).replace(/\s+/g, " ").trim();
-        if (firstBlockHint.length > 48) firstBlockHint = firstBlockHint.slice(0, 48) + "…";
-    }
+    const firstBlockHint = firstBlockTopicLead(s.state.blocks) ?? "";
     // #1426: which client this session came from (plugin stamp wins, then sniff/UA hint).
     const metaRec = s.metadata as Record<string, unknown>;
     // #2155: active self-heal state (zombie plugin degrade / nudge
@@ -987,12 +982,9 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     const keepalive = live ? keepaliveStatusFor(s.id) : undefined;
     const best = displayContextBest(s);
     // Subagent dispatch prompts are identical across children, so an old
-    // set-once title may be pure boilerplate. Prefer the first block topic
-    // for display; a real host-provided title still wins.
-    const storedTitle = s.meta.hostTitle || s.meta.title;
-    const displayTitle = !s.meta.hostTitle && firstBlockHint && isSubagentPrompt(storedTitle)
-        ? firstBlockHint
-        : storedTitle;
+    // set-once title may be pure boilerplate. displaySessionTitle falls back
+    // to the first block topic for display; a real host-provided title wins.
+    const displayTitle = displaySessionTitle(s.meta.hostTitle, s.meta.title, firstBlockHint);
     return {
         id: s.id,
         ...(best ? { contextBest: best } : {}),
