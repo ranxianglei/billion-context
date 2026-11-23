@@ -158,6 +158,27 @@ const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
 // likely shredded normal text than echo. Risk profile unchanged — the gate
 // still requires the valid acplike open AND the single-bare-ref body.
 const DEGEN_PAIR = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>\\s*m\\d{4,}\\s*\x3c\\/[^<>]{1,32}>", "g");
+// #7570: a render tag whose body is a LEADING refs run followed by prose — the
+// model imitated the ref payload and appended its own answer INSIDE the tag
+// (`<acp …>m01912 你好</acp>`). The #1720 doctrine ("content that is not
+// refs-only is prose wearing tags: the tags go, the content stays") strips the
+// outer tags but preserves the WHOLE body, so the imitated leading ref leaks
+// into the client-visible text. The leading ref run is the imitated payload
+// (the kernel's render form is ref-first); the prose after it is the model's
+// own words and stays. A refs-only body is PAIRED's job (strips whole); a body
+// with NO leading ref (prose-first) is genuine prose wearing tags and stays
+// whole. Whole-text: the pair dies with its leading ref, the prose survives.
+const REF_PROSE_PAIR = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>\\s*" + REFS_RUN + "\\s+([^<>]+?)\\s*\x3c\\/" + NAME + ">");
+// Streaming twin of REF_PROSE_PAIR: strip a leading refs run (and its
+// separator) from a body being RELEASED as prose. The prose must be non-empty
+// (a refs-only body is PAIRED's job) and angle-bracket-free (a body with
+// nested tags is re-adjudicated by the main loop, not stripped here). The two
+// forms agree byte-for-byte so whole-text and streaming stay split-invariant.
+const REF_PROSE_BODY = new RegExp("^\\s*" + REFS_RUN + "\\s+([^<>]+?)\\s*$");
+function stripLeadingRefRun(body: string): string {
+    const m = REF_PROSE_BODY.exec(body);
+    return m !== null ? m[1] : body;
+}
 // #2348: the self-closing render-tag imitation: <name …/> and the bare <name/>.
 // The kernel never emits it (its emitter is paired-form only); the model
 // truncates the shape mid-way. It is a COMPLETE unit — the '/' before '>'
@@ -532,6 +553,10 @@ function stripPass(text: string, dropToolCallEmission: boolean, requestText: str
     }
     out = out
         .replace(new RegExp(PAIRED.source, "g"), "")
+        // #7570: a ref+prose body dies with its leading ref (the imitated
+        // payload), the prose survives — BEFORE the lone passes, which would
+        // strip the tags alone and leak the ref into the body.
+        .replace(new RegExp(REF_PROSE_PAIR.source, "g"), "$1")
         .replace(DEGEN_PAIR, "")
         .replace(new RegExp(SELF_CLOSE.source, "g"), "")
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
@@ -1258,7 +1283,12 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
                             buf = combined.slice(span.end);
                         } else {
                             dropSwallowSpan(combined.slice(span.start, span.end));
-                            buf = inner + combined.slice(span.end);
+                            // #7570: the released body's LEADING ref run is the
+                            // imitated payload (kernel render form is ref-first)
+                            // and dies with the tags; the prose after it is the
+                            // model's own words and stays. A prose-first body
+                            // (no leading ref) is released whole (#1720).
+                            buf = stripLeadingRefRun(inner) + combined.slice(span.end);
                         }
                     }
                     swallowed = "";
