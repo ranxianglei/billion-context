@@ -622,6 +622,13 @@ async function runLane(lane: LaneShape, t: TestContext): Promise<void> {
 function compressCfg(wall: number): Record<string, unknown> {
     return {
         compress: { modelContextLimit: wall },
+        // #2383's deterministic-digest regime is DEFAULT OFF (owner decision
+        // 2026-11-22: it is a model-visible hard truncation). This suite is
+        // DESIGNED around it — the ~150x fiber runs against a dumb recording
+        // upstream that cannot produce summaries — so opt in explicitly. (The
+        // control arm never triggers it: its wall is high enough that folding
+        // itself never engages, so the flag is inert there.)
+        network: { emergencyDigest: true },
         update: { checkIntervalMs: 3_600_000 },
     };
 }
