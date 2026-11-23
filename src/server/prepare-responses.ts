@@ -293,6 +293,10 @@ export async function prepareResponses(
             incomingMsgIds,
             incomingSeqs,
             pluginMode,
+            // Identity consolidation (discussions/7591): egress-on sessions
+            // carry no conversations row — the in-memory metadata field is
+            // the row's source of truth, use it instead of the store lookup.
+            convBound: session.metadata["egressAuthority"] === true ? (session.metadata["pluginAgent"] != null) : undefined,
             log,
         });
         if (s0.pinned !== null) {

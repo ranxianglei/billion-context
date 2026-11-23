@@ -166,7 +166,8 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     tail_json           TEXT NOT NULL DEFAULT '{}',
     ccr_json            TEXT,
     last_ingested_seq   INTEGER,
-    orphans_json        TEXT
+    orphans_json        TEXT,
+    r3_latched_at       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS content (
@@ -690,6 +691,18 @@ export function migrateSchema(db: {
             db.exec("ALTER TABLE ccr_entries ADD COLUMN orig_hash TEXT REFERENCES content(hash)");
         }
         db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_orig_hash ON ccr_entries(orig_hash)");
+    }
+    // 身份表收拢 (discussions/7591): the R3 breaker latch moves onto the
+    // sessions row — the l1_world row it used to latch is a dead carrier
+    // once egress-on stops writing that table. PROBE-FIRST, not version-
+    // gated (same discipline as the ccr/blocks probes above): a db whose
+    // user_version already sits at the current version still picks the
+    // column up here; a fresh db already carries it from the base DDL.
+    // NULL/0 = not latched, else the epoch-ms of the latch.
+    const sessionCols = (db.prepare("PRAGMA table_info(sessions)").all() as unknown as { name?: unknown }[])
+        .map((c) => (typeof c?.name === "string" ? c.name : ""));
+    if (sessionCols.length > 0 && !sessionCols.includes("r3_latched_at")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN r3_latched_at INTEGER");
     }
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;

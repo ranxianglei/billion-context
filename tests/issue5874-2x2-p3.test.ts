@@ -490,30 +490,42 @@ test("M3.1: the latch roster lists the stuck sids and the clear PERSISTS (surviv
 // hashed probe). For a conversation-bound session the raw id ≠ the ledger
 // sid, so without a self-heal the placeholder would map sessRaw → a
 // DIFFERENT ledger forever and 400 every turn after the operator unlatched.
-test("M3.2: unlatching an R3 LATCH PLACEHOLDER self-heals — the next stage-0 rebinds to the real ledger (no permanent 400)", () => {
+test("M3.2: the R3 latch placeholder is RETIRED (discussions/7591) — new latches land on the sessions row, and PRE-UPGRADE placeholders still self-heal", () => {
     const p = path.join(hermetic, "m3.2", "index.db");
     const a = openPlane(p);
     // Conversation binding: ledger sid "sid-cb" → raw conversation id "conv-cb".
     const db = (a as unknown as { db: DbLike }).db;
     db.exec("INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES ('default', 'conv-cb', 'sid-cb', 0)");
-    // The latch fires on the real sid — the placeholder row is keyed by the
-    // resolved raw id and carries ledger_id = sessRaw (the real sid unknown).
+    // NEW CONTRACT (2026-11-23 identity-tables-consolidate): the latch fires
+    // on the sessions row — no l1 placeholder is ever created, so the
+    // raw→wrong-ledger trap is structurally impossible for new latches.
     a.snapR3Latch("sid-cb");
-    let row = db.prepare("SELECT ledger_id, witness_probe FROM l1_world WHERE sess_raw = ?").get("conv-cb") as { ledger_id: string; witness_probe: string };
-    assert.equal(row.ledger_id, "conv-cb", "placeholder: the ledger id IS the raw id (the real sid was unknown at latch time)");
-    assert.equal(row.witness_probe, "", "placeholder: no witness probe yet (legitimate rows always carry a hash)");
+    assert.equal(db.prepare("SELECT sess_raw FROM l1_world WHERE sess_raw = ?").get("conv-cb"), undefined, "no l1 placeholder row is created anymore");
+    assert.equal(a.snapR3Latched("sid-cb"), true, "the latch is readable via the sessions row");
     // The operator unlatches (POST /__bili/snapshot/r3-unlatch {sessRaw}).
-    assert.equal(a.snapR3LatchClear("conv-cb"), "conv-cb");
-    // The next turn: BEFORE the fix this threw FoundationRejectError (red)
-    // forever. Now the placeholder is rebindable — stage-0 succeeds and the
-    // row anchors the REAL ledger.
-    const d = a.snapStage0("sid-cb", ["m1"]);
+    assert.equal(a.snapR3LatchClear("conv-cb"), null, "no l1 row, no sessions row for the RAW id → nothing persisted to clear");
+    assert.equal(a.snapR3LatchClear("sid-cb"), "sid-cb", "clearing by the ledger sid hits the sessions row");
+    // The next turn: conv-bound bookkeeping — an empty stored set anchors
+    // (no red, no rebind needed).
+    assert.equal(a.snapStage0("sid-cb", ["m1"]).decision.mode, "anchor");
+    // LEGACY GUARD: a PRE-UPGRADE placeholder (written by the old code path,
+    // ledger_id = sessRaw, witness_probe "") must STILL self-heal — old
+    // databases carry these rows, and the rebind path is kept for them.
+    db.exec("INSERT INTO l1_world (sess_raw, ledger_id, witness_probe, issued_at, r3_latched_at) VALUES ('conv-old', 'conv-old', '', 1, 2)");
+    db.exec("INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES ('default', 'conv-old', 'sid-old', 0)");
+    assert.equal(a.snapR3Latched("sid-old"), true, "the pre-upgrade placeholder is still read as latched (l1 fallback)");
+    // Unlatch the legacy row — the clear returns the bound ledger id (raw).
+    assert.equal(a.snapR3LatchClear("conv-old"), "conv-old");
+    // BEFORE the #6785 fix this threw FoundationRejectError (red) forever.
+    // The placeholder is rebindable — stage-0 succeeds and anchors the REAL
+    // ledger.
+    const d = a.snapStage0("sid-old", ["m1"]);
     assert.ok(d, "stage-0 completed — no R3 400 after unlatch");
-    row = db.prepare("SELECT ledger_id, witness_probe FROM l1_world WHERE sess_raw = ?").get("conv-cb") as { ledger_id: string; witness_probe: string };
-    assert.equal(row.ledger_id, "sid-cb", "the placeholder was rebound to the real ledger sid");
+    const row = db.prepare("SELECT ledger_id, witness_probe FROM l1_world WHERE sess_raw = ?").get("conv-old") as { ledger_id: string; witness_probe: string };
+    assert.equal(row.ledger_id, "sid-old", "the legacy placeholder was rebound to the real ledger sid");
     assert.notEqual(row.witness_probe, "", "the rebased row carries a real witness probe");
     // And the FOLLOWING round is a clean echo (the mapping is stable now).
-    assert.doesNotThrow(() => a.snapStage0("sid-cb", ["m1"]));
+    assert.doesNotThrow(() => a.snapStage0("sid-old", ["m1"]));
 });
 
 // #6785 review (regression guard for the self-heal): a REAL ledger row
