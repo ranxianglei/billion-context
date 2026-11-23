@@ -107,7 +107,21 @@ const OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT = 0.25;
 // nudge each turn once usage reaches this — kept under the default 0.75
 // over-limit line so it fills the pre-limit silent climb seen in #453/#14. Pure
 // host-side: renderNudgeText does not depend on shouldInject.
-const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
+export const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
+const DEFAULT_MAX_CONTEXT_LIMIT_PCT = 0.75;
+
+/** Resolve the effective host-side emergency escalation line (#453). Under the
+ *  default over-limit line (0.75), the escalation line sits 5 percentage points
+ *  below it (0.70) to cover the pre-limit silent zone. When an operator raises
+ *  maxContextLimitPct above the default (e.g. 0.78 or 0.85), shift the
+ *  escalation line proportionally (maxContextLimitPct - 0.05) so it never fires
+ *  at hardcoded 0.70 inside the operator's intended quiet band. */
+export function resolveEmergencyEscalationPct(maxContextLimitPct?: number): number {
+    if (typeof maxContextLimitPct === "number" && Number.isFinite(maxContextLimitPct) && maxContextLimitPct > DEFAULT_MAX_CONTEXT_LIMIT_PCT) {
+        return Math.max(EMERGENCY_NUDGE_ESCALATION_PCT, maxContextLimitPct - (DEFAULT_MAX_CONTEXT_LIMIT_PCT - EMERGENCY_NUDGE_ESCALATION_PCT));
+    }
+    return EMERGENCY_NUDGE_ESCALATION_PCT;
+}
 
 /** #2391: a budget view only; never forward this projection. OpenAI tool search
  * defers individual function schemas, while namespace descriptions stay visible.
@@ -451,6 +465,17 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
     return !(typeof minBenefit === "number" && Number.isFinite(minBenefit) && minBenefit > 0 && (b.maxPending ?? 0) < minBenefit);
 }
 
+export function emergencyNudgeForConfig(
+    nudge: NudgeDecision | null | undefined,
+    loopConfig: { compress: { minCompressRange: number }; nudge: { maxContextLimitPct?: number } },
+): boolean {
+    return emergencyNudge(
+        nudge,
+        resolveEmergencyEscalationPct(loopConfig.nudge.maxContextLimitPct),
+        loopConfig.compress.minCompressRange,
+    );
+}
+
 /** #3461 problem 2: backoff for the EMERGENCY override. The pure check above
  * has no cadence of its own — once usage sits over the escalation line it
  * re-arms on EVERY request, so a headless client retrying a doomed request
@@ -479,8 +504,9 @@ export function emergencyNudgeArmed(
     minCompressRange: number,
     tokenCount: number,
     growthStep?: number,
+    maxContextLimitPct?: number,
 ): boolean {
-    if (!emergencyNudge(nudge, undefined, minCompressRange)) return false;
+    if (!emergencyNudge(nudge, resolveEmergencyEscalationPct(maxContextLimitPct), minCompressRange)) return false;
     const now = Date.now();
     const key = reductionKeyOf(session);
     const raw = session.metadata["emergencyNudgeGate"];
