@@ -17,14 +17,6 @@
 // along; they went red on master the moment #7470 landed. They now assert
 // the new contract: the small real prompt forwards AND the upstream body
 // contains no dsh_session_log.
-//
-// #7470 follow-up (240a2e5): DSH top-level dsh_* client extensions are now
-// INTERCEPTED — they no longer ride upstream at all (the desktop host wants
-// its telemetry kept out of the wire). These e2e pins therefore assert the
-// NEW contract: the small real prompt forwards AND the upstream body no
-// longer contains the dsh_session_log (the pin was written pre-#7470 and
-// originally asserted the extension rode along — re-pinned on master where
-// CI went red for exactly that reason).
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
