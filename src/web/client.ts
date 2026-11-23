@@ -4381,7 +4381,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                     ? t("det.handoff_exported_no_reveal", { path: savedPath })
                     : t("det.handoff_exported", { path: savedPath }), "ok");
                 return;
-            } catch (e) { }
+            } catch { }
             const url = URL.createObjectURL(new Blob([md], { type: "text/markdown;charset=utf-8" }));
             const a = document.createElement("a");
             a.href = url;
