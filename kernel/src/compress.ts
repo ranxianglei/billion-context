@@ -289,7 +289,10 @@ function coveringBlockIds(
 // Block-ID-boundary advice is only actionable when tier distillation is ready;
 // emitting it otherwise sends the model to retry bN..bM ranges that cannot
 // fire yet (the misleading hint behind ranxianglei/billion-context-pi#470).
-function tierActionHint(config: Config, state: CompressionState): string {
+// Exported so the uncompressed status view (report.ts) can advertise the
+// byte-identical tier-distillation action the nudge and the compress
+// failure receipts use — one wording, every surface.
+export function tierActionHint(config: Config, state: CompressionState): string {
   if (!config.tiers.enabled) return "";
   // #5765: retired blocks are excluded from distillation targets — a hint
   // spanning one would point the model at a range apply refuses (#5765 guard

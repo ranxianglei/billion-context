@@ -2272,6 +2272,11 @@ type FileConfig = {
      *  edits apply on the next restart, not mid-session. */
     storage?: {
         unified?: string;
+        /** NOTE: `storage.snapBase` (enabled/cohorts/cutEveryKUserTurns, the
+         *  #5874 v2 snapshot-base plane) was RETIRED before merge (bc51c9445,
+         *  ruling 7439) — replaced wholesale by the egress op-log plane,
+         *  switched by `rollout.features.egressPlane`. A leftover `snapBase`
+         *  key in your config is dead and ignored. */
         /** SQLite engine self-download (#2833): when unified storage is
          *  requested but neither builtin node:sqlite nor a host-installed
          *  better-sqlite3 exists, bili downloads a pinned N-API prebuilt at
@@ -2342,6 +2347,15 @@ type FileConfig = {
         streamKeepAliveMs?: number;
         /** Preflight hold grace (was BILI_PREFLIGHT_HOLD_MS; default 30000). */
         preflightHoldMs?: number;
+        /** #2383 emergency digest fold — when the payload's foldable mass exceeds the LLM fold
+         *  path's coverage bound (16 rounds x 2 x 0.6 = 19.2x the window), every fold switches
+         *  from an LLM summary call to a CPU-only structural digest (per-message ref/role/size
+         *  plus a head fragment). DEFAULT OFF (owner decision 2026-11-22): to the downstream
+         *  model the digest is a hard truncation — originals stay restorable via decompress, but
+         *  the content is gone unless the client asks for it back. With the regime off, those
+         *  payloads run the LLM fold ladder instead and may exhaust its budget into a fail-fast
+         *  413. Env BILI_PREFLIGHT_EMERGENCY_DIGEST wins ("1"/"true" restores the #2383 regime). */
+        emergencyDigest?: boolean;
         /** Max replay attempts on transient upstream errors (was BILI_REPLAY_RETRY_MAX; default 3). */
         replayRetryMax?: number;
         /** Replay backoff base delay (was BILI_REPLAY_RETRY_BASE_MS; default 1500). */
