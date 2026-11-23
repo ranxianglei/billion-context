@@ -661,7 +661,10 @@ export async function prepareOpenai(
         // prose, so weak models can't misread a user-voiced summary as the current
         // question. Egress-view only — session state stays untouched.
         let voicedSource = egressMessages;
-        if (featureEnabled("foldSummaryCcr")) {
+        // Proxy mode only: plugin mode is manifest-governed — bili advertises no
+        // acp_retrieve there, so without CCR armed a placeholder would leave the
+        // stored prose unreachable (96-char head only).
+        if (!pluginMode && featureEnabled("foldSummaryCcr")) {
             const folded = foldSummariesToCcrPlaceholders(egressMessages, turn.state, contentStoreOf(session), retrieveToolName(session));
             if (folded.changed) adoptContentStore(session, folded.store);
             voicedSource = folded.messages as BiliMessage[];
@@ -734,7 +737,7 @@ export async function prepareOpenai(
         // the op-log recording stores the outbound system text).
         if (injectTools) {
             const retrieveAdvertised = ccrEnabled(session) || featureEnabled("foldSummaryCcr");
-            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(retrieveAdvertised ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOpsActive ? blockOps.openai : [])], surface?.toolPrompts, retrieveAdvertised, externalSummaryEnabled(config));
+            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(retrieveAdvertised ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOpsActive ? blockOps.openai : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
