@@ -19,6 +19,31 @@
 
 export interface RawSpan { readonly start: number; readonly end: number }
 
+/** Rebuild the top-level request object from the span scan WITHOUT decoding
+ *  the "messages" array (the multi-hundred-MiB part of a plugin-lane resend).
+ *  Every other top-level field is parsed from its own tiny span. Returns null
+ *  when the body is outside the scannable shape or any field span fails to
+ *  parse — the caller keeps the legacy full JSON.parse (fail-soft, never
+ *  guess — same contract as the scan itself). */
+export function synthesizeTopLevel(bodyText: string): Record<string, unknown> | null {
+    const scan = scanMessagesSpans(bodyText, "all");
+    if (!scan) return null;
+    const out: Record<string, unknown> = {};
+    for (const [key, span] of scan.fieldSpans) {
+        if (key === "messages") continue;
+        try {
+            out[key] = JSON.parse(bodyText.slice(span.start, span.end));
+        } catch {
+            return null;
+        }
+    }
+    // Marker for the deliberately-unparsed conversation array. No legal
+    // chat-completions body carries a non-array "messages", so downstream
+    // Array.isArray checks degrade exactly like a parse failure.
+    out["messages"] = null;
+    return out;
+}
+
 export interface FastpathScanResult {
     /** Element count T of the top-level "messages" array. */
     readonly total: number;

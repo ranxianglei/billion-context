@@ -38,6 +38,7 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { isAutoModeClassifier } from "../auto-mode-forge.js";
 import { countSystemAndToolsTokens, emergencyNudge, emergencyNudgeArmed, projectThinkingMass } from "./budget.js";
@@ -46,10 +47,12 @@ import { effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, applyMsgSeqStamps, validateMsgIds, validateMsgSeqs } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgIdPin, applyMsgSeqStamps, validateMsgIds, validateMsgSeqs } from "../msgid-pin.js";
+import { tryIncrementalPin } from "../snapshot/stage0.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { yieldToEventLoop } from "../yield-loop.js";
+import { recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -226,6 +229,12 @@ export async function prepareAnthropic(
     const markerCounts = stripRawStage(parsed, "anthropic");
     logRawStripCounts(markerCounts, log, sessionId);
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
+    // #7064 §8 phase 2: pin-mode signal (set in the pin block below).
+    let msgidPinMode: "full" | "incremental" | null = null;
+    let msgidModeHeaders: Record<string, string> | undefined;
     try {
         const converted = anthropicToCore(parsed);
         let msgs = converted.msgs;
@@ -237,13 +246,34 @@ export async function prepareAnthropic(
         // fold coverage, and the unified-table rows the rawTail ingest writes.
         if (pluginMode && (incomingMsgIds !== undefined || incomingMsgSeqs !== undefined)) {
             if (featureEnabled("pluginLaneServerHistory")) {
-                const v = incomingMsgIds === undefined ? undefined : validateMsgIds(incomingMsgIds, msgs.length);
+                // #7064 §8 phase 2: the same TWO-FORM rule as stage 0 (the
+                // openai / responses lanes) — this lane pins inline (no
+                // runStage0), so the split is local: len === view = FULL
+                // list (existing path), len !== view = TAIL form (the
+                // shared drift-class helper: anchor + width + entry
+                // screen; any mismatch degrades to the full signal, never
+                // rejects — opencode V1's anthropic-wire header is the
+                // steady-state consumer).
+                const idsFullForm = Array.isArray(incomingMsgIds) && incomingMsgIds.length === msgs.length ? (incomingMsgIds as string[]) : undefined;
+                const v = idsFullForm === undefined ? undefined : validateMsgIds(idsFullForm, msgs.length);
                 if (v !== undefined && v.ok) {
                     msgs = applyMsgIdPin(msgs, v.ids);
                     originalMessages = msgs;
                     noteMsgIdObservation(session, v.ids, msgs, log, sessionId);
+                    msgidPinMode = "incremental";
                 } else if (v !== undefined) {
                     log("warn", `[${sessionId}] [msgid] pin rejected (${v.reason}) — falling back to content-derived ids (#4491)`);
+                    msgidPinMode = "full";
+                } else if (Array.isArray(incomingMsgIds) && incomingMsgIds.length > 0 && incomingMsgIds.length !== msgs.length) {
+                    const ip = tryIncrementalPin(sessionId, "anthropic", msgs, incomingMsgIds as string[], log);
+                    if (ip !== null) {
+                        msgs = ip;
+                        originalMessages = ip;
+                        noteMsgIdObservation(session, ip.map((m) => m.id), msgs, log, sessionId);
+                        msgidPinMode = "incremental";
+                    } else {
+                        msgidPinMode = "full";
+                    }
                 }
                 // #4316 PR2/3: re-attach the ledger seq stamps the lane sent —
                 // the same parallel-array lifecycle as the ids (strip →
@@ -259,6 +289,13 @@ export async function prepareAnthropic(
             } else {
                 log("info", `[${sessionId}] [msgid] biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#4491)`);
             }
+        }
+        // #6785 review fix: "incremental" is gated on the flag (the upgrade
+        // never travels while it is off); the "full" DOWNGRADE travels even
+        // when the flag is off — the rollback self-heal (an already upgraded
+        // client must be told to send the full form again).
+        if (msgidPinMode === "full" || (featureEnabled("pluginMsgIdIncremental") && msgidPinMode !== null)) {
+            msgidModeHeaders = { [MSGID_MODE_HEADER]: msgidPinMode };
         }
         // #3756 snapshot render: outbound prefix from the unified transcript
         // (fold-time ids, immune to identity re-mints); live tail keeps the
@@ -389,6 +426,14 @@ export async function prepareAnthropic(
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
         adoptContentStore(session, turn.contentStore);
+        // In-request ledger flush: the transcript up to THIS user message is
+        // durable before the model call (#3397 durability-before-render) and
+        // the stage-0 envelope / M2 evidence read a current ledger.
+        // snapshotMessages first: the persist build reads session.lastMessages
+        // — and it stays the RAW client resend (never the D-lane view: its
+        // synthetic acp_summary anchor is not a transcript message).
+        snapshotMessages(session, originalMessages);
+        snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -521,13 +566,37 @@ export async function prepareAnthropic(
         }
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
-        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        let egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        // #7398 all-lanes (ruling 7439-4): the egress round-trip for this
+        // lane runs AFTER injectSystem below — the recorded system row must
+        // be the lane's OUTBOUND system, post-injection (a pre-injection
+        // client head would make the +U-visible system drift meaningless);
+        // the pre-injection core is captured here so the record sees this
+        // turn's messages regardless of the serve swap.
+        const laneCoreForRecord = egressMessages;
         rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? clientCacheControls);
         if (sysNotes.length > 0) {
             rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, sysNotes.map((text) => ({ role: "user" as const, content: text })));
         }
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, laneDecisions.compressSurfaceOff, laneDecisions.mcpDialect, detectGenerationBoundary(session, processedMessages, log));
+        // #7398 all-lanes (ruling 7439-4/5): the single shared authority
+        // seam (egress-lane-io). This lane sits POST-kernel: the swapped
+        // core becomes the outbound rebuild and the recorded bytes. Turn 1
+        // = bootstrap (client bytes recorded once); turn 2+ = existing rows
+        // carry flow bytes, fresh rows stay client bytes; probe failure =
+        // legacy (flow NOT advanced, re-attempts next turn). Unreadable
+        // flow → hard fail.
+        if (featureEnabled("egressPlane")) {
+            const st = getStore().egressOpLogStore();
+            if (st) {
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log });
+                const served = recordAuthorityTurn(st, sessionId, auth, laneCoreForRecord, extractSystem(systemOut) ?? "", log);
+                if (served !== null) {
+                    rebuiltMessages = coreToAnthropic(served, anthropicCacheMarks ?? clientCacheControls);
+                }
+            }
+        }
         // #1637: stamp the steady body's system. NOTE: parsed.system stays the
         // #1085 frozen CLIENT head (injectSystem's in-place view) — the round-2
         // adapter consumes that frozen head and stamps its own rebuild, so NO
@@ -639,7 +708,6 @@ export async function prepareAnthropic(
     // SysPrompt row — the kernel breakdown classifies messages only, and on
     // this wire the system rides the top-level `system` field outside the fold.
     session.metadata.systemPromptTokens = countSystemAndToolsTokens(extractSystem(systemOut), toolsOut);
-    snapshotMessages(session, originalMessages);
     // #3397 durability-before-render: make this turn's ledger rows durable NOW
     // (synchronous SQLite ingest, no JSON envelope) so the refs the model is
     // about to see are on disk BEFORE the response is sent. Without this, a
@@ -648,7 +716,10 @@ export async function prepareAnthropic(
     // gate rejects as "above the highest allocated ref". markDirty below keeps
     // the JSON envelope debounced; this only moves the small row ingest ahead.
     getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
 
     // [#5604] a preflight fold of the tail (soft protection relaxed to 0, or a
     // tail tool pair in neverPreserveRecentTools) can leave the outbound array
@@ -711,7 +782,7 @@ export async function prepareAnthropic(
     probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", responseExtraHeaders: msgidModeHeaders, stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 export const TRAILING_ASSISTANT_NUDGE = "[bili] Earlier context was compressed above. Continue the task.";

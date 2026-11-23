@@ -71,7 +71,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { buildCorpus, CODEWORDS, gateStorageCfg, gateRolloutCfg } from "./plugin-lanes.mjs";
+import { buildCorpus, CODEWORDS, gateRolloutCfg } from "./plugin-lanes.mjs";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const WORK = process.env.RESTART_LANES_WORK || path.join(process.env.WORKDIR || process.cwd(), "restart-lanes");
@@ -86,7 +86,7 @@ const MODEL1 = {
 };
 const MODEL_IDS = String(MODEL1.model).split(",").map((s) => s.trim()).filter(Boolean);
 
-const laneCfg = (providers) => ({ providers, compress: { preserveRecentTokens: 0 }, ...gateStorageCfg(), ...gateRolloutCfg() });
+const laneCfg = (providers) => ({ providers, compress: { preserveRecentTokens: 0 }, ...gateRolloutCfg() });
 const MODEL_MAIN = MODEL_IDS[0];
 const AGENTS = (process.env.GATE_AGENTS_R || process.env.GATE_AGENTS || "dsh,pi")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);

@@ -82,6 +82,27 @@ export function incomingMsgIdsHeader(headerValue: string | string[] | undefined)
 
 type SeqValidation = { ok: true; seqs: number[] } | { ok: false; reason: string };
 
+// #5874 2×2 (brief 19544722, Part A): the SEQS half of the dual-channel
+// identity (biliLedgerSeqs, #4316 layer 3 transport). Lenient read like
+// incomingMsgIdsOf — absent/malformed → undefined → callers take exactly
+// the pre-2×2 path (the strict pin stays with validateMsgSeqs).
+export function incomingSeqsOf(body: unknown): number[] | undefined {
+    if (typeof body !== "object" || body === null) return undefined;
+    const raw = (body as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
+    if (!Array.isArray(raw) || raw.length === 0) return undefined;
+    for (const v of raw) {
+        if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 1) return undefined;
+    }
+    return raw as number[];
+}
+
+/** #7064 §8: the pin-mode signal the server stamps on the response — tells
+ *  the client what it may send NEXT turn: "incremental" (the ledger pins the
+ *  prefix; ride only x-bili-pf-tail-ids, suppress the full list) or "full"
+ *  (send the full id list — bootstrap / reanchor / this turn degraded).
+ *  Rides with the existing watermark response headers (same chokepoint). */
+export const MSGID_MODE_HEADER = "x-bili-msgid-mode";
+
 /** Strict validation for the seq stamp array: 1-based positive integers,
  *  exactly one per message. Non-monotonic or non-contiguous values are
  *  ACCEPTED on purpose — the branch pointers pick arbitrary row subsets
