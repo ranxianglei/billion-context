@@ -84,6 +84,13 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
 }
 
 test("e2e #1987: post-fold usage baseline anchors to the shipped payload, not the untruncated kernel view", async () => {
+    // This e2e is DESIGNED around #2383's deterministic-digest regime
+    // (~30x overshoot converging with zero summarization calls), which is
+    // DEFAULT OFF (owner decision 2026-11-22). The knob reads env or the
+    // on-disk config file (fileNetwork) — in-process startServer options
+    // don't reach it — so opt in via env for the duration of this test.
+    const prevDigest = process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST;
+    process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST = "1";
     const calls: Call[] = [];
     const upstream = makeUpstream(calls);
     upstream.listen(0, "127.0.0.1");
@@ -146,6 +153,8 @@ test("e2e #1987: post-fold usage baseline anchors to the shipped payload, not th
         assert.ok(s.stats.lastInputTokens < 60_000, `baseline anchors to the shipped digested payload, not the untruncated view; got ${s.stats.lastInputTokens}`);
         assert.equal(s.stats.lastInputTokensSource, "estimate", "no usage report lands on the converged turn, so the estimate of the shipped payload wins");
     } finally {
+        if (prevDigest === undefined) delete process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST;
+        else process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST = prevDigest;
         proxy.close();
         proxy.closeIdleConnections?.();
         await once(proxy, "close");

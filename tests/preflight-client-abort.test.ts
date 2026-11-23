@@ -160,6 +160,10 @@ for (const pluginMode of [false, true]) {
                 assert.equal(result.retryable, false);
                 assert.ok(f.session.state.blocks.length > 0);
                 assert.equal(mainCalls(), 0);
+                // #7545 one-shot gate: the client-disconnect abort spent the
+                // session's one preflight fold — the livelock-shape linkage
+                // (abort → flag) that the gate's e2e cases simulate.
+                assert.equal(f.session.stats.preflightRuns, 1, "the aborted attempt spent the one-shot preflight fold");
             } finally {
                 client.destroy();
                 const closed = once(downstream, "close");

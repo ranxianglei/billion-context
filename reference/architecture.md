@@ -181,6 +181,7 @@ billion-context/
 │   ├── error-dump.ts             # Rejected-body dump (diagnostics.dump4xx / BILI_DUMP_4XX)
 │   ├── ws-bridge.ts              # Generic WebSocket bridge shell
 │   ├── responses-ws.ts           # Codex/OpenCode Responses-over-WebSocket codec (#1844)
+│   ├── zed-wire.ts               # Zed cloud wire: {thread_id, provider_request} envelope codec + thread_id identity
 │   ├── kiro.ts                   # Kiro CLI: model-gateway hosts, built-in developer/system→user roles, kiro:conversation_id identity
 │   ├── launcher.ts               # `bili <client>` launcher (auto-proxies both schemes)
 │   ├── client-config.ts          # Read-only discovery of each client's own upstream config
