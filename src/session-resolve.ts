@@ -87,6 +87,7 @@ import { log as loggerLog } from "./logger.js";
 // src/order-persist.ts — each side calls the other only inside function
 // bodies, never at module evaluation; see the note on its import).
 import { scheduleOrderPersist } from "./order-persist.js";
+import { featureEnabled } from "./rollout.js";
 
 const TAIL_WINDOW = 8;
 
@@ -342,6 +343,10 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // empty system/instructions verbatim (non-anchoring) — this branch is
         // library defense for direct callers: the corpus census lane.)
         if (!mainShaped(kinds) && tag === "") {
+            if (featureEnabled("trustStampedId")) {
+                record(rawId, turns, tagHash, model);
+                return { key: rawId, action: "claim", reason: "trust-stamped-id: shallow side request rides the verbatim id (no |sub:aux fork)" };
+            }
             return { key: `${rawId}|sub:aux`, action: "derived-aux", reason: "shallow history with no assistant turns" };
         }
         record(rawId, turns, tagHash, model);
@@ -499,8 +504,19 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // headless-subagent call site passes one) widens the key into a
         // three-segment form so distinct same-type runs never share a
         // compression session; empty degrades to the two-segment key.
+        if (featureEnabled("trustStampedId")) {
+            record(rawId, turns, effectiveTagHash, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "trust-stamped-id: persona change rides the verbatim id (no |sub:<fp> fork)" };
+        }
         const laneKey = disc !== "" ? `${rawId}|sub:${fp16(tag)}:${fp16(disc)}` : `${rawId}|sub:${fp16(tag)}`;
         record(laneKey, turns, tagHash, model);
+        // #5844: make the fork VISIBLE with a recovery command. When a host
+        // upgrade changes the persona tag AND the replay shape at once, this
+        // lane starts with ZERO inherited blocks and the parent's fold state
+        // goes unclaimed (a 2.5M-token conversation gets re-folded from
+        // scratch until the client times out at 413). The one-field fix is an
+        // offline command — the user never needs to know the new prompt.
+        loggerLog("warn", `[session-order] persona fork: parent ${rawId} → lane ${laneKey} (replay ${turns.length} turns vs recorded ${recorded.kinds.length}; tag changed without a continuing shape) — the new lane starts with NO inherited fold state; if a host upgrade changed the prompt, reclaim the parent's blocks with: bili sessions reattach ${rawId} ${laneKey} (#5844)`);
         return { key: laneKey, action: "derived-persona", reason: "persona text changed without continuing history — persona lane" };
     }
     if (!mainShaped(kinds)) {
@@ -544,6 +560,10 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // subagents under one main id) on distinct compression sessions.
         const taskRescue = tryMsgIdRescue("diverged-order");
         if (taskRescue !== null) return taskRescue;
+        if (featureEnabled("trustStampedId")) {
+            record(rawId, turns, effectiveTagHash, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "trust-stamped-id: diverged order rides the verbatim id (no |sub:task fork)" };
+        }
         return { key: `${rawId}|sub:task:${skel8(kinds)}`, action: "derived-task", reason: "no order+fragment alignment with the recorded skeleton" };
     }
     // Shorter than recorded: either head truncation (dsh native compaction
@@ -564,6 +584,10 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
     }
     const shortRescue = tryMsgIdRescue("shorter-divergent");
     if (shortRescue !== null) return shortRescue;
+    if (featureEnabled("trustStampedId")) {
+        record(rawId, turns, effectiveTagHash, effectiveModel);
+        return { key: rawId, action: "reanchor", reason: "trust-stamped-id: shorter divergent tail rides the verbatim id (no |sub:task fork)" };
+    }
     return {
         key: `${rawId}|sub:task:${skel8(kinds)}`,
         action: "derived-task",

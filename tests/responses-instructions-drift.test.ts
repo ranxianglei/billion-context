@@ -26,6 +26,16 @@ process.env.XDG_CACHE_HOME = path.join(xdgRoot, "cache");
 process.env.XDG_DATA_HOME = path.join(xdgRoot, "data");
 process.env.XDG_CONFIG_HOME = path.join(xdgRoot, "config");
 
+// #7525: the trust-stamped-id GA (rollout percent 100) retires the content-guessed
+// |sub:<fp> instructions-fingerprint split this suite exists to cover (#150: a
+// codex root thread reusing a task id across personas still splits by
+// instructions fingerprint; the #2250 migrate-carry rides the same |sub:<fp>
+// lineage). Pin this file to the legacy (off) path so that split+migrate
+// coverage stays tested on the escape-hatch path — the same pin the other 16
+// fork-lineage suites carry for the GA. The GA-on path (trust the stamped id,
+// no content-guessed split) is covered by tests/trust-stamped-id.test.ts.
+process.env.BILI_ROLLOUT_TRUST_STAMPED_ID = "0";
+
 const { startServer } = await import("../src/server.ts");
 const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
 const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
