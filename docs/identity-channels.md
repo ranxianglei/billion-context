@@ -1,5 +1,13 @@
 # Identity-channel wiring (#5825)
 
+> **⚠️ SUPERSEDED — per-client *session-id* conclusions (2026-11-22).** The §2 rows for
+> **crush / gemini-cli / hermes / aider / jcode / kimi** ("closed", "content-hash fallback IS the
+> optimum") and **qoder / copilot** ("needs one measurement run") were re-verified against current
+> source and are now outdated — see **`docs/client-session-ids.md`** for the current 18-client
+> session-identity map (what carries a session id, how subagents behave, what to stamp). This page's
+> **message-id HARVEST** machinery (§1 seam, §3 trust boundaries, §4 change checklist) is *not*
+> superseded and remains operative.
+
 One page for the cross-client "stable conversation + message id" wiring: who
 carries identity into bili, where it is consumed, and what every new lane must
 do. The design law (owner ruling 2026-11-07): **every client lane wires INTO

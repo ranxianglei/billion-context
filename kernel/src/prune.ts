@@ -23,6 +23,16 @@ export function isSummaryMessageId(id: string): boolean {
 }
 
 /**
+ * Inverse of summaryMessageId: the block id a rendered-summary message id
+ * belongs to, or null when the id is not a rendered-summary id.
+ */
+export function summaryBlockIdOf(id: string): string | null {
+  return isSummaryMessageId(id)
+    ? id.substring(SUMMARY_ID_PREFIX.length)
+    : null;
+}
+
+/**
  * Base id of a message id: everything before the first `#`. Sub-id
  * projections (`base#callId`, `base#r0`, …) are alternate renderings of the
  * same original message, so coverage is decided per original message — id
