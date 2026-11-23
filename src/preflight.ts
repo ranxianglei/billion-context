@@ -29,6 +29,7 @@ import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
+import { preflightEmergencyDigestEnabled } from "./knobs.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { isCodexClient } from "./codex-compact.js";
 import { describeExternalSummaryFailure, summaryLengthBudgetClause } from "./external-summary.js";
@@ -37,6 +38,7 @@ import { describeExternalSummaryFailure, summaryLengthBudgetClause } from "./ext
 export { describeExternalSummaryFailure };
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { newExternalCallId } from "./external-summary-marker.js";
+import { wrapV1Internal } from "./v1internal.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -157,10 +159,13 @@ const FIT_FORWARD_ESTIMATE_ONLY_MARGIN = 0.85;
 // be a VALID block summary (the folded originals stay restorable via
 // decompress — applyRanges caches them like any other preflight fold), so the
 // summarization call is replaced by a CPU-only structural digest
-// (deterministicDigest below). Hard constant by design: no new config surface,
-// and the trigger derives from this loop's own coverage math instead of an
-// arbitrary multiplier — normal sessions (one turn of growth per request)
-// never approach it.
+// (deterministicDigest below). The trigger derives from this loop's own
+// coverage math instead of an arbitrary multiplier — normal sessions (one turn
+// of growth per request) never approach it. The regime itself is DEFAULT OFF
+// (owner decision 2026-11-22: to the downstream model the digest is a hard
+// truncation — set BILI_PREFLIGHT_EMERGENCY_DIGEST=1 / network.emergencyDigest
+// to restore #2383); off, these payloads run the LLM fold ladder and may
+// exhaust into a fail-fast 413.
 const EMERGENCY_FOLD_COVERAGE = MAX_PREFLIGHT_ROUNDS * 2 * CHUNK_FRACTION;
 // Round cap for the emergency regime: every round is CPU-only (kernel walk +
 // digest, no upstream wait), so even the worst case stays at seconds; 512
@@ -170,6 +175,21 @@ const EMERGENCY_ROUND_CAP = 512;
 // Per-entry head-fragment length in digest form A (form B strips heads when
 // even that does not fit the bounds).
 const DIGEST_HEAD_CHARS = 120;
+// Fresh-session parallel fold gate (owner decision 2026-11-22, #2383 follow-up).
+// A FRESH session (no usage baseline yet) resends its whole raw history verbatim
+// — no compression blocks can have been lost, so folding is pure gain, not a
+// token spend on a possibly-broken session. Below this char bound (≈1M real
+// tokens × 4 chars/token × 1.5 headroom, the owner's "non-strict 1M" gate)
+// the fold work is worth paying: its ranges are summarized K-AT-A-ONCE instead
+// of one-per-round serially. Above the bound the request fails fast instead
+// (the digest regime is default-off) — folding tens-of-MB histories would burn
+// the call budget without converging in one invocation.
+const FRESH_PARALLEL_FOLD_MAX_CHARS = 6_000_000;
+// Concurrent in-model summarization calls per fold round for fresh sessions.
+// 2 halves the ladder's wall clock on the common case while keeping the per-
+// call budget, the probe/dead-verdict and the transient-retry semantics
+// simple to reason about; raise to 4 if upstream rate limits allow.
+const FRESH_PARALLEL_FOLDS = 2;
 
 // #869 review: coverage bound of the two depth budgets above. One round folds
 // ONE range and each fold removes at most CHUNK_FRACTION x window tokens (the
@@ -259,6 +279,8 @@ export interface PreflightDeps {
     imageReserve?: number;
     /** Rebuild the protocol image view after folds; archived images no longer consume the window. */
     measureImageReserve?: (messages: CoreMessage[]) => number;
+    /** Measure the final Responses projection after each fold, including opaque items that core text estimates omit. */
+    measureWireTokens?: (messages: CoreMessage[]) => number;
     /** Constant wire overhead for this request (system prompt + tool definitions, #470). Folding never removes it, so every fit decision must add it — otherwise the loop stops with "text fits" while the billed input still overflows. */
     wireOverhead?: number;
     /** #553: the caller knows this session's input size is unmeasured AND its
@@ -279,6 +301,8 @@ export interface PreflightDeps {
     streamSummaryOff?: boolean;
     /** #2189: the client's billing-attribution block from the INBOUND anthropic system (extractBillingAttributionBlock). Carried into every summary call as system[0]; absent → legacy string system unchanged. */
     billingBlock?: { type: "text"; text: string };
+    /** CloudCode / Antigravity v1internal outer envelope metadata (project, requestId, model, userAgent, requestType). When present, in-channel summary calls are wrapped in `{ ...v1Meta, request: inner }`. */
+    v1Meta?: Record<string, unknown>;
     /** #5974: tokens by which this pass's blind view (processTurn on the client re-send) understates the ACTUAL outbound body, measured by the caller against a fresh full-pipeline rebuild (#4543-① — fold-reconcile id churn re-enters unfolded mass the two pipelines disagree about). When > 0, every fit judgment in this pass runs on the corrected scale (exit bar, futility deficit, relax triggers, tier-distillation funnel, final fitsWindow), so the walk keeps folding until the reconstruction is predicted to fit too. Absent/0 → byte-identical legacy behavior; only the bounded corrective second pass sets it. */
     viewDeltaCorrection?: number;
 }
@@ -464,10 +488,27 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // the #496/#1800 billing arbitration. OpenAI chat `image_url.url`, Anthropic
 // `source.data` and Gemini `inline_data.data` were already excluded.
 const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
+// DSH official-API extension plugins attach transport-only top-level sibling fields
+// (such as `dsh_session_log` up to 8 MiB and `dsh_plugin_packages`) that consume 0 model
+// tokens and are stripped/ignored before inference, whereas nested fields inside
+// `messages[]` remain model-visible and must still be counted.
+const NON_MODEL_TOP_LEVEL_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
+
+function isNonModelTopLevelKey(key: string): boolean {
+    return NON_MODEL_TOP_LEVEL_KEYS.has(key) || key.startsWith("dsh_");
+}
 
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
-    const pending: [unknown, string | undefined][] = [[parsed, undefined]];
+    const pending: [unknown, string | undefined][] = [];
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (isNonModelTopLevelKey(k)) continue;
+            pending.push([v, k]);
+        }
+    } else {
+        pending.push([parsed, undefined]);
+    }
     while (pending.length > 0) {
         const [value, key] = pending.pop()!;
         if (typeof value === "string") {
@@ -503,8 +544,9 @@ export interface RawBodyBreakdown {
 export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
     const pending: [unknown, string | undefined, number][] = [];
-    if (parsed && typeof parsed === "object") {
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (isNonModelTopLevelKey(k)) continue;
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
             pending.push([v, k, bucket]);
         }
@@ -917,8 +959,23 @@ function summaryHeaders(deps: PreflightDeps): Record<string, string> {
 // output, so it is skipped; several candidates only occur when n>1 is
 // requested, which the summary call never is — first candidate wins, mirroring
 // the OpenAI/Anthropic extractors.
+function unwrapGoogleResponseChunk(chunk: Record<string, unknown>): Record<string, unknown> {
+    if (
+        chunk.response &&
+        typeof chunk.response === "object" &&
+        !Array.isArray(chunk.response) &&
+        !("candidates" in chunk) &&
+        !("usageMetadata" in chunk) &&
+        !("promptFeedback" in chunk)
+    ) {
+        return chunk.response as Record<string, unknown>;
+    }
+    return chunk;
+}
+
 function googleChunkText(chunk: Record<string, unknown>): string {
-    const candidates = chunk.candidates;
+    const inner = unwrapGoogleResponseChunk(chunk);
+    const candidates = inner.candidates;
     if (!Array.isArray(candidates) || candidates.length === 0) return "";
     const first = candidates[0];
     if (!first || typeof first !== "object") return "";
@@ -1549,8 +1606,17 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
 // fail-fasts with "context exceeds the model window" instead of compressing.
 const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
 
+function wrapV1SummaryPayload(payload: Record<string, unknown>, meta: Record<string, unknown>): Record<string, unknown> {
+    const cleanMeta: Record<string, unknown> = { ...meta };
+    delete cleanMeta.continuationToken;
+    delete cleanMeta.continuation_token;
+    return wrapV1Internal(payload, cleanMeta);
+}
+
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock, isCodexClient(deps.headers))), stream);
+    const rawPayload = summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock, isCodexClient(deps.headers));
+    const wirePayload = deps.v1Meta ? wrapV1SummaryPayload(rawPayload, deps.v1Meta) : rawPayload;
+    const text = await requestSummaryBody(deps, JSON.stringify(wirePayload), stream);
     let json: unknown;
     try {
         json = JSON.parse(text);
@@ -1772,17 +1838,24 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const calibrateFoldMass = (rawMass: number): number => applyEstimateCalibration(rawMass, kFactor, kOrigin, deps.upstreamOrigin);
     // #5974: measured view-vs-reconstruction divergence (see PreflightDeps.viewDeltaCorrection).
     // Every fit judgment in this pass runs on the corrected scale; 0 keeps legacy behavior.
-    const viewDeltaCorrection = Math.max(0, deps.viewDeltaCorrection ?? 0);
+    let viewDeltaCorrection = Math.max(0, deps.viewDeltaCorrection ?? 0);
+    let reconstructionCorrection: number | undefined;
     let foldTarget = Math.min(limit, deps.compressionTarget ?? limit);
     let textTarget = Math.max(0, foldTarget - imageReserve - viewDeltaCorrection);
     const refreshImages = (view: CoreMessage[]): void => {
         if (deps.measureImageReserve) imageReserve = deps.measureImageReserve(view);
+        if (deps.measureWireTokens) {
+            const coreEstimate = calibrateFoldMass(estimateCoreMessages(view) + wireOverhead);
+            const projectedDifference = Math.max(0, deps.measureWireTokens(view) - coreEstimate);
+            reconstructionCorrection ??= Math.max(0, viewDeltaCorrection - projectedDifference);
+            viewDeltaCorrection = reconstructionCorrection + projectedDifference;
+        }
         textTarget = Math.max(0, foldTarget - imageReserve - viewDeltaCorrection);
     };
     // Removing every nominated source gives an upper bound on image savings.
     // This is only a futility bound: the real post-fold view decides fit.
     const imageSavingBound = (ranges: Array<{ startRef: string; endRef: string }>, view: CoreMessage[]): number => {
-        if (!deps.measureImageReserve || imageReserve <= 0) return 0;
+        if (!deps.measureWireTokens && (!deps.measureImageReserve || imageReserve <= 0)) return 0;
         const { refToIdx } = refMaps(messages, deps.session.state);
         const removed = new Set<string>();
         for (const range of ranges) {
@@ -1790,7 +1863,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (start === undefined || end === undefined || start > end) continue;
             for (let i = start; i <= end; i++) removed.add(messages[i]!.id);
         }
-        return Math.max(0, imageReserve - deps.measureImageReserve(view.filter(message => !removed.has(message.id))));
+        const remaining = view.filter(message => !removed.has(message.id));
+        return Math.max(
+            0,
+            deps.measureImageReserve ? imageReserve - deps.measureImageReserve(remaining) : 0,
+            deps.measureWireTokens ? deps.measureWireTokens(view) - deps.measureWireTokens(remaining) : 0,
+        );
     };
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true, hadFoldableCandidates: false };
     // #4288: set when the round-top fit exit fired — the walk ended in a
@@ -1812,7 +1890,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // pass through, and the latch clears only after a turn is forwarded, so a
     // paused over-window session was refused on every turn. Fold it instead.
     if (epochConfirmPending(deps.session)) {
-        if (result.payloadEstimate + viewDeltaCorrection < limit) {
+        if (Math.max(result.payloadEstimate + viewDeltaCorrection, deps.measureWireTokens?.(messages) ?? 0) < limit) {
             deps.log("debug", `[preflight] fold epoch confirmation pending for ${deps.session.id} — compression paused (verbatim passthrough) until the resent history realigns (#3641)`);
             return result;
         }
@@ -1936,6 +2014,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // attempts keeps the #2662 no-backoff path intact.
     let poolQueueDrop = false;
     const triedKeys = new Set<string>();
+    // #1993 parity, across rounds, for the fresh parallel lane: a summary call
+    // rejected with a hard 400/413 means the full-size span will keep being
+    // rejected — the serial walk retries the two halves within its own round
+    // via pushSpanHalves, but the lane re-nominates from the kernel's plan
+    // each round, so the snapped halves are remembered here by ref pair and
+    // consumed by the next round's nomination before the full span is retried.
+    const freshHalvedSpans = new Map<string, Array<{ startRef: string; endRef: string }>>();
     let rangesRemaining = 0;
     // #1933 F3: scale the depth budgets with the entry overshoot (coverage-bound
     // note atop the file). A raised budget is only a ceiling — well-behaved
@@ -1961,8 +2046,59 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // digest-fold ordinary payloads (caught by the model-switch e2e: its
     // summarization calls vanished under a 300k foreign-model baseline).
     const entryOvershoot = limit > 0 && entryLocal > 0 ? entryLocal / limit : 1;
-    const emergencyFold = entryOvershoot > EMERGENCY_FOLD_COVERAGE;
+    const emergencyOvershoot = entryOvershoot > EMERGENCY_FOLD_COVERAGE;
+    const emergencyFold = emergencyOvershoot && preflightEmergencyDigestEnabled();
     const effectiveRoundCap = emergencyFold ? EMERGENCY_ROUND_CAP : roundBudget;
+    // Fresh-session parallel fold gate (owner decision 2026-11-22): a session
+    // that has NEVER been forwarded (no usage sample ever landed —
+    // lastInputTokens <= 0; stats.requests is already 1 here because the
+    // prepare lanes count this request before preflight runs) AND has never
+    // landed a fold (zero blocks) resends raw history verbatim, so no
+    // compression blocks can be "lost" and folding is pure gain. Existing
+    // sessions keep the serial walk byte-identically: a large payload there
+    // may indicate LOST folds, and the owner's rule for that case is to
+    // diagnose (warn), not to spend tokens folding. The blocks clause is what
+    // actually enforces that: the two look-alikes of "fresh" both carry
+    // active blocks — long-folded sessions whose settle resets lastInputTokens
+    // to 0 (cache-ledger credit floor) and adopted anonymous forks that
+    // inherit blocks but intentionally not stats (fork-adoption).
+    const freshParallelFold = !baselineKnown && !emergencyFold
+        && deps.session.stats.lastInputTokens <= 0
+        && deps.session.state.blocks.length === 0
+        && entryLocal <= FRESH_PARALLEL_FOLD_MAX_CHARS;
+    if (freshParallelFold) {
+        deps.log("info", `[preflight] fresh-session parallel fold armed: ~${entryLocal} chars of verbatim history (≤ ${FRESH_PARALLEL_FOLD_MAX_CHARS} bound), ${FRESH_PARALLEL_FOLDS} concurrent in-model summarization call(s) per round instead of one serial fold`);
+    }
+    // #2383 default-off consequence: beyond the coverage bound with the
+    // digest regime DISABLED, the LLM path cannot converge here — and it
+    // must not even try. The bound is the ladder's own coverage product
+    // (32-call budget × 0.6-window chunks = 19.2x): above it, no
+    // combination of successful folds is guaranteed to land under the
+    // window, and the attempt costs up to 32 large-context summary calls —
+    // minutes of wall clock that no client outlives (#2383's exact
+    // 300s-disconnect loop). For an ESTABLISHED session a payload this size
+    // is additionally the lost-compression-blocks symptom the owner's rule
+    // says to diagnose, not to fold away (a token spend on a possibly-broken
+    // session); the fresh-session parallel lane does not raise the bound
+    // (it spends the same budget concurrently) — it only makes the
+    // convergent band below it faster. Verdict: a STRUCTURAL exhaustion —
+    // deterministic, because nothing about a retry changes it (no digest,
+    // no fold path that fits) — so the caller's existing contract handling
+    // applies unchanged: the identity fast path forwards a trusted session
+    // (upstream reality outranks local doom math), and every other session
+    // gets the terminal non-retryable 413 (#2847) telling the host to
+    // restart/rewind.
+    if (emergencyOvershoot && !emergencyFold) {
+        const why = (baselineKnown || deps.session.state.blocks.length > 0)
+            ? "an established session — a payload this size is the lost-compression-blocks symptom (diagnose and recover the blocks; folding spends up to 32 summary calls for minutes of wall clock the client does not outlive)"
+            : "a fresh resend above the ladder's coverage bound (even a fully successful 32-call budget removes at most 19.2x of text — folding it is a token burn with no guaranteed convergence);";
+        deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) with the emergency digest regime disabled (default off, #2383) — ${why}: failing fast with the structural exhaustion verdict (zero summarization calls) instead of running a ladder that cannot converge inside client patience; set BILI_PREFLIGHT_EMERGENCY_DIGEST=1 or network.emergencyDigest to restore the zero-call digest convergence`);
+        return {
+            ...result,
+            fitsWindow: false,
+            failure: { kind: "exhausted", deterministic: true, detail: `the payload is ~${entryOvershoot.toFixed(1)}x the model window (~${entryLocal} vs ${limit} tokens) — beyond the preflight fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) with the deterministic digest regime disabled (default off, #2383): no combination of folds brings it under the window within this pass. Raise the model context window, restart the session, or set BILI_PREFLIGHT_EMERGENCY_DIGEST=1 to restore digest folding.` },
+        };
+    }
     if (emergencyFold) {
         deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) — folding with deterministic digests instead of summarization calls; originals stay restorable via decompress (#2383)`);
     }
@@ -2779,6 +2915,353 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     }
                 }
             }
+            // Fresh-session parallel fold (owner decision 2026-11-22, #2383
+            // follow-up). Sibling of the external-summary batch lane above —
+            // that one only runs when an explicit external summary runtime is
+            // configured; this is the in-model path for FRESH sessions, where
+            // the serial walk below would pay N sequential 15-40s ladder
+            // rounds to fold a megabytes-of-raw-history first resend:
+            if (freshParallelFold && !(probeGated && probeDead)) {
+                    type FreshNomination = {
+                        skipKey: string;
+                        startRef: string;
+                        endRef: string;
+                        content: string;
+                        chunks: string[];
+                        effectiveMessageIds: string[];
+                        targetKey: string;
+                        spanUnits: number;
+                        // The nominated (snapped) span's message-index bounds —
+                        // #1993 halving on a hard 400/413 needs them to
+                        // remember smaller retry spans across rounds.
+                        spanIdx: [number, number];
+                        // This round's idx→ref map — the halving handler runs
+                        // in the worker, after the nomination loop's own map
+                        // is out of scope; messages are stable within the
+                        // round, so the reference stays valid.
+                        idxToRef: Map<number, string>;
+                    };
+                    const freshNoms: FreshNomination[] = [];
+                    let freshReservedCalls = 0;
+                    for (let oi = 0; oi < ordered.length && freshNoms.length < FRESH_PARALLEL_FOLDS; oi++) {
+                        const range = ordered[oi];
+                        const skipKey = `${range.startRef}:${range.endRef}`;
+                        if (skipSet.has(skipKey)) continue;
+                        const { refToIdx } = refMaps(messages, deps.session.state);
+                        const startIdx = refToIdx.get(range.startRef);
+                        const endIdx = refToIdx.get(range.endRef);
+                        if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) {
+                            skipSet.add(skipKey);
+                            const why = startIdx === undefined
+                                ? `start ref ${range.startRef} is absent from the current messages`
+                                : endIdx === undefined
+                                    ? `end ref ${range.endRef} is absent from the current messages`
+                                    : `position resolution inverted the range (${startIdx} > ${endIdx})`;
+                            deps.log("warn", `[preflight] skipping range ${skipKey}: ${why}`);
+                            noteSkip(`${skipKey}: ${why}`);
+                            continue;
+                        }
+                        if (!triedKeys.has(skipKey)) {
+                            triedKeys.add(skipKey);
+                            rangesTried += 1;
+                        }
+                        // Same span selection as the walk/batch lanes: oldest
+                        // full-budget chunk first, sub-minimum fragments merged
+                        // back up to the kernel's minCompressRange floor (#4740).
+                        const spans = mergeSubMinimumFragments(messages, splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText), minChars, coveredIdx).slice().reverse();
+                        // #1993: a hard 400/413 on this range last round
+                        // remembered its halved spans — consume one (largest
+                        // first) before retrying the full-size span. Stale
+                        // halves (messages since folded away) fail to resolve
+                        // and are dropped.
+                        const remembered = freshHalvedSpans.get(skipKey);
+                        if (remembered && remembered.length > 0) {
+                            remembered.sort((a, b) => refNum(b.endRef) - refNum(a.endRef) || refNum(b.startRef) - refNum(a.startRef));
+                            const half = remembered.shift()!;
+                            const hs = refToIdx.get(half.startRef);
+                            const he = refToIdx.get(half.endRef);
+                            if (hs === undefined || he === undefined || hs > he) {
+                                noteSkip(`${skipKey}: remembered halved span ${half.startRef}–${half.endRef} no longer resolves (#1993)`);
+                                continue;
+                            }
+                            spans.push([hs, he]);
+                        }
+                        const span = spans.pop();
+                        if (!span) continue;
+                        const maps = refMaps(messages, deps.session.state);
+                        // #2672 parity with the walk: snap instead of dropping —
+                        // a boundary without a plain ref loses at most its
+                        // unreferencable rim (the kernel excludes it anyway).
+                        const bounds = snapToUsableBounds(maps.idxToRef, span[0], span[1]);
+                        const bStart = bounds?.[0];
+                        const bEnd = bounds?.[1];
+                        let startRef = bStart !== undefined ? maps.idxToRef.get(bStart) : undefined;
+                        let endRef = bEnd !== undefined ? maps.idxToRef.get(bEnd) : undefined;
+                        if (bStart === undefined || bEnd === undefined || !startRef || !endRef) {
+                            deps.log("warn", `[preflight] dropping span ${span[0]}..${span[1]} of range ${skipKey}: no message carries a usable ref (protected or unreferenced)`);
+                            noteSkip(`${skipKey}: span ${span[0]}..${span[1]} has no usable ref boundary`);
+                            continue;
+                        }
+                        // #1001: refs are not monotonic with position after a
+                        // client history rewrite — emit ascending pairs.
+                        if (refNum(startRef) > refNum(endRef)) {
+                            [startRef, endRef] = [endRef, startRef];
+                        }
+                        const preview = deps.core.applyCompression({
+                            messages,
+                            state: deps.session.state,
+                            config: activeConfig,
+                            ranges: [{ startRef, endRef, summary: "x".repeat(Math.max(MIN_SUMMARY_CHARS, activeConfig.compress.minSummaryLength)) }],
+                        });
+                        const previousBlockIds = new Set(deps.session.state.blocks.map((block) => block.blockId));
+                        const planned = preview.state.blocks.find((block) => !previousBlockIds.has(block.blockId));
+                        if (!planned) {
+                            const verdict = safePrefix([...preview.result.errors, ...preview.result.warnings].join("; "), 300)
+                                || "the kernel created no block and reported no error";
+                            deps.log("warn", `[preflight] preview rejected range ${skipKey}: ${verdict}`);
+                            noteSkip(`${skipKey}: preview rejected — ${verdict}`);
+                            // #2638/#1372 (walk parity): the structural-empty
+                            // verdicts are regime-independent — remember them so
+                            // neither this lane nor the walk re-nominates them.
+                            const named = parseStructuralEmptyVerdict([...preview.result.errors, ...preview.result.warnings].join("\n"));
+                            if (named !== null) {
+                                skipSet.add(skipKey);
+                                recordDeadRange(deps.session, startRef, endRef, named);
+                            }
+                            continue;
+                        }
+                        const targetKey = foldTargetKey(planned, deps.session.state);
+                        // Direct raw messages render host-side (#781 image notes
+                        // live in BiliMessage sidecars); consumed child blocks
+                        // render through the kernel as summaries — byte-identical
+                        // to the walk's renderer.
+                        const idxById = new Map(messages.map((m, i) => [m.id, i]));
+                        const byRaw = deps.session.state?.messageRefs?.byRaw;
+                        const parts: string[] = [];
+                        const droppedParts: string[] = [];
+                        for (const id of planned.directMessageIds) {
+                            const i = idxById.get(id);
+                            if (i === undefined) { droppedParts.push(`message ${id} not found in current messages`); continue; }
+                            const m = messages[i];
+                            let text = m.text ?? "";
+                            const notes = imagePlaceholdersForSummary(m, byRaw?.[m.id]);
+                            if (notes.length > 0) {
+                                const note = notes.join(" ");
+                                text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+                            }
+                            if (!text) { droppedParts.push(`message ${id} rendered no text`); continue; }
+                            const label =
+                                m.contentType === "tool-call"
+                                    ? `assistant tool-call ${m.toolName ?? "?"}`
+                                    : m.contentType === "tool-result"
+                                        ? `tool result ${m.toolName ?? "?"}`
+                                        : m.contentType === "reasoning"
+                                            ? "assistant reasoning"
+                                            : m.role;
+                            parts.push(`[${label}]\n${text}`);
+                        }
+                        for (const nid of planned.directBlockIds) {
+                            const nb = deps.session.state.blocks.find((b) => b.blockId === nid);
+                            if (!nb) { droppedParts.push(`child block ${nid} missing from state`); continue; }
+                            const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
+                            parts.push(`[summarized ${label}]\n${nb.summary}`);
+                        }
+                        if (droppedParts.length > 0) {
+                            deps.log("debug", `[preflight] range ${skipKey}: ${droppedParts.length} part(s) rendered nothing (${droppedParts.slice(0, 3).join("; ")})`);
+                        }
+                        const content = parts.join("\n\n");
+                        if (content.length === 0) {
+                            deps.log("warn", `[preflight] planned block for range ${skipKey} rendered no text: ${droppedParts.slice(0, 5).join("; ") || "all parts empty"}`);
+                            noteSkip(`${skipKey}: planned block rendered no text (${droppedParts.slice(0, 3).join("; ") || "all parts empty"})`);
+                            continue;
+                        }
+                        const chunks = splitSummaryContent(content, budget, countText);
+                        // Char regime only here (freshParallelFold ⇒ !baselineKnown):
+                        // the net-shrink bound's units are the folded span's raw
+                        // char mass, matching the post-fold accounting in commitFold.
+                        const spanUnits = coveredMessageChars(messages, planned.effectiveMessageIds);
+                        // Reserve the calls before dispatching (same discipline as
+                        // the external batch lane above):
+                        if (summaryCalls + freshReservedCalls + chunks.length > summaryBudget) break;
+                        freshReservedCalls += chunks.length;
+                        freshNoms.push({ skipKey, startRef, endRef, content, chunks, effectiveMessageIds: planned.effectiveMessageIds, targetKey, spanUnits, spanIdx: [bStart, bEnd], idxToRef: maps.idxToRef });
+                    }
+                    if (freshNoms.length >= 2) {
+                        const maxSummary = activeConfig.compress.maxSummaryLength;
+                        const startedAt = Date.now();
+                        let laneFailure: PreflightFailure | undefined;
+                        // First hard verdict wins (walk parity: the serial
+                        // walk breaks on its first failure, so which error it
+                        // reports is deterministic — concurrent workers must
+                        // not make that racy). An abort always wins: the
+                        // client is gone either way. Declared before the
+                        // Promise.all below so the worker catch handlers can
+                        // reference it (no TDZ).
+                        const setLaneFailure = (f: PreflightFailure): void => {
+                            if (laneFailure === undefined || f === ABORTED_FAILURE) laneFailure = f;
+                        };
+                        type FreshOutcome = { candidate?: string; reason?: string };
+                        const outcomes = await Promise.all(freshNoms.map(async (nom): Promise<FreshOutcome> => {
+                            // #1775: spread maxSummaryLength across the chunks so
+                            // each call carries a per-chunk character ceiling.
+                            const perChunkBudget = maxSummary > 0
+                                ? Math.floor((maxSummary - (nom.chunks.length - 1) * SUMMARY_JOIN_GAP) / nom.chunks.length)
+                                : undefined;
+                            const partTexts: string[] = [];
+                            for (const chunk of nom.chunks) {
+                                if (summaryCalls >= summaryBudget) { budgetHit = true; break; }
+                                if (deps.signal?.aborted) return { reason: "client aborted" };
+                                summaryCalls += 1;
+                                try {
+                                    let part = await summarizeRange(deps, chunk, nom.startRef, nom.endRef, perChunkBudget);
+                                    let transientTries = 0;
+                                    while (
+                                        "unusable" in part && part.transient &&
+                                        transientTries < TRANSIENT_EMPTY_SUMMARY_RETRIES &&
+                                        transientRetryBudget > 0 &&
+                                        summaryCalls < summaryBudget &&
+                                        !deps.signal?.aborted
+                                    ) {
+                                        transientTries += 1;
+                                        transientRetryBudget -= 1;
+                                        const delayMs = replayBackoffMs(transientTries);
+                                        await sleep(delayMs, deps.signal);
+                                        summaryCalls += 1;
+                                        part = await summarizeRange(deps, chunk, nom.startRef, nom.endRef, perChunkBudget);
+                                    }
+                                    if ("unusable" in part) {
+                                        if (part.deterministic) {
+                                            // #2832: a deterministic empty (normal stop,
+                                            // zero text) is not size-driven — remember the
+                                            // strike and skip this range without halving.
+                                            recordDeterministicEmpty();
+                                            skipSet.add(nom.skipKey);
+                                            noteSkip(`${nom.skipKey}: deterministic empty summary (${part.unusable.slice(0, 160)})`);
+                                        } else {
+                                            clearDeterministicProbe();
+                                        }
+                                        return { reason: part.unusable.slice(0, 200) };
+                                    }
+                                    clearDeterministicProbe();
+                                    partTexts.push(part.summary);
+                                } catch (err) {
+                                    if (deps.signal?.aborted) {
+                                        laneFailure = ABORTED_FAILURE;
+                                    } else if (err instanceof UpstreamHttpError) {
+                                        // #1993/#2189 parity with the walk's catch:
+                                        const transient = isTransientUpstreamError(err.status, err.body);
+                                        const shapeRejection = isCredentialShapeRejection(err.status, err.body);
+                                        const bodySnippet = safePrefix(err.body.trim(), 200);
+                                        setLaneFailure({
+                                            kind: "upstream",
+                                            status: err.status,
+                                            retryable: shapeRejection ? false : transient,
+                                            detail: err.status === 429
+                                                ? shapeRejection
+                                                    ? `the summarization call was rejected with HTTP 429 (rate_limit_error "Error") — suspected credential-shape rejection rather than a rate limit (#2189)`
+                                                    : `the summarization call was rate-limited by the upstream (HTTP 429)`
+                                                : `the summarization call was rejected by the upstream (HTTP ${err.status})${bodySnippet ? `: ${bodySnippet}` : ""}${shapeRejection ? ". The upstream requires a request attribute missing from the summary call, e.g. the client's billing-attribution system block" : ""}`,
+                                        });
+                                        deps.log("warn", `[preflight] fresh-parallel summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)${bodySnippet ? `: ${bodySnippet}` : ""}`);
+                                        if (!transient && (err.status === 400 || err.status === 413)) {
+                                            // #1993 parity: the body was too large for the
+                                            // summary endpoint, so retrying the full
+                                            // span next round would be rejected again.
+                                            // The walk pushes the two snapped halves onto
+                                            // its own round's span queue; the lane
+                                            // re-nominates from the kernel's plan each
+                                            // round, so remember them here by ref — the
+                                            // next round's nomination consumes them before
+                                            // the full span is tried again. At/below the
+                                            // floor the walk gives up on the span; do the
+                                            // same (skipSet) instead of halving forever.
+                                            const [hs, he] = nom.spanIdx;
+                                            if (he > hs && spanUnitsOf(messages, hs, he, countText) >= 2 * minChars) {
+                                                const mid = Math.floor((hs + he) / 2);
+                                                const halves: Array<[number, number] | null> = [snapToUsableBounds(nom.idxToRef, mid + 1, he), snapToUsableBounds(nom.idxToRef, hs, mid)];
+                                                for (const half of halves) {
+                                                    if (!half) continue;
+                                                    const sr = nom.idxToRef.get(half[0]);
+                                                    const er = nom.idxToRef.get(half[1]);
+                                                    if (sr === undefined || er === undefined) continue;
+                                                    const arr = freshHalvedSpans.get(nom.skipKey);
+                                                    if (arr) arr.push({ startRef: sr, endRef: er });
+                                                    else freshHalvedSpans.set(nom.skipKey, [{ startRef: sr, endRef: er }]);
+                                                }
+                                            } else {
+                                                skipSet.add(nom.skipKey);
+                                                noteSkip(`${nom.skipKey}: summary body hard-rejected at/below the minimum span size (${err.status}, #1993)`);
+                                            }
+                                        }
+                                    } else if (err instanceof SummaryTransportError) {
+                                        const caNote = isTlsTrustCode(err.code) ? ` — ${tlsTrustRemediation()}` : "";
+                                        setLaneFailure({ kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) });
+                                    } else {
+                                        setLaneFailure({ kind: "upstream", detail: "the summarization call failed unexpectedly" });
+                                    }
+                                    return { reason: "summarization call failed" };
+                                }
+                            }
+                            if (partTexts.length < nom.chunks.length) {
+                                return { reason: budgetHit ? "summary budget exhausted" : "incomplete assembly" };
+                            }
+                            // Acceptance identical to the walk/batch lanes: absolute
+                            // cap, then net-shrink monotonicity (#861/#1775/#1819),
+                            // rescue-truncate when truncating still nets savings.
+                            const candidate = partTexts.join("\n\n");
+                            const shrinkOk = (text: string): boolean => countText(text) <= nom.spanUnits * NET_SHRINK_TOLERANCE;
+                            if (maxSummary <= 0 || candidate.length <= maxSummary) {
+                                return shrinkOk(candidate) ? { candidate } : { reason: `assembled summary (~${countText(candidate)} units) does not shrink its range (~${nom.spanUnits} units) — suspected regurgitation` };
+                            }
+                            if (candidate.length < nom.content.length) {
+                                const rescued = truncateSummaryToLimit(candidate, maxSummary, activeConfig.compress.minSummaryLength);
+                                if (rescued !== null && shrinkOk(rescued)) {
+                                    deps.log("warn", `[preflight] fresh-parallel range ${nom.skipKey}: assembled summary ${candidate.length} chars exceeded maxSummaryLength (${maxSummary}); truncated to ${rescued.length} chars`);
+                                    return { candidate: rescued };
+                                }
+                            }
+                            return { reason: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${maxSummary}) and cannot be rescued` };
+                        }));
+                        // Sequential commits (kernel state mutates
+                        // single-threaded, #2678 shape): nomination order
+                        // (size-desc, matching the ordered sort).
+                        // walk parity: a hard upstream verdict stands as the
+                        // round's failure BEFORE the commits — each successful
+                        // commit below clears it via commitFold's #1993 reset
+                        // (the payload shrank, so the stale verdict no longer
+                        // describes the end state), and with nothing committed
+                        // it is reported as-is — including a deterministic
+                        // shape wall (#2189) that the old "committed === 0"
+                        // guard silently swallowed behind one lucky commit.
+                        if (laneFailure) failure = laneFailure;
+                        let committed = 0;
+                        for (let ni = 0; ni < freshNoms.length; ni++) {
+                            const out = outcomes[ni];
+                            const nom = freshNoms[ni];
+                            if (out.candidate === undefined) {
+                                // Deliberately NOT added to the skipSet — the
+                                // next round re-nominates the range (a hard
+                                // 400/413 also leaves remembered halves in
+                                // freshHalvedSpans, #1993 parity), and a round
+                                // where the lane commits nothing falls through
+                                // to the serial walk below. Note the walk does
+                                // NOT run in a round where the lane committed a
+                                // fold — that commit already fills the round's
+                                // maxFoldsPerRound = 1 budget.
+                                deps.log("warn", `[preflight] fresh-parallel range ${nom.skipKey} not folded this round (${out.reason}) — re-nominated next round, walk takes over only if this lane commits nothing`);
+                                continue;
+                            }
+                            commitFold(nom.skipKey, nom.startRef, nom.endRef, out.candidate, nom.effectiveMessageIds, false, nom.targetKey);
+                            committed += 1;
+                        }
+                        // A successful commit cleared any stale verdict via
+                        // commitFold's #1993 reset; nothing more to do here —
+                        // see the pre-commit assignment above for the walk-
+                        // parity reasoning.
+                        void committed;
+                        deps.log("info", `[preflight] fresh-parallel fold: ${committed}/${freshNoms.length} range(s) committed in ${Date.now() - startedAt}ms (${freshReservedCalls} concurrent in-model summarization call(s))`);
+                    }
+                }
         }
         // #4224: emergency digests are CPU-only (zero upstream calls), so the
         // LLM-path "one fold per round" cap wastes hundreds of rounds.

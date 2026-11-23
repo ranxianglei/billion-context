@@ -1,19 +1,25 @@
 /**
  * Unified-storage sidecar (#2671).
  *
- * Two opt-in levels via BILI_STORAGE_UNIFIED:
+ * Selections via BILI_STORAGE_UNIFIED / storage.unified:
+ *   - absent or `sqlite` (the DEFAULT since #6480, "pure-sqlite"): the
+ *     drop-in replacement. Reads go unified-first with organic import (a
+ *     session the index has not seen is imported from its legacy file on
+ *     first load) and legacy fallback on any miss, and the JSON envelope
+ *     WRITER defaults off — index.db is the only persistent copy (restore
+ *     dual-write with storage.jsonWriter=on).
+ *   - `full`: the historical #3818 posture — the same unified-first
+ *     machinery, but the JSON envelope writer defaults ON (dual-write;
+ *     rollback = unset the knob).
  *   - `1`/`true`/`shadow` (Phase 1): double-write dry-run. Every session
  *     record the legacy SessionStore commits is ALSO ingested into
  *     <sessionsDir>/index.db, and the reconstructed view is digest-checked
  *     against what the legacy loader (buildSession) would serve after a
  *     restart. Any drift is logged as an error — that is the entire point:
  *     the unified layer must replay legacy bytes exactly, and production
- *     traffic becomes the migration test corpus.
- *   - `full` (Phase 1.5): the drop-in replacement. Reads flip to
- *     unified-first with organic import (a session the index has not seen
- *     is imported from its legacy file on first load) and legacy fallback
- *     on any miss. Legacy files keep being written (rollback = unset the
- *     env), but the unified index is the load path.
+ *     traffic becomes the migration test corpus. The JSON envelope stays
+ *     the sole source of truth at this level.
+ *   - `legacy`: the one-line escape hatch — no sidecar at all.
  *
  * Failure policy: sidecar problems must NEVER break the legacy write path.
  * All work is try/catch'd. The sidecar NEVER gives up on index writes
@@ -25,10 +31,12 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import { featureEnabled } from "../rollout.js";
+import { planIngest, planIngestDelta, planIngestReanchor, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import type { CcrLedgerRow } from "./slim.ts";
 import { splitMediaContent } from "./identity.js";
 import type { BlockView } from "../session.js";
-import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
+import { effectiveJsonWriterOff, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
@@ -46,6 +54,89 @@ import type { CoreMessage, MessageContentStore } from "acp-kernel";
 let integrityQuickCheckFailed = false;
 export function hadIntegrityQuickCheckFailure(): boolean {
     return integrityQuickCheckFailed;
+}
+
+/** Test seam: clear the proven-corruption latch (see integrity-check.js' own
+ *  test resets for the same pattern). */
+export function resetIntegrityQuickCheckLatchForTests(): void {
+    integrityQuickCheckFailed = false;
+}
+
+/** The process's effective storage stance: is the SQLite index the ONLY
+ *  persistent copy (the pure-sqlite stance)? True exactly when the persist
+ *  constructor's jsonWriterOff switch is in force — same knobs, same
+ *  precedence, so the two can never disagree: effective mode full, sqlite
+ *  backend, no encryption opt-out, and the envelope writer off (the
+ *  pure-sqlite default or an explicit off).
+ *
+ *  Why it matters (owner policy 2026-11-21, the #7156 production incident):
+ *  a proven-corrupt index.db in this stance has NO durable fallback behind
+ *  it — the historical "loud alarm + start WITHOUT the index" contract would
+ *  serve a near-empty, non-persistent JSON view and silently lose the
+ *  durable history, which is WORSE than the corruption itself. In every
+ *  other stance (explicit dual-write full, shadow, legacy, network
+ *  backends, encryption) the envelopes remain a real recovery source and
+ *  the historical contract applies.
+ *
+ *  Lives HERE (not in knobs.ts) because knobs.ts importing a storage module
+ *  at top level flips the config/knobs/update module-evaluation order into
+ *  a TDZ crash (update.ts calls knobs at top level; observed 2026-11-21). */
+export function storageStancePureSqlite(
+    env: NodeJS.ProcessEnv = process.env,
+    fileUnified?: string,
+    fileJsonWriter?: string,
+    fileBackend?: string,
+): boolean {
+    if (resolveStorageMode(env, fileUnified) !== "full") return false;
+    if ((env.BILI_ENCRYPTION_KEY ?? "").trim() !== "") return false; // encryption blocks the sidecar → legacy-only, envelope IS the source of truth
+    if (resolveBackendName(env, fileBackend) !== "sqlite") return false; // network backends keep the envelope as the sync read path
+    return effectiveJsonWriterOff(env, fileJsonWriter, fileUnified);
+}
+
+/** Escape hatch for the pure-sqlite proven-corruption refusal:
+ *  BILI_STORAGE_ALLOW_LEGACY_DEGRADE=1/true/on restores the historical
+ *  alarm-and-degrade contract (start WITHOUT the index, serve the JSON path)
+ *  even though the corrupt index is the only persistent copy. Explicitly
+ *  dangerous — every turn served that way lands only in the non-durable
+ *  view — so it is never the default and never implied by any config value. */
+export function legacyDegradeAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+    const raw = (env.BILI_STORAGE_ALLOW_LEGACY_DEGRADE ?? "").trim().toLowerCase();
+    return raw === "1" || raw === "true" || raw === "on";
+}
+
+/** Proven-corruption policy gate (owner policy 2026-11-21, #7156 incident).
+ *  Shared by both proven-corruption branches of maybeOpen: it always latches
+ *  the process verdict and records the boot failure (the status surface),
+ *  then decides the outcome by storage stance:
+ *   - PURE-SQLITE stance (envelopes are not a durable copy) and the escape
+ *     hatch is NOT set → THROW the refusal: boot exits, data stays exactly
+ *     where it is, operator fixes the files by hand (or sets the escape
+ *     hatch). This stance historically degraded, which served a near-empty
+ *     non-persistent JSON view over the only durable copy — strictly worse
+ *     than refusing.
+ *   - every other stance (explicit dual-write full, shadow, legacy,
+ *     network backends, encryption) → fall through; the caller keeps the
+ *     historical 2026-10-30 contract (loud alarm + start WITHOUT the index). */
+function applyProvenCorruptionPolicy(
+    dir: string,
+    env: NodeJS.ProcessEnv,
+    fileUnified: string | undefined,
+    fileJsonWriter: string | undefined,
+    fileBackend: string | undefined,
+    detail: string,
+    err: unknown,
+): void {
+    recordSidecarOpenFailure(detail);
+    integrityQuickCheckFailed = true; // proven-corrupt: operator hand-fix only — no in-process auto-retry
+    if (!storageStancePureSqlite(env, fileUnified, fileJsonWriter, fileBackend) || legacyDegradeAllowed(env)) return;
+    // Over-record so the status wire carries the REFUSAL, not the historical
+    // degrade wording (degradeReason() branches on this prefix).
+    recordSidecarOpenFailure(`REFUSING TO START (pure-sqlite stance): ${detail}`);
+    loggerLog(
+        "error",
+        `[storage] REFUSING TO START — the SQLite index (${path.join(dir, "index.db")}) is PROVEN CORRUPT (${detail}) and this process runs in the PURE-SQLITE stance, so the JSON envelopes are NOT a durable copy of your sessions — degrading to them would serve a near-empty, non-persistent view while your only durable history sits in the corrupt index. Refusing beats losing (2026-11-21 owner policy, #7156 incident). Fix it by hand: 1) back up ${path.join(dir, "index.db")}{,-wal,-shm}; 2) MOVE those files aside; 3) start again — the fresh index re-imports the JSON envelopes written since; 4) restore/recover what the backup can give (sqlite3 .recover is your friend). Set BILI_STORAGE_ALLOW_LEGACY_DEGRADE=1 only if you consciously accept serving the near-empty legacy view instead.`,
+    );
+    throw err;
 }
 
 const VERIFY_BATCH_SIZE = 32;
@@ -265,6 +356,18 @@ export class UnifiedShadow {
             this.lastWarnKey = key;
             loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${this.consecutiveFailures} in a row; ${detail})${sqliteOpenFailureHint(String(err))} — the index write will be RETRIED on every subsequent save until it succeeds again (no self-disable; the JSON envelope keeps serving meanwhile)`);
         }
+        // #7156 (2026-11-21): open no longer writes — with the per-session
+        // watermark prime, the FIRST write of a process happens at its first
+        // ingest. If that write hits proven corruption before the integrity
+        // verdict has landed (large store: async quick_check in flight, or a
+        // cached .chk verdict skipped the rescan), say so LOUDLY and trip the
+        // latch so the status surface shows the proven-corrupt state; the
+        // save itself falls back to the envelope as usual (the warn above).
+        const corruption = sqliteCorruptionDetail(err);
+        if (corruption !== null) {
+            integrityQuickCheckFailed = true;
+            loggerLog("error", `[storage] index.db FAILED at an ingest write (${corruption}) — the integrity check has not run/landed yet (large store / cached verdict), so the corruption surfaced here instead of at quick_check. No file moved, no copy, no automatic rebuild (2026-10-30 owner policy): back up ${this.dbPath ?? "index.db"}{,-wal,-shm}, then MOVE those files aside by hand and start again (#7156)`);
+        }
     }
 
     /** #3931 step 3: true when this shadow rides a network backend (mysql).
@@ -281,7 +384,12 @@ export class UnifiedShadow {
             : { name: "mysql", source: "network" };
     }
 
-    /** Opens the sidecar when a knob asks for one; null (no cost) otherwise. */
+    /** Opens the sidecar when a knob asks for one; null (no cost) otherwise.
+     *  THROWS when the environment is broken (transient open failures) or
+     *  when a PROVEN-corrupt index would leave a pure-sqlite process without
+     *  any durable copy (owner policy 2026-11-21, #7156 incident) and the
+     *  BILI_STORAGE_ALLOW_LEGACY_DEGRADE escape hatch is not set — boot
+     *  refuses on the thrown error instead of degrading. */
     static maybeOpen(
         dir: string,
         env: NodeJS.ProcessEnv = process.env,
@@ -289,6 +397,7 @@ export class UnifiedShadow {
         fileUnified?: string,
         fileWalLimit?: number,
         fileBackend?: string,
+        fileJsonWriter?: string,
     ): UnifiedShadow | null {
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
@@ -308,7 +417,9 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             try {
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, {
+                    walJournalSizeLimitBytes: walLimit,
+                });
             } catch (err) {
                 // #4175: anything else throwing StorageIntegrityError means quick_check
                 // proved the file set corrupt — handled below WITHOUT moving any file
@@ -323,33 +434,47 @@ export class UnifiedShadow {
                 // envelopes — with a loud alarm naming the manual fix.
                 // writerOffActive() sees no sidecar, so even a jsonWriter=off
                 // operator keeps persisting every turn to the envelopes; no
-                // turn ever lands somewhere unsafe. The corrupt set stays
+                // turn ever lands somewhere unsafe — UNLESS the process is in
+                // the pure-sqlite stance, where the envelopes are NOT a
+                // durable copy: that case no longer degrades, it refuses (the
+                // 2026-11-21 layer below). The corrupt set stays
                 // EXACTLY in place: an operator repairs it or moves it aside
                 // by hand (back up first) and the next start picks up a fresh
                 // index that re-imports the envelopes. Transient open
                 // failures below are a different category ("environment
                 // broken", not "data proven bad") and still refuse.
+                // Owner policy 2026-11-21 layer (on top of the 2026-10-30
+                // degrade contract): in the PURE-SQLITE stance the envelopes
+                // are not a durable copy, so this branch THROWS the refusal
+                // (boot exits) unless BILI_STORAGE_ALLOW_LEGACY_DEGRADE is
+                // set; every other stance falls through to the historical
+                // alarm + return null below.
+                applyProvenCorruptionPolicy(dir, env, fileUnified, fileJsonWriter, fileBackend, `integrity quick_check failed: ${err.detail}`, err);
                 loggerLog(
                     "error",
                     `[storage] index.db FAILED its integrity quick_check (${err.detail}) — starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#4175/#4626/#4816)`,
                 );
-                recordSidecarOpenFailure(`integrity quick_check failed: ${err.detail}`);
-                integrityQuickCheckFailed = true; // proven-corrupt: operator hand-fix only — no in-process auto-retry
                 return null;
             }
-            // #3285: watermark trust does not cross process boundaries — a
-            // restart-handoff overlap leaves the previous writer's rows AND
-            // watermark behind; drop them all so this process's first save
-            // per session re-establishes trust from its own view.
-            store.resetAllIngestWatermarks();
+            // #3285 (2026-11-21 per-session rework): watermark trust no longer
+            // gets a global open-time reset — it would make OPEN a write and
+            // touch every session (the #7156 first-write hazard). Each
+            // session's foreign watermark is dropped lazily on this process's
+            // first touch of it, right before the watermark is read (below).
         } catch (err) {
+            // The inner gate's refusal throw (or any StorageIntegrityError the
+            // inner catch let through) re-enters THIS catch — it is already
+            // fully handled (latched, recorded, logged); re-throw untouched
+            // instead of double-processing it as a first-post-open-write
+            // failure (that path only ever sees raw driver errors).
+            if (err instanceof StorageIntegrityError) throw err;
             const errStr = String(err);
             // #7156: corruption-shaped failures CAN reach here. When the
             // integrity check did not run synchronously — a store over the
             // 512 MiB sync threshold checks in the background, or a poisoned
             // .chk verdict cache skipped the rescan (see the close-time gate
             // in store.ts) — the corruption surfaces at the FIRST post-open
-            // write (resetAllIngestWatermarks) instead of at quick_check.
+            // write (an open-path write: migration/DDL) instead of at quick_check.
             // Classify it exactly like the inner catch: proven-corrupt →
             // start WITHOUT the index, files left in place, loud alarm naming
             // the manual fix (2026-10-30 owner policy).
@@ -362,11 +487,17 @@ export class UnifiedShadow {
                 // alarm-only, no cache write — writing "ok" here would re-stamp
                 // the poisoned verdict). The operator moves the files aside by
                 // hand, so the uncheckpointed -wal state is moot.
+                // Same 2026-11-21 layer as the quick_check branch: pure-sqlite
+                // stance THROWS the refusal here too (the corruption surfaced
+                // at the first post-open write instead of at quick_check —
+                // large store / cached verdict); every other stance keeps the
+                // historical alarm + return null below.
+                applyProvenCorruptionPolicy(dir, env, fileUnified, fileJsonWriter, fileBackend, `first post-open write failed: ${corruptionDetail}`, err);
                 loggerLog(
                     "error",
-                    `[storage] index.db FAILED at the first post-open write (${corruptionDetail}) — the integrity check did not run synchronously (large store / cached verdict), so the corruption surfaced here instead of at quick_check. Starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#7156/#4175/#4626)`,
+                    `[storage] index.db FAILED at an open-path write (${corruptionDetail}) — the integrity check did not run synchronously (large store / cached verdict), so the corruption surfaced here instead of at quick_check. Starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#7156/#4175/#4626)`,
                 );
-                recordSidecarOpenFailure(`first post-open write failed: ${corruptionDetail}`);
+                recordSidecarOpenFailure(`open-path write failed: ${corruptionDetail}`);
                 integrityQuickCheckFailed = true; // proven-corrupt: operator hand-fix only — no in-process auto-retry
                 return null;
             }
@@ -394,10 +525,26 @@ export class UnifiedShadow {
         recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         const walTag = ` [wal-cap: ${walLimit}]`;
+        // #7408: the FULL-mode line must state the ACTUAL writer state and
+        // selection — the pre-#6480 wording ("legacy files keep being
+        // written — unset the knob to roll back") is false under the
+        // pure-sqlite default (no knob set, envelopes NOT written) and
+        // contradicted the accurate jsonWriter-off line printed by persist.
+        // At this point mode is full, the backend is sqlite (mysql logs its
+        // own line in openAsync), and encryption-blocking never reaches here
+        // (persist gates the open), so effectiveJsonWriterOff equals the
+        // jsonWriterOff persist.ts computes for save decisions.
+        const sqliteSelection = unifiedSelectionIsSqlite(env, fileUnified);
+        const selection = sqliteSelection
+            ? "pure-sqlite selection (storage.unified absent or =sqlite)"
+            : "storage.unified=full or BILI_STORAGE_UNIFIED=full";
+        const writerOff = effectiveJsonWriterOff(env, fileJsonWriter, fileUnified);
         loggerLog(
             "info",
             mode === "full"
-                ? `[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back${engineTag}${walTag}`
+                ? writerOff
+                    ? `[storage] unified FULL mode ENABLED (${selection}): index.db is the load path AND the only persistent copy — JSON envelopes are not written; restore dual-write with storage.jsonWriter=on${engineTag}${walTag}`
+                    : `[storage] unified FULL mode ENABLED (${selection}): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — ${sqliteSelection ? "remove the explicit storage.jsonWriter=on to return to the pure-sqlite default" : "unset the knob to roll back"}${engineTag}${walTag}`
                 : `[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled${engineTag}${walTag}`,
         );
         return shadow;
@@ -416,9 +563,10 @@ export class UnifiedShadow {
         fileWalLimit?: number,
         fileBackend?: string,
         fileMysqlDsn?: string,
+        fileJsonWriter?: string,
     ): Promise<UnifiedShadow | null> {
         const backendName = resolveBackendName(env, fileBackend);
-        if (backendName !== "mysql") return UnifiedShadow.maybeOpen(dir, env, legacyLoad, fileUnified, fileWalLimit, fileBackend);
+        if (backendName !== "mysql") return UnifiedShadow.maybeOpen(dir, env, legacyLoad, fileUnified, fileWalLimit, fileBackend, fileJsonWriter);
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
         const dsn = (env.BILI_MYSQL_DSN ?? fileMysqlDsn ?? "").trim();
@@ -563,14 +711,39 @@ export class UnifiedShadow {
             // parity oracle, so it runs on the first ingest of a session and
             // then every VERIFY_EVERY_INGESTS-th (drift stays observable via
             // stats.verifyDrift on the sampled saves).
+            // #7439 R-C step 1: a session latched before egress recording
+            // started is re-admitted here once — the flow table is the single
+            // byte generation (ruling 5: server canonical, never client
+            // bytes), so the drift it was latched for can no longer recur;
+            // the skipLastMessages gate in BatchedViewVerification (wired
+            // from egressAuthority) prevents re-latching on subsequent
+            // samples. Clearing the stale latch restores the delta fast path
+            // for sessions that were already on the O(rows) full-ingest path.
             phase = "verify-sample";
             const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
             this.ingestCounts.set(legacy.id, count);
-            if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
+            // #7574: only while the plane is switched ON. The marker is saved
+            // with the session, so after an install turns the plane off it
+            // would otherwise keep the sampled verification off and keep the
+            // delta fast path latched forever for that session.
+            if (legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane") && this.driftedSessions.delete(legacy.id)) {
+                this.driftStreaks.delete(legacy.id);
+                if (this.frozenEnvelopeIds.delete(legacy.id)) {
+                    this.frozenEnvelopeSince.delete(legacy.id);
+                    loggerLog("info", `[storage] egress-active ${legacy.id}: stale drift latch cleared — flow table is the single byte generation, delta fast path restored (#7439 R-C)`);
+                }
+            }
+            // #7439 item 1: BatchedViewVerification is disabled for egress-on
+            // sessions — its two legs are messages-reconciliation, and keeping
+            // it re-latches the known canonical≠client divergence (the #5677
+            // chronic loop source). The egress probe (client bytes vs flow
+            // sampled rows) is the sole verification for egress-on sessions.
+            const egressOn = legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane");
+            if (!egressOn && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
                 if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id));
+                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getCcrEntries(legacy.id), this.sync.getStateFields(legacy.id), this.sync.getOrphanViews(legacy.id) ?? {});
                 for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                     const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                     verifier.addBlocks(rows);
@@ -675,6 +848,11 @@ export class UnifiedShadow {
     private ingestDelta(legacy: LegacySessionLike, hasRawTail: boolean): boolean {
         if (this.sync === null) return false;
         try {
+            // #3285 (2026-11-21 per-session): prime THIS session's trust
+            // before reading the watermark — a foreign-set watermark
+            // (previous process) must not vouch for its rows; own watermarks
+            // stay trusted (idempotent, no second write).
+            this.sync.primeIngestTrust(legacy.id);
             const mark = this.sync.ingestWatermark(legacy.id);
             if (!mark) return false;
             // The pre-transaction probe is an optimization (skip building a
@@ -695,15 +873,31 @@ export class UnifiedShadow {
                 head = { msgId: headMsgId };
             }
             const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail, head);
-            if (!plan) return false;
-            const applied = this.sync.ingestSession(plan, {
-                trustedSeq: mark.seq,
-                boundaryMsgId: boundary.msgId,
-                boundaryHash: boundary.contentHash,
-                trustedTailSeqs: mark.tailSeqs,
-            });
-            if (applied) this.stats.deltaIngests++;
-            return applied;
+            if (plan) {
+                const applied = this.sync.ingestSession(plan, {
+                    trustedSeq: mark.seq,
+                    boundaryMsgId: boundary.msgId,
+                    boundaryHash: boundary.contentHash,
+                    trustedTailSeqs: mark.tailSeqs,
+                });
+                if (applied) this.stats.deltaIngests++;
+                return applied;
+            }
+            // #7474 window re-anchor: envelope (folded-render) shapes that
+            // violate strict-append — the pf-window lane's sliding tail
+            // window — resolve per-row by indexed identity instead of the
+            // O(all rows) full remap. Raw lineage never enters (its delta
+            // gates stay authoritative there); any in-txn doubt returns the
+            // caller to the exact full path.
+            if (!hasRawTail) {
+                const rp = planIngestReanchor(legacy);
+                if (rp) {
+                    const applied = this.sync.ingestSession(rp, undefined, undefined, { trustedTailSeqs: mark.tailSeqs });
+                    if (applied) this.stats.deltaIngests++;
+                    return applied;
+                }
+            }
+            return false;
         } catch {
             return false;
         }
@@ -728,6 +922,13 @@ export class UnifiedShadow {
                     builder.addMessages(store.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                 }
                 warnCorruptSkips(id, builder);
+                // #6785 step 6: slim ccr envelopes hydrate from the CAS-backed
+                // ledger; full legacy envelopes ignore these rows.
+                builder.addCcrEntries(store.getCcrEntries(id));
+                // #6785 step 7: the orphan journal now lives in orphan_blocks;
+                // getOrphanViews also unions any legacy column entries.
+                builder.addOrphanViews(store.getOrphanViews(id) ?? {});
+                builder.addStateFields(store.getStateFields(id) ?? {});
                 // The builder preserves every MERGE_STATE_FIELDS key; its
                 // generic state declaration only needs widening here.
                 return builder.finish() as LegacySessionLike;
@@ -772,7 +973,7 @@ export class UnifiedShadow {
                                 .join("; ")}); loaded without them (#7337)`,
                         );
                     }
-                    mergeOrphanBlockContents(contents, store.getOrphansJson(id));
+                    mergeOrphanBlockContents(contents, JSON.stringify(store.getOrphanViews(id) ?? {}));
                     result.blockContents = contents;
                 }
                 return result;
@@ -818,7 +1019,12 @@ export class UnifiedShadow {
     }
 
     /** Organic import (full mode): ingest a legacy record the index has not
-     *  seen so future loads serve from the unified store. Never throws. */
+     *  seen so future loads serve from the unified store. The envelope is a
+     *  PRUNED render (possibly from another writer): the index's stored block
+     *  lineage and lifetime stats stay authoritative (ingestSession's
+     *  envelopeImport contract, 2026-11-21 / #7156) — the envelope contributes
+     *  its new messages, and its block structure only when the index has none
+     *  for the session. Never throws. */
     importRecord(record: unknown): LegacySessionLike | null {
         if (this.sync === null) return null;
         try {
@@ -829,7 +1035,7 @@ export class UnifiedShadow {
             // viewFor rebuild; callers fall back to the envelope itself.
             // #4216/#4242: orphan shape is representable (journal rides the
             // plan) — import normally instead of rejecting.
-            this.sync.ingestSession(planIngest(legacy));
+            this.sync.ingestSession(planIngest(legacy), undefined, { envelopeImport: true });
             this.stats.imports++;
             loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
             return legacy;
@@ -997,6 +1203,82 @@ export class UnifiedShadow {
         return this.sync.sessionStorageStats(sessionId);
     }
 
+    // #5874 2×2 stage 0 (brief 19544722): the element world-match accessors.
+    // Errors propagate (the lane maps the R3 reject to a hard 400 and every
+    // other fault to the legacy full path).
+
+    /** Stage 0 for one turn (see UnifiedStore.snapStage0). null when there
+     *  is no sync store. */
+    snapStage0(sessionId: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): import("../snapshot/plane.js").Stage0Result | null {
+        if (this.sync === null) return null;
+        return this.sync.snapStage0(sessionId, incoming, opts);
+    }
+
+    /** The stage-0 resync (diverge / re-baseline): clear the l1 envelope so
+     *  the next turn re-issues from the client's current array. */
+    snapStage0Reset(sessionId: string): void {
+        if (this.sync === null) return;
+        this.sync.snapStage0Reset(sessionId);
+    }
+
+    /** #7064 D2: conversation-bound check (see UnifiedStore.snapConvBound). */
+    snapConvBound(sessionId: string): boolean {
+        if (this.sync === null) return false;
+        return this.sync.snapConvBound(sessionId);
+    }
+
+    /** #7064 §8: live stamped msg_ids in seq order (see UnifiedStore.snapMsgIdLiveIds). */
+    snapMsgIdLiveIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.snapMsgIdLiveIds(sessionId);
+    }
+
+    /** #7474 P2 (ruling 7439): pin ledger entry — egress op log when the
+     *  session has one, messages rows otherwise (see UnifiedStore.snapPinLiveIds). */
+    snapPinLiveIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.snapPinLiveIds(sessionId);
+    }
+
+    /** #7398 seg 3: the sqlite UnifiedStore behind this shadow — the egress
+     *  op-log recorder's narrow seam. Null on network backends (mysql): the
+     *  shadow tables are sqlite-lane only, and the recorder skips the turn
+     *  exactly as it does when no sidecar opened. */
+    egressOpLogSync(): UnifiedStore | null {
+        return this.sync;
+    }
+
+    /** #6181 M3: persisted R3 breaker latch (see UnifiedStore.snapR3Latched). */
+    snapR3Latched(sessionId: string): boolean {
+        if (this.sync === null) return false;
+        return this.sync.snapR3Latched(sessionId);
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort). */
+    snapR3Latch(sessionId: string): void {
+        if (this.sync === null) return;
+        this.sync.snapR3Latch(sessionId);
+    }
+
+    /** #6785 review: operator escape hatch (see UnifiedStore.snapR3LatchClear). */
+    snapR3LatchClear(sessRaw: string): string | null {
+        if (this.sync === null) return null;
+        return this.sync.snapR3LatchClear(sessRaw);
+    }
+
+    /** #6785 review: the persisted-latch roster (see UnifiedStore.snapR3LatchedList). */
+    snapR3LatchedList(): Array<{ sessRaw: string; ledgerId: string; latchedAt: number }> {
+        if (this.sync === null) return [];
+        return this.sync.snapR3LatchedList();
+    }
+
+    /** #6785 review: conversation-binding sid of a raw id (see UnifiedStore.snapSidOfRaw). */
+    snapSidOfRaw(sessRaw: string): string | null {
+        if (this.sync === null) return null;
+        return this.sync.snapSidOfRaw(sessRaw);
+    }
+
+
     vacuum(mode: "full" | "incremental"): void {
         if (this.sync === null) throw new Error("[storage] sync vacuum unavailable on a network backend");
         return this.sync.vacuum(mode);
@@ -1074,31 +1356,6 @@ export class UnifiedShadow {
     getCcr(sessionId: string): MessageContentStore | null {
         if (this.sync === null) return null;
         return this.sync.getCcr(sessionId);
-    }
-
-    /** #4739: narrow single-column metadata read for lazy-field restore.
-     *  Full-trust only (shadow mode's index may lag its envelopes) — callers
-     *  gate on readsUnified; network backends degrade to null (the caller
-     *  falls back to the envelope, exactly like today's sync loadSync). */
-    getSessionMetadata(sessionId: string): Record<string, unknown> | null {
-        if (this.sync === null) return null;
-        try {
-            return this.sync.getSessionMetadata(sessionId);
-        } catch {
-            return null;
-        }
-    }
-
-    /** #4739: narrow blockContents read for lazy-field restore (block rows +
-     *  orphans journal, no message rows). Same trust/degrade contract as
-     *  getSessionMetadata. */
-    getBlockContents(sessionId: string): import("./store.ts").BlockContentsMap | null {
-        if (this.sync === null) return null;
-        try {
-            return this.sync.getBlockContents(sessionId) as import("./store.ts").BlockContentsMap | null;
-        } catch {
-            return null;
-        }
     }
 
     /** #4316 PR3/3: raw id → canonical seq (single-row ids only) for the
@@ -1223,7 +1480,6 @@ export class UnifiedShadow {
                     legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
                 }
                 if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-                // #3818/#3841: same orphan-guard + reap-journal semantics.
                 // #4216/#4242: orphan shape rides the plan journal — normal
                 // ingest (the async twin of the sync fix); no freeze.
                 // #3133 watermark delta.
@@ -1235,6 +1491,9 @@ export class UnifiedShadow {
                 // generation so the next sample can re-admit and release it.
                 if (!this.driftedSessions.has(legacy.id)) {
                     try {
+                        // #3285 (2026-11-21 per-session): prime THIS session's
+                        // trust before reading the watermark (idempotent).
+                        await backend.primeIngestTrust(legacy.id);
                         const mark = await backend.ingestWatermark(legacy.id);
                         if (mark) {
                             const boundary = await backend.probeIngestBoundary(legacy.id, mark.seq);
@@ -1243,6 +1502,15 @@ export class UnifiedShadow {
                                 if (plan) {
                                     applied = await backend.ingestSession(plan, { trustedSeq: mark.seq, boundaryMsgId: boundary.msgId, boundaryHash: boundary.contentHash, trustedTailSeqs: mark.tailSeqs });
                                     if (applied) this.stats.deltaIngests++;
+                                } else if (!hasRawTail) {
+                                    // #7474 window re-anchor (async twin): sliding
+                                    // tail windows resolve per-row by indexed
+                                    // identity instead of the O(all rows) remap.
+                                    const rp = planIngestReanchor(legacy);
+                                    if (rp) {
+                                        applied = this.sync?.ingestSession(rp, undefined, undefined, { trustedTailSeqs: mark.tailSeqs }) ?? false;
+                                        if (applied) this.stats.deltaIngests++;
+                                    }
                                 }
                             }
                         }
@@ -1269,11 +1537,14 @@ export class UnifiedShadow {
                 phase = "verify-sample";
                 const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
                 this.ingestCounts.set(legacy.id, count);
-                if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
+                // #7439 item 1: BatchedViewVerification disabled for egress-on
+                // sessions (same rationale as the sync path above).
+                const egressOnAsync = legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane");
+                if (!egressOnAsync && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
                     this.stats.verifySamples++;
                     const sessionRow = await backend.getSessionRow(legacy.id);
                     if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id));
+                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id), await backend.getCcrEntries(legacy.id), await backend.getStateFields(legacy.id), (await backend.getOrphanViews(legacy.id)) ?? {});
                     for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                         const rows = await backend.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                         verifier.addBlocks(rows);
@@ -1323,6 +1594,12 @@ export class UnifiedShadow {
                         builder.addMessages(await reader.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                     }
                     warnCorruptSkips(id, builder);
+                    // #6785 step 6: same slim-envelope hydration on the async
+                    // (MySQL seam) leg — one source, both legs.
+                    builder.addCcrEntries(await reader.getCcrEntries(id));
+                    // #6785 step 7: same orphan-journal union on the async leg.
+                    builder.addOrphanViews(await reader.getOrphanViews(id) ?? {});
+                    builder.addStateFields(await reader.getStateFields(id) ?? {});
                     return builder.finish() as LegacySessionLike;
                 });
                 if (!loaded) return null;
@@ -1341,7 +1618,9 @@ export class UnifiedShadow {
                 const legacy = this.legacyLoad(record);
                 if (!legacy) return null;
                 // #4216/#4242: orphan shape rides the plan journal — import normally.
-                await this.enqueue(() => this.backend!.ingestSession(planIngest(legacy)));
+                // envelopeImport: stored block lineage + stats stay authoritative
+                // (see the sync twin's contract, 2026-11-21 / #7156).
+                await this.enqueue(() => this.backend!.ingestSession(planIngest(legacy), undefined, { envelopeImport: true }));
                 this.stats.imports++;
                 loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
                 return legacy;
@@ -1607,8 +1886,8 @@ class BatchedViewVerification {
     private tailGaps = 0;
     private tailSlot: DriftDiagnostics["tailSlot"];
 
-    constructor(private readonly legacy: LegacySessionLike, session: SessionRow, refs: RefRow[], deadRefs: { ord: number; ref: string }[]) {
-        const header = loadLegacyView({ session, refs, deadRefs, messages: [], blocks: [] });
+    constructor(private readonly legacy: LegacySessionLike, session: SessionRow, refs: RefRow[], deadRefs: { ord: number; ref: string }[], ccrRows: readonly CcrLedgerRow[] = [], stateFieldsRows: Record<string, string> | null = null, orphanViews: Record<string, { one: unknown; full: unknown }> | null = null, private readonly skipLastMessages = false) {
+        const header = loadLegacyView({ session, refs, deadRefs, messages: [], blocks: [] }, ccrRows, stateFieldsRows, orphanViews ?? undefined);
         this.orphans = header.blockContents;
         this.remainingContents = new Map(completeBlockContents(legacy.blockContents, legacy.state.blocks));
         this.tail = JSON.parse(session.tailJson);
@@ -1738,7 +2017,16 @@ class BatchedViewVerification {
         if (this.blockCount !== this.legacy.state.blocks.length) this.changed("state");
         for (const [id, view] of this.orphans) this.compareContents(id, view);
         if (this.remainingContents.size > 0) this.changed("blockContents");
-        this.compareMessages("lastMessages", this.tail.tailSeqs);
+        // Ruling 7439 (egress-authority sessions): the message BYTES are
+        // authoritative in the egress op log, not in the messages table —
+        // there the rows are the identity/cursor ledger (watermark, pin
+        // tail-overlap) and the client legitimately resends its OWN bytes
+        // while the server serves the canonical ones, so this comparison
+        // diverges by design on those sessions and would latch the session
+        // onto the O(rows) full-ingest path (observed: 'diverged:
+        // lastMessages' → chronic slow full ingests). Marked sessions skip
+        // ONLY this dimension; every other check still runs.
+        if (!this.skipLastMessages) this.compareMessages("lastMessages", this.tail.tailSeqs);
         this.compareMessages("pluginSnapshot", this.tail.pluginSnapshotSeqs);
         const diagnostics: DriftDiagnostics = { keys: [...this.keys].sort() };
         if (this.headerDiag?.stateKeys) diagnostics.stateKeys = this.headerDiag.stateKeys;

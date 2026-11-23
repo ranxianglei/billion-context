@@ -94,7 +94,7 @@ interface LaneCtx {
     global: DoctorGlobalInfo;
 }
 
-const REFERENCE_LANES = new Set<PluginAgent>(["omp", "claude", "codex", "kimi", "zcode", "hermes"]);
+const REFERENCE_LANES = new Set<PluginAgent>(["omp", "claude", "codex", "kimi", "zcode", "hermes", "workbuddy"]);
 
 function pkgVersionAt(rootDir: string): string | undefined {
     try {

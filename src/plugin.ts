@@ -24,6 +24,7 @@ import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, co
 import { log as loggerLog } from "./logger.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
+import { formatProtectedMass, uncoveredAudit, type ProtectedMassLedger } from "./uncovered.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
 import { recordAttributionReport } from "./server/attribution-status.js";
@@ -1274,6 +1275,15 @@ type ForkRequest = {
     branchPoint: { messageCount: number; orderHash: string };
     orderedMessages: ForkIdentity[];
     idempotencyKey: string;
+    // #6262 principle 1 (msgid identity track, discussion #6262): the child's
+    // host-stable ids for the claimed prefix. A host-pinned parent exposes the
+    // host ids AS its snapshot rawIds, so the gate in handlePluginFork is rawId
+    // equality — no new validation copy (identifier() below is the SAME check
+    // every rawId already passes).
+    prefixMsgIds?: string[];
+    // Where the byte-verified prefix stopped and the identity track extended it.
+    // Only rides WITH prefixMsgIds; >= messageCount normalizes to "no drift".
+    driftFrom?: number;
 };
 
 function stableJson(value: unknown): string {
@@ -1596,9 +1606,9 @@ function holdsRefs(s: Session): boolean {
     return Object.keys(s.state.messageRefs?.byRef ?? {}).length > 0;
 }
 
-/** #2601: persona-fork descendants of a raw host id — sessions minted by the
- *  persona-anchor fork branch (`${rawId}|sub:${fp}`, persona-anchor.ts) that
- *  actually carried traffic, are fresh, AND hold refs (#2948: freshness alone
+/** #2601: persona-fork descendants of a raw host id — sessions on a
+ *  `${rawId}|sub:` persona lane (the #5095 lane-token fork or the #970 split)
+ *  that actually carried traffic, are fresh, AND hold refs (#2948: freshness alone
  *  selected ref-less aux lanes — see holdsRefs). Grouping by
  *  `id.split("|sub:")[0]` is the house idiom (splitSessionWarnings, #2170
  *  canary). Sorted by lastSeen descending (listSessions order). */
@@ -1737,7 +1747,19 @@ function parseForkRequest(payload: string): ForkRequest {
         if (!identifier(item.rawId) || !(item.ref === null || (typeof item.ref === "string" && /^m\d{5,}$/.test(item.ref))) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
         return { rawId: item.rawId, ref: item.ref, identityHash: item.identityHash };
     });
-    return { protocolVersion: b.protocolVersion, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
+    // #6262 principle 1: optional msgid track. identifier() is REUSED, not copied —
+    // the same shape check every claimed rawId already passes above.
+    let prefixMsgIds: string[] | undefined;
+    if (b.prefixMsgIds !== undefined) {
+        if (!Array.isArray(b.prefixMsgIds) || b.prefixMsgIds.length !== (point.messageCount as number) || b.prefixMsgIds.some((v: unknown) => !identifier(v))) throw new Error("invalid prefixMsgIds");
+        prefixMsgIds = b.prefixMsgIds as string[];
+    }
+    let driftFrom: number | undefined;
+    if (b.driftFrom !== undefined) {
+        if (prefixMsgIds === undefined || !Number.isSafeInteger(b.driftFrom) || (b.driftFrom as number) < 0 || (b.driftFrom as number) > (point.messageCount as number)) throw new Error("invalid driftFrom");
+        driftFrom = (b.driftFrom as number) < (point.messageCount as number) ? (b.driftFrom as number) : undefined;
+    }
+    return { protocolVersion: b.protocolVersion, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey, ...(prefixMsgIds !== undefined ? { prefixMsgIds } : {}), ...(driftFrom !== undefined ? { driftFrom } : {}) };
 }
 
 /** [#2399 stage 2] omp/pi identity-register their session ids at session_start
@@ -1797,6 +1819,23 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             }
             const prefix = snapshot.orderedMessages.slice(0, request.branchPoint.messageCount);
             if (prefix.length !== request.branchPoint.messageCount || forkOrderHash(request.orderedMessages) !== request.branchPoint.orderHash || stableJson(prefix) !== stableJson(request.orderedMessages)) return forkReply(res, 409, { ok: false, code: "BRANCH_POINT_CONFLICT", error: "ordered prefix/hash does not match parent" });
+            // #6262 principle 1 (msgid identity track): the byte check above is
+            // final for the prefix AS CLAIMED (the client copies the parent's
+            // identities verbatim, including the drift region). When the client
+            // additionally claims host-stable ids for the prefix and every one
+            // equals the parent's rawId at its slot (host-pinned parents: the
+            // rawId IS the host id), the region [driftFrom, messageCount) is
+            // identity-stable byte drift — the host re-rendered those messages
+            // after the parent saw them but kept their ids. Blocks and refs are
+            // keyed by rawId, and the child's pinned ids match the parent's, so
+            // everything copied below stays valid in the child: accept and mark
+            // the receipt. Gate failure (parent not host-pinned — its rawIds are
+            // content digests, never host ids — or any id/length mismatch) → the
+            // byte-verified fork proceeds EXACTLY as before: strict, no 409.
+            let forkDriftFrom: number | undefined;
+            if (request.prefixMsgIds !== undefined && request.prefixMsgIds.length === prefix.length && request.prefixMsgIds.every((id, k) => id === prefix[k]!.rawId)) {
+                forkDriftFrom = request.driftFrom;
+            }
             const rawIds = new Set(prefix.map((m) => m.rawId));
             const child = createSession(request.childConversationId, { ...parent.meta, label: request.childConversationId });
             const crossing = parent.state.blocks.filter((b) => b.effectiveMessageIds.some((id) => rawIds.has(id)) && !b.effectiveMessageIds.every((id) => rawIds.has(id)));
@@ -1918,7 +1957,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
                 (child.transient ??= {}).latestKnownMsgId = parent.transient.latestKnownMsgId;
                 child.transient.needlePayloadUpper = parent.transient.needlePayloadUpper;
             }
-            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
+            const response = { ok: true, status: forkDriftFrom !== undefined ? (crossing.length > 0 ? "expanded+drifted" : "drifted") : crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, ...(forkDriftFrom !== undefined ? { driftFrom: forkDriftFrom } : {}), expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             await publishForkSession(child, parent.id);
             recordPluginSession(request.childConversationId, child.id);
@@ -2080,7 +2119,12 @@ export async function handlePluginStatus(conversationId: string, res: import("no
             res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null, sessionId: null, sessionRevision: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
-        res.writeHead(404, { "content-type": "application/json" });
+        // #6642: the 404 fallthrough must carry the SAME cors-mode headers the
+        // 2xx branches above do — the dsh Context tab reads this route
+        // cross-origin, and a bare 404 without access-control-allow-origin is
+        // rejected by the browser as "Failed to fetch", masking the real
+        // "unknown plugin conversation" error the panel is trying to surface.
+        res.writeHead(404, jsonHeaders());
         res.end(JSON.stringify({ ok: false, error: fallbackLatest ? "no session with activity since boot — issue a model request or pass the conversation id" : "unknown plugin conversation" }));
         return;
     }
@@ -2101,13 +2145,16 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     // as acp_status; on failure omit the nudge/ranges sections instead of
     // serving the stale snapshot.
     let nudge: NudgeDecision | undefined;
-    try {
-        const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
-        if (messages.length > 0) {
-            // #833: base kernelConfig carries no file/provider/model compress
-            // settings — render from the session's last resolved Config so the
-            // panel matches actual injection behavior.
-            const pluginCfg = effectiveConfig(session, deps.config);
+    // Hoisted out of the nudge try so the #7463 protected-mass audit below
+    // sees the same message view and resolved config (advisory surfaces must
+    // never classify against a different input than the panel did).
+    const messages: CoreMessage[] = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+    // #833: base kernelConfig carries no file/provider/model compress
+    // settings — render from the session's last resolved Config so the
+    // panel matches actual injection behavior.
+    const pluginCfg = effectiveConfig(session, deps.config);
+    if (messages.length > 0) {
+        try {
             nudge = deps.core.processTurn({
                 messages,
                 state: session.state,
@@ -2119,9 +2166,9 @@ export async function handlePluginStatus(conversationId: string, res: import("no
                 // history, not this panel's processed view (#2627 split).
                 applyView: mem && mem.original.length > 0 ? mem.original : undefined,
             }).nudge;
+        } catch {
+            nudge = undefined;
         }
-    } catch {
-        nudge = undefined;
     }
     // #3204: the submit gate rejects any span that brackets a ref recorded DEAD
     // (the client rewrote/dropped those messages) — the same self-contradiction
@@ -2130,12 +2177,38 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     if (nudge) {
         nudge = { ...nudge, compressibleRanges: excludeDeadRefRanges(nudge.compressibleRanges ?? [], session.state.deadRefs) };
     }
+    // #7463: protected-mass attribution on the HUMAN-only /acp panel + the
+    // structured context view (dsh Context tab). acp_status keeps the same
+    // ledger opt-in (protectedMass param); this panel is on-demand, so the
+    // one extra relaxed offer pass is paid only when a human asks for /acp.
+    // Advisory: any failure just omits the line.
+    let protectedMass: ProtectedMassLedger | undefined;
+    let protectedMassLine: string | undefined;
+    if (messages.length > 0) {
+        try {
+            const audit = uncoveredAudit({
+                core: deps.core,
+                messages,
+                state: session.state,
+                config: ccrLoopConfig(session, pluginCfg),
+                tokenCount: statusInputBaseline(session),
+                contentStore: contentStoreOf(session),
+                applyView: mem && mem.original.length > 0 ? mem.original : undefined,
+                normalRanges: nudge?.compressibleRanges,
+            });
+            const pmLine = formatProtectedMass(audit.mass);
+            if (pmLine !== null) {
+                protectedMass = audit.mass;
+                protectedMassLine = pmLine;
+            }
+        } catch {}
+    }
     // #532/#3862: host-measured system+tools overhead (prepare-time, same
     // source as estimateInputTokens) — shared by the panel text below AND the
     // structured context view, so both surfaces classify identically.
     const sysTokRaw = session.metadata.systemPromptTokens;
     const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
-    const contextView = buildContextView({ nudge, systemPromptTokens, limit: modelContextLimit, session });
+    const contextView = buildContextView({ nudge, systemPromptTokens, limit: modelContextLimit, session, protectedMass });
     let panel: string | undefined;
     try {
         // #532: the kernel breakdown classifies messages only; feeding in the
@@ -2175,6 +2248,9 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     // users actually see — the /acp panel — via the same before-footer slot the
     // Web UI link uses (the footer anchors the LLM-context stripper).
     const preFooter: string[] = [];
+    if (protectedMassLine !== undefined) {
+        preFooter.push(protectedMassLine);
+    }
     const adv = getAdvisoryState();
     if (adv.active) {
         preFooter.push(`⚠️ CRITICAL ADVISORY: ${describeAdvisory(adv.active, adv.lastError)}`);
@@ -4612,13 +4688,13 @@ export async function pipePluginResponsesWithStrip(
         if (proseAcc.length === 0 || !session) return;
         scanModelOutputForPhantomAttachments(session.id, proseAcc);
     };
-    let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
+    let lastDeltaMeta: { item_id?: unknown; output_index?: unknown; content_index?: unknown } | null = null;
     const flushTail = (after: string) => {
         const tail = tagFilter.flush();
         if (tail.length > 0) {
             visibleTextChars += tail.length;
             answerProse += tail;
-            const meta = inRetry && heldItemId !== undefined ? { item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
+            const meta = inRetry && heldItemId !== undefined ? { ...lastDeltaMeta, item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
             appendReplyDelta(meta, tail);
             return `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n` + after;
         }
@@ -5070,7 +5146,7 @@ export async function pipePluginResponsesWithStrip(
                             continue;
                         }
                         const clean = tagFilter.push(delta);
-                        lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"] };
+                        lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"], content_index: ev["content_index"] };
                         if (!inRetry && heldItemId === undefined && ev["item_id"] !== undefined) {
                             heldItemId = ev["item_id"];
                             heldOutputIndex = ev["output_index"];
