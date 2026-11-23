@@ -3,7 +3,7 @@ import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from 
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
-import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, supersededRefRejection, type RewriteCtx } from "./stream.js";
+import { applyRanges, compressBreakerDetail, noVisibleContextRefusal, normalizeRangeOrder, noteCompressLoopFailure, recoverEvictedView, supersededRefRejection, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
 import { describeExternalSummaryFailure, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
@@ -12,6 +12,25 @@ import { newExternalCallId } from "./external-summary-marker.js";
 // Re-exported for callers that historically imported it here; the canonical
 // home is the leaf module (kept import-graph-light for display surfaces).
 export { EXTERNAL_SUMMARY_CALL_ID_PREFIX, isExternalSummaryBlock, newExternalCallId } from "./external-summary-marker.js";
+
+// #6903: the consecutive-failure breaker cause for the external-summary lane.
+// The prefix is matched by the pre-dispatch gate (startsWith); the full string
+// rides the streak so acp_status can show the provider-down verdict. It
+// deliberately does NOT claim "summary too long" — the underlying provider
+// cause (endpoint/credentials/budget) stays an independent diagnosis, and a
+// generic error must not be read as a length-cap rejection.
+const EXTERNAL_SUMMARY_FAILURE_CAUSE_PREFIX = "external-summary-failure";
+const EXTERNAL_SUMMARY_FAILURE_CAUSE = `${EXTERNAL_SUMMARY_FAILURE_CAUSE_PREFIX} — every configured summary candidate failed or exceeded its budget (see the batch diagnostics); fix the endpoint/credentials/budget or wait for the breaker to decay`;
+
+// #6903: the pre-dispatch refusal shown when the breaker is already armed by
+// external-summary failures. It states the breaker is armed (n consecutive
+// all-failure batches), that NOTHING was dispatched (no summary request was
+// sent), and the two recovery paths (fix the config, or wait for the decay).
+// It carries no new numbers/refs the model could anchor on beyond n and
+// decayMinutes (both real values from the streak).
+function armedExternalSummaryRefusal(n: number, decayMinutes: number): string {
+    return `[Compression refused: the external-summary circuit breaker is already armed (${n} consecutive all-failure batches — every configured summary candidate failed or exceeded its budget). Nothing was compressed and no summary request was sent. Do not call compress again to retry the same configuration: the breaker disarms on one substantial fold (a trivial one that saves almost nothing does not count) or ${decayMinutes} minutes without a failing call. Fix the external-summary configuration (endpoint/credentials/budget) if it is misconfigured, or continue your task without compressing — compression resumes automatically once the breaker decays and a summary succeeds.]`;
+}
 
 function withOptionalSummaries(input: unknown): unknown {
     let value = input;
@@ -114,6 +133,20 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
         if (!hasProbeChanges) return applyRanges({ ...parsed, ranges: probes }, ctx);
         return compressResult("[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);
     }
+    // #6903: refuse BEFORE dispatch when the breaker is already armed by
+    // external-summary failures — re-requesting unavailable candidates just
+    // burns budget and the model ignores the in-receipt paragraph. Cause-gated
+    // (not any-armed): substrate-destruction's instructed recovery (compress
+    // one live range) and stale-ref re-anchoring must still be able to dispatch
+    // and clear the breaker; only the provider-down cause guarantees
+    // re-dispatch keeps failing. This refusal does NOT call
+    // noteCompressLoopFailure, so repeated refusals do not extend the 10-min
+    // cooldown — recovery is the decay, not the refusal.
+    const armed = compressBreakerDetail(ctx.session);
+    if (armed !== undefined && armed.cause !== undefined && armed.cause.startsWith(EXTERNAL_SUMMARY_FAILURE_CAUSE_PREFIX)) {
+        ctx.log(`[external-summary] dispatch refused — compress breaker armed by external-summary failures (n=${armed.n}, decay ${armed.decayMinutes} min); no candidate calls dispatched`);
+        return compressResult(armedExternalSummaryRefusal(armed.n, armed.decayMinutes), "refused", 0, "gate:external-summary-breaker");
+    }
     const batch = await plan.summarize(work, signal);
     if (signal?.aborted || ctx.session.state !== state || ctx.session.revisionEpoch !== revision) return compressResult("[Compression FAILED: cancelled or session changed while generating external summaries. Nothing compressed.]", "refused", 0);
     const successful: ParsedRange[] = [];
@@ -125,7 +158,23 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     ctx.log(`[external-summary] completed ${successful.length}/${parsed.ranges.length} range(s); ${describeExternalSummaryFailure(batch)}`);
     // #4833: the bounded attempt diagnostics (source + budgets + outcomes) ride
     // the tool result too — enums and numbers only, never payload bytes.
-    if (successful.length === 0) return compressResult(`[Compression FAILED: all configured external summary candidates failed or exceeded their budget. Nothing compressed; do not retry unchanged configuration — summaries longer than the configured cap are rejected whole, so raise compress.maxSummaryLength or request less via per-range summaryMaxChars.] [${describeExternalSummaryFailure(batch)}]`, "refused", 0);
+    if (successful.length === 0) {
+        // #6903: wire the dispatched-but-all-failed batch into the
+        // consecutive-failure breaker so repeated compress calls stop
+        // re-requesting unavailable candidates (the existing 3-failure /
+        // 10-min-cooldown protection). Count only when a candidate call was
+        // actually dispatched (plan.stats.attempts > 0) — a congestion-only
+        // batch (no dispatch) is not a provider failure — and only for
+        // finished/deadline batches (a cancelled batch is request teardown,
+        // not a provider failure). The pause paragraph (once armed) rides the
+        // receipt; the forced cause keeps the provider-down verdict visible to
+        // acp_status without claiming summary-too-long.
+        const providerFailure = plan.stats.attempts > 0 && (batch.status === "finished" || batch.status === "deadline");
+        const loopGuard = providerFailure
+            ? noteCompressLoopFailure(ctx, valid.map((r) => `${r.startRef}..${r.endRef}`).join(","), describeExternalSummaryFailure(batch), EXTERNAL_SUMMARY_FAILURE_CAUSE)
+            : "";
+        return compressResult(`[Compression FAILED: all configured external summary candidates failed or exceeded their budget. Nothing compressed; do not retry unchanged configuration — summaries longer than the configured cap are rejected whole, so raise compress.maxSummaryLength or request less via per-range summaryMaxChars.] [${describeExternalSummaryFailure(batch)}]${loopGuard}`, "refused", 0);
+    }
     const applied = applyRanges({ ...parsed, ranges: successful }, ctx);
     // Client call arguments carry only an optional hint, never the generated summary.
     // In-place refolds retain their old call id in the kernel; keep their anchor too.

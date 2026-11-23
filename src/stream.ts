@@ -315,8 +315,10 @@ const RETURN_TO_TASK_SUFFIX = " This failure only concerns the compress call. Re
  *  success×1 → fail×N" loop can still arm the breaker). The pause paragraph
  *  branches on the failure cause (#2432): substrate-destruction gets the
  *  single-recovery-step wording, everything else keeps the verbatim loop-noise
- *  paragraph. */
-function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: string, forcedCause?: string): string {
+ *  paragraph.
+ *  #6903: exported so the external-summary lane can wire its
+ *  dispatched-but-all-failed batches into the same streak. */
+export function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: string, forcedCause?: string): string {
     const now = Date.now();
     let streak = readCompressLoopStreak(ctx.session);
     if (streak && now - streak.lastAt > COMPRESS_LOOP_DECAY_MS) streak = undefined;
