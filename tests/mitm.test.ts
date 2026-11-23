@@ -549,3 +549,55 @@ await test("setupMitm e2e: client that aborts the handshake without a TLS alert 
         }
     });
 });
+
+// #3617 negative direction for the `secured` gate: a reset AFTER a completed
+// handshake is mid-stream, not a handshake reject — it must stay info-level
+// (raw TLS error line) without counting or warning.
+await test("setupMitm e2e: mid-stream reset after a completed handshake is NOT counted as a handshake reject (#7585)", async () => {
+    await withTmpCa(async () => {
+        _resetMitmHandshakeRejectStatsForTest();
+        const logs: string[] = [];
+        let serverSawRequest = false;
+        const server = http.createServer((_req, res) => { serverSawRequest = true; res.writeHead(500); res.end(); });
+        setupMitm(server, [], (msg) => { logs.push(msg); });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const port = (server.address() as { port: number }).port;
+        try {
+            const { statusLine, socket } = await rawConnect(port, "127.0.0.1", "api.anthropic.com:443");
+            assert.match(statusLine, /^HTTP\/1\.1 200/);
+            const tlsSock = tls.connect({ socket, rejectUnauthorized: false, servername: "api.anthropic.com" });
+            await once(tlsSock, "secureConnect");
+            // TLS 1.3: the client can finish the handshake before the server
+            // does, so `secureConnect` alone does not prove the server's
+            // `secured` flag is set. Round-trip a request first — the server
+            // can only decrypt and parse it after ITS side completed. No
+            // Connection: close: the server must keep the tunnel open for the
+            // mid-stream reset below to land on a live socket.
+            tlsSock.write("GET / HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n");
+            const deadline = Date.now() + 3000;
+            while (!serverSawRequest && Date.now() < deadline) {
+                await new Promise((r) => setTimeout(r, 10));
+            }
+            assert.ok(serverSawRequest, "server must have decrypted the request before the reset");
+            // Handshake proven complete on both sides — a hard reset now is a
+            // mid-stream failure. RST must come from the raw TCP socket: the
+            // wrapping TLSSocket cannot send one (ERR_INVALID_HANDLE_TYPE).
+            socket.resetAndDestroy();
+            // The server-side error handler logs the raw TLS error line BEFORE
+            // the record call; waiting for that line proves the handler ran,
+            // so the zero-counter assertion below is meaningful.
+            const errDeadline = Date.now() + 3000;
+            while (!logs.some((l) => l.includes("TLS error")) && Date.now() < errDeadline) {
+                await new Promise((r) => setTimeout(r, 10));
+            }
+            assert.ok(logs.some((l) => l.includes("TLS error")), "mid-stream reset must still log the raw TLS error line");
+            assert.equal(getMitmHandshakeRejectStats().total, 0, "post-handshake resets must not be counted as handshake rejects");
+            assert.equal(logs.filter((l) => l.includes("HANDSHAKE REJECT")).length, 0, "no warning for a completed handshake");
+        } finally {
+            server.close();
+            server.closeAllConnections?.();
+            _resetMitmHandshakeRejectStatsForTest();
+        }
+    });
+});
