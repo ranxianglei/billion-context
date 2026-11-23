@@ -1194,7 +1194,7 @@ async function handleRequest(
             // low-confidence fallback flag.
             const aligned = operatorWindowTuned
                 ? { limit: reqConfig.modelContextLimit, clamped: false }
-                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers, pluginWindow ?? runtimeWindow ?? launcherWindow);
+                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers, pluginWindow ?? runtimeWindow ?? launcherWindow, nativeFromFallback);
             if (!operatorWindowTuned && aligned.source === "codex-config-window" && !codexConfigWindowWarned.has(model)) {
                 codexConfigWindowWarned.add(model);
                 log("warn", `[codex] model=${model}: no live model table readable under ${process.env.CODEX_HOME || "~/.codex"} (model_catalog_json / models_cache.json missing or invalid) — aligning against config.toml model_context_window; copy your catalog into $CODEX_HOME/models_cache.json for exact sizing`);
@@ -1206,6 +1206,15 @@ async function handleRequest(
                 windowShrinkReason = "codex";
                 codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
                 log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
+            } else if (aligned.raised === true) {
+                // #7205: bili's own codex model knowledge sizes the session
+                // LARGER than the anonymous fallback did — adopt it. No shrink
+                // reason: the nudge band widens with the window.
+                const before = reqConfig.modelContextLimit;
+                reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
+                nativeFromFallback = false;
+                codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
+                log("info", `[codex] effective window raised ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}; bili's anonymous fallback undersized the session — #7205) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
                 windowShrinkReason = "operator";
             }
