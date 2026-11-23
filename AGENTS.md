@@ -26,6 +26,38 @@
 | GitHub | https://github.com/ranxianglei/billion-context |
 | License | MIT |
 
+### Supported Hosts — Official Source & Binary Locations
+
+When auditing host behavior (plugin APIs, tool-call-id exposure, compaction seams, wire quirks), clone the source repos from THIS table — never guess the location. Lane semantics (launcher / MITM / config seam / native tool lane) are documented per client in docs/clients.md.
+
+| Host (lane name) | Mode | Official source / binary |
+|---|---|---|
+| pi | native tool lane + launcher | [earendil-works/pi](https://github.com/earendil-works/pi) (pi.dev) |
+| omp (oh-my-pi) | native tool lane (pi factory) | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) (omp.sh) |
+| dsh (deepseek-harness) | native tool lane | [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) |
+| opencode | native tool lane (V1 plugin API) | [anomalyco/opencode](https://github.com/anomalyco/opencode) (opencode.ai) |
+| kimi (Kimi Code) | native tool lane + MITM | [MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code) (kimi.com) |
+| hermes (Hermes Agent) | native Python plugin | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
+| zcode (Z.ai) | native tool lane | [zai-org/ZCode](https://github.com/zai-org/ZCode) (z.ai) |
+| claude (Claude Code) | native MCP lane | closed (Anthropic): https://claude.com/product/claude-code |
+| codex (Codex CLI) | launcher + MCP shell | [openai/codex](https://github.com/openai/codex) |
+| gemini (Gemini CLI) | launcher | [google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli) |
+| qwen (Qwen Code) | launcher / MITM | [QwenLM/qwen-code](https://github.com/QwenLM/qwen-code) |
+| copilot (Copilot CLI) | launcher (closed Go binary) | [github/copilot-cli](https://github.com/github/copilot-cli) |
+| aider | MITM | [Aider-AI/aider](https://github.com/Aider-AI/aider) |
+| goose | launcher | [aaif-goose/goose](https://github.com/aaif-goose/goose) |
+| crush (Charm) | MITM | [charmbracelet/crush](https://github.com/charmbracelet/crush) (charm.land/crush) |
+| zed | MITM | [zed-industries/zed](https://github.com/zed-industries/zed) (zed.dev) |
+| jcode (JCode) | MITM (Rust; no plugin seam, #962) | [1jehuang/jcode](https://github.com/1jehuang/jcode) |
+| qoder (Qoder CLI) | MITM / launcher | closed: https://qoder.com · https://download.qoder.com/qoder-app/releases/latest/Qoder-linux-amd64.deb |
+| workbuddy / codebuddy (Tencent) | config seam (workbuddy, #7456) / launcher (codebuddy) | closed: https://workbuddy.ai · https://download.codebuddy.ai · https://codebuddy.cn |
+| trae (Trae CLI) | MITM | closed: https://trae.ai |
+| iflow (iFlow CLI) | launcher | https://iflow.cn |
+| mcode (MiniMax Code) | MITM (event hooks only, #1050) | closed: https://minimax.io |
+| amp (Amp CLI) | MITM (closed Go, #1049) | closed: https://ampcode.com |
+| kiro (AWS Kiro CLI) | MITM | closed (Rust shell + Node agent server) |
+| antigravity (Google) | launcher (closed Go; additive-only plugin surface, #2115) | closed (Google) |
+
 ## 2. Architecture
 
 ### Module Map
@@ -43,7 +75,7 @@ Tier A entries are every-session rules and stay in full below. Tier B entries ca
 5. **The kernel lives in-repo; determinism comes from git, not a registry pin (#2092) (Tier B)** — consumed via `"acp-kernel": "file:./kernel"`; a commit IS the pin. Any kernel source change MUST bump `version` in `kernel/package.json` (CI-enforced — see Kernel Boundary); `pi-subagents/` follows the same pattern. Full text: design-decisions.md #5.
 6. **Single-writer plugin copies (#991)** — every bili presence has exactly ONE writer; mixing writers is what the guard forbids. The canonical statement is the Install-Lane & Update-Ownership Contract below.
 7. **Two compression modes with different summary carriers** (CRITICAL — reason in BOTH, see §6):
-   - **pluginMode** (the `x-bili-plugin` header / registered agent, e.g. `bili pi`): the ACP-native agent OWNS compression — it executes `compress` locally, the call+result live in its own re-sent history, and the wire summary carrier is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`).
+   - **pluginMode** (the `x-bili-plugin` header / registered agent, e.g. `bili pi`): the ACP-native agent OWNS compression **on the wire** — the `compress` call+result live in its own re-sent history (the computation still runs server-side under the session lock — docs/plugin-protocol.md Why-table; do NOT read "owns" as "executes locally"), and the wire summary carrier is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`).
    - **proxy mode** (plain client, no header): the proxy executes `compress` server-side; the tool call is ephemeral (never enters the client's history) and preflight blocks have none, so the carrier is the **`acp_summary` message** — the kernel renders it role `system`, but `systemToUser` (`src/util.ts`) re-voices it as a **`user` message** (leaving it at its anchor) so strict backends (SGLang: exactly one system at index 0, #377) accept it and the head system message stays byte-stable for the prefix cache.
    - The mode is decided per request and bound per session (`session.metadata.pluginAgent`, sticky, upgrade-only). See docs/technical-notes.md "Two compression modes".
 8. **Nudge cadence is flat 50K by design (kernel contract)** — acp-kernel pins the growth interval at 50000 for every window size (`nudge.growthFloor == nudge.growthCap == 50000`; window-percentage scaling was deliberately removed — #379/#380 settled "growth-driven, no usage/count proxy gates"). Do NOT re-scale the interval with the context window or reintroduce percentage gates; a 1M-window session folding every 50K of growth is intended lean-context behavior. User escape hatch: `compress.nudgeGrowthTokens` (flattens `growthFloor`+`growthCap` to a fixed step) — big-window users who want a lazier cadence set it explicitly. Prompt wording is kernel-owned (`src/nudge-text.ts`).
@@ -60,6 +92,8 @@ Tier A entries are every-session rules and stay in full below. Tier B entries ca
 ### #18 — 身份信道接线：所有车道接进同一采集缝，消费者永不直读客户端存储 (#5825) (Tier B)
 
 身份信号来源只有三类：**宿主写入**（msgid body 字段 / 信封 `msgIds` / pf 头）、**宿主盖戳头**（opencode V2 `x-bili-msg-ids`）、**自包含采集器**（`src/identity-harvest.ts` 注册表 + `src/identity-<client>.ts` 适配器；双门：env `BILI_IDENTITY_HARVEST` 或灰度键 `rollout.features.identityChannelHarvest`，均默认关 × 仅回环来源）。**消费者（#5719 归属档 / pin-行链路 / membership / 水位）只从统一缝取数**：handle 入口每请求按「body 字段 > 盖戳头 > 采集」取一次快照——绝不新增「逐调用点单独取数」。新车道 = 新适配器文件 + barrel 一行登记 + 文档一行；适配器自包含、整轮退化（任一环节不判定 ⇒ 该轮整体回退接线前路径，绝不做部分映射）。车道状态表与信任边界：docs/identity-channels.md；身份判定逻辑：docs/session-identity-resolution.md。Full text: design-decisions.md #18.
+
+19. **不用本地估算拒发:超窗一律转发,上游的大小判决才是权威 (no estimate-based size refusal — #7537, owner 裁定 2026-11-22) (Tier A)** — bili 本地判「这个包超过模型窗口 → 413 拒发」的整条机制已废除:本地窗口值本身就常常错(fallback 窗口,#7205),估算 × 错窗口 = 乘性误差,拒掉的往往是上游本来能收的包(#7167/#7382/#2490/#2847 家族);被拒绝的字节没有进过任何上游,错误信息只有本地估算、没有上游的真实号码。新契约:**该折的照折(fold-first 不变),折完一律转发;上游以真实号码拒绝时(413 / 大小类 400),bili 把自己的实测证据(出站 token 数+分维度 breakdown+入站字节+有效窗口)打进日志并在响应上标记 `x-bili-retryable: false`(JSON 体可解析时并入 `bili_evidence` + `error.retryable=false`),防止按状态码驱动的重试循环烧配额**。**保留的本地拒发只有两种:非估算类**——消息条数门(`BILI_MAX_MESSAGES`,真实 wire 约束)与 5GiB 纯字节 sanity cap(资源保护)。实现:src/server.ts 四处 413 拒发点 + src/server/relay.ts 出口熔丝两道大小门(计数门保留);测试钉在 tests/issue7537-preflight-passthrough.test.ts 及既有 preflight 套件的重钉。Full text: design-decisions.md #20.
 
 ### Install-Lane & Update-Ownership Contract (#1196)
 

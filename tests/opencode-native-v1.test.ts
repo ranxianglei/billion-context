@@ -176,11 +176,11 @@ describe("createV1ServerHooks", () => {
     const origin = "http://127.0.0.1:19199";
 
     function makeDeps() {
-        const forwarded: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }> = [];
+        const forwarded: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }> = [];
         return {
             z: fakeZ,
-            forward: async (o: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => {
-                forwarded.push({ conversationId, tool, args, ...(nativeCaller === true ? { nativeCaller: true } : {}) });
+            forward: async (o: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean, toolCallId?: string) => {
+                forwarded.push({ conversationId, tool, args, ...(nativeCaller === true ? { nativeCaller: true } : {}), ...(typeof toolCallId === "string" ? { toolCallId } : {}) });
                 assert.equal(o, origin);
                 return { text: `panel:${tool}`, failed: false };
             },
@@ -212,6 +212,23 @@ describe("createV1ServerHooks", () => {
         const out = await compress.execute({ range: "m1-m2" }, { sessionID: "ses_1" });
         assert.equal(out, "panel:compress");
         assert.deepEqual(deps.forwarded, [{ conversationId: "ses_1", tool: "compress", args: { range: "m1-m2" }, nativeCaller: true }]);
+    });
+
+    it("#7505: forwards the host tool-call id (ctx.id) and omits it when absent", async () => {
+        const deps = makeDeps();
+        const hooks = createV1ServerHooks(() => origin, {}, deps);
+        const cfg: V1Config = { provider: { o: { options: { baseURL: "https://api.openai.com/v1" } } } };
+        await hooks.config?.(cfg);
+        const compress = hooks.tool?.compress;
+        assert.ok(compress);
+        await compress.execute({ range: "m1-m2" }, { sessionID: "ses_1", id: "call_77aa88" });
+        await compress.execute({ range: "m1-m3" }, { sessionID: "ses_1" });
+        // direction 1: host-minted id arrives on the wire
+        assert.equal(deps.forwarded[0]?.toolCallId, "call_77aa88");
+        assert.equal(deps.forwarded[0]?.conversationId, "ses_1");
+        assert.equal(deps.forwarded[0]?.nativeCaller, true);
+        // direction 2: no id in the context → no toolCallId key (no empty-string noise)
+        assert.equal("toolCallId" in (deps.forwarded[1] ?? {}), false);
     });
 
     it("degrades to proxy mode (no headers, no tools) when zod is unavailable", async () => {
@@ -544,6 +561,21 @@ describe("derived-session inheritance report (#1362)", () => {
             await new Promise((r) => setTimeout(r, 50));
             assert.equal(proxy.registers.length, 1, "no repeat register");
             assert.equal(gets, 1, "SDK lookup cached per session");
+        } finally {
+            await proxy.close();
+        }
+    });
+
+    it("prefers data.fork.sessionID over parentID for UI user forks (#5509)", async () => {
+        const proxy = await startProxy();
+        try {
+            // User forks store parent_id NULL — the SDK exposes their lineage as
+            // data.fork.sessionID; a stale parentID must lose to it.
+            const client = { session: { get: async () => ({ data: { id: "ses_fork", parentID: "stale-parent", fork: { sessionID: "ses_real_parent", boundary: { type: "through", messageID: "msg_7" } } } }) } };
+            const hooks = createV1ServerHooks(() => proxy.origin, { client }, v1Deps());
+            await hooks["chat.headers"]?.({ sessionID: "ses_fork" }, { headers: {} });
+            await waitFor("register", () => proxy.registers.length >= 1);
+            assert.deepEqual(proxy.registers[0], { conversationId: "ses_fork", agent: "opencode", identity: true, parentConversationId: "ses_real_parent" });
         } finally {
             await proxy.close();
         }
