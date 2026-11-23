@@ -824,6 +824,13 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             // the checkpoint freezes what the caller just saw, not the last
             // debounced write.
             const resident = peekSession(parsed.sessionId);
+            // #7579 D5: egress-on sessions do not use checkpoints — the
+            // point-fork path (egressPointFork) is the replacement.
+            if (resident && resident.metadata["egressAuthority"] === true) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "egress-on sessions use the point-fork path, not checkpoints" }));
+                return;
+            }
             if (resident) await store.writeNow(resident);
             try {
                 const row = await store.createReplica(parsed.sessionId, {

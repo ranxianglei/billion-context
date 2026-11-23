@@ -470,6 +470,42 @@ CREATE TABLE IF NOT EXISTS egress_flow (
 CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msgid);
 `;
 
+/** #7579 (follow-up to #7439, owner design 2026-11-23): the BLOCK LIFECYCLE
+ *  log — the op-log of the fold blocks, symmetric to the message egress log.
+ *  egress_block_flow is append-only (row types B base / I block-born / U
+ *  block-state-change; NEVER deleted) and carries the bounded kstate residual
+ *  snapshot in `kstate_json` on every row (D4: no fifth table — the sidecar
+ *  rides the block-change rows, whose count = fold count, 2-3 orders of
+ *  magnitude below the message count). egress_block_state is the current
+ *  block-set read replica (PK (session_id, block_id), one latest snapshot per
+ *  block; compaction may physically trim it). SELF-CONTAINED BYTES (D2,
+ *  ruling 7439-1): the one/full block content is inlined in the payload —
+ *  zero content-CAS refs, zero hash columns. op_seq shares the SAME append
+ *  clock as egress_flow (one transaction per turn writes both logs), so any
+ *  op_seq aligns the message view and the block set. Probe-first, no version
+ *  bump (the tables never shipped, like the egress pair). */
+const EGRESS_BLOCK_DDL = `-- #7579: block lifecycle log (flow + state), self-contained bytes, kstate sidecar.
+CREATE TABLE IF NOT EXISTS egress_block_flow (
+    session_id TEXT NOT NULL,
+    op_seq INTEGER NOT NULL,
+    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','U')),
+    block_id TEXT,
+    payload TEXT NOT NULL,
+    kstate_json TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, op_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_egress_block_flow_block ON egress_block_flow (session_id, block_id);
+CREATE TABLE IF NOT EXISTS egress_block_state (
+    session_id TEXT NOT NULL,
+    block_id TEXT NOT NULL,
+    op_seq INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, block_id)
+);
+`;
+
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
 export function migrateSchema(db: {
     exec(sql: string): void;
@@ -547,6 +583,11 @@ export function migrateSchema(db: {
             db.exec(EGRESS_STATE_DDL);
         });
     }
+    // #7579: the block lifecycle log — own probe (same discipline, no bump).
+    const hasEgressBlockFlow = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_block_flow'")
+        .get();
+    if (!hasEgressBlockFlow) db.exec(EGRESS_BLOCK_DDL);
     // 2×2 (#5874 brief, element-level world): the L1 world carries the
     // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
     // session-level witness_probe. Pure additive probe-first ALTER (a dev

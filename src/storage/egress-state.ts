@@ -111,6 +111,11 @@ export interface EgressViewRow {
     /** The kernel-space role (rebuild needs it; the diff keys on msgid so a
      *  role-only drift is impossible — kernel ids are one-shot). */
     role?: string;
+    /** First-observed wall clock (epoch ms) — stamped on the message's I row
+     *  (#7579 D3). A msgid is inserted exactly once (kernel ids are one-shot),
+     *  so the I row IS the first observation; spine rows inherit it. Optional:
+     *  pre-#7579 dev rows (the tables never shipped) lack it. */
+    ts?: number;
 }
 
 type EgressOpType = "B" | "I" | "D" | "U";
@@ -132,12 +137,21 @@ function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: 
     // compaction, so the flow maxima ARE the session's high-waters: the
     // op_seq ordering cursor and the canonical message-number cursor (I
     // rows only — B/D/U carry NULL and never advance it).
+    // #7577: the block lifecycle log (egress_block_flow) shares the SAME
+    // op_seq append clock as egress_flow (one turn writes both logs), so the
+    // op_seq cursor is the MAX over BOTH tables — a block-only turn advances
+    // the clock, and a later message-only turn must continue past it. The
+    // log_seq (canonical message number) stays egress_flow-only: block rows
+    // carry no numbers.
     //
     // #7574: must be read INSIDE the append transaction, never before it.
     const row = db
         .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o, COALESCE(MAX(log_seq), 0) AS n FROM egress_flow WHERE session_id = ?")
         .get(sessionId) as { o: number; n: number } | undefined;
-    const head = Number(row?.o) || 0;
+    const block = db
+        .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_block_flow WHERE session_id = ?")
+        .get(sessionId) as { o: number } | undefined;
+    const head = Math.max(Number(row?.o) || 0, Number(block?.o) || 0);
     let high = Number(row?.n) || 0;
     if (high === 0 && head > 0) {
         // No I row is left above the newest base (a compaction removes the
@@ -172,6 +186,9 @@ interface InsertOp {
     typeTag: string;
     bytes: string;
     role?: string;
+    /** First-observed wall clock (epoch ms) — stamped by recordEgressTurn
+     *  (#7579 D3); the I row is the message's birth, so this is its ts. */
+    ts?: number;
 }
 interface DeleteOp {
     type: "D";
@@ -219,6 +236,7 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
             num += 1;
             const entry: EgressViewRow = { num, msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, bytes: op.bytes };
             if (op.role !== undefined) entry.role = op.role;
+            if (op.ts !== undefined) entry.ts = op.ts;
             view.splice(at + 1, 0, entry);
         } else if (op.type === "D") {
             const s = idxOf(op.start);
@@ -320,7 +338,7 @@ function writeOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], firstO
         const opSeq = firstOpSeq + i;
         if (op.type === "I") {
             num += 1;
-            writeOp(db, sessionId, opSeq, num, "I", op.msgid, JSON.stringify({ after: op.after, ref: op.ref, tokens: op.tokens, type: op.typeTag, role: op.role }), op.bytes, nowMs);
+            writeOp(db, sessionId, opSeq, num, "I", op.msgid, JSON.stringify({ after: op.after, ref: op.ref, tokens: op.tokens, type: op.typeTag, role: op.role, ts: op.ts }), op.bytes, nowMs);
         } else if (op.type === "D") {
             writeOp(db, sessionId, opSeq, null, "D", null, JSON.stringify({ start: op.start, end: op.end }), null, nowMs);
         } else {
@@ -621,6 +639,7 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
                 bytes: row.bytes,
             };
             if (p.role !== undefined) entry.role = p.role as string;
+            if (typeof p.ts === "number") entry.ts = p.ts;
             // `after: null` = the row goes to the FRONT — it was the first
             // row of the view the diff described (a replaced system prompt).
             // #7574: this replay used to append it at the end, so the stored

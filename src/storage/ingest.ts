@@ -584,9 +584,16 @@ function finishPlan(
           })
         : [];
 
+    // #7579 D4: egress-on sessions derive tsStamps/tokenSnapshot from the
+    // egress flow replay (the I rows carry the wall-clock ts); lastPassIds is
+    // a self-heal field. Exclude them from the kstate column to keep it
+    // bounded (<2KB residual sidecar).
+    const egressOn = session.metadata["egressAuthority"] === true;
+    const KSTATE_TRIM_FIELDS = new Set(["tsStamps", "tokenSnapshot", "lastPassIds"]);
     const kstateRaw: Record<string, unknown> = {};
     for (const field of MERGE_STATE_FIELDS) {
         if (TABLE_OWNED_FIELDS.has(field)) continue;
+        if (egressOn && KSTATE_TRIM_FIELDS.has(field)) continue;
         const v = (session.state as Record<string, unknown>)[field];
         if (v !== undefined) kstateRaw[field] = v;
     }
