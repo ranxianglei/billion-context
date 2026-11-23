@@ -51,7 +51,7 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError } from "../storage/egress-record.js";
+import { recordEgressTurn, EgressAuthorityRejectError } from "../storage/egress-record.js";
 import type { EgressViewRow } from "../storage/egress-state.js";
 // Structural mirror of egress-record.ts's EgressSourceMsg (kept private
 // there by the unused-export gate): the recording seam only reads this shape.
@@ -61,54 +61,10 @@ interface EgressRecordSourceMsg {
     contentType?: unknown;
     text?: unknown;
 }
-import { rebuildCoreFromLog, rebuildOutboundFromLog } from "../storage/egress-serve.js";
+import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
+import { resolveEgressAuthority } from "./egress-lane-io.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
-
-/** Ruling 7439-5 input probe (discussions/7439) — light per-turn identity
- * + byte SAMPLING on sampled rows only (never a full byte comparison).
- * Part 1 ORDER: every client id that exists in the server view must appear
- * in server-view order (append-only + client-side folding contract; a
- * reorder means the client is not echoing the server's conversation → the
- * turn degrades to legacy). Part 2 DIVERGENCE: up to 8 sampled rows compare
- * contentType + text length + (short, ≤32KB) exact text. A mismatch does NOT
- * fail the probe — the seam keeps server bytes regardless of what the client
- * sent; sampling only LOGS the divergence event (ruling: 记日志 + 警告,
- * 内容跟服务端, 出站自然收敛). */
-export function egressAuthorityProbe(
-    base: readonly BiliMessage[],
-    client: readonly BiliMessage[],
-    sessionId: string,
-    log: (level: string, msg: string) => void,
-): boolean {
-    const baseIndex = new Map<string, number>();
-    base.forEach((m, i) => {
-        if (!baseIndex.has(m.id)) baseIndex.set(m.id, i);
-    });
-    let cursor = -1;
-    for (const c of client) {
-        const i = baseIndex.get(c.id);
-        if (i === undefined) continue;
-        if (i <= cursor) return false;
-        cursor = i;
-    }
-    let diverged = 0;
-    const step = Math.max(1, Math.floor(client.length / 8));
-    for (let i = 0; i < client.length; i += step) {
-        const c = client[i];
-        const bi = baseIndex.get(c.id);
-        if (bi === undefined) continue;
-        const b = base[bi];
-        const ct = typeof c.text === "string" ? c.text : "";
-        const bt = typeof b.text === "string" ? b.text : "";
-        if (c.contentType !== b.contentType || ct.length !== bt.length || (ct.length <= 32768 && ct !== bt)) diverged++;
-        if (diverged >= 4) break;
-    }
-    if (diverged > 0) {
-        log("warn", `[${sessionId}] egress-authority divergence: ${diverged} sampled row(s) differ client-vs-server — server bytes win (client edits do not stick until the egress update API exists; discussions/7439 ruling 5)`);
-    }
-    return true;
-}
 
 export async function prepareOpenai(
     parsed: OpenAIRequestBody,
@@ -393,41 +349,21 @@ export async function prepareOpenai(
         // (the record below), from turn 2 the log is the content source.
         egressArmed = featureEnabled("egressPlane") && pluginMode && !isTitleGen && s0.pinned !== null;
         if (egressArmed) {
-            // Ruling 7439: from this turn the op log is the content source of
-            // truth for the session, so the unified-storage verifier must not
-            // compare client-resend bytes against the canonical rows (that
-            // compare diverges BY DESIGN once the server serves canonical
-            // bytes the client never saw verbatim). The marker persists in
-            // session metadata (meta_json) so it survives restarts and covers
-            // every later turn, not just this one.
-            session.metadata["egressAuthority"] = true;
+            // The single shared authority seam (egress-lane-io): latch,
+            // recover, hard-fail, bootstrap / swap / legacy — one code path
+            // for all four lanes. This lane sits PRE-kernel: the swapped
+            // core becomes kernel input, and the record is deferred to the
+            // post-kernel segment below with this turn's exact outbound
+            // array (egressRecordSource), diffed against auth.base.
             const st = getStore().egressOpLogStore();
             if (st) {
-                const base0 = recoverEgressBase(st, sessionId);
-                if (base0 === null) {
-                    log("error", `[${sessionId}] egress-authority: no healthy flow point — refusing to run on client bytes (ruling 7439-5); latching egressFlowUnreadable, session-level recovery required`);
-                    session.metadata["egressFlowUnreadable"] = true;
-                    throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (ruling 7439-5) — failing the turn instead of trusting client bytes`);
-                }
-                egressBaseRows = base0.view;
-                if (base0.view.length === 0) {
-                    // Turn-1 cold start (ruling 7439-5): the client bytes are
-                    // the content source EXACTLY ONCE — the record below puts
-                    // them in the flow; from turn 2 this branch never runs
-                    // again for a healthy session.
-                    egressBootstrap = true;
-                    log("info", `[${sessionId}] egress-authority: bootstrap — empty flow, client bytes recorded once (turn 1 of the op-log)`);
-                } else {
-                    const base = rebuildCoreFromLog(base0.view) ?? [];
-                    if (base.length > 0 && egressAuthorityProbe(base, msgs, sessionId, log)) {
-                        const baseById = new Map(base.map((m) => [m.id, m] as const));
-                        msgs = msgs.map((c) => baseById.get(c.id) ?? c);
-                        originalMessages = msgs;
-                        egressSwapApplied = true;
-                        log("info", `[${sessionId}] egress-authority: ${base.length} existing row(s) served from the op-log, ${Math.max(0, msgs.length - base.length)} fresh from the client${base0.degraded ? ` (recovered to log_seq=${base0.seq}, truncated ${base0.truncated} row(s))` : ""}`);
-                    } else if (base.length > 0) {
-                        log("warn", `[${sessionId}] egress-authority: probe failed — flow NOT advanced this turn; legacy bytes served (re-attempts next turn)`);
-                    }
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: msgs, log });
+                egressBaseRows = auth.base;
+                egressBootstrap = auth.bootstrapping;
+                if (auth.swappedCore !== null) {
+                    msgs = auth.swappedCore;
+                    originalMessages = msgs;
+                    egressSwapApplied = true;
                 }
             }
         }

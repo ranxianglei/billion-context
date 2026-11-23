@@ -1,118 +1,192 @@
-// #7398 all-lanes (ruling 7439-4): the egress plane's record/serve seam for
-// the non-OpenAI lanes. The OpenAI lane carries the full mechanism inline in
-// prepare-openai.ts (authority seam + serve + record); these helpers give the
-// other wires the same lane-neutral core round-trip.
+// #7398 all-lanes (ruling 7439-4) + 7439-5: the egress plane's authority
+// seam — ONE implementation shared by all four lanes. This replaced two
+// tracks: the OpenAI lane carried the full mechanism inline in
+// prepare-openai.ts while the other wires got a reduced
+// `authorityLaneTurn` (no probe, no latch). Both are gone; every lane now
+// calls resolveEgressAuthority + recordAuthorityTurn below.
 //
-// ORDER MATTERS — record FIRST, serve from the view THAT CALL just wrote:
-// the served core must contain THIS turn's new message. Serving before
-// recording hands back last turn's view (this turn's user input vanishes
-// from the outbound) and then records a diff against that same replaced
-// view — zero ops, flow frozen forever. review 7439-deviations P1-1.
+// Ruling 7439-5: for egress-on sessions the server flow is the SOLE
+// content authority. The client's resend is — after turn 1 — an
+// identity/order channel (the probe) and the byte source for NEW
+// messages only.
+//
+// Two phases (matching where each lane sits in the pipeline):
+//   1. resolveEgressAuthority — at the lane's seam position (OpenAI:
+//      pre-kernel, so the swap becomes kernel input; Anthropic/
+//      Responses/Google: post-kernel, so the swap becomes the outbound
+//      core + the recorded bytes). Sets the `egressAuthority` latch
+//      (KDD#22 benefit chain), hard-fails (EgressAuthorityRejectError +
+//      `egressFlowUnreadable` latch) when there is NO healthy flow point,
+//      and classifies the turn:
+//        bootstrapping — empty flow (turn-1 cold start): client bytes are
+//                        the content source EXACTLY ONCE;
+//        swapped       — existing rows carry flow bytes, fresh rows stay
+//                        client bytes;
+//        legacy        — probe failed (client did not echo the server
+//                        conversation) or the view did not rebuild: the
+//                        flow is NOT advanced this turn, client bytes
+//                        ride outbound, re-attempt next turn.
+//   2. recordAuthorityTurn — records per the outcome (ORDER MATTERS:
+//      record BEFORE any serve-from-log — the served view must contain
+//      THIS turn's row; serving before recording hands back last turn's
+//      view and the flow freezes on a zero-op diff, review
+//      7439-deviations P1-1). legacy skips the record entirely (never
+//      advance the flow with untrusted bytes). Returns the core the lane
+//      serves (swapped / client-on-bootstrap), or null = keep the legacy
+//      client core.
 //
 // The system row lives INSIDE the recorded view (type "system") but is
-// excluded from the served core — each lane builds its own system block live
-// (prefix-cache anchor), exactly like the OpenAI lane. Callers pass the
-// lane's OUTBOUND system text (post-injection), so system drift is visible
-// as a +U op on that row.
+// excluded from the served core — each lane builds its own system block
+// live (prefix-cache anchor), exactly like the OpenAI lane. Callers pass
+// the lane's OUTBOUND system text (post-injection), so system drift is
+// visible as a +U op on that row.
 //
-// Authority (ruling 7439-5): the server flow is the sole content authority
-// for egress-on sessions. `authorityLaneTurn` implements the full swap +
-// hard-fail semantics: the kernel input is the flow replay result (not
-// client bytes), and an unreadable flow hard-fails the turn (never degrades
-// to client bytes). The first turn (empty flow) is a one-time bootstrap
-// where client bytes are recorded once.
-//
-// Rollout gate (egressPlane, default 0) is owned by the caller.
+// Rollout gate (egressPlane, default 0) and each lane's arming condition
+// are owned by the caller.
 
 import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, type EgressOpLogStore } from "../storage/egress-record.js";
 import { rebuildCoreFromLog } from "../storage/egress-serve.js";
+import type { EgressViewRow } from "../storage/egress-state.js";
 import type { BiliMessage } from "acp-kernel/wire";
+import type { Session } from "../session.js";
 
 type LaneLog = (level: string, msg: string) => void;
 
-/** Append this turn's outbound core view as sparse ops. A corrupt log point
- * skips this turn (warn); the next turn re-derives from the stored view. */
-export function recordLaneTurn(st: EgressOpLogStore, sessionId: string, conversation: BiliMessage[], systemText: string, log: LaneLog): void {
+/** Ruling 7439-5 identity/order channel + divergence sampler.
+ *
+ * Part 1 ORDER: every client id that exists in the server view must appear
+ * in server-view order (append-only + client-side folding contract; a
+ * reorder means the client is not echoing the server's conversation → the
+ * turn degrades to legacy). Part 2 DIVERGENCE: up to 8 sampled rows compare
+ * contentType + text length + (short, ≤32KB) exact text. A mismatch does NOT
+ * fail the probe — the seam keeps server bytes regardless of what the client
+ * sent; sampling only LOGS the divergence event (ruling: 记日志 + 警告,
+ * 内容跟服务端, 出站自然收敛). */
+export function egressAuthorityProbe(
+    base: readonly BiliMessage[],
+    client: readonly BiliMessage[],
+    sessionId: string,
+    log: (level: string, msg: string) => void,
+): boolean {
+    const baseIndex = new Map<string, number>();
+    base.forEach((m, i) => {
+        if (!baseIndex.has(m.id)) baseIndex.set(m.id, i);
+    });
+    let cursor = -1;
+    for (const c of client) {
+        const i = baseIndex.get(c.id);
+        if (i === undefined) continue;
+        if (i <= cursor) return false;
+        cursor = i;
+    }
+    let diverged = 0;
+    const step = Math.max(1, Math.floor(client.length / 8));
+    for (let i = 0; i < client.length; i += step) {
+        const c = client[i];
+        const bi = baseIndex.get(c.id);
+        if (bi === undefined) continue;
+        const b = base[bi];
+        const ct = typeof c.text === "string" ? c.text : "";
+        const bt = typeof b.text === "string" ? b.text : "";
+        if (c.contentType !== b.contentType || ct.length !== bt.length || (ct.length <= 32768 && ct !== bt)) diverged++;
+        if (diverged >= 4) break;
+    }
+    if (diverged > 0) {
+        log("warn", `[${sessionId}] egress-authority divergence: ${diverged} sampled row(s) differ client-vs-server — server bytes win (client edits do not stick until the egress update API exists; discussions/7439 ruling 5)`);
+    }
+    return true;
+}
+
+interface EgressAuthorityOutcome {
+    /** This turn's flow point (possibly empty = bootstrap) — passed to
+     * recordAuthorityTurn as the diff `prev`. */
+    base: EgressViewRow[];
+    /** Empty flow (turn-1 cold start): client bytes are the content source
+     * exactly once. */
+    bootstrapping: boolean;
+    /** Flow-swapped core, or null = the lane keeps its client core and the
+     * flow is NOT advanced this turn. */
+    swappedCore: BiliMessage[] | null;
+}
+
+/** The single authority decision (ruling 7439-5): latch, recover,
+ * hard-fail, classify (bootstrap / swapped / legacy). Lane-neutral —
+ * OpenAI feeds the result as kernel input, the post-kernel lanes as the
+ * outbound core. Throws EgressAuthorityRejectError when no healthy flow
+ * point exists (never degrade to client bytes); latches
+ * metadata.egressFlowUnreadable so operator recovery is required and
+ * retries hit the same error. */
+export function resolveEgressAuthority(args: {
+    session: Session;
+    st: EgressOpLogStore;
+    sessionId: string;
+    core: BiliMessage[];
+    log: LaneLog;
+}): EgressAuthorityOutcome {
+    const { session, st, sessionId, core, log } = args;
+    // Ruling 7439: from this turn the op log is the content source of
+    // truth for the session, so the unified-storage verifier must not
+    // compare client-resend bytes against the canonical rows (that
+    // compare diverges BY DESIGN once the server serves canonical
+    // bytes the client never saw verbatim). The marker persists in
+    // session metadata (meta_json) so it survives restarts and covers
+    // every later turn, not just this one.
+    session.metadata["egressAuthority"] = true;
+    const base0 = recoverEgressBase(st, sessionId);
+    if (base0 === null) {
+        log("error", `[${sessionId}] egress-authority: no healthy flow point — refusing to run on client bytes (ruling 7439-5); latching egressFlowUnreadable, session-level recovery required`);
+        session.metadata["egressFlowUnreadable"] = true;
+        throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (ruling 7439-5) — failing the turn instead of trusting client bytes`);
+    }
+    if (base0.view.length === 0) {
+        // Turn-1 cold start (ruling 7439-5): the client bytes are the
+        // content source EXACTLY ONCE — recordAuthorityTurn puts them in
+        // the flow; from turn 2 this branch never runs again for a
+        // healthy session.
+        log("info", `[${sessionId}] egress-authority: bootstrap — empty flow, client bytes recorded once (turn 1 of the op-log)`);
+        return { base: base0.view, bootstrapping: true, swappedCore: null };
+    }
+    const base = rebuildCoreFromLog(base0.view) ?? [];
+    if (base.length === 0 || !egressAuthorityProbe(base, core, sessionId, log)) {
+        if (base.length > 0) {
+            log("warn", `[${sessionId}] egress-authority: probe failed — flow NOT advanced this turn; legacy bytes served (re-attempts next turn)`);
+        }
+        return { base: base0.view, bootstrapping: false, swappedCore: null };
+    }
+    const baseById = new Map(base.map((m) => [m.id, m] as const));
+    const swapped = core.map((c) => baseById.get(c.id) ?? c);
+    log("info", `[${sessionId}] egress-authority: ${base.length} existing row(s) served from the op-log, ${Math.max(0, core.length - base.length)} fresh from the client${base0.degraded ? ` (recovered to log_seq=${base0.seq}, truncated ${base0.truncated} row(s))` : ""}`);
+    return { base: base0.view, bootstrapping: false, swappedCore: swapped };
+}
+
+/** Record THIS turn per the outcome (see the ORDER MATTERS note above):
+ * swapped → the swapped core (flow bytes + new client rows),
+ * bootstrapping → the client core exactly once, legacy → skip (the flow
+ * must not advance with untrusted bytes). A corrupt log point skips this
+ * turn (warn); the next turn re-derives from the stored view. Returns the
+ * core the lane should serve (swapped / client-on-bootstrap), or null =
+ * keep the legacy client core. */
+export function recordAuthorityTurn(
+    st: EgressOpLogStore,
+    sessionId: string,
+    outcome: EgressAuthorityOutcome,
+    clientCore: BiliMessage[],
+    systemText: string,
+    log: LaneLog,
+): BiliMessage[] | null {
+    if (outcome.swappedCore === null && !outcome.bootstrapping) return null;
+    const conversation = outcome.swappedCore ?? clientCore;
     try {
-        recordEgressTurn({ store: st, sessionId, prev: undefined, conversation, systemText, nowMs: Date.now() });
+        recordEgressTurn({
+            store: st,
+            sessionId,
+            prev: outcome.base.length > 0 ? outcome.base : undefined,
+            conversation,
+            systemText,
+            nowMs: Date.now(),
+        });
     } catch (err) {
         log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
     }
-}
-
-/** Rebuild the session's recorded core view from the flow tables (current
- * healthy point, or a bounded walk-back + truncate past a structurally
- * corrupt point). Null when nothing is servable — the lane keeps its
- * legacy core for this turn. */
-export function rebuildLaneCore(st: EgressOpLogStore, sessionId: string, log: LaneLog): BiliMessage[] | null {
-    try {
-        const base = recoverEgressBase(st, sessionId);
-        if (base === null || base.view.length === 0) return null;
-        const core = rebuildCoreFromLog(base.view);
-        if (core === null || core.length === 0) return null;
-        log("info", `[${sessionId}] egress-serve: served ${base.view.length} rows from op-log${base.degraded ? ` (degraded healthy point, log_seq=${base.seq})` : ""}`);
-        return core;
-    } catch (err) {
-        log("error", `[${sessionId}] egress-serve: log point corrupt or unrebuildable — legacy this turn (session-recovery marker): ${String(err)}`);
-        return null;
-    }
-}
-
-/** Record THIS turn's core view, then serve the view that call just wrote
- * (see the ORDER MATTERS note above). Returns null when the just-recorded
- * view is not servable — the lane keeps its legacy core. */
-export function serveLaneTurn(args: {
-    st: EgressOpLogStore;
-    sessionId: string;
-    conversation: BiliMessage[];
-    systemText: string;
-    log: LaneLog;
-}): BiliMessage[] | null {
-    recordLaneTurn(args.st, args.sessionId, args.conversation, args.systemText, args.log);
-    return rebuildLaneCore(args.st, args.sessionId, args.log);
-}
-
-/** Ruling 7439-5 full authority: the flow is the sole content source.
- *
- * Turn 1 (empty flow): bootstrap — record client bytes once, return them
- * unchanged (the one-time content source).
- * Turn 2+: existing messages are served from the flow (client resends are
- * identity verification only); new messages (not yet in the flow) come from
- * the client. The SWAPPED conversation (flow bytes + new client bytes) is
- * what gets recorded. Unreadable flow → EgressAuthorityRejectError (hard
- * fail, never client bytes).
- *
- * Returns the core to use as kernel input + outbound. Throws on unreadable
- * flow (the lane must propagate the error). */
-export function authorityLaneTurn(args: {
-    st: EgressOpLogStore;
-    sessionId: string;
-    conversation: BiliMessage[];
-    systemText: string;
-    log: LaneLog;
-}): BiliMessage[] {
-    const { st, sessionId, conversation, systemText, log } = args;
-    const base = recoverEgressBase(st, sessionId);
-    if (base === null) {
-        log("error", `[${sessionId}] egress-authority: no healthy flow point (ruling 7439-5) — hard-failing instead of trusting client bytes`);
-        throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (ruling 7439-5) — failing the turn instead of trusting client bytes`);
-    }
-    if (base.view.length === 0) {
-        // Turn-1 bootstrap: client bytes are the content source exactly once.
-        recordLaneTurn(st, sessionId, conversation, systemText, log);
-        log("info", `[${sessionId}] egress-authority: bootstrap — empty flow, client bytes recorded once (turn 1)`);
-        return conversation;
-    }
-    // Turn 2+: swap existing messages with flow bytes, keep new client
-    // messages, record the swapped conversation, return it.
-    const flowCore = rebuildCoreFromLog(base.view);
-    if (flowCore === null || flowCore.length === 0) {
-        log("error", `[${sessionId}] egress-authority: flow unreadable (ruling 7439-5) — hard-failing`);
-        throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} flow unreadable (ruling 7439-5) — failing the turn`);
-    }
-    const flowById = new Map(flowCore.map((m) => [m.id, m] as const));
-    const swapped = conversation.map((c) => flowById.get(c.id) ?? c);
-    recordLaneTurn(st, sessionId, swapped, systemText, log);
-    log("info", `[${sessionId}] egress-authority: ${flowCore.length} rows from op-log, ${Math.max(0, conversation.length - flowCore.length)} fresh from client${base.degraded ? ` (degraded, log_seq=${base.seq})` : ""}`);
-    return swapped;
+    return conversation;
 }

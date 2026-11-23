@@ -52,7 +52,7 @@ import { tryIncrementalPin } from "../snapshot/stage0.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { yieldToEventLoop } from "../yield-loop.js";
-import { authorityLaneTurn } from "./egress-lane-io.js";
+import { recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -580,15 +580,21 @@ export async function prepareAnthropic(
         }
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, laneDecisions.compressSurfaceOff, laneDecisions.mcpDialect, detectGenerationBoundary(session, processedMessages, log));
-        // #7398 all-lanes (ruling 7439-4/5): the flow is the sole content
-        // authority. Turn 1 = bootstrap (client bytes recorded once); turn 2+
-        // = kernel input is the flow replay result (client resends are
-        // identity verification only). Unreadable flow → hard fail.
+        // #7398 all-lanes (ruling 7439-4/5): the single shared authority
+        // seam (egress-lane-io). This lane sits POST-kernel: the swapped
+        // core becomes the outbound rebuild and the recorded bytes. Turn 1
+        // = bootstrap (client bytes recorded once); turn 2+ = existing rows
+        // carry flow bytes, fresh rows stay client bytes; probe failure =
+        // legacy (flow NOT advanced, re-attempts next turn). Unreadable
+        // flow → hard fail.
         if (featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             if (st) {
-                const core = authorityLaneTurn({ st, sessionId, conversation: laneCoreForRecord, systemText: extractSystem(systemOut) ?? "", log });
-                rebuiltMessages = coreToAnthropic(core, anthropicCacheMarks ?? clientCacheControls);
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log });
+                const served = recordAuthorityTurn(st, sessionId, auth, laneCoreForRecord, extractSystem(systemOut) ?? "", log);
+                if (served !== null) {
+                    rebuiltMessages = coreToAnthropic(served, anthropicCacheMarks ?? clientCacheControls);
+                }
             }
         }
         // #1637: stamp the steady body's system. NOTE: parsed.system stays the

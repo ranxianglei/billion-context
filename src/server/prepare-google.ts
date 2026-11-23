@@ -43,7 +43,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
-import { authorityLaneTurn } from "./egress-lane-io.js";
+import { recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -351,10 +351,9 @@ export async function prepareGoogle(
         // stay in session state/persistence untouched.
         let egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         // #7398 all-lanes (ruling 7439-4): the pre-injection core is captured
-        // here; the egress round-trip (record-first, then serve from the
-        // view that call wrote — see egress-lane-io) runs after the system
-        // is assembled below, so the recorded system row is the lane's
-        // OUTBOUND system.
+        // here; the egress authority seam (egress-lane-io) runs after the
+        // system is assembled below, so the recorded system row is the
+        // lane's OUTBOUND system.
         const laneCoreForRecord = egressMessages;
         rebuiltContents = coreToGoogle(egressMessages, { model });
 
@@ -387,15 +386,18 @@ export async function prepareGoogle(
         // instead of being re-serialized into a new shape.
         const extraSystemParts = sysParts.slice(googleClientSystem ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
-        // #7398 all-lanes (ruling 7439-4/5): the flow is the sole content
-        // authority. Turn 1 = bootstrap (client bytes recorded once); turn 2+
-        // = kernel input is the flow replay result (client resends are
-        // identity verification only). Unreadable flow → hard fail.
+        // #7398 all-lanes (ruling 7439-4/5): the single shared authority
+        // seam (egress-lane-io), POST-kernel: the swapped core becomes the
+        // outbound rebuild and the recorded bytes. Unreadable flow → hard
+        // fail.
         if (!isTitleGen && featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             if (st) {
-                const core = authorityLaneTurn({ st, sessionId, conversation: laneCoreForRecord, systemText: googleOutboundSystem ?? googleClientSystem, log });
-                rebuiltContents = coreToGoogle(core, { model });
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log });
+                const served = recordAuthorityTurn(st, sessionId, auth, laneCoreForRecord, googleOutboundSystem ?? googleClientSystem, log);
+                if (served !== null) {
+                    rebuiltContents = coreToGoogle(served, { model });
+                }
             }
         }
         if (injectTools) {
