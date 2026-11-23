@@ -81,8 +81,9 @@ export function dedupInstructionsKeepLatest(parsed: unknown): { body: unknown; m
     if (instructions.length <= RESPONSES_INSTRUCTIONS_CHAR_LIMIT) return { body: parsed, modified: false };
     const parts = instructions.split("\n\n");
     if (parts.length <= 1) return { body: parsed, modified: false };
+    // parts.length > 1 ⇒ at least one "\n\n" was removed, so the last part is
+    // strictly shorter than the original — no length re-check needed.
     const latest = parts[parts.length - 1];
-    if (latest.length >= instructions.length) return { body: parsed, modified: false };
     const body: Record<string, unknown> = { ...rec, instructions: latest };
     return { body, modified: true };
 }
