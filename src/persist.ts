@@ -206,6 +206,7 @@ interface PersistedSession {
         emergencyShrinkEstimate?: number;
         lastInputTokensOrigin?: string;
         overflowArmTokens?: number;
+        preflightRuns?: number;
         overflowArmCompletionReserve?: number;
         overflowArmMismatchWarned?: boolean;
         // #3450 follow-up: provider-lifetime completion proof + its scope.
@@ -4226,6 +4227,8 @@ function buildSession(parsed: PersistedSession): Session {
             emergencyShrinkEstimate: typeof stats.emergencyShrinkEstimate === "number" && Number.isFinite(stats.emergencyShrinkEstimate) && stats.emergencyShrinkEstimate > 0 ? stats.emergencyShrinkEstimate : undefined,
             // #1110: one-shot overflow arm — legacy files lack it; absent = no arm.
             overflowArmTokens: typeof stats.overflowArmTokens === "number" && Number.isFinite(stats.overflowArmTokens) && stats.overflowArmTokens > 0 ? stats.overflowArmTokens : undefined,
+            // One-shot preflight fold gate — legacy files lack it; absent = fresh.
+            preflightRuns: typeof stats.preflightRuns === "number" && Number.isFinite(stats.preflightRuns) && stats.preflightRuns >= 0 ? stats.preflightRuns : undefined,
             // #3450: proven completion reservation + one-time warn flag — legacy files lack both.
             overflowArmCompletionReserve: typeof stats.overflowArmCompletionReserve === "number" && Number.isFinite(stats.overflowArmCompletionReserve) && stats.overflowArmCompletionReserve > 0 ? stats.overflowArmCompletionReserve : undefined,
             overflowArmMismatchWarned: stats.overflowArmMismatchWarned === true ? true : undefined,

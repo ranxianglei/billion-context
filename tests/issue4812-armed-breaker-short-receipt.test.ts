@@ -93,7 +93,7 @@ test("#4812: parse-failure receipts collapse per-repeat once the breaker climbs 
     assert.doesNotMatch(f4, /acp_status/, "no contradictory order beside the loop-noise stop (#2360)");
     assert.match(f4, /\{startId, endId, summary\}/, "keeps a one-line format reminder");
     assert.doesNotMatch(f4, /must be a non-empty array/, "reminder no longer teaches the retired raw-array shape");
-    assert.match(f4, /disarms on one successful fold or 10 minutes/, "states the disarm conditions");
+    assert.match(f4, /disarms on one substantial fold \(a trivial one that saves almost nothing does not count\) or 10 minutes/, "states the disarm conditions (#7300: a trivial fold does not count)");
     assert.ok(f4.length < 700, `short refusal stays small (got ${f4.length} chars)`);
 
     const f5 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;

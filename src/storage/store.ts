@@ -463,8 +463,6 @@ export class UnifiedStore {
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
     readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
-    private inheritedWatermarksUntrusted = false;
-    private readonly committedWatermarkSessions = new Set<string>();
     /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
     private ingestCount = 0;
     /** #5744: last periodic checkpoint result (plus its wall time) for the
@@ -1070,7 +1068,6 @@ export class UnifiedStore {
         opts?: { completeLog?: boolean; envelopeImport?: boolean },
     ): boolean {
         const s = input.session;
-        if (delta && this.inheritedWatermarksUntrusted && !this.committedWatermarkSessions.has(s.sessionId)) return false;
         const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
@@ -1674,10 +1671,7 @@ export class UnifiedStore {
             }
             return true;
         });
-        if (ok) {
-            this.trustCommittedIngestWatermark(s.sessionId);
-            this.maybeCheckpointWal();
-        }
+        if (ok) this.maybeCheckpointWal();
         return ok;
     }
 
@@ -1882,7 +1876,6 @@ export class UnifiedStore {
      *  upgrade) means "no trusted prefix": the next save runs the full
      *  ingest. Point read on the sessions PK. */
     ingestWatermark(sessionId: string): { seq: number; tailSeqs: number[] } | null {
-        if (this.inheritedWatermarksUntrusted && !this.committedWatermarkSessions.has(sessionId)) return null;
         const row = this.db
             .prepare("SELECT last_ingested_seq, tail_json FROM sessions WHERE session_id = ?")
             .get(sessionId) as { last_ingested_seq: number | null; tail_json: string } | undefined;
@@ -1923,19 +1916,29 @@ export class UnifiedStore {
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
     }
 
-    /** #3285: inherited pointers do not vouch for this writer's prefix.
-     *  Invalidate trust locally, preserving all durable pointers and avoiding
-     *  a startup rewrite of every large session row. Each session's first save
-     *  still takes the full authoritative path; only an outer committed save
-     *  can restore this writer's delta eligibility. Pure readers never reset. */
-    resetAllIngestWatermarks(): void {
-        this.inheritedWatermarksUntrusted = true;
-        this.committedWatermarkSessions.clear();
-    }
-
-    trustCommittedIngestWatermark(sessionId: string): void {
-        // Unknown transaction state fails closed; releasing a savepoint is not an outer COMMIT.
-        if (this.db.inTransaction?.() === false) this.committedWatermarkSessions.add(sessionId);
+    /** #3285 (2026-11-21 per-session rework): watermark trust does not cross
+     *  process boundaries — a watermark vouches "the writer that set it
+     *  verified this prefix" but carries no writer identity, so under the
+     *  multi-process shared-directory contract (#2671) a restart-handoff
+     *  overlap leaves a foreign process's rows AND its watermark behind,
+     *  and inheriting that trust lets the new process take unverified empty
+     *  deltas against rows it never wrote.
+     *  The 2026-10-31 implementation dropped EVERY session's watermark in one
+     *  global write at open — it touched every other session and made open
+     *  itself a write (the #7156 first-write hazard). The trust boundary is
+     *  actually per-session: a process only needs to distrust watermarks it
+     *  did not set, for the session it is about to save. So the invalidation
+     *  moved here — first touch of a session in THIS process drops any
+     *  foreign-set watermark for that ONE session (→ the next save takes the
+     *  exact full path, re-establishing trust from this process's own view);
+     *  later touches trust this process's own watermarks. Per (process,
+     *  session) the trust decision is byte-identical to the global reset;
+     *  untouched sessions keep their watermarks, and open performs no write. */
+    private readonly ingestTouchedThisProcess = new Set<string>();
+    primeIngestTrust(sessionId: string): void {
+        if (this.ingestTouchedThisProcess.has(sessionId)) return;
+        this.ingestTouchedThisProcess.add(sessionId);
+        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
     }
 
     /** #3248 lane-ownership probe for the message sweep (#3285): every ext
