@@ -5,8 +5,7 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import type { HandoffReply } from "../server/handoff-response.js";
-import { estimateCoreMessages } from "../preflight.js";
-import { estimateWireOverhead } from "../server/budget.js";
+import { calibratedImageTextSide } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
 import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
 import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
@@ -676,7 +675,10 @@ export async function* runCompressLoop(
             if (nImages > 0) {
                 noteForwardedImageFacts(ctx.session, {
                     nImages,
-                    textSide: estimateCoreMessages(coreMessages) + estimateWireOverhead(ctx.protocol, wireBodyStr),
+                    // #7621: k̂-calibrated (billing caliber) so the settle's
+                    // observed = billedTotal - textSide does not mis-attribute the
+                    // tokenizer gap to the images on k̂>1 routes.
+                    textSide: calibratedImageTextSide(ctx.session, ctx.protocol, coreMessages, wireBodyStr, ctx.upstreamOrigin),
                     host: ctx.imageLearn.host,
                     fp: ctx.imageLearn.fp,
                 });

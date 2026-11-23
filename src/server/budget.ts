@@ -3,7 +3,7 @@ import { googleSystemText, type BiliMessage, type GoogleRequestBody } from "acp-
 import { estimateCoreMessages } from "../preflight.js";
 import { SELF_HEAL_SUPPRESS_CAP_MS, reductionKeyOf } from "../session-self-heal.js";
 import type { Session } from "../session.js";
-import { applyEstimateCalibration } from "../util.js";
+import { applyEstimateCalibration, currentCalibrationFactor } from "../util.js";
 
 // #6752: the output-budget field plumbing moved here from side-request.ts —
 // it is generic wire plumbing (used by the clamp, the restore path, and the
@@ -322,6 +322,32 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
     return defaultCountTokens(sysText)
         + defaultCountTokens(JSON.stringify(protocol === "responses" ? modelVisibleTools(parsed.tools) : parsed.tools ?? []))
         + (protocol === "responses" ? countLoadedToolTokens(parsed) : 0);
+}
+
+/** #7621: the image-learning text side, in the SAME billing caliber as the usage
+ *  total it is subtracted from. settleImageLearning (cache-ledger.ts) computes the
+ *  observed image mass as billedTotal - textSide, so textSide must be the
+ *  provider-billed text — not the raw chars/4 local estimate. On a route with
+ *  active k̂ > 1 (CJK / code-heavy) the raw estimate underestimates the billed text
+ *  by (k-1)×, and that gap is mis-attributed to the images, inflating the learned
+ *  per-image cost (bounded only by the #4153 guards). Calibrate with the
+ *  origin-scoped k̂ (degrades to raw when the factor is absent or the route differs)
+ *  — the same mechanism as estimateInputTokens' local arm and the projectThinkingMass
+ *  calibration (#7608). `origin` is normalized internally by applyEstimateCalibration. */
+export function calibratedImageTextSide(
+    session: Session,
+    protocol: "anthropic" | "openai" | "responses" | "google",
+    msgs: CoreMessage[],
+    body: string | Buffer | Record<string, unknown>,
+    origin: string | undefined,
+): number {
+    const kFactor = currentCalibrationFactor(session.stats, session.metadata?.lastModel);
+    return applyEstimateCalibration(
+        estimateCoreMessages(msgs) + estimateWireOverhead(protocol, body),
+        kFactor,
+        session.stats.calibratedEstimateOrigin,
+        origin,
+    );
 }
 
 /** Output-budget cap so input+output <= window. Returns the clamped budget, or
