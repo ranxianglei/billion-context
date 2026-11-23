@@ -28,7 +28,7 @@ import {
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
 import { recordRequestedMode } from "./storage/runtime-status.js";
-import { runOnlineBackup } from "./storage/online-backup.js";
+import { runOnlineBackup, type OnlineBackupResult } from "./storage/online-backup.js";
 import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
@@ -2359,7 +2359,7 @@ export class SessionStore {
      *  a health-probing supervisor killed bili mid-backup). Default destination
      *  lives beside the archive dir so a backups/ tree grows in one place:
      *  sessionsDir/backups/index-<ts>.db. */
-    async unifiedBackup(dst?: string): Promise<{ ok: boolean; path?: string; bytes?: number; error?: string }> {
+    async unifiedBackup(dst?: string): Promise<OnlineBackupResult> {
         if (!this.shadow || this.shadow.stats.disabled) return { ok: false, error: "unavailable" };
         const dbPath = this.shadow.dbFilePath;
         if (!dbPath) return { ok: false, error: "unavailable" };
