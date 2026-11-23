@@ -81,3 +81,36 @@ test("estimate-sourced lastInputTokens with calibrated contextEstimateTokens pre
     assert.equal(eff.source, "usage");
     assert.equal(eff.tokens, 140_000);
 });
+
+test("uncalibrated contextEstimateTokens keeps the char-count upper bound on a stale cycle (negative direction)", () => {
+    const session = makeSession("test-uncalibrated-stale-cycle");
+    settleUsageReport(session, { total: 139_956, reportedCached: 120_000 }, 10_000);
+    noteOutboundContextEstimates(session, {
+        upperBound: 747_979,
+        scaledText: 145_000,
+        imageTokens: 0,
+        calibrated: false,
+    });
+    assert.equal(usageAnchorCycleStale(session.stats), true);
+    assert.equal(calibratedLocalInputEstimate(session.stats), 747_979);
+    const eff = effectiveTokenCount(session, makeMessages(3_000_000));
+    assert.equal(eff.source, "estimate");
+    assert.equal(eff.tokens, 747_979);
+    assert.equal(statusInputBaseline(session), 747_979);
+});
+
+test("never-reporting upstream keeps the fail-closed upper bound even when the estimate is calibrated (#553/#728 discipline)", () => {
+    const session = makeSession("test-never-reporting-calibrated");
+    noteOutboundContextEstimates(session, {
+        upperBound: 705_288,
+        scaledText: 142_000,
+        imageTokens: 0,
+        calibrated: true,
+    });
+    assert.equal(usageAnchorCycleStale(session.stats), false);
+    assert.equal(calibratedLocalInputEstimate(session.stats), 705_288);
+    const eff = effectiveTokenCount(session, makeMessages(3_000_000));
+    assert.equal(eff.source, "estimate");
+    assert.equal(eff.tokens, 705_288);
+    assert.equal(statusInputBaseline(session), 0);
+});
