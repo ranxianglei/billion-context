@@ -264,7 +264,7 @@ function sortKeys(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(sortKeys);
     if (value && typeof value === "object") {
         const record = value as Record<string, unknown>;
-        const out: Record<string, unknown> = {};
+        const out: Record<string, unknown> = Object.create(null);
         for (const key of Object.keys(record).sort()) out[key] = sortKeys(record[key]);
         return out;
     }
@@ -289,7 +289,7 @@ function canonicalize(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(canonicalize);
     if (value && typeof value === "object") {
         const record = value as Record<string, unknown>;
-        const out: Record<string, unknown> = {};
+        const out: Record<string, unknown> = Object.create(null);
         for (const key of Object.keys(record).sort()) {
             if (key === "cache_control") continue; // #2188: transport-layer hint, not content
             out[key] = canonicalize(record[key]);
