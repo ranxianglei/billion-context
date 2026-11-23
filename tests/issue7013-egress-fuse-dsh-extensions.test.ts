@@ -9,6 +9,14 @@
 // alone; this file pins the FUSE path end to end (both gates that share the
 // meter: the relay fuse and preflight's measured bar) so a regression to
 // "count everything" fails here, not in the field.
+//
+// #7470 re-pin (240a2e5, post-merge follow-up): DSH top-level dsh_* client
+// extensions are now INTERCEPTED before egress — the upstream no longer sees
+// them at all (wire-owns-wording, owner ruling #7168/#7439). The original
+// pins (written pre-#7470 in #7488 / 4222c55) asserted the extension rode
+// along; they went red on master the moment #7470 landed. They now assert
+// the new contract: the small real prompt forwards AND the upstream body
+// contains no dsh_session_log.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -46,7 +54,7 @@ function dshSessionLog(): unknown[] {
     }));
 }
 
-type Call = { bytes: number };
+type Call = { bytes: number; text: string };
 
 function makeUpstream(): { server: http.Server; calls: Call[] } {
     const calls: Call[] = [];
@@ -54,7 +62,8 @@ function makeUpstream(): { server: http.Server; calls: Call[] } {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
-            calls.push({ bytes: Buffer.concat(chunks).length });
+            const text = Buffer.concat(chunks).toString("utf8");
+            calls.push({ bytes: Buffer.concat(chunks).length, text });
             res.writeHead(200, { "content-type": "text/event-stream" });
             res.end(chatSse("forwarded answer"));
         });
@@ -142,9 +151,12 @@ test("e2e #7013: an 8 MiB top-level dsh_session_log does NOT trip the relay egre
 
         assert.equal(r.status, 200, `the small real prompt must forward despite the 8 MiB telemetry extension (got ${r.status}): ${body.slice(0, 300)}`);
         assert.equal(calls.length, 1, "the request reached the upstream");
-        // The extension itself rode along (the model host wants it) — this is
-        // forwarding, not stripping: the upstream saw the whole ~8 MiB body.
-        assert.ok(calls[0]!.bytes > 7_900_000, `upstream should receive the full body incl. the extension (got ${calls[0]!.bytes}B)`);
+        // #7470: the extension is intercepted — the upstream sees ONLY the
+        // small real prompt (the meter must stay dsh_-blind so the ~8 MiB
+        // payload never reaches the fuse bar; and the wire no longer carries
+        // the telemetry at all).
+        assert.ok(calls[0]!.bytes < 20_000, `upstream should receive only the small core prompt (got ${calls[0]!.bytes}B)`);
+        assert.ok(!calls[0]!.text.includes("dsh_session_log"), "the dsh_session_log extension must NOT ride upstream (#7470 intercept)");
     } finally {
         await close();
         rmrf(root);
@@ -169,7 +181,8 @@ test("e2e #7189: same shape WITH model present — preflight's measured gate (th
 
         assert.equal(r.status, 200, `with model present, preflight's measured gate shares the dsh_-blind meter and must not 413 (got ${r.status}): ${body.slice(0, 300)}`);
         assert.equal(calls.length, 1, "the request reached the upstream");
-        assert.ok(calls[0]!.bytes > 7_900_000, `upstream should receive the full body incl. the extension (got ${calls[0]!.bytes}B)`);
+        assert.ok(calls[0]!.bytes < 20_000, `upstream should receive only the small core prompt (got ${calls[0]!.bytes}B)`);
+        assert.ok(!calls[0]!.text.includes("dsh_session_log"), "the dsh_session_log extension must NOT ride upstream (#7470 intercept)");
     } finally {
         await close();
         rmrf(root);
