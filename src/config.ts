@@ -2268,6 +2268,11 @@ type FileConfig = {
      *  edits apply on the next restart, not mid-session. */
     storage?: {
         unified?: string;
+        /** NOTE: `storage.snapBase` (enabled/cohorts/cutEveryKUserTurns, the
+         *  #5874 v2 snapshot-base plane) was RETIRED before merge (bc51c9445,
+         *  ruling 7439) — replaced wholesale by the egress op-log plane,
+         *  switched by `rollout.features.egressPlane`. A leftover `snapBase`
+         *  key in your config is dead and ignored. */
         /** SQLite engine self-download (#2833): when unified storage is
          *  requested but neither builtin node:sqlite nor a host-installed
          *  better-sqlite3 exists, bili downloads a pinned N-API prebuilt at

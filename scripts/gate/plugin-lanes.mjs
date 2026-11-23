@@ -73,28 +73,37 @@ const MODEL1 = {
 // drive with the first (matches Lane A's model rotation semantics).
 const MODEL_IDS = String(MODEL1.model).split(",").map((s) => s.trim()).filter(Boolean);
 
-// GATE_SNAPBASE (#6785 candidate verification): exercise the snapBase egress
-// plane. Unset/0/off = off (byte-identical gate); "all" = every protocol
-// cohort; "openai,responses,anthropic,google" subset = explicit cohorts. The
-// gate's bili.json is the only config surface the lanes' proxies read.
-export function gateStorageCfg() {
-  const v = String(process.env.GATE_SNAPBASE || "");
-  if (!v || v === "0" || v.toLowerCase() === "off") return {};
-  const cohorts = v.toLowerCase() === "all" ? [] : v.split(",").map((x) => x.trim()).filter(Boolean);
-  return { storage: cohorts.length ? { snapBase: { enabled: true, cohorts } } : { snapBase: { enabled: true } } };
-}
-
-// GATE_SNAPSHOT_RENDER (#6785 verification): flip the candidate's snapshotRender
-// egress body plane LIVE through the CONFIG tier —
-// rollout.features.snapshotRender=true (a forced-on shorthand the rollout
-// resolver honors above bucketing). The env tier
-// (BILI_ROLLOUT_SNAPSHOT_RENDER) does NOT reach the lane proxies: cleanEnv()
-// strips BILI_* from the spawn env by design (2026-11-16 gate run 3 showed
-// snapshotRender=off(bucket) with the env set).
+// GATE_SNAPBASE / GATE_SNAPSHOT_RENDER (#6785 verification): flip the
+// candidate's new-plane rollouts LIVE through the CONFIG tier —
+// rollout.features.<name>=true (a forced-on shorthand the rollout resolver
+// honors above bucketing). The env tier (BILI_ROLLOUT_*) does NOT reach the
+// lane proxies: cleanEnv() strips BILI_* from the spawn env by design
+// (2026-11-16 gate run 3 showed snapshotRender=off(bucket) with the env set).
+//
+// GATE_SNAPBASE: the EGRESS op-log plane — successor of the retired snapBase
+// v2 plane (bc51c9445, ruling 7439: `storage.snapBase.*` left the config
+// surface, `rollout.egressPlane` is the one switch). Unset/0/off = off
+// (byte-identical gate); any other value ("all" or a protocol cohort list)
+// forces egressPlane=true. The egress plane has NO per-protocol cohort
+// surface (one switch for all lanes, ruling 7439), so every on-value turns
+// the whole plane on.
+// GATE_SNAPSHOT_RENDER: snapshotRender plus the msgid-plane rollouts that
+// ship with this candidate (pluginMsgIdIncremental, identityChannelHarvest).
 export function gateRolloutCfg() {
-  const v = String(process.env.GATE_SNAPSHOT_RENDER || "");
-  if (!v || v === "0" || v.toLowerCase() === "off") return {};
-  return { rollout: { features: { snapshotRender: true } } };
+  const snap = String(process.env.GATE_SNAPBASE || "");
+  const render = String(process.env.GATE_SNAPSHOT_RENDER || "");
+  const snapOn = !!snap && snap !== "0" && snap.toLowerCase() !== "off";
+  const renderOn = !!render && render !== "0" && render.toLowerCase() !== "off";
+  if (!snapOn && !renderOn) return {};
+  const features = {};
+  if (snapOn) features.egressPlane = true;
+  if (renderOn)
+    Object.assign(features, {
+      snapshotRender: true,
+      pluginMsgIdIncremental: true,
+      identityChannelHarvest: true,
+    });
+  return { rollout: { features } };
 }
 const MODEL_MAIN = MODEL_IDS[0];
 const AGENTS = (process.env.GATE_AGENTS || "dsh,pi,codex,opencode,claude")
@@ -301,7 +310,6 @@ async function runLane(agent, recipe) {
         },
       },
       compress: { preserveRecentTokens: 0 },
-      ...gateStorageCfg(),
       ...gateRolloutCfg(),
     }, null, 2));
   writeWindow(BIG_WINDOW);
