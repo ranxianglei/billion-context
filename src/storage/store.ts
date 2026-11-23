@@ -29,6 +29,7 @@ import {
     egressStateAt,
     egressStateBaseSeq,
     egressStateRead,
+    egressStateView,
     egressFork,
     EgressStateCorruptError,
     type EgressOp,
@@ -2348,6 +2349,24 @@ export class UnifiedStore {
      *  whole-table copy. */
     egressPointForkSession(parentId: string, childId: string, wm: number): boolean {
         return egressPointFork(this.db, parentId, childId, wm) > 0;
+    }
+
+    /** #7577 (b): tsStamps for an egress-on session is NOT persisted (the
+     *  write path trims it — see ingest.ts KSTATE_TRIM_FIELDS); it is DERIVED
+     *  from the live egress view, where each row's msgid IS the kernel raw
+     *  message id and ts is the first-observed wall clock. Returns null when
+     *  the session has no egress rows (egress-off) or a corrupt log. */
+    egressTsStamps(sessionId: string): Record<string, number> | null {
+        try {
+            const view = egressStateView(this.db, sessionId);
+            const out: Record<string, number> = {};
+            for (const row of view) {
+                if (row.ts !== undefined) out[row.msgid] = row.ts;
+            }
+            return Object.keys(out).length > 0 ? out : null;
+        } catch {
+            return null;
+        }
     }
 
     /** Delete the session's block op-log rows (state AND flow). Runs inside
