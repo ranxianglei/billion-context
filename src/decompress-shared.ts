@@ -196,6 +196,55 @@ export function resolveDecompress(
     const blockId = rawBlockId.trim();
     const block = ctx.core.decompress(blockId, ctx.session.state);
     if (!block) {
+        // #5874 P3 (decompress green lane): for a block that left the kernel
+        // state, the snapshot ROW LEDGER is the authoritative record of its
+        // pre-fold content. Covered rows (active=0, cover_ref=block) survive
+        // the block's death in state — so restore from the rows while they
+        // live. Once the lifecycle GC reaps the rows together with the dead
+        // block (ruling B), the content is UNRECOVERABLE and this must say so
+        // explicitly with an audit line — never a silent empty body, never a
+        // bare "not found" (the red line: an empty ref is how a model starts
+        // confabulating history). Sqlite fast lane only: null = no substrate
+        // → the legacy receipts below apply unchanged.
+        const snapRows = getStore().unifiedSnapshotRows(ctx.session.id);
+        if (snapRows !== null) {
+            const covered = snapRows.filter((r) => r.coverRef === blockId).sort((a, b) => a.pos - b.pos);
+            if (covered.length > 0) {
+                const parts: string[] = [];
+                for (const r of covered) {
+                    let cores: unknown;
+                    try {
+                        cores = JSON.parse(r.postJson);
+                    } catch {
+                        parts.push(`[pos ${r.pos}] (row form unreadable — audit: sid=${ctx.session.id} pos=${r.pos})`);
+                        continue;
+                    }
+                    const arr = Array.isArray(cores) ? cores : [cores];
+                    for (const c of arr) {
+                        const cm = c as { role?: unknown; text?: unknown; toolName?: unknown };
+                        const role = typeof cm.role === "string" ? cm.role : "msg";
+                        if (typeof cm.text === "string" && cm.text !== "") parts.push(`[${role}] ${cm.text}`);
+                        else if (typeof cm.toolName === "string") parts.push(`[${role}:tool] ${cm.toolName}(...)`);
+                        else parts.push(`[${role}] (no text)`);
+                    }
+                }
+                const header = `[Block ${blockId} content — ${covered.length} item(s), snapshot ledger]`;
+                return toolOk(`${header}\n${parts.join("\n")}`);
+            }
+            // Rows gone: did this block EVER cover rows? The ckpt coverage map
+            // is the surviving record of every fold the foundation committed.
+            const ckpt = getStore().unifiedSnapshotCkpt(ctx.session.id);
+            if (ckpt !== null) {
+                try {
+                    const meta = JSON.parse(ckpt.metaJson) as { coverage?: Record<string, { blockId?: string }> };
+                    if (Object.values(meta.coverage ?? {}).some((c) => c.blockId === blockId)) {
+                        return toolFail(`[decompress FAILED: block ${blockId}'s pre-fold rows were garbage-collected together with the covering block (snapshot lifecycle GC) — audit: sid=${ctx.session.id} block=${blockId} ckptSeq=${ckpt.ckptSeq} at=${new Date().toISOString()}. The content is unrecoverable; the block summary is the standing record.]`);
+                    }
+                } catch {
+                    // meta unreadable → fall through to the legacy receipts
+                }
+            }
+        }
         // Removed-from-state blocks (the #2695 reap path, or a future archive
         // that drops blocks) still carry their preCompactionArchive entry: fail
         // with the real reason instead of the misleading "not found" — the
