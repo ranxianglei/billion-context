@@ -16,6 +16,7 @@ type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
+import { isSubagentPrompt } from "../session-title.js";
 import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
@@ -985,12 +986,19 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // #3376: idle cache-keepalive state — memory-only, so live rows only.
     const keepalive = live ? keepaliveStatusFor(s.id) : undefined;
     const best = displayContextBest(s);
+    // Subagent dispatch prompts are identical across children, so an old
+    // set-once title may be pure boilerplate. Prefer the first block topic
+    // for display; a real host-provided title still wins.
+    const storedTitle = s.meta.hostTitle || s.meta.title;
+    const displayTitle = !s.meta.hostTitle && firstBlockHint && isSubagentPrompt(storedTitle)
+        ? firstBlockHint
+        : storedTitle;
     return {
         id: s.id,
         ...(best ? { contextBest: best } : {}),
         // #2322: a host-provided name (pi /name) outranks the derived
         // first-message title everywhere the row feeds (list, search, export).
-        ...((s.meta.hostTitle || s.meta.title) ? { title: s.meta.hostTitle || s.meta.title } : {}),
+        ...(displayTitle ? { title: displayTitle } : {}),
         // #1426: meta.label is auto-stamped with the session id on many clients —
         // treat label === id as "no title" so lists/details show 无标题 + block hint.
         ...(s.meta.label && s.meta.label !== s.id ? { label: s.meta.label } : {}),

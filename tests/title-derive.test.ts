@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { deriveTitle, isContextualUserFragment, isAutoInjectedNotification } from "../src/server.js";
+import { SUBAGENT_PROMPT_PREFIX } from "../src/session-title.js";
 import type { CoreMessage } from "acp-kernel";
 
 let seq = 0;
@@ -151,5 +152,24 @@ describe("#2286 isAutoInjectedNotification prefix permitlist", () => {
     it("does not match empty or whitespace-only text", () => {
         assert.equal(isAutoInjectedNotification(""), false);
         assert.equal(isAutoInjectedNotification("  \t\n "), false);
+    });
+});
+
+describe("subagent dispatch prompts do not become session titles", () => {
+    const PROMPT = `${SUBAGENT_PROMPT_PREFIX}\n你是 JavaScript 课程字幕校对员。工作目录：D:\\work\\js-course`;
+
+    it("skips the machine-written dispatch prompt", () => {
+        assert.equal(deriveTitle([msg("user", "text", PROMPT)]), undefined);
+    });
+
+    it("still derives from a later real user message", () => {
+        const t = deriveTitle([msg("user", "text", PROMPT), msg("user", "text", "continue from 151")]);
+        assert.equal(t, "continue from 151");
+    });
+
+    it("does not skip a real question that merely mentions subagents", () => {
+        const t = deriveTitle([msg("user", "text", "Why does every subagent spawned by another session show the same title?")]);
+        assert.ok(t?.startsWith("Why does every subagent"));
+        assert.ok(t?.endsWith("\u2026"));
     });
 });

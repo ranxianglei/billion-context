@@ -17,6 +17,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { markdownToHtml } from "../src/web/markdown.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, hiddenEmptyCount, _resetDiskCacheForTest, _diskScanStatsForTest } from "../src/web/sessions-data.ts";
+import { SUBAGENT_PROMPT_PREFIX } from "../src/session-title.ts";
 import vm from "node:vm";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -1478,6 +1479,26 @@ withFullMode("R2.2 file-less rows: web list and detail survive a vanished legacy
     assert.equal(detail.blockDetails.length, 1);
     assert.equal(detail.blockDetails[0].blockId, "b1");
     assert.equal(detail.blockDetails[0].compressedTokens, 2500);
+});
+
+withSessionsDir("subagent dispatch titles fall back to the first block topic", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const s = makeSession(
+        "subagent-title",
+        { protocol: "openai", title: `${SUBAGENT_PROMPT_PREFIX}\n你是 JavaScript 课程字幕校对员。` },
+        { requests: 3, inputTokens: 900, cachedTokens: 300, contextTokens: 600 },
+    );
+    s.state.blocks.push(mkBlock("b1", 1200, true, "JS 字幕校对 151–153"));
+    await store.writeNow(s);
+    store.closeQuietly();
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const list = await buildSessionList();
+    const row = list.find((x) => x.id === "subagent-title");
+    assert.ok(row, "subagent session is listed");
+    assert.equal(row.firstBlockHint, "JS 字幕校对 151–153");
+    assert.equal(row.title, "JS 字幕校对 151–153", "boilerplate title is replaced by the task topic");
 });
 
 withSessionsDir("#5796: slow-session flag fires at/above threshold and stays off below", async (dir) => {

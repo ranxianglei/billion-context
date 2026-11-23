@@ -20,6 +20,7 @@ import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { buildProxyFailureResponse, isExpectedFailFast, type SkippedProxyInfo } from "./upstream-fail.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
+import { isSubagentPrompt } from "./session-title.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
 // (single source of truth shared with the omp/pi adapters): import from
 // "acp-kernel/wire" (kernel #215).
@@ -5112,7 +5113,10 @@ export function isAutoInjectedNotification(text: string): boolean {
  *  Used so the web UI can show "Fix auth bug" instead of an opaque hash.
  *  Contextual fragments (#2118) and host-injected notifications (#2286) are
  *  skipped — if no real question has arrived yet, no title is set and
- *  derivation retries on later requests. */
+ *  derivation retries on later requests. Agent-spawned subagent sessions get
+ *  an identical machine-written dispatch prompt as their first user message;
+ *  that prompt is skipped too, so the web list falls back to the first block
+ *  topic instead of showing the same boilerplate title for every child. */
 export function deriveTitle(messages: CoreMessage[]): string | undefined {
     for (const m of messages) {
         if (m.role !== "user" || m.contentType !== "text") continue;
@@ -5120,6 +5124,7 @@ export function deriveTitle(messages: CoreMessage[]): string | undefined {
         if (!raw.trim()) continue;
         if (isContextualUserFragment(raw)) continue;
         if (isAutoInjectedNotification(raw)) continue;
+        if (isSubagentPrompt(raw)) continue;
         const clean = raw.replace(/\s+/g, " ").trim();
         return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
     }
