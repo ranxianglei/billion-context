@@ -305,10 +305,11 @@ export function hasCompressSettings(s: CompressSettings): boolean {
 export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings; protectedUserPatterns?: string[] };
 
 /** User-text half of the host predicate: literal substring match on
- *  user-role text messages only. Shared by the resolve-time builder
+ *  user-role text messages only. Both the resolve-time builder
  *  (applyCompressSettings) and the read-time restore (session.ts
- *  effectiveConfig) so the two can never drift. */
-export function matchesProtectedUserPatterns(patterns: readonly string[], msg: CoreMessage): boolean {
+ *  effectiveConfig) reach it through combineMessageProtectedPredicate, so
+ *  the two can never drift. */
+function matchesProtectedUserPatterns(patterns: readonly string[], msg: CoreMessage): boolean {
     if (msg.role !== "user" || typeof msg.text !== "string") return false;
     const text = msg.text;
     return patterns.some((pattern) => text.includes(pattern));
