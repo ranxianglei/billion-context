@@ -55,6 +55,7 @@
 | `BILI_INLINE_DEBUG` | #4669 | 仅 inline 车道：引擎 stderr 日志腿默认静默（stderr 是 pi 的交互终端，日志会挤掉输入框；默认只写 bili.log），设 1 恢复 stderr 输出用于排查 | 随 inline 车道（#3278）走 | 排查逃生口 |
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
 | `BILI_PF_RENDER_WINDOW` / `BILI_PF_RENDER_AUDIT_EVERY` | #5664 v6 render-snapshot plane | 实验性渲染快照车道可调项（默认 OFF，嵌套于 watermarkV6MsgId cohort）：W = 稳态轮回放的冻结核数（默认 8）；N = 计划全量审计节奏（默认 8）；读点 src/server/fastpath-v6-render.ts:50-60 | render 平面转正（rollout 100% 且审计计数归稳）后移 §2 常设面，或随车道退役删除 | opt-in（默认 OFF；仅由显式 rollout 开启） |
+| `BILI_PREFLIGHT_EMERGENCY_DIGEST` | PR #7549 | #2383 emergency digest regime（超窗 >19.2× 的确定性摘要折叠 = 模型可见的硬截断）默认关（owner decision 2026-11-22）；`=1` 或 file `network.emergencyDigest: true` 恢复旧行为（读点 src/knobs.ts preflightEmergencyDigestEnabled） | default-off dogfood 站稳后随 regime 一起退役（或转 §2 常设） | 默认 off（opt-in 恢复） |
 | `BILI_IDENTITY_HARVEST` | #5825 / PR #5842 | 身份信道采集 kill/scope 开关（src/identity-harvest.ts）：缺省=OFF（接线以惰性状态出厂）；`1`/`all`=全部已登记来源；逗号列表=按 roster 名圈定；须与 rollout `pluginLaneServerHistory` 及仅回环来源同时放行才生效 | harvest 车道（claude-code/codebuddy/mcode）站稳后按 #2028 模式退役 env（转 file 键）或移 §2 | opt-in（默认 off；rollout 0% 起灰度） |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）
