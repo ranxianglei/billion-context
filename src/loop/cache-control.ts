@@ -21,13 +21,19 @@ import { noCacheControl as knobNoCacheControl } from "../knobs.js";
  * there. Marks die only by folding (covered messages vanish from the view).
  * Once the cap is reached no NEW marks are added until a fold retires
  * covered ones: a rolling drop would mutate an early element and collapse
- * the LCP. Cap = 3 message marks + 1 system breakpoint = Anthropic's 4-block
- * limit.
+ * the LCP. The cap is the shared 4-breakpoint budget (WC-010) — message
+ * marks + system breakpoint + tools entries combined; bili's own message
+ * marks take at most min(3, the budget left after client marks and
+ * non-message breakpoints) (see computeAnthropicMessageMarks).
  *
- * Client-managed caching wins: any pre-existing cache_control (harvested
- * from the client's messages, present on system blocks, or on tools entries —
- * the 4-breakpoint budget counts all three) suppresses our stamps entirely
- * (pass no marks / return the system unchanged).
+ * Client-managed caching: in PROXY mode, any pre-existing client
+ * cache_control (message/block-level or on tools entries) makes the request
+ * pure-client-managed — bili adds no message marks and no system stamp, and
+ * pins the client's rolling marks instead (#6861). In PLUGIN mode the
+ * client's marks are counted against the shared budget, and bili still
+ * stamps the system breakpoint (when budget remains) plus one supplemental
+ * message anchor while a fold is active. A client global-scope control
+ * (WC-016) suppresses bili's message marks and system stamp in both modes.
  * BILI_NO_CACHE_CONTROL / compat.noCacheControl disables everything.
  */
 
