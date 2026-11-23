@@ -918,6 +918,10 @@ export class UnifiedShadow {
                     builder.addBlocks(blocks);
                     if (blocks.length < VIEW_READ_BATCH_SIZE) break;
                 }
+                // #6818: row-backed state fields (tsStamps) must be effective
+                // BEFORE addMessages — the per-message provenance check reads
+                // state.tsStamps at feed time.
+                builder.addStateFields(store.getStateFields(id) ?? {});
                 for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
                     builder.addMessages(store.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                 }
@@ -927,7 +931,6 @@ export class UnifiedShadow {
                 // #6785 step 7: the orphan journal now lives in orphan_blocks;
                 // getOrphanViews also unions any legacy column entries.
                 builder.addOrphanViews(store.getOrphanViews(id) ?? {});
-                builder.addStateFields(store.getStateFields(id) ?? {});
                 // The builder preserves every MERGE_STATE_FIELDS key; its
                 // generic state declaration only needs widening here.
                 return builder.finish() as LegacySessionLike;
@@ -1585,6 +1588,10 @@ export class UnifiedShadow {
                         builder.addBlocks(blocks);
                         if (blocks.length < VIEW_READ_BATCH_SIZE) break;
                     }
+                    // #6818: row-backed state fields (tsStamps) must be effective
+                    // BEFORE addMessages — the per-message provenance check reads
+                    // state.tsStamps at feed time.
+                    builder.addStateFields(await reader.getStateFields(id) ?? {});
                     for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
                         builder.addMessages(await reader.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                     }
@@ -1593,7 +1600,6 @@ export class UnifiedShadow {
                     builder.addCcrEntries(await reader.getCcrEntries(id));
                     // #6785 step 7: same orphan-journal union on the async leg.
                     builder.addOrphanViews(await reader.getOrphanViews(id) ?? {});
-                    builder.addStateFields(await reader.getStateFields(id) ?? {});
                     return builder.finish() as LegacySessionLike;
                 });
                 if (!loaded) return null;

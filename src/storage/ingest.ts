@@ -794,9 +794,13 @@ export class LegacyViewBuilder {
 
     /** #6785 step 8: the unbounded CompressionState field rows (state_fields
      *  table). Call AFTER constructing, BEFORE finish(); rows overlay the
-     *  column values (legacy sessions have no rows → column serves). */
+     *  column values (legacy sessions have no rows → column serves).
+     *  Applied immediately (idempotent — finish() re-applies): callers that
+     *  feed messages before the state fields (cold-view stamping, #6818)
+     *  must see the row-backed values at addMessages time. */
     addStateFields(fields: Record<string, string>): void {
         this.stateFieldsRows = fields;
+        this.applyStateFieldsRows();
     }
 
     /** #6785 step 8: apply the row-backed state fields OVER the column
@@ -951,10 +955,12 @@ export function resolveCcrContentStore(
 /** Compatibility wrapper for callers that already hold all rows. */
 export function loadLegacyView(rows: LegacyViewRows, ccrRows?: readonly CcrLedgerRow[], stateFieldsRows?: Record<string, string> | null, orphanViews?: Record<string, { one: unknown; full: unknown }>): LegacyView {
     const builder = new LegacyViewBuilder(rows.session, rows.refs, rows.deadRefs);
+    // #6818: row-backed state fields (tsStamps) must be effective BEFORE
+    // addMessages — the per-message provenance check reads state.tsStamps.
+    if (stateFieldsRows) builder.addStateFields(stateFieldsRows);
     builder.addBlocks(rows.blocks);
     builder.addMessages(rows.messages);
     if (ccrRows) builder.addCcrEntries(ccrRows);
-    if (stateFieldsRows) builder.addStateFields(stateFieldsRows);
     if (orphanViews !== undefined) builder.addOrphanViews(orphanViews);
     return builder.finish();
 }

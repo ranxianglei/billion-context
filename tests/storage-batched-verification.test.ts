@@ -160,7 +160,8 @@ test("cold view refuses a timestamp column that conflicts with durable kernel pr
     const { db } = openSqliteDatabase(dbPath);
     try { db.prepare("UPDATE messages SET ts=? WHERE session_id=? AND msg_id=?").run(stamp + 1, view.id, "raw-70"); } finally { db.close(); }
     // Use the raw builder so the production facade's null-on-read-failure policy cannot mask the refusal.
-    assert.throws(() => loadLegacyView({ session: store.getSessionRow(view.id)!, refs: store.getRefs(view.id), deadRefs: store.getDeadRefs(view.id), blocks: store.getBlocks(view.id), messages: store.getMessages(view.id) }), /timestamp.*provenance/i);
+    // #6818: tsStamps is row-backed (#6785 step 8) — feed the state_fields row so the provenance check sees it.
+    assert.throws(() => loadLegacyView({ session: store.getSessionRow(view.id)!, refs: store.getRefs(view.id), deadRefs: store.getDeadRefs(view.id), blocks: store.getBlocks(view.id), messages: store.getMessages(view.id) }, undefined, store.getStateFields(view.id)), /timestamp.*provenance/i);
 });
 
 test("a changed message beyond the first batch trips drift and clears the watermark", (t) => {
