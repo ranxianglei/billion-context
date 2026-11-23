@@ -1816,6 +1816,26 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
         noop: true,
       };
     }
+    // #7596: the integrity withdrawal (a visible tool-call must keep its
+    // reasoning run and its results) removed EVERY message of this fresh fold
+    // — the range sits astride the protected-zone boundary and the kernel
+    // keeps the whole turn intact rather than folding a split turn. Before
+    // this the fatal threw and the ATOMIC batch contract rolled back sibling
+    // ranges that would have folded fine; the model re-sent the same batch
+    // (full context re-read every time) until the breaker fired. Like the
+    // zone fatal above it is now a legal no-op: siblings still fold, and the
+    // warning points the model at older ranges instead of a guaranteed
+    // re-failure. Merge split fatals never carry `degradable` and still throw.
+    if (projection.fatal.kind === "split" && projection.fatal.degradable) {
+      const highest = highestUsedIndex(input.state.messageRefs);
+      return {
+        tokens: 0,
+        warnings: [
+          `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — the integrity gate keeps every visible tool call's reasoning run and its results together, and folding this range would split that turn at the protected-zone boundary, so the range was withdrawn in full instead of split. Nothing failed; do not resend this range as-is — it cannot fold until the whole turn ages out of the protected zone. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"} — target older ranges only.`,
+        ],
+        noop: true,
+      };
+    }
     throw projection.fatal.error;
   }
   const {
