@@ -1521,7 +1521,8 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
             u.searchParams.has("q") ||
             u.searchParams.has("protocol") ||
             u.searchParams.has("client") ||
-            u.searchParams.has("state");
+            u.searchParams.has("state") ||
+            u.searchParams.has("kind");
         if (paged) {
             const rawSize = Number(u.searchParams.get("pageSize"));
             const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
@@ -1529,12 +1530,15 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
             const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
             const rawState = u.searchParams.get("state");
             const state = rawState === "live" || rawState === "history" ? rawState : undefined;
+            const rawKind = u.searchParams.get("kind");
+            const kind = rawKind === "top" || rawKind === "child" ? rawKind : undefined;
             body = {
                 ...(await buildSessionPage({
                     q: u.searchParams.get("q") ?? undefined,
                     protocol: u.searchParams.get("protocol") ?? undefined,
                     client: u.searchParams.get("client") ?? undefined,
                     state,
+                    kind,
                     page,
                     pageSize,
                 })),
