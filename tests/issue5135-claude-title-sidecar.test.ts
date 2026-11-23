@@ -7,7 +7,6 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, _sessionsSizeForTest, peekSession } from "../src/session.ts";
-import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { CLAUDE_CODE_TITLE_SESSION_TAG, isClaudeCodeTitleRequest } from "../src/server/side-request.ts";
@@ -126,7 +125,6 @@ function freshState(): void {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     _resetSessionsForTest();
-    resetSessionOrderForTest();
 }
 
 const ccHeadersFor = (id: string) => ({ "x-claude-code-session-id": id });

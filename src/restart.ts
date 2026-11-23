@@ -59,7 +59,6 @@ import { closeLogger, log, type Logger } from "./logger.js";
 import { flushAllSessions, totalInFlight } from "./session.js";
 import { flushConversations } from "./plugin.js";
 import { flushPrefixAffinity } from "./affinity-persist.js";
-import { flushOrderSkeletons } from "./order-persist.js";
 import { flushResignPending } from "./apig-resign.js";
 import { findInstallDir, isVersionNewer, verifyInstallLoadable } from "./update.js";
 import { isPidAlive, listInstances } from "./instance.js";
@@ -480,13 +479,12 @@ export function withExitDeadline(label: string, op: Promise<unknown>): Promise<v
  *  what the normal shutdown path persists (conversations + sessions +
  *  prefix-affinity + session-order skeletons #3397). */
 async function defaultPreSpawnFlush(): Promise<void> {
-    // #5753: conversations/affinity/order now ride sqlite — settle their
+    // #5753: conversations/affinity now ride sqlite — settle their
     // queued writes (not just enqueue them) before the replacement boots.
     await withExitDeadline("pre-spawn storage flushes", (async () => {
         await flushConversations();
         await flushAllSessions();
         await flushPrefixAffinity();
-        await flushOrderSkeletons();
         await flushResignPending();
     })());
 }
@@ -496,7 +494,6 @@ function defaultFinish(): void {
         await withExitDeadline("final storage flushes", (async () => {
             await flushConversations();
             await flushPrefixAffinity();
-            await flushOrderSkeletons();
             await flushResignPending();
             await flushAllSessions();
         })());

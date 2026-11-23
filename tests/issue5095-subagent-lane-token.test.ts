@@ -1,10 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-// trustStampedId is GA-on by default (#7439). This suite pins the legacy
-// |sub: fork behavior — force the feature OFF so it keeps asserting the
-// pre-retirement path (issue2944-neutral-skeleton idiom).
-process.env.BILI_ROLLOUT_TRUST_STAMPED_ID = "0";
-
 import http from "node:http";
 import { once } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
@@ -13,7 +8,7 @@ import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, peekSession } from "../src/session.ts";
 import { claudeSubagentLaneTokenOf } from "../src/session-id.ts";
-import { resetSessionOrderForTest, resolveSessionOrder } from "../src/session-resolve.ts";
+import { resolveSessionOrder } from "../src/session-resolve.ts";
 import { isClaudeLaneToken, mintClaudeLaneToken, claudeLaneTokenIn, LANE_TOKEN_MARKER } from "../src/claude-lane-token.ts";
 import { subagentStartHookOutput } from "../src/claude-subagent-hook.ts";
 import { applyClaudeManagedBlock, stripClaudeManagedBlock } from "../src/plugin-install.ts";
@@ -26,8 +21,10 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 // (identical system text → identical fingerprint) merge onto ONE lane. The
 // bili-managed SubagentStart hook mints a per-dispatch token that rides the
 // dispatch's first user message; the resolver keys on it deterministically.
-// Gate discipline (#3617): every row below has its negative — token absent
-// keeps resolution byte-identical to #4352 behavior.
+// GA discipline (#7525): every row below has its negative — with no valid
+// token on the wire, the stamped id rides verbatim (no lane of any kind).
+// The legacy per-fingerprint/per-fragment fallback lanes were retired with
+// the trust-stamped-id GA (2026-11-23); the negatives assert that.
 
 const MAIN_SYSTEM = ["You are Claude Code, Anthropic's official CLI for Claude. You are an interactive agent..."];
 const SUB_AGENT_SYSTEM = ["x-anthropic-billing-header: cc_version=...", "You are a Claude agent, built on Anthropic's...", "You are a file search specialist for..."];
@@ -105,52 +102,47 @@ test("#5095 resolver rows: token keys the dispatch deterministically", () => {
     const tokA = mintClaudeLaneToken();
     const tokB = mintClaudeLaneToken();
 
-    resetSessionOrderForTest();
-    resolveSessionOrder(SESSION, history("main", 4), MAIN_TAG);
+    resolveSessionOrder(SESSION, MAIN_TAG);
 
     // Positive: a token'd dispatch never touches the raw key — regardless of
     // the persona text, even the SAME text as the main conversation.
-    const a1 = resolveSessionOrder(SESSION, history("subA", 2), SUB_TAG, undefined, tokA);
+    const a1 = resolveSessionOrder(SESSION, SUB_TAG, tokA);
     assert.equal(a1.key, tokenLaneKey(SESSION, SUB_TAG, tokA));
     assert.equal(a1.action, "derived-persona");
-    // successive passes of the SAME dispatch (grown history, same token) keep the lane
-    const a2 = resolveSessionOrder(SESSION, history("subA", 3), SUB_TAG, undefined, tokA);
+    // successive passes of the SAME dispatch (same token) keep the lane
+    const a2 = resolveSessionOrder(SESSION, SUB_TAG, tokA);
     assert.equal(a2.key, tokenLaneKey(SESSION, SUB_TAG, tokA));
     // THE #5095 D1 GAP, FIXED: a parallel dispatch of the SAME type (same
     // system text → same fingerprint) gets its OWN lane.
-    const b1 = resolveSessionOrder(SESSION, history("subB", 2), SUB_TAG, undefined, tokB);
+    const b1 = resolveSessionOrder(SESSION, SUB_TAG, tokB);
     assert.equal(b1.key, tokenLaneKey(SESSION, SUB_TAG, tokB));
     assert.notEqual(b1.key, a1.key, "parallel same-persona dispatches must not merge");
     // token'd traffic under the MAIN persona also forks (token outranks tag)
-    const c1 = resolveSessionOrder(SESSION, history("subC", 2), MAIN_TAG, undefined, tokA);
+    const c1 = resolveSessionOrder(SESSION, MAIN_TAG, tokA);
     assert.equal(c1.key, tokenLaneKey(SESSION, MAIN_TAG, tokA));
     // the parent keeps the raw key after the burst
-    const main5 = resolveSessionOrder(SESSION, history("main", 5), MAIN_TAG);
+    const main5 = resolveSessionOrder(SESSION, MAIN_TAG);
     assert.equal(main5.key, SESSION);
 
-    // NEGATIVE (control — the documented D1 gap without the token): both
-    // same-type dispatches merge onto ONE fingerprint lane, pre-fix shape.
-    resetSessionOrderForTest();
-    resolveSessionOrder(SESSION, history("main", 4), MAIN_TAG);
-    const x1 = resolveSessionOrder(SESSION, history("subA", 2), SUB_TAG);
-    const x2 = resolveSessionOrder(SESSION, history("subB", 2), SUB_TAG);
-    assert.equal(x1.key, forkKey(SESSION, SUB_TAG));
-    assert.equal(x2.key, forkKey(SESSION, SUB_TAG), "without tokens the fingerprint lane merges parallel dispatches (#5095 D1)");
+    // NEGATIVE (control — no token on the wire): GA rides the stamped id
+    // verbatim — no fingerprint lane is minted at all (the legacy
+    // two-segment `|sub:<fp>` merge behavior was retired with the GA).
+    const x1 = resolveSessionOrder(SESSION, SUB_TAG);
+    const x2 = resolveSessionOrder(SESSION, SUB_TAG);
+    assert.equal(x1.key, SESSION, "token-less dispatch rides the stamped id verbatim");
+    assert.equal(x2.key, SESSION);
 
-    // NEGATIVE: a malformed token is ignored → current behavior
-    resetSessionOrderForTest();
-    resolveSessionOrder(SESSION, history("main", 4), MAIN_TAG);
-    const forged = resolveSessionOrder(SESSION, history("subA", 2), SUB_TAG, undefined, "zzz-not-hex!!");
-    assert.equal(forged.key, forkKey(SESSION, SUB_TAG), "non-hex token falls back to the fingerprint lane (sanitizer)");
+    // NEGATIVE: a malformed token is ignored → the stamped id rides verbatim
+    const forged = resolveSessionOrder(SESSION, SUB_TAG, "zzz-not-hex!!");
+    assert.equal(forged.key, SESSION, "non-hex token does not mint a lane (sanitizer)");
 
     // virgin id: token'd traffic claims ONLY its lane, the raw id stays free
     // for the main conversation (kills the #2156-style claim race).
-    resetSessionOrderForTest();
     const virgin = randomUUID();
-    const first = resolveSessionOrder(virgin, history("subA", 2), SUB_TAG, undefined, tokA);
+    const first = resolveSessionOrder(virgin, SUB_TAG, tokA);
     assert.equal(first.key, tokenLaneKey(virgin, SUB_TAG, tokA));
-    const claim = resolveSessionOrder(virgin, history("main", 4), MAIN_TAG);
-    assert.equal(claim.key, virgin, "the main conversation still claims the virgin raw id afterwards");
+    const claim = resolveSessionOrder(virgin, MAIN_TAG);
+    assert.equal(claim.key, virgin, "the main conversation still rides the virgin raw id afterwards");
 });
 
 test("#5095 install: managed settings carry the SubagentStart hook; user entries survive", () => {
@@ -269,7 +261,6 @@ function freshState(): void {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     _resetSessionsForTest();
-    resetSessionOrderForTest();
 }
 
 const ccHeadersFor = (id: string) => ({ "x-claude-code-session-id": id });
@@ -331,7 +322,7 @@ test("#5095 end to end: parallel same-type dispatches ride distinct lanes; paren
     }
 });
 
-test("#5095 end to end fallback: un-upgraded clients (no token) land on the per-run fragment lane", async () => {
+test("#5095 end to end fallback: un-upgraded clients (no token) ride the stamped id verbatim", async () => {
     freshState();
     const SESSION = randomUUID();
     const ccHeaders = ccHeadersFor(SESSION);
@@ -345,17 +336,14 @@ test("#5095 end to end fallback: un-upgraded clients (no token) land on the per-
         }
         const sub1 = await post(ccHeaders, mainBody(history("sub", 2), SUB_AGENT_SYSTEM));
         assert.equal(sub1.status, 200, `token-less subagent: ${sub1.text}`);
-        // #5095 D1-B fallback: no valid token on the wire → the fork key
-        // widens to the per-run first-user fragment — NOT back onto the
-        // shared two-segment fingerprint lane (#5095's original merge
-        // condition). Un-upgraded installs stay isolated per run.
-        const fragKey = `${SESSION}|sub:${fp16(tag(SUB_AGENT_SYSTEM))}:${fp16("sub-user-1")}`;
-        assert.ok(peekSession(fragKey), "token-less dispatch forks onto its own fragment lane");
-        assert.equal(peekSession(forkKey(SESSION, tag(SUB_AGENT_SYSTEM))), undefined, "no shared fingerprint lane was minted");
+        // GA: no valid token on the wire → the stamped id IS the identity;
+        // the token-less dispatch rides it verbatim (no fragment lane is
+        // minted — the #5095 D1-B fallback was retired with the GA).
+        assert.equal(peekSession(SESSION)!.stats.requests, 4, "token-less dispatch rides the stamped id verbatim");
+        assert.equal(peekSession(forkKey(SESSION, tag(SUB_AGENT_SYSTEM))), undefined, "no fingerprint lane was minted");
         const sub2 = await post(ccHeaders, mainBody(history("sub", 3), SUB_AGENT_SYSTEM));
         assert.equal(sub2.status, 200, `token-less pass 2: ${sub2.text}`);
-        assert.equal(peekSession(fragKey)!.stats.requests, 2, "successive turns of the SAME run stay on one fragment lane");
-        assert.equal(peekSession(SESSION)!.stats.requests, 3, "parent untouched either way");
+        assert.equal(peekSession(SESSION)!.stats.requests, 5, "successive turns of the SAME id stay verbatim");
     } finally {
         await close(proxy);
         await close(upstream);
