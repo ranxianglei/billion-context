@@ -37,6 +37,7 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     "x-bili-pf-count",
     "x-bili-pf-seq",
     "x-bili-pf-tail-ids",
+    "x-bili-pf-delta",
     // #5658: incremental-lane turn correlation id — the native plugin stamps it
     // on a diverted model request alongside x-bili-plugin-turn to correlate the
     // applied-seq ack. Pure host↔bili bookkeeping; like the pf-* handshake
