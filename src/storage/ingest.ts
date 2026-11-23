@@ -29,7 +29,7 @@ import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
-import { CcrLedgerRow, hydrateSlimCcrStore, isEmptyStateValue, refillFullEnvelope, slimCcrEnvelope, splitKstate } from "./slim.js";
+import { CcrLedgerRow, hydrateSlimCcrStore, isEmptyStateValue, slimCcrEnvelope, splitKstate } from "./slim.js";
 import { log as loggerLog } from "../logger.js";
 import { splitMediaContent, identityOfStoredContent } from "./identity.js";
 
@@ -900,12 +900,16 @@ export class LegacyViewBuilder {
  * loadLegacyView, so the slim/full/legacy degradation rule cannot drift
  * between legs. Slim envelope → hydrate from the CAS-backed ledger; a slim
  * row whose ledger is empty or still carries legacy NULL-orig rows is an
- * inconsistency: no store (the file lane still has it), never a partial one
- * — and #7574: no longer a SILENT one, it is logged. Full (pre-step-6)
- * envelopes parse verbatim, with the #7574 rollback self-heal: when ledger
- * rows exist next to a full column, an older build rewrote that column
- * without the texts — refillFullEnvelope takes them back from the ledger.
- * Corrupt JSON → undefined.
+ * inconsistency: no store (the file lane still has it), never a partial one.
+ * Full (pre-step-6) envelopes parse verbatim. Corrupt JSON → undefined.
+ *
+ * #7574: no longer a SILENT degradation. The one way this shape arises in
+ * practice is a rollback: an older build (everything before the unified
+ * storage) parses the slim column as if it were the old full envelope, so
+ * its save rewrites the ledger rows to the bare `{ hash }` stubs it saw and
+ * drops the link to the original text. Those texts cannot be linked back —
+ * the session loads without its content store and the log says why (the
+ * nine row-backed state fields DO come back, see applyStateFieldsRows).
  */
 export function resolveCcrContentStore(
     ccrJson: string | null,
@@ -918,19 +922,14 @@ export function resolveCcrContentStore(
         if (head.ccrSlim === 1) {
             const store = hydrateSlimCcrStore(JSON.parse(ccrJson) as Parameters<typeof hydrateSlimCcrStore>[0], ccrRows);
             if (store === null && ccrRows.length > 0) {
-                loggerLog("warn", `[storage] session=${sessionId}: the content store could not be rebuilt from its ${ccrRows.length} ledger row(s) (a body the content table no longer has, or a key the ledger no longer lists) — the session is loaded without it`);
+                const linkDropped = ccrRows.some((r) => r.origContent === null);
+                loggerLog("warn", `[storage] session=${sessionId}: the content store could not be rebuilt from its ${ccrRows.length} ledger row(s) (${linkDropped
+                    ? "the rows carry no original text — this is what an older build leaves behind after it saved this session; those tool-output and file-read texts cannot be restored"
+                    : "a body the content table no longer has, or a key the ledger no longer lists"}) — the session is loaded without it`);
             }
             return store ?? undefined;
         }
-        const parsed = JSON.parse(ccrJson) as { byRef?: unknown; byHash?: unknown };
-        const healed = refillFullEnvelope(parsed, ccrRows);
-        if (healed.refilled > 0) {
-            loggerLog("warn", `[storage] session=${sessionId}: ${healed.refilled} content-store entr${healed.refilled === 1 ? "y had" : "ies had"} no text in the sessions column — taken back from the ledger (this is what an older build leaves behind after opening this library)`);
-        }
-        if (healed.stillMissing > 0) {
-            loggerLog("error", `[storage] session=${sessionId}: ${healed.stillMissing} content-store entr${healed.stillMissing === 1 ? "y has" : "ies have"} no text in the sessions column nor in the ledger — the content cannot be restored`);
-        }
-        return (healed.store ?? parsed) as LegacyView["contentStore"];
+        return JSON.parse(ccrJson) as LegacyView["contentStore"];
     } catch {
         return undefined;
     }

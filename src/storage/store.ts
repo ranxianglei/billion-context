@@ -23,7 +23,7 @@ import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import { identityOfStoredContent, splitMediaContent } from "./identity.js";
-import { hydrateSlimCcrStore, refillFullEnvelope } from "./slim.js";
+import { hydrateSlimCcrStore } from "./slim.js";
 import {
     egressAppendTurn,
     egressStateAt,
@@ -4286,10 +4286,7 @@ export class UnifiedStore {
             if (parsed && typeof parsed === "object" && parsed.version === 1
                 && parsed.byHash && typeof parsed.byHash === "object"
                 && parsed.byRef && typeof parsed.byRef === "object") {
-                // #7574: the same rollback self-heal as the view leg — a
-                // full column next to ledger rows was rewritten by an older
-                // build without the texts; the ledger still has them.
-                return refillFullEnvelope(parsed, this.getCcrEntries(sessionId)).store ?? parsed;
+                return parsed;
             }
         } catch {
             // fall through: a corrupt mirror degrades to the file path

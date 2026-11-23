@@ -385,20 +385,20 @@ The review of this PR (issue #7574) found gaps in what landed. Everything that c
 
 ### 7.1 Rolling back to an older build
 
-"All new tables are additive" is true for the tables, not for the session. An older build (anything before this PR) reads only the `sessions` row and saves it back without knowing the new tables, so while it runs:
+"All new tables are additive" is true for the tables, not for the session. An older build (anything before this PR) knows only the `sessions` row — not `ccr_entries`, `state_fields` or `orphan_blocks`. While it runs:
 
 - tool outputs and file reads show as `{ hash }` stubs (the `ccr_json` column is hashes-only now, the texts live behind `ccr_entries`);
 - reaped blocks are missing (their contents live in `orphan_blocks`);
 - the nine state fields moved to `state_fields` are missing.
 
-After re-upgrading, the library heals itself when the session is loaded: the texts are taken back from the ledger rows (the older build never touched them), the state fields come back from their rows, the reaped blocks from their table.
+What is left behind depends on whether the older build **saved** that session:
 
-What does **not** come back:
+- **Only read** (no turn on it): nothing on disk changes — after re-upgrading the session is whole again.
+- **Saved at least once** (checked against the real previous build):
+  - the nine state fields come back from their rows and the reaped blocks from their table. A field for which the older build wrote a non-empty value of its own keeps that value (a rule it added stays; a rule it deleted stays deleted);
+  - the tool-output and file-read texts of that session are **gone for good**. The older build parses the hashes-only column as its own store, so its save rewrites the `ccr_entries` rows to the bare `{ hash }` stubs it saw and releases the entry rows — after that no link from the conversation's placeholders to the texts exists anywhere (the text rows themselves are still in the content table, unreferenced). After re-upgrading the session loads **without its content store**. This used to happen silently; it is now one `warn` line per load, naming the cause.
 
-- a state field for which the older build wrote a non-empty value of its own — its value wins (a rule it added stays, a rule it deleted stays deleted);
-- a body the content table no longer has — reported in the log, the session loads without that content store.
-
-Open question for the owner: is this limit acceptable, or should an older build refuse to open a v12 library?
+Decision for the owner (nothing changed here): accept this; or have a newer build keep a copy of that link where an older build does not rewrite it (a side table with the entry and the text digest per key, about 150 bytes per entry); or keep the old full `ccr_json` column for a few releases.
 
 ### 7.2 Big requests with a watermark handshake header
 

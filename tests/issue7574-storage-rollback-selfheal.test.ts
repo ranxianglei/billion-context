@@ -1,25 +1,25 @@
 // #7574 (review of PR #6785) — what happens when an OLDER build (everything
 // before the unified storage landed) opens a library saved by this build.
 //
-// That older build only reads the sessions row. It does not know the
-// content table behind ccr_entries, the state_fields rows or the
-// orphan_blocks table, so it loads a session WITHOUT them and writes the
-// row back without them:
-//   - the slim ccr column becomes a "full" envelope whose entries are
-//     `{ hash }` stubs with no text (tool outputs and file reads showed as
-//     `{ hash }`);
+// That older build only knows the sessions row. It does not know the
+// content-table rows behind ccr_entries, the state_fields rows or the
+// orphan_blocks table, so it loads a session WITHOUT them and its next
+// save leaves this behind (replayed here statement for statement; first
+// observed with the real previous build):
+//   - the slim ccr column round-trips unchanged (it is that build's own
+//     parsed object), but the ledger rows are rewritten to the bare
+//     `{ hash }` stubs the older build saw, without the link to the
+//     original text, and the entry rows are released — the tool-output and
+//     file-read texts of that session are gone for good;
 //   - the nine row-backed state fields are written back as the older
-//     build's defaults (nothing / empty), or with what was added while it
-//     ran.
-// After re-upgrading, this build used to trust the row: the texts stayed
-// gone and every state_fields row was overlaid on the column — so a rule
-// added while the older build ran vanished again.
+//     build's own values (nothing, an empty container, or what was added
+//     while it ran).
+// After re-upgrading, this build used to trust the row silently: the lost
+// content store said nothing, and every state_fields row was overlaid on
+// the column — so a rule added while the older build ran vanished again.
 //
-// The ledger rows survive the rollback (the older build never touches
-// them), so the load path now takes the texts back from there and keeps a
-// state-field value the older build really wrote. Checked here against a
-// real library, with the older build simulated by rewriting the sessions
-// row the way it does.
+// Now: the lost store is reported in the log with its cause, and a
+// state-field value the older build really wrote wins over the row.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -104,77 +104,78 @@ function load(store: UnifiedStore, id: string): ReturnType<typeof loadLegacyView
     return loadLegacyView(rows, store.getCcrEntries(id), store.getStateFields(id));
 }
 
-test("after an older build rewrote the sessions row, tool-output texts come back from the ledger", () => {
-    const dir = mkdtempSync(join(tmpdir(), "rollback-7574-ccr-"));
+function column(raw: ReturnType<typeof openSqliteDatabase>, field: "ccr_json" | "kstate_json"): string {
+    return (raw.db.prepare(`SELECT ${field} AS v FROM sessions WHERE session_id = ?`).get("sess-rb") as { v: string }).v;
+}
+
+/**
+ * The older build's save, statement for statement: the slim column stays
+ * what it is (that build round-trips its own parsed object), every ledger
+ * row now points at the bare `{ hash }` stub that build saw — with no
+ * original — and the entry row it replaced is released.
+ */
+function olderBuildSavesTheSession(raw: ReturnType<typeof openSqliteDatabase>): void {
+    const slim = JSON.parse(column(raw, "ccr_json")) as { ccrSlim: number; byRef: Record<string, { hash: string }> };
+    assert.equal(slim.ccrSlim, 1, "the older build leaves the column alone");
+    const putContent = raw.db.prepare("INSERT OR REPLACE INTO content (hash, byte_len, refcount, bytes) VALUES (?, ?, 1, ?)");
+    const rows = raw.db.prepare("SELECT ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord").all("sess-rb") as { ccr_key: string; content_hash: string }[];
+    raw.db.prepare("PRAGMA foreign_keys = OFF").run();
+    for (const r of rows) {
+        const stub = JSON.stringify(slim.byRef[r.ccr_key]);
+        assert.deepEqual(Object.keys(slim.byRef[r.ccr_key]), ["hash"], "what the older build saw is the bare stub");
+        putContent.run(sha(stub), Buffer.byteLength(stub), Buffer.from(stub, "utf8"));
+        raw.db.prepare("UPDATE ccr_entries SET content_hash = ?, orig_hash = NULL WHERE session_id = ? AND ccr_key = ?").run(sha(stub), "sess-rb", r.ccr_key);
+        raw.db.prepare("DELETE FROM content WHERE hash = ?").run(r.content_hash);
+    }
+}
+
+test("a session the older build only read (never saved) is intact after re-upgrading", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rollback-7574-read-only-"));
     const { store, raw } = open(dir);
-    const logs: string[] = [];
-    setLogCapture((_lvl, m) => { logs.push(m); });
     try {
         store.ingestSession(planIngest(session(fullState(), ccrStore())), undefined, { completeLog: true });
-        assert.equal(store.getCcrEntries("sess-rb").length, 2, "the ledger holds both entries");
-        assert.equal(JSON.parse((raw.db.prepare("SELECT ccr_json AS c FROM sessions WHERE session_id = ?").get("sess-rb") as { c: string }).c).ccrSlim, 1);
-
-        // The older build: it parsed the slim column as a full store, so every
-        // entry is its { hash } stub and byHash is empty — and that is what
-        // it saves.
-        const olderBuildColumn = { version: 1, byHash: {}, byRef: { m00010: { hash: BIG_H }, m00011: { hash: TOOL_H } } };
-        raw.db.prepare("UPDATE sessions SET ccr_json = ? WHERE session_id = ?").run(JSON.stringify(olderBuildColumn), "sess-rb");
-
+        // The older build opens the library and closes it: nothing on disk changes.
         const view = load(store, "sess-rb");
-        assert.ok(view.contentStore, "the store is served");
-        assert.equal(view.contentStore!.byHash[BIG_H], BIG_BODY, "the file-read text is back");
-        assert.equal(view.contentStore!.byHash[TOOL_H], TOOL_JSON, "the tool-output text is back");
-        assert.deepEqual(view.contentStore!.byRef.m00010, FILE_ENTRY, "a pure { hash } stub is replaced by the ledger's full entry");
-        assert.deepEqual(view.contentStore!.byRef.m00011, TOOL_ENTRY);
-        assert.deepEqual(Object.keys(view.contentStore!.byHash).sort(), [BIG_H, TOOL_H].sort(), "nothing else was invented");
-        assert.ok(logs.some((l) => l.includes("sess-rb") && l.includes("2 content-store entries had no text")), `the heal is logged: ${logs.join(" | ")}`);
-        // the direct path gives the same store
-        assert.deepEqual(store.getCcr("sess-rb"), view.contentStore, "getCcr heals the same way");
-
-        // The next save puts the library back in order: slim column, same bytes.
-        store.ingestSession(planIngest(session(fullState(), view.contentStore)), undefined, { completeLog: true });
-        assert.equal(JSON.parse((raw.db.prepare("SELECT ccr_json AS c FROM sessions WHERE session_id = ?").get("sess-rb") as { c: string }).c).ccrSlim, 1, "the column is slim again");
-        assert.deepEqual(store.getCcr("sess-rb")?.byRef, ccrStore().byRef, "and still serves the full entries");
+        assert.equal(view.contentStore!.byHash[BIG_H], BIG_BODY, "the file-read text is there");
+        assert.equal(view.contentStore!.byHash[TOOL_H], TOOL_JSON, "the tool-output text is there");
+        assert.deepEqual(view.contentStore!.byRef.m00010, FILE_ENTRY);
+        assert.deepEqual(store.getCcr("sess-rb"), view.contentStore);
     } finally {
-        setLogCapture(null);
         raw.db.close();
         store.close();
         rmSync(dir, { recursive: true, force: true });
     }
 });
 
-test("an entry the older build really changed is kept as written; an entry nobody has text for is reported, not invented", () => {
-    const dir = mkdtempSync(join(tmpdir(), "rollback-7574-mixed-"));
+test("after the older build saved the session its tool-output texts are gone for good — the session still loads, without a store, and the log says why", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rollback-7574-saved-"));
     const { store, raw } = open(dir);
     const logs: string[] = [];
     setLogCapture((_lvl, m) => { logs.push(m); });
     try {
         store.ingestSession(planIngest(session(fullState(), ccrStore())), undefined, { completeLog: true });
-        const UNKNOWN_H = sha("nobody has this text");
-        raw.db.prepare("UPDATE sessions SET ccr_json = ? WHERE session_id = ?").run(JSON.stringify({
-            version: 1,
-            byHash: {},
-            byRef: {
-                // the older build changed the entry's metadata
-                m00010: { hash: BIG_H, rawId: "renamed-by-the-older-build", kind: "file read", tokens: 5, chars: BIG_BODY.length, head: "BBBBBBBBBB" },
-                // an entry the ledger knows nothing about
-                m00012: { hash: UNKNOWN_H, rawId: "raw-12", kind: "file read" },
-                // an entry whose text the column still has: untouched
-                m00011: { hash: TOOL_H, rawId: "raw-11", kind: "command", tokens: 2, chars: TOOL_JSON.length, head: "{...}" },
-            },
-        }), "sess-rb");
-        // give m00011 its text in the column (an entry written by the older build itself)
-        const col = JSON.parse((raw.db.prepare("SELECT ccr_json AS c FROM sessions WHERE session_id = ?").get("sess-rb") as { c: string }).c) as { byHash: Record<string, string> };
-        col.byHash[TOOL_H] = TOOL_JSON;
-        raw.db.prepare("UPDATE sessions SET ccr_json = ? WHERE session_id = ?").run(JSON.stringify(col), "sess-rb");
+        assert.equal(store.getCcrEntries("sess-rb").length, 2, "the ledger holds both entries");
+        assert.equal(logs.length, 0, `nothing to report before the rollback (log: ${logs.join(" | ")})`);
+
+        olderBuildSavesTheSession(raw);
+        assert.deepEqual(
+            store.getCcrEntries("sess-rb").map((r) => [r.key, r.origContent]),
+            [["m00010", null], ["m00011", null]],
+            "the ledger rows carry the stubs and no original — the link to the texts is gone",
+        );
 
         const view = load(store, "sess-rb");
-        const store2 = view.contentStore!;
-        assert.equal(store2.byHash[BIG_H], BIG_BODY, "the text of a changed entry is still filled in (the content hash is the same)");
-        assert.equal((store2.byRef.m00010 as { rawId: string }).rawId, "renamed-by-the-older-build", "but the entry itself is kept as the older build wrote it");
-        assert.equal(store2.byHash[UNKNOWN_H], undefined, "no text is invented for an unknown entry");
-        assert.equal(store2.byHash[TOOL_H], TOOL_JSON, "an entry whose text the column has is untouched");
-        assert.ok(logs.some((l) => l.includes("1 content-store entry has no text")), `the unrecoverable entry is reported: ${logs.join(" | ")}`);
+        assert.equal(view.contentStore, undefined, "no partial store is invented");
+        assert.ok(
+            logs.some((l) => l.includes("sess-rb") && l.includes("could not be rebuilt from its 2 ledger row(s)") && l.includes("an older build leaves behind")),
+            `the loss and its cause are logged: ${logs.join(" | ")}`,
+        );
+        assert.equal(store.getCcr("sess-rb"), null, "the direct read degrades the same way");
+
+        // The next save by this build clears what the older build left behind.
+        store.ingestSession(planIngest(session(fullState(), view.contentStore)), undefined, { completeLog: true });
+        assert.equal(store.getCcrEntries("sess-rb").length, 0, "no ledger rows without a store");
+        assert.equal(store.getCcr("sess-rb"), null);
     } finally {
         setLogCapture(null);
         raw.db.close();
