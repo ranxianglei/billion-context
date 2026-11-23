@@ -770,10 +770,19 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
     // sharing a 512 KiB prefix apart. Re-noting a byte-identical payload (the
     // non-streaming settle path) reuses the prior slot's count/full instead of
     // re-deriving them.
+    // #7149 batch3-1 (delta anchoring): the byte-identical re-note inherits the
+    // prior digest via a pure byte compare — ZERO hashing on the common path.
+    // Changed/new bodies keep the full-body digest: `bd` is the ground-truth
+    // equality proof (#2131) and the ONLY equality proof once the payload
+    // exceeds BODY_FULL_CAP (nothing is retained), so a delta descriptor cannot
+    // replace it without breaking settle's be decision. View-ID anchoring is
+    // not available here — the send chokepoints hold the wire string, not the
+    // stored canonical views (those live in the storage layer).
     const buf = Buffer.from(body, "utf8");
-    const digest = createHash("sha256").update(buf).digest("hex");
     const transient = pendingCapture(session);
     const prior = transient.sentBody;
+    const sameBytes = prior !== undefined && prior.bytes === buf.byteLength && prior.full !== null && prior.full.equals(buf);
+    const digest = sameBytes ? prior.digest : createHash("sha256").update(buf).digest("hex");
     const samePayload = prior !== undefined && prior.digest === digest;
     transient.sentBody = {
         order: ++captureOrder,
@@ -1040,14 +1049,9 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
                 i++;
                 continue;
             }
-            // String content: hop to the next quote or backslash (native
-            // scans) instead of branching per byte — the bulk of any body.
-            let m = n;
-            const q = body.indexOf(34, i + 1);
-            if (q !== -1 && q < m) m = q;
-            const b = body.indexOf(92, i + 1);
-            if (b !== -1 && b < m) m = b;
-            i = m;
+            // Advance once per byte. Separate delimiter searches would each
+            // rescan the whole remaining body when a delimiter is absent.
+            i++;
             continue;
         }
         if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; i++; continue; }
@@ -1058,14 +1062,8 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
             i++;
             continue;
         }
-        // Inter-token filler (whitespace/commas/colons/literals): hop to the
-        // next structural byte, again natively.
-        let m = n;
-        for (const code of [34, 123, 125, 91, 93]) {
-            const p = body.indexOf(code, i + 1);
-            if (p !== -1 && p < m) m = p;
-        }
-        i = m;
+        // Whitespace, commas, colons and literals need no separate search.
+        i++;
     }
     return null;
 }
@@ -1934,7 +1932,7 @@ export function noteOutboundContextEstimates(
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number; model?: string },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
@@ -1982,6 +1980,17 @@ export function settleUsageReport(
         // it to demote the baseline when the current request routes elsewhere.
         const settleOrigin = normalizeUpstreamOrigin(s.upstream);
         if (settleOrigin !== undefined) session.stats.lastInputTokensOrigin = settleOrigin;
+        // Identity-fast-path: stamp which MODEL measured this baseline — the
+        // gate refuses to trust acceptance evidence across a model switch.
+        // Lanes that settle without an explicit model (streamed plugin pipes)
+        // fall back to metadata.lastModel: prepare re-covers it with the
+        // CURRENT request's model on every request, so in the normal case it
+        // is exactly this request's model (a concurrent interleaving can only
+        // produce one conservative demotion — the safe direction).
+        const stampedModel = typeof s.model === "string" && s.model !== "" ? s.model
+            : typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel
+            : undefined;
+        if (stampedModel !== undefined) session.stats.lastInputTokensModel = stampedModel;
         // #1933 F1: consume the pending pair — the local text estimate of the
         // payload THIS report bills, recorded at prepare time. Same route
         // required. Admitted samples (plausibility band) accumulate in a
@@ -2082,12 +2091,16 @@ export function settleUsageReport(
                         // side would misread the pair as mid. No array locatable
                         // (unparseable body) keeps the conservative pre-fix class.
                         const shorterFull = prevSlot.full.length <= curSlot.full.length ? prevSlot.full : curSlot.full;
-                        const arrClose = messagesArrayCloseOffset(shorterFull);
-                        // #3476: a growing logical unit (single giant message whose interior
-                        // container extends in place) is byte-wise a mid-body insertion but
-                        // semantically an append — recognize it in the would-be-mid slot.
-                        const midInsert = isMidInsertionAppend(prevSlot.full, curSlot.full, lcp);
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : midInsert ? "append" : "mid";
+                        if (lcp >= shorterFull.length - 64) curLine.bs = "append";
+                        else if (lcp < 1024) curLine.bs = "head";
+                        else {
+                            const arrClose = messagesArrayCloseOffset(shorterFull);
+                            // #3476: a growing logical unit (single giant message whose interior
+                            // container extends in place) is byte-wise a mid-body insertion but
+                            // semantically an append — recognize it in the would-be-mid slot.
+                            curLine.bs = arrClose !== null && lcp >= arrClose ? "tail"
+                                : isMidInsertionAppend(prevSlot.full, curSlot.full, lcp) ? "append" : "mid";
+                        }
                     } else {
                         curLine.bs = "unknown";
                     }

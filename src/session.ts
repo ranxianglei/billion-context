@@ -459,6 +459,21 @@ export type Session = {
          *  usage report (one-shot, per the #554 contract) and on compression
          *  reset. Absent on legacy session files → treated as no arm. */
         overflowArmTokens?: number;
+        /** One-shot preflight fold gate — 1 when the session's preflight
+         *  fold attempt was ABORTED by a client disconnect (the livelock
+         *  shape: a 3.5-4 min self-summary cut at the client's ~300s stream
+         *  watchdog, payload never shrinking — 2026-11-22 log-32 incident:
+         *  nine runs, each aborted at exactly +300.0s). The preflight
+         *  trigger (server.ts preflightCompressIfNeeded) forwards as-is once
+         *  this is set or the session carries committed compression
+         *  (state.stats.compressionCount). A fast summary failure (429/400/
+         *  empty) does NOT set it — the #726/#4079 retry contract keeps
+         *  re-running the walk on transient outages. Overflow recovery after
+         *  the shot is spent lives in #1195 in-request refold + the egress
+         *  fuse; steady growth is the model's job via the compress tool
+         *  (nudge path). Persisted; cleared on compression reset.
+         *  Absent on legacy session files → treated as fresh. */
+        preflightRuns?: number;
         /** #3450: completion-channel reservation PROVEN by an upstream-stated
          *  overflow ("N in the completion" billed against the same wall) —
          *  preflight folds against window − reserve because the foldable
@@ -554,6 +569,14 @@ export type Session = {
          *  provider says nothing about whether another accepts the payload.
          *  Absent on legacy session files → baseline keeps legacy behavior. */
         lastInputTokensOrigin?: string;
+         /** Identity-fast-path: the REQUEST MODEL that measured lastInputTokens
+          *  — stamped at usage settlement (settleUsageReport / applyUsageSample)
+          *  and at overflow arming, alongside lastInputTokensOrigin. Acceptance
+          *  evidence on one model says nothing about another model's wall on
+          *  the same origin (#2189: 300k billed on claude-big does not bind
+          *  claude-small). Absent on legacy session files → the gate demotes
+          *  conservatively and the protection chain judges. */
+        lastInputTokensModel?: string;
          /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
           *  consistent same-route samples of (upstream-billed input ÷ local
          *  text estimate), clamped to [0.25, 4] — two-way since #2366: the
@@ -717,6 +740,18 @@ export type Session = {
      *  model keeps re-fetching. Bounded by trimRetrieveCounts; lost on restart
      *  (advisory signal only). */
     retrieveCountsByRef?: Map<string, number>;
+    /** #6522 in-memory only (NOT persisted): the "Uncovered history remains"
+     *  receipt note has already fired in the current nudge-injection cycle.
+     *  The note fires once per cycle — repeating it after every successful
+     *  fold drove models into an infinite compress→note loop (#6522). Each
+     *  ACTUAL nudge injection (nudgeOutcome === "injected", stamped in
+     *  src/server/handle.ts) re-opens the latch: a fresh nudge is a new
+     *  "big enough, compress while you are at it" moment. The same detail
+     *  stays available on demand via acp_status(scope:"uncompressed").
+     *  Lost on restart (at most one extra note). #7318: only read while
+     *  compress.postComPressTail is on; with the recommendation off the note
+     *  never fires and the latch is inert. */
+    uncoveredReceiptNoted?: boolean;
     /** In-memory only (NOT persisted): request-only injections riding the
      *  nudge channel. Since the GHSA jc6g v2 rework, acp_retrieve delivers its
      *  full text in the tool result itself — this carrier now only serves
@@ -957,12 +992,17 @@ export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
     return (stats.localInputEstimate ?? 0) > 0;
 }
 
+/** Last measured usage or bounded overflow evidence, before status fallbacks. */
+export function evidenceInputBaseline(stats: Session["stats"]): number {
+    return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
+        ? stats.lastInputTokens
+        : stats.lastUsageGradeTokens ?? 0;
+}
+
 export function statusInputBaseline(session: Session): number {
     const stats = session.stats;
     if (usageAnchorCycleStale(stats)) return stats.localInputEstimate ?? 0;
-    const baseline = stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
-        ? stats.lastInputTokens
-        : stats.lastUsageGradeTokens ?? 0;
+    const baseline = evidenceInputBaseline(stats);
     return staleSmallAnchorFallback(stats, baseline) ?? baseline;
 }
 
@@ -1786,6 +1826,10 @@ export function resetSessionCompression(session: Session): void {
     // longer bounds this session; drop it so the guard falls back to the
     // declared window instead of clamping to a stale ceiling.
     delete session.stats.overflowArmTokens;
+    // One-shot fold gate: the rebuilt conversation is a fresh lifecycle —
+    // it gets its own first preflight attempt (matches the reset semantics
+    // of the arm and baseline it rides alongside).
+    delete session.stats.preflightRuns;
     // #3450: same boundary — the proven completion reservation described the
     // pre-compaction payload lineage, and the rebuilt conversation re-arms the
     // one-time mismatch warning.
@@ -1802,6 +1846,7 @@ export function resetSessionCompression(session: Session): void {
     // learned against the pre-compaction content class, and the baseline's
     // measuring route no longer bounds this rebuilt session.
     delete session.stats.lastInputTokensOrigin;
+    delete session.stats.lastInputTokensModel;
     delete session.stats.calibratedEstimate;
     delete session.stats.calibratedEstimateOrigin;
     // #2117 B: same boundary — the factor's model provenance dies with it.
