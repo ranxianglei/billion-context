@@ -1485,7 +1485,7 @@ withSessionsDir("subagent dispatch titles fall back to the first block topic", a
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     const s = makeSession(
         "subagent-title",
-        { protocol: "openai", title: `${SUBAGENT_PROMPT_PREFIX}\n你是 JavaScript 课程字幕校对员。` },
+        { protocol: "openai", title: SUBAGENT_PROMPT_PREFIX },
         { requests: 3, inputTokens: 900, cachedTokens: 300, contextTokens: 600 },
     );
     s.state.blocks.push(mkBlock("b1", 1200, true, "JS 字幕校对 151–153"));
@@ -1499,6 +1499,62 @@ withSessionsDir("subagent dispatch titles fall back to the first block topic", a
     assert.ok(row, "subagent session is listed");
     assert.equal(row.firstBlockHint, "JS 字幕校对 151–153");
     assert.equal(row.title, "JS 字幕校对 151–153", "boilerplate title is replaced by the task topic");
+});
+
+withSessionsDir("subagent dispatch title fallback: a normal title is not replaced", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const s = makeSession(
+        "normal-title",
+        { protocol: "openai", title: "Fix the login bug" },
+        { requests: 3, inputTokens: 900, cachedTokens: 300, contextTokens: 600 },
+    );
+    s.state.blocks.push(mkBlock("b1", 1200, true, "JS 字幕校对 151–153"));
+    await store.writeNow(s);
+    store.closeQuietly();
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const list = await buildSessionList();
+    const row = list.find((x) => x.id === "normal-title");
+    assert.ok(row, "session is listed");
+    assert.equal(row.title, "Fix the login bug", "a real title must not be replaced by the block topic");
+});
+
+withSessionsDir("subagent dispatch title fallback: a host-provided title wins", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const s = makeSession(
+        "host-title",
+        { protocol: "openai", title: SUBAGENT_PROMPT_PREFIX, hostTitle: "JS 字幕校对" },
+        { requests: 3, inputTokens: 900, cachedTokens: 300, contextTokens: 600 },
+    );
+    s.state.blocks.push(mkBlock("b1", 1200, true, "JS 字幕校对 151–153"));
+    await store.writeNow(s);
+    store.closeQuietly();
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const list = await buildSessionList();
+    const row = list.find((x) => x.id === "host-title");
+    assert.ok(row, "session is listed");
+    assert.equal(row.title, "JS 字幕校对", "hostTitle outranks the boilerplate fallback");
+});
+
+withSessionsDir("subagent dispatch title fallback: no block topic keeps the stored title", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const s = makeSession(
+        "no-block",
+        { protocol: "openai", title: SUBAGENT_PROMPT_PREFIX },
+        { requests: 3, inputTokens: 900, cachedTokens: 300, contextTokens: 600 },
+    );
+    await store.writeNow(s);
+    store.closeQuietly();
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const list = await buildSessionList();
+    const row = list.find((x) => x.id === "no-block");
+    assert.ok(row, "session is listed");
+    assert.equal(row.title, SUBAGENT_PROMPT_PREFIX, "no hint available: keep the stored title, never blank");
 });
 
 withSessionsDir("#5796: slow-session flag fires at/above threshold and stays off below", async (dir) => {

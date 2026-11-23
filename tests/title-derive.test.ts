@@ -155,19 +155,29 @@ describe("#2286 isAutoInjectedNotification prefix permitlist", () => {
     });
 });
 
-describe("subagent dispatch prompts do not become session titles", () => {
-    const PROMPT = `${SUBAGENT_PROMPT_PREFIX}\n你是 JavaScript 课程字幕校对员。工作目录：D:\\work\\js-course`;
+describe("subagent dispatch prompts: the task after the prefix becomes the title", () => {
+    const TASK = "你是 JavaScript 课程字幕校对员。工作目录：D:\\work\\js-course";
+    const PROMPT = `${SUBAGENT_PROMPT_PREFIX}\n${TASK}`;
 
-    it("skips the machine-written dispatch prompt", () => {
-        assert.equal(deriveTitle([msg("user", "text", PROMPT)]), undefined);
+    it("derives the title from the task after the dispatch prefix", () => {
+        assert.equal(deriveTitle([msg("user", "text", PROMPT)]), TASK);
     });
 
-    it("still derives from a later real user message", () => {
-        const t = deriveTitle([msg("user", "text", PROMPT), msg("user", "text", "continue from 151")]);
+    it("a prefix-only dispatch prompt produces no title", () => {
+        assert.equal(deriveTitle([msg("user", "text", SUBAGENT_PROMPT_PREFIX)]), undefined);
+    });
+
+    it("a prefix-only dispatch prompt does not block a later real user message", () => {
+        const t = deriveTitle([msg("user", "text", SUBAGENT_PROMPT_PREFIX), msg("user", "text", "continue from 151")]);
         assert.equal(t, "continue from 151");
     });
 
-    it("does not skip a real question that merely mentions subagents", () => {
+    it("matches the dispatch prefix case-insensitively", () => {
+        const t = deriveTitle([msg("user", "text", "you are a subagent spawned by another session.\nFix the login bug")]);
+        assert.equal(t, "Fix the login bug");
+    });
+
+    it("does not strip a real question that merely mentions subagents", () => {
         const t = deriveTitle([msg("user", "text", "Why does every subagent spawned by another session show the same title?")]);
         assert.ok(t?.startsWith("Why does every subagent"));
         assert.ok(t?.endsWith("\u2026"));
