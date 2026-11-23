@@ -325,7 +325,7 @@ export const EARLY_HOLD_GATE_MIN_BYTES = 1024 * 1024;
 // #7589: below this total outbound size no single top-level field can be a
 // telemetry-bloat problem, so the per-field size log (and its O(body)
 // re-serialization) is skipped — it only earns its cost on large bodies.
-export const FIELD_SIZE_LOG_MIN_BYTES = 512 * 1024;
+const FIELD_SIZE_LOG_MIN_BYTES = 512 * 1024;
 
 export function tryAnswerEarlyHold(o: {
     method?: string;
