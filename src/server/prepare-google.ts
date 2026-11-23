@@ -43,7 +43,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
-import { recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -162,12 +162,14 @@ export async function prepareGoogle(
         // only — pure proxy traffic has no msgid channel), the SAME gated
         // contract as the openai/anthropic twins. No watermark fast-path on
         // this wire, so there is no `wpHit` skip.
+        let msgidPinned = false;
         if (pluginMode && incomingMsgIds !== undefined) {
             if (featureEnabled("pluginLaneServerHistory")) {
                 const v = validateMsgIds(incomingMsgIds, msgs.length);
                 if (v.ok) {
                     msgs = applyMsgIdPin(msgs, v.ids);
                     originalMessages = msgs;
+                    msgidPinned = true;
                 } else {
                     log("warn", `[${sessionId}] [msgid] google-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#6525)`);
                 }
@@ -390,11 +392,15 @@ export async function prepareGoogle(
         // seam (egress-lane-io), POST-kernel: the swapped core becomes the
         // outbound rebuild and the recorded bytes. Unreadable flow → hard
         // fail.
+        // #7574: the swap (server authority) is armed by the ONE shared rule
+        // (egressAuthorityArmed — same as the OpenAI lane). Every other main
+        // turn is only recorded.
         if (!isTitleGen && featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             if (st) {
-                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log });
-                const served = recordAuthorityTurn(st, sessionId, auth, laneCoreForRecord, googleOutboundSystem ?? googleClientSystem, log);
+                const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinned, sideRequest: isTitleGen });
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
+                const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log);
                 if (served !== null) {
                     rebuiltContents = coreToGoogle(served, { model });
                 }

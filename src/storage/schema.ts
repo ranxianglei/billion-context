@@ -431,9 +431,11 @@ CREATE TABLE IF NOT EXISTS state_fields (
  *  outbound conversation (B base / I insert / D delete-range / U
  *  update-content; anchors are msgids, never positions). DUAL TABLES:
  *  egress_state is what serving reads and compaction physically trims below
- *  the watermark; egress_flow is append-only and never deleted (any op_seq
- *  stays reconstructible — rollback is based on this table, not on client
- *  resends). SELF-CONTAINED BYTES (ruling 7439-1): the `bytes` column holds
+ *  the watermark; egress_flow is the record — compaction trims it below the
+ *  watermark as well (#7574: it used to keep every row AND gain one full
+ *  snapshot per fold, so a long session grew without bound), so every op_seq
+ *  from the newest base on stays reconstructible — rollback is based on this
+ *  table, not on client resends. SELF-CONTAINED BYTES (ruling 7439-1): the `bytes` column holds
  *  the message's final core JSON for I/U rows — no hash refs, no content
  *  table; replay needs only this table pair. TWO SEQUENCES (ruling 7439,
  *  canonical message number): op_seq orders EVERY row (the primary key);

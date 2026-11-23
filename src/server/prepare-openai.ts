@@ -62,7 +62,8 @@ interface EgressRecordSourceMsg {
     text?: unknown;
 }
 import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
-import { resolveEgressAuthority } from "./egress-lane-io.js";
+import { resolveEgressAuthority, egressAuthorityArmed } from "./egress-lane-io.js";
+import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
@@ -173,6 +174,7 @@ export async function prepareOpenai(
     // :coreToOpenai chain) — the shadow comparison target for serve-from-log.
     let legacyCoreElements: unknown = undefined;
     let egressBaseRows: EgressViewRow[] | null = null;
+    let egressBaseSeq = 0;
     let egressSwapApplied = false;
     let egressBootstrap = false;
     let egressArmed = false;
@@ -361,7 +363,7 @@ export async function prepareOpenai(
         // Bootstrap: an armed turn with an EMPTY flow is the turn-1 cold start
         // the ruling allows — the client bytes enter the flow exactly once
         // (the record below), from turn 2 the log is the content source.
-        egressArmed = featureEnabled("egressPlane") && pluginMode && !isTitleGen && s0.pinned !== null;
+        egressArmed = egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: isTitleGen });
         if (egressArmed) {
             // The single shared authority seam (egress-lane-io): latch,
             // recover, hard-fail, bootstrap / swap / legacy — one code path
@@ -371,8 +373,9 @@ export async function prepareOpenai(
             // array (egressRecordSource), diffed against auth.base.
             const st = getStore().egressOpLogStore();
             if (st) {
-                const auth = resolveEgressAuthority({ session, st, sessionId, core: msgs, log });
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: msgs, log, armed: true });
                 egressBaseRows = auth.base;
+                egressBaseSeq = auth.baseSeq;
                 egressBootstrap = auth.bootstrapping;
                 if (auth.swappedCore !== null) {
                     msgs = auth.swappedCore;
@@ -699,6 +702,7 @@ export async function prepareOpenai(
                         store: st,
                         sessionId,
                         prev: egressBaseRows ?? undefined,
+                        baseSeq: egressBaseSeq,
                         conversation: egressMessages,
                         systemText: openaiOutboundSystem,
                         nowMs: Date.now(),
@@ -956,13 +960,18 @@ export async function prepareOpenai(
                     store: st,
                     sessionId,
                     prev: egressBaseRows ?? undefined,
+                    baseSeq: egressBaseSeq,
                     conversation: egressRecordSource ?? (processedMessages.length > 0 ? processedMessages : originalMessages),
                     systemText: openaiOutboundSystem ?? openaiSystemText,
                     nowMs: Date.now(),
                 });
             }
         } catch (err) {
-            log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
+            if (err instanceof EgressConcurrentWriteError) {
+                log("warn", `[${sessionId}] egress op-log recording skipped this turn (another request on this session recorded first): ${String(err)}`);
+            } else {
+                log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
+            }
         }
     }
     // #7398 seg 4a: SHADOW comparison — rebuild the outbound core portion

@@ -25,15 +25,16 @@ import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.
 import { identityOfStoredContent, splitMediaContent } from "./identity.js";
 import { hydrateSlimCcrStore, refillFullEnvelope } from "./slim.js";
 import {
-    egressStateAppend,
+    egressAppendTurn,
     egressStateAt,
-    egressStateCompact,
-    egressStateView,
+    egressStateBaseSeq,
+    egressStateRead,
     egressFork,
     EgressStateCorruptError,
     type EgressOp,
     type EgressViewRow,
 } from "./egress-state.js";
+import { featureEnabled } from "../rollout.js";
 import {
     snapL1Record,
     snapR3LatchedRead,
@@ -1673,7 +1674,11 @@ export class UnifiedStore {
             const msgidBoundsForCovered = (payloadJson: string): [string | null, string | null] => {
                 if (egressPos === null) {
                     try {
-                        egressPos = new Map(this.snapEgressPinLiveIds(s.sessionId).map((id, i) => [id, i] as const));
+                        // #7574: coordinates come from the op log only while
+                        // the plane is ON (see snapPinLiveIds).
+                        egressPos = featureEnabled("egressPlane")
+                            ? new Map(this.snapEgressPinLiveIds(s.sessionId).map((id, i) => [id, i] as const))
+                            : new Map();
                     } catch {
                         egressPos = new Map();
                     }
@@ -2078,7 +2083,7 @@ export class UnifiedStore {
      *  order (the pin's 0-based index ⇔ position contract); the constant system
      *  row is not part of the msgid ledger. */
     snapEgressPinLiveIds(sid: string): string[] {
-        const view = egressStateView(this.db, sid);
+        const view = egressStateRead(this.db, sid);
         return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map((r) => r.msgid);
     }
 
@@ -2086,18 +2091,28 @@ export class UnifiedStore {
      *  authorities — the egress op log when the session has one, the messages
      *  rows otherwise (identical output for every non-egress session). A
      *  corrupt op log degrades to the messages ledger: the tail-overlap check
-     *  then mismatches and takes the full signal — never a reject. */
+     *  then mismatches and takes the full signal — never a reject.
+     *
+     *  #7574: the op log is the ledger only while the plane is ON for this
+     *  install. Once it is switched off nothing maintains the log, while the
+     *  first full ingest after the switch rebuilds the messages projection —
+     *  so an off install that kept reading the log would answer every pin
+     *  from a view frozen at the switch. Off = the messages ledger, exactly
+     *  as on an install that never ran the plane. */
     snapPinLiveIds(sid: string): string[] {
-        try {
-            const view = egressStateView(this.db, sid);
-            if (view.length > 0) {
-                return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map((r) => r.msgid);
+        if (featureEnabled("egressPlane")) {
+            try {
+                const view = egressStateRead(this.db, sid);
+                if (view.length > 0) {
+                    return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map((r) => r.msgid);
+                }
+            } catch {
+                // EgressStateCorruptError — degrade to the messages ledger below.
             }
-        } catch {
-            // EgressStateCorruptError — degrade to the messages ledger below.
         }
         return this.snapMsgIdLiveIds(sid);
     }
+
 
     /** #6181 M3: whether this sid's R3 breaker latch PERSISTED from a
      *  previous process (a restart must not re-arm a misbehaving host and
@@ -2166,21 +2181,22 @@ export class UnifiedStore {
      *  src/storage/egress-state.ts (dual table: bounded state + total flow).
      *  Corruption throws EgressStateCorruptError — callers degrade the whole
      *  session to the legacy full path (never a partial view). */
-    egressStateAppendOps(sessionId: string, ops: EgressOp[], nowMs: number): number[] {
-        return egressStateAppend(this.db, sessionId, ops, nowMs);
+    /** Record one turn (guarded, validated, appended, compacted — one
+     *  transaction; src/storage/egress-state.ts egressAppendTurn). */
+    egressAppendTurn(sessionId: string, ops: EgressOp[], baseSeq: number, nowMs: number): EgressViewRow[] {
+        return egressAppendTurn(this.db, sessionId, ops, nowMs, { baseSeq });
     }
 
+    /** The serving read: state replay + comparison with the log; a damaged
+     *  state COPY is rebuilt from the flow. Only a flow that does not replay
+     *  throws EgressStateCorruptError. */
     egressStateView(sessionId: string): EgressViewRow[] {
-        return egressStateView(this.db, sessionId);
+        return egressStateRead(this.db, sessionId);
     }
 
-    /** Rollback reconstruction at any log_seq (flow table is total). */
+    /** Rollback reconstruction at any op_seq at or above the newest base. */
     egressStateViewAt(sessionId: string, logSeq: number): EgressViewRow[] {
         return egressStateAt(this.db, sessionId, logSeq);
-    }
-
-    egressStateCompactView(sessionId: string, view: EgressViewRow[], nowMs: number): number {
-        return egressStateCompact(this.db, sessionId, view, nowMs);
     }
 
     egressStateMaxSeq(sessionId: string): number {
@@ -2190,10 +2206,20 @@ export class UnifiedStore {
         return Number(row.mx) || 0;
     }
 
+    /** op_seq of the newest base row (0 = the session has none). */
+    egressStateBaseSeq(sessionId: string): number {
+        return egressStateBaseSeq(this.db, sessionId);
+    }
+
     egressStateTruncateAfter(sessionId: string, opSeq: number): number {
-        const a = this.db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND op_seq > ?`).run(sessionId, opSeq);
-        const b = this.db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?`).run(sessionId, opSeq);
-        return Number(a.changes) + Number(b.changes);
+        // #7574: one step — two separate DELETEs could leave the state
+        // truncated and the flow not (a crash between them), which the
+        // twin check would then report as corruption on every read.
+        return this.db.transaction(() => {
+            const a = this.db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND op_seq > ?`).run(sessionId, opSeq);
+            const b = this.db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?`).run(sessionId, opSeq);
+            return Number(a.changes) + Number(b.changes);
+        });
     }
 
     /** Ruling 7439 (fork = whole-table copy): copy the parent's entire egress
@@ -2211,8 +2237,10 @@ export class UnifiedStore {
      *  rows) — there is no content-CAS to release. Runs inside the caller's
      *  sweep transaction. */
     deleteEgressOps(sessionId: string): void {
-        this.db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sessionId);
-        this.db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(sessionId);
+        this.db.transaction(() => {
+            this.db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(sessionId);
+        });
     }
 
 

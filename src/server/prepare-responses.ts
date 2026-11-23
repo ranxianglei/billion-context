@@ -54,7 +54,7 @@ import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, 
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, egressTinyBudget, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -544,7 +544,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // (trigger/prompt form) are transient, like title-gen, and are not
         // recorded nor served.
         let laneCore = processedMessages;
-        if (!isCompactionTrigger && featureEnabled("egressPlane")) {
+        // #7574: the swap (server authority) is armed by the ONE shared rule
+        // (egressAuthorityArmed — same as the OpenAI lane). Every other main
+        // turn is only recorded.
+        const egressSide = isCompactionTrigger || egressTinyBudget(parsed);
+        if (!egressSide && featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 // The single shared authority seam (egress-lane-io),
@@ -553,8 +557,9 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 // parts (the developer block is injected below and rebuilt
                 // live every turn — recording it would churn the system
                 // row). Unreadable flow → hard fail.
-                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCore, log });
-                const served = recordAuthorityTurn(st, sessionId, auth, laneCore, projection.systemParts.join("\n\n"), log);
+                const armed = egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: egressSide });
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCore, log, armed });
+                const served = recordAuthorityTurn(st, sessionId, auth, projection.systemParts.join("\n\n"), log);
                 if (served !== null) laneCore = served;
             }
         }
