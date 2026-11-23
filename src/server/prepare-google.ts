@@ -109,7 +109,11 @@ export async function prepareGoogle(
     // Title-generation requests (tiny budget) get no compress tooling — same
     // heuristic and same prefix-cache rationale as prepareOpenai.
     const isTitleGen = maxTokens <= 200;
-    const shouldInject = opts.compress.injectTool && !isTitleGen;
+    // zed cloud wire: the response is NDJSON byte-passthrough, so an in-stream
+    // acp loop is structurally unreachable (same reasoning as DSH #3177) — the
+    // model-side compress surface (tools + standing prompt + nudge) is off.
+    const zedLane = req.headers["x-bili-zed-lane"] !== undefined;
+    const shouldInject = opts.compress.injectTool && !isTitleGen && !zedLane;
     const injectTools = shouldInject && !pluginMode;
     // #3417: surface gating lives in lane-decisions (observed reachability
     // overrides the dsh default, #3401); alias kept for the remaining reads.
