@@ -346,3 +346,16 @@ test("C#4107-2 (fixed #4210): close fragment at chunk boundary is split-invarian
   const split = run([t.slice(0, 49), t.slice(49)]);
   assert.equal(whole, split, "#4107-2 regressed: chunk split diverged again");
 });
+// #7604: DEAD_REF_CLOSE matches the whole refs RUN against an unterminated
+// close — the leading refs of a multi-ref dead-close run are residue by
+// construction (a run is never prose, #2023), so they die with the unit in
+// one sweep. This control pins the strip the P5 exclusion used to paper
+// over; P1 covers the same shape family's split invariance.
+test("C#7604: multi-ref dead-close run dies whole in one sweep", () => {
+  const t = "angle < not a tag\nm00001 m00002</acp\n\u{1F4E6} [ACP] Compressed m00120\u2013m0300 \u2192 1 block(s)";
+  const s1 = stripAcpTags(t);
+  assert.ok(!s1.includes("</acp"), `dead close survived — out=${JSON.stringify(s1)}`);
+  assert.ok(!s1.includes("m00001") && !s1.includes("m00002"), `run residue survived — out=${JSON.stringify(s1)}`);
+  assert.ok(s1.includes("angle < not a tag"), "prose lost");
+  assert.equal(stripAcpTags(s1), s1, "not a fixed point");
+});
