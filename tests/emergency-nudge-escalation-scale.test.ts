@@ -27,10 +27,22 @@ function makeNudge(contextUsage: number): NudgeDecision {
             },
         ],
         breakdown: {
+            usage: contextUsage,
+            growth: 0,
+            growthReference: 0,
+            effectiveThreshold: 0,
+            nudgeGrowthTokens: 0,
+            growthFloor: 0,
+            hasPendingNudge: 0,
+            overLimit: 0,
+            emergencyOverride: 0,
+            pendingT1: 0,
+            pendingT2: 0,
+            pendingT3: 0,
             maxPending: 5_000,
             minPressureBenefit: 1_000,
         },
-    } as unknown as NudgeDecision;
+    };
 }
 
 function makeSession(): Session {

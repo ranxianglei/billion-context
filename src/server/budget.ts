@@ -497,7 +497,10 @@ export function emergencyNudgeForConfig(
  * Kernel-driven injections (nudge.shouldInject=true) never pass through here —
  * call sites OR them in BEFORE the emergency arm, so normal cadence is
  * untouched. State lives in session.metadata.emergencyNudgeGate (survives
- * restarts with the snapshot, visible on /__bili/sessions like selfHeal). */
+ * restarts with the snapshot, visible on /__bili/sessions like selfHeal).
+ * The escalation line is config-aware (#7605): resolveEmergencyEscalationPct
+ * keeps the default 0.70 and tracks maxContextLimitPct - 0.05 once an operator
+ * raises the over-limit line above the 0.75 default. */
 export function emergencyNudgeArmed(
     session: Session,
     nudge: NudgeDecision | null | undefined,
