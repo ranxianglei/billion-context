@@ -28,6 +28,7 @@ import {
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
 import { recordRequestedMode } from "./storage/runtime-status.js";
+import { runOnlineBackup } from "./storage/online-backup.js";
 import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
@@ -2352,20 +2353,24 @@ export class SessionStore {
     }
 
     /** #4175: online consistent snapshot of the unified store (VACUUM INTO,
-     *  sqlite only). Default destination lives beside the archive dir so a
-     *  backups/ tree grows in one place: sessionsDir/backups/index-<ts>.db. */
-    unifiedBackup(dst?: string): { ok: boolean; path?: string; bytes?: number; error?: string } {
+     *  sqlite only). Runs in a worker thread so the proxy's event loop stays
+     *  free for the whole copy (#7561: a synchronous VACUUM INTO froze
+     *  /__bili/health and in-flight requests for ~46 s on a 1.5 GB store, and
+     *  a health-probing supervisor killed bili mid-backup). Default destination
+     *  lives beside the archive dir so a backups/ tree grows in one place:
+     *  sessionsDir/backups/index-<ts>.db. */
+    async unifiedBackup(dst?: string): Promise<{ ok: boolean; path?: string; bytes?: number; error?: string }> {
         if (!this.shadow || this.shadow.stats.disabled) return { ok: false, error: "unavailable" };
-        try {
-            const target = dst ?? join(this.sessionsDir, "backups", `index-${new Date().toISOString().replace(/[:.]/g, "-")}.db`);
-            const bytes = this.shadow.backupInto(target);
-            this.log("info", `[persist] unified backup written: ${target} (${bytes} bytes)`);
-            return { ok: true, path: target, bytes };
-        } catch (err) {
-            const error = String(err);
-            this.log("warn", `[persist] unified backup failed: ${error}`);
-            return { ok: false, error };
+        const dbPath = this.shadow.dbFilePath;
+        if (!dbPath) return { ok: false, error: "unavailable" };
+        const target = dst ?? join(this.sessionsDir, "backups", `index-${new Date().toISOString().replace(/[:.]/g, "-")}.db`);
+        const result = await runOnlineBackup(dbPath, target);
+        if (result.ok) {
+            this.log("info", `[persist] unified backup written: ${result.path} (${result.bytes} bytes)`);
+        } else {
+            this.log("warn", `[persist] unified backup failed: ${result.error}`);
         }
+        return result;
     }
 
     /** #3928: read-only prediction of unifiedGc for `bili storage gc --dry-run`.

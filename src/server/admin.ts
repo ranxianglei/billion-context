@@ -660,7 +660,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 return;
             }
             const dst = typeof parsed.dst === "string" && parsed.dst.length > 0 ? parsed.dst : undefined;
-            const result = store.unifiedBackup(dst);
+            // #7561: async — VACUUM INTO runs in a worker thread, so the proxy
+            // (and /__bili/health) keep answering for the whole copy.
+            const result = await store.unifiedBackup(dst);
             log("info", `[admin] POST /__bili/storage/backup — ok=${result.ok} path=${result.path ?? "-"} bytes=${result.bytes ?? 0}`);
             res.writeHead(result.ok ? 200 : 409, { "content-type": "application/json" });
             res.end(JSON.stringify(result));
