@@ -10,10 +10,9 @@ test("#7587 lists top-level field sizes and marks transport-only DSH fields", ()
         dsh_plugin_packages: "{}",
     });
 
-    assert.ok(line);
-    assert.match(line, /messages=2B/);
-    assert.match(line, /dsh_session_log=2KB \(non-prompt\)/);
-    assert.match(line, /dsh_plugin_packages=4B \(non-prompt\)/);
+    // Exact format pinned: prompt fields carry NO marker, dsh_* fields carry
+    // exactly one (both directions of the #7587 gate).
+    assert.equal(line, "messages=2B, tools=2B, dsh_session_log=2KB (non-prompt), dsh_plugin_packages=4B (non-prompt)");
 });
 
 test("#7587 stays silent for bodies that have no top-level object fields", () => {

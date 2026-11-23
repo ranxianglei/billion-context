@@ -979,9 +979,9 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     const wireBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : wireBody.byteLength;
     if (opts.debug || wireBytes >= 1024 * 1024) {
         try {
-            const wireText = typeof wireBody === "string" ? wireBody : Buffer.from(wireBody).toString("utf8");
+            const wireText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
             const sizes = formatForwardFieldSizes(JSON.parse(wireText));
-            if (sizes) log("info", `[forward] field sizes: ${sizes}`);
+            if (sizes) log("info", `[${prepared?.session.id ?? "passthrough"}] [forward] field sizes: ${sizes}`);
         } catch { /* non-JSON bodies keep the existing behavior */ }
     }
     try {
