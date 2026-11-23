@@ -87,6 +87,7 @@ import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
+import { epochConfirmPending } from "./fold-reconcile.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -4166,7 +4167,16 @@ export async function preflightCompressIfNeeded(
     // stays with #1195 in-request refold and the egress fuse, and
     // steady-state growth is the model's job via the compress tool
     // (nudge path) — not another proxy-side multi-minute summary.
-    const compressionCommitted = (session.state.stats?.compressionCount ?? 0) > 0;
+    // #3641/#6069 epoch exception: while the epoch-confirm latch is pending,
+    // the resent history shares nothing with the fold substrate (wholesale
+    // replacement) — the committed folds belong to the REPLACED epoch and are
+    // suspended exactly like folding itself (preflight pauses/resumes on the
+    // same latch, src/preflight.ts). The new epoch gets its own one-shot
+    // attempt: its spent state is re-armed at the latch site (fold-reconcile),
+    // and once the new fold commits the latch clears on the first clean pass,
+    // so this gate blocks again on the fresh committed count.
+    const epochReplaced = epochConfirmPending(session);
+    const compressionCommitted = !epochReplaced && (session.state.stats?.compressionCount ?? 0) > 0;
     const preflightSpent = (session.stats.preflightRuns ?? 0) > 0;
     if (compressionCommitted || preflightSpent) {
         if (!preflightGateBlockedLogged.has(session.id)) {
