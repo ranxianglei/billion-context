@@ -1,18 +1,24 @@
-// #7439/#6884 trust-stamped-id (server-side, gated).
+// #7525 trust-stamped-id — GA (characterization of the post-retirement
+// resolver, 2026-11-23 owner ruling).
 //
-// With the flag ON, the persona-order resolver's |sub: CONTENT-forecasting
-// (derived-aux / derived-task / persona-lane-by-content) is retired for
-// id-bearing traffic: the stamped session id IS the complete identity, so the
-// retired forks ride the verbatim raw id instead of forking. The ONE survivor
-// is the #5095 client-DECLARED subagent lane-token tail, which still forks —
-// it is a declared distinct lane, not a content guess.
+// The stamped session id IS the complete identity: the resolver rides it
+// verbatim, unconditionally. The content-evidence ladder that used to sit
+// under it — the |sub:aux / |sub:<fp> / |sub:task:<skel8> fork lanes, their
+// recorded skeletons (#3397 persistence), the tag-change migration rungs
+// (#2241/#4778/#5686), the #5719 msgid rescue — and the
+// BILI_ROLLOUT_TRUST_STAMPED_ID=0 escape hatch are all retired: under the
+// GA flag every one of those exits was dead code for stamped traffic, so
+// they are gone from src/session-resolve.ts along with it. Reverting to
+// fork-lane behavior is a git-level operation now.
 //
-// The flag is forced ON for this whole file. node --test gives each file its
-// own process, so this env never leaks into the OFF characterization corpus in
-// tests/issue2944-neutral-skeleton.test.ts (which pins the byte-identical
-// legacy forks). Hermetic roots are set here because a directly-invoked single
-// file does NOT get tests/preload-test-env.mjs.
+// The ONE survivor is the #5095 client-DECLARED subagent lane-token tail,
+// which still forks — it is a declared distinct lane, not a content guess.
+//
+// The resolver is a pure function (no in-memory skeletons), so there is no
+// state to reset between tests. Hermetic roots are set here because a
+// directly-invoked single file does NOT get tests/preload-test-env.mjs.
 import assert from "node:assert";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
@@ -25,78 +31,68 @@ process.env.XDG_CACHE_HOME = path.join(XDG, "cache");
 process.env.XDG_CONFIG_HOME = path.join(XDG, "config");
 process.env.BILI_PERSIST = "0";
 process.env.NODE_ENV = "test";
-process.env.BILI_ROLLOUT_TRUST_STAMPED_ID = "1";
 
-const { resolveSessionOrder, resetSessionOrderForTest } = await import("../src/session-resolve.ts");
+const { resolveSessionOrder, personaConversationOrder } = await import("../src/session-resolve.ts");
 
-type Msg = { role: string; content: string };
-/** Alternating user/assistant turns, ~120 chars each (same shape as the
- *  legacy-corpus helper). */
-function msgs(n: number, tag = "m"): Msg[] {
-    const out: Msg[] = [];
-    for (let i = 0; i < n; i++) {
-        const role = i % 2 === 0 ? "user" : "assistant";
-        out.push({ role, content: `${tag} #${i} — body with enough prose to be a realistic cell ${"x".repeat(80)}` });
-    }
-    return out;
-}
-
-test("trust-stamped-id ON: first-sight shallow side request rides the verbatim id (no |sub:aux fork)", () => {
-    resetSessionOrderForTest();
-    // A lone user turn (no assistant, no persona tag): the legacy ladder forks
-    // this onto `aux-id|sub:aux`; trusted, it rides the stamped id verbatim.
-    const r = resolveSessionOrder("aux-id", [
-        { role: "user", content: "start a side thing, please be brief " + "z".repeat(80) },
-    ]);
+test("stamped id rides verbatim on first sight (no |sub:aux fork)", () => {
+    // A lone side request used to fork onto `aux-id|sub:aux` under the legacy
+    // ladder; trusted, it rides the stamped id verbatim.
+    const r = resolveSessionOrder("aux-id");
     assert.equal(r.key, "aux-id");
-    assert.equal(r.action, "claim");
+    assert.equal(r.action, "raw");
 });
 
-test("trust-stamped-id ON: growth under a claimed id continues verbatim (no fork)", () => {
-    resetSessionOrderForTest();
-    resolveSessionOrder("grow-id", msgs(6, "seed"));
-    const r = resolveSessionOrder("grow-id", msgs(10, "seed"));
-    assert.equal(r.key, "grow-id");
-    assert.equal(r.action, "continue");
-});
-
-test("trust-stamped-id ON: a divergent/shorter stranger order rides the verbatim id (no |sub:task fork)", () => {
-    resetSessionOrderForTest();
-    // Seed a main-shaped 10-turn skeleton, then a shorter, different-content
-    // history under the same id that tail-aligns by alternation but whose
-    // fragments do NOT match: the legacy ladder forks it onto
-    // `task-id|sub:task:<skel8>` (id-reuse guard); trusted, it re-anchors to
-    // the stamped id.
-    resolveSessionOrder("task-id", msgs(10, "seed"));
-    const r = resolveSessionOrder("task-id", msgs(4, "other"));
+test("a divergent/shorter stranger order rides the verbatim id (no |sub:task fork)", () => {
+    // The legacy id-reuse guard forked shorter divergent histories onto
+    // `task-id|sub:task:<skel8>`; GA rides the stamped id either way.
+    const r = resolveSessionOrder("task-id");
     assert.equal(r.key, "task-id");
+    assert.equal(r.action, "raw");
 });
 
-test("trust-stamped-id ON: a persona tag+shape drift re-anchors the verbatim id (no |sub:<fp> persona fork)", () => {
-    resetSessionOrderForTest();
-    const claim = resolveSessionOrder("persona-id", msgs(6, "a"), "You are the pre-upgrade assistant persona.");
-    assert.equal(claim.action, "claim", "old persona claims the raw id");
-    // "Upgrade": the host now replays fewer turns AND sends a different tag —
-    // the legacy ladder forks this onto `persona-id|sub:<fp>` (the #5844
-    // incident shape); trusted, it re-anchors to the stamped id.
-    const r = resolveSessionOrder("persona-id", msgs(4, "b"), "You are the post-upgrade assistant persona, with a completely different system prompt.");
-    assert.equal(r.key, "persona-id");
-    assert.equal(r.action, "reanchor");
+test("persona-tag changes never fork anymore (#2241/#4778/#5686 retired)", () => {
+    assert.equal(resolveSessionOrder("conv").key, "conv");
+    assert.equal(resolveSessionOrder("conv", "a completely different persona text").key, "conv");
+    assert.equal(resolveSessionOrder("conv", undefined).action, "raw");
+    // GA drift pin (master d904b4e1, the #5844 incident shape): a SHORTER
+    // replay under a brand-new persona tag — the legacy ladder forked this
+    // onto persona-id|sub:<fp16(tag)>; under GA the id rides verbatim
+    // (history shape is not a resolver input, tag drift alone never forks).
+    assert.equal(
+        resolveSessionOrder("persona-id", "You are the post-upgrade assistant persona, with a completely different system prompt.").key,
+        "persona-id",
+    );
 });
 
-test("trust-stamped-id ON: the #5095 lane-token tail STILL forks (the declared-lane survivor)", () => {
-    resetSessionOrderForTest();
+test("the #5095 lane-token tail STILL forks (the declared-lane survivor)", () => {
     // The token value the resolver sees is the BARE 12-hex (handle.ts extracts
     // it via claudeSubagentLaneTokenOf → claudeLaneTokenIn, which strips the
-    // `bili-lane-token:` marker). isClaudeLaneToken matches exactly /^[0-9a-f]{12}$/.
+    // `bili-lane-token:` marker). isClaudeLaneToken matches /^[0-9a-f]{12}$/.
     const token = "001122334455";
-    // The token is a client-declared subagent dispatch (handle.ts extracts it
-    // from the dispatch's first user message and passes it as the 5th arg).
-    // A declared distinct lane must survive the flag and fork — it is not a
-    // content guess. No persona tag is passed, so the key takes the two-segment
-    // form `<id>|sub:t:<token>`.
-    const r = resolveSessionOrder("sub-id", msgs(6, "seed"), undefined, undefined, token);
+    // No persona tag: the key takes the two-segment form `<id>|sub:t:<token>`.
+    const r = resolveSessionOrder("sub-id", undefined, token);
     assert.equal(r.action, "derived-persona");
-    assert.ok(r.key.startsWith("sub-id|sub:"), `expected a |sub: lane-token tail, got ${r.key}`);
-    assert.ok(r.key.endsWith(`t:${token}`), `expected the token tail, got ${r.key}`);
+    assert.equal(r.key, `sub-id|sub:t:${token}`);
+    // With a persona tag: byte-identical to the pre-retirement lane-key shape,
+    // so persisted per-dispatch sessions keep their keys across the upgrade.
+    const fp = (s: string): string => createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16);
+    const r2 = resolveSessionOrder("sub-id", "You are a Claude agent...", token);
+    assert.equal(r2.key, `sub-id|sub:${fp("You are a Claude agent...")}:t:${token}`);
+});
+
+test("a malformed token is ignored → verbatim id (sanitizer)", () => {
+    const r = resolveSessionOrder("sub-id", "some persona", "zzz-not-hex!!");
+    assert.equal(r.key, "sub-id");
+    assert.equal(r.action, "raw");
+});
+
+test("personaConversationOrder is the wire adapter used by handle.ts", () => {
+    const seen: string[] = [];
+    const raw = personaConversationOrder("conv", undefined, undefined, (id, r) => {
+        seen.push(`${r.action}:${r.key}`);
+    });
+    assert.equal(raw, "conv");
+    assert.deepEqual(seen, ["raw:conv"], "the raw path still notifies (the handle's observer filters it to silence)");
+    const tok = "abcdef123456";
+    assert.equal(personaConversationOrder("conv", undefined, tok), `conv|sub:t:${tok}`);
 });
