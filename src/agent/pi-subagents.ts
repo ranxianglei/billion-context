@@ -48,7 +48,7 @@ import { logHostEvent } from "./host-log.js";
  *  subagents.agentOverrides.<name>.tools (a string array) in settings.json. */
 const NATIVE_STAND_DOWN_MESSAGE = buildStandDownMessage(
   "pi-subagents' agents do NOT get ACP context compression by default. To give them compress/decompress/search_context/acp_status, add those tool names to subagents.agentOverrides.<name>.tools (a string array) in settings.json.",
-  'To keep acp_delegate despite pi-subagents being installed, set "pi": { "subagents": { "forceEnable": true } } in billion-context.json.',
+  'To keep acp_delegate despite pi-subagents being installed, set "pi": { "subagents": { "forceEnable": true } } in billion-context.json. If you have chosen pi-subagents and do not need acp_delegate, set "pi": { "subagents": false } to disable it and silence this warning.',
 );
 
 /** The four bili pi-plugin slash commands ownable via `pi.commands`. */

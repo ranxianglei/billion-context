@@ -248,6 +248,10 @@ test("project-scope pi-subagents install stands acp_delegate down (#415)", async
     const warning = ctx.ui.notifications[0][0];
     assert.ok(!warning.includes("/acp-subagents"), `native stand-down warning must not reference the non-existent /acp-subagents command, got: ${warning}`);
     assert.ok(warning.includes("agentOverrides"), "native stand-down warning points at the agentOverrides workaround");
+    // The warning also offers the "disable acp_delegate entirely" end state for
+    // users who have chosen pi-subagents: `pi.subagents: false` gates the
+    // stand-down check on policy.enabled, so it silences the warning.
+    assert.ok(warning.includes('"subagents": false'), `native stand-down warning offers the "pi.subagents: false" disable option, got: ${warning}`);
 });
 
 // The user scope resolves through PI_CODING_AGENT_DIR, not HOME (os.homedir()
