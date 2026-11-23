@@ -650,3 +650,10 @@ entries:
     desc_ja: "傍受された接続の TLS ハンドシェイクタイムアウト。"
     site_en: "<code>mitm.handshakeTimeoutMs</code> — TLS handshake timeout (default 10000)."
     site_zh: "<code>mitm.handshakeTimeoutMs</code> —— TLS 握手超时（默认 10000）。"
+  - key: handoff.reveal
+    type: boolean
+    default: "true"
+    group: behavior
+    desc_en: "After the web panel's handoff .md export writes the file to the OS Downloads folder, reveal it in the file manager (explorer /select on Windows, open -R on macOS, xdg-open <dir> elsewhere). A reveal failure (headless host, no file manager) never fails the export — the file is still written and its path shown in the toast. Set false for headless/bot profiles (#7233)."
+    desc_zh: "Web 面板交接 .md 导出把文件写入系统 Downloads 后，在文件管理器中定位该文件（Windows explorer /select、macOS open -R、其他平台 xdg-open <dir>）。无法打开文件管理器（无头环境、无文件管理器）时导出不会失败——文件照常写入，toast 显示路径。无头/机器人配置设为 false（#7233）。"
+    desc_ja: "Web パネルの引き継ぎ .md エクスポートがファイルを OS の Downloads に書き込んだ後、ファイルマネージャーで表示します（Windows は explorer /select、macOS は open -R、その他は xdg-open <dir>）。表示できない場合（ヘッドレス、ファイルマネージャーなし）でもエクスポートは失敗せず、ファイルは書き込まれ、パスがトーストに表示されます。ヘッドレス/ボットプロファイルでは false に設定します（#7233）。"
