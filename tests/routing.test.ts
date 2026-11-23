@@ -74,6 +74,9 @@ test("lookupContextLimit returns known windows", () => {
     assert.equal(lookupContextLimit("gpt-5"), 400_000);
     assert.equal(lookupContextLimit("o1-preview"), 200_000);
     assert.equal(lookupContextLimit("gemini-2.5-pro"), 1_000_000);
+    assert.equal(lookupContextLimit("gemini-3-pro"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-4-neon-xhigh"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-4-hydrogen-xhigh"), 1_048_576);
     assert.equal(lookupContextLimit("glm-4.6"), 128_000);
     assert.equal(lookupContextLimit("glm-4.5-air"), 200_000);
     assert.equal(lookupContextLimit("deepseek-chat"), 1_000_000);
