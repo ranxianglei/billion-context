@@ -7,7 +7,7 @@ import tls from "node:tls";
 import net from "node:net";
 import { once } from "node:events";
 import http from "node:http";
-import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm, noteMitmTlsError, _resetCertRejectionWarningForTest, recordBlindTunnel, getBlindTunnelStats, _resetBlindTunnelStatsForTest } from "../src/mitm.js";
+import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm, noteMitmTlsError, _resetCertRejectionWarningForTest, recordBlindTunnel, getBlindTunnelStats, _resetBlindTunnelStatsForTest, recordMitmHandshakeReject, getMitmHandshakeRejectStats, _resetMitmHandshakeRejectStatsForTest } from "../src/mitm.js";
 import { ensureRootCA, rootCaPath, getSecureContext, mintHostCert, _resetForTest } from "../src/ca.js";
 import { _resetDiscoveryCacheForTest } from "../src/discover.js";
 import { setMaskHostsEnabled } from "../src/log-mask.js";
@@ -455,4 +455,97 @@ test("noteMitmTlsError: non-cert TLS errors (reset/close) do NOT trigger the CA 
     noteMitmTlsError("api.anthropic.com", 443, "read ECONNRESET", log);
     assert.equal(logs.filter((l) => l.includes("REJECTED the MITM certificate")).length, 0);
     assert.equal(logs.length, 2, "raw TLS error lines still logged");
+});
+
+// #7585: a client whose TLS stack ignores the ambient trust bundle (Hermes
+// 0.22.6-0.23.3 on macOS) resets the connection mid-handshake WITHOUT a TLS
+// alert — the alert-based warning above never fires, so these failures used to
+// be a wall of info-level lines with zero diagnosis.
+test("recordMitmHandshakeReject: counts per host and warns exactly once per host for non-alert errors (#7585)", () => {
+    _resetMitmHandshakeRejectStatsForTest();
+    const logs: string[] = [];
+    const log = (msg: string) => { logs.push(msg); };
+    recordMitmHandshakeReject("chatgpt.com", "read ECONNRESET", log);
+    recordMitmHandshakeReject("chatgpt.com", "read ECONNRESET", log);
+    recordMitmHandshakeReject("api.openai.com", "other side closed", log);
+    const stats = getMitmHandshakeRejectStats();
+    assert.equal(stats.total, 3);
+    assert.deepEqual(stats.hosts, { "chatgpt.com": 2, "api.openai.com": 1 });
+    const warnings = logs.filter((l) => l.includes("HANDSHAKE REJECT"));
+    assert.equal(warnings.length, 2, `one warning per distinct host, got ${warnings.length}`);
+    assert.match(warnings[0], /SSL_CERT_FILE/, "warning must name the known trust-bundle case");
+    assert.match(warnings[0], /NO_PROXY/, "warning must name the operator opt-out");
+    assert.match(warnings[0], /root-ca\.pem/, "warning must point at the root CA file path");
+    // Public host (chatgpt.com) appears verbatim; a private host stays masked.
+    assert.ok(warnings[0].includes("chatgpt.com"), "public host visible by default");
+    recordMitmHandshakeReject("relay.internal", "read ECONNRESET", log);
+    const privateWarning = logs.filter((l) => l.includes("HANDSHAKE REJECT")).at(-1);
+    assert.ok(privateWarning, "private host gets its own first-time warning");
+    assert.ok(!privateWarning.includes("relay.internal"), "private host must stay masked");
+    assert.match(privateWarning, /<private-host>/);
+});
+
+test("recordMitmHandshakeReject: TLS-alert errors count but do not add a second warning (#7585)", () => {
+    _resetMitmHandshakeRejectStatsForTest();
+    const logs: string[] = [];
+    const log = (msg: string) => { logs.push(msg); };
+    recordMitmHandshakeReject("api.anthropic.com", "ssl/tls alert certificate unknown", log);
+    recordMitmHandshakeReject("api.anthropic.com", "ssl/tls alert unknown ca", log);
+    const stats = getMitmHandshakeRejectStats();
+    assert.equal(stats.total, 2, "alert-based rejections are handshake failures too");
+    assert.deepEqual(stats.hosts, { "api.anthropic.com": 2 });
+    assert.equal(logs.filter((l) => l.includes("HANDSHAKE REJECT")).length, 0, "the alert case keeps noteMitmTlsError's specific warning only");
+});
+
+await test("setupMitm: logs the effective MITM whitelist at lane start (#7585)", async () => {
+    await withTmpCa(async () => {
+        const logs: string[] = [];
+        const server = http.createServer((_req, res) => { res.writeHead(500); res.end(); });
+        setupMitm(server, ["foo.example"], (msg) => { logs.push(msg); });
+        const line = logs.find((l) => l.startsWith("mitm active: effective whitelist ="));
+        assert.ok(line, "whitelist line must be logged at setup");
+        assert.match(line, /api\.anthropic\.com/, "built-in default present");
+        assert.match(line, /api\.openai\.com/, "built-in default present");
+        assert.match(line, /chatgpt\.com/, "built-in default present");
+        assert.match(line, /foo\.example/, "configured extra present");
+        server.close();
+        server.closeAllConnections?.();
+    });
+});
+
+await test("setupMitm e2e: client that aborts the handshake without a TLS alert is counted + warned once (#7585)", async () => {
+    await withTmpCa(async () => {
+        _resetMitmHandshakeRejectStatsForTest();
+        const logs: string[] = [];
+        const server = http.createServer((_req, res) => { res.writeHead(500); res.end(); });
+        setupMitm(server, [], (msg) => { logs.push(msg); });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const port = (server.address() as { port: number }).port;
+        try {
+            for (let i = 0; i < 2; i++) {
+                const { statusLine, socket } = await rawConnect(port, "127.0.0.1", "chatgpt.com:443");
+                assert.match(statusLine, /^HTTP\/1\.1 200/);
+                // No ClientHello at all, then a hard reset — the truststore
+                // signature: the server's TLSSocket errors mid-handshake without
+                // any TLS alert from the client.
+                socket.resetAndDestroy();
+            }
+            // The server-side error event is async; poll the counter with a bound.
+            const deadline = Date.now() + 3000;
+            while (getMitmHandshakeRejectStats().total < 2 && Date.now() < deadline) {
+                await new Promise((r) => setTimeout(r, 10));
+            }
+            const stats = getMitmHandshakeRejectStats();
+            assert.equal(stats.total, 2, `each aborted handshake must be counted, got ${JSON.stringify(stats)}`);
+            assert.deepEqual(stats.hosts, { "chatgpt.com": 2 });
+            assert.equal(logs.filter((l) => l.includes("HANDSHAKE REJECT")).length, 1, "warning fires once per host, not per event");
+            assert.ok(logs.some((l) => l.includes("chatgpt.com") && l.includes("HANDSHAKE REJECT")), "public host named in the warning");
+            assert.equal(logs.filter((l) => l.includes("TLS error")).length, 2, "raw TLS error line stays per event");
+        } finally {
+            server.close();
+            server.closeAllConnections?.();
+            _resetMitmHandshakeRejectStatsForTest();
+        }
+    });
 });

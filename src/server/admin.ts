@@ -15,7 +15,7 @@ import { detectCostAdvisories } from "../plugin-advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath, logRetentionStatus } from "../logger.js";
 import { logGenerations } from "../log-retention.js";
-import { getBlindTunnelStats } from "../mitm.js";
+import { getBlindTunnelStats, getMitmHandshakeRejectStats } from "../mitm.js";
 import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { configDir, defaultLogFile } from "../paths.js";
@@ -312,7 +312,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // operators can see whether this proxy dies with its sessions (armed)
         // or outlives them all (daemon squatting a stable port).
         const aux = auxProxyShot(opts);
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), auxProxy: aux.proxy, auxProxySource: aux.source, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), mitmHandshakeRejects: getMitmHandshakeRejectStats(), auxProxy: aux.proxy, auxProxySource: aux.source, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
@@ -1393,7 +1393,7 @@ function sendStats(res: http.ServerResponse): void {
         };
     });
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
+    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), mitmHandshakeRejects: getMitmHandshakeRejectStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
 }
 
 /** #2152: the `advisory` field exposed by BOTH /__bili/status and /__bili/overview —
@@ -1527,6 +1527,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
         notices: mergedNotices(process.env, remoteAnnouncementPayloads()),
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
+        mitmHandshakeRejects: getMitmHandshakeRejectStats(),
         conflicts: summarizeConflicts(listSessions()),
         passthrough: { enabled: !!opts.passthrough, source: opts.passthroughSource },
         alerts: getUpstreamAlerts(),
