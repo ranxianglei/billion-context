@@ -123,20 +123,26 @@ test("default: the #2383 emergency digest regime is OFF — unconvergent extreme
     try {
         assert.equal(process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST, undefined, "test premise: the opt-in env is unset (default)");
         // 60 msgs x 32k chars ~= 1.92M chars — deliberately BELOW the 2MB
-        // doomed-probe byte floor (src/server.ts: the fail-fast 413 fires at
-        // coreTextBytes > max(2MB, window×7.5)) and below the fresh-parallel
-        // bound only via the identified-session gate: this session carries a
-        // header (so it is NOT "fresh" — baselineKnown), no blocks, ~20x the
-        // 24k window under the token regime — past the 19.2x coverage bound.
+        // doomed-probe byte floor (src/server.ts: coreTextBytes > max(2MB,
+        // window×7.5); pre-#7537 that gate answered a local 413, now it is an
+        // evidence logger) and below the fresh-parallel bound only via the
+        // identified-session gate: this session carries a header (so it is NOT
+        // "fresh" — baselineKnown), no blocks, ~20x the 24k window under the
+        // token regime — past the 19.2x coverage bound.
         // With digest default-off, that combination is a STRUCTURAL exhaustion:
         // the ladder cannot converge inside client patience (#2383) and an
         // established session this size is the lost-blocks symptom — so the
-        // verdict is deterministic with ZERO summarization calls, and the
-        // untrusted session gets the terminal non-retryable 413 (#2847).
-        // (The old 80×32k = 2.56MB size tripped the byte floor and answered 413
-        // before preflight, pinning nothing about this gate.) Same size as the
-        // e2e scenario A below, which pins the opt-in side (env=1): zero
-        // summarization calls + digest blocks — a clean A/B of the default flip.
+        // verdict is deterministic with ZERO summarization calls. This session
+        // has no proven upstream wall (first request, no usage sample), so per
+        // #7537 the request FORWARDS and the upstream's own size verdict is
+        // authoritative — the pin here is the zero-ladder property (exactly one
+        // call, the forward itself; on master with digest on the same request
+        // converges with digest blocks instead), not a local refusal.
+        // (The old 80×32k = 2.56MB size tripped the pre-#7537 byte floor and
+        // answered 413 before preflight, pinning nothing about this gate.)
+        // Same size as the e2e scenario A below, which pins the opt-in side
+        // (env=1): zero summarization calls + digest blocks — a clean A/B of
+        // the default flip.
         const mark = calls.length;
         const r = await fetch(url, {
             method: "POST",
@@ -144,11 +150,9 @@ test("default: the #2383 emergency digest regime is OFF — unconvergent extreme
             body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(60, 32_000) }),
         });
         const body = await r.text();
-        assert.equal(r.status, 413,
-            `structural fast-fail: beyond the coverage bound with digest off, an untrusted session gets the terminal non-retryable 413 (#2847) without burning the ladder (got ${r.status}); body: ${body.slice(0, 400)}`);
-        assert.match(body, /exceeds the window|coverage bound/, "the failure names an over-window structural verdict (the #554 measured-body guard may answer with its own wording ahead of the preflight detail)");
-        assert.ok(!body.includes("\"retryable\":true"), "the 413 is non-retryable (terminal for retry-looping hosts)");
-        assert.ok(calls.length === mark, "zero upstream calls — no summarization, no forward (structural exhaustion, not ladder exhaustion)");
+        assert.equal(r.status, 200,
+            `structural fast-fail with no proven upstream wall forwards per #7537 without burning the ladder (got ${r.status}); body: ${body.slice(0, 400)}`);
+        assert.equal(calls.length, mark + 1, "exactly one upstream call — the forward itself; the structural verdict fires BEFORE the 32-call ladder (#2383's minutes-long burn is gone)");
         assert.ok(!body.includes("[deterministic digest"), "no digest artifacts in the answer");
 
         const s = listSessions().find((x) => x.id === "emg-default-off");
