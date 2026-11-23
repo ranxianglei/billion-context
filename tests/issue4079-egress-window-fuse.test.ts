@@ -214,8 +214,15 @@ test("e2e #5000 (#7537): a body whose mass rides tools[] is FORWARDED — the me
         assert.equal(r.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
         assert.equal(r.headers.get("x-bili-retryable"), "false", "non-retryable — the tools[] mass won't change on retry");
         // THE behavior under test: the payload WAS forwarded — the measured
-        // tier is now an evidence logger, not a judge (#7537).
-        assert.equal(calls.length, 1, `upstream must see exactly one call (got ${JSON.stringify(calls)})`);
+        // tier is now an evidence logger, not a judge (#7537). With the #2383
+        // emergency digest default-OFF (#7549), a fresh-session first resend this
+        // size may spend a few small (sub-1MB) summarization calls on the core
+        // text during preflight before the forward — so pin the shape: exactly
+        // one call carries the full tools-mass body, and everything before it is
+        // small.
+        const forwardedFull = calls.filter((c) => c.bytes >= 1_000_000);
+        assert.equal(forwardedFull.length, 1, `upstream must see the full tools-mass body exactly once (got calls: ${JSON.stringify(calls.map((c) => c.bytes))})`);
+        assert.ok(calls.slice(0, calls.length - 1).every((c) => c.bytes < 1_000_000), `only small summarization calls may precede the forward (got calls: ${JSON.stringify(calls.map((c) => c.bytes))})`);
     } finally {
         await close();
         rmrf(root);
