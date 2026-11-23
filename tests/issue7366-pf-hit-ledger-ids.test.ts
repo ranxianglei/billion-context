@@ -4,7 +4,7 @@
 // tail fragment is re-converted by openaiToCore. Pre-fix, snapshotMessages
 // took wpHit.windowCores (fresh h_… ids) and ingest (INSERT OR IGNORE on
 // (session_id, seq) — msg_id write-once) wrote h_… into the ledger for
-// every post-seed row. The next turn's KDD#21 tail-overlap check then
+// every post-seed row. The next turn's KDD#22 tail-overlap check then
 // compared declared host ids against h_… rows → guaranteed drift → the
 // session was locked into permanent full/incremental alternation and the
 // tail-only steady state was unreachable.
@@ -126,7 +126,7 @@ test("pinned watermark-HIT turns ledger the DECLARED tail ids (#7366)", async ()
                 "seed rows carry the declared host ids",
             );
 
-            // Turn 2: +1 message, KDD#21 tail form (count + anchor/new ids).
+            // Turn 2: +1 message, KDD#22 tail form (count + anchor/new ids).
             // Must be a fastpath HIT — and the NEW row must land with the
             // declared id, not a content-hash mint.
             logs.length = 0;

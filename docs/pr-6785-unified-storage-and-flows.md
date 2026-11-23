@@ -11,7 +11,7 @@ It turns the two O(full) paths — "recompute the outbound view from scratch eve
 
 | Block | Proposal / origin | Switch (default) |
 |---|---|---|
-| ~~① Snapshot base v2~~ (fold journal + egress-snapshot + scope-rev) | #5874 v2 / #7064 slimming | **RETIRED by this PR** (bc51c9445, 7439 ruling): the plane never shipped — replaced wholesale by the round-2 op log (`egress_state`/`egress_flow`, KDD #22); its stage-0 identity ledger (L1 world / pf pin) stays, but `storage.snapBase.*` is GONE from the config surface — a leftover `snapBase` key in your config is a dead key (ignored) |
+| ~~① Snapshot base v2~~ (fold journal + egress-snapshot + scope-rev) | #5874 v2 / #7064 slimming | **RETIRED by this PR** (bc51c9445, 7439 ruling): the plane never shipped — replaced wholesale by the round-2 op log (`egress_state`/`egress_flow`, KDD #23); its stage-0 identity ledger (L1 world / pf pin) stays, but `storage.snapBase.*` is GONE from the config surface — a leftover `snapBase` key in your config is a dead key (ignored) |
 | ② Outbound op-log (egress_state/egress_flow + rebuild-serve + server authority) | Discussion #7398/#7439 | `egressPlane` (0) — ONE switch for the whole new path |
 | ③ Full-resend watermark + delta tail slice | #5403/#5418 + this PR | `pluginFullResendWatermark` (5) / `pluginDeltaResend` (0) |
 | ④ Incremental msgid pin (tail-ids tail form) | #7064 §8 | `pluginMsgIdIncremental` (**100**, on by default from this PR) |
@@ -336,7 +336,7 @@ Construction = the user scenario's plugin shape: client history grows from 1 mes
 - The compact B row ≈8MB @ 100k rows vs the "few-KB per turn" red line: a design-declared exception (#7398 §5); to hold the red line strictly, the B row could become a "range reference + anti-forgery fingerprint" (the #7064 l1_world demotion idea), at the cost of losing the state table's self-contained replay closure — needs an owner ruling.
 - After an archive restore the egress op-log restarts empty (the next turn re-appends the full +I view — correct, but one full batch).
 
-## 6. Round 2 — ruling 7439-2 (KDD #22): the op log as sole canonical, lazy projection, window re-anchor (2026-11-22)
+## 6. Round 2 — ruling 7439-2 (KDD #23): the op log as sole canonical, lazy projection, window re-anchor (2026-11-22)
 
 > Round-2 work landed on the same branch after the §1–§5 snapshot. Where this section and earlier sections conflict, THIS section wins.
 
@@ -352,12 +352,12 @@ Root cause of the pre-fix growing-session latency (ep3 ON 5697 ms/turn @ 100k): 
 
 Fix: `planIngestReanchor` + the `ingestSession` re-anchor txn branch. Per window row, ONE indexed `(session_id, msg_id, identity)` probe: existing rows **keep their seq** (identity-stability invariant; byte-hash + retired_at checks), new rows land at `MAX(seq)+1`, #6947 ref backfill; `anchored === 0` or a stored-`tail_json` mismatch → the branch declines and the full path runs UNCHANGED. O(window) point lookups ≈ ms; the full path remains the universal fallback.
 
-### 6.3 P2b/P2b-ext: the egress-on session's messages projection goes LAZY (KDD #22)
+### 6.3 P2b/P2b-ext: the egress-on session's messages projection goes LAZY (KDD #23)
 
 For sessions with `metadata.egressAuthority === true` (and `egressPlane` on):
 
 - **No per-turn unified ingest**: `ingestRowsNow` and the debounced unified legs early-return — the `messages` table is demoted to a **lazy projection** for these sessions (rebuilt one-time O(n) on plane rollback / web read / replica restore). Boot after restart still comes from the op log (`recoverEgressBase`), not from the projection.
-- **Pin channel reads the op log**: the KDD #20/#21 pin ledger (tail-overlap / live-id re-stamp) for egress-on sessions resolves from `egress_flow` I rows (msgid + log_seq) instead of the messages ledger (`snapPinLiveIds` shim). Wire unchanged.
+- **Pin channel reads the op log**: the KDD #21/#21 pin ledger (tail-overlap / live-id re-stamp) for egress-on sessions resolves from `egress_flow` I rows (msgid + log_seq) instead of the messages ledger (`snapPinLiveIds` shim). Wire unchanged.
 - **Envelope frozen at bootstrap** (`d28d9ff3a`): no per-turn read+rewrite of the 15.5MB growing session JSON (kernel refs are never pruned — messageRefs 10MB + tsStamps 5.5MB at 100k); the frozen route must keep the resident fields unthinned (`9183ea817`, #4788 D2) or the pinned turn 502s.
 - **Verification**: the egress probe (flow vs client sample) is the SOLE drift verifier for egress-on sessions — `BatchedViewVerification` is off for them (`13b9baae2`): the client-vs-canonical leg would only measure the known server-wins divergence (ruling 7439-5) and re-latch drift forever.
 - Flow-corruption semantics: HARD FAIL, no projection fallback for outbound — flow and messages die together anyway (flow independence, ruling 7439-2 §2).

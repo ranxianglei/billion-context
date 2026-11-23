@@ -208,14 +208,14 @@ test("watermark: envelope re-render without rawTail never rides the delta (#2960
 
             // Stale-convergence path shape: record(disk) with NO rawTail, the
             // envelope's folded re-render presenting the SAME identities in a
-            // DIFFERENT order and the same length. The #7474 reanchor (KDD #22,
+            // DIFFERENT order and the same length. The #7474 reanchor (KDD #23,
             // "OFF 臂同受益") now rides here — byte-equivalent to the full path
             // (same served view, same watermark) — so the served view must
             // follow the envelope render order, not the stale raw ordering.
             const envRender = [msgs[0], carrier, msgs[1], msgs[2]];
             legacy = mkLegacy("wm-render", envRender);
             shadow.record(legacy);
-            assert.equal(stats(shadow).deltaIngests, 1, "envelope render rides the reanchor delta (#7474 KDD #22)");
+            assert.equal(stats(shadow).deltaIngests, 1, "envelope render rides the reanchor delta (#7474 KDD #23)");
             const served = view(store, "wm-render");
             assert.ok(served.lastMessages);
             assert.deepEqual(served.lastMessages.map((m) => m.id), ["h_msg0", "acp_summary_b1", "h_msg1", "h_msg2"], "served view must follow the envelope render order");
@@ -238,15 +238,15 @@ test("watermark: delta survives a fold (holes above the trusted tip)", () => {
             assert.equal(stats(shadow).deltaIngests, 0);
 
             // Fold: m2..m5 collapse into a new summary message; the tail
-            // SHRINKS below the trusted length — the #7474 reanchor (KDD #22)
+            // SHRINKS below the trusted length — the #7474 reanchor (KDD #23)
             // rides (byte-equivalent to the full path), and the summary lands
             // ABOVE the surviving old rows (abs 8).
             const summary = { id: "h_summary", role: "user", contentType: "text", text: "summary of 2..5" } as CoreMessage;
             const tail1 = [tail0[0], tail0[1], summary, tail0[6], tail0[7]];
             shadow.record(mkLegacy("wm-fold", tail1));
-            assert.equal(stats(shadow).deltaIngests, 1, "fold rides the reanchor delta (#7474 KDD #22)");
+            assert.equal(stats(shadow).deltaIngests, 1, "fold rides the reanchor delta (#7474 KDD #23)");
             const mark1 = store.ingestWatermark("wm-fold");
-            assert.ok(mark1, "reanchor re-establishes the watermark at the fold (#7474 KDD #22)");
+            assert.ok(mark1, "reanchor re-establishes the watermark at the fold (#7474 KDD #23)");
             assert.deepEqual(mark1.tailSeqs, [0, 1, 8, 6, 7], "tail pointers carry the holes verbatim");
             assert.equal(mark1.seq, 7, "watermark = seq of the LAST tail message, not the max");
 

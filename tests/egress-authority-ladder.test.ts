@@ -125,7 +125,7 @@ test("egress-lane-io: authority seam records first, then serves the written view
         assert.ok(t1 !== null, "a bootstrap turn serves the client core");
         assert.deepEqual(t1.map((m) => m.id), ["m1", "m2"], "core rows only — the system row stays out");
         assert.equal(t1[0].text, "alpha");
-        assert.equal(session.metadata["egressAuthority"], true, "the KDD#22 latch is set on the first armed turn");
+        assert.equal(session.metadata["egressAuthority"], true, "the KDD#23 latch is set on the first armed turn");
         const rowsBefore = H.db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(S) as { n: number };
         // turn 2 (swapped): unchanged echo + ONE new message — the served
         // core must already contain this turn's message (record-first), and

@@ -626,7 +626,7 @@ export function evaluateDeltaResend(
     const rawStamp = req.headers[PF_COUNT_HEADER];
     const T = typeof rawStamp === "string" && /^\d+$/.test(rawStamp.trim()) ? parseInt(rawStamp.trim(), 10) : NaN;
     if (!Number.isInteger(T) || T < 1) return reanchor("no-count");
-    // The body carries the NEW elements [stampT .. T-1] ONLY (KDD#21 wire:
+    // The body carries the NEW elements [stampT .. T-1] ONLY (KDD#22 wire:
     // tail-ids carry anchor+new, the body carries what the client is appending).
     // L = T - stampT; the anchor is element stampT-1, already in the ledger.
     const L = T - seed.stampT;

@@ -2,7 +2,7 @@
 
 > 范围:`2026-11-15_msgid-snapshot-unified` @ `39941c816`(base `origin/master` `b10c1a0d4`)。
 > 134 文件 +13740/−367。本文是本 PR 的**审查级**完整梳理:四部分(表结构 / 实现逻辑 / 数据流转 / 开关)+ 实测验证 + 本轮发现与修复。行号均指 head 处源码。
-> **第 2 轮(owner 裁定 7439-2,KDD #22,2026-11-22)已落在同一分支、晚于本快照**——op log 正史编号、窗口 re-anchor delta、messages 惰性投影与常驻性能门。见 **§6**(与本文件 §1.2 egress DDL 草图、§5.4 遗留项冲突处以 §6 为准)。
+> **第 2 轮(owner 裁定 7439-2,KDD #23,2026-11-22)已落在同一分支、晚于本快照**——op log 正史编号、窗口 re-anchor delta、messages 惰性投影与常驻性能门。见 **§6**(与本文件 §1.2 egress DDL 草图、§5.4 遗留项冲突处以 §6 为准)。
 
 
 ---
@@ -13,7 +13,7 @@
 
 | 块 | 提案/来源 | 开关(默认) |
 |---|---|---|
-| ~~① 快照底座 v2~~(fold 日志 + egress_snapshot + scope-rev) | #5874 v2 / #7064 瘦身 | **本 PR 已退役**(bc51c9445,7439 裁定):平面从未上线——被 round-2 op log(`egress_state`/`egress_flow`,KDD #22)整体取代;stage-0 身份账本(L1 world / pf pin)保留,但 `storage.snapBase.*` 已从配置面**移除**——你配置里残留的 `snapBase` 键是死键(被忽略) |
+| ~~① 快照底座 v2~~(fold 日志 + egress_snapshot + scope-rev) | #5874 v2 / #7064 瘦身 | **本 PR 已退役**(bc51c9445,7439 裁定):平面从未上线——被 round-2 op log(`egress_state`/`egress_flow`,KDD #23)整体取代;stage-0 身份账本(L1 world / pf pin)保留,但 `storage.snapBase.*` 已从配置面**移除**——你配置里残留的 `snapBase` 键是死键(被忽略) |
 | ② 出站 op-log(egress_state/egress_flow + 重建 serve + 服务端权威) | 讨论区 7398/7439 | `egressPlane`(0)——整条新链路的**唯一开关** |
 | ③ 全量重发水位 + delta 尾切片 | #5403/#5418 + 本 PR | `pluginFullResendWatermark`(5)/ `pluginDeltaResend`(0) |
 | ④ 增量 msgid pin(tail-ids 尾形态) | #7064 §8 | `pluginMsgIdIncremental`(**100**,本 PR 起默认开) |
@@ -338,7 +338,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 - 压实 B 行 ≈8MB @10w 行 vs "每轮新增存储几 K" 红线:设计自认的例外(7398 §5);若要彻底守住红线,可把 B 行改成"区间引用+防伪指纹"(#7064 对 l1_world 的降级思路),代价是失去"状态表独立可重放"的封闭性——需 owner 裁定。
 - 归档恢复后 egress op-log 从空重启(下一轮全量 +I 重建,正确但有一次全批)。
 
-## 6. 第 2 轮——裁定 7439-2(KDD #22):op log 唯一正史、惰性投影、窗口 re-anchor(2026-11-22)
+## 6. 第 2 轮——裁定 7439-2(KDD #23):op log 唯一正史、惰性投影、窗口 re-anchor(2026-11-22)
 
 > 第 2 轮工作落在同一分支、晚于 §1–§5 快照。本节与前面章节冲突时,以本节为准。
 
@@ -354,12 +354,12 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 
 修复:`planIngestReanchor` + `ingestSession` re-anchor 事务分支。每窗口行一次索引点查 `(session_id, msg_id, identity)`:已存在行**保持原 seq**(身份稳定性不变量;字节 hash + retired_at 校验),新行落在 `MAX(seq)+1`,#6947 ref 回填;`anchored === 0` 或存储 `tail_json` 不符 ⇒ 分支让位,全量路径原样执行。O(窗口) 点查 ≈ 毫秒;全量路径仍是通用兜底。
 
-### 6.3 P2b/P2b-ext:egress-on 会话的 messages 投影惰性化(KDD #22)
+### 6.3 P2b/P2b-ext:egress-on 会话的 messages 投影惰性化(KDD #23)
 
 对 `metadata.egressAuthority === true`(且 `egressPlane` 开)的会话:
 
 - **不再逐轮统一 ingest**:`ingestRowsNow` 与防抖统一腿早退——这些会话的 `messages` 表降级为**惰性投影**(平面回滚 / web 读 / 副本恢复时一次性 O(n) 重建)。重启后的引导仍走 op log(`recoverEgressBase`),不走投影。
-- **pin 通道读 op log**:KDD #20/#21 pin 账本(尾重叠 / 活 id 重盖)在 egress-on 会话上改从 `egress_flow` I 行(msgid + log_seq)解析,不经 messages 账本(`snapPinLiveIds` shim)。wire 不变。
+- **pin 通道读 op log**:KDD #21/#21 pin 账本(尾重叠 / 活 id 重盖)在 egress-on 会话上改从 `egress_flow` I 行(msgid + log_seq)解析,不经 messages 账本(`snapPinLiveIds` shim)。wire 不变。
 - **信封在 bootstrap 冻结**(`d28d9ff3a`):不再逐轮读+写 15.5MB 的会话 JSON(kernel refs 永不裁剪——10w 时 messageRefs 10MB + tsStamps 5.5MB);冻结路由必须保持常驻字段不被裁剪(`9183ea817`,#4788 D2),否则 pinned 轮 502。
 - **校验**:egress 探针(flow vs 客户端抽样)是 egress-on 会话唯一的漂移校验器——`BatchedViewVerification` 对它们关闭(`13b9baae2`):客户端 vs 正史那条腿只会量到已知的服务端赢分歧(裁定 7439-5),并把 drift 永远锁死。
 - flow 损坏语义:硬失败,出站无投影兜底——flow 与 messages 同生共死(flow 独立性,裁定 7439-2 §2)。

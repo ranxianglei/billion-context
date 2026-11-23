@@ -2,7 +2,7 @@
 // snapshot is the ~2-row tail WINDOW — a verified suffix of the ledger, NOT
 // the complete log. If that save claims rawness, the #3285
 // authoritative-set sweep retires every prefix row the window omits,
-// draining the msgid pin ledger (snapMsgIdLiveIds) to the window: the KDD#21
+// draining the msgid pin ledger (snapMsgIdLiveIds) to the window: the KDD#22
 // tail form then degrades to the full form every turn (full id list in the
 // body, full validation, path=full ingest) and the "唯一 id 事实源"
 // oscillates between 100k live rows and the 2-row window.

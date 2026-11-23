@@ -15,7 +15,7 @@
 //      pre-kernel, so the swap becomes kernel input; Anthropic/
 //      Responses/Google: post-kernel, so the swap becomes the outbound
 //      core + the recorded bytes). Sets the `egressAuthority` latch
-//      (KDD#22 benefit chain), hard-fails (EgressAuthorityRejectError +
+//      (KDD#23 benefit chain), hard-fails (EgressAuthorityRejectError +
 //      `egressFlowUnreadable` latch) when there is NO healthy flow point,
 //      and classifies the turn:
 //        bootstrapping — empty flow (turn-1 cold start): client bytes are

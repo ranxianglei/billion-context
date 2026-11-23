@@ -269,7 +269,7 @@ Three additional phases harden the #1628 failure class:
 
 `tests/egress-bench.test.ts` (dedicated CI lane `.github/workflows/ci-e2e-egbench.yml`,
 master push + `workflow_dispatch`): a hermetic growing-session benchmark that pins the
-egress plane's per-turn cost to O(live-window) (KDD #22, #7474).
+egress plane's per-turn cost to O(live-window) (KDD #23, #7474).
 
 ```bash
 ACP_TEST_EG_BENCH=1 node --import tsx --test tests/egress-bench.test.ts

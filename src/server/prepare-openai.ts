@@ -514,7 +514,7 @@ export async function prepareOpenai(
         // field re-stamped to the client-declared host msgids (stage 0).
         // Ingesting the raw window cores wrote h_… into the ledger for every
         // post-seed row (msg_id is write-once — INSERT OR IGNORE on
-        // (session_id, seq)), so the next turn's KDD#21 tail-overlap check
+        // (session_id, seq)), so the next turn's KDD#22 tail-overlap check
         // compared declared host ids against h_… rows → guaranteed drift →
         // full form every turn. pinned is element-wise a map of the same
         // view (ids only), so its tail slice aligns position-for-position
@@ -531,12 +531,12 @@ export async function prepareOpenai(
         // (lastMessagesFolded=false) makes the save present it as the raw tail,
         // and the #3285 authoritative-set sweep then retires every prefix row
         // the window omits — draining the msgid pin ledger (snapMsgIdLiveIds)
-        // to the window, so tryIncrementalPin sees ledger≈2 and the KDD#21
+        // to the window, so tryIncrementalPin sees ledger≈2 and the KDD#22
         // tail form degrades to the full form every turn (full-list body +
         // 100k id validation + path=full ingest, alternating with window turns).
         // Mark the tail non-raw: persist presents the envelope view, the sweep
         // stays off, and the ledger keeps the watermark-protected prefix live
-        // (KDD#20 水位线以下存活行). Every consumer of the flag already treats
+        // (KDD#21 水位线以下存活行). Every consumer of the flag already treats
         // "pruned view, not raw log" as the skip-sweep / skip-append contract
         // (persist tail selection, ingest tail_json, handoff stash, export).
         if (wpHit !== undefined) session.lastMessagesFolded = true;

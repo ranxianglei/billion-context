@@ -114,11 +114,15 @@ for (const pluginMode of [false, true]) {
             assert.equal((await post([...input, { type: "message", role: "user", content: "One more ordinary turn." }])).status, 200);
             assert.equal(summaries, beforeContinuation);
             forwards.length = 0;
-            assert.equal((await post([{ type: "message", role: "user", content: "A".repeat(4_600_000) }])).status, 413);
-            assert.equal(forwards.length, 0);
+            // #7537: an unfoldable over-window body is no longer doomed on
+            // bili's own measurement — it forwards; the upstream is the size
+            // authority (this mock accepts → 200).
+            assert.equal((await post([{ type: "message", role: "user", content: "A".repeat(4_600_000) }])).status, 200);
+            assert.equal(forwards.length, 1);
+            forwards.length = 0;
             assert.equal((await post(seed, [{ type: "function", name: "oversized",
-                description: "D".repeat(4_600_000), parameters: { type: "object" } }])).status, 413);
-            assert.equal(forwards.length, 0);
+                description: "D".repeat(4_600_000), parameters: { type: "object" } }])).status, 200);
+            assert.equal(forwards.length, 1);
         } finally {
             setLogCapture(null);
             proxy.close(); proxy.closeAllConnections();
