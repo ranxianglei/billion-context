@@ -183,3 +183,88 @@ export function splitKstate(
     }
     return { column, rows };
 }
+
+/**
+ * #7574 (review of #6785) — "is this value the older build's default?".
+ * A build that predates the state_fields rows loads a session WITHOUT the
+ * nine row-backed fields and writes the column back with whatever its own
+ * code put there — nothing, or an empty container. Used by the view
+ * builder to tell "the older build had nothing" (empty) from "something
+ * was added while the older build ran" (non-empty = newer than the row).
+ */
+export function isEmptyStateValue(v: unknown): boolean {
+    if (v === null || v === undefined || v === "" || v === 0 || v === false) return true;
+    if (Array.isArray(v)) return v.length === 0;
+    if (typeof v === "object") return Object.keys(v as object).length === 0;
+    return false;
+}
+
+/**
+ * #7574 (review of #6785) — rollback self-heal of the content store.
+ *
+ * The slim column is written by this build only. When an OLDER build
+ * (pre-#6785) opens the library it parses that column as if it were the
+ * old full envelope: every byRef entry shrinks to its `{ hash }` stub and
+ * byHash is gone, and its next save writes exactly that back — so after
+ * re-upgrading, tool outputs and file reads showed as `{ hash }` with no
+ * text although the text was still in the ledger (ccr_entries: the older
+ * build does not know that table and leaves it alone).
+ *
+ * A full column together with ledger rows only arises that way (this build
+ * writes the slim column and the rows in the same transaction). So the
+ * ledger is used to fill what the column lost — nothing else is touched:
+ *   - an entry whose original text is missing in the column gets it from
+ *     the ledger row with the same key, when that row's entry carries the
+ *     same content hash;
+ *   - when the column's entry is a pure projection of the ledger's (the
+ *     `{ hash }` stub), the ledger's full entry replaces it; an entry the
+ *     older build changed in any other way is kept as written;
+ *   - entries the ledger has no text for are counted (`stillMissing`).
+ * Returns null when there was nothing to fill.
+ */
+export function refillFullEnvelope(
+    parsed: { byRef?: unknown; byHash?: unknown },
+    rows: readonly CcrLedgerRow[],
+): { store: MessageContentStore | null; refilled: number; stillMissing: number } {
+    const none = { store: null, refilled: 0, stillMissing: 0 } as const;
+    if (rows.length === 0) return none;
+    if (parsed.byRef === null || parsed.byRef === undefined || typeof parsed.byRef !== "object" || Array.isArray(parsed.byRef)) return none;
+    const byRef = { ...(parsed.byRef as Record<string, unknown>) };
+    const byHash: Record<string, unknown> = parsed.byHash !== null && parsed.byRef !== undefined && typeof parsed.byHash === "object" && !Array.isArray(parsed.byHash)
+        ? { ...(parsed.byHash as Record<string, unknown>) }
+        : {};
+    const rowByKey = new Map<string, CcrLedgerRow>();
+    for (const r of rows) if (!rowByKey.has(r.key)) rowByKey.set(r.key, r);
+    let refilled = 0;
+    let stillMissing = 0;
+    for (const key of Object.keys(byRef)) {
+        const raw = byRef[key];
+        if (raw === null || raw === undefined || typeof raw !== "object") continue;
+        const hash = (raw as { hash?: unknown }).hash;
+        if (typeof hash !== "string") continue;
+        if (typeof byHash[hash] === "string") continue; // the text is there
+        const row = rowByKey.get(key);
+        let rowEntry: Record<string, unknown> | null = null;
+        if (row !== undefined && row.origContent !== null) {
+            try {
+                const parsedRow = JSON.parse(row.content) as unknown;
+                if (parsedRow !== null && typeof parsedRow === "object" && !Array.isArray(parsedRow)) rowEntry = parsedRow as Record<string, unknown>;
+            } catch { /* not an entry — counted as missing below */ }
+        }
+        if (row === undefined || row.origContent === null || rowEntry === null || rowEntry.hash !== hash) {
+            stillMissing++;
+            continue;
+        }
+        const columnEntry = raw as Record<string, unknown>;
+        const isProjection = Object.keys(columnEntry).every((k) => JSON.stringify(columnEntry[k]) === JSON.stringify(rowEntry![k]));
+        if (isProjection) byRef[key] = rowEntry;
+        byHash[hash] = row.origContent;
+        refilled++;
+    }
+    if (refilled === 0) return { store: null, refilled: 0, stillMissing };
+    return {
+        store: { version: 1, byHash: byHash as Record<string, string>, byRef: byRef as Record<string, StoredEntry> },
+        refilled,
+        stillMissing,
+    };
+}
