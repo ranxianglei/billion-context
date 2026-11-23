@@ -148,6 +148,11 @@ async function runBringUp(t: BringUpCase) {
                 staleDead = true;
                 return true;
             },
+            // #7156: the mock resident "dies" with the graceful release — the
+            // pre-spawn second-writer gate's safety condition is process
+            // death, and process.pid (the mock's pid) can never really exit.
+            isConnectable: async (origin) => origin === staleOrigin ? !staleDead : true,
+            isPidAlive: (pid) => (pid === process.pid ? !staleDead : false),
         },
     );
     return { shutdownCalls, spawnCalls, handle, clock };

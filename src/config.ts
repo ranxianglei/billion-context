@@ -11,12 +11,14 @@ import { resolveOutputHeadroomCap, type WireProtocol } from "./util.js";
 import { DEFAULT_MITM_DOMAINS, matchesAnyMitmDomain } from "./mitm-domains.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
+import { parseModelEndpointPatterns, type ModelEndpointPattern } from "./model-endpoints.js";
 import { parseCompatDropFields } from "./compat-drop.js";
 import type { ImageBillingMode } from "./image-tokens.js";
 import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 import type { OutputSteeringConfig } from "./output-steering.js";
 import { parseExternalSummaryChain, type ExternalSummaryChain, validSummaryCredentialName } from "./external-summary-settings.js";
 import { parseBillingSettings, setBillingOverrides } from "./billing.js";
+import { parseEgressTransformEntries, type EgressTransformEntry } from "./egress-transforms.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -337,6 +339,23 @@ export type CompressSettings = {
      *  offending span(s). Host-only; off unless explicitly enabled at some
      *  level. Deepest level wins PER FIELD across global → provider → model. */
     requireRecommendation?: boolean;
+    /** #7318: the model-visible "fold more" recommendation in the SUCCESS
+     *  compress receipt — the remaining-offer range list (with the one-call
+     *  hint) after a partial fold, and the "Uncovered history remains" audit
+     *  note, which fires at most once per nudge-injection cycle (#6522). When
+     *  false or absent (DEFAULT) the success receipt carries no fold
+     *  recommendation at all: only the verbatim "No compressible ranges
+     *  remain" stop signal when the offer is genuinely exhausted (and honest
+     *  silence while material uncovered mass remains, #4331). Off by default
+     *  because per-receipt re-recommendation drove models into endless fold
+     *  loops against explicit user stop requests (#7318: 200+ folds in one
+     *  night; #6522/#5872 same family), each fold rewriting the context
+     *  prefix and re-billing the prompt-cache tail. The per-turn growth nudge
+     *  (KDD #8, `compress.injectNudge`) is a separate channel and is NOT
+     *  affected by this knob. Host-only (never passed to the kernel); opt-in.
+     *  Deepest level wins PER FIELD across global → provider → model, like
+     *  every other compress field. */
+    postComPressTail?: boolean;
     /** Trailing messages never offered for compression
      *  (kernel `preserveRecentMessages`). */
     preserveRecentMessages?: number;
@@ -542,6 +561,18 @@ export type CompressSettings = {
          *  old behavior of marking any result ≥ minToolTokens. */
         mediaOnly?: boolean;
     };
+    /** [#5765] Block-lifecycle tools (kernel `Config.blockOps`,
+     *  acp-kernel >= 0.0.194): acp_retire / acp_restore move compressed
+     *  blocks out of (back into) the resident view; acp_rewrite replaces a
+     *  block's stored summary with supplied text. When `enabled` the three
+     *  tools are advertised, injected and prompted for; when off (default)
+     *  they are absent from every surface and a stray call gets a
+     *  "not enabled" receipt. Off unless explicitly enabled at some level.
+     *  Merged sub-field-wise across the three levels like `absorb`. */
+    blockOps?: {
+        /** Enable the block-lifecycle tools for this scope. Absent/false = off. */
+        enabled?: boolean;
+    };
     /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
      *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
      *  ID-referenced at arrival by the kernel's ccr-store node (prune →
@@ -609,6 +640,11 @@ export type CompressSettings = {
         /** A closed turn's reasoning run must exceed this many chars to be
          *  dropped (default 2048). */
         threshold?: number;
+        /** (#7144 follow-up) Also drop the reasoning of ANY closed round in
+         *  the protected tail, not only compress turns — those rounds leave
+         *  the window (and their reasoning) at the next fold anyway. The
+         *  in-flight round is never touched. Default: false. */
+        tail?: boolean;
     };
     /** [#739] Opt-in guard against gpt-5.x/gpt-6.x "lattice" reasoning truncation
      *  (reasoning stops at exactly base*n+offset tokens, default 518n-2 -> 516,
@@ -655,27 +691,6 @@ export type CompressSettings = {
      *  Real edits never match (normalized text differs) and honestly
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
-    /** EXPERIMENTAL view transform A (default OFF): move a still-visible
-     *  compress call/result pair from its original tail-adjacent position to
-     *  its own fold point, so resent history ends "[folded region] – [pair] –
-     *  [protected messages]" instead of a tool exchange at the very end (which
-     *  weak-attention models read as a fresh command). Purely view-side — refs
-     *  and state are untouched; identical layout is recomputed every turn.
-     *  Env BILI_COMPRESS_AT_FOLD_POINT wins over every level;
-     *  applyCompressSettings resolves it per request. Maps to kernel
-     *  Config.compressAtFoldPoint (acp-kernel >= 0.0.177; v2 semantics since
-     *  0.0.188 — summary text relocated to the fold point, pair kept in slot
-     *  with pointer args). */
-    compressAtFoldPoint?: boolean;
-    /** Second opt-in riding on compressAtFoldPoint (default OFF): also drop
-     *  the contiguous run of UNSIGNED reasoning cores immediately preceding a
-     *  relocated pair at the moment of repositioning (the turn's think about
-     *  the fold itself). Both switches must be set for anything to be dropped,
-     *  and the host additionally refuses any core carrying a wire signature or
-     *  running under strict reasoning-echo (#1658/#684 doctrine). Env
-     *  BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING wins over every level.
-     *  Maps to kernel Config.compressAtFoldPointClearThinking. */
-    compressAtFoldPointClearThinking?: boolean;
 };
 /** #5079: governs every prompt_cache_key BILI ITSELF writes to an egress body
  *  (chat-wire conversation-id stamping, Responses-wire identity injection).
@@ -725,13 +740,33 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
 // MODEL, and testing the full id first lets the provider segment hijack the
 // match ("Kimi/glm-5" → ^kimi 200K instead of ^glm-5 1M; "deepseek/
 // deepseek-r1" skips the specific ^deepseek-(r1|v3|ocr) rule because of the
-// "/" and falls to broad ^deepseek 1M — #2074). The full id remains the
-// FALLBACK for tails carrying no family signal whose provider segment does
-// ("qwen/qwq-32b").
+// "/" and falls to broad ^deepseek 1M — #2074). Custom-provider gateways go
+// one layer deeper still: "vendor/region:model" ids ("liuyue/cn:
+// deepseek-v4.1-flash" — #5907), where even the basename carries a namespace
+// prefix before the colon. Every root therefore ALSO yields its tail after
+// the LAST colon as a candidate, tested strictly AFTER the un-stripped root:
+// the tail is the last-resort model-part form, and a tag-shaped suffix
+// ("gpt-5:o3-preview" → "o3-preview") could false-match an unrelated family
+// rule if it were tested first. The full id remains the FALLBACK for tails
+// carrying no family signal whose provider segment does ("qwen/qwq-32b").
 function modelRoots(model: string): string[] {
+    const roots: string[] = [];
+    const push = (root: string): void => {
+        if (root.length > 0 && !roots.includes(root)) roots.push(root);
+    };
+    const colonTail = (root: string): string => {
+        const colon = root.lastIndexOf(":");
+        return colon >= 0 && colon < root.length - 1 ? root.slice(colon + 1) : "";
+    };
     const slash = model.lastIndexOf("/");
-    if (slash > 0 && slash < model.length - 1) return [model.slice(slash + 1), model];
-    return [model];
+    const basename = slash > 0 && slash < model.length - 1 ? model.slice(slash + 1) : model;
+    push(basename);
+    push(colonTail(basename));
+    if (basename !== model) {
+        push(model);
+        push(colonTail(model));
+    }
+    return roots;
 }
 
 export function lookupContextLimit(model: string | undefined): number | undefined {
@@ -946,6 +981,11 @@ export type ProxyOptions = {
      *  " · inline"), never read for control flow. */
     inlineLane?: boolean;
     routes: ProviderRoutes;
+    /** #1295: declared custom-wire model endpoints — the single source of
+     *  truth feeding BOTH the protocol classifier (proxy side) and the fetch
+     *  claim (client side). Empty = built-in path tables only. Optional so
+     *  inline test fixtures stay terse; consumers treat absent as empty. */
+    modelEndpoints?: ModelEndpointPattern[];
     /** Named dialing recipes from the providers table (pi/opencode idiom) —
      *  referenced by `compress.externalSummary.targets` ("glm/glm-4.9-flash").
      *  Populated by loadOptions; optional so inline test fixtures (which
@@ -964,6 +1004,11 @@ export type ProxyOptions = {
      *  traffic (MCP/web) regains the user's shell proxy, while model egress
      *  keeps the clean-env direct semantics (e1c6c92). */
     auxProxyFallback?: ProxyFallbackOptions;
+    /** #6003 phase 2: user-registerable egress body-rewrite pipeline, parsed
+     *  from the top-level `egressTransforms` config array (file-only). Runs after
+     *  session processing and before v1Wrap/re-sign/fetch on every outbound path.
+     *  Empty/absent = no-op (zero regression). Refreshed on config reload. */
+    egressTransforms?: EgressTransformEntry[];
     modelContextLimit: number;
     kernelConfig: Config;
     /** Global-level compression settings (level 1) — the tuning fields from the
@@ -1665,6 +1710,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const namedProviders = loadNamedProviders(env);
     warnAbsorbPluginDivergences(routes, fileConfig.compress?.absorb);
     warnCcrPluginDivergences(routes, fileConfig.compress);
+    const modelEndpoints = parseModelEndpointPatterns(fileConfig.modelEndpointPatterns);
     const passthrough = passthroughState(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
     const biliProxy = nonEmpty(env.BILI_UPSTREAM_PROXY);
@@ -1749,6 +1795,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         upstream,
         auxProxyFallback,
         routes,
+        modelEndpoints,
         namedProviders,
         proxy,
         proxyMode,
@@ -1807,6 +1854,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
         chainEgressStamp: (env.BILI_CHAIN_STAMP ?? (fileConfig.chainEgressStamp === true ? "1" : "0")) !== "0",
         stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
+        // #6003 phase 2: file-only (not one of the six env categories); parsed +
+        // validated here so a malformed entry warns once at boot instead of at
+        // first request. Absent → [] → every call site short-circuits (no-op).
+        egressTransforms: parseEgressTransformEntries(fileConfig.egressTransforms),
     };
 }
 
@@ -1921,6 +1972,13 @@ export interface PiSubagentsFileConfig {
     /** "skip" (default) — suppress the completion notification when the
      *  model already read the result file; "always" — always inject. */
     notifyIfRead?: "skip" | "always";
+    /** Deliver acp_delegate notifications as a typed custom message carrying a
+     *  versioned details envelope (run identity + launch provenance) alongside
+     *  the SAME model-visible text, so third-party UIs tie a notice to its
+     *  launching turn without parsing prose (#5750). Default false — plain
+     *  user-message delivery, byte-identical to before; hosts without
+     *  ExtensionAPI.sendMessage fall back to the plain path automatically. */
+    notifyStructured?: boolean;
     /** TUI shortcut for the fleet inspector (default "ctrl+alt+d"); ""
      *  disables keyboard registration (/acp-fleet still works). */
     fleetShortcut?: string;
@@ -1967,6 +2025,9 @@ type FileConfig = {
     providersPath?: string;
     /** Inline providers, same shape as providers.json. */
     providers?: Record<string, unknown>;
+    /** #1295: declarable custom-wire model endpoints — one source feeding both
+     *  the client claim gate and the proxy protocol classifier. */
+    modelEndpointPatterns?: unknown;
     /** Global default upstream HTTP proxy (applied to all providers unless a
      *  per-URL `proxy` overrides it). `http://host:port`. */
     proxy?: string;
@@ -2207,6 +2268,11 @@ type FileConfig = {
      *  edits apply on the next restart, not mid-session. */
     storage?: {
         unified?: string;
+        /** NOTE: `storage.snapBase` (enabled/cohorts/cutEveryKUserTurns, the
+         *  #5874 v2 snapshot-base plane) was RETIRED before merge (bc51c9445,
+         *  ruling 7439) — replaced wholesale by the egress op-log plane,
+         *  switched by `rollout.features.egressPlane`. A leftover `snapBase`
+         *  key in your config is dead and ignored. */
         /** SQLite engine self-download (#2833): when unified storage is
          *  requested but neither builtin node:sqlite nor a host-installed
          *  better-sqlite3 exists, bili downloads a pinned N-API prebuilt at
@@ -2226,10 +2292,11 @@ type FileConfig = {
          *  wins. The proxy hot path stays on sqlite until the step-3 async
          *  swap; the boot notice names that boundary. */
         mysql?: { dsn?: string };
-        /** Phase 3 (#2960): "off" stops writing the legacy JSON envelope while
-         *  storage.unified is "full" — the SQLite index becomes the only
-         *  persistent copy (reads were already unified-first; boot enumerates
-         *  the index union). Ignored with a one-time warning under
+        /** Phase 3 (#2960): "off" stops writing the legacy JSON envelope AND
+         *  the per-session CCR content-store sidecar while storage.unified is
+         *  "full" — the SQLite index (session row + ccr mirror) becomes the
+         *  only persistent copy (reads were already unified-first; boot
+         *  enumerates the index union). Ignored with a one-time warning under
          *  shadow/legacy, where the JSON file remains the sole source of
          *  truth. Env BILI_STORAGE_JSON_WRITER wins; default "on". Rollback =
          *  unset (JSON writing resumes; index-only sessions keep loading via
@@ -2276,14 +2343,25 @@ type FileConfig = {
         streamKeepAliveMs?: number;
         /** Preflight hold grace (was BILI_PREFLIGHT_HOLD_MS; default 30000). */
         preflightHoldMs?: number;
+        /** #2383 emergency digest fold — when the payload's foldable mass exceeds the LLM fold
+         *  path's coverage bound (16 rounds x 2 x 0.6 = 19.2x the window), every fold switches
+         *  from an LLM summary call to a CPU-only structural digest (per-message ref/role/size
+         *  plus a head fragment). DEFAULT OFF (owner decision 2026-11-22): to the downstream
+         *  model the digest is a hard truncation — originals stay restorable via decompress, but
+         *  the content is gone unless the client asks for it back. With the regime off, those
+         *  payloads run the LLM fold ladder instead and may exhaust its budget into a fail-fast
+         *  413. Env BILI_PREFLIGHT_EMERGENCY_DIGEST wins ("1"/"true" restores the #2383 regime). */
+        emergencyDigest?: boolean;
         /** Max replay attempts on transient upstream errors (was BILI_REPLAY_RETRY_MAX; default 3). */
         replayRetryMax?: number;
         /** Replay backoff base delay (was BILI_REPLAY_RETRY_BASE_MS; default 1500). */
         replayRetryBaseMs?: number;
-        /** Egress-side 429 throttle governor master switch (#4204; was env-only BILI_THROTTLE_429; default true).
-         *  After consecutive upstream 429s, further sends to that origin+credential are answered locally
-         *  (429 + Retry-After, then a terminal 424) instead of being forwarded, so host-driven retry loops
-         *  cannot pin a concurrency-style provider limit. false restores the legacy always-forward behavior. */
+        /** Egress-side 429 throttle governor master switch (#4204; was env-only BILI_THROTTLE_429; default false,
+         *  #6639/#5853). OFF by default: upstream 429s are forwarded to the client untouched — the host owns the
+         *  retry decision — and bili only logs a warn per observed 429. Set true for accounts where host-driven
+         *  retry loops would pin a shared concurrency-style provider limit: after consecutive upstream 429s,
+         *  further sends to that origin+credential are then answered locally (429 + Retry-After, then a terminal
+         *  424) instead of being forwarded. */
         throttle429Enabled?: boolean;
         /** Consecutive upstream 429s before the hold turns terminal — local 424 answers outside every known
          *  client-SDK retry set, so hosts stop re-driving (#4204; was env-only BILI_THROTTLE_429_MAX_CONSECUTIVE; default 5). */
@@ -2338,9 +2416,12 @@ type FileConfig = {
          *  guaranteed upstream 400. Count only — it never folds. Env BILI_MAX_MESSAGES wins. */
         maxMessages?: number;
         /** #5794 item 2: cost band (decoded bytes) for the JSON.parse + normalization sweep AFTER
-         *  decode; a body above it is refused with an actionable 413 before the sweep, because any
-         *  parseable body over 32 MiB is ≥ ~8M tokens — beyond every real model window. 0 disables
-         *  the ingest cap (legacy parse-everything). Env BILI_INGEST_BODY_BYTES wins. */
+         *  decode; when re-enabled, a body above it is refused with an actionable 413 before the
+         *  sweep, because any parseable body over 32 MiB is ≥ ~8M tokens — beyond every real model
+         *  window. DISABLED by default for all lanes (#7426): on the re-send lanes (opencode/dsh
+         *  re-send the entire raw ledger every turn and bili folds it) the raw inbound byte count
+         *  is not a valid "beyond model window" proxy. 0 = no ingest cap (the default); set a byte
+         *  value to re-enable. Env BILI_INGEST_BODY_BYTES wins. */
         ingestBodyBytes?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
@@ -2348,6 +2429,7 @@ type FileConfig = {
         enabled?: boolean;
         zstd?: boolean;
         debounceMs?: number;
+        maxDelayMs?: number;
         tailTokens?: number;
         epermAlertThreshold?: number;
         epermAlertRepeatMs?: number;
@@ -2408,6 +2490,11 @@ type FileConfig = {
          *  oldest-first deletion when exceeded. Unset/0 = off (default). */
         maxTotalBytes?: number;
         maxAgeDays?: number;
+        /** Private log retention (bili.log): target wall-clock hours kept before
+         *  the hard byte budget trims the oldest sealed generation. Defaults 48 h
+         *  and 256 MiB; env BILI_LOG_RETENTION_HOURS / BILI_LOG_BUDGET_BYTES win. */
+        logRetentionHours?: number;
+        logBudgetBytes?: number;
     };
     /** Fake-completion fallback tuning (#2030) — was BILI_FAKE_COMPLETION_RETRIES / BILI_FAKE_BUF_CAP. */
     fakeCompletion?: { retries?: number; bufCapBytes?: number };
@@ -2442,6 +2529,13 @@ type FileConfig = {
     decompressTmpCap?: number;
     /** Image rescale egress pass on/off (#3400) — env BILI_IMAGE_RESCALE (default: on). */
     imageRescale?: boolean;
+    /** #6003 phase 2: user-registerable egress body-rewrite plugins. Each entry:
+     *  `{ id?, module, enabled?, priority?, match? }` where `module` is an ESM file
+     *  (relative paths resolve against this config file's directory) whose default
+     *  export is `{ id?, priority?, match?, timeoutMs?, transform(ctx) }`. File-only
+     *  (no env tier); hot-reloaded via POST /__bili/config/reload. See
+     *  docs/configuration.md "Egress transforms". */
+    egressTransforms?: unknown;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -2496,6 +2590,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "autoModeForge", "imageRescale", "guardrails",
     // #3376:
     "cacheKeepalive",
+    // #6003 phase 2: user-registerable egress body-rewrite pipeline.
+    "egressTransforms",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -2504,19 +2600,17 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
     "nudgeGrowthTokens", "minPressureBenefitTokens", "requireUsageSampleForPressure", "maxEstimateHoldRounds", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
-    "requireNudge", "requireRecommendation",
+    "requireNudge", "requireRecommendation", "postComPressTail",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "messageTimestamps", "rules", "injectTool", "injectNudge",
-    "acknowledgePromptsRisk", "absorb", "ccr", "search",
+    "acknowledgePromptsRisk", "absorb", "blockOps", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary", "externalSummary",
     // #3635: summary-length caps — previously accepted nowhere, silently dropped.
     "maxSummaryLength", "minSummaryLength",
-    // Experimental fold-point carrier relocation switches (view-only).
-    "compressAtFoldPoint", "compressAtFoldPointClearThinking",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -2527,7 +2621,11 @@ const seenUnknownTopLevelKeySignatures = new Set<string>();
 export function warnUnknownTopLevelKeys(obj: Record<string, unknown>): void {
     // #3651: the removed top-level allowDshCompaction key gets its own deprecation
     // note (warnRemovedDshAllowKey) — exclude it here so it isn't named twice.
-    const unknown = Object.keys(obj).filter((key) => !KNOWN_TOP_LEVEL_KEYS.has(key) && key !== "allowDshCompaction");
+    // #6132: the experimental fold-point relocation keys were REMOVED entirely
+    // (v1 #5471 + unreleased v2 #5949) — they parse nowhere and are inert at
+    // every level. Named here (not in the generic unknown-key warning) with
+    // the removal reason, like allowDshCompaction (#3651).
+    const unknown = Object.keys(obj).filter((key) => !KNOWN_TOP_LEVEL_KEYS.has(key) && key !== "allowDshCompaction" && !(INERT_REMOVED_COMPRESS_KEYS as readonly string[]).includes(key));
     if (unknown.length === 0) return;
     const signature = [...unknown].sort().join("\u0000");
     if (seenUnknownTopLevelKeySignatures.has(signature)) return;
@@ -2755,7 +2853,15 @@ let seenInertStripImagesSignature = "";
 // EVERY compress level it can appear (global / provider / model). (`absorb` was
 // removed by #3293 but REVIVED by #3402/#3422 — it parses again and is NOT inert.)
 // Dedup by dead-key path signature (#1815 style): re-warn when the set changes.
-const INERT_REMOVED_COMPRESS_KEYS = ["imageCompression"] as const;
+// #6132 + #3266: removed `compress.*` keys that may still sit in old configs.
+// They parse nowhere and do nothing at any level — named once per distinct
+// shape (deduped like warnUnknownTopLevelKeys) with the removal reason.
+const INERT_REMOVED_COMPRESS_KEYS = ["imageCompression", "compressAtFoldPoint", "compressAtFoldPointClearThinking"] as const;
+const INERT_REMOVED_COMPRESS_KEY_REASON: Record<(typeof INERT_REMOVED_COMPRESS_KEYS)[number], string> = {
+    imageCompression: "compress.imageCompression was removed and no longer does anything at any level (image pre-compression + image_full restore channel, #3266); images pass through byte-identical",
+    compressAtFoldPoint: "compress.compressAtFoldPoint (the experimental fold-point relocation, #5470) was removed in #6132 — the resent layout is the long-standing baseline and the flag no longer changes anything",
+    compressAtFoldPointClearThinking: "compress.compressAtFoldPointClearThinking (the companion opt-in of the removed fold-point relocation) was removed in #6132",
+};
 let seenInertRemovedCompressKeysSignature = "";
 function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
     const hits: string[] = [];
@@ -2765,6 +2871,9 @@ function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
             if ((block as Record<string, unknown>)[key] !== undefined) hits.push(`${pathPrefix}.${key}`);
         }
     };
+    for (const key of INERT_REMOVED_COMPRESS_KEYS) {
+        if (obj[key] !== undefined) hits.push(`top-level ${key}`);
+    }
     scanBlock(obj.compress, "compress");
     const providers = obj.providers;
     if (providers && typeof providers === "object" && !Array.isArray(providers)) {
@@ -2785,7 +2894,11 @@ function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
     const sig = hits.join(",");
     if (sig === "" || sig === seenInertRemovedCompressKeysSignature) return;
     seenInertRemovedCompressKeysSignature = sig;
-    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — compress.imageCompression was removed and no longer does anything at any level (image pre-compression + image_full restore channel, #3266). Remove it from the config; images pass through byte-identical.`);
+    const reasons = [...new Set(hits.map((h) => {
+        const key = h.split(".").pop();
+        return INERT_REMOVED_COMPRESS_KEY_REASON[key as keyof typeof INERT_REMOVED_COMPRESS_KEY_REASON] ?? `${h} was removed and is ignored`;
+    }))];
+    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — ${reasons.join("; ")}. Remove it from your config to silence this.`);
 }
 
 function warnInertResignPassthrough(obj: Record<string, unknown>): void {
@@ -3264,20 +3377,11 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (typeof obj.nudgeModelDecided !== "boolean") ok = false;
         else out.nudgeModelDecided = obj.nudgeModelDecided;
     }
-    // Experimental fold-point relocation pair (see CompressSettings docs): plain
-    // booleans; absent = off. Without this, file-tier/panel values are silently
-    // dropped by the parser while env resolution still honors them.
-    for (const key of ["compressAtFoldPoint", "compressAtFoldPointClearThinking"] as const) {
-        if (!(key in obj)) continue;
-        if (typeof obj[key] !== "boolean") {
-            ok = false;
-            continue;
-        }
-        out[key] = obj[key];
-    }
     // #5683: unprompted/out-of-bounds compression policy gates — plain booleans,
     // off unless explicitly set (an explicit false at a deeper level disables).
-    for (const key of ["requireNudge", "requireRecommendation"] as const) {
+    // #7318: postComPressTail is the same species — plain boolean, off unless
+    // explicitly enabled (default-off recommendation surface).
+    for (const key of ["requireNudge", "requireRecommendation", "postComPressTail"] as const) {
         if (!(key in obj)) continue;
         if (typeof obj[key] !== "boolean") ok = false;
         else out[key] = obj[key];
@@ -3379,6 +3483,22 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 }
             }
             if (ok) out.absorb = cleaned;
+        }
+    }
+    if ("blockOps" in obj && obj.blockOps !== undefined) {
+        const b = obj.blockOps;
+        if (!b || typeof b !== "object" || Array.isArray(b)) {
+            ok = false;
+        } else {
+            const bo = b as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["blockOps"]> = {};
+            for (const key of ["enabled"] as const) {
+                if (!(key in bo)) continue;
+                const v = bo[key];
+                if (typeof v !== "boolean") { ok = false; continue; }
+                cleaned.enabled = v;
+            }
+            if (ok) out.blockOps = cleaned;
         }
     }
     if ("ccr" in obj && obj.ccr !== undefined) {

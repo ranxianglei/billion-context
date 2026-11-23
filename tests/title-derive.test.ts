@@ -89,6 +89,9 @@ describe("#2118 isContextualUserFragment mirrors codex matches_marked_text", () 
 const DSH_APPROVAL = 'The approval policy changed from "ask" to "never" (changed by the user).';
 const DSH_RUNTIME_CTX = "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nMode: read-only.";
 const DSH_RUNTIME_CLEARED = "Current runtime context: none. Earlier runtime-context snapshots no longer apply.";
+// #7085: dsh 0.2.2-rc.3 wraps the reworded runtime-context snapshot in a
+// \x3csystem-reminder\x3e envelope (no longer contains "Current runtime context").
+const DSH_RUNTIME_CTX_NEW = '\x3csystem-reminder\x3e\nThe following information describes your current session:\n\nCurrent working directory: "/path/to/repo".\n\nCurrent DSH file policy: danger-full-access.';
 const DSH_TIME_CTX = "Time sampled while preparing turn 1, step 1: 2026-07-15T09:01:01+08:00[Asia/Shanghai]\nBrowser time zone for this request: Asia/Shanghai. Interpret otherwise-unqualified dates and times in this zone.\nElapsed since the preceding model-visible message: unavailable.";
 
 describe("#2286 deriveTitle skips dsh-injected notifications", () => {
@@ -114,6 +117,11 @@ describe("#2286 deriveTitle skips dsh-injected notifications", () => {
     it("the browser-time-zone line embedded in the time-context message is covered by its prefix", () => {
         assert.equal(deriveTitle([msg("user", "text", DSH_TIME_CTX), msg("user", "text", "why is CI red?")]), "why is CI red?");
     });
+
+    it("the 0.2.2-rc.3 reworded snapshot ahead of the real question does not become the title (#7085)", () => {
+        const t = deriveTitle([msg("user", "text", DSH_RUNTIME_CTX_NEW), msg("user", "text", "fix the failing test")]);
+        assert.equal(t, "fix the failing test");
+    });
 });
 
 describe("#2286 isAutoInjectedNotification prefix permitlist", () => {
@@ -122,6 +130,7 @@ describe("#2286 isAutoInjectedNotification prefix permitlist", () => {
         assert.equal(isAutoInjectedNotification(DSH_RUNTIME_CTX), true);
         assert.equal(isAutoInjectedNotification(DSH_RUNTIME_CLEARED), true);
         assert.equal(isAutoInjectedNotification(DSH_TIME_CTX), true);
+        assert.equal(isAutoInjectedNotification(DSH_RUNTIME_CTX_NEW), true, "the 0.2.2-rc.3 reworded snapshot (system-reminder envelope) is recognized too (#7085)");
     });
 
     it("matches a polluted set-once title truncated at 60 chars with ellipsis", () => {

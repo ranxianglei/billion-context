@@ -189,7 +189,7 @@ test("gate error offers tier distillation only once the trigger count is reached
   assert.equal(retry.result.noop, true);
   assert.match(
     retry.result.warnings.join(" "),
-    /Tier distillation is actionable now: compress\(\{ content: \[\{ startId: "b1", endId: "b5", summary: "\.\.\.", topic: "\.\.\." \}\] \}\) merges those tier-1 blocks into one tier-2 block/,
+    /Tier distillation is actionable now: compress\(\{ content: "b1–b5 optional topic\\nsummary markdown\.\.\." \}\) merges those tier-1 blocks into one tier-2 block/,
   );
 });
 

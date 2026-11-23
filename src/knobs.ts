@@ -28,6 +28,7 @@ import { parseDurationField } from "./duration.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
 import { WAL_JOURNAL_SIZE_LIMIT } from "./storage/schema.js";
+import { LOG_RETENTION_BUDGET_BYTES, LOG_RETENTION_TARGET_MS } from "./log-retention.js";
 
 /** Tiered raw number: the env var wins when SET (even empty/garbage — the
  *  caller applies the historical validation), else a finite number from the
@@ -128,21 +129,32 @@ export function replayBaseDelayMs(): number {
     return Number.isFinite(v) && v >= 0 ? v : REPLAY_BASE_DELAY_MS;
 }
 
+/** BILI_PREFLIGHT_EMERGENCY_DIGEST > network.emergencyDigest > false (owner decision
+ *  2026-11-22: the #2383 CPU digest regime is a model-visible hard truncation —
+ *  default off; "1"/"true" env or an explicit file true restores it). */
+export function preflightEmergencyDigestEnabled(): boolean {
+    const envRaw = process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST;
+    if (envRaw !== undefined) return envRaw === "1" || envRaw === "true";
+    return fileNetwork().emergencyDigest === true;
+}
+
 // --- #4204 egress-side 429 throttle governor ---
 
 const THROTTLE_429_MAX_CONSECUTIVE = 5;
 const THROTTLE_429_BASE_DELAY_MS = 2_000;
 const THROTTLE_429_MAX_DELAY_MS = 30_000;
 
-/** BILI_THROTTLE_429 > network.throttle429Enabled > true. The egress 429
- *  governor (#4204) is ON by default: consecutive upstream 429s put sends to
- *  that origin+credential on local backoff instead of amplifying a
- *  concurrency-style provider limit. "0"/"false" restores the legacy
- *  always-forward behavior. Read per request so the switch flips live. */
+/** BILI_THROTTLE_429 > network.throttle429Enabled > false. The egress 429
+ *  governor (#4204) is OFF by default (#6639/#5853): upstream 429s are
+ *  forwarded to the client untouched — the host owns the retry decision —
+ *  and bili only warns in the log. Opt in ("1"/"true" here, or
+ *  network.throttle429Enabled: true) for accounts where host retry storms
+ *  pin a shared concurrency-style provider limit (#4204). Read per request
+ *  so the switch flips live. */
 export function throttle429Enabled(): boolean {
     const envRaw = process.env.BILI_THROTTLE_429;
     if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
-    return fileNetwork().throttle429Enabled !== false;
+    return fileNetwork().throttle429Enabled === true;
 }
 
 /** BILI_THROTTLE_429_MAX_CONSECUTIVE > network.throttle429MaxConsecutive > 5.
@@ -283,12 +295,16 @@ const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
 const DEFAULT_HTTP_OUTBOUND_BYTES = 10 * 1024 * 1024;
-// #5794: the ingest cost band (decoded bytes) that may run the JSON.parse /
-// normalization sweep. 32 MiB ≈ the observed 51.2 MiB/29,619-msg incident
-// (5.5–7.2 s per round, 54.6% of local CPU, 747 s event-loop FATAL); any
-// parseable body ABOVE it is already ≥ ~8M tokens = 5–10× the largest model
-// window, so it can never succeed. 0 = no ingest cap (legacy).
-const DEFAULT_INGEST_BODY_BYTES = 32 * 1024 * 1024;
+// #5794 → #7426: disabled by default (0 = no ingest cap, all lanes). The original
+// 32 MiB cost band was a proxy for "beyond every model window", but on the re-send
+// lanes (opencode/dsh re-send the ENTIRE raw ledger every turn and bili folds it)
+// the RAW inbound byte count says nothing about the real (folded) context — it 413'd
+// a 33.5 MB opencode turn whose folded context was tiny. So the band is OFF for all
+// lanes by default (#7426, user decision). Set BILI_INGEST_BODY_BYTES /
+// network.ingestBodyBytes to re-enable the #5794 cost band if a specific deployment
+// hits the pre-fold parse CPU (51.2 MiB incident: 5.5–7.2 s/round, 54.6% CPU,
+// 747 s event-loop FATAL).
+const DEFAULT_INGEST_BODY_BYTES = 0;
 
 /** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
  *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
@@ -342,12 +358,13 @@ export function limitsHttpOutboundBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_HTTP_OUTBOUND_BYTES;
 }
 
-/** BILI_INGEST_BODY_BYTES > network.ingestBodyBytes > 32 MiB. Cost band for the
- *  JSON.parse + normalization sweep AFTER decode (the 51.2 MiB #5794 body spent
- *  seconds there per round). Bodies above it are refused before the sweep with
- *  an actionable 413; any parseable body over 32 MiB is ≥ ~8M tokens, i.e.
- *  beyond every real model window, so nothing valid is blocked. 0 disables the
- *  ingest cap (legacy parse-everything). */
+/** BILI_INGEST_BODY_BYTES > network.ingestBodyBytes > 0 (disabled). Cost band for
+ *  the JSON.parse + normalization sweep AFTER decode (#5794). DISABLED by default for
+ *  all lanes (#7426): on the re-send lanes (opencode/dsh) the raw inbound byte count is
+ *  not a valid "beyond model window" proxy — it 413'd a 33.5 MB opencode turn whose
+ *  folded context was tiny. Set BILI_INGEST_BODY_BYTES to re-enable the #5794 cost band
+ *  (any parseable body over 32 MiB is ≥ ~8M tokens, beyond every real model window).
+ *  0 = no ingest cap (parse-everything). */
 export function limitsIngestBytes(): number {
     const v = tInt("BILI_INGEST_BODY_BYTES", loadConfigFile().network?.ingestBodyBytes);
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_INGEST_BODY_BYTES;
@@ -454,6 +471,14 @@ export function persistZstdEnabled(): boolean {
 export function persistDebounceMs(): number {
     const v = tInt("BILI_PERSIST_DEBOUNCE_MS", filePersist().debounceMs);
     return Number.isFinite(v) && v >= 0 ? v : 500;
+}
+
+/** BILI_PERSIST_MAX_DELAY_MS > persist.maxDelayMs > 5000 (#6058: under sustained
+ *  traffic the max-delay cap — not the debounce window — sets the session-order /
+ *  prefix-affinity snapshot rewrite rate; both writers had it hardcoded at 5s). */
+export function persistMaxDelayMs(): number {
+    const v = tInt("BILI_PERSIST_MAX_DELAY_MS", filePersist().maxDelayMs);
+    return Number.isFinite(v) && v >= 0 ? v : 5_000;
 }
 
 /** BILI_PERSIST_TAIL_TOKENS > persist.tailTokens > 16384 (0 disables message persistence). */
@@ -698,6 +723,25 @@ export function dshContextTabLabel(): string | undefined {
     return s.length > 0 ? s : undefined;
 }
 
+type PluginBypassOverride = "auto" | "on" | "off";
+
+/** BILI_PLUGIN_BYPASS — operator override of the x-bili-plugin-bypass
+ *  passthrough decision (#6220). Three-state, read per-request (flips live,
+ *  no restart):
+ *    unset / "auto"    → current behavior: the inbound header decides per request
+ *    "1"/"on"/"true"   → force bypass: every inbound request is forwarded verbatim
+ *    "0"/"off"/"false" → never bypass: ignore any inbound x-bili-plugin-bypass header
+ *    unrecognized value → "auto" (current behavior)
+ *  Env-only per the owner-approved design in #6220: the header is a wire
+ *  contract stamped by hosts; the override is a per-process operator
+ *  posture, not a per-route config field. */
+export function pluginBypassOverride(): PluginBypassOverride {
+    const raw = process.env.BILI_PLUGIN_BYPASS?.trim().toLowerCase();
+    if (raw === "1" || raw === "on" || raw === "true") return "on";
+    if (raw === "0" || raw === "off" || raw === "false") return "off";
+    return "auto";
+}
+
 /** BILI_DECOMPRESS_TMP_CAP > decompressTmpCap > 50. */
 export function decompressTmpCap(): number {
     const v = tIntLoose("BILI_DECOMPRESS_TMP_CAP", loadConfigFile().decompressTmpCap);
@@ -766,6 +810,16 @@ export function dump4xxEnabled(): boolean {
     return fileDiag().dump4xx === true;
 }
 
+/** ACP_DEBUG > debug > false — the existing global verbose-debug switch,
+ *  resolved EXACTLY like Options.debug (src/config.ts): same expression, so
+ *  the two surfaces can never disagree on any input. Reused by the
+ *  pi-lane nudge debug surface (src/nudge-debug.ts / src/agent/pi.ts) so the
+ *  feature rides the familiar debug switch instead of adding a knob of its
+ *  own. */
+export function debugEnabled(): boolean {
+    return (process.env.ACP_DEBUG ?? (loadConfigFile().debug ? "1" : "0")) === "1";
+}
+
 /** BILI_DUMP_4XX_MAX_BYTES > diagnostics.dump4xxMaxBytes > 2 MiB (floor 1 KiB). */
 export function dump4xxMaxBytes(): number {
     const envRaw = process.env.BILI_DUMP_4XX_MAX_BYTES;
@@ -773,6 +827,40 @@ export function dump4xxMaxBytes(): number {
     const f = fileDiag().dump4xxMaxBytes;
     const n = typeof f === "number" && Number.isFinite(f) && f > 0 ? f : NaN;
     return Math.max(1024, n || 2 * 1024 * 1024);
+}
+
+/** BILI_LOG_RETENTION_HOURS > diagnostics.logRetentionHours > 48. How much
+ *  wall-clock history the private log keeps before the byte budget trims it.
+ *  Floor 1 h. A SET env var owns the switch even when its content is illegal
+ *  (process-level convention, #2030): an unparsable value falls back to the
+ *  DEFAULT, never to the file layer, so the file key cannot silently shadow it. */
+function logRetentionTargetMs(): number {
+    const envRaw = process.env.BILI_LOG_RETENTION_HOURS;
+    const f = fileDiag().logRetentionHours;
+    const fromFile = typeof f === "number" && Number.isFinite(f) && f > 0 ? f : LOG_RETENTION_TARGET_MS / 3_600_000;
+    const hours = envRaw !== undefined
+        ? (Number.isFinite(Number(envRaw)) && Number(envRaw) > 0 ? Number(envRaw) : LOG_RETENTION_TARGET_MS / 3_600_000)
+        : fromFile;
+    return Math.max(1, hours) * 3_600_000;
+}
+
+/** BILI_LOG_BUDGET_BYTES > diagnostics.logBudgetBytes > 256 MiB. HARD cap on
+ *  bytes across the active log + every sealed generation — the budget wins over
+ *  the target window. Floor 1 MiB so a typo cannot degenerate the log to nothing.
+ *  Same set-env-owns-the-switch rule as the target above. */
+function logRetentionBudgetBytes(): number {
+    const envRaw = process.env.BILI_LOG_BUDGET_BYTES;
+    const f = fileDiag().logBudgetBytes;
+    const fromFile = typeof f === "number" && Number.isFinite(f) && f > 0 ? f : LOG_RETENTION_BUDGET_BYTES;
+    const bytes = envRaw !== undefined
+        ? (Number.isFinite(Number(envRaw)) && Number(envRaw) > 0 ? Number(envRaw) : LOG_RETENTION_BUDGET_BYTES)
+        : fromFile;
+    return Math.max(1 << 20, bytes);
+}
+
+/** The resolved retention policy snapshot the logger installs at startup. */
+export function logRetentionPolicy(): { targetMs: number; budgetBytes: number } {
+    return { targetMs: logRetentionTargetMs(), budgetBytes: logRetentionBudgetBytes() };
 }
 
 /** BILI_DUMP_MAX_TOTAL_BYTES > diagnostics.maxTotalBytes > off (null). Total-size cap
@@ -919,14 +1007,21 @@ export function fileStorageWalJournalSizeLimit(): number | undefined {
     return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
 }
 
-/** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
- *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
- *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
- *  config-file `storage.unified` value (strict spellings); absent everywhere =
- *  full (#3818 flip — the shadow dry-run ran as the default since #2815 and
- *  the digest reconciliation held, so the index is now the load path by
- *  default; JSON envelopes keep being written, and "legacy" remains the
- *  one-line escape hatch). */
+
+/** Tiered storage-migration switch (#2671): legacy | shadow | full | sqlite.
+ *  Lives here per the env-var discipline — env tier BILI_STORAGE_UNIFIED
+ *  (1/true = shadow, full/unified = full, sqlite = pure-sqlite, 0/false/legacy/
+ *  garbage = legacy) wins over the config-file `storage.unified` value (strict
+ *  spellings). "sqlite" is a first-class spelling that behaves exactly like
+ *  "full" for the store machinery (index is the load path, unified-first reads)
+ *  but flips the `storage.jsonWriter` DEFAULT to off — the SQLite index becomes
+ *  the only persistent copy (the Phase 3 #2960 jsonWriter-off posture). The
+ *  absent default is pure-sqlite: after the dual-write fleet ran since #3818
+ *  with digest reconciliation holding, JSON envelopes stop being written by
+ *  default; explicit "full" keeps the historical #3818 semantics (dual-write
+ *  by default), and "legacy" remains the one-line escape hatch. Future
+ *  spellings follow the same shape (mysql = network backend mode, json =
+ *  envelope-only alias for legacy). */
 export type StorageMode = "legacy" | "shadow" | "full";
 
 /** Resolve the unified-storage level. Pure: env + file tier value in, mode out
@@ -950,32 +1045,68 @@ export function resolveArchiveAfterDays(env: NodeJS.ProcessEnv = process.env, fi
 export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
     const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
     if (raw) {
-        if (raw === "full" || raw === "unified") return "full";
+        if (raw === "full" || raw === "unified" || raw === "sqlite") return "full";
         if (raw === "1" || raw === "true" || raw === "shadow") return "shadow";
         return "legacy";
     }
     const file = fileUnified?.trim().toLowerCase();
-    if (file === "full") return "full";
+    if (file === "full" || file === "sqlite") return "full";
     if (file === "shadow") return "shadow";
     if (file) return "legacy";
     return "full";
 }
 
-/** Phase 3 JSON-envelope switch (#2960): when the unified store runs in
- *  full mode, `storage.jsonWriter=off` stops writing the legacy JSON envelope —
- *  the SQLite index becomes the only persistent copy (reads were already
- *  unified-first since #2671; boot enumerates the index union since #2992).
- *  Env BILI_STORAGE_JSON_WRITER (0/false/off = off; 1/true/on = on) wins over
- *  the config-file `storage.jsonWriter` value; absent = on. Only honored when
- *  the effective mode is full — under shadow/legacy the JSON file remains the
- *  sole source of truth and the request is ignored with a one-time warning.
- *  Rollback: unset the knob (JSON writing resumes; index-only sessions keep
- *  loading via the boot union, and replicas/restore re-materialize envelopes). */
-export function resolveJsonWriterOff(env: NodeJS.ProcessEnv = process.env, fileValue?: string): boolean {
+/** Whether the RAW unified selection is the pure-sqlite posture: the spelling
+ *  is "sqlite" (either tier) or absent everywhere (the default flipped to
+ *  pure-sqlite). Explicit "full"/"shadow"/"legacy" (and garbage, which degrades
+ *  to legacy) are not. This — not the resolved machine mode — decides the
+ *  jsonWriter default, so `full` and `sqlite` stay distinct knobs even though
+ *  both resolve to the same store machinery. */
+export function unifiedSelectionIsSqlite(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): boolean {
+    const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
+    if (raw) return raw === "sqlite";
+    const file = fileUnified?.trim().toLowerCase();
+    return file === undefined || file === "" || file === "sqlite";
+}
+
+/** Phase 3 JSON-envelope switch (#2960), tri-state: was the JSON envelope
+ *  WRITER explicitly turned on or off? Env BILI_STORAGE_JSON_WRITER
+ *  (0/false/off = off; 1/true/on = on) wins over the config-file
+ *  `storage.jsonWriter` value (strict "off"/"on" spellings); absent or garbage
+ *  = unset, so the unified selection decides the default. */
+export function resolveJsonWriterChoice(env: NodeJS.ProcessEnv = process.env, fileValue?: string): "on" | "off" | "unset" {
     const raw = env.BILI_STORAGE_JSON_WRITER?.trim().toLowerCase();
-    if (raw === "0" || raw === "false" || raw === "off") return true;
-    if (raw === "1" || raw === "true" || raw === "on") return false;
-    return fileValue?.trim().toLowerCase() === "off";
+    if (raw === "0" || raw === "false" || raw === "off") return "off";
+    if (raw === "1" || raw === "true" || raw === "on") return "on";
+    const file = fileValue?.trim().toLowerCase();
+    if (file === "off") return "off";
+    if (file === "on") return "on";
+    return "unset";
+}
+
+/** Effective JSON-writer-off decision. Pure-sqlite selections (spelling
+ *  "sqlite" or absent) DEFAULT to off — the SQLite index is the only
+ *  persistent copy (reads were already unified-first since #2671; boot
+ *  enumerates the index union since #2992). Explicit "full" keeps the
+ *  historical #3818 dual-write default. An explicit on/off at either tier
+ *  overrides the default. Only honored when the effective mode is full on the
+ *  sqlite backend — under shadow/legacy the JSON file remains the sole source
+ *  of truth, and the persist constructor ignores a requested off with a
+ *  one-time warning. Rollback: storage.jsonWriter=on or
+ *  BILI_STORAGE_JSON_WRITER=1 (index-only sessions keep loading via the boot
+ *  union, and replicas/restore re-materialize envelopes). */
+export function effectiveJsonWriterOff(env: NodeJS.ProcessEnv = process.env, fileValue?: string, fileUnified?: string): boolean {
+    const choice = resolveJsonWriterChoice(env, fileValue);
+    if (choice !== "unset") return choice === "off";
+    return unifiedSelectionIsSqlite(env, fileUnified);
+}
+
+/** Was off REQUESTED explicitly (env spelling or file "off")? Used by the
+ *  persist constructor to warn once when the request cannot take effect
+ *  (shadow/legacy/encryption/network backend), distinguishing it from the
+ *  pure-sqlite default being in effect. */
+export function jsonWriterOffRequested(env: NodeJS.ProcessEnv = process.env, fileValue?: string): boolean {
+    return resolveJsonWriterChoice(env, fileValue) === "off";
 }
 
 /** Snapshot-render SHADOW observability switch (#3756 follow-up): compute the
@@ -1025,38 +1156,3 @@ export function resolveStorageWalJournalSizeLimit(env: NodeJS.ProcessEnv = proce
     return WAL_JOURNAL_SIZE_LIMIT;
 }
 
-/** EXPERIMENTAL fold-point carrier relocation switch (view transform A): when
- *  on, a still-visible compress call/result pair is moved from its original
- *  tail-adjacent position to its own fold point, so resent history ends in
- *  "[folded region] – [pair] – [protected messages]" instead of a tool exchange
- *  sitting at the very end (which weak-attention models read as a fresh
- *  command). Pure view-side transform — refs/state untouched, recomputed
- *  identically every turn; off = byte-identical to the pre-feature layout.
- *  OPT-IN (default OFF; verified on real models 2026-11-01 #5470, kept opt-in
- *  per owner decision).
- *  Env BILI_COMPRESS_AT_FOLD_POINT (0/false/off vs 1/true/on) wins over the
- *  config-file `compress.compressAtFoldPoint` boolean; absent everywhere = OFF.
- *  Garbage spellings fall through tiers. Pure: never throws. */
-export function resolveCompressAtFoldPoint(env: NodeJS.ProcessEnv = process.env, fileValue?: unknown): boolean {
-    const raw = env.BILI_COMPRESS_AT_FOLD_POINT?.trim().toLowerCase();
-    if (raw === "1" || raw === "true" || raw === "on") return true;
-    if (raw === "0" || raw === "false" || raw === "off") return false;
-    return typeof fileValue === "boolean" ? fileValue : false;
-}
-
-/** Second opt-in riding on BILI_COMPRESS_AT_FOLD_POINT: drop the contiguous
- *  run of unsigned reasoning cores immediately preceding a relocated pair at
- *  the moment of repositioning (the turn's "think" about the fold itself).
- *  Default OFF; both switches must be set for anything to be dropped, and the
- *  host additionally refuses any core carrying a wire signature or running
- *  under strict reasoning-echo (#1658/#684 doctrine — signed bytes are never
- *  rewritten or deleted).
- *  Env BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING wins over config-file
- *  `compress.compressAtFoldPointClearThinking`; absent = OFF. Pure: never
- *  throws. */
-export function resolveCompressAtFoldPointClearThinking(env: NodeJS.ProcessEnv = process.env, fileValue?: unknown): boolean {
-    const raw = env.BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING?.trim().toLowerCase();
-    if (raw === "1" || raw === "true" || raw === "on") return true;
-    if (raw === "0" || raw === "false" || raw === "off") return false;
-    return typeof fileValue === "boolean" ? fileValue : false;
-}

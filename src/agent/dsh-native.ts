@@ -63,12 +63,16 @@ import { decodeRequestBody } from "../content-encoding.js";
 import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "../knobs.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { bodyOverWindowDetail as sharedBodyOverWindowDetail, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { bodyOverWindowDetail as sharedBodyOverWindowDetail, getDeclaredModelEndpoints, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, setDeclaredModelEndpoints, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { matchModelEndpoint, loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { runOutsideFetchChain } from "./fetch-chain/index.js";
+import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
+import { detectWireFormat } from "acp-kernel/wire";
+import { coreAlignEnvelopeIds, laneMsgIdsForOpenAiWire, laneMsgIdsForResponsesWire, laneMsgIdsForWire } from "./pi-msgids.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
-import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
+import { compactionCoverageText, declareDshCompactionActive, detectCompactionOverlayGap } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
@@ -134,7 +138,11 @@ type CommandInvocation = {
     attachments?: unknown;
     signal?: AbortSignal | undefined;
 };
-type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal };
+// #7505: exec carries the host's tool-call id — the SAME wire id the model minted
+// (deepseek-harness translate.ts brands native.id into ToolCallId and resends it
+// verbatim; pipeline.ts hands the whole exec to tool.execute). Forward it so the
+// server can key the fold block on it and drop the redundant inline anchor.
+type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal; callId?: string };
 
 type ToolDefinition = {
     name: string;
@@ -147,7 +155,7 @@ type ToolDefinition = {
 type CommandOutcome = { kind: "success" | "error"; text: string };
 
 export type PluginContext = {
-    tools: { register: (definition: ToolDefinition) => unknown };
+    tools: { register: (definition: ToolDefinition) => unknown; get?: (name: string) => unknown };
     commands: { register: (command: { name: string; description: string; handler: (invocation?: CommandInvocation) => Promise<CommandOutcome> }) => unknown };
     agents: { currentInitiator?: () => AgentLike | undefined; get?: (id: string) => AgentLike | undefined };
     // Runtime-info sources (#955), resolved via dynamic ctx.inject when the
@@ -214,18 +222,9 @@ export function planNativeDsh(env: NodeJS.ProcessEnv): { mode: "off" | "attach" 
 
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
 
-// One registration lifecycle per HOST CONTEXT. toolsReady is the ONLY gate
-// for header stamping (pi.ts discipline): stamped headers flip the proxy into
-// plugin mode, which suppresses wire tool injection — stamping before the
-// local tools exist would send a tool-less request.
-// #3380: registrations live in the host process's tool layer and die ONLY
-// with their context (the apply() re-arm below is the sole reset). Proxy
-// death merely moves the origin — the execute closures read the LIVE base
-// (#983) — so proxy-death paths must NOT clear toolsReady: doing so forced a
-// doomed re-registration that DSH rejects ("tool X is already registered"),
-// locked the latch false forever, and silently stripped every request of its
-// identity headers (wire mode → anonymous zero-fold ledgers → 413 on large
-// sessions).
+// Tool readiness belongs to one activation, including Cordis restarts that
+// reuse their context. Proxy death only moves the live base read by execute
+// closures (#3380); it does not invalidate surviving host registrations.
 type RegisterState = {
     base: string | undefined;
     toolsReady: boolean;
@@ -301,12 +300,7 @@ export { DSH_BUILD_CHECK } from "./client-build-note.js";
  * the gate rows' fate implied. Best-effort by necessity: preset configs
  * resolve lazily, so "so far" is the honest frame. */
 function gateCoverageSuffix(): string {
-    const t = dshCompactionGateTelemetry();
-    if (t === null || t.covered.length === 0) {
-        return " Overlay coverage so far: no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later).";
-    }
-    const entries = t.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
-    return ` Overlay coverage so far: ${t.covered.length} preset ${t.covered.length === 1 ? "entry" : "entries"} rewritten (${entries}).`;
+    return ` Overlay coverage so far: ${compactionCoverageText()}.`;
 }
 
 /** #1590/#1809: origin of the proxy as currently reachable — register.base
@@ -935,7 +929,7 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
             if (typeof sid !== "string" || sid.length === 0) {
                 throw new Error(`bili tool ${tool.name} requires an owning agent session`);
             }
-            const out = await forwardTool(base, sid, tool.name, args, exec.signal, true);
+            const out = await forwardTool(base, sid, tool.name, args, exec.signal, true, exec.callId);
             // #2204: dsh tool results are plain strings — a business failure
             // throws so the host renders an error, not success text.
             if (out.failed) throw new Error(out.text);
@@ -980,39 +974,109 @@ function fireGiveUp(): void {
     armRecoveryTimer();
 }
 
-async function registerTools(ctx: PluginContext): Promise<void> {
-    if (register.pending !== undefined) return register.pending;
-    const base = register.base;
-    if (register.toolsReady || base === undefined) return;
-    register.pending = (async () => {
-        const tools = await fetchManifest(base, "anthropic");
-        // #2082: land on the CURRENT context, not the one that started this
-        // flight — a re-activation mid-fetch must not register into (or die
-        // on) the deactivated context captured at call time.
-        const target = activeCtx ?? ctx;
+type ToolsOwner = {
+    ctx: PluginContext;
+    closed: boolean;
+    restoring: boolean;
+    definitions: Map<string, ToolDefinition>;
+};
+let toolsOwner: ToolsOwner | undefined;
+
+function toolsAreReady(): boolean {
+    const owner = toolsOwner;
+    if (owner === undefined) return register.toolsReady;
+    register.toolsReady = !owner.closed && owner.definitions.size > 0
+        && (owner.ctx.tools.get === undefined ? register.toolsReady
+            : [...owner.definitions.keys()].every((name) => owner.ctx.tools.get?.(name) !== undefined));
+    return register.toolsReady;
+}
+
+function restoreTools(owner: ToolsOwner): void {
+    if (owner !== toolsOwner || owner.closed || owner.restoring) return;
+    owner.restoring = true;
+    register.toolsReady = false;
+    try {
         let adopted = 0;
-        for (const tool of tools) {
+        for (const [name, definition] of owner.definitions) {
+            if (owner.ctx.tools.get?.(name) !== undefined) {
+                adopted++;
+                continue;
+            }
             try {
-                target.tools.register(toolDefinition(tool));
+                // The HOST owns the registration's lifetime: DSH's ToolsService
+                // attaches it to the calling fiber via layers.effect(ctx, …), so
+                // a restart or dispose removes it and tools/change lets the next
+                // activation restore (#6702). Proxy death runs no effect — the
+                // registration survives it (#3380).
+                owner.ctx.tools.register(definition);
             } catch (err) {
-                // #3380: idempotent adoption — a name this process ALREADY
-                // holds in the host tool layer throws "already registered";
-                // that registration is exactly what we want, so skip it and
-                // register the rest (also converges a partial registration
-                // left by an earlier interrupted flight).
                 if (!errMessage(err).includes("already registered")) throw err;
-                adopted += 1;
+                adopted++;
             }
         }
         if (adopted > 0 && !regAdoptLogged) {
             regAdoptLogged = true;
             persistClientEvent(`tool registration adopted ${adopted} pre-existing registration(s) from this process — continuing`);
         }
-        register.toolsReady = true;
+        register.toolsReady = owner.definitions.size > 0;
+        if (!toolsAreReady()) throw new Error("bili: tool registrations did not become visible");
+    } finally {
+        owner.restoring = false;
+    }
+}
+
+function beginToolsOwner(ctx: PluginContext): ToolsOwner {
+    if (ctx.effect === undefined && toolsOwner?.ctx === ctx && !toolsOwner.closed) return toolsOwner;
+    if (toolsOwner !== undefined) toolsOwner.closed = true;
+    const owner: ToolsOwner = { ctx, closed: false, restoring: false, definitions: new Map() };
+    toolsOwner = owner;
+    register.toolsReady = false;
+    register.pending = undefined;
+    register.retryAt = 0;
+    ctx.effect?.(() => () => {
+        owner.closed = true;
+        if (toolsOwner === owner) {
+            register.toolsReady = false;
+            register.pending = undefined;
+        }
+    }, "bili: tool registration lifetime");
+    ctx.on?.("tools/change", () => {
+        if (owner !== toolsOwner || owner.closed || owner.restoring || owner.definitions.size === 0) return;
+        // A real Cordis teardown fires tools/change from the tool disposers
+        // BEFORE the fiber's own disposers run: restoring while the fiber is
+        // past its active window (states beyond LOADING=1/ACTIVE=2 — FAILED,
+        // DISPOSED, UNLOADING) would resurrect registrations that teardown is
+        // releasing. Hosts without a fiber expose no state and keep restoring.
+        const fiberState = (owner.ctx as { fiber?: { state?: number } }).fiber?.state;
+        if (fiberState !== undefined && fiberState !== 1 && fiberState !== 2) return;
+        try {
+            restoreTools(owner);
+        } catch (err) {
+            register.toolsReady = false;
+            register.lastRegistrationError = errMessage(err);
+            armRecoveryTimer();
+        }
+    });
+    return owner;
+}
+
+async function registerTools(ctx: PluginContext): Promise<void> {
+    const owner = toolsOwner;
+    if (owner === undefined || owner.closed || owner.ctx !== ctx) return;
+    if (register.pending !== undefined) return register.pending;
+    const base = register.base;
+    if (toolsAreReady() || base === undefined) return;
+    const pending = (async () => {
+        const tools = await fetchManifest(base, "anthropic");
+        if (owner !== toolsOwner || owner.closed || register.base !== base) return;
+        owner.definitions = new Map(tools.map((tool) => [tool.name, toolDefinition(tool)]));
+        restoreTools(owner);
         register.failStreak = 0;
         register.lastRegistrationError = undefined;
     })()
         .catch((err: unknown) => {
+            if (owner !== toolsOwner || owner.closed) return;
+            register.toolsReady = false;
             // Cordis deactivates the plugin context while the host tears down
             // (dsh --help, early CLI exits): every later register attempt hits
             // "cannot get required service ... in inactive context" and would
@@ -1040,9 +1104,10 @@ async function registerTools(ctx: PluginContext): Promise<void> {
             persistClientEvent(`manifest registration failed (${errMessage(err)}) — retrying; requests stay in wire mode until it succeeds`);
         })
         .finally(() => {
-            register.pending = undefined;
+            if (owner === toolsOwner && register.pending === pending) register.pending = undefined;
         });
-    return register.pending;
+    register.pending = pending;
+    return pending;
 }
 
 // #2082: recovery retries are traffic-driven (headersFor on model
@@ -1055,13 +1120,7 @@ async function registerTools(ctx: PluginContext): Promise<void> {
 // ops knob); absent it tracks RETRY_INTERVAL_MS. Tests that do not opt in
 // never start a timer at all (NODE_TEST_CONTEXT guard keeps suites quiet).
 let recoveryTimer: NodeJS.Timeout | undefined;
-// #2082: the LATEST context seen by apply()/maybeRetry. Every async recovery
-// path (the timer tick below, an in-flight registration landing after a
-// re-activation) must resolve its context at landing time, not from a capture
-// taken when the retry was armed — a captured context may already be
-// deactivated by then (dsh reload / profile switch), and registering into it
-// throws "inactive context" and would re-poison register.dead, exactly what
-// this fix removes.
+// #2082: the recovery timer follows the latest activation's context.
 let activeCtx: PluginContext | undefined;
 function recoveryIntervalMs(): number {
     const raw = process.env.BILI_DSH_RECOVERY_INTERVAL_MS;
@@ -1089,7 +1148,10 @@ function armRecoveryTimer(): void {
 }
 
 function maybeRetry(ctx: PluginContext): void {
+    if (toolsOwner === undefined) beginToolsOwner(ctx);
+    if (toolsOwner?.closed || toolsOwner?.ctx !== ctx) return;
     activeCtx = ctx;
+    toolsAreReady();
     // #3380: the base-less state heals through the RESPAWN branch below even
     // when toolsReady is true (registrations survive proxy death) — gating on
     // toolsReady alone would strand a given-up register with no driver left.
@@ -1160,7 +1222,11 @@ function registerArmed(): Promise<void> {
 // log line each. Three states + per-endpoint cumulative counts make the
 // "dozens refused, one passed" distribution diagnosable at a glance.
 type GateAttribution =
-    | { state: "ok"; sid: string }
+    // #6880: `purpose` rides the dispatch's own options (GenerateOptions.purpose,
+    // dsh contract: set ONLY on auxiliary calls — ordinary conversation leaves
+    // it unset). Stamped as x-bili-plugin-purpose so the server classifies the
+    // request BY DECLARATION instead of content-guessing (#6880).
+    | { state: "ok"; sid: string; purpose?: string }
     | { state: "none"; initiatorPresent: boolean }
     | { state: "threw"; message: string };
 
@@ -1186,10 +1252,24 @@ type GateAttribution =
 interface LlmDispatchScope {
     sid: string;
     msgIds: string[] | undefined;
+    // #6525: the raw host message list (pi-ai shape: {id, role, content,
+    // toolCallId}) — the full-resend envelope stamps biliMsgIds from these
+    // by lockstep fingerprint walk, not from the id array alone (pairing
+    // must be PROVEN, never assumed positional — pi-msgids.ts discipline).
+    messages: unknown;
+    // #6880: the dispatch's declared purpose (dsh auxiliary calls; absent
+    // for conversation turns).
+    purpose?: string;
 }
 const dispatchScope = new AsyncLocalStorage<LlmDispatchScope>();
 
 let noticedScopedAttribution = false;
+// #6770: the #3962 coverage readout only ever rode the profile-bundle note,
+// which stays silent wherever profileContext.startedBundles cannot be read
+// (observed on both a desktop dsh build and the dsh-go runtime), so the
+// coverage reading had no reachable exit. Emit it once per process on the
+// first routed request instead.
+let compactionCoverageNoted = false;
 
 /** #4491: extract the host message ids from llm/stream `options.messages`,
  *  all-or-nothing. Mirrors validateMsgIds in src/msgid-pin.ts (the 400-class
@@ -1244,6 +1324,88 @@ function runLlmDispatch<R>(scope: LlmDispatchScope, operation: () => R): R {
     return runOutsideFetchChain(() => dispatchScope.run(scope, operation));
 }
 
+/** dsh's flat host message shape differs from the pi-ai form the shared
+ *  walkers' host-side fingerprint (entryFingerprint / assistantParts in
+ *  pi-msgids.ts) understands in exactly two places, and the mismatch made
+ *  every tool-bearing turn bail the all-or-nothing envelope — the host ids
+ *  then churned back to content digests on the next full-resend (#6525 B7):
+ *   1. assistant tool-call blocks are `type:"tool-call"` (hyphen); the
+ *      fingerprint only recognizes `type:"toolCall"` (camel) and reads `.id`.
+ *   2. tool results carry role `"tool"`; the fingerprint takes the `toolres`
+ *      branch only for role `"toolResult"` (reading `.toolCallId`), so an
+ *      un-normalized `tool` fell into the text branch and mismatched.
+ *  Normalize ONLY for fingerprinting: the envelope ids come from `mm.id` and
+ *  the wire-side pairing is unchanged, so this cannot cause a mis-pin. */
+function dshFpRole(role: unknown): unknown {
+    return role === "tool" ? "toolResult" : role;
+}
+function dshFpContent(content: unknown): unknown {
+    if (!Array.isArray(content)) return content;
+    return content.map((b) => {
+        if (b === null || typeof b !== "object") return b;
+        const o = b as Record<string, unknown>;
+        if (o.type === "tool-call") return { type: "toolCall", id: o.id, name: o.name };
+        return b;
+    });
+}
+
+/** #6525: resolve the envelope (carrier ①) id array for a full-resend model
+ *  body — CORE-aligned (== the post-hoist core count the server validates
+ *  against, prepare-openai/anthropic) or undefined (degrade to
+ *  content-derived ids, never guess). Pure — unit-testable without a plugin
+ *  ctx. Never re-implements the host's wire transforms: the pi-ai lockstep
+ *  walkers (the SAME functions the pi/omp lanes pin with) prove
+ *  wire-element ⇔ host-message pairing by order-preserving fingerprints and
+ *  bail all-or-nothing; the kernel's own converters then prove the pin is
+ *  core-alignable via the #3642 wireIndex back-pointer — every non-leading
+ *  wire element must own exactly ONE core (parallel tool calls /
+ *  reasoning+text / text+image parts split one host message into N cores,
+ *  and N cores cannot share one host id: validateMsgIds rejects duplicates).
+ */
+function resolveEnvelopeMsgIds(parsed: Record<string, unknown>, hostMessages: unknown): string[] | undefined {
+    const fmt = detectWireFormat(parsed);
+    if (fmt !== "openai" && fmt !== "anthropic" && fmt !== "responses") return undefined; // google stays content-derived (#6525 v1)
+    const wire = fmt === "responses" ? parsed.input : parsed.messages;
+    if (!Array.isArray(wire)) return undefined;
+    if (!Array.isArray(hostMessages) || hostMessages.length === 0) return undefined;
+    // pi-shaped entries: dsh's flat host messages share the pi-ai message
+    // shape ({role, content blocks} + toolCallId on results) and entry.id IS
+    // the host's stable message id (#4491) — the walkers consume them through
+    // the same makeEntryTake contract as pi's branch entries. System-role
+    // entries are EXCLUDED: they ride the hoisted/folded leading system (the
+    // bili-ps-N slots on the openai wire; the separate `system` field on
+    // anthropic), which never aligns 1:1 to a non-leading wire element.
+    const entries: Array<Record<string, unknown>> = [];
+    for (const m of hostMessages) {
+        if (m === null || typeof m !== "object") return;
+        const mm = m as Record<string, unknown>;
+        if (mm.role === "system" || mm.role === "developer") continue;
+        entries.push({ type: "message", id: mm.id, message: { role: dshFpRole(mm.role), content: dshFpContent(mm.content), toolCallId: mm.toolCallId } });
+    }
+    const wireAligned = fmt === "anthropic"
+        ? laneMsgIdsForWire(wire, entries)
+        : fmt === "responses"
+        ? laneMsgIdsForResponsesWire(wire, entries)
+        : laneMsgIdsForOpenAiWire(wire, entries);
+    if (wireAligned === undefined) return undefined; // pairing not provable — degrade
+    // Shared core-alignment proof (pi-msgids.ts) — the SAME function the pi/omp
+    // lanes stamp with (review M1: the inline copy was a cherry-pick artifact;
+    // any future fix to the proof must land once, not per-host).
+    return coreAlignEnvelopeIds(fmt, wireAligned, wire, parsed);
+}
+
+/** #6525: the full-resend envelope's body field name, DUPLICATED from
+ *  src/msgid-pin.ts MSG_IDS_BODY_FIELD — host code is injected into a foreign
+ *  runtime and must not import server modules (same structural mirroring as
+ *  hostMsgIdsOf's reject class). Kept at module level so
+ *  tests/msgid-rule-parity.test.ts can mechanically assert the two never
+ *  drift (review n2). */
+export const ENVELOPE_MSG_IDS_FIELD = "biliMsgIds";
+
+/** Test-only accessor (#6525 review): pins the resolver against the kernel.
+ *  The bail matrix lives in tests/issue6525-dsh-envelope.test.ts. */
+export const _envelopeMsgIdsForTest = resolveEnvelopeMsgIds;
+
 /** Test-only accessors (#5826 review): pins tests/msgid-rule-parity.test.ts
  *  drives these collectors directly against the shared reject-class set. */
 export const _hostMsgIdsOfForTest = hostMsgIdsOf;
@@ -1274,13 +1436,22 @@ function attributionOf(ctx: PluginContext): GateAttribution {
     // driving), and it survives exactly the shapes the ambient reading does
     // not (agentless compaction/title lanes, disposed scopes, retried
     // re-sends whose initiator scope went away between attempts).
+    // #6770: first routed request is the earliest point where the overlay's
+    // structural rewrites can have happened (preset configs resolve lazily),
+    // so the coverage reading goes out here — the durable profile note that
+    // used to carry it never fires when profileContext.startedBundles cannot
+    // be read, which is the observed state on every host we checked.
+    if (!compactionCoverageNoted) {
+        compactionCoverageNoted = true;
+        persistClientEvent(`bili-native-dsh: compaction overlay coverage — ${compactionCoverageText()} (#6770)`);
+    }
     const scoped = dispatchScope.getStore();
     if (scoped !== undefined && scoped.sid.length > 0) {
         if (!noticedScopedAttribution) {
             noticedScopedAttribution = true;
             persistClientEvent("bili-native-dsh: llm/stream attribution active — session id rides the request object (#4082)");
         }
-        return { state: "ok", sid: scoped.sid };
+        return { state: "ok", sid: scoped.sid, purpose: scoped.purpose };
     }
     try {
         const init = ctx.agents?.currentInitiator?.();
@@ -1598,7 +1769,14 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the proxy-base gate — the proxy origin is not known yet, so the fork protocol cannot be reached (#4215)`);
         return;
     }
-    await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body });
+    // #6262 principle 1: host msgids for the msgid identity track — CORE-aligned
+    // via the SAME envelope resolver the full-resend stamp uses (review m1: the
+    // old per-wire-message hostMsgIdsOf could never pass the adopter's
+    // msgIds.length === core.length lock on the openai wire — the hoisted lead
+    // system shifts the count — or on a multi-block anthropic turn, so the
+    // track silently never engaged). undefined → byte track only, exactly as
+    // before; the mismatch can never mis-fire (the gate is identity-strict).
+    await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body, msgIds: resolveEnvelopeMsgIds(body as Record<string, unknown>, dispatchScope.getStore()?.messages) });
 }
 
 // #1677: session id of the command's invoking agent (host-passed invocation); malformed
@@ -1907,28 +2085,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // (disabling the plugin must not brick session creation, #3662).
     declareDshCompactionActive();
 
-    // #2082: a fresh activation invalidates the "host tearing down" verdict.
-    // Without this reset, ONE registerTools rejection carrying "inactive
-    // context" (a cordis deactivate/reactivate cycle — dsh reloading the
-    // plugin after the desktop profile copy was swapped in place, a profile
-    // switch, a settings toggle) poisons register.dead for the whole process
-    // lifetime: every later maybeRetry() returns immediately and the bili
-    // tools never come back until dsh restarts.
-    // #2101: a re-activation ALSO invalidates a SUCCESSFUL registration.
-    // Registrations die with their context: the tools registered into the
-    // previous activation are disposed when that context deactivates, but
-    // register.toolsReady keeps its stale stamp — and every
-    // registerTools()/maybeRetry() early-returns on it, so the new context
-    // never gets the bili tools (the #2082 symptom reached from the success
-    // ordering: a settings toggle, a profile switch or a plugin reload
-    // AFTER a healthy boot loses the tools until dsh restarts). Clear the
-    // stale stamp so the retry loop re-registers into the live context;
-    // retryAt goes with it (#1783: a fresh activation must not stand behind
-    // a stale back-off wall).
-    if (register.toolsReady && activeCtx !== undefined && activeCtx !== ctx) {
-        register.toolsReady = false;
-        register.retryAt = 0;
-    }
+    const owner = beginToolsOwner(ctx);
     register.dead = false;
     // #3380: a fresh activation starts a clean registration cycle — stale
     // failure bookkeeping from the previous context must not carry over
@@ -2039,13 +2196,17 @@ export async function apply(ctx: PluginContext): Promise<void> {
     if (typeof ctx.inject === "function" && typeof ctx.on === "function") {
         const onEvent = ctx.on.bind(ctx);
         ctx.inject(["llm"], () => {
-            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown }, next: () => AsyncIterable<unknown>) => {
+            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown; purpose?: unknown }, next: () => AsyncIterable<unknown>) => {
                 const sid = typeof options?.sessionId === "string" && options.sessionId.length > 0 ? options.sessionId : undefined;
                 if (sid === undefined) return next();
                 // #4491: capture the host message ids riding the same options
                 // — undefined (all-or-nothing) when any message lacks a usable
                 // id, so sidecar shapes degrade to id-less turns.
-                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
+                // #6880: capture the dispatch's declared purpose the same way
+                // (dsh sets it on every auxiliary call; conversation leaves it
+                // unset). Absent/odd values simply stay off the turn.
+                const purpose = typeof options?.purpose === "string" && options.purpose.length > 0 && options.purpose.length <= 64 && /^[\x21-\x7e]+$/.test(options.purpose) ? options.purpose : undefined;
+                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages), messages: options?.messages, purpose };
                 // #5403/#5418 v3: feed the per-slot id sequence into the
                 // watermark channel (the fetch chokepoint emits count +
                 // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
@@ -2092,6 +2253,11 @@ export async function apply(ctx: PluginContext): Promise<void> {
         ctx.webServer.register(originRoute);
         ctx.webServer.register(adminRelayRoute);
     }
+
+    // #1295: declared custom-wire endpoints — the SAME config source the proxy
+    // classifier reads. Loaded best-effort into this host process; a config
+    // change takes effect on the next host start.
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
 
     if (plan.mode === "attach") {
         const attachOrigin = plan.attachOrigin;
@@ -2305,17 +2471,27 @@ export async function apply(ctx: PluginContext): Promise<void> {
         // floor sits under it; the bare floor marks the stronger "provably
         // over" tier in the line below. #4111 keeps the media exclusion
         // (base64 mass bills through the upstream's image lane, not as text).
-        // Unknown window or unsized body keeps #1117 semantics.
+        // An unsized body keeps #1117 semantics; an UNKNOWN window falls back
+        // to the 1M floor (#5907).
         // #4079: the declared window can be wrong SMALL (stale host config,
         // model-catalog fallback) — the bar never assumes below max(declared, 1M).
-        const doom = bodyOverWindowDetail(body, init, effectiveContextWindow(ctx));
+        // #5907: NO declaration at all (a custom provider whose model info the
+        // host never resolved) must not disarm the arm either — fall back to
+        // the same floor instead of forwarding an oversized body into a
+        // guaranteed upstream rejection.
+        const declared = effectiveContextWindow(ctx);
+        const doom = bodyOverWindowDetail(body, init, declared ?? MIN_ASSUMED_WINDOW_TOKENS);
         if (doom !== undefined) {
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body est ~${doom.estTokens.toLocaleString("en-US")} tok ${doom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${doom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${doom.window.toLocaleString("en-US")} (declared ${doom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}) — core ${doom.coreBytes.toLocaleString("en-US")}B${doom.mediaBytes > 0 ? `, ${doom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#2924/#4111/#5613); a direct send would 400 upstream`);
+            const windowNote = declared === undefined
+                ? `no window declared; assuming the ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")} floor`
+                : `declared ${doom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}`;
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body est ~${doom.estTokens.toLocaleString("en-US")} tok ${doom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${doom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${doom.window.toLocaleString("en-US")} (${windowNote}) — core ${doom.coreBytes.toLocaleString("en-US")}B${doom.mediaBytes > 0 ? `, ${doom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#2924/#4111/#5613/#5907); a direct send would 400 upstream`);
             noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
         return refuse(url, attributionOf(ctx), body);
     };
+
     // #4068/#4079: `none` keeps #1117 direct semantics by design — an
     // agentless lane is not ours to manage — but a body whose CALIBRATED
     // core-text token estimate reaches the window has no direct future: the
@@ -2325,22 +2501,34 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // gateway send that passed every floor-only check, then bricked the
     // whole session when upstream rejected it). Same dual-tier pricing as
     // the threw arm — calibrated estimate first, the bare floor marking the
-    // "provably over" tier, #4111's media exclusion intact. Unknown window
-    // or unsized/streamed body keeps #1117, now named in the durable line
-    // via refuse()'s size note.
+    // "provably over" tier, #4111's media exclusion intact. An unsized/streamed
+    // body keeps #1117, now named in the durable line via refuse()'s size
+    // note; an unknown window falls back to the 1M floor (#5907).
     const refuseUnattributed = (url: string, attr: Exclude<GateAttribution, { state: "ok" }>, body: { bytes: number } | undefined, init: RequestInit | undefined): GateVerdict => {
         // #4079: same undersized-declaration guard as the threw arm — the
         // bar never assumes below the 1M common window floor. #4111: same
         // media-aware core-text caliber too (see bodyOverWindowDetail).
-        const unattributedDoom = bodyOverWindowDetail(body, init, effectiveContextWindow(ctx));
+        // #5907: an unknown window falls back to the same floor instead of
+        // disarming the whole arm.
+        const declared = effectiveContextWindow(ctx);
+        const unattributedDoom = bodyOverWindowDetail(body, init, declared ?? MIN_ASSUMED_WINDOW_TOKENS);
         if (unattributedDoom !== undefined) {
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body est ~${unattributedDoom.estTokens.toLocaleString("en-US")} tok ${unattributedDoom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${unattributedDoom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${unattributedDoom.window.toLocaleString("en-US")} (declared ${unattributedDoom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}) — core ${unattributedDoom.coreBytes.toLocaleString("en-US")}B${unattributedDoom.mediaBytes > 0 ? `, ${unattributedDoom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#4068/#4079/#4111/#5613); a direct send would be a guaranteed upstream rejection`);
+            const windowNote = declared === undefined
+                ? `no window declared; assuming the ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")} floor`
+                : `declared ${unattributedDoom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}`;
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body est ~${unattributedDoom.estTokens.toLocaleString("en-US")} tok ${unattributedDoom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${unattributedDoom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${unattributedDoom.window.toLocaleString("en-US")} (${windowNote}) — core ${unattributedDoom.coreBytes.toLocaleString("en-US")}B${unattributedDoom.mediaBytes > 0 ? `, ${unattributedDoom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#4068/#4079/#4111/#5613/#5907); a direct send would be a guaranteed upstream rejection`);
             noteAttrRefusal(attr.state, { endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized-unattributed";
         }
         return refuse(url, attr, body);
     };
     state.takeoverGate = (url, body, init) => {
+        // #1295: an operator-declared endpoint is explicitly "this URL IS my
+        // model API" — declaration outranks heuristic attribution (a provider
+        // plugin's LLM call may run outside dsh's ALS initiator scope). The
+        // proxy-side body disambiguation still guards against same-path
+        // non-conversation payloads being misrouted.
+        if (matchModelEndpoint(getDeclaredModelEndpoints(), url) !== undefined) return true;
         const attr = attributionOf(ctx);
         if (attr.state === "ok") {
             threwStreak = 0;
@@ -2357,9 +2545,10 @@ export async function apply(ctx: PluginContext): Promise<void> {
         // gate contract already tolerates Promise verdicts (threw arm).
         if (attr.state === "none") {
             // #4829 review: without init there is no body to decode and the
-            // claim can never succeed — settle synchronously so this shape
-            // keeps the OLD verdict class: native-ws-intercept.ts compares
-            // its gate result with === false WITHOUT awaiting.
+            // claim can never succeed — settle synchronously. Both gate
+            // consumers await the verdict today (fetch lane since #4829, WS
+            // lane inside its deferred window since #5838), so this is a fast
+            // path, not a verdict-class contract.
             if (init === undefined) {
                 threwStreak = 0;
                 threwGiveUpNoticed = false;
@@ -2417,7 +2606,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
         if (unroutedEndpoints.has(key)) return;
         if (unroutedEndpoints.size >= 256) return;
         unroutedEndpoints.add(key);
-        const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …); a custom-wire endpoint needs its own support.`;
+        const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …) or endpoints declared via modelEndpointPatterns in the global config.`;
         persistClientEvent(line);
     };
 
@@ -2532,6 +2721,18 @@ export async function apply(ctx: PluginContext): Promise<void> {
         const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
         refreshModelInfo(register.base, target);
         const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
+        // #6880: the declared purpose rides its own header (ASCII-gated like
+        // the model header below — an odd value degrades to no header, and
+        // the server falls back to its content heuristics). Post-#6883 this is
+        // stamped on EVERY dispatch: the real dsh purpose for auxiliary
+        // calls, or the "conversation" sentinel for main turns (dsh leaves
+        // GenerateOptions.purpose unset for ordinary conversation). PRESENCE
+        // is therefore the v2 declaration — the server routes declared aux by
+        // the header alone and keys declared main traffic on the raw session
+        // id (no persona-order ladder); the sentinel itself is not a side.
+        const declaredPurpose = attr.purpose ?? "conversation";
+        const purposeHeader = asciiHeaderValue(declaredPurpose);
+        if (purposeHeader !== undefined) headers["x-bili-plugin-purpose"] = purposeHeader;
         // #3370: the incremental-turn marker (and, since #3329, the turn id)
         // is no longer stamped here — a closure-level armed flag shared by
         // every session raced concurrent requests across the awaited
@@ -2581,6 +2782,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
         await maybeRecallBeforeSend(ctx, url, init);
         await maybeForkAdoptBeforeSend(ctx, init);
         await maybeIncrementalNative(url, init);
+        await maybeStampEnvelopeMsgIds(ctx, url, init);
         emitHostParseDiagnostic(init);
     };
     // #3304: the dsh swap stamps the turn id atomically with the body, so the
@@ -2706,6 +2908,73 @@ export async function apply(ctx: PluginContext): Promise<void> {
         }
     };
 
+    // #6525 envelope wiring (carrier ①'s last mile): full-resend requests
+    // stamp the model body's own parallel id array — ENVELOPE_MSG_IDS_FIELD
+    // (module level, == MSG_IDS_BODY_FIELD, src/msgid-pin.ts; the host code
+    // must not import server modules — see the constant's doc).
+    // A pinned prefix then exists on EVERY turn, not only on the lane's
+    // anthropic-wire turns. Resolution never re-implements the host's wire
+    // transforms: the pi-ai lockstep walkers (laneMsgIdsForWire /
+    // laneMsgIdsForOpenAiWire, the SAME functions the pi/omp lanes pin with)
+    // prove wire-element ⇔ host-message pairing by order-preserving
+    // fingerprints and bail all-or-nothing; the kernel's own converters then
+    // prove the pin is core-alignable — every non-leading wire element must
+    // own exactly ONE core via the #3642 wireIndex back-pointer (parallel
+    // tool calls / reasoning+text / text+image parts split one host message
+    // into N cores, and N cores cannot share one host id: validateMsgIds
+    // rejects duplicates). Any bail leaves the body byte-identical →
+    // content-derived ids, exactly today's behavior. maybeIncrementalNative
+    // runs FIRST and swaps the body — the delta payload pins msgIds itself,
+    // so once it fired the envelope must not touch the body. The server
+    // strips the field before forwarding and gates the pin on pluginMode +
+    // the pluginLaneServerHistory rollout (prepare-openai/anthropic).
+    let envelopeStampedFor: string | undefined; // one log line per session
+    async function maybeStampEnvelopeMsgIds(ctx: PluginContext, _url: string, init: RequestInit | undefined): Promise<void> {
+        if (!register.toolsReady || init === undefined) return;
+        const attr = attributionOf(ctx);
+        if (attr.state !== "ok") return; // non-plugin traffic carries no msgid channel
+        // Explicit guard (review m2): once the incremental lane diverted this
+        // request it owns the body — the delta form pins msgIds itself and the
+        // envelope must not re-stamp it. The marker header is set atomically
+        // with the swap, so its presence IS the "lane diverted" flag (the
+        // walker's delta-shape bail was the only guard before; keep both).
+        if (new Headers(init.headers).has(INCREMENTAL_TURN_MARKER_HEADER)) return;
+        const body = init.body;
+        if (typeof body !== "string" || body.length === 0) return; // stream/Request bodies ride content-derived
+        const parsed = (await parsedBodyOnce(init)) as Record<string, unknown> | undefined;
+        if (parsed === undefined) return;
+        const coreAligned = resolveEnvelopeMsgIds(parsed, dispatchScope.getStore()?.messages);
+        if (coreAligned === undefined) return;
+        // #7064 §8: steady-state suppression — the pf tail-ids channel
+        // (captured at the pfCaptureIds site above, same chokepoint) carries
+        // anchor+new and the server pins the prefix from the ledger; the
+        // full list rides only at bootstrap / reanchor (pfSuppressFullMsgIds).
+        // #6785 review fix (owner): the tail-ids CARRIER is parsed by the
+        // openai lane ONLY — suppressing the envelope list on the responses
+        // /anthropic wire would leave that turn with NO ids at all (body
+        // list gone, header unread) ⇒ a pin-less stretch until the session
+        // is back on the openai wire. Those wires parse the body list
+        // themselves (two-form rule: the full form is always accepted), so
+        // it rides there — suppression is a per-WIRE decision, not a
+        // per-session one.
+        const fmt = detectWireFormat(parsed) as string | undefined;
+        // #6785 review fix (owner): compare in the SAME space T was measured
+        // in — the server stamps x-bili-pf-seq from the WIRE element total
+        // (scanMessagesSpans over the messages array, leading bili-ps- system
+        // run included), while coreAligned is core-space (system run
+        // excluded). Comparing core count vs wire T misfired the shrink
+        // check by L every turn once L > 1 (permanent re-anchor loop, §8
+        // dead for that session). The wire array length IS the space.
+        const wireLen = Array.isArray(parsed.messages) ? (parsed.messages as unknown[]).length : coreAligned.length;
+        if (fmt === "openai" && pfChannel.pfSuppressFullMsgIds(attr.sid, wireLen)) return;
+        const stamped = { ...parsed, [ENVELOPE_MSG_IDS_FIELD]: coreAligned };
+        init.body = JSON.stringify(stamped);
+        if (envelopeStampedFor !== attr.sid) {
+            envelopeStampedFor = attr.sid;
+            persistClientEvent(`bili-native-dsh: msgid envelope stamped on full-resend for ${attr.sid} (${coreAligned.length} ids, ${fmt} wire) — pinned prefix live from turn one (#6525)`);
+        }
+    }
+
     // #1268: arm the interceptor's toolsReady gate — the first model request
     // holds until this resolves, so it stamps into plugin mode instead of
     // losing the boot race and silently riding wire mode. Resolves when the
@@ -2720,7 +2989,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
         resolveToolsGate();
     } else {
         void state.ready.then(async (origin) => {
-            if (origin !== undefined) await registerTools(ctx).catch(() => {});
+            if (origin !== undefined && owner === toolsOwner && !owner.closed) await registerTools(ctx).catch(() => {});
             resolveToolsGate();
         });
     }
@@ -2846,8 +3115,8 @@ export async function apply(ctx: PluginContext): Promise<void> {
     });
 
     // node:test drives apply() directly with a mock ctx — never patch
-    // globalThis.fetch from inside a test run.
-    if (process.env.NODE_TEST_CONTEXT === undefined) installNativeFetchIntercept(state);
+    // globalThis.fetch/WebSocket from inside a test run.
+    if (process.env.NODE_TEST_CONTEXT === undefined) installDshIntercepts(state);
 
     // #4134: hold activation until the ACP tool registration has landed (or
     // is provably not coming / 2s cap). The host composes each model round
@@ -2863,6 +3132,20 @@ export async function apply(ctx: PluginContext): Promise<void> {
     if (process.env.NODE_TEST_CONTEXT === undefined) await registerArmed();
 }
 
+/** Both client-side egress legs of the dsh lane (#5838): model HTTP(S) through
+ *  the fetch intercept, and the Codex Responses WebSocket leg through the WS
+ *  wrapper. DSH embeds pi-ai whose openai-codex-responses provider defaults to
+ *  transport auto, so a successful WebSocket exchange NEVER calls fetch — with
+ *  only the fetch leg installed the whole conversation bypasses the proxy while
+ *  bili's own gate leaves native compaction off, i.e. nothing compresses until
+ *  the context limit. The state carries the per-dispatch hooks (async
+ *  takeoverGate, toolsReady, beforeSend fork adoption, headersFor stamps) that
+ *  the wrapper runs inside its deferred window before the upgrade goes out. */
+export function installDshIntercepts(state: NativeInterceptState): void {
+    installNativeFetchIntercept(state);
+    installNativeWebSocketIntercept(state);
+}
+
 /** Test hook: reset the module-level registration lifecycle so suites can
  *  drive apply() repeatedly with a fresh mock ctx. (#4215: optional
  *  toolsReady so gate scenarios can arm the registration state directly.) */
@@ -2875,6 +3158,8 @@ export function _resetRegisterForTest(base: string | undefined, toolsReady = fal
         recoveryTimer = undefined;
     }
     activeCtx = undefined;
+    if (toolsOwner !== undefined) toolsOwner.closed = true;
+    toolsOwner = undefined;
     // #2187: apply() now reaches the respawn arming on every plan, so a stale
     // single-flight wrapper (capturing a previous test's spawn stub) must not
     // survive a reset.
@@ -3012,6 +3297,12 @@ export function _resetNonWebTraceForTest(): void {
 /** Test hook: reset the once-per-process unverified-dsh-build note flag. */
 export function _resetDshNewerBuildNoteForTest(): void {
     dshNewerBuildNoted = false;
+}
+
+/** Test hook (#6770): reset the once-per-process compaction-coverage readout
+ *  flag so a test can pin the emit wiring, not just the formatter. */
+export function _resetCompactionCoverageNoteForTest(): void {
+    compactionCoverageNoted = false;
 }
 
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed

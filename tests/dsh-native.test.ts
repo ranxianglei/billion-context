@@ -5,7 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, installDshIntercepts, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { nativeInterceptInstalled, _resetForTest as _resetFetchInterceptForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { nativeWebSocketInterceptInstalled, _resetForTest as _resetWsInterceptForTest } from "../src/agent/native-ws-intercept.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -483,7 +485,7 @@ type NameCall = { conversationId: string; name: string };
 
 type MockAttributionCall = { agent: string; state: string; refusals: number; since: number; error?: string; endpoint?: string };
 
-function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -526,8 +528,8 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
             let body = "";
             req.on("data", (c) => (body += c));
             req.on("end", () => {
-                const parsed = JSON.parse(body) as { conversationId?: string; tool?: string; args?: unknown; nativeCaller?: unknown };
-                toolCalls.push({ conversationId: parsed.conversationId ?? "", tool: parsed.tool ?? "", args: parsed.args, ...(parsed.nativeCaller === true ? { nativeCaller: true } : {}) });
+                const parsed = JSON.parse(body) as { conversationId?: string; tool?: string; args?: unknown; nativeCaller?: unknown; toolCallId?: unknown };
+                toolCalls.push({ conversationId: parsed.conversationId ?? "", tool: parsed.tool ?? "", args: parsed.args, ...(parsed.nativeCaller === true ? { nativeCaller: true } : {}), ...(typeof parsed.toolCallId === "string" ? { toolCallId: parsed.toolCallId } : {}) });
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, result: "compressed 42 tokens" }));
             });
@@ -578,7 +580,7 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
     };
 }
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): Promise<{ origin: string; close: () => void }> {
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): Promise<{ origin: string; close: () => void }> {
     const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus, turnEnabled, attributionCalls, holdManifest));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
@@ -603,7 +605,7 @@ type RegisteredTool = {
     description?: string;
     parameters: unknown;
     output: { schema: unknown; render: (args: unknown, value: unknown) => Array<{ type: string; text: string }> };
-    execute: (args: Record<string, unknown>, exec: { agent?: { session?: { id?: unknown } }; signal?: AbortSignal }) => Promise<unknown>;
+    execute: (args: Record<string, unknown>, exec: { agent?: { session?: { id?: unknown } }; signal?: AbortSignal; callId?: string }) => Promise<unknown>;
 };
 
 // #1785: poll budget raised 5s→15s so a loaded dev host clears a loopback round-trip (fast CI is sub-second).
@@ -775,6 +777,32 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
 // the stale origin and tool calls followed it there (windows-22 CI: the call
 // was answered by the previous test's still-alive mock). The held manifest
 // keeps world 1's probe IN FLIGHT across the reset deterministically.
+test("#7505: dsh forwards exec.callId as the toolCallId when the host supplies it (and omits it when not)", async () => {
+    const calls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }> = [];
+    const cap = await startMockProxy(calls);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-callid-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: cap.origin }, async () => {
+            _resetRegisterForTest(cap.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (callid)");
+            const tool = ctx.registeredTools[0];
+            await tool.execute({ summary: "s" }, { agent: { session: { id: "session-cid" } }, callId: "call_9f8e7d" });
+            await tool.execute({ summary: "s" }, { agent: { session: { id: "session-cid" } } });
+        });
+        // direction 1: host-minted id arrives on the wire
+        assert.equal(calls[0]?.toolCallId, "call_9f8e7d");
+        assert.equal(calls[0]?.conversationId, "session-cid");
+        // direction 2: no id in exec → no toolCallId key in the body (no empty-string noise)
+        assert.equal("toolCallId" in (calls[1] ?? {}), false);
+    } finally {
+        cap.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
 test("#3616 apply() attach mode: a superseded verify landing must not revert the registered origin", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-gen-"));
     try {
@@ -2168,8 +2196,15 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
             assert.equal(await gate(url, { bytes: 4004 }), false);
             // Unreadable body / unknown size → #1117 direct semantics.
             assert.equal(await gate(url), false);
-            // No window resolvable → the size arm disarms entirely → direct.
+            // #5907: no window resolvable (a custom provider the host never
+            // resolved) no longer disarms the arm — the bar falls back to the
+            // 1M floor, so a provably-oversized body refuses LOCALLY instead
+            // of riding DIRECT into a guaranteed upstream 400.
             _setModelInfoForTest();
+            assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized");
+            assert.match(localLines()[3]!, /vs window 1,000,000 \(no window declared; assuming the 1,000,000 floor\)/);
+            // Under the assumed floor (4004 B/4 = 1001 tok ≤ 1M) the arm stays
+            // disarmed → #1117 direct, exactly as before.
             assert.equal(await gate(url, { bytes: 4004 }), false);
         });
     } finally {
@@ -2230,8 +2265,13 @@ test("#4068 gate `none` oversize arm: an unattributed body that provably cannot 
             assert.equal(await gate(url, { bytes: 4004 }), false);
             // Unreadable body / unknown size → #1117 direct semantics.
             assert.equal(await gate(url), false);
-            // No window resolvable → the size arm disarms entirely → direct.
+            // #5907: unknown window falls back to the 1M floor instead of
+            // disarming — a provably-oversized UNATTRIBUTED body refuses
+            // locally instead of riding #1117 DIRECT into a guaranteed 4xx.
             _setModelInfoForTest();
+            assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized-unattributed");
+            assert.match(localLines()[3]!, /vs window 1,000,000 \(no window declared; assuming the 1,000,000 floor\)/);
+            // Under the assumed floor the arm stays disarmed → #1117 direct.
             assert.equal(await gate(url, { bytes: 4004 }), false);
             // Attributed traffic is untouched by the arm (#3617 both-ways):
             // a claimed oversized body goes to the proxy, where preflight's
@@ -3426,5 +3466,34 @@ test("#5792: dsh pre-send chain parses the request body once per request", async
         proxy.close();
         rmrf(home);
         rmrf(stateHome);
+    }
+});
+
+// #5838: installDshIntercepts must arm BOTH egress legs — with only the fetch
+// leg installed, a successful codex-responses WebSocket exchange never calls
+// fetch and the whole conversation bypasses the proxy.
+test("#5838: installDshIntercepts arms both egress legs (fetch + codex-responses WebSocket)", () => {
+    const g = globalThis as Record<PropertyKey, unknown>;
+    const savedFetch = g.fetch;
+    const savedWsDesc = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+    const FakeWs = class {};
+    const restore = (): void => {
+        _resetFetchInterceptForTest();
+        _resetWsInterceptForTest();
+        if (savedWsDesc !== undefined) Object.defineProperty(globalThis, "WebSocket", savedWsDesc);
+        else delete g.WebSocket;
+        g.fetch = savedFetch;
+    };
+    try {
+        restore();
+        g.WebSocket = FakeWs;
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:8787", ready: Promise.resolve("http://127.0.0.1:8787") };
+        installDshIntercepts(state);
+        assert.equal(nativeInterceptInstalled(), true, "fetch leg installed");
+        assert.equal(nativeWebSocketInterceptInstalled(), true, "WebSocket leg installed");
+        assert.notEqual(g.fetch, savedFetch, "global fetch wrapped");
+        assert.notEqual(g.WebSocket, FakeWs, "global WebSocket wrapped");
+    } finally {
+        restore();
     }
 });

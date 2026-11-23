@@ -334,3 +334,12 @@ test("#3250: a configured cap flows open() → journal_size_limit (custom limit 
         rmBestEffort(dir);
     }
 });
+
+test("#6323: auto_vacuum precedes WAL so fresh databases honor INCREMENTAL", () => {
+    const { db } = openSqliteDatabase(":memory:");
+    for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
+    migrateSchema(db);
+    const row = db.prepare("PRAGMA auto_vacuum").get() as Record<string, unknown>;
+    assert.equal(Object.values(row)[0], 2, "auto_vacuum should be INCREMENTAL (2)");
+    db.close();
+});

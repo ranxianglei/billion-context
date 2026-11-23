@@ -19,6 +19,9 @@ import type http from "node:http";
  *  - google:    an in-stream `{"error":{code,message,status}}` frame — Gemini's
  *               own error channel, which its SDK throws on; the stream then
  *               ends (there is no separate terminal byte to synthesize).
+ *  - commandcode: a bare-JSONL `{"type":"error",error,message}` line — the
+ *               CLI wire's own error event, which dsh's handleCliEvent turns
+ *               into a thrown LlmError; the stream then ends.
  * compat.streamErrorShape="completion" restores the legacy shapes (failure text
  * delivered inside a synthesized successful completion), for hosts whose SDK
  * cannot surface an in-band error event.
@@ -27,7 +30,7 @@ import type http from "node:http";
  * still attempt res.end(). Never throws.
  */
 
-type Protocol = "anthropic" | "openai" | "responses" | "google";
+type Protocol = "anthropic" | "openai" | "responses" | "google" | "commandcode";
 
 function safeWrite(res: http.ServerResponse, chunk: string): void {
     try {
@@ -52,6 +55,10 @@ function nativeErrorChunk(protocol: Protocol, message: string): string {
         // Gemini's error object is `{code: number, message, status}` — a
         // numeric code + gRPC-style status, no free-form `type`.
         return `data: ${JSON.stringify({ error: { code: 500, message, status: "INTERNAL" } })}\n\n`;
+    }
+    if (protocol === "commandcode") {
+        // #1295: bare-JSONL error line — the CLI wire's own error event.
+        return `${JSON.stringify({ type: "error", error: "acp_proxy_error", message })}\n`;
     }
     return `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "stream_error", message } })}\n\n`;
 }
@@ -83,15 +90,19 @@ function legacyCompletionChunk(protocol: Protocol, visible: string, state?: Lega
         const oi = 0;
         const errorItem = { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text: visible }] };
         return `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: oi, item: { type: "message", id: itemId, role: "assistant", content: [] } })}\n\n` +
-            `event: response.content_part.added\ndata: ${JSON.stringify({ type: "response.content_part.added", item_id: itemId, output_index: oi, part: { type: "output_text", text: "" } })}\n\n` +
-            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", item_id: itemId, output_index: oi, delta: visible })}\n\n` +
-            `event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: itemId, output_index: oi, text: visible })}\n\n` +
-            `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: itemId, output_index: oi, part: { type: "output_text", text: visible } })}\n\n` +
+            `event: response.content_part.added\ndata: ${JSON.stringify({ type: "response.content_part.added", item_id: itemId, output_index: oi, content_index: 0, part: { type: "output_text", text: "" } })}\n\n` +
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", item_id: itemId, output_index: oi, content_index: 0, delta: visible })}\n\n` +
+            `event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: itemId, output_index: oi, content_index: 0, text: visible })}\n\n` +
+            `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: itemId, output_index: oi, content_index: 0, part: { type: "output_text", text: visible } })}\n\n` +
             `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: oi, item: errorItem })}\n\n` +
             `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [errorItem] } })}\n\n`;
     }
     if (protocol === "google") {
         return `data: ${JSON.stringify({ error: { code: 500, message: visible, status: "INTERNAL" } })}\n\n`;
+    }
+    if (protocol === "commandcode") {
+        // #1295: the CLI wire has no "completion" disguise — always the native error line.
+        return `${JSON.stringify({ type: "error", error: "acp_proxy_error", message: visible })}\n`;
     }
     // #2689: strict clients validate the full Anthropic SSE lifecycle — the old
     // bare delta had no numeric index and no owning block (orphan), so
@@ -162,11 +173,11 @@ export function emitStreamError(res: http.ServerResponse, protocol: Protocol, me
  *    (it just does not reach the wire).
  * Never throws.
  */
-/** #2328 Q2: termination diagnostics carried on the in-band truncation
- *  error frame (`meta`) and in the log line, so "the upstream never sent a
+/** #2328 Q2: termination diagnostics. They ride the proxy log line only and
+ *  never a client-visible SSE frame (#5951), so "the upstream never sent a
  *  terminal event" (#721's no-terminal-seen) and "a terminal was arriving but
- *  its bytes never completed / were unrecognizable" can be told apart from
- *  the client side (#2347 forensics). Every field is plain-JSON safe. */
+ *  its bytes never completed / were unrecognizable" can be told apart
+ *  (#2347 forensics). Every field is plain-JSON safe. */
 export interface TruncationDiag {
     /** Which pipe path fired: clean EOF without a terminal, or a read error. */
     cause: "eof" | "read-error";
@@ -206,7 +217,36 @@ export interface TruncationDiag {
     upstreamStatus?: number;
     /** #5951: the failed read itself, named, on a cut the pipe could not replay. */
     readError?: string;
+    /** Sanitized `Error.cause` chain; names and codes only, never error text. */
+    readErrorCause?: Array<{ name: string; code?: string }>;
+    /** Safe upstream trace identifiers captured from response headers. */
+    upstreamRequestId?: string;
+    upstreamLogId?: string;
+    upstreamCfRay?: string;
+    /** #5951: the replay predicate's own inputs, on both pipe lanes. */
+    replay?: ReplayRefusalDiag;
     upstreamContentType?: string;
+}
+
+/** #5951: why a cut was not replayed, counter by counter. The predicate itself
+ *  lives in plugin.ts and is silent when it declines, so a refused cut names
+ *  here the exact value that refused it. Absent `replay` = no replay door on
+ *  this pipe at all. */
+interface ReplayRefusalDiag {
+    /** The pipe held a refetch, i.e. a replay was possible on this cut. */
+    replayAvailable: boolean;
+    sawThinking?: boolean;
+    sawReasoning?: boolean;
+    sawToolUse?: boolean;
+    sawFunctionCall?: boolean;
+    blocksForwarded?: number;
+    openStreams?: number;
+    forwardedAny?: boolean;
+    releasedMarkupChars?: number;
+    proseChars?: number;
+    answerProseChars?: number;
+    fastPathChars?: number;
+    heldVisibleChars?: number;
 }
 
 export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Protocol, finished: boolean, log?: (msg: string) => void, diag?: TruncationDiag, transparent = false): void {
@@ -214,13 +254,9 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
     const action = finished
         ? protocol === "google" ? "finish reason already delivered, stream complete" : "finish reason seen, synthesizing missing terminal byte"
         : transparent ? "passing through raw (host owns truncation handling, #2563)" : "emitting in-band error";
-    // #2328: the diag blob rides the log line too — one grep for
-    // `upstream stream truncated` pulls the full classification + counters
-    // without needing the client-side error frame.
+    // Diagnostics stay in the proxy's local log. Never attach upstream IDs or
+    // transport details to client-visible SSE error metadata.
     log?.(`[acp-proxy: upstream stream truncated (${protocol}) — ${action}${diag ? `; classification=${diag.classification} cause=${diag.cause}; diag=${JSON.stringify(diag)}` : ""}]`);
-    // #2328: attach the diagnostics as `meta` on the in-band error object.
-    // Wire-shape change (new field on an error-only frame) — human-merge item.
-    const metaField = diag === undefined ? {} : { meta: diag };
     try {
         if (transparent && !finished) {
             // #2563: host-owned handling — deliver exactly what arrived
@@ -230,21 +266,25 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
             if (finished) {
                 safeWrite(res, "data: [DONE]\n\n");
             } else {
-                safeWrite(res, `data: ${JSON.stringify({ error: { type: "server_error", code: "upstream_stream_truncated", message, ...metaField } })}\n\ndata: [DONE]\n\n`);
+                safeWrite(res, `data: ${JSON.stringify({ error: { type: "server_error", code: "upstream_stream_truncated", message } })}\n\ndata: [DONE]\n\n`);
             }
         } else if (protocol === "responses") {
-            safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_stream_truncated", message, ...metaField })}\n\n`);
+            safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_stream_truncated", message })}\n\n`);
         } else if (protocol === "google") {
             // The finishReason chunk IS Gemini's stream terminator: when it was
             // delivered, the client is already done and an extra terminal
             // object would read as a second answer. Only the mid-flight cut
             // needs the error frame (503/UNAVAILABLE — an upstream-cut stream).
-            if (!finished) safeWrite(res, `data: ${JSON.stringify({ error: { code: 503, message, status: "UNAVAILABLE", ...metaField } })}\n\n`);
+            if (!finished) safeWrite(res, `data: ${JSON.stringify({ error: { code: 503, message, status: "UNAVAILABLE" } })}\n\n`);
+        } else if (protocol === "commandcode") {
+            // The finish event IS this wire's terminator: when delivered there
+            // is nothing to synthesize; only a mid-flight cut gets an error line.
+            if (!finished) safeWrite(res, `${JSON.stringify({ type: "error", error: "upstream_stream_truncated", message })}\n`);
         } else {
             if (finished) {
                 safeWrite(res, `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
             } else {
-                safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "upstream_stream_truncated", message, ...metaField } })}\n\n`);
+                safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "upstream_stream_truncated", message } })}\n\n`);
             }
         }
     } catch {
@@ -269,6 +309,9 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
  *  - google:    an `{"error":{code,message,status}}` frame; the retryability
  *               survives as the numeric-code/status pair (503 UNAVAILABLE vs
  *               500 INTERNAL), Gemini having no free-form `type` field.
+ *  - commandcode: a bare-JSONL error line; the CLI wire has no
+ *               stream-level retryability channel (its HTTP layer owns
+ *               retries), so only code+message survive.
  * Never throws.
  */
 export function emitPreflightError(res: http.ServerResponse, protocol: Protocol, error: { message: string; retryable: boolean }, log?: (msg: string) => void): void {
@@ -281,6 +324,8 @@ export function emitPreflightError(res: http.ServerResponse, protocol: Protocol,
             safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: err.code, message: err.message })}\n\n`);
         } else if (protocol === "google") {
             safeWrite(res, `data: ${JSON.stringify({ error: { code: error.retryable ? 503 : 500, message: error.message, status: error.retryable ? "UNAVAILABLE" : "INTERNAL" } })}\n\n`);
+        } else if (protocol === "commandcode") {
+            safeWrite(res, `${JSON.stringify({ type: "error", error: err.code, message: err.message })}\n`);
         } else {
             safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: err.code, message: err.message } })}\n\n`);
         }

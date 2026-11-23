@@ -19,6 +19,31 @@
 
 export interface RawSpan { readonly start: number; readonly end: number }
 
+/** Rebuild the top-level request object from the span scan WITHOUT decoding
+ *  the "messages" array (the multi-hundred-MiB part of a plugin-lane resend).
+ *  Every other top-level field is parsed from its own tiny span. Returns null
+ *  when the body is outside the scannable shape or any field span fails to
+ *  parse — the caller keeps the legacy full JSON.parse (fail-soft, never
+ *  guess — same contract as the scan itself). */
+export function synthesizeTopLevel(bodyText: string): Record<string, unknown> | null {
+    const scan = scanMessagesSpans(bodyText, "all");
+    if (!scan) return null;
+    const out: Record<string, unknown> = {};
+    for (const [key, span] of scan.fieldSpans) {
+        if (key === "messages") continue;
+        try {
+            out[key] = JSON.parse(bodyText.slice(span.start, span.end));
+        } catch {
+            return null;
+        }
+    }
+    // Marker for the deliberately-unparsed conversation array. No legal
+    // chat-completions body carries a non-array "messages", so downstream
+    // Array.isArray checks degrade exactly like a parse failure.
+    out["messages"] = null;
+    return out;
+}
+
 export interface FastpathScanResult {
     /** Element count T of the top-level "messages" array. */
     readonly total: number;
@@ -88,6 +113,7 @@ export function scanMessagesSpans(
                 if (s.charCodeAt(i) === close) { i++; depth--; return; }
                 for (;;) {
                     if (c === 91) {
+                        skipWs();
                         walkValue();
                     } else {
                         skipWs();
@@ -112,7 +138,7 @@ export function scanMessagesSpans(
             const startTok = i;
             while (i < n) {
                 const t = s.charCodeAt(i);
-                if (t === 45 || t === 46 || (t >= 48 && t <= 57) || t === 101 || t === 69
+                if (t === 43 || t === 45 || t === 46 || (t >= 48 && t <= 57) || t === 101 || t === 69
                     || t === 102 || t === 116 || t === 114 || t === 117 || t === 97 || t === 108 || t === 115 || t === 110) {
                     i++;
                     continue;
@@ -132,7 +158,6 @@ export function scanMessagesSpans(
             skipWs();
             if (i >= n) throw new Error("e");
             const c0 = s.charCodeAt(i);
-            if (c0 === 125) { i++; break; }
             if (c0 !== 34) throw new Error("e");
             const keyStart = i;
             readString();

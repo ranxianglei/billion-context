@@ -32,6 +32,7 @@ import path from "node:path";
 import { stateDir } from "./paths.js";
 import { loadConfigFile, type RolloutFeatureOverride, type RolloutFileConfig } from "./config.js";
 import { log as loggerLog } from "./logger.js";
+import { kvStore } from "./persist.js";
 
 /** One feature's baked-in rollout plan (version-owned, set at release time). */
 export interface RolloutPlan {
@@ -58,12 +59,11 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // stamped by the previous response) the server stops re-parsing and
     // re-materializing the identical prefix and decodes only head + new tail.
     // Every verification miss degrades to the legacy full-parse path
-    // byte-identically. EXPERIMENTAL grey rollout at 5% (owner ruling
-    // 2026-11-02: default off, small cohort first, web switch + one-time
-    // intro notice ship alongside); force it per install with
-    // `rollout.features.pluginFullResendWatermark: true|false` (or a percent)
-    // / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1|0`.
-    pluginFullResendWatermark: { percent: 5 },
+    // byte-identically. GA: default ON (owner ruling 2026-11-22, PR #6785:
+    // ran the 5% grey since 2026-11-02 with no issues); opt out per install
+    // with `rollout.features.pluginFullResendWatermark: false` (or a percent)
+    // / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=0`.
+    pluginFullResendWatermark: { percent: 100 },
     // #4804 WS delta continuation: codex/opencode WebSocket clients that keep a
     // previous_response_id checkpoint stop reconstructing full history on every
     // turn — the session augments the delta with the server-committed previous
@@ -95,8 +95,54 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // serve the outbound prefix from the server-owned transcript
     // (POST /__bili/plugin/render). The id-set algebra classifies vanishing
     // cohorts (compressed vs deleted) and detects generation switches.
-    // Default 0% — force on with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=1`.
-    pluginLaneServerHistory: { percent: 0 },
+    // GA (#6525/#6539, owner ruling 2026-11-13): pinned by default. The pin is
+    // the intended end-state of the msgid identity infrastructure — stamped
+    // ids become the recorded `messages.msg_id` so the resolve/settlement/fork
+    // consumers read real host identity, not content digests. The render
+    // endpoint it co-gates is inert until a client opts in (none calls it yet).
+    // Roll back with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=0`.
+    pluginLaneServerHistory: { percent: 100 },
+    // #7064 §8 (owner rulings 2026-11-18): steady-state turns ride the
+    // bounded tail (anchor + new cores) instead of re-sending the FULL msgid
+    // list every turn (the opencode 16KiB header budget died past ~1000
+    // messages); the full form survives only at bootstrap + reanchor. ALL
+    // stamping clients are covered (pi / dsh openai wire via
+    // x-bili-pf-tail-ids; opencode V1 anthropic + V2 responses via the
+    // x-bili-msg-ids channel carrying the tail — server two-form rule). The
+    // owner set it ON by default: it is a core part of the msgid storage
+    // structure, and every mismatch self-heals one round trip (degrade →
+    // full signal → reanchor). Roll back with
+    // `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL=0`. Requires
+    // pluginLaneServerHistory.
+    pluginMsgIdIncremental: { percent: 100 },
+    // #5403 family, delta arm: the client sends body.messages as the TAIL
+    // SLICE [T-L .. T-1] (anchor included) plus x-bili-pf-count = T and
+    // x-bili-pf-tail-ids (width L) — the server rebuilds the view from the
+    // stashed prefix cores + the small re-parsed slice. Inbound bytes drop
+    // from O(history) to O(delta). Every unsatisfiable claim is a 400
+    // re-anchor the client answers with a full-form resend (one-round
+    // convergence); flipping the key back to 0 400s every delta turn, which
+    // is the rollback path (clients converge to the full form within one
+    // turn). Default OFF until the shim send-sides ship — a delta body is
+    // unprocessable by older servers, so both ends must roll together.
+    // Force with `rollout.features.pluginDeltaResend: true` or
+    // `BILI_ROLLOUT_PLUGIN_DELTA_RESEND=1`.
+    pluginDeltaResend: { percent: 0 },
+    // #7398/#7439: the egress plane — ONE switch for the whole new path.
+    // ON: every lane (OpenAI/Anthropic/Responses/Google) records its
+    // outbound conversation view as sparse ops (I/D/U) into the
+    // egress_state/egress_flow dual tables (rows SELF-CONTAINED — message
+    // bytes ride the row, no content CAS, ruling 7439-1), serves the
+    // outbound core portion back from the op log (byte-identical by
+    // construction), and pinned plugin lanes take server authority — the
+    // kernel input is replayed from the flow (rulings 7439-3/5); a bounded
+    // backward ladder recovers to the newest healthy log point, and ANY
+    // unrebuildable/corrupt state degrades the turn to legacy (never a
+    // partial swap, never client-as-authority). OFF = legacy chain, zero
+    // rows, byte-identical to pre-feature.
+    // Force with `rollout.features.egressPlane: true` or
+    // `BILI_ROLLOUT_EGRESS_PLANE=1`.
+    egressPlane: { percent: 0 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
     // message identity aligned from their OWN local transcript/sqlite
@@ -108,6 +154,22 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // the seam may even read local files — coupling them made opting one's
     // own install in require bumping an unrelated rollout. Default 0%.
     identityChannelHarvest: { percent: 0 },
+    // #7168/#7439 DSH client-extension intercept: DSH (deepseek-harness) rides
+    // top-level `dsh_*` fields on every request — `dsh_session_log` (the 8 MiB
+    // lossless session-log upload for the official DeepSeek API; the model never
+    // reads it) plus the sibling `dsh_plugin_packages`. On forked/seeded sessions
+    // it resends the whole log each turn until its watermark catches up. Default
+    // 0% = INTERCEPT: bili strips top-level `dsh_*` from the inbound body
+    // (handle.ts) so the 8 MiB is never forwarded upstream — no bandwidth waste,
+    // no unknown-field risk on a non-DeepSeek upstream. DSH self-heals because its
+    // upload watermark only advances on a 2xx (llm-deepseek/adapter.ts), which bili
+    // still returns; the window meter is separately exempt (#7168 dsh_* skip).
+    // RELEASE once the server-authoritative egress work (#6785 / discussion #7439)
+    // ships the client-extension sideband — flip this to 100% (or remove the strip)
+    // and DSH's official-DeepSeek session-log upload resumes. Force pass-through
+    // now with `rollout.features.passDshExtensions: true` /
+    // `BILI_ROLLOUT_PASS_DSH_EXTENSIONS=1`.
+    passDshExtensions: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;
@@ -234,6 +296,54 @@ export function rolloutDecisions(id: string): RolloutDecision[] {
  *  relocating XDG_STATE_HOME get independent ids within one process. */
 const idCache = new Map<string, string>();
 
+// #5753: the identity rides the UNIFIED storage (kv_store namespace "rollout",
+// key "install-id") under the #5548 carrier rules: kv primary once hydrated,
+// legacy file kept as pre-hydration fallback + sole carrier on legacy-only
+// instances + fresh-install BOOTSTRAP. The bootstrap matters: two lane copies
+// racing on a brand-new install must converge on ONE id (the historical wx
+// create-file race is the tie-breaker), so generation still creates the file
+// exactly once per install lifetime; every later read/write goes to kv.
+const ID_NS = "rollout";
+const ID_KEY = "install-id";
+let kvInstallId: string | null = null;
+let kvIdHydrated = false;
+let kvIdWarned = false;
+
+function kvIdWarnOnce(tag: string, err: unknown): void {
+    if (kvIdWarned) return;
+    kvIdWarned = true;
+    loggerLog("warn", `[rollout] ${tag} failed — install id stays file-based for this process: ${err instanceof Error ? err.message : String(err)}`);
+}
+
+/** Once per process (wired at cli start): adopt the unified-storage id when
+ *  present, otherwise import the legacy file into kv one time. Never throws.
+ */
+export async function hydrateRolloutIdentity(): Promise<void> {
+    const store = kvStore();
+    if (kvIdHydrated || !store) return;
+    try {
+        const doc = await store.getKvAsync(ID_NS, ID_KEY);
+        const v = doc && typeof doc === "object" ? ((doc as { id?: unknown })["id"] as unknown) : undefined;
+        if (typeof v === "string" && /^[0-9a-f-]{8,}$/i.test(v)) {
+            kvInstallId = v;
+            kvIdHydrated = true;
+            return;
+        }
+        // no usable row: import the legacy file (one-time migration).
+        const file = rolloutIdFile();
+        const fileCached = idCache.get(file) ?? readIdFile(file);
+        if (fileCached !== undefined) {
+            await store.setKvAsync(ID_NS, ID_KEY, { id: fileCached });
+            kvInstallId = fileCached;
+            idCache.set(file, fileCached);
+            loggerLog("info", `[rollout] imported the install id from the legacy JSON file into unified storage (kv_store namespace "${ID_NS}")`);
+        }
+        kvIdHydrated = true;
+    } catch (err) {
+        kvIdWarnOnce("hydrate", err);
+    }
+}
+
 function rolloutIdFile(): string {
     return path.join(stateDir(), "rollout-id.json");
 }
@@ -257,6 +367,10 @@ export function rolloutInstallId(): string {
     const file = rolloutIdFile();
     const cached = idCache.get(file);
     if (cached !== undefined) return cached;
+    if (kvInstallId !== null) {
+        idCache.set(file, kvInstallId);
+        return kvInstallId;
+    }
     const existing = readIdFile(file);
     if (existing !== undefined) {
         idCache.set(file, existing);
@@ -291,6 +405,17 @@ export function rolloutInstallId(): string {
         return derived;
     }
     const settled = readIdFile(file) ?? generated;
+    // #5753: once the identity is settled, it lives in the unified store; the
+    // file remains only as the cross-process bootstrap artifact written above.
+    // (kvStore(): suites may install partial stubs — never call methods that
+    // are absent on them.)
+    const kvs = kvStore();
+    if (kvs && kvInstallId === null) {
+        void kvs
+            .setKvAsync(ID_NS, ID_KEY, { id: settled })
+            .then(() => { if (kvInstallId === null) kvInstallId = settled; })
+            .catch((err) => kvIdWarnOnce("persist", err));
+    }
     idCache.set(file, settled);
     return settled;
 }
@@ -303,6 +428,16 @@ export function rolloutInstallId(): string {
  * → same id across restarts, so the cohort stays sticky even on this path. */
 export function derivedInstallId(home: string, hostname: string, username: string): string {
     return "derived-" + createHash("sha256").update(`${username}\n${hostname}\n${home}`).digest("hex").slice(0, 32);
+}
+
+/** Test seam: drop the unified-identity caches. */
+export function _resetRolloutIdentityForTest(): void {
+    kvInstallId = null;
+    kvIdHydrated = false;
+    kvIdWarned = false;
+    // a simulated restart re-resolves every carrier — the file-keyed identity
+    // cache must not leak a wiped volume's id into the "fresh" process.
+    idCache.clear();
 }
 
 /** One feature's effective gate, against the real install id. Call sites use

@@ -23,7 +23,7 @@ precisely so knobs don't bloat the environment. Precedence everywhere:
 
 | Category | Home | Examples |
 |----------|------|----------|
-| Behavior tunables (timeouts, caps, modes, diagnostics) | config-file key resolved through `src/knobs.ts`; env stays the override tier | `network.*`, `persist.*`, `sessions.*`, `update.*`, `diagnostics.*`, `fakeCompletion.*`, `plugin.*` |
+| Behavior tunables (timeouts, caps, modes, diagnostics) | config-file key resolved through `src/knobs.ts`; env stays the override tier | `network.*`, `persist.*`, `sessions.*`, `update.*`, `diagnostics.*` (incl. `logRetentionHours` / `logBudgetBytes`), `fakeCompletion.*`, `plugin.*` |
 | Secrets / credentials | env only (never written to disk) | `BILI_LAUNCH_TOKEN`, `BILI_ENCRYPTION_KEY` |
 | Per-process channels (written by another bili component at spawn) | env only + comment at the read site naming the writer | `BILI_MCP_PROXY`, `BILI_PARENT_PID`, `BILI_STRICT_PORT`, `BILI_OPENCODE_ACP_SPEC`, `BILI_LAUNCHER_MODEL_*`, `PI_ACP_DELEGATE_*` (child-delegate propagation, #2230; file tier = `pi.subagents`) |
 | Host-side posture (read inside a third-party host process at bootstrap) | env only + comment at the read site | `BILLION_CONTEXT_PLUGIN*`, `BILI_NATIVE_*`, `BILI_RECLAIM_FETCH_PATCH` |

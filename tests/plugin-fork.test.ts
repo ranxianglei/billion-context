@@ -25,6 +25,10 @@ process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
 test.after(() => rmSync(testRoot, { recursive: true, force: true }));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
+// #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+// off) — this suite's cold-disk-restore tests read the legacy JSON
+// content-store files off disk, so pin the dual-write writer explicitly.
+process.env.BILI_STORAGE_JSON_WRITER = "on";
 const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
 
 interface SnapshotResponse {
@@ -295,6 +299,27 @@ test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", { ti
     } finally { await h.close(); }
 });
 
+test("HTTP fork carries the timestamp ledger so the first child replay re-renders cached tag bytes (#5608)", { timeout: 60_000 }, async () => {
+    // the carry only has teeth when stamps exist: defeat the suite's ambient
+    // BILI_MESSAGE_TIMESTAMPS=0 pin so this instance resolves the #4313 default ON
+    const prevStampEnv = process.env.BILI_MESSAGE_TIMESTAMPS;
+    delete process.env.BILI_MESSAGE_TIMESTAMPS;
+    const h = await harness();
+    try {
+        const parent = resolveConversation("parent").session!;
+        assert.ok(parent.state.tsStamps && Object.keys(parent.state.tsStamps).length >= 3, "the seeded turn minted stamps for the tagged messages");
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot, "child"));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const child = resolveConversation("child").session!;
+        assert.deepEqual(child.state.tsStamps, parent.state.tsStamps, "stamps are raw-id (content-hash) keyed — the whole ledger denotes exact cached bytes and rides the fork verbatim");
+    } finally {
+        await h.close();
+        if (prevStampEnv === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
+        else process.env.BILI_MESSAGE_TIMESTAMPS = prevStampEnv;
+    }
+});
+
 async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[], tools: unknown[], requestAgent?: string, maxTokens = 256, announcePlugin = true, pluginName = "ekko-agent") {
     const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conversationId };
     if (announcePlugin) {
@@ -392,6 +417,40 @@ function forkRequest(snapshot: { parentRevision: string; orderedMessages: unknow
     const orderedMessages = snapshot.orderedMessages.slice(0, count);
     return { protocolVersion: 1, parentConversationId: "parent", childConversationId: child, parentRevision: snapshot.parentRevision, branchPoint: { messageCount: count, orderHash: hash(orderedMessages) }, orderedMessages, idempotencyKey: `fork-${child}` };
 }
+
+test("HTTP fork retains ref state in source order and removes only the excluded side", { timeout: 60_000 }, async () => {
+    const h = await harness(false, false);
+    try {
+        const count = 256;
+        const history = Array.from({ length: count }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `fork source ${i}` }));
+        await sendIntentModel(h, "parent", history, [], "main");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const refs = snapshot.body.orderedMessages.map((message) => message.ref);
+        const parent = resolveConversation("parent").session!;
+        parent.state.hiddenOrphanRefs = [refs[127]!, refs[128]!, refs[0]!, refs[127]!];
+        parent.state.emergencyTruncateLatch = [
+            { ref: refs[1]!, text: "first clipped text" },
+            { ref: refs[200]!, text: "outside clipped text" },
+            { ref: refs[126]!, text: "last clipped text" },
+        ];
+        parent.state.renderDeferredRefs = [refs[255]!, refs[2]!, refs[2]!];
+        parent.state.deadRefs = [refs[3]!, refs[254]!, refs[255]!, refs[254]!];
+        parent.state.viewLatches = { [refs[4]!]: { text: "inside" }, [refs[129]!]: { text: "outside" } };
+        const before = structuredClone(parent.state);
+
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", 128));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const child = resolveConversation("child").session!;
+        assert.deepEqual(child.state.hiddenOrphanRefs, [refs[127], refs[0], refs[127]]);
+        assert.deepEqual(child.state.emergencyTruncateLatch, [before.emergencyTruncateLatch![0], before.emergencyTruncateLatch![2]]);
+        assert.deepEqual(child.state.renderDeferredRefs, [refs[2], refs[2]]);
+        assert.deepEqual(child.state.deadRefs, [refs[254], refs[255], refs[254]]);
+        assert.deepEqual(child.state.viewLatches, { [refs[4]!]: { text: "inside" } });
+        assert.deepEqual(child.pluginSnapshot, parent.pluginSnapshot!.slice(0, 128));
+        assert.deepEqual(parent.state, before, "fork filtering does not mutate the parent's state");
+    } finally { await h.close(); }
+});
 
 test("HTTP protected tools keep plain-text snapshots, forks and revisions usable (#2620)", { timeout: 60_000 }, async () => {
     const h = await harness(false, false, { protectedTools: ["ask_user_question"] });
@@ -888,6 +947,15 @@ test("HTTP CCR shared payload deletion fails closed before persistence", { timeo
 
 for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "wrong-raw-alias", "changed-payload"] as const) {
     test(`HTTP CCR ${corruption} fails closed after cold disk restore`, async () => {
+        // Pure-SQLite is the default storage writer now (2026-11-13): these
+        // corruption tests corrupt and re-read a .content-store.json envelope,
+        // which never exists on disk under the default writer (ENOENT on
+        // sessions/<protocol> — red in the e2e-dsh-plugin-lane). Pin dual-write
+        // like the other e2e lanes (d252543a/74a925db); the test still removes
+        // index.db below, so the fail-closed 409 contract is unchanged, and
+        // pure-sqlite-only semantics stay covered by the storage unit tests.
+        const previousWriter = process.env.BILI_STORAGE_JSON_WRITER;
+        process.env.BILI_STORAGE_JSON_WRITER = "1";
         const h = await harness(true);
         try {
             const parent = resolveConversation("parent").session!;
@@ -945,7 +1013,11 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
             assert.equal(parentState(), before);
             assert.equal(readFileSync(path, "utf8"), JSON.stringify(disk));
             store2.closeQuietly();
-        } finally { await h.close(); }
+        } finally {
+            if (previousWriter === undefined) delete process.env.BILI_STORAGE_JSON_WRITER;
+            else process.env.BILI_STORAGE_JSON_WRITER = previousWriter;
+            await h.close();
+        }
     });
 }
 
@@ -970,10 +1042,11 @@ for (const storageMode of ["legacy", "full"] as const) {
             parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
             parent.contentStoreDirty = true;
             assert(h.store.flushSync(parent));
-            // #4316 PR3/3: only a unified cold load runs the one-time ledger
-            // alignment; the CI legacy baseline retains the original state.
+            // #4316 PR3/3 + #5608-D: cold load NO LONGER runs the one-time
+            // ledger alignment — it must preserve the persisted state
+            // byte-for-byte so the provider prefix survives the restart;
+            // the alignment rides the session's next post-restart fold save.
             const persistedState = JSON.parse(JSON.stringify(parent.state));
-            if (h.store.replicasAvailable()) persistedState.refLedgerAligned = true;
             assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
             const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
             const req = forkRequest(snapshot);

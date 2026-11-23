@@ -250,7 +250,15 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
     } else {
         // Non-configurable host property or reclaim disabled
         // (BILI_RECLAIM_FETCH_PATCH=0): keep the classic direct install
-        // (no guard, the old behavior).
+        // (no guard, the old behavior). #5907: without the guard a
+        // third-party replacement silently un-routes every model request
+        // (zero bili.log lines, raw payload to upstream) — name the degraded
+        // posture once instead of staying silent.
+        if (!shouldReclaimFetchPatch()) {
+            logHostEvent("warn", "[native-client]", "[bili-native] BILI_RECLAIM_FETCH_PATCH=0 — the #1158 fetch self-heal is disabled by configuration; a third-party globalThis.fetch replacement will silently un-route model traffic instead of being re-chained (documented degradation, #1158/#5907)");
+        } else {
+            logHostEvent("warn", "[native-client]", "[bili-native] globalThis.fetch is not configurable on this host — the #1158 self-heal guard cannot be installed; a third-party fetch replacement will silently un-route model traffic (no compression, no bili.log lines) until the host restarts. Robust fallback: point the provider baseURL at http://<proxy-host>:<port>/bili/<upstream-base> (#5907)");
+        }
         globalThis.fetch = top;
     }
 }

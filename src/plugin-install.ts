@@ -26,6 +26,10 @@
 //   zcode    ~/.zcode/cli/config.json  hooks.enabled + SessionStart hook +
 //            mcp.servers.bili (stdio MCP); provider-store routing happens
 //            per-session, see src/zcode/ (no URL frozen at install time)
+//   workbuddy ~/.workbuddy/settings.json  env.CODEBUDDY_BASE_URL wraps the
+//            product endpoint into the resident proxy + autoCompactEnabled
+//            gate (pure wire mode — desktop-spawned CLI sessions run with
+//            --strict-mcp-config, so no host tool face is possible, #7456)
 // Installers throw on failure (bad/locked config, missing host CLI); the CLI
 // layer catches, prints `bili plugin: <msg>` and exits 1.
 
@@ -39,7 +43,7 @@ import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError
 import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome, readClaudeSettings } from "./client-config.js";
 import { stripBiliWrappers, vertexBaseUrlForLocation } from "./vertex.js";
 import { resolveClaudeNativePort } from "./config.js";
-import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
+import { isPidAlive, isProxyInstanceFile, lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { piNpmCopyRoot } from "./pi-channel.js";
 import { clearOwnerLaneBackoff, fetchRegistryVersion } from "./update.js";
@@ -85,7 +89,7 @@ export function portableHookCommand(exe: string, args: string[] = []): string {
     return /\s/.test(head) ? [`& "${head}"`, ...tail].join(" ") : [head, ...tail].join(" ");
 }
 
-export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode"] as const;
+export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode", "workbuddy"] as const;
 export type PluginAgent = (typeof PLUGIN_AGENTS)[number];
 
 export function selfPackageRoot(): string {
@@ -1378,10 +1382,13 @@ function stripLegacyOpencodeAcp(data: Record<string, unknown>, notes: string[], 
 
 // #925: how THIS bili was installed decides which plugin entry install can
 // publish. An npm-form install (package root under node_modules — npm/pnpm/
-// yarn, both path-separator styles) ships its entry through package.json
-// exports["./server"], so opencode loads the bare package name via its own
-// Npm.add machinery (host-managed install + upgrade, portable config). Any
-// other form (git checkout / dev build) has no published entry — local shim dir.
+// yarn, both path-separator styles) CAN ship its entry through package.json
+// exports["./server"] as the bare package name (host-managed install +
+// upgrade, portable config) — but ONLY on OpenCode 1.x hosts. On 2.x hosts
+// the bare name resolves to the package MAIN field on some platforms
+// (Windows: dist/index.js — the CLI, no default export → LoadError, #3976),
+// so every 2.x install writes the local shim dir instead. Any non-npm form
+// (git checkout / dev build) has no published entry — local shim dir too.
 export function isNpmInstallForm(root: string): boolean {
     return /(^|[/\\])node_modules[/\\]/.test(root);
 }
@@ -1389,6 +1396,8 @@ export function isNpmInstallForm(root: string): boolean {
 export const OPENCODE_NPM_ENTRY = "billion-context";
 
 const DEV_FORM_NOTE = "dev form: machine-local shim, not portable across machines — an npm install writes the bare package name instead";
+
+const V2_NPM_SHIM_NOTE = "OpenCode 2.x host: machine-local shim dir instead of the bare package name — 2.x loads bare names via the package main field, which is not the plugin (#3976)";
 
 // #925: pick + apply the plugin entry for this install form. Replaces any
 // existing entry of either form (single owner), returns note(s). #927: the
@@ -1400,13 +1409,21 @@ const DEV_FORM_NOTE = "dev form: machine-local shim, not portable across machine
 // scalars) are preserved verbatim in form and position. A strings-only
 // projection must never be written back, and "plugin present" must mean
 // the key was left untouched (no rewrite of the surrounding file either).
+// #3976: the ENTRY FORM is decided by install form AND host major version —
+// the `plugins` key is written only for 2.x hosts (#927 pickPluginKey), so
+// key === "plugins" is the 2.x gate: every 2.x install (npm or dev form)
+// writes the shim dir, because a bare package name resolves to the package
+// main field (dist/index.js — the CLI, no default export) on 2.x hosts such
+// as Windows and loads no plugin at all. 1.x keeps the portable bare name
+// for npm-form installs; dev form always shims (no published entry).
 export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; root: string; shimDir: string; agentJs: string; key?: "plugin" | "plugins"; touched?: Set<string> }): string[] {
     const { data, root, shimDir, agentJs } = args;
     const key = args.key ?? "plugin";
     const touched = args.touched ?? new Set<string>();
     const ours = [OPENCODE_NPM_ENTRY, shimDir];
     const npmForm = isNpmInstallForm(root);
-    const entry = npmForm ? OPENCODE_NPM_ENTRY : shimDir;
+    const useShim = !npmForm || key === "plugins";
+    const entry = useShim ? shimDir : OPENCODE_NPM_ENTRY;
     const isOurs = (x: unknown): boolean => typeof x === "string" && ours.includes(x);
     const raw = data[key];
     const oursIn = (): string[] => {
@@ -1415,10 +1432,15 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
         return [];
     };
     const replaced = oursIn();
-    if (npmForm && replaced.includes(shimDir)) fs.rmSync(shimDir, { recursive: true, force: true });
-    if (!npmForm) {
+    if (!useShim && replaced.includes(shimDir)) fs.rmSync(shimDir, { recursive: true, force: true });
+    if (useShim) {
         fs.mkdirSync(shimDir, { recursive: true });
-        fs.writeFileSync(path.join(shimDir, "index.js"), `export { default } from ${JSON.stringify(agentJs)};\n`);
+        // Rewrite whenever the content drifts from THIS root (a reinstall to
+        // a new path must heal a stale shim even when the config entry is
+        // already present and left untouched below).
+        const idx = path.join(shimDir, "index.js");
+        const want = `export { default } from ${JSON.stringify(agentJs)};\n`;
+        if (!fs.existsSync(idx) || fs.readFileSync(idx, "utf8") !== want) fs.writeFileSync(idx, want);
     }
     // Exactly our one entry, already the right form — nothing to migrate:
     // leave the key (and the file) untouched.
@@ -1434,12 +1456,113 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
         data[key] = [entry];
     }
     touched.add(key);
-    if (npmForm) {
-        if (replaced.length === 0) return [`plugin -> ${OPENCODE_NPM_ENTRY}`];
-        return [`plugin -> ${OPENCODE_NPM_ENTRY} (replaced ${replaced.join(", ")})`];
+    if (!useShim) {
+        if (replaced.length === 0) return [`${key} -> ${OPENCODE_NPM_ENTRY}`];
+        return [`${key} -> ${OPENCODE_NPM_ENTRY} (replaced ${replaced.join(", ")})`];
     }
-    if (replaced.length === 0) return [`plugin -> ${shimDir}`, DEV_FORM_NOTE];
-    return [`plugin -> ${shimDir} (replaced ${replaced.join(", ")})`, DEV_FORM_NOTE];
+    const note = npmForm ? V2_NPM_SHIM_NOTE : DEV_FORM_NOTE;
+    if (replaced.length === 0) return [`${key} -> ${shimDir}`, note];
+    return [`${key} -> ${shimDir} (replaced ${replaced.join(", ")})`, note];
+}
+
+// #6816: OpenCode 2.x ships a built-in Claude Agent provider (claude-agent/*)
+// that drives a local Claude Code binary and makes NO HTTP request from
+// OpenCode — the plugin's HTTP-hook routing never sees its traffic, so the
+// provider silently runs uncompressed while `bili doctor` stays green. The
+// fix routes it by pointing it at the proxy in the host config (the
+// reporter's verified workaround), pinned to the LIVE lane port — the port
+// drifts (#5127/#5129), so it is resolved per install, never hardcoded.
+const OPENCODE_CLAUDE_AGENT_PROVIDER = "claude-agent";
+
+/** #6816: the proxy origin a claude-agent baseURL must point at. */
+export function opencodeClaudeAgentBaseUrl(): string {
+    return `http://127.0.0.1:${lanePreferredPort("opencode")}/bili/https://api.anthropic.com`;
+}
+
+/** #6816: the claude-agent baseURL currently in the opencode config, if any.
+ *  Fail-open: an unreadable or malformed config reads as "not configured"
+ *  (the install path refuses to overwrite such a file anyway, §7.3). */
+export function inspectOpencodeClaudeAgent(): { file: string; baseUrl: string | undefined } {
+    const file = opencodeTargetFile();
+    let baseUrl: string | undefined;
+    try {
+        const { data } = loadOpencodeConfig(file);
+        const providers = data.providers;
+        if (isPlainMcpObject(providers)) {
+            const entry = providers[OPENCODE_CLAUDE_AGENT_PROVIDER];
+            if (isPlainMcpObject(entry)) {
+                const settings = entry.settings;
+                if (isPlainMcpObject(settings) && typeof settings.baseURL === "string") baseUrl = settings.baseURL;
+            }
+        }
+    } catch {
+        baseUrl = undefined;
+    }
+    return { file, baseUrl };
+}
+
+// #6816: route the built-in Claude Agent provider at the live lane port.
+// Merge-preserving: foreign providers and existing claude-agent settings
+// survive; a foreign baseURL is the user's explicit choice and is never
+// clobbered (§7.3). 1.x hosts have no such provider — skip there.
+function applyOpencodeClaudeAgentEntry(data: Record<string, unknown>, touched: Set<string>, notes: string[]): void {
+    if (detectOpencodeMajor() < 2) {
+        notes.push("claude-agent baseURL skipped (OpenCode 1.x has no built-in Claude Agent provider)");
+        return;
+    }
+    const url = opencodeClaudeAgentBaseUrl();
+    const providers = data.providers;
+    if (providers !== undefined && !isPlainMcpObject(providers)) {
+        notes.push('claude-agent baseURL skipped ("providers" is not an object)');
+        return;
+    }
+    const existing = isPlainMcpObject(providers) ? providers[OPENCODE_CLAUDE_AGENT_PROVIDER] : undefined;
+    if (existing !== undefined && !isPlainMcpObject(existing)) {
+        notes.push('claude-agent baseURL skipped ("providers.claude-agent" is not an object)');
+        return;
+    }
+    const settings = isPlainMcpObject(existing) ? existing.settings : undefined;
+    if (settings !== undefined && !isPlainMcpObject(settings)) {
+        notes.push('claude-agent baseURL skipped ("providers.claude-agent.settings" is not an object)');
+        return;
+    }
+    const current = isPlainMcpObject(settings) ? settings.baseURL : undefined;
+    if (typeof current === "string" && !isBiliClaudeBaseUrl(current)) {
+        notes.push(`claude-agent baseURL untouched (foreign: ${current})`);
+        return;
+    }
+    if (current === url) {
+        notes.push("claude-agent baseURL present");
+        return;
+    }
+    const nextProviders = isPlainMcpObject(providers) ? providers : {};
+    const nextEntry = isPlainMcpObject(existing) ? existing : {};
+    const nextSettings = isPlainMcpObject(settings) ? settings : {};
+    nextSettings.baseURL = url;
+    nextEntry.settings = nextSettings;
+    nextProviders[OPENCODE_CLAUDE_AGENT_PROVIDER] = nextEntry;
+    data.providers = nextProviders;
+    touched.add("providers");
+    notes.push(current === undefined ? `claude-agent baseURL -> ${url}` : `claude-agent baseURL re-pinned ${current} -> ${url}`);
+}
+
+// #6816: take back only a baseURL we could have written — a foreign one is
+// the user's and stays. Prune the emptied parents so remove leaves no husk.
+function removeOpencodeClaudeAgentEntry(data: Record<string, unknown>, touched: Set<string>, notes: string[]): void {
+    const providers = data.providers;
+    if (!isPlainMcpObject(providers)) return;
+    const entry = providers[OPENCODE_CLAUDE_AGENT_PROVIDER];
+    if (!isPlainMcpObject(entry)) return;
+    const settings = entry.settings;
+    if (!isPlainMcpObject(settings)) return;
+    const current = settings.baseURL;
+    if (typeof current !== "string" || !isBiliClaudeBaseUrl(current)) return;
+    delete settings.baseURL;
+    if (Object.keys(settings).length === 0) delete entry.settings;
+    if (Object.keys(entry).length === 0) delete providers[OPENCODE_CLAUDE_AGENT_PROVIDER];
+    if (Object.keys(providers).length === 0) delete data.providers;
+    touched.add("providers");
+    notes.push("claude-agent baseURL removed");
 }
 
 function opencodeInstall(withMcp = false): string {
@@ -1501,9 +1624,10 @@ function opencodeInstall(withMcp = false): string {
         }
     }
 
-    // Native plugin (#820/#925): self-spawned proxy + http.request URL rewrite.
-    // Entry form depends on how THIS bili was installed — npm → bare package
-    // name (exports["./server"], host-managed), checkout/dev → local shim dir.
+    // Native plugin (#820/#925/#3976): self-spawned proxy + http.request URL
+    // rewrite. Entry form: OpenCode 1.x + npm install → bare package name
+    // (host-managed, portable); every 2.x install and any dev-form install →
+    // local shim dir (bare names do not load under 2.x hosts, #3976).
     const root = selfPackageRoot();
     const agentJs = path.join(root, "dist", "agent", "opencode-native.js");
     requireDistFile(agentJs);
@@ -1528,6 +1652,10 @@ function opencodeInstall(withMcp = false): string {
         touched.add("compaction");
         notes.push("compaction.auto set to false");
     }
+
+    // #6816: the built-in Claude Agent provider bypasses HTTP-hook routing —
+    // point it at the proxy (live lane port) or leave a foreign baseURL alone.
+    applyOpencodeClaudeAgentEntry(data, touched, notes);
 
     writeOpencodeConfig(file, original, data, touched);
     return `opencode: installed -> ${file} (${notes.join("; ")})`;
@@ -1580,6 +1708,9 @@ function opencodeRemove(): string {
         if (removed.includes(dir)) fs.rmSync(dir, { recursive: true, force: true });
         notes.push(`plugin removed (${removed.join(", ")})`);
     }
+
+    // #6816: take back only a bili baseURL — a foreign one is the user's.
+    removeOpencodeClaudeAgentEntry(data, touched, notes);
 
     if (notes.length > 0) {
         const cur = data.compaction as Record<string, unknown> | undefined;
@@ -2082,6 +2213,180 @@ function zcodeStatus(): string {
     return status;
 }
 
+// — workbuddy (#7456) ————————————————————————————————————————————————————————
+// WorkBuddy Desktop (Electron) embeds a CodeBuddy Code CLI fork: every agent
+// session — the desktop-hosted sidecar and manual CLI runs — is that CLI, so
+// its model traffic can be routed through bili by wrapping the endpoint in
+// the user settings file. The CLI resolves `env.CODEBUDDY_BASE_URL` from
+// settings BEFORE process.env (per-key settings read, decompiled evidence in
+// issue #7456), which is what makes the desktop path work despite the app
+// spawning its CLI with an explicit env allowlist. Pure wire mode by design:
+// desktop-spawned sessions run with --strict-mcp-config, which blocks every
+// user/project/local MCP scope, so a host tool face (MCP entry, plugin
+// header) is impossible for the app's own sessions — compression rides the
+// proxy instead.
+
+/** WorkBuddy's product endpoint — the upstream baked in when no relay is
+ *  configured and the settings file carries no base URL of its own. */
+export const WORKBUDDY_DEFAULT_UPSTREAM = "https://www.workbuddy.ai";
+
+/** <WORKBUDDY_CONFIG_DIR | CODEBUDDY_CONFIG_DIR | ~/.workbuddy> — the CLI
+ *  resolves the config home in exactly this order. */
+export function workbuddyConfigDir(env: NodeJS.ProcessEnv = process.env): string {
+    const raw = (env.WORKBUDDY_CONFIG_DIR || env.CODEBUDDY_CONFIG_DIR)?.trim();
+    return raw !== undefined && raw.length > 0 ? raw : path.join(os.homedir(), ".workbuddy");
+}
+
+export function workbuddySettingsFile(env: NodeJS.ProcessEnv = process.env): string {
+    return path.join(workbuddyConfigDir(env), "settings.json");
+}
+
+/** True for a base-URL value written by a bili managed block: loopback
+ *  /bili/-wrapped upstream. Same ownership rule as the claude lane — any
+ *  port matches, so an older install's port is rewritten, not orphaned. */
+export function isBiliWorkbuddyBaseUrl(value: unknown): boolean {
+    if (typeof value !== "string") return false;
+    return /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5}\/bili\/https?:\/\//.test(value);
+}
+
+/** The inverse of the wrap: strip a bili wrapper (any loopback port) from a
+ *  base URL. Returns undefined for anything not written by us. */
+function unwrapBiliWbBaseUrl(value: string): string | undefined {
+    const m = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5}\/bili\/(https?:\/\/.+)$/.exec(value);
+    return m ? m[1] : undefined;
+}
+
+/** Upstream to bake at INSTALL time: an explicit BILI_WORKBUDDY_UPSTREAM relay wins
+ *  (documented user override); otherwise preserve the relay a previous
+ *  install wrapped; otherwise the product endpoint. A foreign, un-wrapped
+ *  value is never fed back as an upstream — apply skips foreign values. */
+export function workbuddyInstallUpstream(existingBaseUrl: unknown, env: NodeJS.ProcessEnv = process.env): string {
+    const relay = env.BILI_WORKBUDDY_UPSTREAM?.trim();
+    if (relay !== undefined && relay.length > 0) return relay.replace(/\/+$/, "");
+    const raw = typeof existingBaseUrl === "string" ? existingBaseUrl.trim() : "";
+    return (raw.length > 0 ? unwrapBiliWbBaseUrl(raw) : undefined) ?? WORKBUDDY_DEFAULT_UPSTREAM;
+}
+
+/** The loopback origin the managed block bakes in: an explicit BILI_WORKBUDDY_PROXY
+ *  override, else the resident default (manual `bili start`, the panel). The
+ *  block is static config with no per-session bootstrap, so it pins the
+ *  resident — a lane-zone port would die with its session. */
+export function workbuddyNativeOrigin(env: NodeJS.ProcessEnv = process.env): string {
+    const explicit = env.BILI_WORKBUDDY_PROXY?.trim();
+    if (explicit !== undefined && explicit.length > 0) return explicit.replace(/\/+$/, "");
+    return "http://127.0.0.1:8787";
+}
+
+/** Install-time liveness for the warning: a proxy instance is recorded AND
+ *  its origin matches the one the managed block pins AND its pid is alive.
+ *  Origin-matching keeps the check honest — a live LANE-zone instance on
+ *  another port does not make the pinned origin reachable, and a dead pid
+ *  with a stale record does not fake health. */
+function pinnedOriginLive(origin: string): boolean {
+    const inst = readProxyInstanceFile();
+    if (inst === undefined || inst.origin !== origin) return false;
+    if (!isProxyInstanceFile(inst)) return true;
+    return isPidAlive(inst.pid);
+}
+
+/** Pure merge of the #7456 managed block into parsed settings (install
+ *  path). Never clobbers user keys: a foreign CODEBUDDY_BASE_URL is reported
+ *  and skipped, not overwritten (same rule as the claude lane); an explicit
+ *  `autoCompactEnabled: true` is honored. Returns the mutated copy plus human
+ *  notes. Exported for tests. */
+export function applyWorkbuddyManagedSettings(settings: Record<string, unknown>, opts: { origin: string; upstream: string; relay?: string }): { data: Record<string, unknown>; notes: string[] } {
+    const data = structuredClone(settings);
+    const notes: string[] = [];
+    const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : {}) as Record<string, unknown>;
+    const cur = env.CODEBUDDY_BASE_URL;
+    const prefix = opts.origin.replace(/\/+$/, "") + "/bili/";
+    const target = prefix + opts.upstream;
+    const isRelayMatch = opts.relay !== undefined && opts.relay.length > 0 && typeof cur === "string" && cur.replace(/\/+$/, "") === opts.relay.replace(/\/+$/, "");
+    const isWrappingCur = typeof cur === "string" && unwrapBiliWbBaseUrl(target) === cur.replace(/\/+$/, "");
+    if (cur === undefined || cur === null || isBiliWorkbuddyBaseUrl(cur) || isRelayMatch || isWrappingCur) {
+        if (cur !== target) {
+            env.CODEBUDDY_BASE_URL = target;
+            notes.push("env.CODEBUDDY_BASE_URL pinned to the bili proxy");
+        }
+        const gated = data.autoCompactEnabled;
+        if (gated === undefined || gated === null) {
+            data.autoCompactEnabled = false;
+            notes.push("autoCompactEnabled=false (bili owns compression; manual compaction survives)");
+        } else if (gated === false) {
+            // Already gated — an earlier install or the user set it.
+        } else if (gated === true) {
+            notes.push("autoCompactEnabled left untouched (explicit true — host auto-compact stays on)");
+        } else {
+            notes.push(`autoCompactEnabled left untouched (foreign value ${JSON.stringify(gated)})`);
+        }
+    } else {
+        notes.push(`env.CODEBUDDY_BASE_URL left untouched (foreign value ${JSON.stringify(cur)} — unset it or set BILI_WORKBUDDY_UPSTREAM, then reinstall)`);
+        notes.push("autoCompactEnabled left untouched (bili proxy bypassed — foreign CODEBUDDY_BASE_URL)");
+    }
+    if (Object.keys(env).length > 0) data.env = env;
+    return { data, notes };
+}
+
+export function stripWorkbuddyManagedSettings(settings: Record<string, unknown>): { data: Record<string, unknown>; removed: string[] } {
+    const data = structuredClone(settings);
+    const removed: string[] = [];
+    const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : undefined) as Record<string, unknown> | undefined;
+    if (env !== undefined) {
+        if (isBiliWorkbuddyBaseUrl(env.CODEBUDDY_BASE_URL)) {
+            delete env.CODEBUDDY_BASE_URL;
+            removed.push("env.CODEBUDDY_BASE_URL");
+        }
+        if (Object.keys(env).length === 0) delete data.env;
+    }
+    if (data.autoCompactEnabled === false) {
+        delete data.autoCompactEnabled;
+        removed.push("autoCompactEnabled");
+    }
+    return { data, removed };
+}
+
+function workbuddyInstall(): string {
+    const file = workbuddySettingsFile();
+    const settings = readJson(file);
+    const cur = (settings.env as Record<string, unknown> | undefined)?.CODEBUDDY_BASE_URL;
+    const origin = workbuddyNativeOrigin();
+    const { data, notes } = applyWorkbuddyManagedSettings(settings, { origin, upstream: workbuddyInstallUpstream(cur), relay: process.env.BILI_WORKBUDDY_UPSTREAM?.trim() });
+    if (JSON.stringify(data) !== JSON.stringify(settings)) writeJson(file, data);
+    if (!pinnedOriginLive(origin)) notes.push(`no bili proxy reachable at ${origin} — start a resident bili (panel or 'bili start') first; WorkBuddy sessions cannot reach their model until it is up`);
+    return `wrote the billion-context WorkBuddy routing into ${file} (${notes.join("; ")}) — start or restart WorkBuddy to activate`;
+}
+
+function workbuddyRemove(): string {
+    const file = workbuddySettingsFile();
+    const notes: string[] = [];
+    try {
+        const { data, removed } = stripWorkbuddyManagedSettings(readJson(file));
+        if (removed.length > 0) {
+            writeJson(file, data);
+            for (const r of removed) notes.push(`removed ${r}`);
+        }
+    } catch {}
+    return notes.length > 0 ? `removed the billion-context WorkBuddy lane (${notes.join("; ")}) — restart WorkBuddy to finish` : "not installed";
+}
+
+function workbuddyStatus(): string {
+    let installed = false;
+    let origin: string | undefined;
+    let gated = false;
+    try {
+        const doc = readJson(workbuddySettingsFile());
+        const cur = (doc.env as Record<string, unknown> | undefined)?.CODEBUDDY_BASE_URL;
+        if (typeof cur === "string" && isBiliWorkbuddyBaseUrl(cur)) {
+            installed = true;
+            const i = cur.indexOf("/bili/");
+            origin = i > 0 ? cur.slice(0, i) : undefined;
+        }
+        gated = doc.autoCompactEnabled === false;
+    } catch {}
+    if (!installed) return "not installed";
+    return `installed${origin !== undefined ? ` (routing ${origin})` : ""}${gated ? " (auto-compact gated)" : ""}`;
+}
+
 // — doctor (#1235) —————————————————————————————————————————————————————
 
 /** Structured per-lane presence for `bili doctor`: what the lane's entries
@@ -2397,6 +2702,15 @@ export function inspectLanePresence(agent: PluginAgent): LanePresence {
         } catch {}
         return out;
     }
+    if (agent === "workbuddy") {
+        try {
+            const cur = (readJson(workbuddySettingsFile()).env as Record<string, unknown> | undefined)?.CODEBUDDY_BASE_URL;
+            if (typeof cur === "string" && isBiliWorkbuddyBaseUrl(cur)) {
+                return { installed: true, pointers: [`env.CODEBUDDY_BASE_URL=${cur}`], targets: [], form: "managed-block" };
+            }
+        } catch {}
+        return laneAbsent();
+    }
     // zcode
     const doc = readJson(zcodeUserConfigFile());
     const sessionStart = zcodeAsPlain(zcodeAsPlain(doc.hooks)?.events)?.SessionStart;
@@ -2429,11 +2743,11 @@ export function isPluginAgent(value: string): value is PluginAgent {
 }
 
 export function pluginInstall(agent: PluginAgent, opts: { withMcp?: boolean } = {}): string {
-    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : agent === "kimi" ? kimiInstall() : agent === "hermes" ? hermesInstall() : agent === "zcode" ? zcodeInstall() : opencodeInstall(opts.withMcp === true);
+    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : agent === "kimi" ? kimiInstall() : agent === "hermes" ? hermesInstall() : agent === "zcode" ? zcodeInstall() : agent === "workbuddy" ? workbuddyInstall() : opencodeInstall(opts.withMcp === true);
 }
 
 export function pluginRemove(agent: PluginAgent): string {
-    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : agent === "hermes" ? hermesRemove() : agent === "zcode" ? zcodeRemove() : opencodeRemove();
+    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : agent === "hermes" ? hermesRemove() : agent === "zcode" ? zcodeRemove() : agent === "workbuddy" ? workbuddyRemove() : opencodeRemove();
 }
 
 /** #2155 uninstall guardrail (advisory half): `bili plugin remove <agent>`
@@ -2497,6 +2811,7 @@ export function pluginStatusAll(): PluginStatusRow[] {
         ["kimi", kimiStatus],
         ["hermes", hermesStatus],
         ["zcode", zcodeStatus],
+        ["workbuddy", workbuddyStatus],
     ];
     return checks.map(([agent, check]) => {
         let copyVersion: string | undefined;
@@ -2531,6 +2846,7 @@ export const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     kimi: "the global bili install (plugin points at its dist)",
     hermes: "the global bili install (sidecar points at its dist); `bili plugin update hermes` re-copies the plugin",
     zcode: "the global bili install (hook/MCP point at its dist)",
+    workbuddy: "the resident bili proxy (pure config routing — no copy to update)",
 };
 
 /** Render `bili plugin list` as an aligned table with a version column (#2325).
@@ -2635,6 +2951,18 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
             return [`opencode: the cache copy is bili-owned and self-updates in place through its own proxy${where}${v} (#1234) — this command does NOT run opencode's upgrade; OpenCode v2 'plugin update' is an extra manual channel, and reload/restart OpenCode after a disk update to activate it`];
         }
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === dir))) {
+            // #3976: on 2.x hosts even npm installs use the shim — tell the
+            // user which root the shim re-exports before prescribing a fix.
+            let target: string | undefined;
+            try {
+                const m = /from\s+"([^"]+)"/.exec(fs.readFileSync(path.join(dir, "index.js"), "utf8"));
+                if (m) target = m[1];
+            } catch {}
+            if (target !== undefined && isNpmInstallForm(target)) {
+                const ver = pkgVersionAt(path.dirname(path.dirname(path.dirname(target))));
+                const v = ver !== undefined ? ` v${ver}` : "";
+                return [`opencode: the shim points at the npm install${v} (#3976) — it self-updates in place through its own proxy; reload/restart OpenCode after a disk update to activate it`];
+            }
             return ["opencode: plugin points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"];
         }
         return ["opencode: not installed"];

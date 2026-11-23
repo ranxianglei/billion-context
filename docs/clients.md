@@ -40,10 +40,15 @@ Two lanes, same plugin (#941):
   remove — user entries and comments survive, an emptied file gets its
   placeholder `[]` back. Run dsh once in each profile first so the profile
   dirs exist. The plugin spawns its own proxy at load (attaches to a healthy
-  one instead of doubling; parent-pid watchdog), rewrites model-API traffic
-  to `<proxy>/bili/<upstream-url>` via a global fetch patch, registers the
-  manifest tools verbatim, and gates plugin-mode headers on tool readiness
-  (round 1 rides wire mode). Opt-out: `BILI_NATIVE_DSH=0`. Remove with
+   one instead of doubling; parent-pid watchdog), rewrites model-API traffic
+   to `<proxy>/bili/<upstream-url>` via global fetch and Codex Responses
+   WebSocket patches (#5838), registers the manifest tools verbatim, and gates
+   plugin-mode headers on tool readiness. WS upgrades await registration and
+   carry DSH session/model headers; every `response.create` awaits attribution
+   and fork preparation. Cached sockets refuse sends after identity/model,
+   plugin activation, or proxy-origin changes, requiring reconnect (or the
+   provider's SSE fallback). Other WebSockets remain untouched. Opt-out:
+   `BILI_NATIVE_DSH=0`. Remove with
   `bili plugin remove dsh` or `dsh plugin --profile <name> remove
   billion-context` — both go through the same channel. Registry installs
   require a published release that carries `dsh.bundle.patch.yml`; use the
@@ -54,6 +59,26 @@ Two lanes, same plugin (#941):
   `billion-context/dsh`, the profile resolved a pre-bundle copy from a stale
   package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
   <name> add billion-context@latest`.
+- **Codex WebSocket leg (#5838):** the embedded pi-ai `openai-codex` provider
+  defaults to `transport: auto`, which prefers a direct WebSocket exchange —
+  a successful WS round trip never calls fetch. Builds shipped before the
+  WS-lane fix therefore never see those model requests: ACP tools answer 404
+   and nothing compresses until the context limit. On such builds set DSH's
+   existing `providers.openai-codex.transport` setting to `sse` (hot settings;
+   no new bili configuration key is needed) so the traffic rides the fetch
+   leg; from the fix release onward the WebSocket leg is intercepted and
+   header-stamped automatically.
+- **Boundary — third-party Codex transports:** plugins that build their OWN
+  Codex WebSocket client bypass bili's intercepts by construction. Example
+  found in the wild 2026-11-08: `dsh-codex-subscription` with
+  `connectionMode: websocket` imports the `ws` package directly and swaps
+  `globalThis.WebSocket` for a per-host Proxy, so model frames never pass the
+  global fetch/WS patches — no proxy visibility, ACP tools answer 404, and
+  with native compaction suppressed there is no compaction path at all (the
+  second #5838 source). Use `connectionMode: sse` (the plugin default) until
+  the plugin passes the ambient `globalThis.WebSocket` through when no CONNECT
+  proxy agent is needed; bili cannot intercept module-scoped `ws` imports
+  inside a host-owned profile bundle.
 - **Desktop app (Electron host):** the same plugin also runs inside the
   deepseek-harness **desktop** app, installed through its in-app plugin
   manager. There the bootstrap spawns its proxy from within the app process,
@@ -204,6 +229,24 @@ tokens. It refreshes every 10 s; when the running proxy predates this build
 the tab degrades to a restart notice plus an open-Web-UI button instead of
 guessing. Plain React from dsh's own runtime — no iframe, no added
 dependencies.
+
+**DSH Go host (third-party Android app):** the app
+(`ccch1mneyyy/dsh-Go`) ships its own dsh runtime — dsh `0.2.2-rc.1` on node
+24.22.1 / Ubuntu 24.04.5 inside a proot rootfs, ~135 patched dsh files per app
+build. The profile lane above works unchanged: run `dsh plugin --profile <name>
+add billion-context` inside its Linux environment; the engine mounts the bundle
+and spawns the proxy as its own child. Verified on a Redmi K80 / Android 16 /
+arm64-v8a — the first conversation went through the proxy (`[window]
+source=plugin`, `effective window 1048576 -> 792576 (reserved 256000)`,
+`forward POST → api.deepseek.com/anthropic/v1/messages`), and
+`GET /__bili/plugin/status` reported `contextTokens` from usage. That host's
+client is native, so a bundle shipping only `dsh.client.platform: web` (this
+one's Context tab and settings page) has no surface to render into — the
+host-side lane, the tools and the HTTP panel are unaffected, and native
+surfaces are opted into separately through `dshGo` slots (dsh-Go,
+`docs/plugins/native-for-free.md`). It also defines
+`preset-dsh-go-companion` and `preset-dsh-go-companion-full`, whose nested
+`compaction-basic` rows the #4147 structural walk is expected to cover.
 
 ## Kimi Code (Moonshot)
 
@@ -463,6 +506,17 @@ two small node scripts that do the work around the client:
   `BILLION_CONTEXT_PROXY` is set (attach mode owns the proxy) or
   `BILI_PROVIDER_REWRITES` is defined. Opt-out: `BILI_NATIVE_ZCODE=0`.
 
+## WorkBuddy (Tencent desktop app)
+
+WorkBuddy Desktop is an Electron app (`@genie/workbuddy-desktop`) that embeds a CodeBuddy Code CLI fork: every agent session — the desktop-hosted sidecar and manual terminal runs — is that CLI. The app spawns the CLI with an explicit env allowlist, so shell exports never reach it; but the CLI reads `env.CODEBUDDY_BASE_URL` from its user settings file *before* process.env — and that file is the seam (#7456):
+
+- **Install:** `bili plugin install workbuddy` writes `~/.workbuddy/settings.json` (config home overridable via `WORKBUDDY_CONFIG_DIR` / `CODEBUDDY_CONFIG_DIR`): wraps `env.CODEBUDDY_BASE_URL` into the resident proxy (`http://127.0.0.1:8787/bili/https://www.workbuddy.ai`) and sets `autoCompactEnabled: false`, switching off WorkBuddy's own auto-compaction so bili owns compression (manual compaction survives). A foreign `CODEBUDDY_BASE_URL` is reported and left untouched; an explicit `autoCompactEnabled: true` is honored; every write snapshots the previous state to `.bili-bak`. The install warns loudly when no live proxy is recorded at the pinned origin.
+- **Remove:** `bili plugin remove workbuddy` strips exactly what the install wrote; user keys stay.
+- **Wire mode only (no host tool face).** Compression rides the proxy (`acp_summary`), like every OpenAI-wire lane. A host MCP tool face is *impossible* for the app's own sessions: the desktop-spawned CLI sidecar runs with `--strict-mcp-config`, which blocks user/project/local MCP scopes, and a globally stamped plugin-mode header would degrade exactly those sessions (the zcode degraded mode, #4344). A terminal-only MCP face is a possible v2 follow-up (dual tool-surface tradeoff).
+- **Keep a resident bili running** (panel or `bili start`): the settings block pins the resident origin — there is no per-session bootstrap. bili on a custom port: set `BILI_WORKBUDDY_PROXY=http://127.0.0.1:<port>` before installing; `BILI_WORKBUDDY_UPSTREAM=https://<relay>` wraps your own relay instead of `https://www.workbuddy.ai`.
+- **Status:** the `workbuddy` row of `bili plugin list` / `bili doctor` reports the routing origin and the auto-compact gate.
+- **Known limitations:** routing takes effect on WorkBuddy restart (settings load at CLI session start). Auth (SSO bearer + `X-User-Id`) is added by the embedded CLI and passes through the `/bili/` forward untouched; model traffic has no TLS pinning or client signing, so no cert-MITM is needed. App login/SSO traffic goes through the browser and never touches bili.
+
 ## Codex (OpenAI Codex CLI)
 
 **Temporary catalog outages (#3993).** For authenticated `GET https://chatgpt.com/backend-api/codex/models` requests routed through Bili, a last-valid complete catalog can cover transport failures and HTTP 500/502/503/504. This prevents transient discovery failure from discarding Codex's known context/tool capabilities. The private cache is under the existing XDG cache directory (`codex-model-catalog-v1`); it is isolated by full URL/client version and credential/account/org/project fingerprints, contains no raw credentials, and is limited to 1 MiB per catalog, 16 entries and six hours. Online discovery always takes precedence; offline hits do not extend age. With a usable cache the network/body deadline is four seconds. Caller cancellation, 401/403, other explicit errors and invalid/empty catalogs do not become cached success. Cold, expired or changed-credential requests still need successful discovery. Offline replay does not clear the upstream circuit or prove inference reachability. No inference payload, compression mode or configured context limit is changed.
@@ -661,8 +715,8 @@ integration is the ceiling for v1). Launcher-only by design.
 
 Pi has a full native mode (`bili plugin install pi`, README quickstart
 option 1); this section covers what the one-line table can't — **which model
-transports the native intercept actually covers**. Pi is the only host that
-brings WebSocket model traffic into the loop.
+transports the native intercept actually covers**. DSH also intercepts Codex
+Responses WebSockets (#5838); its host-specific lifecycle is described above.
 
 **Sub-agent config (#2230).** The built-in `acp_delegate` surface (three
 delegate tools, roles, fleet inspector — wired by `bili pi` through the
@@ -673,6 +727,19 @@ section of `~/.config/billion-context/billion-context.json` (boolean shorthand
 fallback — read only while the section is absent, ignored once it exists.
 Full field table and the `PI_ACP_DELEGATE_*` env overrides:
 configuration.md → [`pi`](configuration.md#pi).
+
+**Nudge visibility (what the proxy injected, without model-context cost).**
+With the global debug switch on (`ACP_DEBUG=1`, or `"debug": true` in the
+config file), every nudge the proxy injects mid-compression is shown in the
+terminal — once per user turn, as a transient notification after the model
+has answered — with the VERBATIM wire text: exactly the ephemeral trailing
+user message the model reads that turn, byte for byte. The notification is
+terminal-only: it is never written to the session file and adds nothing to
+model context (the nudge reaching the model is the pre-existing mechanism's
+job; this view just lets a human see it happen). Pi inline mode only — in
+spawn/attach the proxy is a separate process and the view is unavailable.
+Covers the Anthropic and OpenAI wire lanes (the two pi reaches over HTTP); on
+hosts without `ui.notify` the feature degrades to absent.
 
 **How routing works.** The pi extension bootstraps (or attaches to) its own
 proxy and patches `globalThis.fetch` in-process: every model-API HTTP request
@@ -828,11 +895,13 @@ Verified entry points (community-maintained list — the mechanism is generic):
 | **Void** | custom OpenAI-compatible endpoint setting |
 | **Cursor** (single-model channel) | Settings → Models → OpenAI API key → **Override Base URL** |
 | **Warp** | custom-model base URL setting |
+| **Command Code** (`cmd`, commandcode.ai) | `~/.commandcode/providers.json` — per-provider (and per-model) `baseURL` (keys live in `auth.json`, never in this file) |
 
 Notes:
 
 - **Crush** is a launcher lane now — prefer `bili crush` (config untouched, HTTPS domains MITM'd automatically).
 - **Zed** is a launcher lane too — prefer `bili zed` (Linux; config untouched, model domains MITM'd automatically, loopback providers stay direct). The settings.json `api_url` path above remains the cross-platform alternative.
+- **Command Code**: the row above covers its BYOK models (standard wires, compressed today). Its catalog/gateway models ride a custom wire (`POST /alpha/generate`) that relays byte-for-byte — see [below](#an-unrecognized-endpoint-goes-direct-and-nothing-compresses-1290); the declarable-wire fix is tracked in #1295.
 - Clients you **sign into** (OAuth/subscription) usually hardcode the endpoint — the prefix trick doesn't apply; see the [MITM section below](#client-uses-httpproxy-connect-but-nothing-compresses) instead.
 - Plain **web apps** (browser-only products) have no local traffic to intercept.
 - VS Code extensions keep their base-URL fields in plain-text settings but secrets in the OS keychain — only the base URL ever needs editing here.
@@ -882,7 +951,7 @@ the V1 shape and 2.x hosts load the V2 `setup()`. The standalone
 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) extension is
 V1-only and does **not** load under 2.x — for OpenCode 2.x, billion-context
 is the recommended context manager. Everything below is verified end-to-end
-on `@opencode/cli` 2.0.3 (V1 lane: 1.14.46 and 1.18.31).
+on `@opencode/cli` 2.1.0 (V1 lane: 1.14.46 and 1.18.31).
 
 | Path | Command | When |
 |---|---|---|
@@ -935,13 +1004,20 @@ Registers a self-spawning plugin in your real opencode config and sets
 face is added by default (the native plugin already provides the bili tools,
 session-bound); pass `--with-mcp` to add one — the entry then carries no
 origin pin, so it survives the plugin's ephemeral-port proxy restarts (#926).
-Entry form depends on how THIS bili was installed: an **npm install** writes
-the bare package name (`"plugin": ["billion-context"]`) — the package
-publishes `exports["./server"]` → `dist/agent/opencode-native.js`, so
-opencode loads it through its own Npm.add machinery; zero absolute paths, portable. (That exact bare-name entry doubles as a hand-install without bili — see README Quickstart Option 1.) A **git checkout / dev build** falls back to a local shim dir
-(`<configDir>/plugins/billion-context/index.js` → this checkout's
-`dist/agent/opencode-native.js`) — machine-local by construction; re-running
-install from an npm install migrates the entry back to the bare name.
+Entry form depends on the host generation AND how THIS bili was installed.
+An **OpenCode 1.x npm install** writes the bare package name
+(`"plugin": ["billion-context"]`) — the package publishes
+`exports["./server"]` → `dist/agent/opencode-native.js`, so opencode loads
+it through its own Npm.add machinery; zero absolute paths, portable. (That
+exact bare-name entry doubles as a hand-install without bili — see README
+Quickstart Option 1.) On an **OpenCode 2.x host** — and for any **git
+checkout / dev build** — the installer writes a local shim dir instead
+(`<configDir>/plugins/billion-context/index.js` → this install's
+`dist/agent/opencode-native.js`): 2.x resolves a bare package name through
+the package `main` field (`dist/index.js`, the CLI — no plugin definition),
+so the bare name never loads there (#3976); re-running install (or a reinstall
+to a new path) regenerates the shim to point at the current root, and a
+legacy bare-name entry in a 2.x config is migrated to the shim automatically.
 
 At load the plugin bootstraps its own proxy (attaches to a healthy instance
 instead of doubling; parent-pid watchdog kills it when opencode exits),
@@ -951,6 +1027,27 @@ launcher. Opt-out: `BILI_NATIVE_OPENCODE=0`. If no proxy can be made
 healthy, requests go direct (uncompressed) with a one-time warning and
 recover automatically. Under a `bili opencode` launch this entry is skipped
 entirely (the launcher owns the proxy).
+
+### Built-in Claude Agent provider (2.x)
+
+OpenCode 2.x ships a built-in **Claude Agent** provider (`claude-agent/*`) that drives a local Claude Code CLI. That child calls Anthropic directly — it makes no request *from* OpenCode — so the plugin's HTTP-hook routing never sees its traffic and its sessions would otherwise run uncompressed. On a 2.x host, `bili plugin install opencode` routes it by writing `providers.claude-agent.settings.baseURL` in your opencode config, pinned to the live opencode lane port:
+
+```json
+{
+  "providers": {
+    "claude-agent": {
+      "settings": {
+        "baseURL": "http://127.0.0.1:<port>/bili/https://api.anthropic.com"
+      }
+    }
+  }
+}
+```
+
+- **Existing installs** — re-run `bili plugin install opencode`; the entry is written at install time, so a pre-existing config is not retro-routed.
+- **Port drift** — if the opencode lane port changes, the pinned URL goes stale; `bili doctor` warns on the opencode lane and a re-run re-pins it.
+- **Your own proxy** — a non-bili `baseURL` is left untouched (it's yours, not ours to clobber).
+- **Known limitation** — compression works, but the `mcp__opencode__*` bili tools still have no session state in these sessions: the proxy keys the session by the Claude Code child's id, not OpenCode's `ses_…` id.
 
 ### OpenAI Responses WebSockets (V2)
 

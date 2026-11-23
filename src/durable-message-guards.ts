@@ -150,9 +150,21 @@ export function dshMcpCatalogPath(msg: CoreMessage): string | undefined {
  *  forever. Each snapshot is tiny (~100–400 chars); superseded ones fold
  *  harmlessly under the latest-per-identity default because the newest
  *  carries the supersedes clause. #2766: assistant-role messages are never
- *  carriers (see dshSkillCatalogPath). */
+ *  carriers (see dshSkillCatalogPath).
+ *  #7085: dsh 0.2.2-rc.3 reworded the populated snapshot — it no longer
+ *  contains "Current runtime context" but opens with the lead-in "The
+ *  following information describes your current session" (wrapped in
+ *  \x3csystem-reminder\x3e). The lead-in has TWO continuations: the first
+ *  snapshot ends it with ":" while re-sends after a context change continue
+ *  it with ". It replaces earlier versions of this context, including any
+ *  retained in conversation summaries." — the marker is the shared prefix
+ *  WITHOUT the trailing colon so both forms classify. The old literal stays
+ *  because cross-form transition sessions carry BOTH shapes; the cleared form
+ *  still uses the old literal, so dropping it would blind the invalidation
+ *  notice. */
 export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
-    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Current runtime context")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string"
+        && (msg.text.includes("Current runtime context") || msg.text.includes("The following information describes your current session"))
         ? "durable/runtime-context"
         : undefined;
 }
@@ -313,6 +325,31 @@ export function dshImageHandlePath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
+/** #6021 — the image-offload placeholder (@deepseek-ai/dsh-compaction-image-
+ *  offload) replaces the live request-image handle in the slot after a
+ *  compaction: "[image omitted to fit request image limits; ...]" plus the
+ *  user's original words. #5752 deliberately left it unclassified — then it
+ *  was only C3 slot evidence that the handle had retired. But once the slot
+ *  holds the placeholder it IS the only text-bearing user message in the
+ *  visible zone, so lastUserAnchor() pins a two-day-old screenshot as the
+ *  current question. Classifying it as a one-shot carrier in BOTH registries
+ *  below fixes the anchor (and lets the retired old id take the
+ *  expected-rebase channel) without touching the handle logic — a placeholder
+ *  still never classifies as a handle (pinned in #5142). The marker may sit
+ *  mid-text (user words follow the closing bracket), so `includes`, not a
+ *  prefix match. The text-only-route sibling ("image omitted because this
+ *  model accepts text only;") is the same emitter and shares the family.
+ *  #2766: assistant-role messages are never carriers. */
+export function dshImageOffloadPlaceholderPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" &&
+        msg.contentType === "text" &&
+        typeof msg.text === "string" &&
+        (msg.text.includes("image omitted to fit request image limits;") ||
+            msg.text.includes("image omitted because this model accepts text only;"))
+        ? "oneshot/image-offload-placeholder"
+        : undefined;
+}
+
 /** Case-insensitive ASCII prefix check over the first needle.length chars —
  *  mirrors the asciiCI convention of src/server.ts (kept local so this
  *  module stays dependency-free). */
@@ -328,8 +365,8 @@ function startsWithAsciiCI(hay: string, needle: string): boolean {
     return true;
 }
 
-/** dsh lane classifier: any of the eleven evidence-backed identities → its
- *  canonical path (four durable carriers + seven foldable one-shot injections).
+/** dsh lane classifier: any of the twelve evidence-backed identities → its
+ *  canonical path (four durable carriers + eight foldable one-shot injections).
  *  Every classified message loses Rule-3 last-user anchor eligibility (#5109/
  *  #5173); only `durable/*` paths are actually pinned by the default policy —
  *  the oneshot/ families ride here purely so an injection can never displace
@@ -346,7 +383,8 @@ function dshDurableToolPath(msg: CoreMessage): string | undefined {
         dshMnemonPath(msg) ??
         dshSubagentSettledPath(msg) ??
         dshAgentRelayPath(msg) ??
-        dshImageHandlePath(msg)
+        dshImageHandlePath(msg) ??
+        dshImageOffloadPlaceholderPath(msg)
     );
 }
 
@@ -404,19 +442,24 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
         dshMnemonPath(msg) ??
         dshSubagentSettledPath(msg) ??
         dshAgentRelayPath(msg) ??
-        dshImageHandlePath(msg),
+        dshImageHandlePath(msg) ??
+        dshImageOffloadPlaceholderPath(msg),
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
- *  exact marker strings of the eleven dsh classifiers above (twelve markers:
- *  the mnemon family contributes two), so a unified-store
- *  row can be screened with cheap substring checks BEFORE JSON.parse (rows
- *  may carry megabytes of base64 media). Lockstep with the classifiers is
- *  enforced in tests/issue5142-expected-rebase.test.ts. */
+ *  exact marker strings of the twelve dsh classifiers above (fifteen markers:
+ *  the runtime-context family contributes two — the pre-0.2.2-rc.3 "Current
+ *  runtime context" literal and the 0.2.2-rc.3 lead-in without its trailing
+ *  colon, which both the first-snapshot and re-send intros share, #7085 — the
+ *  mnemon family contributes two, the image-offload family contributes two), so a
+ *  unified-store row can be screened with cheap substring checks BEFORE
+ *  JSON.parse (rows may carry megabytes of base64 media). Lockstep with the
+ *  classifiers is enforced in tests/issue5142-expected-rebase.test.ts. */
 export const dshCarrierRawMarkers: readonly string[] = [
     "\x3cavailable_skills\x3e",
     "Instructions from:",
     "Current runtime context",
+    "The following information describes your current session",
     "\x3cmcp_catalog\x3e",
     "Time sampled while preparing turn",
     "\x3ctype\x3eimage\x3c/type\x3e",
@@ -426,4 +469,6 @@ export const dshCarrierRawMarkers: readonly string[] = [
     "Background subagent ",
     " sent a message: ",
     "; request preview ",
+    "image omitted to fit request image limits;",
+    "image omitted because this model accepts text only;",
 ];

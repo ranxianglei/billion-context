@@ -43,9 +43,15 @@ function disarm(id: string): void {
 
 /** Arm (or re-arm) the silence timer for a freshly cold-loaded session.
  *  No-op when the saved view is already stale — a long-idle session staying
- *  idle after attach is normal, not a failure. */
+ *  idle after attach is normal, not a failure. A missing or non-finite /
+ *  unrepresentable savedAt disarms any pending alarm instead of arming:
+ *  without a trustworthy timestamp we cannot prove the session was hot, and
+ *  formatting it in the fire-time warning would throw (#6043). */
 export function noteColdLoad(id: string, source: string, savedAt?: number): void {
-    if (savedAt === undefined) return;
+    if (savedAt === undefined || !Number.isFinite(new Date(savedAt).getTime())) {
+        disarm(id);
+        return;
+    }
     if (Date.now() - savedAt > HOT_ATTACH_WINDOW_MS) {
         disarm(id);
         return;

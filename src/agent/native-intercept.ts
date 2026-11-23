@@ -10,6 +10,7 @@ import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from ".
 import { logHostEvent } from "./host-log.js";
 
 import { envMillis } from "./native-bootstrap.js";
+import { matchModelEndpoint, type ModelEndpointPattern } from "../model-endpoints.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
@@ -273,6 +274,23 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
 // `acp_status` reporting "unknown plugin conversation") (#5593).
 const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^:?]+:(?:streamGenerateContent|generateContent|countTokens)$|(?:^|\/)v1internal:(?:streamGenerateContent|generateContent|countTokens)$/;
 
+// #1295: declared custom-wire endpoints (src/model-endpoints.ts) — the SAME
+// config source the proxy classifier reads, so client claim and proxy
+// classification can no longer drift. Entries populate this at plugin load;
+// a config change takes effect on the next host start.
+let declaredPatterns: readonly ModelEndpointPattern[] = [];
+
+export function setDeclaredModelEndpoints(patterns: readonly ModelEndpointPattern[]): void {
+    declaredPatterns = patterns;
+}
+
+/** Current declared patterns (read-only view). Host gates consult this to let
+ *  explicitly declared endpoints through even when heuristic attribution is
+ *  unavailable (#1295). */
+export function getDeclaredModelEndpoints(): readonly ModelEndpointPattern[] {
+    return declaredPatterns;
+}
+
 /** True when the URL points at a model-API endpoint worth proxying. Never
  *  true for bili's own proxy paths (`/bili/…`, `/__bili/…`) or non-HTTP(S). */
 /** True when this process carries the native fetch intercept (#519) — every
@@ -291,6 +309,8 @@ export function isModelApiUrl(url: string): boolean {
         const u = new URL(url);
         const segments = u.pathname.split("/").filter((s) => s.length > 0);
         if (segments[0] === "bili") return false;
+        // #1295: an explicit declaration outranks the built-in suffix table.
+        if (matchModelEndpoint(declaredPatterns, url) !== undefined) return true;
         const pathname = u.pathname.replace(/\/+$/, "");
         return MODEL_API_SUFFIX.test(pathname);
     } catch {
@@ -410,7 +430,7 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
         try {
             const headers = new Headers(input.headers);
             for (const [k, v] of Object.entries(extra)) headers.set(k, v);
-            const rebuilt = new Request(input.url, { method: input.method, headers, body: input.body, duplex: "half" });
+            const rebuilt = new Request(input.url, { method: input.method, headers, body: input.body, signal: input.signal, duplex: "half" });
             return { input: rebuilt, init };
         } catch {
             return { input, init };
@@ -446,6 +466,175 @@ function outgoingHeadersOf(input: string | URL | Request, init?: RequestInit): R
     } catch {
         return undefined;
     }
+}
+
+// #4566: hop hygiene. A host process memoizes its proxy hop for its whole life
+// (omp stamps PI_PROXY_ANTHROPIC into init.proxy per provider; the launcher
+// exports HTTPS_PROXY/BILLION_CONTEXT_PROXY). When the lane's port moves
+// (busy-drop ladder, build-mismatch ladder) or the instance dies, every
+// intercepted dispatch keeps riding the STALE hop: bun dials it even for
+// loopback targets, so a rewrite onto our own live origin round-trips through
+// the dead port (connection refused), and a direct fallback CONNECTs the real
+// upstream through whichever bili happens to answer that port
+// (SELF_SIGNED_CERT_IN_CHAIN without the CA). Nothing inside a running host can
+// re-memoize — so the intercept, which already re-resolves the TARGET per
+// request (#3654), must also own the hop:
+//  - a dispatch whose FINAL target is a loopback bili origin never carries
+//    init.proxy (a loopback target needs no hop; the healthy-lane case was a
+//    self-proxy round-trip before and is outcome-identical after);
+//  - a direct fallback drops a hop PROVEN bili-owned (an evidence-permitlist,
+//    the KDD-9 discipline: env values of bili-owned names plus the origins
+//    this process recorded) and scopes NO_PROXY around the send while a
+//    bili-owned ENV hop exists, so bun cannot route the real upstream through
+//    the dead lane. A hop whose value is not bili-owned (the user's own proxy
+//    posture) is never touched.
+
+function initProxyOf(init: RequestInit | undefined): string | undefined {
+    if (init === undefined || typeof init !== "object") return undefined;
+    const p = (init as Record<string, unknown>).proxy;
+    return typeof p === "string" && p.length > 0 ? p : undefined;
+}
+
+function withoutInitProxy(init: RequestInit | undefined): RequestInit | undefined {
+    if (init === undefined || typeof init !== "object") return init;
+    if (!Object.prototype.hasOwnProperty.call(init, "proxy")) return init;
+    const copy: Record<string, unknown> = { ...init };
+    delete copy.proxy;
+    return copy as RequestInit;
+}
+
+/** Normalize a proxy/origin value ("http://h:p", bare "h:p", trailing slash)
+ *  to a comparable lowercase origin. undefined when empty/unparseable. */
+function normalizeHopValue(value: string): string | undefined {
+    const t = value.trim().replace(/\/+$/, "").toLowerCase();
+    if (t.length === 0) return undefined;
+    try {
+        return t.includes("://") ? new URL(t).origin : new URL(`http://${t}`).origin;
+    } catch {
+        return undefined;
+    }
+}
+
+function isLoopbackTarget(url: string): boolean {
+    let u: URL;
+    try {
+        u = new URL(url);
+    } catch {
+        return false;
+    }
+    const h = u.hostname; // URL.hostname brackets IPv6 literals ([::1])
+    return h === "localhost" || h === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+const droppedHopsLogged = new Set<string>();
+function logDroppedHop(hop: string, target: string): void {
+    if (droppedHopsLogged.has(hop) || droppedHopsLogged.size >= 32) return;
+    droppedHopsLogged.add(hop);
+    logHostEvent("warn", "[native-client]", `bili-native: dropping host-cached proxy hop ${hop} for ${target} — the hop outlived its lane and would dial a dead/moved proxy; the dispatch goes hopless instead (#4566)`);
+}
+
+/** Loopback-target sites (routed/self/rewrite/dsh-divert): the final target is
+ *  a loopback bili origin, so whatever hop the host cached is either a
+ *  no-op round-trip (healthy lane) or a dead-end (moved/died lane) — drop it. */
+function hoplessForLoopback(target: string, init: RequestInit | undefined): RequestInit | undefined {
+    const hop = initProxyOf(init);
+    if (hop === undefined || !isLoopbackTarget(target)) return init;
+    logDroppedHop(hop, target);
+    return withoutInitProxy(init);
+}
+
+/** Hop values this process was GIVEN by bili: env values of the names bili
+ *  itself exports (PI_PROXY / PI_PROXY_* / BILLION_CONTEXT_PROXY) plus the
+ *  origins this process recorded (live, baked-routed, verified-dead-and-
+ *  replaced). A user-set generic HTTP(S)_PROXY is NOT in this set. */
+function biliOwnedHopValues(env: NodeJS.ProcessEnv, state: NativeInterceptState, replacedOrigins: ReadonlySet<string>): Set<string> {
+    const out = new Set<string>();
+    for (const [k, v] of Object.entries(env)) {
+        if ((k === "PI_PROXY" || k.startsWith("PI_PROXY_") || k === "BILLION_CONTEXT_PROXY") && v !== undefined && v.length > 0) {
+            const n = normalizeHopValue(v);
+            if (n !== undefined) out.add(n);
+        }
+    }
+    for (const o of [state.origin, state.routedOrigin, ...replacedOrigins]) {
+        if (o === undefined) continue;
+        const n = normalizeHopValue(o);
+        if (n !== undefined) out.add(n);
+    }
+    return out;
+}
+
+/** The env-var hop a URL would ride per scheme (HTTPS_PROXY for https:,
+ *  HTTP_PROXY for http:, ALL_PROXY last resort). undefined when none is set. */
+function envHopForUrl(url: string, env: NodeJS.ProcessEnv): string | undefined {
+    let proto = "";
+    try {
+        proto = new URL(url).protocol;
+    } catch {
+        return undefined;
+    }
+    const keys = proto === "https:" ? ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] : ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+    for (const k of keys) {
+        const v = env[k];
+        if (v !== undefined && v.trim().length > 0) return v;
+    }
+    return undefined;
+}
+
+/** Reference-counted NO_PROXY scoping: while a bili-owned env hop exists, a
+ *  fallback send to host H must not ride it — H is added to NO_PROXY/no_proxy
+ *  for the send's duration and removed again. Refcounts keep concurrent sends
+ *  safe (single-threaded JS: no torn state between increment and decrement);
+ *  the base values are captured lazily on the first hold and restored EXACTLY
+ *  on the last release. Bun honors runtime NO_PROXY changes immediately
+ *  (probed on bun 1.4.0); node hosts treat these vars as inert for their
+ *  fetch. The mutation is process-wide — children spawned during the hold
+ *  window inherit the entries forever — so only NO_PROXY-safe hosts are ever
+ *  held (no IPv6 literals; #7319). */
+const noProxyHolds = new Map<string, number>();
+let noProxyBase: { upper: string | undefined; lower: string | undefined } | undefined;
+
+function applyNoProxyHolds(): void {
+    const join = (base: string | undefined): string => {
+        const parts = base === undefined ? [] : base.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+        for (const h of noProxyHolds.keys()) {
+            if (!parts.some((p) => p.replace(/^\./, "") === h)) parts.push(h);
+        }
+        return parts.join(",");
+    };
+    process.env.NO_PROXY = join(noProxyBase?.upper);
+    process.env.no_proxy = join(noProxyBase?.lower);
+}
+
+function acquireNoProxyHold(host: string): void {
+    if (noProxyBase === undefined) noProxyBase = { upper: process.env.NO_PROXY, lower: process.env.no_proxy };
+    noProxyHolds.set(host, (noProxyHolds.get(host) ?? 0) + 1);
+    applyNoProxyHolds();
+}
+
+function releaseNoProxyHold(host: string): void {
+    const n = (noProxyHolds.get(host) ?? 0) - 1;
+    if (n <= 0) noProxyHolds.delete(host);
+    else noProxyHolds.set(host, n);
+    if (noProxyHolds.size === 0) {
+        if (noProxyBase !== undefined) {
+            if (noProxyBase.upper === undefined) delete process.env.NO_PROXY;
+            else process.env.NO_PROXY = noProxyBase.upper;
+            if (noProxyBase.lower === undefined) delete process.env.no_proxy;
+            else process.env.no_proxy = noProxyBase.lower;
+            noProxyBase = undefined;
+        }
+    } else {
+        applyNoProxyHolds();
+    }
+}
+
+/** True when the host is already exempted by the CURRENT NO_PROXY/no_proxy
+ *  (exact match or dot-suffix entry) — then no temporary hold is needed. */
+function hostExemptedByNoProxy(host: string, env: NodeJS.ProcessEnv): boolean {
+    const entries = [...(env.NO_PROXY ?? "").split(","), ...(env.no_proxy ?? "").split(",")]
+        .map((s) => s.trim().replace(/^\./, "").toLowerCase())
+        .filter((s) => s.length > 0);
+    return entries.some((e) => host === e || host.endsWith(`.${e}`));
 }
 
 /** #2592/#2709: client-side mirror of the passthrough lane's cheap ASCII
@@ -731,11 +920,20 @@ function emptySlotOversizeRefusal(
 
 /** #5405: same byte ceiling for an unattributed gate verdict. This is not a
  *  window-doom verdict (the 1M floor may still allow the body), so it needs
- *  its own marker and wording; retryable:true because attribution can return. */
-function unattributedByteOversizeRefusal(url: string): Response {
+ *  its own marker and wording; retryable:true because attribution can return.
+ *  #7450: the ceiling is on TOTAL bytes but compression only acts on text —
+ *  when the media split is known, name it in the message so the user can tell
+ *  at a glance whether any folding could ever bring this body under the cap. */
+function unattributedByteOversizeRefusal(url: string, detail: { bytes: number; cap: number; mediaBytes?: number }): Response {
+    const basis = `its body (${detail.bytes.toLocaleString("en-US")} B) is larger than the silent-direct byte ceiling (${detail.cap.toLocaleString("en-US")} B)`;
+    const remedy = detail.mediaBytes !== undefined && detail.mediaBytes > 0
+        ? detail.mediaBytes >= detail.cap
+            ? `Of those bytes, ${detail.mediaBytes.toLocaleString("en-US")} B is inline media (images/audio) that no compression can shrink — the media alone already exceeds the ceiling, so this conversation cannot fit under it as-is: start a fresh session or attach smaller images. Routing through a bili session will not remove the media.`
+            : `Of those bytes, ${detail.mediaBytes.toLocaleString("en-US")} B is inline media that compression cannot shrink; the rest is text a bili-managed session can fold. Route the conversation through a bili-managed session so the text can be compressed under the ceiling, or retry after the host re-establishes attribution.`
+        : "Route the conversation through a bili-managed session so it can be compressed, or retry after the host re-establishes attribution.";
     const message =
-        "billion-context refused this request locally: it is not attributed to a bili-managed session and its body is larger than the silent-direct byte ceiling, so forwarding it would send a multi-megabyte prompt to the provider uncompressed (#5405). " +
-        "Route the conversation through a bili-managed session so it can be compressed, or retry after the host re-establishes attribution.";
+        "billion-context refused this request locally: it is not attributed to a bili-managed session and " + basis + ", so forwarding it would send a multi-megabyte prompt to the provider uncompressed (#5405). " +
+        remedy;
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed-bytes" };
     if (url.endsWith("/messages")) {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message, retryable: true } }), { status: 422, headers });
@@ -929,7 +1127,7 @@ function fallbackOversizeRefusal(
     return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_fallback", message, retryable: true } }), { status: 422, headers });
 }
 
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+export async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<undefined>((resolve) => {
         timer = setTimeout(() => resolve(undefined), ms);
@@ -1253,9 +1451,9 @@ export function replaceRequestTarget(e: { request?: unknown }, target: string): 
     } catch {
         // undici refuses to copy a body-bearing Request without explicit
         // duplex — reconstruct with the body stream passed explicitly.
-        const src = old as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null };
+        const src = old as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null; signal?: AbortSignal };
         try {
-            const init: RequestInit & { duplex?: "half" } = { method: typeof src.method === "string" ? src.method : "GET" };
+            const init: RequestInit & { duplex?: "half" } = { method: typeof src.method === "string" ? src.method : "GET", signal: src.signal };
             const pairs: [string, string][] = [];
             try {
                 for (const pair of src.headers ?? []) pairs.push([pair[0], pair[1]]);
@@ -1278,7 +1476,7 @@ export function replaceRequestTarget(e: { request?: unknown }, target: string): 
  *  whose target and headers must survive while the body is swapped for the
  *  incremental payload. A string body needs no duplex. */
 export function replaceRequestPayload(e: { request?: unknown }, body: string, extraHeaders?: Record<string, string>): void {
-    const old = e.request as { url?: unknown; method?: unknown; headers?: unknown } | null | undefined;
+    const old = e.request as { url?: unknown; method?: unknown; headers?: unknown; signal?: AbortSignal } | null | undefined;
     if (old == null || typeof old.url !== "string") return;
     try {
         const headers = new Headers((old.headers ?? undefined) as ConstructorParameters<typeof Headers>[0]);
@@ -1287,6 +1485,7 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
             method: typeof old.method === "string" ? old.method : "POST",
             headers,
             body,
+            signal: old.signal,
         });
     } catch {
         // replacement impossible (exotic request) — the caller's plan is
@@ -1301,14 +1500,14 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
 export function withRestoredBody(input: string | URL | Request, init: RequestInit | undefined, body: string): { input: string | URL | Request; init: RequestInit | undefined } {
     if (input instanceof Request) {
         try {
-            const plain = new Request(input.url, { method: input.method, headers: input.headers });
+            const plain = new Request(input.url, { method: input.method, headers: input.headers, signal: input.signal });
             return { input: plain, init: { ...(init ?? {}), body } };
         } catch {
             const headers: Record<string, string> = {};
             try {
                 for (const [k, v] of input.headers) headers[k] = v;
             } catch {}
-            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body } };
+            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body, signal: init?.signal !== undefined ? init.signal : input.signal } };
         }
     }
     return { input, init: { ...(init ?? {}), body } };
@@ -1494,6 +1693,58 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         // failed / proxy died / respawn failed): only those flip the dispatch-
         // mode tracker, because the other callers are by-design direct traffic,
         // not degradation (#4516).
+        /** #4566: hop hygiene for the FALLBACK (direct-to-real-upstream) send —
+         *  the single choke point every give-up / bootstrap-fail / unattributed /
+         *  signed-passthrough path funnels through. Two independent stale hops can
+         *  kill the send here: (a) the host-memoized init.proxy (omp caches
+         *  PI_PROXY_ANTHROPIC per process) — dropped when PROVEN bili-owned;
+         *  (b) the launcher-exported HTTPS_PROXY/HTTP_PROXY env hop — neutralized
+         *  for the target host via scoped NO_PROXY while it points at a bili
+         *  origin. A hop whose value is not bili-owned is never touched. */
+        const sanitizeFallbackHop = (dispatchUrl: string, init: RequestInit | undefined): { init: RequestInit | undefined; dispose: () => void } => {
+            const owned = biliOwnedHopValues(process.env, state, replacedOrigins);
+            let cleaned = init;
+            const hop = initProxyOf(init);
+            if (hop !== undefined) {
+                const n = normalizeHopValue(hop);
+                if (n !== undefined && owned.has(n)) {
+                    logDroppedHop(hop, dispatchUrl);
+                    cleaned = withoutInitProxy(init);
+                }
+            }
+            let heldHost: string | undefined;
+            const envHop = envHopForUrl(dispatchUrl, process.env);
+            if (envHop !== undefined) {
+                const n = normalizeHopValue(envHop);
+                if (n !== undefined && owned.has(n)) {
+                    let host: string | undefined;
+                    try {
+                        host = new URL(dispatchUrl).hostname.toLowerCase();
+                    } catch {
+                        // no parseable host → nothing to scope
+                    }
+                    // #7319: never write an IPv6 literal into NO_PROXY — URL.hostname
+                    // brackets it ([::1]) and Python httpx (trust_env) crashes at
+                    // client construction on bracketed/bare IPv6 entries (InvalidURL:
+                    // Invalid port). No bracket convention satisfies both Node's URL
+                    // output and httpx's parsing, so IPv6 hosts skip the hold: a
+                    // fallback send to one rides the env hop on Bun (Node fetch is
+                    // env-inert) — accepted over poisoning every child of the host
+                    // process.
+                    if (host !== undefined && !host.includes(":") && !hostExemptedByNoProxy(host, process.env)) {
+                        heldHost = host;
+                        acquireNoProxyHold(host);
+                    }
+                }
+            }
+            return {
+                init: cleaned,
+                dispose: () => {
+                    if (heldHost !== undefined) releaseNoProxyHold(heldHost);
+                },
+            };
+        };
+
         const directSendOrRefuse = async (
             dispatchUrl: string,
             defaultInput: string | URL | Request,
@@ -1601,21 +1852,40 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                       : await outgoingBodyBytesCapped(defaultInput, init, cap);
                 if (silentBytes !== undefined && silentBytes > cap) {
                     state.onDispatch?.(dispatchUrl, "refused");
-                    logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B); would be sent uncompressed (#5405/#5408)`);
-                    return unattributedByteOversizeRefusal(dispatchUrl);
+                    // #7450: the ceiling is on TOTAL bytes but compression only
+                    // acts on text — bill the incompressible media share (when
+                    // the raw body is cheaply at hand) so the refusal and the
+                    // log say whether any folding could ever bring this body
+                    // under the cap.
+                    const silentRaw = prep.outcome === "restored"
+                        ? prep.body
+                        : measured?.raw ?? (typeof init?.body === "string" ? init.body : undefined);
+                    const silentMediaBytes = silentRaw !== undefined ? mediaBytesOfWireBody(silentRaw) : undefined;
+                    logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B${silentMediaBytes !== undefined && silentMediaBytes > 0 ? `; ${silentMediaBytes.toLocaleString("en-US")} B inline media, incompressible` : ""}); would be sent uncompressed (#5405/#5408)`);
+                    return unattributedByteOversizeRefusal(dispatchUrl, { bytes: silentBytes, cap, mediaBytes: silentMediaBytes });
                 }
             }
-            if (prep.outcome === "as-is") {
+            // #4566: clean the stale hops only when a real send follows — the
+            // refusal paths above never dial out, so no hold is armed for them.
+            // Both sends are awaited inside the try, so the NO_PROXY hold
+            // outlives the in-flight request; finally releases it on settle or
+            // failure alike.
+            const hop = sanitizeFallbackHop(dispatchUrl, init);
+            try {
+                if (prep.outcome === "as-is") {
+                    state.onDispatch?.(dispatchUrl, "direct");
+                    const resp = await send(defaultInput, hop.init);
+                    if (degradeLog !== undefined) noteDispatchMode("direct", `bili-native: ${degradeLog}: ${dispatchUrl}`);
+                    return resp;
+                }
+                const restored = withRestoredBody(defaultInput, hop.init, prep.body);
                 state.onDispatch?.(dispatchUrl, "direct");
-                const resp = await send(defaultInput, init);
+                const resp = await send(restored.input, restored.init);
                 if (degradeLog !== undefined) noteDispatchMode("direct", `bili-native: ${degradeLog}: ${dispatchUrl}`);
                 return resp;
+            } finally {
+                hop.dispose();
             }
-            const restored = withRestoredBody(defaultInput, init, prep.body);
-            state.onDispatch?.(dispatchUrl, "direct");
-            const resp = await send(restored.input, restored.init);
-            if (degradeLog !== undefined) noteDispatchMode("direct", `bili-native: ${degradeLog}: ${dispatchUrl}`);
-            return resp;
         };
 
         // Already-routed `/bili/` model requests (launcher settings overlay):
@@ -1665,7 +1935,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // #5403/#5418: the watermark handshake (x-bili-pf-count / -tail-ids)
             // is emitted ONCE here for every routed model request — lanes differ
             // only in where their ids are captured (pfChannel.pfCaptureIds).
-            const pfExtra = pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {});
+            // pfRequestHeaders must see the MERGED view: the conversation header
+            // may come from headersFor (dsh lane) rather than the client request (#5813).
+            const pfOutgoing = outgoingHeadersOf(input, init) ?? {};
+            const pfExtra = pfChannel.pfRequestHeaders({ ...pfOutgoing, ...(routedExtra ?? {}) });
             const allExtra = { ...(routedExtra ?? {}), ...pfExtra };
             captureStampedWindow(allExtra); // #5996: remember this lane's resolved window
             let target = url;
@@ -1677,7 +1950,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 const fresh = await readyOrigin(state);
                 if (fresh !== undefined && fresh !== baked.origin) target = `${fresh}${baked.pathname}${baked.search}`;
             }
-            const stamped = withHeaders(target === url ? input : makeTarget(target), init, allExtra);
+            const stamped = withHeaders(target === url ? input : makeTarget(target), hoplessForLoopback(target, init), allExtra);
             try {
                 state.onDispatch?.(target, target === url ? "self" : "retry");
                 const resp = await send(stamped.input, stamped.init);
@@ -1722,7 +1995,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     // BILLION_CONTEXT_PROXY process-wide in the omp/pi lanes).
                     const u = new URL(target);
                     const retried = `${again}${u.pathname}${u.search}`;
-                    const restamped = withHeaders(makeTarget(retried), init, allExtra);
+                    const restamped = withHeaders(makeTarget(retried), hoplessForLoopback(retried, init), allExtra);
                     state.onDispatch?.(retried, "retry");
                     const resp = await send(restamped.input, restamped.init);
                     try {
@@ -1830,8 +2103,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 if (fetchMethodOf(input, init) === "POST" && await dshCompactionMarkerInBody(input, init)) {
                     const compactionOrigin = await readyOrigin(state);
                     if (compactionOrigin !== undefined) {
-                        const stamped = withHeaders(makeTarget(`${compactionOrigin}/bili/${url}`), init, { [BILI_PASSTHROUGH_HEADER]: "1" });
-                        state.onDispatch?.(`${compactionOrigin}/bili/${url}`, "rewrite");
+                        const diverted = `${compactionOrigin}/bili/${url}`;
+                        const stamped = withHeaders(makeTarget(diverted), hoplessForLoopback(diverted, init), { [BILI_PASSTHROUGH_HEADER]: "1" });
+                        state.onDispatch?.(diverted, "rewrite");
                         return send(stamped.input, stamped.init);
                     }
                 }
@@ -1897,7 +2171,12 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // #5418: hosts that dial the proxy directly (dsh profile bundles,
             // #809 attach probes) land here already addressed — stamp + learn
             // here or their watermark channel silently never seeds.
-            const selfStamp = withHeaders(input, init, pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {}));
+            // Same merge discipline as the routed branch (#5813): headersFor may
+            // be the sole source of the conversation header.
+            const selfRouted = state.headersFor?.(url);
+            const selfOutgoing = outgoingHeadersOf(input, init) ?? {};
+            const selfPfExtra = pfChannel.pfRequestHeaders({ ...selfOutgoing, ...(selfRouted ?? {}) });
+            const selfStamp = withHeaders(input, hoplessForLoopback(url, init), { ...(selfRouted ?? {}), ...selfPfExtra });
             const resp = await send(selfStamp.input, selfStamp.init);
             pfChannel.pfLearnStamp(outgoingHeadersOf(selfStamp.input, selfStamp.init) ?? {}, resp.status, resp.headers);
             noteDispatchMode("proxy");
@@ -1911,15 +2190,18 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 logHostEvent("error", "[native-client]", `bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
             }
         }
-        const first = makeTarget(`${origin}/bili/${url}`);
-        state.onDispatch?.(`${origin}/bili/${url}`, "rewrite");
+        const rewritten = `${origin}/bili/${url}`;
+        const first = makeTarget(rewritten);
+        state.onDispatch?.(rewritten, "rewrite");
         // #5403/#5418: same single chokepoint as the routed branch — the
         // rewrite path is where attach-mode hosts (and the V1 fetch patch)
-        // ride the proxy without a settings overlay.
-        const branchExtra = { ...(state.headersFor?.(url) ?? {}), ...pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {}), ...(resignExtra ?? {}) };
+        // ride the proxy without a settings overlay. Same merged-view fix (#5813).
+        const rwRouted = state.headersFor?.(url) ?? {};
+        const rwOutgoing = outgoingHeadersOf(input, init) ?? {};
+        const branchExtra = { ...rwRouted, ...pfChannel.pfRequestHeaders({ ...rwOutgoing, ...rwRouted }), ...(resignExtra ?? {}) };
         captureStampedWindow(branchExtra); // #5996: remember this lane's resolved window
         try {
-            const stamped = withHeaders(first, init, branchExtra);
+            const stamped = withHeaders(first, hoplessForLoopback(rewritten, init), branchExtra);
             const resp = await send(stamped.input, stamped.init);
             try {
                 pfChannel.pfLearnStamp(outgoingHeadersOf(stamped.input, stamped.init) ?? {}, resp.status, resp.headers);
@@ -1940,9 +2222,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             if (err instanceof TypeError && !isDeadClosureError(err)) {
                 const again = await recover(origin);
                 if (again !== undefined) {
-                    const retried = makeTarget(`${again}/bili/${url}`);
-                    state.onDispatch?.(`${again}/bili/${url}`, "retry");
-                    const stamped = withHeaders(retried, init, branchExtra);
+                    const retriedUrl = `${again}/bili/${url}`;
+                    const retried = makeTarget(retriedUrl);
+                    state.onDispatch?.(retriedUrl, "retry");
+                    const stamped = withHeaders(retried, hoplessForLoopback(retriedUrl, init), branchExtra);
                     const resp = await send(stamped.input, stamped.init);
                     try {
                         pfChannel.pfLearnStamp(outgoingHeadersOf(stamped.input, stamped.init) ?? {}, resp.status, resp.headers);
@@ -2003,9 +2286,19 @@ export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): 
     delete g[ACTIVE_STATE];
     delete g[ACTIVE_STATE_SEQ];
     signedDirectSeen.clear();
+    declaredPatterns = [];
     lastMissingStateLogSeq = Symbol("unset");
     lastKnownContextWindow = undefined;
     respawnCooldownOverrideMs = undefined;
+    droppedHopsLogged.clear();
+    if (noProxyBase !== undefined) {
+        if (noProxyBase.upper === undefined) delete process.env.NO_PROXY;
+        else process.env.NO_PROXY = noProxyBase.upper;
+        if (noProxyBase.lower === undefined) delete process.env.no_proxy;
+        else process.env.no_proxy = noProxyBase.lower;
+        noProxyBase = undefined;
+    }
+    noProxyHolds.clear();
     resetFetchChainForTest(opts);
 }
 

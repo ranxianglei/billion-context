@@ -23,6 +23,16 @@ export function isSummaryMessageId(id: string): boolean {
 }
 
 /**
+ * Inverse of summaryMessageId: the block id a rendered-summary message id
+ * belongs to, or null when the id is not a rendered-summary id.
+ */
+export function summaryBlockIdOf(id: string): string | null {
+  return isSummaryMessageId(id)
+    ? id.substring(SUMMARY_ID_PREFIX.length)
+    : null;
+}
+
+/**
  * Base id of a message id: everything before the first `#`. Sub-id
  * projections (`base#callId`, `base#r0`, …) are alternate renderings of the
  * same original message, so coverage is decided per original message — id
@@ -263,6 +273,13 @@ function collectSummaryAnchors(
 ): SummaryAnchor[] {
   const anchors: SummaryAnchor[] = [];
   for (const block of activeBlocks(state)) {
+    // #5765 retire: the user marked this block out of the resident view — its
+    // summary is intentionally NOT re-rendered here. Its folded messages stay
+    // covered (coveredMessageIds counts every active block), and any stale
+    // rendered copy from a previous view is dropped by rebuildMessages via
+    // knownSummaryIds (built from ALL blocks, retired included). decompress /
+    // search_context are unaffected — they read stored content, not anchors.
+    if (block.retired) continue;
     // #4311: the originating call is on the wire — its arguments carry the
     // summary text, so injecting the block render would duplicate it. The
     // stale render (if a previously-pruned view carried one) is dropped by

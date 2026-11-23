@@ -5,13 +5,14 @@ import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
-import test, { after } from "node:test";
+import test from "node:test";
 import WebSocket from "ws";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
+import { setLogCapture } from "../src/logger.ts";
 import type { ProxyOptions } from "../src/config.ts";
 
 // #3342: a Codex Responses-over-WebSocket client talking to a supplier that
@@ -28,14 +29,6 @@ process.env.XDG_STATE_HOME = testHome;
 process.env.XDG_DATA_HOME = testHome;
 process.env.XDG_CACHE_HOME = testHome;
 
-// Each full bili server leaves a ref'd undici idle-watchdog per fallback leg
-// (released only via clearTimer, which the WS sink path never calls) plus
-// phase-aligned unref'd peer-rescan ticks that outlive the assertions. Every
-// test already reports (30s test + 15s exchange timeouts catch real hangs), so
-// force a clean exit once the suite is done to keep the hermetic shard from
-// being held open by teardown residue.
-after(() => { process.exit(process.exitCode ?? 0); });
-
 const user = (text: string): Item => ({ type: "message", role: "user", content: [{ type: "input_text", text }] });
 const developer = (text: string): Item => ({ type: "message", role: "developer", content: [{ type: "input_text", text }] });
 
@@ -49,7 +42,7 @@ async function until(condition: () => boolean): Promise<void> {
     }
 }
 
-async function fixture() {
+async function fixture(warmupEncoding?: (frame: Item) => string, splitWarmup = false) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ws-httpfb-"));
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -59,6 +52,7 @@ async function fixture() {
     let failMode: FailMode = "ok";
     let toolArguments: string | undefined;
     let stallNext = false;
+    let stallMidstreamNext = false;
     const heldRequests: Array<{ aborted: boolean }> = [];
     const upstream = http.createServer((req, res) => {
         if (req.method !== "POST") { res.writeHead(404).end(); return; }
@@ -67,15 +61,23 @@ async function fixture() {
         req.on("end", () => {
             const parsed = JSON.parse(body) as Item;
             httpRows.push({ request: parsed, headers: req.headers });
-            if (stallNext) {
-                // Hold the request open without responding — pins that a client
-                // disconnect aborts the in-flight HTTP egress instead of pinning it.
+            if (stallNext || stallMidstreamNext) {
+                // Hold the request open without finishing — pins that a client
+                // disconnect aborts the in-flight HTTP egress instead of pinning it,
+                // both before the supplier answers and while it is still generating.
+                const midstream = stallMidstreamNext;
                 stallNext = false;
+                stallMidstreamNext = false;
                 const held = { aborted: false };
                 heldRequests.push(held);
                 const markAborted = (): void => { held.aborted = true; };
                 req.on("aborted", markAborted);
                 res.on("close", markAborted);
+                if (midstream) {
+                    const id = `resp_http_${++serial}`;
+                    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+                    res.write(`event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id, status: "in_progress", output: [] } })}\n\n`);
+                }
                 return;
             }
             // Connection: close stops undici from pooling the socket; without it
@@ -89,12 +91,28 @@ async function fixture() {
             }
             const id = `resp_http_${++serial}`;
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-            const send = (type: string, fields: Item): void => { res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`); };
+            const warmupChunks: Buffer[] = [];
+            const send = (type: string, fields: Item): void => {
+                const frame = { type, ...fields };
+                const encoded = parsed.generate === false && warmupEncoding ? warmupEncoding(frame) : `event: ${type}\ndata: ${JSON.stringify(frame)}\n\n`;
+                if (parsed.generate === false && splitWarmup) warmupChunks.push(Buffer.from(encoded));
+                else res.write(encoded);
+            };
             if (parsed.generate === false) {
                 // No-generation warmup: terminal with empty output, whatever the input.
                 send("response.created", { response: { id, status: "in_progress", output: [] } });
                 send("response.completed", { response: { id, object: "response", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 } } });
-                res.end();
+                if (splitWarmup) {
+                    void (async () => {
+                        for (const chunk of warmupChunks) {
+                            for (let index = 0; index < chunk.length; index++) {
+                                res.write(chunk.subarray(index, index + 1));
+                                await new Promise<void>(resolve => setImmediate(resolve));
+                            }
+                        }
+                        res.end();
+                    })();
+                } else res.end();
                 return;
             }
             const item: Item = toolArguments !== undefined
@@ -151,7 +169,9 @@ async function fixture() {
             const timer = setTimeout(() => { cleanup(); reject(new Error("WS turn timed out")); }, 15000);
             const onClose = (): void => { cleanup(); reject(new Error("WS client closed")); };
             const onMessage = (raw: WebSocket.RawData): void => {
-                const event = JSON.parse(raw.toString()) as Item;
+                let event: Item;
+                try { event = JSON.parse(raw.toString()) as Item; }
+                catch (error) { cleanup(); reject(error); return; }
                 events.push(event);
                 if (["response.completed", "response.failed", "response.incomplete", "error"].includes(String(event.type))) { cleanup(); resolve(events); }
             };
@@ -171,8 +191,10 @@ async function fixture() {
         resetFailMode: (): void => { failMode = "ok"; },
         get heldAbortedCount(): number { return heldRequests.filter(h => h.aborted).length; },
         setStallNext: (v: boolean): void => { stallNext = v; },
+        setStallMidstreamNext: (v: boolean): void => { stallMidstreamNext = v; },
         close: async (): Promise<void> => {
             peer.terminate();
+            upstream.closeAllConnections();
             await Promise.all([new Promise<void>(r => proxy.close(() => r())), new Promise<void>(r => upstream.close(() => r()))]);
         },
     };
@@ -188,6 +210,82 @@ const errorEvent = (events: Item[]): Item => {
     assert.ok(event, `expected an error frame in ${JSON.stringify(events.map(e => e.type))}`);
     return event;
 };
+
+const warmupEncodings: Array<{ name: string; encode: (frame: Item) => string }> = [
+    { name: "LF control", encode: frame => `data: ${JSON.stringify(frame)}\n\n` },
+    { name: "CRLF", encode: frame => `event: ${frame.type}\r\ndata: ${JSON.stringify(frame)}\r\n\r\n` },
+    { name: "lone CR", encode: frame => `event: ${frame.type}\rdata: ${JSON.stringify(frame)}\r\r` },
+    { name: "no optional data space", encode: frame => `data:${JSON.stringify(frame)}\n\n` },
+    { name: "multiple data fields", encode: frame => JSON.stringify(frame, null, 2).split("\n").map(line => `data: ${line}`).join("\n") + "\n\n" },
+];
+
+for (const { name, encode } of warmupEncodings) {
+    test(`warmup SSE ${name} preserves the terminal event and usable checkpoint`, { timeout: 30000 }, async () => {
+        const fx = await fixture(encode);
+        try {
+            const events = await fx.probe();
+            const warm = completed(events);
+            assert.deepEqual(events.map(event => event.type), ["response.created", "response.completed"]);
+            assert.equal(warm.status, "completed");
+            assert.deepEqual(warm.output, []);
+            assert.equal(fx.lastHttpRequest.generate, false);
+            assert.deepEqual(fx.lastHttpRequest.input, []);
+            const continued = completed(await fx.turn([user("follow up after warmup")], { previous_response_id: warm.id }));
+            assert.equal(continued.status, "completed");
+            assert.ok(fx.httpRows.some(row => JSON.stringify(row.request.input).includes("follow up after warmup")));
+            assert.ok(fx.upgradesRefused > 0, "real WS refusal exercised HTTP fallback");
+            assertAllEgress(fx.httpRows);
+        } finally {
+            await fx.close();
+        }
+    });
+}
+
+for (const status of ["failed", "incomplete"]) {
+    test(`warmup SSE keeps a multiline ${status} terminal unsuccessful`, { timeout: 30000 }, async () => {
+        const fx = await fixture(frame => {
+            const event = frame.type === "response.completed"
+                ? { ...frame, type: `response.${status}`, response: { ...(frame.response as Item), status } }
+                : frame;
+            return JSON.stringify(event, null, 2).split("\n").map(line => `data:${line}`).join("\r\n") + "\r\n\r\n";
+        });
+        try {
+            const events = await fx.probe();
+            const terminal = events[events.length - 1]!;
+            assert.equal(terminal.type, `response.${status}`);
+            assert.equal((terminal.response as Item).status, status);
+            const continued = await fx.turn([user("retry after failed warmup")], { previous_response_id: (terminal.response as Item).id });
+            assert.match(JSON.stringify(errorEvent(continued)), /previous_response_not_found/);
+        } finally {
+            await fx.close();
+        }
+    });
+}
+
+test("warmup SSE does not accept a terminal without its final blank line", { timeout: 30000 }, async () => {
+    const fx = await fixture(frame => `data: ${JSON.stringify(frame)}\n${frame.type === "response.completed" ? "" : "\n"}`);
+    try {
+        const events = await fx.probe();
+        assert.equal(events[0]!.type, "response.created");
+        assert.match(JSON.stringify(errorEvent(events)), /incomplete_response/);
+        assert.ok(!events.some(event => event.type === "response.completed"));
+    } finally {
+        await fx.close();
+    }
+});
+
+test("warmup SSE keeps split CRLF and UTF-8 bytes intact", { timeout: 30000 }, async () => {
+    const fx = await fixture(frame => `data:${JSON.stringify({ ...frame, marker: "é中🙂" })}\r\n\r\n`, true);
+    try {
+        const events = await fx.probe();
+        const warm = completed(events);
+        assert.deepEqual(events.map(event => event.marker), ["é中🙂", "é中🙂"]);
+        assert.equal(completed(await fx.turn([user("continue after split bytes")], { previous_response_id: warm.id })).status, "completed");
+        assertAllEgress(fx.httpRows);
+    } finally {
+        await fx.close();
+    }
+});
 // The HTTP egress must carry the full effective input with no local checkpoint
 // marker and no WS-only frame field, and force streaming so the SSE sink works.
 function assertHttpEgressShape(request: Item): void {
@@ -357,6 +455,44 @@ test("a client disconnect aborts an in-flight HTTP fallback egress instead of pi
         const turn = fx.turn([user("stall")]);
         const rejected = assert.rejects(turn, /WS client closed/);
         await until(() => fx.httpRows.length >= 1);
+        fx.peer.terminate();
+        await rejected;
+        await until(() => fx.heldAbortedCount === 1);
+        assert.equal(_liveUpstreamTimersForTest(), baseline, "no idle-watchdog timer left behind by the aborted egress");
+    } finally {
+        await fx.close();
+    }
+});
+
+test("closing the client after its turn has finished is not treated as a mid-turn disconnect", { timeout: 30000 }, async () => {
+    const fx = await fixture();
+    const lines: string[] = [];
+    setLogCapture((_level, msg) => { lines.push(msg); });
+    try {
+        const baseline = _liveUpstreamTimersForTest();
+        completed(await fx.turn([user("finish first")]));
+        // The egress watchdog is released once the relay has read the supplier's EOF.
+        await until(() => _liveUpstreamTimersForTest() === baseline);
+        fx.peer.terminate();
+        await until(() => lines.some(l => l.includes("client closed phase=")));
+        assert.ok(lines.some(l => l.includes("client closed phase=idle")), "the exchange had ended before the client left");
+        assert.equal(lines.filter(l => l.includes("client disconnected mid-stream")).length, 0, "a finished exchange is not aborted");
+    } finally {
+        setLogCapture(null);
+        await fx.close();
+    }
+});
+
+test("a client disconnect mid-stream aborts the HTTP fallback egress while the supplier is still generating", { timeout: 30000 }, async () => {
+    const fx = await fixture();
+    try {
+        fx.setStallMidstreamNext(true);
+        const baseline = _liveUpstreamTimersForTest();
+        let frames = 0;
+        fx.peer.on("message", () => { frames++; });
+        const turn = fx.turn([user("stall mid-stream")]);
+        const rejected = assert.rejects(turn, /WS client closed/);
+        await until(() => frames >= 1);
         fx.peer.terminate();
         await rejected;
         await until(() => fx.heldAbortedCount === 1);

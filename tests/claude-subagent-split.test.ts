@@ -6,7 +6,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, peekSession } from "../src/session.ts";
-import { anthropicFirstUserFrag, anthropicLaterUserFrag, claudeSubagentAgentId, claudeSubagentSplit } from "../src/session-id.ts";
+import { claudeSubagentAgentId, claudeSubagentSplit, claudeRequestClassOf } from "../src/session-id.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -155,6 +155,42 @@ test("claudeSubagentAgentId: two-signal discrimination (headers + main system pr
     assert.equal(claudeSubagentAgentId(subagentHeaders, ["  You are Claude Code..."]), undefined, "main prefix matched after leading whitespace");
 });
 
+test("claudeRequestClassOf: validates the per-task label against the known set", () => {
+    for (const v of ["main", "subagent", "blocking-subagent", "workflow", "compaction", "auxiliary", "side_reply"]) {
+        assert.equal(claudeRequestClassOf({ "x-claude-code-request-class": v }), v, `accepts ${v}`);
+    }
+    assert.equal(claudeRequestClassOf({ "x-claude-1p-request-class": "subagent" }), "subagent", "the 1p twin is read when the main header is absent");
+    assert.equal(claudeRequestClassOf({ "x-claude-code-request-class": "main", "x-claude-1p-request-class": "subagent" }), "main", "the main header shadows the 1p twin");
+    assert.equal(claudeRequestClassOf({ "x-claude-code-request-class": "bogus", "x-claude-1p-request-class": "subagent" }), undefined, "a present-but-unknown main value still shadows the twin (fall through to the text rule)");
+    assert.equal(claudeRequestClassOf({ "x-claude-code-request-class": "bogus" }), undefined, "unknown value is treated as absent");
+    assert.equal(claudeRequestClassOf({}), undefined, "absent header is undefined");
+    assert.equal(claudeRequestClassOf({ "x-claude-code-request-class": ["subagent"] }), undefined, "array-valued (repeated) header is ambiguous → absent");
+});
+
+test("#7439 request-class override: subagent label beats a main-like system; main label beats an agent-id", () => {
+    // A subagent whose system text STARTS with a main prefix would normally be
+    // classified as main (no split) by the system-prefix heuristic. An explicit
+    // request-class=subagent label now forces the split.
+    const mainLikeSystem = ["You are Claude Code, Anthropic's official CLI..."];
+    const subWithMainLikeSystem = { "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "subagent" };
+    assert.equal(claudeSubagentAgentId(subWithMainLikeSystem, mainLikeSystem), SUB_AGENT, "request-class=subagent forces the split even with a main-like system block");
+    // ...but WITHOUT the label the same request stays unsplit (legacy heuristic) — proves the change is additive.
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT }, mainLikeSystem), undefined, "no label → legacy heuristic (main-like system) is unchanged");
+    // A main turn that (oddly) carries an agent-id + request-class=main must NOT split.
+    assert.equal(
+        claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "main" }, mainLikeSystem),
+        undefined,
+        "request-class=main suppresses the split",
+    );
+    // A side task (compaction) is neither "main" nor "subagent", so it falls
+    // through to the legacy header/system path (unchanged).
+    assert.equal(
+        claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "compaction" }, GENERAL_PURPOSE_SUB_SYSTEM),
+        SUB_AGENT,
+        "compaction (not main/sub) falls through to the legacy header/system path",
+    );
+});
+
 test("claudeSubagentAgentId: explicit channel header outranks the text signals (#5724, CC 2.1.326 capture)", () => {
     const declaredSub = { "x-claude-code-session-id": SESSION, "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "subagent" };
     assert.equal(claudeSubagentAgentId(declaredSub, CLAUDE_CODE_SDK_SUB_SYSTEM), SUB_AGENT, "declared subagent splits");
@@ -259,110 +295,4 @@ test("#970 gate: subagentSplit:false restores the single-session behavior", asyn
         await close(proxy);
         await close(upstream);
     }
-});
-
-test("anthropicFirstUserFrag strips leading <system-reminder> blocks so long shared reminders do not collide in 1024-char cap", () => {
-    const sharedReminder = `<system-reminder>\n${"Codebase instructions line.\n".repeat(80)}</system-reminder>`;
-    const messagesA = [
-        {
-            role: "user",
-            content: [
-                { type: "text", text: sharedReminder },
-                { type: "text", text: "Task arm A: explore gateway_service.go" },
-            ],
-        },
-    ];
-    const messagesB = [
-        {
-            role: "user",
-            content: [
-                { type: "text", text: sharedReminder },
-                { type: "text", text: "Task arm B: explore gemini_messages_compat_service.go" },
-            ],
-        },
-    ];
-    const discA = anthropicFirstUserFrag(messagesA);
-    const discB = anthropicFirstUserFrag(messagesB);
-    assert.notEqual(discA, "", "discriminator A should be non-empty");
-    assert.notEqual(discA, discB, "subagents with >1024 chars shared <system-reminder> and distinct task prompts must not collide");
-});
-
-test("anthropicFirstUserFrag reminder-strip edges: string path, reminders-only fallback, no-reminder output unchanged", () => {
-    const reminder = `<system-reminder>\nShared CLAUDE.md context.\n</system-reminder>`;
-    // String content: leading reminder stripped, the task text is what discriminates.
-    const stringWithReminder = anthropicFirstUserFrag([{ role: "user", content: `${reminder}Task arm C: check the billing lane` }]);
-    assert.equal(stringWithReminder, "Task arm C: check the billing lane", "string content strips the leading reminder before slicing");
-    // Reminders-only message: nothing left after stripping → fall back to the ORIGINAL text (never "").
-    const onlyReminders = `${reminder}<system-reminder>\nSecond reminder block.\n</system-reminder>`;
-    assert.equal(anthropicFirstUserFrag([{ role: "user", content: onlyReminders }]), onlyReminders.slice(0, 1024), "reminders-only falls back to the original text");
-    // No reminder at all: byte-identical to the pre-strip behavior (common case untouched).
-    const plain = `plain task ${"x".repeat(1500)}`;
-    assert.equal(anthropicFirstUserFrag([{ role: "user", content: plain }]), plain.slice(0, 1024), "reminder-free text is sliced exactly as before");
-});
-
-test("anthropicFirstUserFrag advances past a reminders-only first user message to the next run-distinguishing message (#6011)", () => {
-    const boilerplate = `<system-reminder>\n${"Shared CLAUDE.md context.\n".repeat(40)}</system-reminder>`;
-    const messages = [
-        { role: "user", content: boilerplate },
-        { role: "assistant", content: "ok" },
-        { role: "user", content: "Task arm D: inspect the retry ladder" },
-    ];
-    assert.equal(
-        anthropicFirstUserFrag(messages),
-        "Task arm D: inspect the retry ladder",
-        "the reminders-only first message carries no run material — the scan advances instead of falling back to the shared boilerplate",
-    );
-});
-
-test("anthropicFirstUserFrag advances across several uninformative user messages; reminders-only floor still wins when nothing later helps (#6011)", () => {
-    const r1 = `<system-reminder>\nFirst shared block.\n</system-reminder>`;
-    const r2 = `<system-reminder>\nSecond shared block.\n</system-reminder>`;
-    const advanceTwo = [
-        { role: "user", content: r1 },
-        { role: "assistant", content: "ok" },
-        { role: "user", content: r2 },
-        { role: "assistant", content: "ok" },
-        { role: "user", content: "Task arm E: trace the watermark stamp" },
-    ];
-    assert.equal(anthropicFirstUserFrag(advanceTwo), "Task arm E: trace the watermark stamp", "two consecutive reminders-only messages are both skipped");
-    const nothingLater = [
-        { role: "user", content: r1 },
-        { role: "assistant", content: "ok" },
-        { role: "user", content: r2 },
-    ];
-    assert.equal(
-        anthropicFirstUserFrag(nothingLater),
-        r1.slice(0, 1024),
-        "no later material → the FIRST reminders-only message's raw text stays the degradation floor",
-    );
-});
-
-test("anthropicLaterUserFrag skips the first user message and joins bounded later fragments (#6011)", () => {
-    const sharedFirst = `<system-reminder>\n${"Shared boilerplate line.\n".repeat(30)}</system-reminder>`;
-    const u1 = "Task A specifics: gateway_service.go";
-    const u2 = `Task A follow-up ${"y".repeat(600)}`;
-    const u3 = "Task A third";
-    const u4 = "Task A fourth";
-    const u5 = "Task A fifth";
-    const messages = [
-        { role: "user", content: sharedFirst },
-        { role: "assistant", content: "ok" },
-        { role: "user", content: u1 },
-        { role: "assistant", content: "ok" },
-        { role: "user", content: u2 },
-        { role: "assistant", content: "ok" },
-        { role: "user", content: u3 },
-        { role: "assistant", content: "ok" },
-        { role: "user", content: u4 },
-        { role: "assistant", content: "ok" },
-        { role: "user", content: u5 },
-    ];
-    assert.equal(
-        anthropicLaterUserFrag(messages),
-        `${u1}\u0001${u2.slice(0, 512)}\u0001${u3}\u0001${u4}`,
-        "skips the shared first message, caps each segment at 512 chars after strip, stops at four segments",
-    );
-    assert.notEqual(anthropicLaterUserFrag(messages), "", "usable later material produces a non-empty wide fragment");
-    assert.equal(anthropicLaterUserFrag([{ role: "user", content: sharedFirst }]), "", "no later user message → empty (call site keeps the un-widened key)");
-    assert.equal(anthropicLaterUserFrag([]), "", "empty body → empty");
 });

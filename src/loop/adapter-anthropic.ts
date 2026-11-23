@@ -1,5 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToAnthropic, type AnthropicRequestBody } from "acp-kernel/wire";
+import { coreToAnthropic, healAnthropicSystemPositions, insertBeforeTrailingSystemRun, type AnthropicRequestBody } from "acp-kernel/wire";
 import { dedupeAdjacentOutputConfig } from "../dedupe-adjacent-output-config.js";
 import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
@@ -7,7 +7,7 @@ import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
+import { createSseFramer, sseEventData, replaceSseEventData } from "../sse-util.js";
 import type {
     CompressLoopAdapter,
     EmitCompletionOpts,
@@ -24,7 +24,7 @@ interface ToolUseBuffer {
 async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    const framer = createSseFramer();
     try {
         while (true) {
             let done: boolean;
@@ -35,23 +35,13 @@ async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerato
                 break;
             }
             if (done) break;
-            buf += decoder.decode(value, { stream: true });
-            buf = normalizeSseLineEndings(buf);
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) >= 0) {
-                const raw = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
+            for (const raw of framer.push(decoder.decode(value, { stream: true }))) {
                 if (raw.trim().length > 0) yield raw;
             }
         }
-        buf = finalizeSseLineEndings(buf);
-        let idx: number;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-            const raw = buf.slice(0, idx);
-            buf = buf.slice(idx + 2);
+        for (const raw of framer.finish()) {
             if (raw.trim().length > 0) yield raw;
         }
-        if (buf.trim().length > 0) yield buf;
     } finally {
         reader.releaseLock();
     }
@@ -76,26 +66,24 @@ function parseAnthropicSse(eventStr: string): { type: string; data: Record<strin
 }
 
 function remapIndexInEvent(eventStr: string, newIndex: number): Buffer {
-    const lines = eventStr.split("\n");
-    const rebuilt: string[] = [];
-    let touched = false;
-    for (const l of lines) {
-        if (!touched && l.startsWith("data:")) {
-            const jsonStr = l.slice(5).replace(/^ /, "");
-            try {
-                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
-                if (typeof obj === "object" && obj !== null && typeof obj.index === "number") {
-                    obj.index = newIndex;
-                    rebuilt.push(`data: ${JSON.stringify(obj)}`);
-                    touched = true;
-                    continue;
-                }
-            } catch {
+    return rewriteEventData(eventStr, obj => {
+        if (typeof obj.index !== "number") return false;
+        obj.index = newIndex;
+        return true;
+    });
+}
+
+function rewriteEventData(eventStr: string, edit: (obj: Record<string, unknown>) => boolean): Buffer {
+    const data = sseEventData(eventStr);
+    if (data !== null) {
+        try {
+            const obj = JSON.parse(data) as unknown;
+            if (typeof obj === "object" && obj !== null && !Array.isArray(obj) && edit(obj as Record<string, unknown>)) {
+                return Buffer.from(replaceSseEventData(eventStr, JSON.stringify(obj)) + "\n\n", "utf8");
             }
-        }
-        rebuilt.push(l);
+        } catch { /* malformed events keep their original bytes */ }
     }
-    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
+    return Buffer.from(eventStr + "\n\n", "utf8");
 }
 
 /** #1310: zero the usage object of a forwarded `message_start`. The real
@@ -108,49 +96,23 @@ function remapIndexInEvent(eventStr: string, newIndex: number): Buffer {
  *  Neutralizing the start makes the synthetic terminal the SOLE usage
  *  authority on the wire; a zeroed usage object stays schema-valid. */
 function neutralizeStartUsage(eventStr: string): Buffer {
-    const lines = eventStr.split("\n");
-    const rebuilt: string[] = [];
-    for (const l of lines) {
-        if (l.startsWith("data:")) {
-            const jsonStr = l.slice(5).replace(/^ /, "");
-            try {
-                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
-                if (typeof obj === "object" && obj !== null && obj.type === "message_start") {
-                    const msg = obj.message as Record<string, unknown> | undefined;
-                    if (msg && typeof msg === "object") {
-                        msg.usage = { input_tokens: 0, output_tokens: 0 };
-                        rebuilt.push(`data: ${JSON.stringify(obj)}`);
-                        continue;
-                    }
-                }
-            } catch { /* fall through to verbatim */ }
-        }
-        rebuilt.push(l);
-    }
-    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
+    return rewriteEventData(eventStr, obj => {
+        if (obj.type !== "message_start") return false;
+        const msg = obj.message as Record<string, unknown> | undefined;
+        if (!msg || typeof msg !== "object") return false;
+        msg.usage = { input_tokens: 0, output_tokens: 0 };
+        return true;
+    });
 }
 
 function rewriteTextDeltaEvent(eventStr: string, newIndex: number, newText: string): Buffer {
-    const lines = eventStr.split("\n");
-    const rebuilt: string[] = [];
-    for (const l of lines) {
-        if (l.startsWith("data:")) {
-            const jsonStr = l.slice(5).replace(/^ /, "");
-            try {
-                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
-                if (typeof obj === "object" && obj !== null && typeof obj.index === "number") {
-                    obj.index = newIndex;
-                    const d = obj.delta as Record<string, unknown> | undefined;
-                    if (d && typeof d.text === "string") d.text = newText;
-                    rebuilt.push(`data: ${JSON.stringify(obj)}`);
-                    continue;
-                }
-            } catch {
-            }
-        }
-        rebuilt.push(l);
-    }
-    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
+    return rewriteEventData(eventStr, obj => {
+        if (typeof obj.index !== "number") return false;
+        obj.index = newIndex;
+        const d = obj.delta as Record<string, unknown> | undefined;
+        if (d && typeof d.text === "string") d.text = newText;
+        return true;
+    });
 }
 
 // The loop's own early ends say "length", OpenAI's word; Anthropic has no
@@ -316,13 +278,15 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // injectSystem — both must emit byte-identical system (F2 seam).
             const system = originalSystem !== undefined ? appendSystemText(systemPrompt, originalSystem) : systemPrompt;
             const stamped = cacheMarks ? stampAnthropicSystemCacheControl(system) : system;
+            // #5432: notes go BEFORE a trailing client system run; the #4570
+            // backstop heals whatever still arrives illegal (fold orphans).
             const withNotes = notes && notes.length > 0
-                ? [...messages, ...notes.map((text) => ({ role: "user" as const, content: text }))]
+                ? healAnthropicSystemPositions(insertBeforeTrailingSystemRun(messages, notes.map((text) => ({ role: "user" as const, content: text }))))
                 : messages;
             return { ...body, system: stamped, messages: withNotes };
         },
 
-        async *parseStream(upstream, round) {
+        async *parseStream(upstream, round, opts) {
             const pending = new Map<number, ToolUseBuffer>();
             let roundInput: number | undefined;
             let roundCached: number | undefined;
@@ -358,8 +322,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             const requestText = JSON.stringify(requestBody);
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
-                    createTagEchoFilter((snippet) => {
-                        loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    createTagEchoFilter((snippet, duringDrain) => {
+                        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag";
+                        loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }, (snippet) => {
                         // #2190: residue audit — log-only, see plugin.ts twins.
                         loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
@@ -376,6 +341,21 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             let lastTextIndex: number | null = null;
             let lastThinkingIndex: number | null = null;
             let sawThinking = false;
+            // round2-hold: thinking deltas of a bili-owned round, buffered off the
+            // client wire until their signature releases them. Per-parse by design:
+            // a dead attempt's buffer must vanish with it (that is what keeps the
+            // #413 blind re-fetch zero-side-effect), while heldThinkingStarts lives
+            // at factory level so a re-fetched parse can discard the dead attempt's
+            // still-held start. The frames are stored UN-remapped: a held block has
+            // no client index yet (the start frame is what allocates it), so the
+            // index remap happens at flush time.
+            const heldThinkingDeltas = new Map<number, string[]>();
+            // round2-hold: hold ONLY when the upstream is evidenced to sign — a
+            // relay that never signs (GLM/DeepSeek anthropic-compat) has no
+            // signature contract to violate, so holding would just delay its
+            // thinking to a burst at block end for nothing. Self-arms below the
+            // moment this parse sees a signature_delta.
+            let upstreamSignsThinking = opts?.upstreamSignsThinking === true;
             let toolCallsEmitted = 0;
             let degenerateWarned = false;
             const maybeWarnDegenerate = (reason: string | undefined) => {
@@ -545,17 +525,42 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             // persists the filtered bytes and re-sends them forever). So the
                             // #1881/#1882 prose filters NEVER touch thinking; cosmetic
                             // tag/marker echoes inside a thinking pane are accepted.
-                            const startBuf = releaseHeldThinking(upstreamIndex);
-                            const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                            lastThinkingIndex = ci;
-                            if (startBuf) {
-                                yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                            if (round > 1 && upstreamSignsThinking && heldThinkingStarts.has(upstreamIndex)) {
+                                // round2-hold: bili owns round ≥ 2 (its own re-request
+                                // after a proxy tool) — the client CANNOT replay it,
+                                // because round 1 already committed its own bytes to
+                                // the client's stream. On a signing upstream a cut
+                                // that leaves an unsigned thinking block on the wire
+                                // is unrecoverable: #2501 proves the re-fetch cannot
+                                // fix it (next replay 400 "thinking.signature: Field
+                                // required" → the client strips all thinking). So the
+                                // payload is buffered and the block stays invisible
+                                // until `signature_delta`, which releases start +
+                                // payload + signature together (block below). A death
+                                // before that leaves zero client state, and the #413
+                                // blind re-fetch heals the turn by re-running the
+                                // same round. Round 1 keeps its live stream: that
+                                // turn is the client's own and it can replay it.
+                                const held = heldThinkingDeltas.get(upstreamIndex) ?? [];
+                                held.push(eventStr);
+                                heldThinkingDeltas.set(upstreamIndex, held);
+                                // Accounting only — the loop still accumulates the
+                                // text for the re-request rebuild; `withheld` keeps
+                                // it off the wire (core.ts reasoning branch).
+                                yield { kind: "reasoning", delta: delta.thinking, withheld: true } as ParsedStreamEvent;
+                            } else {
+                                const startBuf = releaseHeldThinking(upstreamIndex);
+                                const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                                lastThinkingIndex = ci;
+                                if (startBuf) {
+                                    yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                                }
+                                yield {
+                                    kind: "reasoning",
+                                    delta: delta.thinking,
+                                    raw: remapIndexInEvent(eventStr, ci),
+                                } as ParsedStreamEvent;
                             }
-                            yield {
-                                kind: "reasoning",
-                                delta: delta.thinking,
-                                raw: remapIndexInEvent(eventStr, ci),
-                            } as ParsedStreamEvent;
                         } else if (!heldThinkingStarts.has(upstreamIndex)) {
                             // #2501: empty thinking_delta with the start already on the
                             // wire — inert, forwarded like any unknown round-1 delta.
@@ -571,10 +576,34 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
                         // #2501: a signature is payload-bearing — release the held start
                         // first (Opus 5.5 sends ONLY this between start and stop).
+                        // round2-hold: the signature is what makes the block VALID
+                        // client history, so this is the one moment the buffered
+                        // deltas may be released — start, payload, signature, all in
+                        // this burst. From here this upstream has PROVEN it signs, so
+                        // later blocks of the same response are held too (the loop's
+                        // evidence can only be computed before the parse starts).
+                        upstreamSignsThinking = true;
                         const startBuf = releaseHeldThinking(upstreamIndex);
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         if (startBuf) {
                             yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                        }
+                        const held = heldThinkingDeltas.get(upstreamIndex);
+                        if (held !== undefined) {
+                            heldThinkingDeltas.delete(upstreamIndex);
+                            if (held.length > 0) {
+                                lastThinkingIndex = ci;
+                                // One frame per held event, concatenated and remapped to
+                                // the index the start frame just allocated: the client
+                                // sees the whole payload arrive with its start, inside
+                                // the SAME single block (never one block per delta — the
+                                // #1455/round-2 duplicate-thinking trap).
+                                yield {
+                                    kind: "meta",
+                                    chunk: Buffer.concat(held.map((h) => Buffer.concat([remapIndexInEvent(h, ci), Buffer.from("\n\n", "utf8")]))),
+                                    firstRoundOnly: false,
+                                } as ParsedStreamEvent;
+                            }
                         }
                         yield {
                             kind: "reasoning",
@@ -605,7 +634,23 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         // stop may surface: a signature-less thinking block in the client's
                         // history is the exact poison #2501 fixes. Discard silently.
                         // (Map.delete returns a BOOLEAN — true iff an entry was removed.)
-                        if (heldThinkingStarts.delete(upstreamIndex)) continue;
+                        // round2-hold: this is also the discard point for a bili-owned
+                        // round whose block ended WITHOUT a signature — the upstream
+                        // proved it signs (that is why the payload was held), so a
+                        // signature-less block from it is invalid history by
+                        // definition and must never reach the client. The withheld
+                        // text still lives in the loop's accounting, where the
+                        // re-request rebuild drops unsigned reasoning segments for
+                        // signing protocols (core.ts requiresThinkingSignature).
+                        if (heldThinkingStarts.delete(upstreamIndex)) {
+                            if (heldThinkingDeltas.delete(upstreamIndex)) {
+                                // The loop accumulated a reasoning segment for the
+                                // withheld payload; seal it so the NEXT thinking
+                                // block cannot inherit it.
+                                yield { kind: "reasoning", delta: "", blockEnd: true, withheld: true } as ParsedStreamEvent;
+                            }
+                            continue;
+                        }
                         // Seal the current thinking segment so interleaved thinking
                         // blocks each keep their own signature on rebuild.
                         // #1960: a redacted block has no captured reasoning — replay its

@@ -4,7 +4,7 @@
 // interception, x-bili-plugin stamping, ACP tool registration, plugin-tool
 // execution (acp_status / compress) and real compression — runs in-process
 // with zero tokens and no network. Gated by ACP_TEST_E2E_NATIVE=1 (needs
-// `npm run build` first — the pi package loads dist/agent/pi-native.js).
+// `npm run build` first — the pi package loads dist/agent/billion-context.js).
 //
 // Assertions map 1:1 to #1239's acceptance list:
 //   1. traffic is intercepted + plugin-mode claimed (x-bili-plugin: pi)
@@ -34,7 +34,7 @@ import { assertPortDead } from "../port-race.js";
 
 const PI_BIN = process.env.E2E_PI_BIN ?? "pi";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
-const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/pi-native.js");
+const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/billion-context.js");
 const FAKE_UPSTREAM = path.join(import.meta.dirname, "fake-upstream-chat.mjs");
 const TMO = Number(process.env.E2E_TMO ?? 150_000);
 const WORK_ROOT = path.join(process.cwd(), "tmp");
@@ -112,7 +112,7 @@ const skipReason = !run
 const suiteSkipReason =
   skipReason ??
   (!distBuilt()
-    ? "dist/agent/pi-native.js missing — run `npm run build` first"
+    ? "dist/agent/billion-context.js missing — run `npm run build` first"
     : undefined);
 const checkOnly = process.env.E2E_CHECK === "1";
 
@@ -205,6 +205,10 @@ function cleanEnv(): NodeJS.ProcessEnv {
     )
       delete env[key];
   }
+  // #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+  // off) — this suite asserts the legacy JSON persistence surface, so pin
+  // the dual-write writer explicitly.
+  env.BILI_STORAGE_JSON_WRITER = "on";
   // NODE_TEST_CONTEXT: set by the node:test runner and inherited by the spawned
   // pi — pi-native.ts deliberately stands down inside node:test (unit-test
   // guard), which would silently disable the very bootstrap this suite
@@ -468,6 +472,12 @@ function piRun(
         // (CI sentinel incident, #4599). Pin the legacy posture so this
         // coverage stays deterministic; inline posture is covered by
         // tests/pi-inline-ws.test.ts and tests/pi-native.test.ts.
+        // Pure-SQLite became the default storage writer (2026-11-13 owner
+        // decision): JSONL session envelopes stop being written unless
+        // dual-write is requested. This lane asserts the JSONL envelopes —
+        // pin dual-write so the coverage does not ride the default; the
+        // pure-SQLite path is covered by unit tests + the real-model gate.
+        BILI_STORAGE_JSON_WRITER: "1",
         BILI_PI_INLINE: "0",
         PI_CODING_AGENT_DIR: ctx.piAgentDir,
         XDG_CONFIG_HOME: ctx.xdg.config,

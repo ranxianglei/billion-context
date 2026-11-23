@@ -144,6 +144,12 @@ test("#5167 launcher rotation sees a draining resident as released (fresh-connec
                 // like a production bring-up.
                 // requestInstanceShutdown deliberately NOT injected: the real
                 // POST must drive the real drain path (202 + listener close).
+                // #7156: the test's in-process resident can never really EXIT
+                // (it is us), so script its death the way a real graceful
+                // rotation ends — otherwise the pre-spawn second-writer gate
+                // would correctly hold the spawn for its drain grace and
+                // refuse. The gate itself is exercised by the #5955 suite.
+                isPidAlive: (pid: number) => pid !== process.pid,
                 spawnImpl: (): SpawnChild => { spawnCalls += 1; return makeFakeChild(CHILD_PID); },
                 now: (): number => ticks * 5_000,
                 sleep: (): Promise<void> => { ticks += 1; return Promise.resolve(); },
