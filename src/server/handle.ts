@@ -35,7 +35,7 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
+import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, preferZedThreadIdIdentity, qoderSideTaskConversation, zcodeMemoryConversation } from "../session-id.js";
 import { preferKiroConversationIdentity } from "../kiro.js";
 import { personaConversationOrder, type SessionOrderResolution } from "../session-resolve.js";
 
@@ -56,6 +56,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge, threadsBetaToDecline } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
+import { opencodeForkParent } from "../opencode-fork-lineage.js";
 import { consumePluginRegisterFor, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
@@ -63,6 +64,7 @@ import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, 
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
+import { ZED_PROVIDER_PROTOCOL, ZED_PROVIDERS, unwrapZedEnvelope, type ZedEnvelopeMeta, type ZedProvider } from "../zed-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
@@ -108,6 +110,25 @@ function earlyHoldCredHeaders(req: http.IncomingMessage): Record<string, string>
         const v = headerValue(req, n);
         if (v !== undefined && v !== "") out[n] = v;
     }
+    return out;
+}
+
+// #7168/#7439: DSH rides top-level `dsh_*` client extensions on every request —
+// `dsh_session_log` (the 8 MiB lossless session-log upload for the official
+// DeepSeek API; the model never reads it) plus the sibling `dsh_plugin_packages`.
+// During the transition bili INTERCEPTS them: this drops every TOP-LEVEL `dsh_*`
+// key so the 8 MiB is never forwarded upstream (no bandwidth waste, no unknown-
+// field risk on a non-DeepSeek upstream). Nested `dsh_*` (inside messages, etc.)
+// is untouched — only top-level keys go. Returns the same reference when there is
+// nothing to drop (fast path). Gated by the `passDshExtensions` rollout flag
+// (default OFF = strip). RELEASE the intercept by flipping the flag to 100% once
+// the client-extension sideband ships (#6785 / discussion #7439). Exported for tests.
+export function withoutDshClientExtensions(parsed: unknown): unknown {
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return parsed;
+    const rec = parsed as Record<string, unknown>;
+    if (!Object.keys(rec).some((k) => k.startsWith("dsh_"))) return parsed;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(rec)) if (!k.startsWith("dsh_")) out[k] = v;
     return out;
 }
 
@@ -379,9 +400,10 @@ async function handleRequest(
     let providerDestUrl: string;
     let protocol: WireProtocol | null;
     /** #1295: wire family of a declared custom endpoint (currently only
-     *  "commandcode"). Undefined for built-in families; drives the envelope
+     *  "commandcode"); plus the zed cloud envelope wire (POST /completions,
+     *  body-classified). Undefined for built-in families; drives the envelope
      *  unwrap/rewrap + JSONL codec selection further down the pipeline. */
-    let wireFamily: "commandcode" | null = null;
+    let wireFamily: "commandcode" | "zed" | null = null;
     /** Gemini's model, resolved from the request path (its body never carries
      *  one). Undefined for every other protocol. */
     let googleModel: string | undefined;
@@ -483,15 +505,58 @@ async function handleRequest(
                 protocol = declared.wire;
             }
         } else {
-            protocol = urlPath.endsWith("/chat/completions") || urlPath.endsWith("/llm_raw_chat")
-                ? "openai"
-                : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
-                  ? "anthropic"
-                  : urlPath.endsWith("/responses") || responsesCompact
-                    ? "responses"
-                    : googlePathKind(urlPath) !== null
-                      ? "google"
-                      : null;
+            // zed cloud wire: cloud.zed.dev POSTs the provider request nested in a
+            // `{thread_id, prompt_id, provider, model, provider_request}` envelope
+            // to /completions. The ENVELOPE is the classifier (commandcode
+            // precedent) — but it must be PROBED BEFORE the suffix chain claims
+            // the path, because urlPath.endsWith("/completions") lands "/completions"
+            // on "anthropic". The probe is classification ONLY on the raw
+            // pre-decode bytes; the strict codec re-validates after the decode
+            // below and anything it rejects relays verbatim. The marker header
+            // lets the prepare* layers suppress the model-side compress surface
+            // (the response is NDJSON byte-passthrough — an in-stream acp loop is
+            // structurally unreachable, #3177 reasoning).
+            // The probe keys off the DESTINATION path: /bili/ tunnel URLs keep
+            // req.url wrapper-shaped, so urlPath is the embedded path only via
+            // route.rewrittenUrl.
+            let zedPath = urlPath;
+            if (route?.rewrittenUrl !== undefined) {
+                try {
+                    zedPath = new URL(route.rewrittenUrl).pathname;
+                } catch {
+                    zedPath = "";
+                }
+            }
+            let zedProtocol: WireProtocol | null = null;
+            if ((zedPath === "/completions" || (route?.rewrittenUrl !== undefined && urlPath === "/completions")) && zedPath !== "/completions/compact") {
+                let probe: Record<string, unknown> | undefined;
+                try {
+                    const raw: unknown = JSON.parse(bodyBuffer.toString("utf8"));
+                    if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+                        const r = raw as Record<string, unknown>;
+                        if (typeof r.provider === "string" && (ZED_PROVIDERS as readonly string[]).includes(r.provider)
+                            && r.provider_request !== null && typeof r.provider_request === "object" && !Array.isArray(r.provider_request)) {
+                            probe = r;
+                        }
+                    }
+                } catch {
+                    probe = undefined;
+                }
+                if (probe !== undefined) {
+                    wireFamily = "zed";
+                    zedProtocol = ZED_PROVIDER_PROTOCOL[probe.provider as ZedProvider];
+                    req.headers["x-bili-zed-lane"] = "1";
+                }
+            }
+            protocol = zedProtocol ?? (zedPath.endsWith("/chat/completions") || zedPath.endsWith("/llm_raw_chat")
+                    ? "openai"
+                    : zedPath.endsWith("/v1/messages") || zedPath.endsWith("/messages")
+                      ? "anthropic"
+                      : zedPath.endsWith("/responses") || responsesCompact
+                        ? "responses"
+                        : googlePathKind(zedPath) !== null
+                          ? "google"
+                          : null);
         }
         // Gemini carries the model in the PATH, not the body — resolve it here so
         // the window/config block below and every later model-keyed decision see
@@ -522,8 +587,10 @@ async function handleRequest(
                 // session). Any TEXT-dominated parseable body above the ingest
                 // cost band is already ≥ ~8M tokens — beyond every real model
                 // window — so refuse it HERE, after decode (which can balloon
-                // 10:1) but before the sweep that costs the seconds. 0 disables
-                // the cap (legacy parse-everything).
+                // 10:1) but before the sweep that costs the seconds. DISABLED
+                // by default for all lanes (#7426: on the re-send lanes the raw
+                // inbound byte count is not a valid "beyond model window"
+                // proxy); set a byte value to re-enable.
                 //
                 // Image-bearing bodies are exempt on EVERY lane: base64 pixels
                 // are excluded from the token meter by design ("images billed
@@ -702,6 +769,12 @@ async function handleRequest(
             parsed = null;
         }
     }
+    // #7168/#7439: intercept DSH client extensions (default) — strip top-level
+    // `dsh_*` so the 8 MiB `dsh_session_log` is never forwarded upstream. Gated by
+    // the `passDshExtensions` rollout flag (default OFF = strip); release it once
+    // the client-extension sideband ships (#6785 / #7439). See
+    // withoutDshClientExtensions + src/rollout.ts.
+    if (!featureEnabled("passDshExtensions")) parsed = withoutDshClientExtensions(parsed);
     // Capture the raw-wire verdict before unwrapping or preparing can mutate
     // parsed. Only these scalars are needed for the post-forward bookkeeping.
     const rawWireMetadata = protocol ? preparePluginWireMetadata(bodyBuffer, parsed) : undefined;
@@ -764,6 +837,38 @@ async function handleRequest(
         }
         parsed = unwrapped.body;
         ccMeta = unwrapped.meta;
+    }
+    // zed cloud envelope: unwrap the `{thread_id, prompt_id, provider, model,
+    // provider_request}` wrapper so everything below — #1284 disambiguation,
+    // model/window resolution, session binding, kernel prepare — sees the
+    // standard provider wire. rewrapZedEnvelope restores the envelope at the
+    // final forward boundary. Strict fidelity (#1284 precedent): a body the
+    // classifier promised but the codec cannot convert relays verbatim with a
+    // one-time loud warning — never a partial conversion.
+    let zedMeta: ZedEnvelopeMeta | undefined;
+    let zedThreadId: string | undefined;
+    if (wireFamily === "zed" && protocol !== null) {
+        const unwrapped = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+            ? unwrapZedEnvelope(parsed as Record<string, unknown>)
+            : undefined;
+        if (!unwrapped) {
+            const relayKey = `zed:${upstreamOrigin}${urlPath}`;
+            if (!nonConversationRelayWarned.has(relayKey)) {
+                nonConversationRelayWarned.add(relayKey);
+                if (nonConversationRelayWarned.size > NON_CONVERSATION_RELAY_WARN_CAP) {
+                    nonConversationRelayWarned.delete(nonConversationRelayWarned.values().next().value as string);
+                }
+                log("warn", `[zed] /completions envelope body is not a convertible zed cloud request — relaying verbatim to ${maskUrlsInText(upstreamOrigin)} — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
+            }
+            await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+            return;
+        }
+        parsed = unwrapped.innerBody;
+        zedMeta = unwrapped.meta;
+        zedThreadId = unwrapped.threadId;
+        // The google arm's inner body carries no model (Gemini's is path-based);
+        // the ENVELOPE's `model` is the only source on this wire.
+        if (protocol === "google" && googleModel === undefined) googleModel = zedMeta.model;
     }
     // #2824: one cheap raw-text pass decides whether the incoming-image index
     //  (#1995/#2607) can find anything — a provably image-free body skips BOTH
@@ -1162,16 +1267,19 @@ async function handleRequest(
                   : [];
         const claudeSub = protocol === "anthropic" ? claudeSubagentAgentId(req.headers, systemTextsForSplit) : undefined;
         const responsesIdentity = protocol === "responses"
-            ? (codexTurn
-                ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
-                : preferKiroConversationIdentity(
-                      preferPromptCacheKeyIdentity(
-                          conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
-                          parsed as ResponsesRequestBody,
-                      ),
-                      parsed,
-                      req.headers,
-                  ))
+            ? preferZedThreadIdIdentity(
+                  codexTurn
+                      ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
+                      : preferKiroConversationIdentity(
+                            preferPromptCacheKeyIdentity(
+                                conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
+                                parsed as ResponsesRequestBody,
+                            ),
+                            parsed,
+                            req.headers,
+                        ),
+                  zedThreadId,
+              )
             : undefined;
         // OpenAI chat mirrors the responses pck promotion: clients that replay
         // full history statelessly (omp chat-completions via a relay) send NO
@@ -1185,11 +1293,14 @@ async function handleRequest(
             ? conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader)
             : "";
         const openaiIdentity = protocol === "openai"
-            ? preferPromptCacheKeyIdentity(
-                  convHeader
-                    ? { value: openaiSignal, source: "header" as const, clientProvided: true }
-                    : { value: openaiSignal, source: "content-fingerprint" as const, clientProvided: false },
-                  parsed as { prompt_cache_key?: unknown },
+            ? preferZedThreadIdIdentity(
+                  preferPromptCacheKeyIdentity(
+                      convHeader
+                          ? { value: openaiSignal, source: "header" as const, clientProvided: true }
+                          : { value: openaiSignal, source: "content-fingerprint" as const, clientProvided: false },
+                      parsed as { prompt_cache_key?: unknown },
+                  ),
+                  zedThreadId,
               )
             : undefined;
         // Anthropic mirrors the openai pck promotion (#268): the omp plugin
@@ -1201,11 +1312,14 @@ async function handleRequest(
             ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
             : "";
         const anthropicIdentity = protocol === "anthropic"
-            ? preferPromptCacheKeyIdentity(
-                  convHeader
-                    ? { value: anthropicSignal, source: "header" as const, clientProvided: true }
-                    : { value: anthropicSignal, source: "content-fingerprint" as const, clientProvided: false },
-                  parsed as { prompt_cache_key?: unknown },
+            ? preferZedThreadIdIdentity(
+                  preferPromptCacheKeyIdentity(
+                      convHeader
+                          ? { value: anthropicSignal, source: "header" as const, clientProvided: true }
+                          : { value: anthropicSignal, source: "content-fingerprint" as const, clientProvided: false },
+                      parsed as { prompt_cache_key?: unknown },
+                  ),
+                  zedThreadId,
               )
             : undefined;
         // Gemini native wire: no conversation-header convention, and no
@@ -1221,11 +1335,14 @@ async function handleRequest(
         // Without this, every Antigravity window shares the anonymous branch and
         // collides on the constant FNV-1a sessionId / empty-prefix affinity.
         const googleIdentity = protocol === "google"
-            ? {
-                  value: v1ConvId ?? googleSignal,
-                  source: v1ConvId || convHeader ? ("header" as const) : ("content-fingerprint" as const),
-                  clientProvided: !!v1ConvId || !!convHeader,
-              }
+            ? preferZedThreadIdIdentity(
+                  {
+                      value: v1ConvId ?? googleSignal,
+                      source: v1ConvId || convHeader ? ("header" as const) : ("content-fingerprint" as const),
+                      clientProvided: !!v1ConvId || !!convHeader,
+                  },
+                  zedThreadId,
+              )
             : undefined;
         // #2156: a request that will ride the #388 side passthrough further
         // down must NEVER participate in persona namespace resolution.
@@ -1483,7 +1600,20 @@ async function handleRequest(
         const zcodeMemory = zcodeParentIdentity?.clientProvided
             ? zcodeMemoryConversation(zcodeParentIdentity.value, req.headers)
             : undefined;
-        const conversation = zcodeMemory !== undefined ? zcodeMemory : protocol === "google"
+        // #7439 worklist — Qoder side tasks (agent/webfetch/hook summary) reuse
+        // the parent x-session-id and are tagged only in body
+        // metadata.business_type; give each its own |aux: lane (zcode-memory
+        // pattern) so they don't merge into the parent conversation. Responses
+        // wire only; plain Task subagents carry no wire marker.
+        const qoderSideTask = protocol === "responses"
+            ? qoderSideTaskConversation(
+                (responsesIdentity?.value
+                    ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)) ?? "",
+                parsed,
+            )
+            : undefined;
+        const auxSidecar = zcodeMemory ?? qoderSideTask;
+        const conversation = auxSidecar !== undefined ? auxSidecar : protocol === "google"
             // #2730: the google lane is persona-aware too — dsh stamps its one
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
             // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google
@@ -2193,6 +2323,28 @@ async function handleRequest(
                     log("warn", `[${sessionId}] [resume-inheritance] transcript lineage lookup failed (${String(err)}); falling back to prefix match (#1486)`);
                 }
             }
+            // #7421: opencode records its fork parent in the local SQLite DB
+            // (session_v2.fork_session_id); the host plugin only learns it from
+            // session.created's parentID, which some builds do not emit on fork.
+            // Declaring the true parent here scopes the prefix match below to
+            // that chain (findResumeParentWithin) instead of the unscoped scan
+            // a mid-chain fork can't satisfy — the unscoped miss then weak-adopts
+            // a globally-closest chain, which can be an UNRELATED session
+            // (crosstalk). Loopback only (the DB is a local file); opencode lane
+            // only (ses_ ids are opencode-specific). A parent this proxy doesn't
+            // know still degrades safely: the scoped match misses, the weak-adopt
+            // stays scoped to it, and the derived-fork link below reports the miss.
+            if (!resume && derivedParent === undefined && pluginAgent === "opencode" && isLoopbackAddress(req.socket.remoteAddress)) {
+                try {
+                    const parent = opencodeForkParent(sessionId);
+                    if (parent !== undefined) {
+                        derivedParent = parent;
+                        log("info", `[${sessionId}] [resume-inheritance] opencode fork lineage from session_v2.fork_session_id -> ${parent} (#7421)`);
+                    }
+                } catch (err) {
+                    log("warn", `[${sessionId}] [resume-inheritance] opencode fork lineage lookup failed (${String(err)}); falling back to prefix match (#7421)`);
+                }
+            }
             if (!resume) {
                 const affinityList = affinityMessageList();
                 const matched = derivedParent !== undefined
@@ -2355,7 +2507,13 @@ async function handleRequest(
         // derivedFromSessionId set and skips this link.
         if (derivedParent !== undefined && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined) {
             try {
-                const parentSession = resolveConversation(derivedParent)?.session;
+                // #7421: resolveConversation is memory-only (conversations map +
+                // peekSession), so after a proxy restart even a corrected parent
+                // id was dropped ("unknown to this proxy"). For plugin lanes the
+                // conversation id IS the session id (opencode ses_…), so a disk
+                // load by that id recovers the parent; a non-session id safely
+                // returns undefined and keeps the miss path below.
+                const parentSession = resolveConversation(derivedParent)?.session ?? getStore().loadSync(derivedParent, { protocol, upstreamOrigin }) ?? undefined;
                 if (parentSession) {
                     session.metadata.derivedFrom = derivedParent;
                     session.metadata.derivedFromSessionId = parentSession.id;
@@ -3253,6 +3411,7 @@ async function handleRequest(
                 const runPrepare = async (): Promise<Prepared> => {
                     const p = await runPrepareInner();
                     if (ccMeta !== undefined) p.commandcode = { meta: ccMeta };
+                    if (wireFamily === "zed" && zedMeta !== undefined) p.zed = { meta: zedMeta };
                     return p;
                 };
                 // #332: codex's native remote-compaction request (trigger form)
@@ -3394,8 +3553,23 @@ async function handleRequest(
                     nudgeInjected: prepared.nudgeOutcome === "injected",
                     requireNudge: preparedCs?.requireNudge === true,
                     requireRecommendation: preparedCs?.requireRecommendation === true,
+                    postComPressTail: preparedCs?.postComPressTail === true,
                     modelRound: !countTokens && !responsesCompact && !prepared.codexForge && !prepared.threadsLane,
                 });
+                // #6522: an ACTUAL injection re-opens the uncovered-history note
+                // latch (postCompressTail, src/stream.ts). A fresh nudge is a new
+                // "context is big enough — compress while you are at it" moment,
+                // so the receipt may note the uncovered runs once more in this
+                // cycle; folds without a new injection stay silent (anti-nag,
+                // #6522 loop). Only the post-gate delivery fact "injected"
+                // resets — the same fact that mints the nudge credit above;
+                // "gated"/"vetoed"/"skipped" never reached the model and never
+                // re-open the note. The note itself only exists while
+                // compress.postComPressTail is on (#7318) — with it off this
+                // latch is inert.
+                if (prepared.nudgeOutcome === "injected") {
+                    session.uncoveredReceiptNoted = false;
+                }
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
                 // reply that is already forged (#3008 prompt form).
@@ -3421,11 +3595,23 @@ async function handleRequest(
                         anonAffinity !== null,
                         log,
                         instanceId,
+                        v1Meta,
                     );
                     if (isPreflightFailFast(outcome)) {
                         // #301: the payload still overflows the window and
                         // preflight could not fix it — answer with a
                         // structured error instead of forwarding.
+                        // #7376: this is the only egress decision point for the
+                        // main payload. preflightCompressIfNeeded (above) runs
+                        // to completion BEFORE forward() is ever reached (below,
+                        // only when this branch is NOT taken) — it is a local
+                        // token-estimate + fold computation with no upstream I/O
+                        // for the MAIN body, so a fail-fast verdict means the
+                        // main payload was never sent upstream. The only egress
+                        // during preflight is the separate, smaller
+                        // summarization call (external summary chain) — a
+                        // different request, not the fail-fasted payload. The
+                        // "NOT forwarded" wording is therefore always true.
                         if (respondFailFast && outcome.respond && !res.destroyed) {
                             if (res.headersSent) {
                                 // #568: the hold already committed 200 early — the status
