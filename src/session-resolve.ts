@@ -333,6 +333,34 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
     const disc = laneDiscriminator !== undefined && laneDiscriminator.trim().length > 0 ? laneDiscriminator.trim() : "";
     const recorded = skeletons.get(rawId);
     if (recorded === undefined) {
+        // #7506 ①: first-claim msgid NEGATIVE guard. The in-memory skeleton
+        // can be lost even though the conversation's rows survive — SIGKILL
+        // on the 500ms persist debounce, or LRU eviction of a cold id while
+        // its unified-store rows stay (the #3397 persistence saves the
+        // process from a clean restart, not from death). When the id has
+        // rows in the unified store and the incoming stamped ids have ZERO
+        // overlap with them, this request is NOT a continuation of that
+        // conversation — a different conversation reusing the id (the #1916
+        // review-steals-raw race, now with the store as the witness instead
+        // of the tag). Don't claim raw: shallow → aux, main-shaped → task.
+        // The #4491 contract (host-minted stable UUIDs resent unchanged)
+        // makes a per-request id-change host impossible, so a legitimate
+        // continuation ALWAYS overlaps and is never rejected here. Degrades
+        // to the pre-change path when stamped ids are absent or the store
+        // view is unavailable (null/empty) — exactly the byte-evidence
+        // behavior before this guard existed.
+        if (inboundIds !== undefined && readStoredMsgIds !== undefined) {
+            const stored = readStoredMsgIds(rawId);
+            if (stored !== null && stored.length > 0) {
+                const known = new Set(stored);
+                if (!inboundIds.some((s) => known.has(s))) {
+                    if (!mainShaped(kinds)) {
+                        return { key: `${rawId}|sub:aux`, action: "derived-aux", reason: "shallow first-claim, zero msgid overlap with stored history — not a continuation (#7506)" };
+                    }
+                    return { key: `${rawId}|sub:task:${skel8(kinds)}`, action: "derived-task", reason: "first-claim, zero msgid overlap with stored history — not a continuation (#7506)" };
+                }
+            }
+        }
         // First sight under the id. A main-shaped history claims the raw
         // key; a shallow history claims ONLY when it carries a persona tag
         // (the codex turn-1 shape: one user message + instructions — a real
