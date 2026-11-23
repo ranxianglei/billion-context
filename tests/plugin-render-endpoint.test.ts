@@ -43,7 +43,7 @@ async function harness(gateOn: boolean): Promise<Harness> {
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = "full";
     if (gateOn) process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY = "1";
-    else delete process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY;
+    else process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY = "0";
     _resetSessionsForTest();
     _resetPluginStateForTest();
     resetToolRingForTest();
@@ -123,7 +123,7 @@ test("probe advertises serverHistory with the gate state (capability discovery)"
     try {
         const p = await off.probe();
         assert.equal(p.status, 200);
-        assert.equal(p.body.serverHistory, false, "default rollout 0% = capability hidden");
+        assert.equal(p.body.serverHistory, false, "gate forced off = capability hidden");
     } finally {
         await off.close();
     }

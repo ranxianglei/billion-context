@@ -129,6 +129,15 @@ export function replayBaseDelayMs(): number {
     return Number.isFinite(v) && v >= 0 ? v : REPLAY_BASE_DELAY_MS;
 }
 
+/** BILI_PREFLIGHT_EMERGENCY_DIGEST > network.emergencyDigest > false (owner decision
+ *  2026-11-22: the #2383 CPU digest regime is a model-visible hard truncation —
+ *  default off; "1"/"true" env or an explicit file true restores it). */
+export function preflightEmergencyDigestEnabled(): boolean {
+    const envRaw = process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST;
+    if (envRaw !== undefined) return envRaw === "1" || envRaw === "true";
+    return fileNetwork().emergencyDigest === true;
+}
+
 // --- #4204 egress-side 429 throttle governor ---
 
 const THROTTLE_429_MAX_CONSECUTIVE = 5;
@@ -1003,6 +1012,7 @@ export function fileStorageWalJournalSizeLimit(): number | undefined {
     const v = loadConfigFile().storage?.walJournalSizeLimitBytes;
     return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
 }
+
 
 /** Tiered storage-migration switch (#2671): legacy | shadow | full | sqlite.
  *  Lives here per the env-var discipline — env tier BILI_STORAGE_UNIFIED
