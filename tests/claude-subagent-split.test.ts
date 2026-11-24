@@ -6,7 +6,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, peekSession } from "../src/session.ts";
-import { claudeSubagentAgentId, claudeSubagentSplit } from "../src/session-id.ts";
+import { claudeSubagentAgentId, claudeSubagentSplit, claudeRequestClassOf } from "../src/session-id.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -136,6 +136,39 @@ test("claudeSubagentAgentId: two-signal discrimination (headers + main system pr
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "  ", "x-claude-code-parent-agent-id": "p" }, EXPLORE_SUB_SYSTEM), "p", "blank agent id falls back to the parent id");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": ["a"], "x-claude-code-parent-agent-id": "p" }, EXPLORE_SUB_SYSTEM), "p", "array-valued (repeated) agent header falls back to parent");
     assert.equal(claudeSubagentAgentId(subagentHeaders, ["  You are Claude Code..."]), undefined, "main prefix matched after leading whitespace");
+});
+
+test("claudeRequestClassOf: validates the per-task label against the known set", () => {
+    for (const v of ["main", "subagent", "workflow", "compaction", "auxiliary", "side_reply"]) {
+        assert.equal(claudeRequestClassOf({ "x-claude-code-request-class": v }), v, `accepts ${v}`);
+    }
+    assert.equal(claudeRequestClassOf({ "x-claude-code-request-class": "bogus" }), undefined, "unknown value is treated as absent");
+    assert.equal(claudeRequestClassOf({}), undefined, "absent header is undefined");
+    assert.equal(claudeRequestClassOf({ "x-claude-code-request-class": ["subagent"] }), undefined, "array-valued (repeated) header is ambiguous → absent");
+});
+
+test("#7439 request-class override: subagent label beats a main-like system; main label beats an agent-id", () => {
+    // A subagent whose system text STARTS with a main prefix would normally be
+    // classified as main (no split) by the system-prefix heuristic. An explicit
+    // request-class=subagent label now forces the split.
+    const mainLikeSystem = ["You are Claude Code, Anthropic's official CLI..."];
+    const subWithMainLikeSystem = { "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "subagent" };
+    assert.equal(claudeSubagentAgentId(subWithMainLikeSystem, mainLikeSystem), SUB_AGENT, "request-class=subagent forces the split even with a main-like system block");
+    // ...but WITHOUT the label the same request stays unsplit (legacy heuristic) — proves the change is additive.
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT }, mainLikeSystem), undefined, "no label → legacy heuristic (main-like system) is unchanged");
+    // A main turn that (oddly) carries an agent-id + request-class=main must NOT split.
+    assert.equal(
+        claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "main" }, mainLikeSystem),
+        undefined,
+        "request-class=main suppresses the split",
+    );
+    // A side task (compaction) is neither "main" nor "subagent", so it falls
+    // through to the legacy header/system path (unchanged).
+    assert.equal(
+        claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "compaction" }, GENERAL_PURPOSE_SUB_SYSTEM),
+        SUB_AGENT,
+        "compaction (not main/sub) falls through to the legacy header/system path",
+    );
 });
 
 test("claudeSubagentSplit: stable namespace, main untouched", () => {

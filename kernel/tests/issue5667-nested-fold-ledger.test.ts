@@ -260,10 +260,13 @@ test("C: an unresolvable endpoint surfaces the real reason, not a flat verdict",
   const u1 = msg("u1", "please do the thing");
   const t1 = msg("t1", "call skill", "assistant");
   const state = createInitialState();
-  // t1's stored ref is BLOCKED (protected tool) — a valid-looking range whose
-  // tail endpoint cannot be resolved, so projectUnit throws on it.
+  // t1's stored ref is a corrupt non-mNNNNN string — a valid-looking range
+  // row whose endpoint cannot be parsed, so projectUnit throws on it.
+  // (#6936 moved BLOCKED-sentinel rows out of the range table into the
+  // UNREFED section, so the detail-surfacing catch is now reached through a
+  // corrupt ref instead of the sentinel.)
   state.messageRefs = {
-    byRaw: { u1: "m00001", t1: "BLOCKED" },
+    byRaw: { u1: "m00001", t1: "mX" },
     byRef: { m00001: "u1" },
   };
   const out = buildStatusReport(state, [u1, t1], defaultCountTokens, {
