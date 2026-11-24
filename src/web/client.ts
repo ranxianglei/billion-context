@@ -4830,7 +4830,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 }
                 return;
             }
-            const n = Math.floor(Number(v));
+            const n = Number(v);
             if (!Number.isInteger(n) || n < 0 || n > 5) { degenMax.value = ""; return; }
             if (!c) d.compress = {};
             const dr = (d.compress.degenerateRetry && typeof d.compress.degenerateRetry === "object" && !Array.isArray(d.compress.degenerateRetry)) ? d.compress.degenerateRetry : {};
