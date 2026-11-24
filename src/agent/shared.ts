@@ -255,14 +255,15 @@ export type RuntimeInfoReport = {
     source?: string;
 };
 
-// #2943: SessionStart hooks (zcode/kimi) are short-lived child processes the
+// #2943: SessionStart hooks (zcode/kimi/claude) are short-lived child processes the
 // client waits on. The old tail `void main().finally(() => process.exit(0))`
 // force-exited while an async handle was still open/mid-close — on Windows
-// Node 24.14.x that races libuv's win async-handle close path and aborts with
+// Node 24.x before the libuv restructure (24.14.x–24.18.x confirmed) that
+// races libuv's win async-handle close path and aborts with
 // `assert(!(handle->flags & UV_HANDLE_CLOSING))` (src/win/async.c) BEFORE any
 // stdout is written, silently killing the whole integration (newer Node ships
-// the libuv endgame restructure that removed this race, which is why only
-// 24.14.x hit it). Never call process.exit() on the normal path: tear down the
+// the libuv endgame restructure that removed this race; 24.21+ is clean).
+// Never call process.exit() on the normal path: tear down the
 // one handle we always open (stdin) and let the loop drain to a NATURAL exit
 // 0. An unref'd backstop force-exits ONLY if something unexpected keeps the
 // loop alive — by then every handle has long since settled, so the forced exit
