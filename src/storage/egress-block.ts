@@ -55,6 +55,7 @@
  */
 
 import type { SqliteDatabase } from "./driver.js";
+import type { EgressViewRow } from "./egress-state.js";
 import type { CompressionState } from "acp-kernel";
 
 /**
@@ -105,6 +106,60 @@ export function serializeKstateResidualFromKstateJson(kstateJson: string): strin
     return JSON.stringify(residual);
 }
 
+/** The in-memory kernel block set + its contents — the inputs the
+ *  egress-on block recorder needs (PR #7664 A). Structurally typed so the
+ *  server layer can pass Session fields directly. */
+export type EgressBlockLedgerInput = {
+    state: CompressionState;
+    blockContents: Map<string, { one: unknown | null; full: unknown }>;
+};
+
+/** #7664 (PR-A): build the block set for the ledger from the IN-MEMORY
+ *  kernel state — the unified-leg recorder's twin (store.ts ingest builds
+ *  the same snapshots from its incoming rows). Coordinates resolve against
+ *  the EGRESS flow view instead of unified rows (an egress-on session has
+ *  none): a covered msgid still live in the view carries its canonical
+ *  log_seq num; covered ids already D-retired by THIS turn (the fold shape)
+ *  keep their msgid bounds with 0/0 seqs — the "unknown bounds" shape
+ *  ingest uses for unresolvable coverage. The msgid bounds are the
+ *  self-contained keys (ruling 7439-2); seqs are best-effort evidence on
+ *  the egress clock. */
+export function buildEgressBlockSnapshots(ledger: EgressBlockLedgerInput, view: readonly EgressViewRow[]): Map<string, EgressBlockSnapshot> {
+    const numByMsgid = new Map<string, number>();
+    for (const r of view) if (r.num > 0) numByMsgid.set(r.msgid, r.num);
+    const out = new Map<string, EgressBlockSnapshot>();
+    for (const b of ledger.state.blocks) {
+        const c = ledger.blockContents.get(b.blockId);
+        const full = c?.full ?? (b.summary === undefined ? { count: 0 } : { text: b.summary, count: 0 });
+        const one = c?.one ?? null;
+        let startMsgid: string | null = null;
+        let endMsgid: string | null = null;
+        let startSeq = 0;
+        let endSeq = 0;
+        for (const id of b.effectiveMessageIds) {
+            const n = numByMsgid.get(id);
+            if (startMsgid === null) startMsgid = id;
+            endMsgid = id;
+            if (n === undefined || n <= 0) continue;
+            if (startSeq === 0 || n < startSeq) startSeq = n;
+            if (n > endSeq) endSeq = n;
+        }
+        out.set(b.blockId, {
+            tier: b.tier,
+            startMsgid,
+            startSeq,
+            endMsgid,
+            endSeq,
+            supersedesBlockId: null,
+            active: b.active,
+            reaped: false,
+            one: one === null ? null : JSON.stringify(one),
+            full: JSON.stringify(full),
+        });
+    }
+    return out;
+}
+
 export class EgressBlockCorruptError extends Error {
     constructor(readonly sessionId: string, readonly reason: string) {
         super(`egress-block corrupt (session=${sessionId}): ${reason}`);
@@ -130,12 +185,12 @@ export interface EgressBlockSnapshot {
     full: string;
 }
 
-interface EgressBlockInsertOp {
+export interface EgressBlockInsertOp {
     type: "I";
     blockId: string;
     snapshot: EgressBlockSnapshot;
 }
-interface EgressBlockUpdateOp {
+export interface EgressBlockUpdateOp {
     type: "U";
     blockId: string;
     snapshot: EgressBlockSnapshot;

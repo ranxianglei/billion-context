@@ -517,11 +517,13 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         const r4 = snap0.orderedMessages[3]!.ref!;
         const receipt = await compressTool(h.origin, "p7", r2, r4, P7_SUMMARY, parentCall);
         await settle(h.store, "p7");
-        // NOTE: the egress BLOCK LEDGER (egress_block_*) is NOT asserted here —
-        // in a fully armed egress-on session the unified ingest is skipped
-        // (egressProjectionFrozen) and the ledger is never written; that gap
-        // is pinned by T9. What DOES ride the fork is the KERNEL block set
-        // (state.blocks + blockContents), asserted below.
+        // #7577 second leg: the egress BLOCK LEDGER rows ride the fork too —
+        // written on the parent's egress record path (the unified ingest is
+        // frozen for egress-on sessions), copied by the R-B four-table fork.
+        const p7Ledger = await rawBlockRows(h.dir, "p7", "egress_block_flow");
+        console.error("DBG T7 p7 ledger:", JSON.stringify(p7Ledger.map((r) => ({ t: (r as any).row_type, b: (r as any).block_id, seq: (r as any).op_seq, fseq: (r as any).flow_op_seq, pl: (r as any).payload })), "state blocks:", JSON.stringify(peekSession("p7")!.state.blocks.map((b) => ({ id: b.blockId, active: b.active, eids: b.effectiveMessageIds }))), "log tail:", logs.filter((l) => l.includes("block ledger")).slice(-3));
+        assert(p7Ledger.some((r) => (r as { row_type: string; block_id: string }).row_type === "I" && (r as { block_id: string }).block_id === "b1"), "the parent's block ledger carries the b1 I row");
+        // The KERNEL block set rides the fork: same blocks, same payloads.
 
         // Fork the folded state (client transcript still the 5 raw cells —
         // the host folds on its next turn).
@@ -533,6 +535,10 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         });
         assert.equal(status, 201, JSON.stringify(body));
         assert.deepEqual((body.inheritedBlocks as Array<{ id: string }>).map((b) => b.id), ["b1"], "the folded block is inherited wholesale (its covered cells are all inside the prefix)");
+        // The ledger tables are copied verbatim by the four-table fork (T1's
+        // message-flow twin, for blocks).
+        const c7Ledger = await rawBlockRows(h.dir, "c7", "egress_block_flow");
+        assert.deepEqual(c7Ledger, p7Ledger, "child egress_block_flow = parent's at fork time, row for row");
         // The KERNEL block set rides the fork: same blocks, same payloads.
         const p7KernelBlocks = JSON.stringify(peekSession("p7")!.state.blocks);
         const c7 = peekSession("c7")!;
@@ -677,20 +683,18 @@ test("#7658 T8: fork-after-fork — the grandchild inherits the whole chain", as
     }
 });
 
-test("#7658 T9 gap pin: the egress BLOCK LEDGER is never written in a fully armed egress-on session", async () => {
-    // RED PIN (current behavior, by design of this PR): #7577 promised the
-    // block ledger (egress_block_state / egress_block_flow) rebuilds the block
-    // set fork-side from the op log alone — but its ONLY writer sits in the
-    // unified ingestSession (src/storage/store.ts:1874 area, gated on the
+test("#7658 T9: the egress BLOCK LEDGER is written on the egress record path (the #7577 second leg)", async () => {
+    // #7577 promised the block ledger (egress_block_state / egress_block_flow)
+    // rebuilds the block set from the op log alone — but its only writer sat
+    // in the unified ingestSession (src/storage/store.ts, gated on the
     // save-envelope metadata.egressAuthority), and a fully armed egress-on
-    // session (plane ON + egressAuthority latch) skips the unified record
-    // entirely (egressProjectionFrozen, src/persist.ts:3259). So the ledger
-    // tables stay empty: the R-B four-table fork copies two EMPTY tables.
-    // The kernel block set (state.blocks + blockContents) still rides the
-    // fork correctly — that is what T7 asserts. Fix direction: move the
-    // block-ledger write into the egress record path (recordAuthorityTurn's
-    // transaction, diffing the turn's core blocks); out of scope here, this
-    // test pins the boundary so the fix flips it green.
+    // session skips the unified record entirely (egressProjectionFrozen,
+    // src/persist.ts) — so the ledger tables stayed EMPTY (T9 used to pin
+    // that red). Fix (this PR): the egress record path carries the in-memory
+    // block set (egressBlockLedgerFor) and diffBlockSet lands it in the
+    // dual-clock tables with the kstate residual sidecar — the second leg of
+    // the kstate retirement (block flow → blocks; the message flow already
+    // covered messageRefs/tokenSnapshot/tsStamps).
     const logs: string[] = [];
     const T9_SUMMARY = "T9 pin: a fully armed egress-on fold. " + "q".repeat(64);
     const h = await harness(logs);
@@ -706,17 +710,37 @@ test("#7658 T9 gap pin: the egress BLOCK LEDGER is never written in a fully arme
         // The KERNEL block landed (the /tool channel works)...
         const blocksAtFold = peekSession("p9")!.state.blocks;
         assert.equal(blocksAtFold.filter((b) => b.active).length, 1, "the fold created exactly one active kernel block");
-        // ...and the fold turn flushes the save envelope (same as T5). The
-        // kernel deactivates b1 afterwards (its covered cells left the host
-        // history without a live carrier — kernel consumer logic, unrelated
-        // to egress); the block row itself stays in state.blocks.
+        // ...and the fold turn records it in the ledger on the egress record
+        // path (the kernel deactivates b1 afterwards — its covered cells left
+        // the host history without a live carrier; kernel consumer logic,
+        // unrelated to egress; the block row stays in state.blocks).
         const msgs = [HISTORY[0]!, { role: "assistant" as const, content: T9_SUMMARY }, HISTORY[4]!, m("user", 6)];
         await turn(h.base, "p9", msgs, ["p9-id-0", "p9-fold-0", "p9-id-4", "p9-new-0"]);
         await settle(h.store, "p9");
         assert.equal(peekSession("p9")!.state.blocks.length, blocksAtFold.length, "the kernel block row survives its deactivation");
-        // ...but the egress block ledger is empty: nothing was written.
-        assert.equal((await rawBlockRows(h.dir, "p9", "egress_block_state")).length, 0, "egress_block_state: no rows (gap)");
-        assert.equal((await rawBlockRows(h.dir, "p9", "egress_block_flow")).length, 0, "egress_block_flow: no rows (gap)");
+        // THE LEDGER IS WRITTEN: one I row in the flow, one state replica.
+        const stateRows = (await rawBlockRows(h.dir, "p9", "egress_block_state")) as Array<Record<string, unknown>>;
+        const flowRows = (await rawBlockRows(h.dir, "p9", "egress_block_flow")) as Array<Record<string, unknown>>;
+        assert.equal(stateRows.length, 1, "one state-replica row (b1)");
+        assert.equal(stateRows[0]?.["block_id"], "b1");
+        const iRow = flowRows.find((r) => r["row_type"] === "I" && r["block_id"] === "b1");
+        assert(iRow !== undefined, "the I row for b1 in the block flow");
+        // Self-contained (ruling 7439-2): the I row carries the block's FULL
+        // bytes (the original covered messages, not the summary) and the
+        // kstate residual sidecar; coordinates are best-effort on the egress
+        // clock — b1's covered cells were D-retired by THIS turn, so the seqs
+        // are the 0/0 "unknown bounds" shape and the msgids carry the range.
+        const payload = JSON.parse(String(iRow!["payload"])) as Record<string, unknown>;
+        assert(payload["full"] === undefined || String(payload["full"]).includes(String(HISTORY[1]!.content)), "the I row's full bytes carry the original covered messages");
+        const sidecar = iRow!["kstate_json"];
+        assert(typeof sidecar === "string" && sidecar.length > 0, "the kstate residual sidecar rides the row");
+        JSON.parse(sidecar as string);
+        assert.equal(payload["startMsgid"], "p9-id-1", "coverage start msgid");
+        assert.equal(payload["endMsgid"], "p9-id-3", "coverage end msgid");
+        // Replay reconstructs the block set from the ledger alone.
+        const rep = h.store.egressOpLogStore()!.egressBlockReplay("p9", Number(stateRows[0]!["op_seq"]));
+        assert(rep.blocks.has("b1"), "replay returns b1");
+        assert(typeof rep.kstate === "string" && rep.kstate.length > 0, "replay returns the sidecar");
     } finally {
         await h.close(h.store);
     }
