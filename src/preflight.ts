@@ -21,7 +21,7 @@ import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
-import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES } from "./upstream-fail.js";
+import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES, UPSTREAM_FIRST_BYTE_TIMEOUT_CODE } from "./upstream-fail.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
@@ -1474,6 +1474,15 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
                 deps.log("info", `[preflight] non-streaming summary timed out at the gateway (HTTP ${err.status}); retrying with SSE (learned for this session, #2155)`);
                 continue;
             }
+            if (err instanceof SummaryTransportError && !stream && !deps.streamSummaryOff && deps.protocol !== "google" && err.code === UPSTREAM_FIRST_BYTE_TIMEOUT_CODE) {
+                // Non-streaming summary hit a tightened first-byte budget while
+                // buffering the full completion; flip the session to SSE so
+                // streaming headers/deltas arrive before the phase-1 budget.
+                deps.session.metadata.preflightStreamSummary = true;
+                stream = true;
+                deps.log("info", `[preflight] non-streaming summary timed out before first byte (${err.message}); retrying with SSE (learned for this session)`);
+                continue;
+            }
             if (err instanceof UpstreamHttpError && err.status === 400) {
                 let adapted = false;
                 const paramRejected = deps.protocol === "responses" && includeMaxOutputTokens && MAX_OUTPUT_TOKENS_REJECTED_RE.test(err.body);
@@ -1511,7 +1520,7 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
 // kinds (#1263/#1453 isFailFastUpstreamKind): a summary call must not die
 // faster than the request it protects. TLS trust failures stay OUT on purpose:
 // a bad CA does not self-heal within the backoff window (the main path agrees).
-const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "ECONNABORTED"]);
+const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "ECONNABORTED", UPSTREAM_FIRST_BYTE_TIMEOUT_CODE]);
 const SUMMARY_DIAGNOSTIC_CODES = new Set([
     ...TRANSIENT_SUMMARY_CODES, "ETIMEDOUT", "UND_ERR_ABORTED",
     "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "Z_DATA_ERROR", "Z_BUF_ERROR", "Z_MEM_ERROR",
@@ -1532,6 +1541,9 @@ class SummaryTransportError extends Error {
             if (!code && typeof value.code === "string" && SUMMARY_DIAGNOSTIC_CODES.has(value.code)) code = value.code;
             cause = value.cause;
         }
+        // Tightened phase-1 watchdog stamps UPSTREAM_FIRST_BYTE_TIMEOUT on an
+        // AbortError with zero response bytes received — fail-fast, not idle/client abort.
+        if (code === UPSTREAM_FIRST_BYTE_TIMEOUT_CODE) aborted = false;
         const name = error instanceof Error && ["Error", "TypeError", "AbortError", "TimeoutError"].includes(error.name) ? error.name : "Error";
         super(`summary ${stage} failed (${name}${code ? `, code=${code}` : ""}; ${attempts} attempt${attempts === 1 ? "" : "s"})`);
         this.name = "SummaryTransportError";
@@ -1590,6 +1602,9 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
             // extended beyond the 400 "stream required" shape). Streaming
             // attempts keep the normal transient replay below.
             if (failure instanceof UpstreamHttpError && !stream && !deps.streamSummaryOff && (failure.status === 524 || failure.status === 504)) {
+                throw failure;
+            }
+            if (failure instanceof SummaryTransportError && !stream && !deps.streamSummaryOff && deps.protocol !== "google" && failure.code === UPSTREAM_FIRST_BYTE_TIMEOUT_CODE) {
                 throw failure;
             }
             // #2189: retrying the identical shape cannot succeed — name it and fail fast.
