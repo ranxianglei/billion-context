@@ -357,3 +357,36 @@ export function detectCompactionOverlayGap(ctx: CompactionDisableHost): Compacti
     if (typeof ctx.reflect?.provide !== "function") return "no-service-provide";
     return null;
 }
+type HostPlaneEntry = {
+    options?: { id?: unknown; name?: unknown; disabled?: unknown; config?: unknown } | undefined;
+};
+
+/** Rows whose `auto:false` the bundle patch no longer owns in the COMPOSED
+ *  tree: a dsh patch replaces a row's whole `config`, and `compaction-basic`
+ *  defaults `auto` to true, so any later layer that restates this row (a hand
+ *  written profile patch, a later bundle, a partial #2474 snapshot) silently
+ *  re-arms native auto-compaction. Disabled rows are stock web-profile
+ *  behaviour and are not reported. Returns the offending entry ids so the
+ *  caller can alarm; empty = the declaration survived. */
+export function hostPlaneRowsMissingAutoFalse(entries: Iterable<unknown>): string[] {
+    const lost: string[] = [];
+    for (const raw of entries) {
+        if (raw === null || typeof raw !== "object") continue;
+        const options = (raw as HostPlaneEntry).options;
+        if (options === undefined || options.name !== DSH_COMPACTION_BASIC_PACKAGE) continue;
+        if (options.disabled === true) continue;
+        const config = options.config;
+        const auto = config !== null && typeof config === "object" && !Array.isArray(config)
+            ? (config as { auto?: unknown }).auto
+            : undefined;
+        if (auto === false) continue;
+        lost.push(typeof options.id === "string" && options.id.length > 0 ? options.id : DSH_COMPACTION_BASIC_PACKAGE);
+    }
+    return lost;
+}
+
+/** One-line alarm for the rows hostPlaneRowsMissingAutoFalse reported. */
+export function hostPlaneOverrideLostWarning(entryIds: readonly string[]): string {
+    const rows = entryIds.map((id) => JSON.stringify(id)).join(", ");
+    return `bili: the host-plane compaction-basic override is GONE (entry ${rows}): a later patch layer replaced that row's whole config, so "auto" fell back to its default true and dsh native auto-compaction is ARMED again. Restate "auto: false" in the LAST patch row that touches id compaction-basic, or remove that override (a landed checkpoint destroys the fold base).`;
+}
