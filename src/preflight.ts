@@ -498,6 +498,30 @@ function isNonModelTopLevelKey(key: string): boolean {
     return NON_MODEL_TOP_LEVEL_KEYS.has(key) || key.startsWith("dsh_");
 }
 
+function formatBodySize(bytes: number): string {
+    if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)}MB`;
+    if (bytes >= 1024) return `${Math.round(bytes / 1024)}KB`;
+    return `${bytes}B`;
+}
+
+/**
+ * #7587: one-line breakdown of the outbound top-level fields, so a body
+ * bloated by transport-only telemetry (DSH's `dsh_session_log` is the
+ * motivating case) is visible without reverse-engineering the inbound log.
+ * `JSON.stringify` is used because it measures the bytes that actually go on
+ * the wire; non-model fields are marked so they are not mistaken for prompt.
+ */
+export function formatForwardFieldSizes(parsed: unknown): string | undefined {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const entries = Object.entries(parsed as Record<string, unknown>);
+    if (entries.length === 0) return undefined;
+    return entries.map(([key, value]) => {
+        const text = JSON.stringify(value) ?? "";
+        const bytes = Buffer.byteLength(text, "utf8");
+        return `${key}=${formatBodySize(bytes)}${isNonModelTopLevelKey(key) ? " (non-prompt)" : ""}`;
+    }).join(", ");
+}
+
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
     const pending: [unknown, string | undefined][] = [];

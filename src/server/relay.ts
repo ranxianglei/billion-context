@@ -49,7 +49,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { describeCoreTextDuplication, formatForwardFieldSizes, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -971,6 +971,18 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             }
         }
         applyResign(headers, wireBody);
+    }
+    // #7587: make telemetry-bloat visible at the point where the final bytes
+    // are known. Parsing every request would be wasteful, so this runs only
+    // for debug sessions or oversized bodies — exactly the cases where the
+    // breakdown pays for itself.
+    const wireBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : wireBody.byteLength;
+    if (opts.debug || wireBytes >= 1024 * 1024) {
+        try {
+            const wireText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+            const sizes = formatForwardFieldSizes(JSON.parse(wireText));
+            if (sizes) log("info", `[${prepared?.session.id ?? "passthrough"}] [forward] field sizes: ${sizes}`);
+        } catch { /* non-JSON bodies keep the existing behavior */ }
     }
     try {
         checkOutboundBody(wireBody);
