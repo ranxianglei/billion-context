@@ -1932,7 +1932,7 @@ export function noteOutboundContextEstimates(
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number; model?: string; context?: number },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
@@ -1960,7 +1960,9 @@ export function settleUsageReport(
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
         // context the NEXT request will actually carry (see stream.ts applyRanges).
-        session.stats.lastInputTokens = Math.max(0, s.total - (session.stats.compressCreditTokens ?? 0));
+        // An advisor reply bills several model calls; the context is what its last one read.
+        const contextTotal = s.context !== undefined && s.context > 0 ? s.context : s.total;
+        session.stats.lastInputTokens = Math.max(0, contextTotal - (session.stats.compressCreditTokens ?? 0));
         // #1569: calibration anchor for estimate-grade turns — written ONLY by
         // real upstream usage reports (all three response shapes funnel here),
         // never by estimate-grade samples or arming paths; dropped at native-
@@ -1980,6 +1982,17 @@ export function settleUsageReport(
         // it to demote the baseline when the current request routes elsewhere.
         const settleOrigin = normalizeUpstreamOrigin(s.upstream);
         if (settleOrigin !== undefined) session.stats.lastInputTokensOrigin = settleOrigin;
+        // Identity-fast-path: stamp which MODEL measured this baseline — the
+        // gate refuses to trust acceptance evidence across a model switch.
+        // Lanes that settle without an explicit model (streamed plugin pipes)
+        // fall back to metadata.lastModel: prepare re-covers it with the
+        // CURRENT request's model on every request, so in the normal case it
+        // is exactly this request's model (a concurrent interleaving can only
+        // produce one conservative demotion — the safe direction).
+        const stampedModel = typeof s.model === "string" && s.model !== "" ? s.model
+            : typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel
+            : undefined;
+        if (stampedModel !== undefined) session.stats.lastInputTokensModel = stampedModel;
         // #1933 F1: consume the pending pair — the local text estimate of the
         // payload THIS report bills, recorded at prepare time. Same route
         // required. Admitted samples (plausibility band) accumulate in a
@@ -1992,7 +2005,7 @@ export function settleUsageReport(
         // only ever overflows never settles a usage report, so without this the
         // local estimator's calibre never self-corrects and the same "fits"
         // verdict re-forwards the same doomed body forever.
-        ingestCalibrationPair(session, s.total, s.upstream);
+        ingestCalibrationPair(session, contextTotal, s.upstream);
         // #1820: a real usage-grade sample supersedes the post-rebuild meter
         // anchor immediately — no need to wait out its prepare budget.
         clearPostRebuildAnchor(session);

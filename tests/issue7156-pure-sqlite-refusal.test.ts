@@ -65,14 +65,16 @@ function truncateHalf(dbPath: string): void {
     truncateSync(dbPath, Math.floor(statSync(dbPath).size / 2));
 }
 
-/** Zero one 4 KiB page (the deterministic recipe from
- *  issue7156-storage-corruption.test.ts): open() survives (the pragmas +
- *  migration only touch the header + page 1), but the first write that
- *  resolves the schema throws "database disk image is malformed". */
+/** Zero one 4096-byte page (1-indexed SQLite page number). The deterministic recipe
+ *  is to zero the sessions table's ROOT page (looked up from sqlite_master, so it is
+ *  stable across schema sizes): open() survives (async mode — the sync quick_check
+ *  never runs, and the migrations only touch the schema on page 1) but the first
+ *  write that traverses the sessions b-tree (resetAllIngestWatermarks) throws
+ *  "database disk image is malformed". */
 function zeroPage(p: string, page: number): void {
     const fd = openSync(p, "r+");
     try {
-        writeSync(fd, Buffer.alloc(4096, 0), 0, 4096, page * 4096);
+        writeSync(fd, Buffer.alloc(4096, 0), 0, 4096, (page - 1) * 4096);
     } finally {
         closeSync(fd);
     }
@@ -231,17 +233,23 @@ test("#7156 refusal is RECORDED for the diagnostics surface and repeats on every
     }
 });
 
-test("#7156 pure-sqlite: a first-post-open-write corruption REFUSES TO START too", { skip: SKIP_NO_ENGINE }, () => {
+test("#7156 pure-sqlite (2026-11-21 per-session rework): open no longer writes — a pre-verdict corruption boots, then surfaces loudly at the first ingest write", { skip: SKIP_NO_ENGINE }, () => {
     const dir = tmpDir();
     const prevUnified = process.env.BILI_STORAGE_UNIFIED;
     process.env.BILI_STORAGE_UNIFIED = "sqlite";
     try {
         // The incident's large-store path: the integrity check does not run
         // synchronously (async mode forced), so a proven corruption surfaces
-        // at the FIRST post-open write (resetAllIngestWatermarks) instead of
-        // at quick_check — the branch the truncateHalf tests above cannot
-        // reach. Same recipe as the #7156 FIX 4 dual-write test, but the
-        // pure-sqlite stance must REFUSE, not degrade.
+        // at the process's FIRST INGEST WRITE instead of at quick_check —
+        // the branch the truncateHalf tests above cannot reach. Before
+        // 2026-11-21 the open-time GLOBAL watermark reset
+        // (resetAllIngestWatermarks) made OPEN a write and this corruption
+        // refused the boot. Now open performs NO write at all: the store
+        // BOOTS even with the verdict not yet landed, and the corruption
+        // surfaces — loudly (integrity latch + error) — at the process's
+        // first ingest write. The pure-sqlite stance never writes JSON
+        // envelopes, so the failed save leaves the in-memory view serving;
+        // there is no durable JSON copy to silently degrade to.
         const p = join(dir, "index.db");
         const s0 = UnifiedStore.open(p);
         s0.close();
@@ -250,21 +258,31 @@ test("#7156 pure-sqlite: a first-post-open-write corruption REFUSES TO START too
             ro.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES (?, 1, 1)").run("s" + i + "-" + "x".repeat(300));
         }
         ro.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        const rootPage = (ro.prepare("SELECT rootpage FROM sqlite_master WHERE name = 'sessions'").get() as { rootpage: number }).rootpage;
         ro.close();
-        zeroPage(p, 2);
+        // Corrupt the sessions root page: open() survives (async mode — the sync
+        // quick_check never runs), but the first write (resetAllIngestWatermarks)
+        // traverses the sessions b-tree and throws CORRUPT.
+        zeroPage(p, rootPage);
         setIntegritySyncThresholdForTests(1); // force async mode for any size
         const errors: string[] = [];
         setLogCapture((level, msg) => { if (level === "error") errors.push(String(msg)); });
         try {
-            assert.throws(
-                () => UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "sqlite" }, () => null),
-                /malformed|not a database/i,
-                "a first-write corruption in the pure-sqlite stance refuses to start",
-            );
-            assert.equal(hadIntegrityQuickCheckFailure(), true, "the integrity latch tripped");
+            const legacy = {
+                id: "s-corrupt-" + "x".repeat(10),
+                createdAt: 1, lastSeen: 2, meta: {}, stats: {}, metadata: {},
+                state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 1, nextRunId: 1 },
+                blockContents: new Map(),
+                lastMessages: [{ role: "user", content: "hello" }],
+            };
+            const sh = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "sqlite" }, () => legacy as never);
+            assert.ok(sh, "open performs NO write anymore — a pre-verdict corrupt store BOOTS (2026-11-21 per-session watermark fix)");
+            assert.equal(hadIntegrityQuickCheckFailure(), false, "no integrity latch before the first write");
+            sh.record({});
+            assert.equal(hadIntegrityQuickCheckFailure(), true, "the integrity latch tripped at the first ingest write");
             assert.ok(
-                errors.some((m) => m.includes("first post-open write")),
-                `the error names the first-write corruption; got ${JSON.stringify(errors)}`,
+                errors.some((m) => m.includes("ingest write")),
+                `the error names the first-ingest-write corruption; got ${JSON.stringify(errors)}`,
             );
         } finally {
             setLogCapture(null);
