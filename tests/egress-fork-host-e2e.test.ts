@@ -279,7 +279,7 @@ test("#7658 T3: cold parent — restart, snapshot via reconstruction, fork still
     }
 });
 
-test("#7658 T4 (RED pin): capped egress-on parent — snapshot dropped → fork 409 today, 201 once the op-log source lands", async () => {
+test("#7658 T4: capped egress-on parent — snapshot and fork serve from the op log", async () => {
     const logs: string[] = [];
     const h = await harness(logs);
     try {
@@ -302,21 +302,33 @@ test("#7658 T4 (RED pin): capped egress-on parent — snapshot dropped → fork 
         await h.store.flushSessionNow(parent);
 
         const snapAfter = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=p4`);
-        const fork = await postFork(h.origin, {
+        // #7658 wiring 2: the raw snapshot is gone, but the egress op log
+        // still holds the full canonical history — the snapshot route falls
+        // back to it (forkSnapshot's egressOpLogSource) instead of 409ing.
+        assert.equal(snapAfter.status, 200, `capped egress-on parent snapshot must serve from the op log (got ${snapAfter.status})`);
+        const snapAfterBody = (await snapAfter.json()) as { ok?: boolean; parentRevision?: string; orderHash?: string; orderedMessages?: { rawId: string; ref: number | null; identityHash: string }[] };
+        assert.equal(snapAfterBody.orderedMessages?.length, 5);
+
+        // A client still holding the PRE-cap snapshot conflicts: the
+        // op-log cells carry the canonical (stamped) bytes, so the
+        // pre-cap identity hashes drift on the stamped cells. That is
+        // identity-stable byte drift — the #6262 track — and the strict
+        // byte check refuses it (drift-track extension: follow-up).
+        const staleFork = await postFork(h.origin, {
             protocolVersion: 2, parentConversationId: "p4", childConversationId: "c4", parentRevision: snap.parentRevision,
-            branchPoint: { messageCount: snap.orderedMessages.length, orderHash: snap.orderHash }, orderedMessages: snap.orderedMessages, idempotencyKey: "fork:c4",
+            branchPoint: { messageCount: snap.orderedMessages.length, orderHash: snap.orderHash }, orderedMessages: snap.orderedMessages, idempotencyKey: "fork:c4-stale",
         });
-        // TODAY: the fork cannot see the parent's history (unified table frozen
-        // at the arm point, in-memory snapshot dropped) → 409.
-        // TODO(#7658 wiring 2): flips to 201 when forkSnapshot gains the
-        // egress-on source (rebuildCoreFromLog over the parent flow).
-        if (process.env.BILI_TEST_EGRESS_FORK_OPLOG_SOURCE === "1") {
-            assert.equal(snapAfter.status, 200, `capped egress-on parent snapshot must serve from the op log (got ${snapAfter.status})`);
-            assert.equal(fork.status, 201, JSON.stringify(fork.body));
-        } else {
-            assert.equal(fork.status, 409, `current behavior pin: capped parent 409s (body: ${JSON.stringify(fork.body)})`);
-            assert.equal(fork.body.code, "SNAPSHOT_UNAVAILABLE");
-        }
+        assert.equal(staleFork.status, 409, JSON.stringify(staleFork.body));
+        assert.equal(staleFork.body.code, "BRANCH_POINT_CONFLICT", "stale pre-cap snapshot → identity drift → conflict (documented boundary)");
+
+        // The real host flow: re-snapshot, then fork with the fresh cells.
+        const fork = await postFork(h.origin, {
+            protocolVersion: 2, parentConversationId: "p4", childConversationId: "c4", parentRevision: snapAfterBody.parentRevision!,
+            branchPoint: { messageCount: snapAfterBody.orderedMessages!.length, orderHash: snapAfterBody.orderHash! }, orderedMessages: snapAfterBody.orderedMessages!, idempotencyKey: "fork:c4",
+        });
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        // The child got the verbatim whole-table copy — number space intact.
+        assert.deepEqual(h.store.egressOpLogStore()!.egressStateView("c4"), h.store.egressOpLogStore()!.egressStateView("p4"));
     } finally {
         await h.close(h.store);
     }

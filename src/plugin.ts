@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
+import { rebuildCoreFromLog } from "./storage/egress-serve.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -1504,8 +1505,33 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     return out;
 }
 
+/** #7658 wiring 2: the egress op-log snapshot source. An egress-on
+ *  session's unified leg is frozen, so once the in-memory raw snapshot is
+ *  gone (dropOverCap under BILI_PUBLIC_SNAPSHOT_CAP_BYTES, or a cold
+ *  process whose reconstruction only sees the frozen-at-arm-point rows)
+ *  the flow is the ONLY place that still holds the full history — and it
+ *  is the content authority by ruling 7439-5, same source the lane serves
+ *  from. Last resort after the raw snapshot and the raw-tail
+ *  reconstruction, so sessions where those still work keep today's
+ *  behavior. */
+function egressOpLogSource(session: Session): CoreMessage[] | null {
+    if (session.metadata.egressAuthority !== true) return null;
+    const st = getStore().egressOpLogStore();
+    if (!st) return null;
+    const view = st.egressStateView(session.id);
+    return view.length > 0 ? rebuildCoreFromLog(view) : null;
+}
+
+/** #7658 wiring 2: ONE source chain for the snapshot identity AND the
+ *  child's inherited pluginSnapshot — the two must agree, so both ride
+ *  this helper (the fork route used to compute the first two links on its
+ *  own and null-slice when only the op-log fallback had a source). */
+function forkSourceOf(session: Session, source?: CoreMessage[] | null): CoreMessage[] | null {
+    return source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session) ?? egressOpLogSource(session);
+}
+
 function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
-    const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
+    const messages = forkSourceOf(session, source);
     if (!messages) {
         const capped = session.metadata.publicSnapshotCapped === true;
         const base = capped ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
@@ -1805,7 +1831,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
             // #5140 item 4: a cold non-retained parent has no resident snapshot;
             // stand in with the verified unified raw tail (no fresh model call).
-            const source = parent.pluginSnapshot ?? reconstructRawTailForFork(parent);
+            const source = forkSourceOf(parent);
             let snapshot: ReturnType<typeof forkSnapshot>;
             try { snapshot = forkSnapshot(parent, source); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
