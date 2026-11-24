@@ -114,12 +114,9 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
     let store = new SessionStore({ enabled: true, dir, debounceMs: 60000 });
     _setStoreForTest(store);
     assert.ok(await store.waitForReplicas(5000), "unified store ready");
-    let dbv: ReturnType<typeof openSqliteDatabase>["db"] | null = null;
-    /** the read-only verification handle, opened once index.db exists. */
-    const vd = () => {
-        if (dbv === null) dbv = openSqliteDatabase(join(dir, "index.db")).db;
-        return dbv;
-    };
+    /** the read-only verification handle; index.db exists once the unified
+     *  store is open (opened straight-line so the finally-close typechecks). */
+    const dbv = openSqliteDatabase(join(dir, "index.db")).db;
     try {
         const sid = "sess-dualclock-e2e";
         const ctx = makeCtx(sid);
@@ -189,23 +186,23 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         await store.writeNow(persistable(ctx.session, ctx.messages));
 
         // 1. flow density on the RAW rows — strictly +1, no gaps
-        const seqs = (vd().prepare(`SELECT op_seq FROM egress_flow WHERE session_id = ? ORDER BY op_seq`).all(sid) as { op_seq: number }[]).map((r) => r.op_seq);
+        const seqs = (dbv.prepare(`SELECT op_seq FROM egress_flow WHERE session_id = ? ORDER BY op_seq`).all(sid) as { op_seq: number }[]).map((r) => r.op_seq);
         assert.ok(seqs.length > 0, "flow rows exist");
         for (let i = 1; i < seqs.length; i++) {
             assert.equal(seqs[i], seqs[i - 1]! + 1, `flow stays dense at op ${seqs[i]} (was: jump from ${seqs[i - 1]})`);
         }
         // 2. readability at the original freeze point
-        const view3 = egressStateView(vd(), sid);
+        const view3 = egressStateView(dbv, sid);
         assert.equal(view3.length, 52, "the post-fold view is readable (the original bug froze here)");
         assert.deepEqual(VIEW_KEY(view3), VIEW_KEY(row3), "view equals the recorded turn-3 rows");
         const midSeq = seqs[Math.floor(seqs.length / 2)]!;
-        assert.ok(egressStateAt(vd(), sid, midSeq).length > 0, "point-in-time reads work inside the log");
+        assert.ok(egressStateAt(dbv, sid, midSeq).length > 0, "point-in-time reads work inside the log");
 
         // 3. the block row's dual-clock fields, on the raw rows
-        const ptrRow = vd().prepare(`SELECT op_seq, flow_op_seq FROM egress_block_flow WHERE session_id = ?`).get(sid) as { op_seq: number; flow_op_seq: number };
+        const ptrRow = dbv.prepare(`SELECT op_seq, flow_op_seq FROM egress_block_flow WHERE session_id = ?`).get(sid) as { op_seq: number; flow_op_seq: number };
         assert.equal(ptrRow.op_seq, 1, "the block table numbers itself (its first and only row is op 1)");
         assert.ok(ptrRow.flow_op_seq <= ustore()!.egressStateMaxSeq(sid), "pointer within the flow's span");
-        const statePtr = vd().prepare(`SELECT op_seq, flow_op_seq FROM egress_block_state WHERE session_id = ?`).get(sid) as { op_seq: number; flow_op_seq: number };
+        const statePtr = dbv.prepare(`SELECT op_seq, flow_op_seq FROM egress_block_state WHERE session_id = ?`).get(sid) as { op_seq: number; flow_op_seq: number };
         assert.deepEqual([statePtr.op_seq, statePtr.flow_op_seq], [ptrRow.op_seq, ptrRow.flow_op_seq], "state replica row carries the same clock fields");
 
         // ---------------- restart: new store over the same DB --------------
@@ -216,11 +213,11 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         const db2 = store.egressOpLogStore()!;
         const reloaded = await store.loadAsync(sid);
         assert.ok(reloaded, "session loads after restart");
-        const view4 = egressStateView(vd(), sid);
+        const view4 = egressStateView(dbv, sid);
         assert.deepEqual(VIEW_KEY(view4), VIEW_KEY(row3), "post-restart view is byte-equal (replay works over the interleaved log)");
         const tsStamps = db2.egressTsStamps(sid);
         assert.ok(tsStamps && Object.keys(tsStamps).length >= 52, "tsStamps derive from the log after the trim");
-        const replayed = egressBlockReplay(vd(), sid, (vd().prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_block_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx);
+        const replayed = egressBlockReplay(dbv, sid, (dbv.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_block_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx);
         assert.equal(replayed.blocks.size, 1, "block table replays to the live set");
         assert.equal(replayed.blocks.get(blk.blockId)?.active, true);
 
@@ -230,11 +227,11 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         assert.equal(opSeq, parentMax);
         const child = await store.loadAsync(childId);
         assert.ok(child, "fork-to-now child loads");
-        const childView = egressStateView(vd(), childId);
+        const childView = egressStateView(dbv, childId);
         assert.deepEqual(VIEW_KEY(childView), VIEW_KEY(row3), "child flow is byte-equal to the parent's");
         assert.equal(db2.egressBlockView(childId).get(blk.blockId)?.active, true, "child inherited the block");
         for (const t of ["egress_flow", "egress_block_flow", "egress_state", "egress_block_state"]) {
-            const n = (s: string) => (vd().prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE session_id = ?`).get(s) as { n: number }).n;
+            const n = (s: string) => (dbv.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE session_id = ?`).get(s) as { n: number }).n;
             assert.equal(n(childId), n(sid), `${t} row count carried over`);
         }
 
@@ -244,7 +241,7 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         // is deleted. So points at/before the base seq are unreconstructable —
         // the documented limitation (admin.ts rejects them with 400 "earlier
         // points need the point-reconstruction materializer (follow-up)").
-        const baseSeq = (vd().prepare(`SELECT op_seq FROM egress_flow WHERE session_id = ? AND row_type = 'B' ORDER BY op_seq DESC LIMIT 1`).get(sid) as { op_seq: number } | undefined)?.op_seq;
+        const baseSeq = (dbv.prepare(`SELECT op_seq FROM egress_flow WHERE session_id = ? AND row_type = 'B' ORDER BY op_seq DESC LIMIT 1`).get(sid) as { op_seq: number } | undefined)?.op_seq;
         assert.ok(baseSeq !== undefined && baseSeq > wm1, "the fold wrote a compaction base past turn 1");
         assert.equal(ptrRow.flow_op_seq, baseSeq, "the block row's pointer IS the base point (save ran after the fold's own base write)");
         const floorId = "child-belowbase";
@@ -260,7 +257,7 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         assert.ok(store.flushSync(foldSession), "fold child session row persisted");
         const foldWm = ptrRow.flow_op_seq; // = baseSeq: the flow point the block row points at
         assert.ok(db2.egressPointForkSession(sid, foldId, foldWm), "point fork at the fold watermark");
-        const foldView = egressStateView(vd(), foldId);
+        const foldView = egressStateView(dbv, foldId);
         assert.deepEqual(
             foldView.map((r) => r.msgid),
             row2.map((r) => r.msgid),
@@ -272,9 +269,9 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         assert.ok((foldBlocks.get(blk.blockId)?.full ?? "").includes("lorem ipsum"), "forked block keeps its self-contained coverage");
 
         // the parent is untouched by the forks
-        assert.equal(egressStateView(vd(), sid).length, 52);
+        assert.equal(egressStateView(dbv, sid).length, 52);
     } finally {
         await store.closeQuietly();
-        dbv?.close();
+        dbv.close();
     }
 });
