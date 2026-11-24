@@ -132,20 +132,16 @@ interface EgressStateRow {
 const INSERT_STATE = `INSERT INTO egress_state (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
 const INSERT_FLOW = `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
 
-function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: number } {
-    // egress_flow is the record and a superset of egress_state after every
-    // compaction, so the flow maxima ARE the session's high-waters: the
-    // op_seq ordering cursor and the canonical message-number cursor (I
-    // rows only — B/D/U carry NULL and never advance it).
-    // #7577 (owner ruling 2026-11-24): DUAL CLOCKS — the block lifecycle log
-    // numbers itself (egress_block_flow.op_seq dense within its own table,
-    // see egress-block.ts); its rows carry flow_op_seq as a POINTER to this
-    // clock (flow's MAX at write time) for cross-table alignment at point
-    // forks. The flow table keeps its exclusive number pool: the op_seq and
-    // log_seq cursors are egress_flow-only, and its density invariant
-    // (#7574) stays intact regardless of what the block table does.
-    //
-    // #7574: must be read INSIDE the append transaction, never before it.
+/** The canonical message frontier: the highest number ever ISSUED
+ * (retired messages included — I rows only advance it, B/D/U never do).
+ * MAX(log_seq) over the flow rows is the fast answer, but a compaction
+ * physically removes the I rows its newest base subsumes (#7574), so the
+ * moment right after a fold the flow can hold a base row ONLY — the
+ * high-water then lives in the base payload (entries' inline numbers and
+ * the explicit highWater field). Callers reading the frontier OUTSIDE the
+ * append transaction must go through this fallback; the next append's
+ * validation replay reports an unreadable base. */
+export function egressMessageHighWater(db: SqliteDatabase, sessionId: string): number {
     const row = db
         .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o, COALESCE(MAX(log_seq), 0) AS n FROM egress_flow WHERE session_id = ?")
         .get(sessionId) as { o: number; n: number } | undefined;
@@ -172,7 +168,28 @@ function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: 
             }
         }
     }
-    return { opSeq: head + 1, num: high + 1 };
+    return high;
+}
+
+function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: number } {
+    // egress_flow is the record and a superset of egress_state after every
+    // compaction, so the flow maxima ARE the session's high-waters: the
+    // op_seq ordering cursor and the canonical message-number cursor (I
+    // rows only — B/D/U carry NULL and never advance it).
+    // #7577 (owner ruling 2026-11-24): DUAL CLOCKS — the block lifecycle log
+    // numbers itself (egress_block_flow.op_seq dense within its own table,
+    // see egress-block.ts); its rows carry flow_op_seq as a POINTER to this
+    // clock (flow's MAX at write time) for cross-table alignment at point
+    // forks. The flow table keeps its exclusive number pool: the op_seq and
+    // log_seq cursors are egress_flow-only, and its density invariant
+    // (#7574) stays intact regardless of what the block table does.
+    //
+    // #7574: must be read INSIDE the append transaction, never before it.
+    const row = db
+        .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_flow WHERE session_id = ?")
+        .get(sessionId) as { o: number } | undefined;
+    const head = Number(row?.o) || 0;
+    return { opSeq: head + 1, num: egressMessageHighWater(db, sessionId) + 1 };
 }
 
 interface InsertOp {

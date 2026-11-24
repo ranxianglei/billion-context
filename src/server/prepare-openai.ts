@@ -318,6 +318,13 @@ export async function prepareOpenai(
             incomingSeqs,
             incomingTailIds,
             pluginMode,
+            // Identity consolidation (discussions/7591): egress-on sessions
+            // carry no conversations row — the in-memory metadata field is
+            // the row's source of truth, use it instead of the store lookup.
+            // Predicate mirrors the row write verbatim (ingest.ts namespace =
+            // the pluginAgent when a non-empty string, else "proxy") so the
+            // two cannot drift apart.
+            convBound: session.metadata["egressAuthority"] === true ? (typeof session.metadata["pluginAgent"] === "string" && session.metadata["pluginAgent"] !== "") : undefined,
             wpHit,
             log,
         });
