@@ -1635,31 +1635,38 @@ test("ensureProxyRunning: unarmed LANE'D listener is not attached by default —
 
 // #2877 flipped the default: an unarmed USER-ZONE daemon (manual `bili start`,
 // no lane) is no longer ridden by a LANEd launch — every agent converging on one
-// manual proxy was the bug (#2877). The hook now spawns its own session proxy.
-test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is NOT ridden by default — spawns its own (#2877)", async () => {
+// manual proxy was the bug (#2877). Pre-#7675 the hook then spawned its own
+// session proxy, which in the field laddered to base+1 behind the live manual
+// daemon — a silent second writer over the shared store (#7156 class). #7675
+// closes that drift: the lane launch REFUSES with an actionable error instead
+// (the manual daemon's own port zone, or stop it); the explicit legacy policy
+// (attachPolicy=global-fallback) still rides it (next row).
+test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is NOT ridden by default — the launch refuses instead of drifting a second writer (#2877 → #7675)", async () => {
     let spawnCalls = 0;
-    let childToken = "";
-    let spawned = false;
-    const handle = await ensureProxyRunning(
-        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
-        {
-            spawnImpl: (_cmd, _args, options) => {
-                spawned = true;
-                childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
-                spawnCalls++;
-                return makeFakeChild(42505);
+    let err: unknown;
+    try {
+        await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+            {
+                spawnImpl: (_cmd, _args, options) => {
+                    spawnCalls++;
+                    return makeFakeChild(42505);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-1", watchdog: { armed: false } }),
+                readInstanceFile: () => recordedInstance({ instanceId: "manual-1" }),
+                registerWatcher: async () => "ok",
+                sleep: () => new Promise((r) => setTimeout(r, 0)),
+                scriptPath: FP_SCRIPT,
             },
-            fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-1", watchdog: { armed: false } }),
-            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "manual-1" })),
-            registerWatcher: async () => "ok",
-            sleep: () => new Promise((r) => setTimeout(r, 0)),
-            scriptPath: FP_SCRIPT,
-        },
-    );
-    assert.equal(spawnCalls, 1, "the manual user-zone daemon is no longer ridden by default (#2877)");
-    assert.ok(handle.child);
-    assert.equal(handle.attached, undefined);
+        );
+    } catch (e) {
+        err = e;
+    }
+    assert.equal(spawnCalls, 0, "no second writer may drift behind a live manual daemon (#7675)");
+    assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second writer"),
+        `actionable refusal: ${err instanceof Error ? err.message : String(err)}`);
+    assert.ok(err instanceof Error && err.message.includes("manual launch with no lane"), "the refusal names the holder's origin");
 });
 
 // The pre-#2877 behavior (ride the user-maintained daemon) is preserved behind
