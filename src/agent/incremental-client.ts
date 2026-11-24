@@ -140,7 +140,7 @@ const REQUEST_PARAM_KEY_SET = new Set<string>(REQUEST_PARAM_KEYS);
 
 /** Keys the lane assembles from the wire's top level — hosts pass the full
  *  anthropic body as `request`, so these are by-design, not dropped. */
-const LANE_OWNED_REQUEST_KEYS = new Set(["messages", "system"]);
+const LANE_OWNED_REQUEST_KEYS = new Set(["messages", "system", "biliOmpSessionId", "biliOmpSyntheticPck"]);
 
 /** #3406 item 6: params dropped here never reach the lane (its own warn
  *  cannot fire for helper-planned turns), so surface them once per
@@ -437,6 +437,7 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
         request,
         messages,
     };
+    if (src.biliOmpSessionId !== undefined) body.biliOmpSessionId = src.biliOmpSessionId;
     if (resync) body.resync = true;
     if (includeSystem) body.system = args.system === undefined ? null : args.system;
     // #4491: only a provably-parallel, non-empty array rides the envelope —

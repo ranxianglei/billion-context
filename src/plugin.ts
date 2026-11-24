@@ -977,6 +977,15 @@ export function takePendingPluginRegister(
 }
 const registeredIds = new Map<string, { agent: string; parentConversationId?: string }>();
 
+/** A shared provider key naming an OMP parent cannot identify which fork sent a legacy turn. */
+export function hasRegisteredOmpChild(parent: unknown): boolean {
+    if (typeof parent !== "string" || !parent) return false;
+    for (const entry of registeredIds.values()) {
+        if (entry.agent === "omp" && entry.parentConversationId === parent) return true;
+    }
+    return false;
+}
+
 /** Identity-driven binding (#162): hosts whose model requests carry the SAME
  *  id the MCP shell registered (claude code: every request has
  *  x-claude-code-session-id === CLAUDE_CODE_SESSION_ID === the registered
@@ -1226,6 +1235,9 @@ function conversationIdForSession(sessionId: string): string | undefined {
  *  on lookup; unknown ids still create no session. */
 export function resolveConversation(conversationId: string): { session: Session | undefined; entry?: ConversationEntry } {
     let entry = conversations.get(conversationId);
+    if (registeredIds.get(conversationId)?.agent === "omp") {
+        return { session: peekSession(conversationId), entry: entry?.sessionId === conversationId ? entry : undefined };
+    }
     let session = peekSession(conversationId) ?? (entry ? peekSession(entry.sessionId) : undefined);
     if (!session) {
         session = findSessionByCanonicalId(conversationId);
@@ -1581,6 +1593,7 @@ export function forkParentRevisionLegacy(session: Session): string {
 async function resolveForkConversation(id: string): Promise<Session | undefined> {
     if (peekSession(id)) return peekSession(id);
     if (await getStore().loadAsync(id)) return getSessionAsync(id);
+    if (registeredIds.get(id)?.agent === "omp") return undefined;
     const { session, entry } = resolveConversation(id);
     if (session) return session;
     const persistedId = entry?.sessionId ?? id;
@@ -2492,6 +2505,12 @@ export async function handlePluginTool(
     if (!session) {
         session = await resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
+    }
+    // A tool-use witness from a legacy shared-key turn cannot authorize access
+    // to another OMP session, even when the host recognizes that call id.
+    if (nativeCaller && conversationId && session && session.id !== conversationId
+        && (registeredIds.get(conversationId)?.agent === "omp" || session.metadata.pluginAgent === "omp")) {
+        return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "OMP tool call resolves outside its host session", conversationId });
     }
     // #760: the verbatim-id fallback above can resolve a session with NO map
     // entry (first call), so only the session itself gates execution.

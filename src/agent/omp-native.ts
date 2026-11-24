@@ -75,15 +75,10 @@ const state: NativeInterceptState = {
     headersFor: () => ({ [BILI_HOST_RECOVERY_OWNER_HEADER]: BILI_HOST_RECOVERY_OWNER_OMP }),
 };
 
-// #3248 phase 2: incremental-turn divert for omp. omp never emits header
-// events, so the ONLY identity signal at the fetch layer is the
-// `prompt_cache_key` body field the omp extension stamps (pi.ts
-// stampPromptCacheKey — present exactly when the plugin is active). The
-// beforeSend hook reads it as the conversation id, plans the incremental
-// body, swaps init.body and stamps the plugin headers DIRECTLY ON init —
-// plugin mode is safe here: x-bili-plugin-conversation gets the same value
-// wire mode already resolves to via preferPromptCacheKeyIdentity, so the
-// session id does not fork. #3329: each planned turn is keyed by a fresh
+// OMP's provider hook stamps the per-request host session in the body. Use
+// that same owner for the converted Anthropic turn as for a full resend.
+// A provider cache key may name the parent or be shared by many sessions.
+// #3329: each planned turn is keyed by a fresh
 // per-request turn id stamped onto init's headers (x-bili-turn-id) —
 // several sessions share one provider URL, and keying the pending table by
 // URL mis-attributes a late response to whichever session planned last on
@@ -164,9 +159,9 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
             return;
         }
         if (parsed === null || typeof parsed !== "object") return;
-        const b = parsed as { messages?: unknown; model?: unknown; system?: unknown; prompt_cache_key?: unknown };
+        const b = parsed as { messages?: unknown; model?: unknown; system?: unknown; biliOmpSessionId?: unknown };
         if (typeof b.model !== "string" || !Array.isArray(b.messages)) { return; }
-        const sid = typeof b.prompt_cache_key === "string" ? b.prompt_cache_key.trim() : "";
+        const sid = typeof b.biliOmpSessionId === "string" ? b.biliOmpSessionId.trim() : "";
         if (sid.length === 0) { return; }
         // #5403/#5418: feed the SAME proven id list into the shared watermark
         // channel (the fetch chokepoint emits x-bili-pf-count + tail-ids; core

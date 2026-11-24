@@ -2710,14 +2710,16 @@ test("omp before_provider_request stamps prompt_cache_key only for chat-completi
     // native prompt_cache_key already present → not overridden
     {
         const pi = mk();
-        const out = await handler(pi, { messages: [{ role: "user", content: "hi" }], prompt_cache_key: "native-pck" });
-        assert.equal(out, undefined, "native pck is not overridden");
+        const out = await handler(pi, { messages: [{ role: "user", content: "hi" }], prompt_cache_key: "native-pck" }) as Record<string, unknown>;
+        assert.equal(out.prompt_cache_key, "native-pck");
+        assert.equal(out.biliOmpSessionId, sid);
     }
-    // responses payload (input array) → untouched
+    // Responses can inherit a parent cache key even though the hook owns a child.
     {
         const pi = mk();
-        const out = await handler(pi, { input: [{ role: "user", content: "hi" }] });
-        assert.equal(out, undefined, "responses payload (input) untouched");
+        const input = [{ role: "user", content: "hi" }];
+        const out = await handler(pi, { input, prompt_cache_key: "parent-uuid" });
+        assert.deepEqual(out, { input, prompt_cache_key: "parent-uuid", biliOmpSessionId: sid });
     }
     // anthropic wire shape (messages + max_tokens) → stamped too when the
     // destination is proxy-visible: the plugin cannot tell the wires apart by

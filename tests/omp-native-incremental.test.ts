@@ -1,5 +1,5 @@
 // #3248 phase 2 — omp native incremental adapter. omp never emits header
-// events, so the ONLY identity signal at the fetch layer is prompt_cache_key
+// events, so the host session is carried at the fetch layer in biliOmpSessionId
 // (stamped into the body by the omp extension). These suites drive the two
 // exported seams (ompIncrementalBeforeSend / ompIncrementalOnResponse) with a
 // fake lane origin pinned via _setOmpOriginForTest. #3329: ack calls pass the
@@ -52,7 +52,7 @@ after(async () => {
     __resetOmpIncrementalForTests();
 });
 
-test("omp incremental: prompt_cache_key becomes the conversation id; plugin headers + marker land on init; delta after ack", async () => {
+test("omp incremental uses the host conversation across turns sharing a parent cache key", async () => {
     __resetIncrementalClientForTests();
     __resetOmpIncrementalForTests();
     const lane = await fakeLane(true);
@@ -60,10 +60,11 @@ test("omp incremental: prompt_cache_key becomes the conversation id; plugin head
     _setOmpOriginForTest(lane.base);
 
     const msgs1 = [{ role: "user", content: "hello omp" }];
-    const init = initOf({ model: "claude-test", max_tokens: 512, prompt_cache_key: "omp-inc-1", messages: msgs1 });
+    const init = initOf({ model: "claude-test", max_tokens: 512, biliOmpSessionId: "omp-inc-1", prompt_cache_key: "parent", messages: msgs1 });
     await ompIncrementalBeforeSend(MODEL_URL, init);
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
-    assert.equal(body.conversationId, "omp-inc-1", "prompt_cache_key rides as the conversation id");
+    assert.equal(body.conversationId, "omp-inc-1");
+    assert.equal(body.biliOmpSessionId, "omp-inc-1");
     assert.equal(body.sinceSeq, 0);
     assert.equal((body.messages as unknown[]).length, 1);
     const headers = init.headers as Headers;
@@ -75,20 +76,20 @@ test("omp incremental: prompt_cache_key becomes the conversation id; plugin head
     ompIncrementalOnResponse(MODEL_URL, new Response("{}", { status: 200, headers: { "x-bili-applied-seq": "1" } }), headersOf(headers));
 
     const msgs2 = [...msgs1, { role: "assistant", content: "hi" }, { role: "user", content: "next" }];
-    const init2 = initOf({ model: "claude-test", max_tokens: 512, prompt_cache_key: "omp-inc-1", messages: msgs2 });
+    const init2 = initOf({ model: "claude-test", max_tokens: 512, biliOmpSessionId: "omp-inc-1", prompt_cache_key: "parent", messages: msgs2 });
     await ompIncrementalBeforeSend(MODEL_URL, init2);
     const body2 = JSON.parse(String(init2.body)) as Record<string, unknown>;
     assert.equal(body2.sinceSeq, 1, "acked watermark rides");
     assert.equal((body2.messages as unknown[]).length, 2, "delta only");
 });
 
-test("omp incremental: no prompt_cache_key (plugin inactive) leaves the init untouched", async () => {
+test("omp incremental leaves a legacy parent cache key on full resend without independent host proof", async () => {
     __resetIncrementalClientForTests();
     __resetOmpIncrementalForTests();
     const lane = await fakeLane(true);
     lanes.push(lane);
     _setOmpOriginForTest(lane.base);
-    const original = { model: "claude-test", max_tokens: 512, messages: [{ role: "user", content: "hi" }] };
+    const original = { model: "claude-test", max_tokens: 512, prompt_cache_key: "parent", messages: [{ role: "user", content: "hi" }] };
     const init = initOf(original);
     await ompIncrementalBeforeSend(MODEL_URL, init);
     assert.deepEqual(JSON.parse(String(init.body)), original, "unstamped body = extension inactive = full resend");
@@ -101,7 +102,7 @@ test("omp incremental: probe disabled leaves the body untouched", async () => {
     const lane = await fakeLane(false);
     lanes.push(lane);
     _setOmpOriginForTest(lane.base);
-    const original = { model: "claude-test", max_tokens: 512, prompt_cache_key: "omp-inc-off", messages: [{ role: "user", content: "hi" }] };
+    const original = { model: "claude-test", max_tokens: 512, biliOmpSessionId: "omp-inc-off", messages: [{ role: "user", content: "hi" }] };
     const init = initOf(original);
     await ompIncrementalBeforeSend(MODEL_URL, init);
     assert.deepEqual(JSON.parse(String(init.body)), original);
@@ -129,7 +130,7 @@ test("omp incremental: late response crossing the TTL attributes by turn id, nev
     let t = realNow();
     Date.now = () => t;
     try {
-        const initA1 = initOf({ model: "claude-test", max_tokens: 512, system, prompt_cache_key: "omp-late-a", messages: a1msgs });
+        const initA1 = initOf({ model: "claude-test", max_tokens: 512, system, biliOmpSessionId: "omp-late-a", messages: a1msgs });
         await ompIncrementalBeforeSend(MODEL_URL, initA1);
         const aHeaders = headersOf(initA1.headers as Headers);
         assert.notEqual(aHeaders["x-bili-turn-id"], undefined, "turn id stamped on A's outgoing init");
@@ -137,7 +138,7 @@ test("omp incremental: late response crossing the TTL attributes by turn id, nev
         // A's round-trip outlives the pending TTL (slow non-streaming request)
         // — the sweep frees the URL slot, so B converts under the guard.
         t += 31_000;
-        const initB1 = initOf({ model: "claude-test", max_tokens: 512, system, prompt_cache_key: "omp-late-b", messages: b1msgs });
+        const initB1 = initOf({ model: "claude-test", max_tokens: 512, system, biliOmpSessionId: "omp-late-b", messages: b1msgs });
         await ompIncrementalBeforeSend(MODEL_URL, initB1);
         const bHeaders = headersOf(initB1.headers as Headers);
         assert.notEqual(bHeaders["x-bili-turn-id"], undefined, "turn id stamped on B's outgoing init");
@@ -158,7 +159,7 @@ test("omp incremental: late response crossing the TTL attributes by turn id, nev
         // B (the URL-keyed bug), this sinceSeq would read 42.
         ompIncrementalOnResponse(MODEL_URL, new Response("{}", { status: 200, headers: { "x-bili-applied-seq": "7" } }), bHeaders);
         const b2msgs = [...b1msgs, { role: "assistant", content: "b1r" }, { role: "user", content: "b2" }];
-        const initB2 = initOf({ model: "claude-test", max_tokens: 512, system, prompt_cache_key: "omp-late-b", messages: b2msgs });
+        const initB2 = initOf({ model: "claude-test", max_tokens: 512, system, biliOmpSessionId: "omp-late-b", messages: b2msgs });
         await ompIncrementalBeforeSend(MODEL_URL, initB2);
         const b2Body = JSON.parse(String(initB2.body)) as Record<string, unknown>;
         assert.equal(b2Body.sinceSeq, 7, "B was never credited with A's ack (42) — it rides its own (7)");
@@ -172,7 +173,7 @@ test("omp incremental: late response crossing the TTL attributes by turn id, nev
         // watermark it never actually received (b2's pending was consumed by
         // its own ack above, so the URL slot is free again).
         const a2msgs = [...a1msgs, { role: "assistant", content: "a1r" }, { role: "user", content: "a2" }];
-        const initA2 = initOf({ model: "claude-test", max_tokens: 512, system, prompt_cache_key: "omp-late-a", messages: a2msgs });
+        const initA2 = initOf({ model: "claude-test", max_tokens: 512, system, biliOmpSessionId: "omp-late-a", messages: a2msgs });
         await ompIncrementalBeforeSend(MODEL_URL, initA2);
         const a2Body = JSON.parse(String(initA2.body)) as Record<string, unknown>;
         assert.equal(a2Body.sinceSeq, 0, "A's expired entry was swept — honest reseed");
@@ -182,7 +183,7 @@ test("omp incremental: late response crossing the TTL attributes by turn id, nev
         // B's next delta is then free to convert under the guard.
         ompIncrementalOnResponse(MODEL_URL, new Response("{}", { status: 200, headers: { "x-bili-applied-seq": "11" } }), headersOf(initA2.headers as Headers));
         const b3msgs = [...b2msgs, { role: "assistant", content: "b2r" }, { role: "user", content: "b3" }];
-        const initB3 = initOf({ model: "claude-test", max_tokens: 512, system, prompt_cache_key: "omp-late-b", messages: b3msgs });
+        const initB3 = initOf({ model: "claude-test", max_tokens: 512, system, biliOmpSessionId: "omp-late-b", messages: b3msgs });
         await ompIncrementalBeforeSend(MODEL_URL, initB3);
         const b3Body = JSON.parse(String(initB3.body)) as { sinceSeq: number };
         assert.equal(b3Body.sinceSeq, 9, "B rides its own watermark");

@@ -60,7 +60,7 @@ const wire = (role: "user" | "assistant", text: string) => ({ role, content: tex
 
 /** Drive the exact stash the omp extension performs per model request: the
  *  (id, role) extraction from the live branch, keyed by the session id the
- *  prompt_cache_key will carry. */
+ *  provider hook stamps on the request. */
 function stashHint(sid: string, branch: unknown[]): void {
     const ctx = { sessionManager: { getSessionId: () => sid, getBranch: () => branch } } as CtxShape;
     noteHostMsgIdHint(sid, ompBranchMsgIdEntries(ctx));
@@ -69,7 +69,7 @@ function stashHint(sid: string, branch: unknown[]): void {
 /** Convert one outgoing request through the fetch-layer seam; `ack` settles
  *  the round so the next conversion on this URL is not single-flight held. */
 async function convert(sid: string, messages: unknown[]): Promise<{ body: Record<string, unknown>; ack: (appliedSeq: number) => void }> {
-    const init = initOf({ model: "claude-test", max_tokens: 512, prompt_cache_key: sid, messages });
+    const init = initOf({ model: "claude-test", max_tokens: 512, biliOmpSessionId: sid, messages });
     await ompIncrementalBeforeSend(MODEL_URL, init);
     const normalized = headersOf(new Headers(init.headers as Record<string, string> | Headers));
     return {

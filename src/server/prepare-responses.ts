@@ -75,6 +75,7 @@ export async function prepareResponses(
     visibilityMarkers: boolean,
     billingUpstream?: string,
     decide?: DecideConfig,
+    preserveProviderCacheKey = false,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const inboundMessageCount = Array.isArray(parsed.input) ? parsed.input.length : 1;
@@ -761,21 +762,12 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     if (!isCompactionTrigger) {
         clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     }
-    // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
-    // is first-wins and would keep injecting pck toward a relay we switched
-    // away from (same class of bug as the compressProtocol fix above, #286).
-    const promptCacheKey = resolvePromptCacheKey(
-        rebuilt.prompt_cache_key,
-        identity,
-        effectivePromptCacheRouting(opts.promptCache),
-        upstreamOrigin,
-        sessionId,
-    );
-    if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
-    // #3813: mirror the OpenAI lane's #2645 ablation consult — once an egress
-    // origin+model is A/B-confirmed to reject prompt_cache_key, drop it here too
-    // (client-supplied or injected) so each turn stops re-paying a 400 + retry.
-    if (pckKeyAbated(billingUpstream, upstreamOrigin, modelIdOf(parsed))) delete rebuilt.prompt_cache_key;
+    if (!preserveProviderCacheKey) {
+        // Resolve against this request's upstream after a relay switch (#286).
+        const promptCacheKey = resolvePromptCacheKey(rebuilt.prompt_cache_key, identity, effectivePromptCacheRouting(opts.promptCache), upstreamOrigin, sessionId);
+        if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
+        if (pckKeyAbated(billingUpstream, upstreamOrigin, modelIdOf(parsed))) delete rebuilt.prompt_cache_key;
+    }
     // This adapter is stateless: we replay the FULL conversation in `input`.
     // Strip Responses' native chaining field so the upstream does not resolve
     // stored server-side state ON TOP of the input we already sent (which would

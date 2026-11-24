@@ -117,6 +117,7 @@ export async function prepareOpenai(
     decide?: DecideConfig,
     bodyText?: string,
     bodyParseDeferred = false,
+    preserveProviderCacheKey = false,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -870,11 +871,13 @@ export async function prepareOpenai(
     // A/B seam as the rejection backstop; disabled never emits a bili-owned
     // key but still forwards genuine client keys verbatim (and still honors
     // an A/B ablation against them).
-    const pckDecision = resolveRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin, effectivePromptCacheRouting(opts.promptCache), session.id, modelIdOf(parsed));
-    if (pckDecision === "stamp") {
-        rebuilt.prompt_cache_key = session.id;
-    } else if (pckDecision === "drop") {
-        delete (rebuilt as Record<string, unknown>).prompt_cache_key;
+    if (!preserveProviderCacheKey) {
+        const pckDecision = resolveRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin, effectivePromptCacheRouting(opts.promptCache), session.id, modelIdOf(parsed));
+        if (pckDecision === "stamp") {
+            rebuilt.prompt_cache_key = session.id;
+        } else if (pckDecision === "drop") {
+            delete (rebuilt as Record<string, unknown>).prompt_cache_key;
+        }
     }
     // OpenAI Chat Completions only emits a usage object in the final stream
     // chunk when the client sets stream_options.include_usage=true. Without

@@ -53,10 +53,10 @@ import { executeThreadsReforge, threadsBetaToDecline } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { opencodeForkParent } from "../opencode-fork-lineage.js";
-import { consumePluginRegisterFor, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, hasRegisteredOmpChild, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
+import { BILI_HOST_RECOVERY_OWNER_HEADER, BILI_HOST_RECOVERY_OWNER_OMP, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
@@ -184,6 +184,40 @@ function persistLineageLinkNow(session: Session): void {
  *  be noise on a stream that re-sends the same id every turn. */
 const vertexModelNormalised = new Set<string>();
 const VERTEX_MODEL_LOG_CAP = 64;
+
+/** undefined keeps ordinary identity resolution; null forwards an ambiguous turn without a ledger. */
+function ompModelOwner(headers: http.IncomingHttpHeaders, body: Record<string, unknown>, protocol: WireProtocol): string | null | undefined {
+    const stamp = body.biliOmpSessionId;
+    const transport = headers[BILI_HOST_RECOVERY_OWNER_HEADER];
+    const native = transport === BILI_HOST_RECOVERY_OWNER_OMP;
+    if (!native && stamp === undefined) return undefined;
+    const agent = pluginAgentHeader(headers);
+    if ((agent !== undefined && agent !== "omp") || (transport !== undefined && !native)
+        || (protocol === "responses" && (isCodexHost(headers) || headers["x-bili-ws-lane"] !== undefined || headers["x-codex-turn-metadata"] !== undefined))) return null;
+
+    const claimed = pluginConversationHeader(headers);
+    if (stamp !== undefined) {
+        if (typeof stamp !== "string" || !stamp || stamp.length > 512 || stamp.trim() !== stamp || (claimed !== undefined && claimed !== stamp)) return null;
+        const registration = consumePluginRegisterFor(stamp);
+        const verified = registration ? registration.agent === "omp" : native || (protocol !== "responses" && agent === "omp");
+        return verified ? stamp : null;
+    }
+
+    // Legacy children occasionally carry an independent session id. A
+    // registration proves lineage, but cannot choose the sender by itself.
+    const pck = body.prompt_cache_key;
+    const metadata = body.metadata as { session_id?: unknown } | null | undefined;
+    const signals: unknown[] = [claimed, headers["session-id"], headers.session_id, headers["x-session-id"], headers["x-acp-session"]];
+    if (protocol === "responses") signals.push(body.session_id, metadata?.session_id);
+    const explicit = signals.find(id => id != null);
+    if (explicit !== undefined && (typeof explicit !== "string" || !explicit || signals.some(id => id != null && id !== explicit))) return null;
+    const registration = typeof explicit === "string" ? consumePluginRegisterFor(explicit) : undefined;
+    if (registration && registration.agent !== "omp") return null;
+    if (typeof explicit === "string" && typeof pck === "string" && explicit !== pck) {
+        return registration?.parentConversationId === pck ? explicit : null;
+    }
+    return hasRegisteredOmpChild(pck) || hasRegisteredOmpChild(explicit) ? null : undefined;
+}
 
 export async function handle(
     req: http.IncomingMessage,
@@ -790,6 +824,26 @@ async function handleRequest(
             }
         }
     }
+    const ompBody = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+    const hasOmpFields = ompBody !== undefined && ("biliOmpSessionId" in ompBody || "biliOmpSyntheticPck" in ompBody);
+    const ompOwner = ompBody && wireFamily === null && (protocol === "responses" || protocol === "openai" || protocol === "anthropic")
+        ? ompModelOwner(req.headers, ompBody, protocol) : undefined;
+    if (ompOwner === null) {
+        const clean = scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log);
+        await forward(req, res, opts, clean, null, core, config, log, route, instanceId, undefined);
+        return;
+    }
+    const syntheticPck = hasOmpFields && ompBody.biliOmpSyntheticPck === true && ompBody.prompt_cache_key === ompBody.biliOmpSessionId;
+    const preserveProviderCacheKey = ompOwner !== undefined && (protocol === "responses" || protocol === "openai");
+    const ompProviderContinuation = ompOwner !== undefined && protocol === "responses"
+        && (ompBody?.previous_response_id != null || ompBody?.conversation != null);
+    if (hasOmpFields) {
+        if (syntheticPck) delete ompBody.prompt_cache_key;
+        delete ompBody.biliOmpSessionId;
+        delete ompBody.biliOmpSyntheticPck;
+        // Continuations and compact may bypass prepare and forward this buffer.
+        if (protocol === "responses") bodyBuffer = Buffer.from(JSON.stringify(ompBody));
+    }
     // #7168/#7439: intercept DSH client extensions (default) — strip top-level
     // `dsh_*` so the 8 MiB `dsh_session_log` is never forwarded upstream. Gated by
     // the `passDshExtensions` rollout flag (default OFF = strip); release it once
@@ -881,7 +935,7 @@ async function handleRequest(
                 }
                 log("warn", `[zed] /completions envelope body is not a convertible zed cloud request — relaying verbatim to ${maskUrlsInText(upstreamOrigin)} — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
             }
-            await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+            await forward(req, res, opts, scrubMsgIdFields(bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
             return;
         }
         parsed = unwrapped.innerBody;
@@ -1105,7 +1159,7 @@ async function handleRequest(
             const runtimeAgent = pluginAgentHeader(req.headers);
             const runtimeEntry = runtimeAgent !== undefined
                 ? pluginRuntimeInfoFor(runtimeAgent, model)
-                : pluginRuntimeInfoForConversation(runtimeConversationId(req.headers, parsed, opts.sessionHeader), model);
+                : pluginRuntimeInfoForConversation(ompOwner ?? runtimeConversationId(req.headers, parsed, opts.sessionHeader), model);
             const runtimeWindow = pluginWindow === undefined ? runtimeEntry?.contextWindow : undefined;
             const launcherWindow = launcherContextWindow(model);
             const configuredModelEntry = resolveModelEntry(opts.routes, embeddedUrl, model);
@@ -1275,7 +1329,7 @@ async function handleRequest(
         // over content hashing, so IDE clients (ZCode/Cursor) that inject a
         // fixed system-reminder into every new conversation don't collide on a
         // shared 200-char prefix and leak compression state across sessions.
-        const clientConv = clientConversationHeader(req.headers);
+        const clientConv = ompOwner ?? clientConversationHeader(req.headers);
         const convHeader = clientConv ?? sessionHeader;
         // Codex turn-metadata partitioning (#316 / PR-A): when the explicit
         // Codex turn metadata is present and cross-checked against the
@@ -1285,7 +1339,7 @@ async function handleRequest(
         // independent state per thread, #150). Untrusted metadata (absent /
         // unparseable / mismatched / unknown thread_source) → undefined, and
         // the legacy chain below is unchanged.
-        const codexTurn = protocol === "responses" ? codexTurnIdentity(req.headers) : undefined;
+        const codexTurn = protocol === "responses" && ompOwner === undefined ? codexTurnIdentity(req.headers) : undefined;
         // Claude Code subagent discriminator (#970): subagent requests carry
         // the agent headers AND lack the main agent's system-prefix block
         // (see claudeSubagentAgentId for the two-signal contract). Hoisted so
@@ -1300,7 +1354,8 @@ async function handleRequest(
                         .filter((t) => t.length > 0)
                   : [];
         const claudeSub = protocol === "anthropic" ? claudeSubagentAgentId(req.headers, systemTextsForSplit) : undefined;
-        const responsesIdentity = protocol === "responses"
+        const responsesIdentity = protocol === "responses" && ompOwner !== undefined
+            ? { value: ompOwner, source: "header" as const, clientProvided: true } : protocol === "responses"
             ? preferZedThreadIdIdentity(
                   codexTurn
                       ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
@@ -1636,7 +1691,7 @@ async function handleRequest(
             )
             : undefined;
         const auxSidecar = zcodeMemory ?? qoderSideTask;
-        const conversation = auxSidecar !== undefined ? auxSidecar : protocol === "google"
+        const conversation = ompOwner !== undefined ? ompOwner : auxSidecar !== undefined ? auxSidecar : protocol === "google"
             // #2730: the google lane is persona-aware too — dsh stamps its one
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
             // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google
@@ -1795,7 +1850,7 @@ async function handleRequest(
                 // key owned by the main session (#970 discipline).
                 ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
                 : undefined;
-        const personaForked = rawPersonaIdentity !== undefined && conversation !== rawPersonaIdentity;
+        const personaForked = ompOwner === undefined && rawPersonaIdentity !== undefined && conversation !== rawPersonaIdentity;
         // #2170 measure 4: stamp sessions deliberately namespaced onto a
         // `|sub:` key — #970 claude subagents, #1916/#1307/#1314 dsh persona-
         // fork reviews, codex/claude-over-Responses instructions personas —
@@ -1989,14 +2044,14 @@ async function handleRequest(
         //    it stable for the session's life; pre-#2879 sessions keep the
         //    bare label (no migration). Others stay empty ("—" in the UI).
         const bodyIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
-        const affinity = affinityToken(bodyIdentity ?? {
-            value: clientConv ?? conversation,
-            source: clientConv ? "header" : "generated",
-            clientProvided: !!clientConv,
-        });
-        const clientLabel = bodyIdentity?.clientProvided
-            ? bodyIdentity.value
-            : clientConversationHeader(req.headers);
+        const affinity = ompOwner !== undefined
+            ? (typeof ompBody?.prompt_cache_key === "string" && req.headers["x-session-id"] === undefined ? ompBody.prompt_cache_key : undefined)
+            : affinityToken(bodyIdentity ?? {
+                value: clientConv ?? conversation,
+                source: clientConv ? "header" : "generated",
+                clientProvided: !!clientConv,
+            });
+        const clientLabel = ompOwner ?? (bodyIdentity?.clientProvided ? bodyIdentity.value : clientConversationHeader(req.headers));
         // #4942: async seam — on network storage backends a memory miss must
         // be able to reload from the DB instead of starting a fresh session.
         const session = await getSessionAsync(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
@@ -2136,6 +2191,10 @@ async function handleRequest(
                 pluginConversation = clientConv ?? conversation;
                 derivedParent = identityAgent.parentConversationId;
             }
+        }
+        if (ompOwner !== undefined && !pluginAgent) {
+            pluginAgent = "omp";
+            pluginConversation = ompOwner;
         }
         if (!pluginAgent && session.stats.requests === 0 && codexTurnIdentity(req.headers) === undefined && claudeSub === undefined && zcodeMemory === undefined) {
             // A codex subagent thread mints a fresh session too, but it must
@@ -2523,7 +2582,7 @@ async function handleRequest(
         // header or session_id.
         if (zcodeMemory === undefined && (protocol === "responses" || protocol === "openai" || protocol === "anthropic")) {
             const pck = (parsed as { prompt_cache_key?: unknown }).prompt_cache_key;
-            if (typeof pck === "string" && pck.trim().length > 0) {
+            if (typeof pck === "string" && pck.trim().length > 0 && (pluginAgent !== "omp" || pck.trim() === session.id)) {
                 recordPluginSession(pck.trim(), session.id);
             }
         }
@@ -2996,6 +3055,7 @@ async function handleRequest(
                       ? urlPath.includes(":streamRawPredict")
                       : requestStream,
                 compressInjected: false,
+                preserveProviderCacheKey,
                 sidePassthrough: true,
             };
             logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
@@ -3099,7 +3159,7 @@ async function handleRequest(
                 const runtimeMax = (pluginHeadersMatchModel(req.headers, fbModel0) ? pluginReportedMaxOutput(req.headers) : undefined)
                     ?? (fbAgent !== undefined
                         ? pluginRuntimeInfoFor(fbAgent, fbModel0)?.maxOutput
-                        : pluginRuntimeInfoForConversation(runtimeConversationId(req.headers, parsed, opts.sessionHeader), fbModel0)?.maxOutput);
+                        : pluginRuntimeInfoForConversation(ompOwner ?? runtimeConversationId(req.headers, parsed, opts.sessionHeader), fbModel0)?.maxOutput);
                 if (typeof runtimeMax === "number" && runtimeMax > 0) {
                     maxOutput = runtimeMax;
                     if (!headroomFallbackLogged.has(`${fbModel0 ?? "?"}|runtime-info`)) {
@@ -3388,18 +3448,16 @@ async function handleRequest(
                     // already owns: no kernel, no dev injection, no plane
                     // side effects — the response-side ingest still updates
                     // the session from the answer).
-                    const pureChainContinuation =
-                        protocol === "responses" &&
-                        !responsesCompact &&
-                        !wsLaneEnvelope &&
-                        pluginMode &&
-                        typeof (work as ResponsesRequestBody).previous_response_id === "string" &&
-                        (work as ResponsesRequestBody).previous_response_id!.length > 0 &&
-                        (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0);
+                    const pureChainContinuation = protocol === "responses" && !responsesCompact && !wsLaneEnvelope && (
+                        ompProviderContinuation ||
+                        (pluginMode && typeof (work as ResponsesRequestBody).previous_response_id === "string"
+                            && (work as ResponsesRequestBody).previous_response_id!.length > 0
+                            && (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0))
+                    );
                     const preparedOut = protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
-                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText, bodyParseDeferred)
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText, bodyParseDeferred, preserveProviderCacheKey)
                           : pureChainContinuation
                             ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
                             : responsesCompact
@@ -3407,11 +3465,12 @@ async function handleRequest(
                             // prepareResponsesCompact falls back to the raw bodyBuffer —
                             // forward it unchanged (byte-identical passthrough).
                             ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide);
+                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, preserveProviderCacheKey);
                     // The resolved model rides with the prepared request: on the
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
                     preparedOut.model = requestModel;
+                    if (preserveProviderCacheKey) preparedOut.preserveProviderCacheKey = true;
                     // #6181 B3: the compact-passthrough base hard-codes
                     // resetAfterSuccess — which schedules a native-compaction
                     // REBASE for the next Responses turn (reconcileNative-
@@ -3745,7 +3804,7 @@ async function handleRequest(
                 // ALWAYS refused — its refusal has no user-side fix yet, only
                 // bili shipping the re-signer. Passthrough settings are inert
                 // for those schemes.
-                if (guardScheme === APIG_RESIGN_SCHEME && guardResign.passthrough) {
+                if (guardScheme === APIG_RESIGN_SCHEME && guardResign.passthrough && !hasOmpFields) {
                     clearSignedRefusal(guardScheme);
                     log("warn", `[signed-passthrough] built-in-scheme request without a working re-sign arm forwarded byte-untouched, no compression (#1884 escape hatch via resign["sdk-hmac-sha256"].passthrough / BILI_RESIGN_PASSTHROUGH — the user has acknowledged this link runs uncompressed)`);
                     forwarded = true;

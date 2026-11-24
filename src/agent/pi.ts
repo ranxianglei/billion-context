@@ -473,35 +473,13 @@ function noteOmpCoworkBypass(modelId: string): void {
     logHostEvent("warn", "[native-client]", `bili-plugin(omp): ${key} leaves this host through the host-native direct TLS transport (OMP Cowork transport, #2583) — those requests bypass bili's fetch interception and go DIRECT (uncompressed, invisible to the proxy). The prompt_cache_key identity stamp is withheld so the field can never leak into the upstream body.`);
 }
 
-// omp's chat-completions payloads carry NO conversation signal (no
-// prompt_cache_key / session / user, and no session header — verified by dump),
-// so the proxy's openai identity falls to a content fingerprint that never
-// matches the session id this plugin registered (the identity register is keyed
-// by the omp session uuid). The before_provider_request return value REPLACES
-// the whole outgoing payload (omp onPayload chain, verified in the omp 17.3.8
-// dist), so stamp prompt_cache_key with the omp session id: the proxy binds
-// pluginMode by that identity and /acp finds the session by it.
-// Chat shape = messages array, no responses `input`, no native prompt_cache_key.
-// max_tokens is NOT a discriminator: omp's openai-compat providers send it in
-// every chat-completions body (maxTokensField:"max_tokens") exactly like the
-// anthropic wire — excluding it meant the target shape was never stamped
-// (#268). The anthropic wire gets stamped too: the proxy records the mapping
-// from the body pck there as well and strips the field before forwarding to
-// the real Anthropic. pi is untouched (it stamps x-bili-plugin-conversation in
-// before_provider_headers, which outranks the body field).
-// #1403: stamp ONLY when the destination will actually be seen by the proxy —
-// the pck's sole consumer is the proxy itself (identity bind + strip-before-
-// forward). A destination the proxy blind-tunnels never sees the field, so the
-// stamp rides verbatim into the upstream body, where strict-schema upstreams
-// (opencode zen's anthropic endpoint: "prompt_cache_key: Extra inputs are not
-// permitted") 400 the whole request. Unrouted destinations degrade to the
-// proxy's anonymous prefix-affinity sessions (#309): compression still works,
-// /acp lookup by session id does not — acceptable vs a guaranteed 400.
-export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Record<string, unknown> | undefined {
-    // #3482 site 3: the identity-stamp CHANNEL is a registry property — omp
-    // stamps the body pck, pi stamps x-bili-plugin-conversation in
-    // before_provider_headers (which outranks the body field). No adapter-side
-    // name gate.
+// OMP's onPayload hook replaces the outgoing object. Stamp its host session
+// on this request: forks can share the provider's cache key. Keep the legacy
+// synthetic key on chat wires without a provider key, and mark its provenance
+// on the request so a direct fallback can remove only the key we added.
+export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string, sid: string | null | undefined = sessionIdOf(ctx)): Record<string, unknown> | undefined {
+    // OMP returns the stamped body through before_provider_request. Pi
+    // announces its conversation in before_provider_headers instead.
     const profile = hostProfileFor(agent);
     if (!profile.stampsBodyPromptCacheKey) return undefined;
     // #2583 (hoisted): the Cowork withhold must gate EVERY stamp path, not
@@ -525,13 +503,19 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
     const payload = (event as { payload?: unknown } | undefined)?.payload;
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
     const p = payload as Record<string, unknown>;
-    if (!Array.isArray(p.messages)) return undefined;
-    if (p.input !== undefined) return undefined;
-    if (typeof p.prompt_cache_key === "string" && p.prompt_cache_key.trim().length > 0) return undefined;
-    const sid = sessionIdOf(ctx);
-    if (sid === undefined || sid.length === 0) return undefined;
-    rememberStampedPromptCacheKey(sid);
-    return { ...p, prompt_cache_key: sid };
+    const api = ctx.model?.api;
+    const responses = Array.isArray(p.input) || typeof p.input === "string" || typeof p.previous_response_id === "string"
+        || (api === "openai-responses" && p.conversation !== undefined);
+    // Codex Responses can use a WebSocket transport outside the fetch hook.
+    if (api === "openai-codex-responses") return undefined;
+    if (!responses && !Array.isArray(p.messages)) return undefined;
+    if (!sid?.trim()) return undefined;
+    const synthesizeKey = !responses && p.prompt_cache_key === undefined;
+    return {
+        ...p,
+        ...(synthesizeKey ? { prompt_cache_key: sid, biliOmpSyntheticPck: true } : {}),
+        biliOmpSessionId: sid,
+    };
 }
 
 // #6525: single source of truth for "the proxy will see this request's
@@ -569,10 +553,16 @@ function bodyProxyVisible(ctx: Ctx, agent: string): boolean {
     // strict schema (#1403). The one-time diagnostic note stays at the pck
     // site; this is the pure predicate.
     if (profile.coworkTransportPossible && ompCoworkTransportBypassesFetch(ctx.model, process.env)) return false;
+    if (agent === "omp" && ctx.model?.api === "openai-codex-responses") return false;
     if (destinationRoutedThroughProxy(ctx.model?.baseUrl)) return true;
     if (!nativeInterceptInstalled()) return false;
     if (detectProxyBase(ctx.model?.baseUrl) === undefined) return false;
     const base = ctx.model?.baseUrl ?? "";
+    if (agent === "omp" && ctx.model?.api === "openai-responses") {
+        // The HTTP Responses SDK appends /responses to the configured
+        // provider base, which need not end in /v1 (e.g. a custom relay).
+        return isModelApiUrl(base) || isModelApiUrl(`${base.replace(/\/+$/, "")}/responses`);
+    }
     const expanded = /\/v\d+\/?$/.test(base) ? `${base.replace(/\/+$/, "")}/chat/completions` : base;
     return isModelApiUrl(base) || isModelApiUrl(expanded);
 }
@@ -652,24 +642,7 @@ function stampMsgIdEnvelope(
     return { ...base, biliMsgIds: ids };
 }
 
-// Values this process stamped as prompt_cache_key. The proxy strips the field
-// before it forwards; a request that degrades to a direct send never reaches
-// the proxy, so the omp direct-send guard drops the stamp itself — only a
-// value recorded here, never a key the host set. Bounded, oldest first out.
-const STAMPED_PROMPT_CACHE_KEYS_MAX = 1024;
-const stampedPromptCacheKeys = new Set<string>();
-
-function rememberStampedPromptCacheKey(sid: string): void {
-    stampedPromptCacheKeys.delete(sid);
-    stampedPromptCacheKeys.add(sid);
-    if (stampedPromptCacheKeys.size > STAMPED_PROMPT_CACHE_KEYS_MAX) {
-        const oldest = stampedPromptCacheKeys.values().next().value;
-        if (oldest !== undefined) stampedPromptCacheKeys.delete(oldest);
-    }
-}
-
-/** The JSON body without the prompt_cache_key this process stamped, or
- *  undefined when the body carries no such stamp (unchanged, send as-is). */
+/** Strip OMP's private fields before a degraded request goes directly upstream. */
 function withoutStampedPromptCacheKey(text: string): string | undefined {
     let parsed: unknown;
     try {
@@ -678,9 +651,15 @@ function withoutStampedPromptCacheKey(text: string): string | undefined {
         return undefined;
     }
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-    const { prompt_cache_key: key, ...rest } = parsed as Record<string, unknown>;
-    if (typeof key !== "string" || !stampedPromptCacheKeys.has(key)) return undefined;
-    return JSON.stringify(rest);
+    const body = parsed as Record<string, unknown>;
+    if (!("biliOmpSessionId" in body) && !("biliOmpSyntheticPck" in body)
+        && !("biliMsgIds" in body) && !("biliLedgerSeqs" in body)) return undefined;
+    if (body.biliOmpSyntheticPck === true && body.prompt_cache_key === body.biliOmpSessionId) delete body.prompt_cache_key;
+    delete body.biliOmpSyntheticPck;
+    delete body.biliOmpSessionId;
+    delete body.biliMsgIds;
+    delete body.biliLedgerSeqs;
+    return JSON.stringify(body);
 }
 
 function fmtTok(n: number): string {
@@ -920,9 +899,8 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
             // no state is copied). Plain pi sessions never identity-register:
             // their plugin-mode binding rides the x-bili-plugin-conversation
             // header stamped per request below, so the extra register only
-            // fires when derivation is actually declared. omp ALWAYS registers
-            // (its wire carries no other conversation signal), so it reports
-            // the parent whenever the header declares one.
+            // fires when derivation is actually declared. OMP also registers
+            // its host id for tool lookup and reports any declared parent.
             const parent = agent === "pi" || agent === "omp" ? parentConversationIdOf(ctx) : undefined;
             if ((agent === "omp" || (agent === "pi" && parent !== undefined)) && sid !== "" && state.identityAt !== sid) {
                 try {
@@ -1667,8 +1645,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // claim = ACP tools registered; round 1 rides wire mode). #1531: the
         // report carries the session id as conversationId and is AWAITED
         // before the request dispatches — omp sends no x-bili-plugin header,
-        // so the proxy resolves this report by the prompt_cache_key identity
-        // stamped below, and the first request must not outrun its own
+        // so the proxy resolves this report by the host id stamped in the
+        // request body, and the first request must not outrun its own
         // report. Worst hold = native-origin wait (bounded by the bootstrap
         // readyTimeoutMs) + one POST (STATUS_TIMEOUT_MS) — well inside omp's
         // handler timeout guardrail.
@@ -1809,13 +1787,18 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: payload, msgIds: forkMsgIds });
         }
         pi.on("before_provider_request", async (event, ctx) => {
+            // Capture the host session while this provider event owns it. A
+            // session switch during the asynchronous registration must not
+            // move this already-assembled request to the next session.
+            const requestSid = sessionIdOf(ctx);
+            const requestModel = ctx.model;
             // #5403/#5418 unified watermark channel: capture THIS request's
             // host msgids per family for the ONE chokepoint emitter. Runs on
             // EVERY model request — including the OpenAI-family turns the
             // incremental divert shape-gates away (#3433). A failed resolution
             // CLEARS the previous list; a stale anchor is worse than no field.
             {
-                const pfSid = sessionIdOf(ctx);
+                const pfSid = requestSid;
                 if (pfSid !== undefined && pfSid.length > 0) {
                     const payload = (event as { payload?: unknown } | undefined)?.payload;
                     const msgs = payload === null || typeof payload !== "object" ? undefined : (payload as { messages?: unknown }).messages;
@@ -1838,11 +1821,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // #4491 omp msgids: snapshot the branch's stable entry ids BEFORE
             // any await below — the hint must be the generation of THIS
             // payload. The fetch-layer planner (omp-native) reads it back by
-            // the prompt_cache_key conversation id and carries `msgIds` only
+            // the request's host session id and carries `msgIds` only
             // when the ids align 1:1 with the actually-sent messages; any
             // mismatch degrades to no field, never a misaligned array.
             if (agent === "omp") {
-                const hintSid = sessionIdOf(ctx);
+                const hintSid = requestSid;
                 if (hintSid !== undefined && hintSid.length > 0) noteHostMsgIdHint(hintSid, ompBranchMsgIdEntries(ctx));
             }
             // omp emits this per model request (but never before_provider_headers);
@@ -1878,7 +1861,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // the window), so it rides the same awaited pre-send slot — after
             // registerTools (plugin claim) but before the payload returns.
             try {
-                await maybeAdoptForkChild(event, ctx);
+                if (agent !== "omp" || requestSid === sessionIdOf(ctx)) await maybeAdoptForkChild(event, ctx);
             } catch (err) {
                 logHostEvent("error", "[native-client]", `bili-plugin(${agent}): fork adoption failed (${err instanceof Error ? err.message : String(err)}) — starting the session fresh (#2399)`);
             }
@@ -1901,8 +1884,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // the pck stamp when it fired (base = pck-stamped payload for
             // omp, original payload for pi) and returns undefined to leave
             // the request byte-identical when the envelope can't be stamped.
-            const pck = stampPromptCacheKey(event, ctx, agent);
-            return stampMsgIdEnvelope(event, ctx, agent, pck) ?? pck;
+            if (agent !== "omp") return stampMsgIdEnvelope(event, ctx, agent, undefined);
+            const requestCtx = { model: requestModel, sessionManager: ctx.sessionManager };
+            const pck = requestSid ? stampPromptCacheKey(event, requestCtx, agent, requestSid) : undefined;
+            if (sessionIdOf(ctx) !== requestSid) return pck;
+            return stampMsgIdEnvelope(event, requestCtx, agent, pck) ?? pck;
         });
         // #3248 incremental turns: the ack channel. after_provider_response
         // fires with status + headers BEFORE the stream is consumed, so the
