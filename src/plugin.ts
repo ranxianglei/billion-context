@@ -73,7 +73,7 @@ import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
 import { billOutputUsage } from "./billing.js";
-import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
+import { promptInputTotal, declaredInclusiveFromUsage, lastIterationContext, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 import { lookupToolUseIdSession, lookupToolWitness, recordToolUseId, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
@@ -1275,6 +1275,15 @@ type ForkRequest = {
     branchPoint: { messageCount: number; orderHash: string };
     orderedMessages: ForkIdentity[];
     idempotencyKey: string;
+    // #6262 principle 1 (msgid identity track, discussion #6262): the child's
+    // host-stable ids for the claimed prefix. A host-pinned parent exposes the
+    // host ids AS its snapshot rawIds, so the gate in handlePluginFork is rawId
+    // equality — no new validation copy (identifier() below is the SAME check
+    // every rawId already passes).
+    prefixMsgIds?: string[];
+    // Where the byte-verified prefix stopped and the identity track extended it.
+    // Only rides WITH prefixMsgIds; >= messageCount normalizes to "no drift".
+    driftFrom?: number;
 };
 
 function stableJson(value: unknown): string {
@@ -1597,9 +1606,9 @@ function holdsRefs(s: Session): boolean {
     return Object.keys(s.state.messageRefs?.byRef ?? {}).length > 0;
 }
 
-/** #2601: persona-fork descendants of a raw host id — sessions minted by the
- *  persona-anchor fork branch (`${rawId}|sub:${fp}`, persona-anchor.ts) that
- *  actually carried traffic, are fresh, AND hold refs (#2948: freshness alone
+/** #2601: persona-fork descendants of a raw host id — sessions on a
+ *  `${rawId}|sub:` persona lane (the #5095 lane-token fork or the #970 split)
+ *  that actually carried traffic, are fresh, AND hold refs (#2948: freshness alone
  *  selected ref-less aux lanes — see holdsRefs). Grouping by
  *  `id.split("|sub:")[0]` is the house idiom (splitSessionWarnings, #2170
  *  canary). Sorted by lastSeen descending (listSessions order). */
@@ -1738,7 +1747,19 @@ function parseForkRequest(payload: string): ForkRequest {
         if (!identifier(item.rawId) || !(item.ref === null || (typeof item.ref === "string" && /^m\d{5,}$/.test(item.ref))) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
         return { rawId: item.rawId, ref: item.ref, identityHash: item.identityHash };
     });
-    return { protocolVersion: b.protocolVersion, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
+    // #6262 principle 1: optional msgid track. identifier() is REUSED, not copied —
+    // the same shape check every claimed rawId already passes above.
+    let prefixMsgIds: string[] | undefined;
+    if (b.prefixMsgIds !== undefined) {
+        if (!Array.isArray(b.prefixMsgIds) || b.prefixMsgIds.length !== (point.messageCount as number) || b.prefixMsgIds.some((v: unknown) => !identifier(v))) throw new Error("invalid prefixMsgIds");
+        prefixMsgIds = b.prefixMsgIds as string[];
+    }
+    let driftFrom: number | undefined;
+    if (b.driftFrom !== undefined) {
+        if (prefixMsgIds === undefined || !Number.isSafeInteger(b.driftFrom) || (b.driftFrom as number) < 0 || (b.driftFrom as number) > (point.messageCount as number)) throw new Error("invalid driftFrom");
+        driftFrom = (b.driftFrom as number) < (point.messageCount as number) ? (b.driftFrom as number) : undefined;
+    }
+    return { protocolVersion: b.protocolVersion, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey, ...(prefixMsgIds !== undefined ? { prefixMsgIds } : {}), ...(driftFrom !== undefined ? { driftFrom } : {}) };
 }
 
 /** [#2399 stage 2] omp/pi identity-register their session ids at session_start
@@ -1798,6 +1819,23 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             }
             const prefix = snapshot.orderedMessages.slice(0, request.branchPoint.messageCount);
             if (prefix.length !== request.branchPoint.messageCount || forkOrderHash(request.orderedMessages) !== request.branchPoint.orderHash || stableJson(prefix) !== stableJson(request.orderedMessages)) return forkReply(res, 409, { ok: false, code: "BRANCH_POINT_CONFLICT", error: "ordered prefix/hash does not match parent" });
+            // #6262 principle 1 (msgid identity track): the byte check above is
+            // final for the prefix AS CLAIMED (the client copies the parent's
+            // identities verbatim, including the drift region). When the client
+            // additionally claims host-stable ids for the prefix and every one
+            // equals the parent's rawId at its slot (host-pinned parents: the
+            // rawId IS the host id), the region [driftFrom, messageCount) is
+            // identity-stable byte drift — the host re-rendered those messages
+            // after the parent saw them but kept their ids. Blocks and refs are
+            // keyed by rawId, and the child's pinned ids match the parent's, so
+            // everything copied below stays valid in the child: accept and mark
+            // the receipt. Gate failure (parent not host-pinned — its rawIds are
+            // content digests, never host ids — or any id/length mismatch) → the
+            // byte-verified fork proceeds EXACTLY as before: strict, no 409.
+            let forkDriftFrom: number | undefined;
+            if (request.prefixMsgIds !== undefined && request.prefixMsgIds.length === prefix.length && request.prefixMsgIds.every((id, k) => id === prefix[k]!.rawId)) {
+                forkDriftFrom = request.driftFrom;
+            }
             const rawIds = new Set(prefix.map((m) => m.rawId));
             const child = createSession(request.childConversationId, { ...parent.meta, label: request.childConversationId });
             const crossing = parent.state.blocks.filter((b) => b.effectiveMessageIds.some((id) => rawIds.has(id)) && !b.effectiveMessageIds.every((id) => rawIds.has(id)));
@@ -1919,7 +1957,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
                 (child.transient ??= {}).latestKnownMsgId = parent.transient.latestKnownMsgId;
                 child.transient.needlePayloadUpper = parent.transient.needlePayloadUpper;
             }
-            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
+            const response = { ok: true, status: forkDriftFrom !== undefined ? (crossing.length > 0 ? "expanded+drifted" : "drifted") : crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, ...(forkDriftFrom !== undefined ? { driftFrom: forkDriftFrom } : {}), expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             await publishForkSession(child, parent.id);
             recordPluginSession(request.childConversationId, child.id);
@@ -2622,7 +2660,9 @@ export async function handlePluginTool(
 // part of the context size, but NOT a cache hit (#790).
 // declaredInclusive = #4128 upstream self-declaration (billing_usage.semantic)
 // that input_tokens already INCLUDES cache_read — set only on the anthropic lane.
-export type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number; declaredInclusive?: boolean };
+// contextTokens = the context an advisor reply's last executor call read (its
+// top-level usage sums several calls; see lastIterationContext).
+export type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number; declaredInclusive?: boolean; contextTokens?: number };
 
 function num(v: unknown): number | undefined {
     return typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -2685,6 +2725,8 @@ export function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | u
         if (creation !== undefined && creation > 0) sample.creationTokens = creation;
         const output = num(usage["output_tokens"]);
         if (output !== undefined) sample.outputTokens = output;
+        const context = lastIterationContext(usage);
+        if (context !== undefined) sample.contextTokens = context;
         // #4128: honour a billing_usage stamp carried on the delta frame too.
         const declared = declaredInclusiveFromUsage(usage);
         if (declared !== undefined) sample.declaredInclusive = declared;
@@ -2742,8 +2784,8 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const hit = reportedCached === null ? undefined : Math.round((100 * reportedCached) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
-        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
-        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, creation: typeof sample.creationTokens === "number" ? sample.creationTokens : undefined });
+        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${sample.contextTokens !== undefined ? ` context=${sample.contextTokens}` : ""}${foldNew ? " fold=new" : ""}`);
+        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, creation: typeof sample.creationTokens === "number" ? sample.creationTokens : undefined, context: sample.contextTokens });
     }
     if (sample.outputTokens !== undefined) {
         session.stats.outputTokens += sample.outputTokens;
@@ -2774,6 +2816,7 @@ export function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.creationTokens !== undefined) acc.creationTokens = sample.creationTokens;
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
     if (sample.declaredInclusive !== undefined) acc.declaredInclusive = sample.declaredInclusive;
+    if (sample.contextTokens !== undefined) acc.contextTokens = sample.contextTokens;
 }
 
 /** Terminal reasons after which the model genuinely finished its turn. A
@@ -2878,10 +2921,22 @@ export async function pipePluginChatWithStrip(
     // every count taken from bili.log.
     const who = session ? `[${session.id}] ` : "";
     const onTagDrop = (snippet: string, duringDrain?: boolean) => {
-        droppedTagInFrame = true;
         sawStrippedEcho = true;
         const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
         loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
+    // #6034 (option E): the answer ledger's markup flag is VERDICT-driven,
+    // not "any drop arms it". A complete refs-only echo unit dies whole — it
+    // leaves no interior behind, so the answer text around it must count as
+    // the answer; arming on every drop miscounted a 108-char real answer as
+    // markup after such an echo and killed a healthy turn twice (the sample
+    // in #6034). Only a session-start open (verdict pending until the span
+    // resolves) and a close that releases its prose body leave interior.
+    // Last-write-wins is safe: the filter delivers verdicts in release order
+    // within a frame (a unit's drop precedes its interior's resolution), and
+    // the frame's released text is counted only after push() returns.
+    const onTagDropVerdict = (leavesInterior: boolean) => {
+        droppedTagInFrame = leavesInterior;
     };
     // #2190: the filter released bytes that still carry echo-residue shape —
     // the leak is now observable instead of silent. Log-only; the bytes were
@@ -2924,7 +2979,7 @@ export async function pipePluginChatWithStrip(
             const signedThinking = field === "thinking" || (protocol === "openai" && (field === "reasoning_content" || field === "reasoning"));
             // #5259: outermost = acts on final outgoing bytes; a bare-ref head
             // is decided once per (field,index) stream and then disarmed.
-            s = { filter: signedThinking ? createIdentityStreamFilter() : composeStreamFilters(composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), createBareRefHeadFilter(onBareRefDrop)), field, index };
+            s = { filter: signedThinking ? createIdentityStreamFilter() : composeStreamFilters(composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText, onTagDropVerdict), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), createBareRefHeadFilter(onBareRefDrop)), field, index };
             streams.set(key, s);
         }
         return s;
@@ -2972,8 +3027,12 @@ export async function pipePluginChatWithStrip(
      *  unclosed-tag case): markup the filter declined to swallow. A turn whose
      *  only visible output is this is as dead to the host as an empty one. */
     let releasedMarkupChars = 0;
-    /** Set while a frame is being rewritten because a render tag was dropped:
-     *  the text that survives such a frame is the tag's own interior. */
+    /** VERDICT-driven (onTagDropVerdict, #6034 option E): true while the
+     *  filter has just dropped an artifact whose interior the stream still
+     *  releases — the text surviving such a frame is the tag's own interior
+     *  (markup), so the answer ledger must not count it as the answer. A
+     *  whole-dead unit (complete refs-only echo) or a content release keeps
+     *  it false and the released text stays answer. */
     let droppedTagInFrame = false;
     let finalFinishReason: string | undefined;
     // #2328 Q2/Q4: termination diagnostics — every truncation emit below

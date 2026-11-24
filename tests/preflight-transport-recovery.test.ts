@@ -256,3 +256,104 @@ test("preflight marks TLS trust failures client-retryable without in-loop retry 
         globalThis.fetch = originalFetch;
     }
 });
+
+test("preflight retries tightened first-byte timeouts (UPSTREAM_FIRST_BYTE_TIMEOUT) in-loop", async () => {
+    const prevFirstByte = process.env.BILI_UPSTREAM_FIRST_BYTE_MS;
+    const prevMax = process.env.BILI_REPLAY_RETRY_MAX;
+    process.env.BILI_UPSTREAM_FIRST_BYTE_MS = "150";
+    process.env.BILI_REPLAY_RETRY_MAX = "3";
+    try {
+        await withUpstream((res, attempt) => {
+            if (attempt === 1) {
+                res.socket?.pause();
+                return;
+            }
+            success(res);
+        }, async (url, attempts) => {
+            const f = fixture(url);
+            const result = await preflightCompress(f.deps, f.messages);
+            assert.equal(result.fitsWindow, true, result.failure?.detail);
+            assert.equal(attempts(), 3);
+            assert.equal(result.compressedRanges, 1);
+            assert.match(f.logs.join("\n"), /UPSTREAM_FIRST_BYTE_TIMEOUT/);
+            assert.match(f.logs.join("\n"), /retrying/);
+        });
+    } finally {
+        if (prevFirstByte === undefined) delete process.env.BILI_UPSTREAM_FIRST_BYTE_MS;
+        else process.env.BILI_UPSTREAM_FIRST_BYTE_MS = prevFirstByte;
+        if (prevMax === undefined) delete process.env.BILI_REPLAY_RETRY_MAX;
+        else process.env.BILI_REPLAY_RETRY_MAX = prevMax;
+    }
+});
+
+test("preflight non-streaming summary learns SSE on tightened first-byte timeout instead of burning retries", async () => {
+    const prevFirstByte = process.env.BILI_UPSTREAM_FIRST_BYTE_MS;
+    const prevMax = process.env.BILI_REPLAY_RETRY_MAX;
+    process.env.BILI_UPSTREAM_FIRST_BYTE_MS = "150";
+    process.env.BILI_REPLAY_RETRY_MAX = "3";
+    let nonStreamHits = 0;
+    let streamHits = 0;
+    const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { stream?: boolean };
+            if (parsed.stream === true) {
+                streamHits += 1;
+                success(res);
+                return;
+            }
+            nonStreamHits += 1;
+            res.socket?.pause();
+        });
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    try {
+        const f = fixture(`http://127.0.0.1:${address.port}/responses`);
+        delete f.session.metadata.preflightStreamSummary;
+        const result = await preflightCompress(f.deps, f.messages);
+        assert.equal(result.fitsWindow, true, result.failure?.detail);
+        assert.equal(nonStreamHits, 1, "surfaces immediately after 1 non-streaming first-byte timeout");
+        assert.ok(streamHits >= 1, "falls back to SSE immediately");
+        assert.equal(f.session.metadata.preflightStreamSummary, true, "learns SSE for the session");
+    } finally {
+        if (prevFirstByte === undefined) delete process.env.BILI_UPSTREAM_FIRST_BYTE_MS;
+        else process.env.BILI_UPSTREAM_FIRST_BYTE_MS = prevFirstByte;
+        if (prevMax === undefined) delete process.env.BILI_REPLAY_RETRY_MAX;
+        else process.env.BILI_REPLAY_RETRY_MAX = prevMax;
+        const closed = once(server, "close");
+        server.close();
+        server.closeIdleConnections?.();
+        server.closeAllConnections();
+        await closed;
+    }
+});
+
+test("preflight exhausted first-byte timeouts remain client-retryable", async () => {
+    const prevFirstByte = process.env.BILI_UPSTREAM_FIRST_BYTE_MS;
+    const prevMax = process.env.BILI_REPLAY_RETRY_MAX;
+    process.env.BILI_UPSTREAM_FIRST_BYTE_MS = "120";
+    process.env.BILI_REPLAY_RETRY_MAX = "2";
+    try {
+        await withUpstream((res) => {
+            res.socket?.pause();
+        }, async (url, attempts) => {
+            const f = fixture(url);
+            const result = await preflightCompress(f.deps, f.messages);
+            assert.equal(attempts(), 2);
+            assert.equal(result.fitsWindow, false);
+            assert.equal(result.failure?.kind, "upstream");
+            assert.equal(result.failure?.retryable, true);
+            assert.match(result.failure?.detail ?? "", /UPSTREAM_FIRST_BYTE_TIMEOUT/);
+            assert.equal(f.session.state.blocks.length, 0);
+        });
+    } finally {
+        if (prevFirstByte === undefined) delete process.env.BILI_UPSTREAM_FIRST_BYTE_MS;
+        else process.env.BILI_UPSTREAM_FIRST_BYTE_MS = prevFirstByte;
+        if (prevMax === undefined) delete process.env.BILI_REPLAY_RETRY_MAX;
+        else process.env.BILI_REPLAY_RETRY_MAX = prevMax;
+    }
+});

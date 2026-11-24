@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, healAnthropicSystemPositions, insertBeforeTrailingSystemRun, type AnthropicRequestBody } from "acp-kernel/wire";
 import { dedupeAdjacentOutputConfig } from "../dedupe-adjacent-output-config.js";
-import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
+import { appendSystemText, declaredInclusiveFromUsage, lastIterationContext } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBareRefHeadFilter, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
@@ -134,6 +134,7 @@ function buildTextDeltaEvent(index: number, text: string): Buffer {
 export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[], errorShape: "protocol" | "completion" = "protocol", cacheMarks?: Map<string, { type: "ephemeral" }>, clientCacheControls?: Map<string, unknown>, absorbArmed?: boolean): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
+    let stopSequence: string | null = null;
     // #2701: anthropic Threads. Every internal round's message_start carries a
     // NEW upstream response id; a threads-continue turn's re-requests must
     // continue from the LATEST one, and the final terminal frame must report
@@ -253,7 +254,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         if (model) extra.model = model;
         return Buffer.from(
             `event: message_delta\n` +
-            `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage, ...extras, ...extra })}\n\n` +
+            `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: stopReason === "stop_sequence" ? stopSequence : null }, usage, ...extras, ...extra })}\n\n` +
             `event: message_stop\n` +
             `data: ${JSON.stringify({ type: "message_stop" })}\n\n`,
             "utf8",
@@ -287,10 +288,13 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         },
 
         async *parseStream(upstream, round, opts) {
+            // A new round or retry must not reuse an earlier attempt's match.
+            stopSequence = null;
             const pending = new Map<number, ToolUseBuffer>();
             let roundInput: number | undefined;
             let roundCached: number | undefined;
             let roundCreation: number | undefined;
+            let roundContext: number | undefined;
             // #4072: verbatim cache_creation breakdown for THIS round's frames —
             // like the numerics above, the final round's value is what the
             // synthetic terminal carries (stitched turns take the post-fold
@@ -617,9 +621,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             signature: delta.signature,
                             raw: remapIndexInEvent(eventStr, ci),
                         } as ParsedStreamEvent;
-                    } else if (round === 1) {
+                    } else if (round === 1 || indexMap.has(upstreamIndex)) {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: round === 1 } as ParsedStreamEvent;
                     }
                 } else if (type === "content_block_stop") {
                     const upstreamIndex = (data.index as number) ?? 0;
@@ -693,6 +697,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     // #4128: honour a billing_usage stamp carried on the delta frame.
                     const declared = declaredInclusiveFromUsage(u);
                     if (declared !== undefined) roundDeclaredInclusive = declared;
+                    roundContext = lastIterationContext(u);
                     if (input !== undefined && input > 0 && cached !== undefined) {
                         // Complete authoritative usage object — e.g. the synthetic
                         // terminal of a stitched multi-round stream (round1
@@ -728,6 +733,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     }
                     const d = (data.delta ?? {}) as Record<string, unknown>;
                     if (typeof d.stop_reason === "string") stopReason = d.stop_reason;
+                    if (typeof d.stop_sequence === "string" || d.stop_sequence === null) stopSequence = d.stop_sequence;
                     const deltaExtras = terminalExtrasOf(data, MESSAGE_DELTA_KNOWN_KEYS);
                     if (!usageYielded) {
                         usageYielded = true;
@@ -739,6 +745,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             creationTokens: roundCreation,
                             declaredInclusive: roundDeclaredInclusive,
                             cacheCreation: roundCacheCreation,
+                            contextTokens: roundContext,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
@@ -764,6 +771,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             creationTokens: roundCreation,
                             declaredInclusive: roundDeclaredInclusive,
                             cacheCreation: roundCacheCreation,
+                            contextTokens: roundContext,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);

@@ -237,6 +237,19 @@ async function* iterGoogleChunks(stream: ReadableStream<Uint8Array>): AsyncGener
                     }
                 }
             }
+            // Keep only the unfinished element across reads. Retaining completed
+            // prefixes can repeatedly copy the history during concatenation/indexing.
+            if (arrayDone) {
+                buf = "";
+                cursor = 0;
+            } else {
+                const consumed = started ? elementStart : cursor;
+                if (consumed > 0) {
+                    buf = buf.slice(consumed);
+                    cursor -= consumed;
+                    if (started) elementStart = 0;
+                }
+            }
         }
         if (mode === "sse") {
             for (const raw of framer.finish()) {

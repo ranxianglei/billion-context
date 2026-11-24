@@ -372,9 +372,40 @@ function armIdleBody(body: ReadableStream<Uint8Array>, rearm: () => void): Reada
     });
 }
 
+const REPLAY_ERROR_BODY_BYTES = 1 << 20;
+
+async function readReplayErrorBody(response: Response): Promise<string> {
+    const reader = response.body?.getReader();
+    if (!reader) return "";
+    const decoder = new TextDecoder();
+    const parts: string[] = [];
+    let kept = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) {
+                parts.push(decoder.decode());
+                return parts.join("");
+            }
+            const take = Math.min(value.byteLength, REPLAY_ERROR_BODY_BYTES - kept);
+            parts.push(decoder.decode(value.subarray(0, take), { stream: true }));
+            kept += take;
+            if (take < value.byteLength) {
+                // Cancellation can await a tee sibling that never consumes its body.
+                void reader.cancel().catch(() => undefined);
+                // Do not flush an incomplete UTF-8 code point cut by the byte budget.
+                return `[upstream error body truncated after ${REPLAY_ERROR_BODY_BYTES} bytes]\n${parts.join("")}`;
+            }
+        }
+    } finally {
+        reader.releaseLock();
+    }
+}
+
 /** Upstream HTTP failure after all retry attempts are exhausted (or a
  *  non-transient error that fails fast). `attempts` is the number of requests
- *  actually made; `body` is the upstream error body (already read). */
+ *  actually made; `body` is the decoded error body, or a marked prefix when
+ *  a replay error exceeds its byte budget. */
 export class UpstreamHttpError extends Error {
     readonly status: number;
     readonly body: string;
@@ -564,7 +595,7 @@ export async function fetchWithRetry(
         if (result.response.ok) return result;
         let errText: string;
         try {
-            errText = await result.response.text();
+            errText = await readReplayErrorBody(result.response);
         } finally {
             result.clearTimer();
         }
