@@ -226,7 +226,7 @@ const TRUNC_REF_CLOSE = new RegExp("m\\d{4,}\\s*\\x3c\\/([a-zA-Z]{0,32})$");
 // close terminates — those belong to the existing close rules. The
 // [\w>] lookbehind mirrors ORPHAN_REF_CLOSE: word-adjacent runs (xm01233) and
 // runs right after a tag terminator (\x3e, #644) are not this unit.
-const DEAD_REF_CLOSE = new RegExp("(?<![\\w>])m\\d{4,}\\s*\\x3c\\/[a-zA-Z]{0,32}(?![a-zA-Z])(?![^\\x3c\\x3e]{0,32}\\x3e)", "g");
+const DEAD_REF_CLOSE = new RegExp("(?<![\\w>])" + REFS_RUN + "\\s*\\x3c\\/[a-zA-Z]{0,32}(?![a-zA-Z])(?![^\\x3c\\x3e]{0,32}\\x3e)", "g");
 // The wrapped-turn imitation: the model opens a render tag and writes its
 // payload where the attributes are still open, so the attribute list runs into
 // a `<` instead of ending at its `>`. The recorded shape (architect session
