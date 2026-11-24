@@ -309,6 +309,7 @@
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
+| `compress.protectedUserPatterns` | string[] | none | — | 用户文本消息的字面子串：命中即永不折叠，即使它不是最后一条 user 消息。用于长会话里 host 标记的当前任务 prompt。 |
 | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。 |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
@@ -320,6 +321,7 @@
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
 | `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
 | `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。 |
+| `compress.degenerateRetry` | object | 1 attempt (built-in nudge) | — | 零可见输出回合（退化终端回合）的重试预算与 nudge 句配置。续接 nudge 只附在重试请求体上——不写入会话状态，客户端下一轮不重放。 |
 | `compress.blockOps` | object | off | — | 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，关闭时线上字节与 #5765 之前完全一致。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
 | `compress.search` | object | off | — | search_context 的检索行为设置；当前含 planAware 重排。 |
@@ -336,6 +338,8 @@
 | `compress.absorb.excludeTools` | string[] | [] | — | 排除出吸收范围的工具名。 |
 | `compress.absorb.toolName` | string | "absorb" | — | absorb 工具的注册名。 |
 | `compress.absorb.mediaOnly` | boolean | true | — | 仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。 |
+| `compress.degenerateRetry.maxAttempts` | integer | 1 | — | 空回合重试预算（#7666）：回合以客户端零可见输出收尾时，把 agent 自己的原请求追加一条尾部 user nudge 后重发。0=关（空回合直接放行），1=一次（#7666 前的默认行为），上限 5；第 i 次发 nudges[i]（短了循环）。与断流重发（#2171）预算独立——同一回合各可花一次。 |
+| `compress.degenerateRetry.nudges` | string[] | 3 built-in | — | 自定义空回合重试 nudge 句（#7666）；第 i 次重试发第 i 句（短了循环）。不填 = 内置轮换，首句即默认续接 nudge。 |
 | `compress.blockOps.enabled` | boolean | false | — | 启用三个压缩块生命周期工具（注入 + prompt + manifest）。关闭 = 无工具、无 prompt 段、零每请求开销。 |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | 启用内容缓存与回取块。 |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | 可进入 CCR 存储的工具结果的最小估算 token 大小。 |
@@ -1567,6 +1571,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   - **累积快照** —— 每条新结果取代旧结果（客户端的 todo/任务清单）：用 `protectedLatestTools`。对这类工具保护**全部**实例会让其历史无限膨胀 —— 正是 #639 通过只保护最新一条来规避的故障。
   - 经验法则：低频高价值工具 → `protectedTools`；高频刷屏工具 → 绝不做全历史保护（上下文无界增长）；累积快照型工具 → `protectedLatestTools`。
 
+#### `protectedUserPatterns`
+
+- **类型：** `string[]`（字面文本子串，如 `["【本轮消息】"]`）
+- **默认值：** `[]`（无 —— 按 host 自行开启）
+- **状态：** ACTIVE
+- **说明：** 用户角色文本消息只要包含列表中的任一**字面子串**就永不被压缩（映射到内核 `Config.isMessageProtected`）。为长生命周期 agent 会话而设：当前任务 prompt 往往**不是最后一条 user 消息**（后面还有 tool-result / 图片 user 消息），内核的 last-user 保护覆盖不到它；一旦它被折叠，wire 上可能只剩更早的旧 user 消息，模型会误把旧任务当成当前任务继续执行。host 用稳定标记（例如 `【本轮消息】`）标识当前任务并在这里登记。匹配为字面子串（不是 glob）；只检查 user 角色的文本消息；空数组会被拒绝；跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedUserPatterns": ["【本轮消息】"] } }`。
+
 #### `neverPreserveRecentTools`
 
 - **类型：** `string[]`（工具名模式）
@@ -1639,6 +1650,19 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   - `excludeTools: string[]` — 永不吸收的工具名模式。**已知限制：对工具*结果*目前无效，直到 [ranxianglei/acp-kernel#213](https://github.com/ranxianglei/acp-kernel/issues/213) 修复发布**（wire 投影不把 `toolName` 携带在结果上，内核名称守卫无法命中）。
   - `toolName: string` — 重命名注入工具（默认 `"absorb"`）；声明/注入的模式、系统提示段与按会话裁决在两条车道中都跟随该名称。**车道治理（#1359）：** 插件模式用**基础**配置治理整个 `absorb` 块，因此重命名后的工具既以该名声明、也以该名执行（二者永不背离）；provider/model 层的 `absorb.*` 覆盖**仅限代理车道**（代理注入并裁决合并后的名称）。加载时会输出一条警告，列出任何取值与基础值不同的 provider/model `absorb.*` 字段。
   注入跟随线上原生工具面：代理模式在 anthropic/openai/responses 原生工具线上注入工具（按每请求解析的名称）+ 系统提示段，插件模式在插件清单中广告它（MCP shell 自动拾取）。Responses **marker/文本协议**路由不支持（无原生工具面 — 强制的 absorb 指令不可满足），标题生成请求（`max_tokens ≤ 200`）跳过注入如压缩提示一样。吸收配对在重启后保持隐藏（在会话状态持久化）。
+
+#### `degenerateRetry`
+
+- **类型：** `object`（`{ maxAttempts?, nudges? }`）——子字段按最深优先合并（全局 → provider → model）
+- **默认值：** 未设置 = `{ maxAttempts: 1 }` + 内置 nudge 轮换（即 #7666 前行为）
+- **状态：** ACTIVE
+
+**说明：** 空回合（degenerate terminal turn）的重试预算——以“客户端收不到任何可见内容”收尾的回合（tag-echo 剥光、压缩草稿收尾、空承诺收尾）。每次重试 = agent 自己的原始转发体 + 尾部追加一条 user nudge（`src/degenerate-retry.ts`）；改动不碰会话状态，nudge 是瞬时的——客户端下一轮请求与本来完全一致。子字段：
+
+- `maxAttempts`（integer 0–5，默认 1）——单个回合可花几次 nudge 重试。0 = 完全禁用（空回合直接放行）。预算耗尽：chat 车道向客户端发 #870 in-band 错误（"…after the continuation nudge" / "…after N continuation nudges"），responses 车道放行空回合。
+- `nudges`（string[]，1–8，默认内置 3 句）——第 i 次重试发第 i 句（短了循环）。内置轮换首句 = 默认续接 nudge（"Your previous response ended without a tool call. Continue now: …"）。
+
+与断流重发（#2171）独立，后者保留自己的一次性预算。失败家族与本地 7 天数据（85 次空回合 arm、单次重试救回 93%）见 #7666 / #6034。
 
 #### `blockOps`
 

@@ -41,9 +41,8 @@ test("recording is content-table-free: rows carry bytes, content stays empty, re
         const sid = "sess-egress-selfcontained";
 
         const ops: EgressOpLogStore = {
-            egressStateAppendOps: (s, o, nowMs) => store.egressStateAppendOps(s, o, nowMs),
+            egressAppendTurn: (s, o, baseSeq, nowMs) => store.egressAppendTurn(s, o, baseSeq, nowMs),
             egressStateView: (s) => store.egressStateView(s),
-            egressStateCompactView: (s, v, nowMs) => store.egressStateCompactView(s, v, nowMs),
             egressStateViewAt: (s, x) => store.egressStateViewAt(s, x),
             egressStateMaxSeq: (s) => store.egressStateMaxSeq(s),
             egressStateTruncateAfter: (s, x) => store.egressStateTruncateAfter(s, x),

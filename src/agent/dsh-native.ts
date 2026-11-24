@@ -55,7 +55,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { logHostEvent } from "./host-log.js";
 import * as pfChannel from "./pf-channel.js";
-import { DSH_BUILD_CHECK, emitNewerClientBuildNote, walkUpNodeModuleVersion } from "./client-build-note.js";
+import { DSH_BUILD_CHECK, emitNewerClientBuildNote, isDshGoHost, walkUpNodeModuleVersion } from "./client-build-note.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } from "../launcher.js";
 import { isVersionNewer } from "../update.js";
 import { VERSION } from "../version.js";
@@ -69,7 +69,7 @@ import { bodyOverWindowDetail as sharedBodyOverWindowDetail, getDeclaredModelEnd
 import { matchModelEndpoint, loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { runOutsideFetchChain } from "./fetch-chain/index.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyManifestVersion, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { detectWireFormat } from "acp-kernel/wire";
 import { coreAlignEnvelopeIds, laneMsgIdsForOpenAiWire, laneMsgIdsForResponsesWire, laneMsgIdsForWire } from "./pi-msgids.js";
@@ -286,6 +286,7 @@ let nonWebTraceLogged = false;
 // Unverified dsh client build note (#warn): once-per-process, same channel
 // discipline.
 let dshNewerBuildNoted = false; // #4545, once per process
+let dshGoHostNoted = false; // #6588, once per process
 let regAdoptLogged = false;
 
 // #4545 newer-than-tested dsh client-build note (soft, never gates). Shared
@@ -781,9 +782,13 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
     // path (e.g. an admin-gated port) that never exposes the plugin manifest.
     const explicitAttachOrigin = nativeAttachOrigin(process.env);
     const home = explicitAttachOrigin ?? state.routedOrigin ?? attachOrigin;
-    const version = await fetchProxyVersion(home).catch(() => undefined);
+    // #6899: compare the CLEAN manifest version — fetchProxyVersion's display
+    // string appends ` (commit)`, which parseSemVer rejects, so comparing it
+    // always reads "not newer" and the rotation below never fires.
+    const manifest = await fetchProxyManifestVersion(home).catch(() => undefined);
     if (gen !== originGen) return undefined;
-    if (version !== undefined) {
+    if (manifest !== undefined) {
+        const version = manifest.version;
         // #3544: healthy is NOT sufficient — a STRICTLY OLDER build is never
         // replaced by waiting (its fingerprint differs, so no bring-up can
         // attach or reuse it either, and the detached process outlives every
@@ -801,7 +806,8 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
             register.base = home;
             return home;
         }
-        persistClientEvent(`attach target ${home} runs v${version} (ours v${VERSION}) — requesting its graceful shutdown before spawning the current build`);
+        const display = manifest.commit !== undefined ? `${version} (${manifest.commit})` : version;
+        persistClientEvent(`attach target ${home} runs v${display} (ours v${VERSION}) — requesting its graceful shutdown before spawning the current build`);
         const rotated = await rotatePinnedStaleProxy(home);
         if (gen !== originGen) return undefined;
         if (!rotated) {
@@ -3092,6 +3098,23 @@ export async function apply(ctx: PluginContext): Promise<void> {
             if (emitNewerClientBuildNote(DSH_BUILD_CHECK, found)) dshNewerBuildNoted = true;
         } catch {
             // resolver is fail-open: layout surprises stay silent
+        }
+    }
+
+    // DSH Go host posture (#6588): that host ships its own dsh runtime inside a
+    // proot rootfs and its client is native, so this bundle's web client face
+    // (dsh.client.platform: web — the Context tab and the settings page) has no
+    // surface to render into while the host-side lane is unaffected. One probe,
+    // never a gate; the durable record is the readable one there (the host
+    // exposes at most its last engine log lines elsewhere).
+    if (!dshGoHostNoted) {
+        try {
+            if (isDshGoHost()) {
+                logHostEvent("info", "[dsh-client]", "bili-native-dsh: DSH Go host (third-party Android app) — the plugin's web client face (Context tab, settings page) has no surface in its native client; the host-side lane is unaffected (#6588)");
+                dshGoHostNoted = true;
+            }
+        } catch {
+            // posture probe is fail-open: an odd env stays silent
         }
     }
 

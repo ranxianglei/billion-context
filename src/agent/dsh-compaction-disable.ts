@@ -307,6 +307,17 @@ export type CompactionDisableHost = {
 };
 type MiddlewareSelf = { entry?: { options?: { name?: unknown } } | undefined };
 
+/** Entry option name carried by the fiber that owns a config resolution.
+ *  The host dispatches `internal/config` as `waterfall('internal/config',
+ *  fiber, next)` — the first argument is the event NAME, so cordis binds no
+ *  `this` (vendor/cordis/src/events.ts:163 → thisArg null) and the listener
+ *  receives `(fiber, next)`. Reading `this` therefore always yields
+ *  undefined; the name lives on the first argument. */
+export function entryNameOf(fiber: unknown): string | undefined {
+    const name = (fiber as MiddlewareSelf | undefined)?.entry?.options?.name;
+    return typeof name === "string" && name.length > 0 ? name : undefined;
+}
+
 /** Register the load-time overlay + publish the gate. Runs from the always-on
  *  gate entry's apply() (dsh-compaction-gate.ts, #3662) — NOT from bili-native,
  *  whose disable/kill-switch must not take the service with it. The provide
@@ -318,7 +329,7 @@ type MiddlewareSelf = { entry?: { options?: { name?: unknown } } | undefined };
 export function registerCompactionDisable(ctx: CompactionDisableHost): void {
     if (typeof ctx.on === "function") {
         // Preset entries must carry the gate: sibling imports may finish out of order.
-        ctx.on("internal/config", function (this: MiddlewareSelf, _raw: unknown, next: () => unknown): unknown {
+        ctx.on("internal/config", function (fiber: unknown, next: () => unknown): unknown {
             const resolved = next();
             // #3662: honor the process verdict — without an active declaration
             // from bili-native every row passes through stock.
@@ -330,7 +341,7 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             // their resolved config object identity.
             const config = (resolved ?? {}) as { plugins?: unknown };
             if (!Array.isArray(config.plugins)) return resolved;
-            const rawName = this?.entry?.options?.name;
+            const rawName = entryNameOf(fiber);
             const entryName = typeof rawName === "string" ? rawName : "unnamed-entry";
             const compactionRows = countCompactionRows(config.plugins);
             if (compactionRows === 0) {
@@ -364,4 +375,37 @@ export function detectCompactionOverlayGap(ctx: CompactionDisableHost): Compacti
     if (typeof ctx.on !== "function") return "no-config-hook";
     if (typeof ctx.reflect?.provide !== "function") return "no-service-provide";
     return null;
+}
+type HostPlaneEntry = {
+    options?: { id?: unknown; name?: unknown; disabled?: unknown; config?: unknown } | undefined;
+};
+
+/** Rows whose `auto:false` the bundle patch no longer owns in the COMPOSED
+ *  tree: a dsh patch replaces a row's whole `config`, and `compaction-basic`
+ *  defaults `auto` to true, so any later layer that restates this row (a hand
+ *  written profile patch, a later bundle, a partial #2474 snapshot) silently
+ *  re-arms native auto-compaction. Disabled rows are stock web-profile
+ *  behaviour and are not reported. Returns the offending entry ids so the
+ *  caller can alarm; empty = the declaration survived. */
+export function hostPlaneRowsMissingAutoFalse(entries: Iterable<unknown>): string[] {
+    const lost: string[] = [];
+    for (const raw of entries) {
+        if (raw === null || typeof raw !== "object") continue;
+        const options = (raw as HostPlaneEntry).options;
+        if (options === undefined || options.name !== DSH_COMPACTION_BASIC_PACKAGE) continue;
+        if (options.disabled === true) continue;
+        const config = options.config;
+        const auto = config !== null && typeof config === "object" && !Array.isArray(config)
+            ? (config as { auto?: unknown }).auto
+            : undefined;
+        if (auto === false) continue;
+        lost.push(typeof options.id === "string" && options.id.length > 0 ? options.id : DSH_COMPACTION_BASIC_PACKAGE);
+    }
+    return lost;
+}
+
+/** One-line alarm for the rows hostPlaneRowsMissingAutoFalse reported. */
+export function hostPlaneOverrideLostWarning(entryIds: readonly string[]): string {
+    const rows = entryIds.map((id) => JSON.stringify(id)).join(", ");
+    return `bili: the host-plane compaction-basic override is GONE (entry ${rows}): a later patch layer replaced that row's whole config, so "auto" fell back to its default true and dsh native auto-compaction is ARMED again. Restate "auto: false" in the LAST patch row that touches id compaction-basic, or remove that override (a landed checkpoint destroys the fold base).`;
 }

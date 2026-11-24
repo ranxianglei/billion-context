@@ -2,6 +2,8 @@
 
 > Scope: `2026-11-15_msgid-snapshot-unified` @ `39941c816` (base `origin/master` `b10c1a0d4`).
 > 134 files, +13740/−367. This is the **review-grade** full walkthrough of this PR: four parts (table structure / implementation logic / data flow / switches) plus measured validation and this round's findings and fixes. All line numbers refer to source at head.
+>
+> **Retirement note (post-merge, read before relying on the table list):** as of the #7439 series end-state, `l1_world` is a **degraded placeholder** (R3 latch carrier moved to `sessions.r3_latched_at`; egress-on stage-0 is stateless — #7617), `conversations` is retired for egress-on, and the `fold_journal`/`egress_snapshot` tables were dropped before merge. The current tables — including the `egress_flow`/`egress_state` op log and the `egress_block_flow`/`egress_block_state` dual-clock block log — are documented in [architecture/storage.md](./architecture/storage.md) and the one-stop [egress-plane.md](./egress-plane.md); the retirement register is [deprecations.md](./deprecations.md).
 
 ---
 
@@ -25,7 +27,7 @@ It turns the two O(full) paths — "recompute the outbound view from scratch eve
 
 - `STORAGE_SCHEMA_VERSION = 12` (schema.ts:105; this PR bumps it from 11).
 - v12 is **probe-first** (checks for table existence instead of gating on the version number): sibling branch #5855 had already landed the pf-plane tables into shared databases as "v12/v13" (field case 2026-11-08: user_version 13, pf tables present, l1_world absent), and a version gate would skip those databases.
-- All new tables are **additive**: an old build opening a new file ignores the extra tables; a new build opening an old file probes and adds what is missing.
+- All new tables are **additive**: an old build opening a new file ignores the extra tables; a new build opening an old file probes and adds what is missing. The tables survive, the row does not come back unchanged — see §7.1 for what an older build does to a session it opens.
 - Per-database pragma at open (auto_vacuum=INCREMENTAL must be first): `journal_mode=WAL, synchronous=NORMAL, busy_timeout=5000, foreign_keys=ON, journal_size_limit=8MiB`.
 
 ### 1.2 The 8 tables added by this PR (all DDL in schema.ts)
@@ -115,7 +117,7 @@ PRIMARY KEY (session_id, log_seq)
 ```
 
 - `egress_state` = serving reads + compaction physically trims below the watermark;
-- `egress_flow` = append-only, **never deleted** (any historical log_seq can be rebuilt; rollback is based on this table, not on client resends).
+- `egress_flow` = append-only, **never deleted** (any historical log_seq can be rebuilt; rollback is based on this table, not on client resends). Changed in #7574 (§7.3): a compaction now trims this table too — it keeps the newest base row plus everything after it.
 
 Row payload contracts (egress-state.ts):
 - `I`: `{"after": msgid|null, "ref", "tokens", "type", "content_hash", "role"?, "cas_ref"?}`
@@ -162,7 +164,7 @@ Ported: `orphan_blocks`, `state_fields`, `ccr_entries.orig_hash` (+ index, probe
 
 - `diffEgressView` (153-204): the spine = the longest subsequence of `next`'s msgids that appears **in ascending order** in `prev` (two-pointer scan); a spine row whose contentHash changed ⇒ `U`; a prev row off the spine ⇒ emit the maximal contiguous `D` span in prev order; a next row off the spine ⇒ emit `I`s in next order (anchor = previous row); **a move = D+I, there is no M op**; op order D→U→I; invariant `replay(prev, diff(prev,next)) === next`.
 - `nextLogSeq` is taken from **flow** (state is physically trimmed by compaction; flow is the superset).
-- `egressStateAt(db, sid, x)` (264-274): replay flow up to `log_seq <= x` = rebuild at any historical point (rollback).
+- `egressStateAt(db, sid, x)` (264-274): replay flow up to `log_seq <= x` = rebuild at any historical point (rollback). Since #7574 (§7.3): any point from the newest base row on.
 - `egressStateCompact` (278-292): the replay result is written as one `B` row (both tables) + physical delete of state rows below the watermark (flow untouched).
 - Any anchor/endpoint/duplicate/malformed violation ⇒ throws `EgressStateCorruptError` (36-42) ⇒ the caller **degrades the whole session to legacy**, never a fuzzy fallback.
 
@@ -199,7 +201,7 @@ Ported: `orphan_blocks`, `state_fields`, `ccr_entries.orig_hash` (+ index, probe
 
 ### 2.9 Incremental msgid pin (#7064 §8, default 100)
 
-Steady turns declare ids via the bounded `x-bili-pf-tail-ids` (anchor + new, ≤2048 ids, `?` placeholders) or a short body id array; the server **re-stamps the prefix from ledger live rows** (ingest INSERT OR IGNORE on (session_id,seq) — a position's msg_id is written once). Acceptance rule (finalized 2026-11-19): the declared tail span [T-L,T-1] must be **row-by-row equal** to the ledger's overlap span; any drifted row ⇒ degrade to full, never 400; overlong sessions (>2048) pin fine with truncated tail lists (longer overlap = stronger proof). Snapshot rounds (empty ledger / post-fold re-anchor) send the full form; full form takes priority. The response stamps `x-bili-msgid-mode: incremental|full` (cleared on any 4xx; same learning point as pf-seq, pfLearnStamp). Mismatches self-heal in one round.
+Steady turns declare ids via the bounded `x-bili-pf-tail-ids` (anchor + new, ≤2048 ids, `?` placeholders) or a short body id array; the server **re-stamps the prefix from ledger live rows** (ingest INSERT OR IGNORE on (session_id,seq) — a position's msg_id is written once). Acceptance rule (finalized 2026-11-19): the declared tail span [T-L,T-1] must be **row-by-row equal** to the ledger's overlap span; any drifted row ⇒ degrade to full, never 400; overlong sessions (>2048) pin fine with truncated tail lists (longer overlap = stronger proof). Snapshot rounds (empty ledger / post-fold re-anchor) send the full form; full form takes priority. The response stamps `x-bili-msgid-mode: incremental|full` (cleared on any 4xx; same learning point as pf-seq, pfLearnStamp). Mismatches self-heal in one round. A well-formed short array that arrives on an **empty** ledger — an incremental client on its first turn after the server lost the ledger (restored or recreated database, removed session) — is served without the pin and answered with `full`, so the next turn rebuilds the ledger; only an array with broken entries (empty, too long, reserved prefix, whitespace/control characters, duplicates) is still refused with 400 (#7574, owner ruling 2026-11-23 — before, every short array on an empty ledger was a 400).
 
 ### 2.10 Admin surface
 
@@ -272,7 +274,7 @@ Fold tx: blocks insert/update + covered rows retired (same tx) + one fold_journa
 |---|---|---|---|---|
 | `pluginLaneServerHistory` | **100** | 0→100 (GA, owner ruling 2026-11-13) | ⑤ server-side canonical: biliMsgIds row pinning + /__bili/plugin/render + incremental-lane serverHistory announcement | env=0 |
 | `pluginMsgIdIncremental` | **100** | new, on | ④ tail-form id declaration, ledger re-stamps prefix | env=0 |
-| `pluginFullResendWatermark` | 5 | (existing 5% rollout) | ③ watermark fast path | env=0 |
+| `pluginFullResendWatermark` | **100** | 5→100 (GA, owner ruling 2026-11-22) | ③ watermark fast path | env=0 |
 | `pluginDeltaResend` | 0 | new, off | ③ delta tail-slice arm; 0 = 400 on delta requests, client converges to full in one round | born in rollback state |
 | `egressPlane` | 0 | new, off | ② the WHOLE new path under one switch: sparse-op recording (all four lanes) + serve-from-log (byte-identical swap) + server authority for pinned plugin lanes (rulings #7439 3/5); off = legacy chain, zero rows, byte-identical to pre-feature. Replaces the retired `egressOpLog`/`egressServeLog` pair | born in rollback state |
 
@@ -357,7 +359,7 @@ Fix: `planIngestReanchor` + the `ingestSession` re-anchor txn branch. Per window
 For sessions with `metadata.egressAuthority === true` (and `egressPlane` on):
 
 - **No per-turn unified ingest**: `ingestRowsNow` and the debounced unified legs early-return — the `messages` table is demoted to a **lazy projection** for these sessions (rebuilt one-time O(n) on plane rollback / web read / replica restore). Boot after restart still comes from the op log (`recoverEgressBase`), not from the projection.
-- **Pin channel reads the op log**: the KDD #21/#21 pin ledger (tail-overlap / live-id re-stamp) for egress-on sessions resolves from `egress_flow` I rows (msgid + log_seq) instead of the messages ledger (`snapPinLiveIds` shim). Wire unchanged.
+- **Pin channel reads the op log**: the KDD #21/#22 pin ledger (tail-overlap / live-id re-stamp) for egress-on sessions resolves from `egress_flow` I rows (msgid + log_seq) instead of the messages ledger (`snapPinLiveIds` shim). Wire unchanged.
 - **Envelope frozen at bootstrap** (`d28d9ff3a`): no per-turn read+rewrite of the 15.5MB growing session JSON (kernel refs are never pruned — messageRefs 10MB + tsStamps 5.5MB at 100k); the frozen route must keep the resident fields unthinned (`9183ea817`, #4788 D2) or the pinned turn 502s.
 - **Verification**: the egress probe (flow vs client sample) is the SOLE drift verifier for egress-on sessions — `BatchedViewVerification` is off for them (`13b9baae2`): the client-vs-canonical leg would only measure the known server-wins divergence (ruling 7439-5) and re-latch drift forever.
 - Flow-corruption semantics: HARD FAIL, no projection fallback for outbound — flow and messages die together anyway (flow independence, ruling 7439-2 §2).
@@ -378,3 +380,49 @@ For sessions with `metadata.egressAuthority === true` (and `egressPlane` on):
 ### 6.5 Resident perf gate (ruling: e2e bench ×3, ≤+20% over baseline)
 
 `tests/egress-bench.test.ts` (gate `ACP_TEST_EG_BENCH=1`; dedicated CI lane `.github/workflows/ci-e2e-egbench.yml` on master): hermetic in-process proxy (port 0, temp XDG), 30k-row growing pinned session with host-side folds + the pf watermark channel, median-of-3 steady p50/max within +20% of `tests/e2e/bench/egress-bench.baseline.json` (calibration 201/300 ms; missing baseline prints CALIBRATION and passes). Pins per-turn cost to O(live-window): a regression back to a full-table path goes red. The 100k growing-run matrix above stays as the deep-dive reference; the bench is the resident guard.
+
+## 7. Follow-up after the review (#7574)
+
+The review of this PR (issue #7574) found gaps in what landed. Everything that changed since, in one place. Line numbers quoted above refer to the code as it landed in this PR.
+
+### 7.1 Rolling back to an older build
+
+"All new tables are additive" is true for the tables, not for the session. An older build (anything before this PR) knows only the `sessions` row — not `ccr_entries`, `state_fields` or `orphan_blocks`. While it runs:
+
+- tool outputs and file reads show as `{ hash }` stubs (the `ccr_json` column is hashes-only now, the texts live behind `ccr_entries`);
+- reaped blocks are missing (their contents live in `orphan_blocks`);
+- the nine state fields moved to `state_fields` are missing.
+
+What is left behind depends on whether the older build **saved** that session:
+
+- **Only read** (no turn on it): nothing on disk changes — after re-upgrading the session is whole again.
+- **Saved at least once** (checked against the real previous build):
+  - the nine state fields come back from their rows and the reaped blocks from their table. A field for which the older build wrote a non-empty value of its own keeps that value (a rule it added stays; a rule it deleted stays deleted);
+  - the tool-output and file-read texts of that session are **gone for good**. The older build parses the hashes-only column as its own store, so its save rewrites the `ccr_entries` rows to the bare `{ hash }` stubs it saw and releases the entry rows — after that no link from the conversation's placeholders to the texts exists anywhere (the text rows themselves are still in the content table, unreferenced). After re-upgrading the session loads **without its content store**. This used to happen silently; it is now one `warn` line per load, naming the cause.
+
+Decision for the owner (nothing changed here): accept this; or have a newer build keep a copy of that link where an older build does not rewrite it (a side table with the entry and the text digest per key, about 150 bytes per entry); or keep the old full `ccr_json` column for a few releases.
+
+### 7.2 Big requests with a watermark handshake header
+
+A request of 1 MiB or more that carries an `x-bili-pf-*` header has its JSON decoded lazily (`messages` left as a placeholder). The placeholder used to be filled in only when the plugin lane and the watermark flag were both on; otherwise the request failed with `502 wireMessages is not iterable`, and on a watermark hit every top-level field that handle.ts had stripped (`dsh_*`, …) was forwarded upstream again. The body is now always decoded back before it is forwarded, and the forwarded top-level fields are exactly the ones the non-deferred path sends, in the same key order.
+
+### 7.3 The outbound op log (egress)
+
+- **Who is the authority — one rule for all four wires.** Only a plugin-lane turn with a successful msgid pin, not a side request, plane on, may have its conversation replaced by the server log. Every other turn is recorded but served as before. (Before: the three post-kernel wires also handed authority to unpinned plugin turns and plain-proxy sessions; the anthropic wire even for title requests.)
+- **A damaged log.** It costs a turn only for those authority sessions (same 500 as before). A session that is only mirrored keeps answering; the damage is logged once per turn. `GET /__bili/egress/latches` lists the sessions that failed. `POST /__bili/egress/reset { sessionId }` drops the damaged log; the next turn rebuilds it from the client's conversation. A latched session no longer re-scans its log on every request.
+- **Walking back** (and truncating after the last healthy point) happens only when the log really does not replay, and only for authority sessions. A busy/locked/I/O error is passed on and deletes nothing.
+- **Two requests on one session.** The writer whose turn started on an older log is refused (`EgressConcurrentWriteError`) and its turn is served unrecorded. A batch that would break the log is refused before anything is written.
+- **Compaction.** A turn that deletes compacts in the same write, and the compaction trims **both** tables. `egress_flow` is no longer "append-only, never deleted": it keeps the newest base row plus everything after it, and `egressStateAt` rebuilds any point from the newest base on. (Before: the flow kept every row and grew by one full snapshot per fold.)
+- **The serving copy** (`egress_state`) is compared with the log on every read; a damaged copy is copied again from the log, a hole in the log is reported.
+- **`after: null` on a non-empty view means "the new first row"**, in both replays. (Before: validation put it first, storage put it last, and the next turn paid a delete-and-insert rewrite.)
+- **Plane off** = nothing reads the op log, even for sessions that have one: the pin ledger reads `messages`, the drift checks are off.
+
+### 7.4 msgids
+
+- The 400 for a failed msgid validation carries `x-bili-msgid-mode: full`, like the delta re-anchor, so the client knows to send the full list next turn.
+- A well-formed short id array on an **empty** ledger (the client's database was restored or rebuilt) no longer fails the turn: it runs without the pin and the response asks for the full list. Only a tail with broken entries is still an identity fault. This reverses the empty-ledger exception of 2026-11-18 (AGENTS.md, KDD #22).
+- pi only suppresses the full `biliMsgIds` list on the OpenAI wire (that is the wire whose server side reads the `x-bili-pf-tail-ids` header). After a `/model` switch to an anthropic- or responses-wire model the full list rides again; before, those requests carried no ids at all until the tail passed its byte budget.
+
+### 7.5 Migration
+
+The migration completes on the next start when it was interrupted between the two egress tables, and a library that upgraded from an earlier release gets the `conversations(session_id)` index (it used to be created only for databases born on a current build).

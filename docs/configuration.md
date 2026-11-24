@@ -309,6 +309,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
+| `compress.protectedUserPatterns` | string[] | none | — | Literal substrings on user text messages: matching prompts never fold, even when they are not the latest user message. For host-marked current-task prompts in long-lived sessions. |
 | `compress.protectedTools` | string[] | none | — | Hard exclusion across all history: results of listed tools never fold. Path patterns (skill/<name>) select skills by name (#1947). |
 | `compress.protectedLatestTools` | string[] | none | — | Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns keep the latest instance per skill (skill/*, #1947). |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection). |
@@ -320,6 +321,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
 | `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
 | `compress.absorb` | object | opt-in (disabled) | — | Opt-in instant distillation of tool results into short abstracts; originals go to the content store. By default only image-bearing results qualify. |
+| `compress.degenerateRetry` | object | 1 attempt (built-in nudge) | — | Retry budget and nudge sentences for turns that end with zero client-visible output (degenerate terminal turns). The continuation nudge rides the retry body only — it is never persisted into session state and never replayed on the client's next request. |
 | `compress.blockOps` | object | off | — | Opt-in block-lifecycle tools (acp_retire / acp_restore / acp_rewrite) for compressed-block management; default-off keeps the wire byte-identical to pre-#5765. |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
 | `compress.search` | object | off | — | Search-behavior settings for search_context; currently holds planAware re-ranking. |
@@ -336,6 +338,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.absorb.excludeTools` | string[] | [] | — | Tool names excluded from absorption. |
 | `compress.absorb.toolName` | string | "absorb" | — | Registered name of the absorb tool. |
 | `compress.absorb.mediaOnly` | boolean | true | — | Restrict absorption to tool results that carry media (images). Image bytes are exempt from minToolTokens since they are not counted in text. Set false to restore legacy full-text absorption of any large result. |
+| `compress.degenerateRetry.maxAttempts` | integer | 1 | — | Degenerate-terminal retry budget (#7666): when a turn ends with nothing client-visible, the agent's own request is re-issued with a trailing user nudge. 0 = off (the turn passes through bare), 1 = once (pre-#7666 behavior), max 5; attempt i sends nudges[i] (cycling). Independent of the zero-byte-cut re-issue (#2171) — a turn may spend one of each. |
+| `compress.degenerateRetry.nudges` | string[] | 3 built-in | — | Custom nudge sentences for degenerate-terminal retries (#7666); retry i sends sentence i (cycling when shorter). Unset = the built-in rotation, whose first entry is the default continuation nudge. |
 | `compress.blockOps.enabled` | boolean | false | — | Enable the three block-lifecycle tools (injection + prompt + manifest). Off = no tools, no prompt section, zero per-request cost. |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | Enable the content-cache-and-retrieve block. |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | Minimum estimated token size of a tool result eligible for CCR storage. |
@@ -1584,6 +1588,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   - **Cumulative snapshots** — each newer result supersedes the older ones (a client's todo/task list): use `protectedLatestTools`. Protecting **all** instances of such a tool makes its history grow unboundedly — the exact failure #639 worked around by protecting only the latest.
   - Rule of thumb: low-frequency, high-value tools → `protectedTools`; chatty tools → never full-history protect (context grows without bound); cumulative-snapshot tools → `protectedLatestTools`.
 
+#### `protectedUserPatterns`
+
+- **Type:** `string[]` (literal text substrings, e.g. `["【本轮消息】"]`)
+- **Default:** `[]` *(none — opt in per host)*
+- **Status:** ACTIVE
+- **Description:** User-role text messages containing any listed literal substring are never compressed (mapped to kernel `Config.isMessageProtected`). Built for long-lived agent sessions where the current task prompt is **not the last user message**: tool-result and image user messages often follow it, so the kernel's last-user protection does not cover it. If that prompt is folded, a stale earlier user message can remain as the only raw user turn and the model may resume the old task. Hosts mark the live task with a stable literal (for example `【本轮消息】`) and list it here. Matching is literal substring (no glob); only user-role text messages are candidates; empty array is rejected; whole-array replace at the deepest defined level. Example: `{ "compress": { "protectedUserPatterns": ["【本轮消息】"] } }`.
+
 #### `neverPreserveRecentTools`
 
 - **Type:** `string[]` (tool-name patterns)
@@ -1654,6 +1665,19 @@ Optional surface blocks: `prompts` (inline rule-text overrides), `nudgeSections`
   - `excludeTools: string[]` — tool-name patterns never absorbed. **Known limitation:** a no-op on tool *results* until [ranxianglei/acp-kernel#213](https://github.com/ranxianglei/acp-kernel/issues/213) ships (wire projections don't carry `toolName` on results, so the kernel's name guard can't fire).
   - `toolName: string` — rename the injected tool (default `"absorb"`); the advertised/injected schema, the system-prompt section and per-session adjudication all follow the name in both lanes. **Lane governance (#1359):** plugin mode governs the *entire* `absorb` block by the **base** config, so a renamed tool is advertised under that name and executed under it (they can never diverge); provider/model-level `absorb.*` overrides are **proxy-lane-only** (the proxy injects and adjudicates the merged name). A load-time warning lists any provider/model `absorb.*` field whose value diverges from base.
   Injection follows the wire's native-tool surface: proxy mode injects the tool (under the per-request resolved name) + a system-prompt section on the anthropic/openai/responses native-tools wires, plugin mode advertises it in the plugin manifest **only while enabled** (hosts register the manifest's tools verbatim — advertising a disabled tool breaks them, #1192; the MCP shell picks it up for free). Responses **marker/text-protocol** routes are not supported (no native tool surface — the REQUIRED absorb instruction would be unsatisfiable), and title-generation requests (`max_tokens ≤ 200`) skip injection like the compress prompt does. Absorbed pairs stay hidden across restarts (persisted in the session state).
+
+#### `degenerateRetry`
+
+- **Type:** `object` (`{ maxAttempts?, nudges? }`) — sub-fields merge deepest-wins (global → provider → model)
+- **Default:** unset = `{ maxAttempts: 1 }` with the built-in nudge rotation (pre-#7666 behavior)
+- **Status:** ACTIVE
+
+**Description:** the retry budget for degenerate terminal turns — turns that reach their completion with nothing client-visible (the tag-echo shape, a compression-draft or bare-announcement tail). Each attempt re-issues the agent's own forwarded body with a trailing user nudge appended (`src/degenerate-retry.ts`); the mutation never touches session state, so the nudge is transient — the client's next request is byte-identical to what it would have been. Sub-fields:
+
+- `maxAttempts` (integer 0–5, default 1) — how many nudge re-issues one turn may spend. 0 disables degenerate retries entirely (the turn passes through bare). Exhausted budget: the chat lane emits the in-band #870 error ("…after the continuation nudge" / "…after N continuation nudges"), the responses lane passes the empty turn through.
+- `nudges` (string[], 1–8, default: the 3 built-in sentences) — sentence for attempt i (cycling when shorter). The built-in rotation starts with the default continuation nudge ("Your previous response ended without a tool call. Continue now: …").
+
+Independent of the zero-byte-cut re-issue (#2171), which keeps its own one-shot budget. See #7666 / #6034 for the failure family and the local 7-day data (85 degenerate arms, 93% rescued by the single-attempt retry).
 
 #### `blockOps`
 
