@@ -9,7 +9,11 @@
 | `egress_block_flow` | 追加式块正史（I/U/B 行） | `(session_id, op_seq)` |
 | `egress_block_state` | 读副本：每块最新快照 | `(session_id, block_id)` |
 
-两表共享与 `egress_flow` **相同的 op_seq 时钟**（一轮同时写两个日志；`blockNextSeq` = `egress_flow` + `egress_block_flow` 的 MAX）。
+**双时钟**（owner 裁定 2026-11-24——原“共享时钟”设计被否：折叠轮的块行在 SAVE 时落盘，晚于同轮的消息行，下一条消息会从“最后一条 flow 行 +2”处开始，导致每次 egress 读的 `op_seq === prevSeq + 1` 稠密校验全部报错）：
+
+- 块表**自己发号**：`egress_block_flow.op_seq` 在表内稠密，从 `MAX(egress_block_flow) + 1` 发出。块表内部怎么压缩、变换、重编号都是自成体系，不碰 flow 的号池。
+- `egress_flow` 保留**独占**号池与稠密不变量，零改动。
+- 每条块行携带 **`flow_op_seq`**——指向 flow 时钟的指针：写入时刻 `egress_flow` 的 `MAX(op_seq)`（只增不减，故 `flow_op_seq <= X` 的行构成前缀）。点位 fork 在 flow 水位 `X` 处：拷贝 `op_seq <= X` 的 flow 行 + `flow_op_seq <= X` 的块行，消息视图与块集合在该时刻对齐。
 
 ### 行类型
 
@@ -49,7 +53,7 @@
 对 egress-on 会话：
 - `maybeCutForkBaseAsync` / `createReplica` 跳过（不建 fork_base/replica/auto 行）。
 - Admin `POST /__bili/replicas` 对 egress-on 父会话走点 fork：`201 {ok, pointFork, sessionId, opSeq, restoredFrom}` —— 生成一个全新的独立子会话（父会话永不被改，子会话是快照而非活别名）。egress-off 父保留 checkpoint 行为；低于高水位的 `opSeq` 被拒绝（400），因为它需要点位重构物化器（后续项）。
-- `persistForkSession` / `cloneSessionRows` 使用 `egressPointFork`（四张表 `egress_state`、`egress_flow`、`egress_block_state`、`egress_block_flow`）。fork-to-now（`wm` = 高水位）直接拷贝全部四表（SQL `INSERT…SELECT`）；真点位 fork（`wm` < 高水位）按 `op_seq <= wm` 过滤拷贝 flow 表，再回放这些行重建状态副本（直接按 op_seq 过滤拷贝会漏掉最新行在 wm 之后的块）。
+- `persistForkSession` / `cloneSessionRows` 使用 `egressPointFork`（四张表 `egress_state`、`egress_flow`、`egress_block_state`、`egress_block_flow`）。水位是 **flow 时钟**（`egressStateMaxSeq`——双时钟下的参考时钟）。fork-to-now（`wm` >= flow 高水位）直接拷贝全部四表（SQL `INSERT…SELECT`）；真点位 fork（`wm` < flow 高水位）按 `op_seq <= wm` 拷 flow 行、按 `flow_op_seq <= wm` 拷块行，再回放重建状态副本（直接按块表自己的 op_seq 过滤会把两个无关时钟对齐）。
 
 ## kstate 裁剪（D4）
 

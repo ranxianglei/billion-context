@@ -18,10 +18,23 @@
  *                         snapshot); the fast read of the current set.
  *                         PK (session_id, block_id).
  *
- * SHARED CLOCK (#7577): the block rows share the SAME op_seq append clock as
- * egress_flow — one turn writes both logs, so any op_seq aligns the message
- * view (egressStateAt) with the block set (egressBlockReplay). The cursor is
- * the MAX over BOTH tables.
+ * DUAL CLOCKS (#7577, owner ruling 2026-11-24 — the original shared-clock
+ * design was rejected because it broke egress_flow's density invariant: a
+ * fold's block rows were written AFTER the same turn's message rows, so the
+ * next message append started two op_seqs past the last flow row and
+ * applyOps' `op_seq === prevSeq + 1` check threw on every subsequent read).
+ *   - The block tables number THEMSELVES: egress_block_flow.op_seq is dense
+ *     within its own table (1,2,3,…), issued from MAX(egress_block_flow)+1.
+ *     What the block table does internally (compress, transform, renumber)
+ *     is self-contained — it never touches the flow number pool.
+ *   - egress_flow keeps its EXCLUSIVE number pool and its #7574 density
+ *     invariant, untouched.
+ *   - Every block row carries flow_op_seq — a POINTER to the flow clock:
+ *     egress_flow's MAX(op_seq) at the moment the row was written (never
+ *     decreases, so the rows with flow_op_seq <= X form a prefix). A point
+ *     fork at flow watermark X copies flow rows with op_seq <= X and block
+ *     rows with flow_op_seq <= X, aligning the message view with the block
+ *     set at that moment.
  *
  * Row types (payload = the block snapshot, the contract):
  *   I  block born       block_id required  snapshot (one fold creates it)
@@ -133,6 +146,7 @@ type EgressBlockRowType = "B" | "I" | "U";
 
 interface EgressBlockRow {
     op_seq: number;
+    flow_op_seq: number;
     row_type: EgressBlockRowType;
     block_id: string | null;
     payload: string;
@@ -141,24 +155,34 @@ interface EgressBlockRow {
 
 interface EgressBlockStateRow {
     op_seq: number;
+    flow_op_seq: number;
     block_id: string;
     payload: string;
 }
 
-const INSERT_BLOCK_STATE = `INSERT INTO egress_block_state (session_id, block_id, op_seq, payload, created_at) VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(session_id, block_id) DO UPDATE SET op_seq = excluded.op_seq, payload = excluded.payload, created_at = excluded.created_at`;
-const INSERT_BLOCK_FLOW = `INSERT INTO egress_block_flow (session_id, op_seq, row_type, block_id, payload, kstate_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`;
+const INSERT_BLOCK_STATE = `INSERT INTO egress_block_state (session_id, block_id, op_seq, flow_op_seq, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(session_id, block_id) DO UPDATE SET op_seq = excluded.op_seq, flow_op_seq = excluded.flow_op_seq, payload = excluded.payload, created_at = excluded.created_at`;
+const INSERT_BLOCK_FLOW = `INSERT INTO egress_block_flow (session_id, op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
 
-/** The shared op_seq cursor: MAX over egress_flow AND egress_block_flow
- *  (#7577 — one turn writes both logs, so the clocks must not diverge). */
+/** The block table's OWN next op_seq: dense within egress_block_flow
+ *  (dual-clock ruling — the flow number pool is NOT consulted). Must be read
+ *  INSIDE the write transaction (#7574 discipline). */
 function blockNextSeq(db: SqliteDatabase, sessionId: string): number {
-    const flow = db
-        .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_flow WHERE session_id = ?")
-        .get(sessionId) as { o: number } | undefined;
     const block = db
         .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_block_flow WHERE session_id = ?")
         .get(sessionId) as { o: number } | undefined;
-    return Math.max(Number(flow?.o ?? 0), Number(block?.o ?? 0)) + 1;
+    return (Number(block?.o) || 0) + 1;
+}
+
+/** The flow watermark: egress_flow's MAX(op_seq) at write time — the pointer
+ *  recorded on every block row. Read INSIDE the write transaction (after any
+ *  flow rows the current turn just appended), so it reflects "what the flow
+ *  clock said at the moment this block state landed". */
+function flowWatermark(db: SqliteDatabase, sessionId: string): number {
+    const flow = db
+        .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_flow WHERE session_id = ?")
+        .get(sessionId) as { o: number } | undefined;
+    return Number(flow?.o) || 0;
 }
 
 function snapshotEqual(a: EgressBlockSnapshot, b: EgressBlockSnapshot): boolean {
@@ -227,7 +251,8 @@ export function diffBlockSet(
 }
 
 /** Append a batch of I/U ops to BOTH tables (flow + state) in ONE
- *  transaction. Every row gets the next op_seq (shared clock) and the kstate
+ *  transaction. Every row gets the next op_seq from the block table's OWN
+ *  number pool (dual clocks) plus the flow watermark pointer and the kstate
  *  sidecar; the state replica is upserted per block. Returns the assigned
  *  op_seqs in input order. */
 export function egressBlockAppend(
@@ -257,12 +282,13 @@ export function egressBlockAppend(
             }
         }
         firstOpSeq = blockNextSeq(db, sessionId);
+        const wm = flowWatermark(db, sessionId);
         for (let i = 0; i < ops.length; i++) {
             const op = ops[i];
             const opSeq = firstOpSeq + i;
             const payload = JSON.stringify(op.snapshot);
-            db.prepare(INSERT_BLOCK_FLOW).run(sessionId, opSeq, op.type, op.blockId, payload, kstateJson, nowMs);
-            db.prepare(INSERT_BLOCK_STATE).run(sessionId, op.blockId, opSeq, payload, nowMs);
+            db.prepare(INSERT_BLOCK_FLOW).run(sessionId, opSeq, wm, op.type, op.blockId, payload, kstateJson, nowMs);
+            db.prepare(INSERT_BLOCK_STATE).run(sessionId, op.blockId, opSeq, wm, payload, nowMs);
         }
     });
     return Array.from({ length: ops.length }, (_, i) => firstOpSeq + i);
@@ -273,7 +299,7 @@ export function egressBlockAppend(
  *  EgressBlockCorruptError on a malformed row. */
 export function egressBlockView(db: SqliteDatabase, sessionId: string): Map<string, EgressBlockSnapshot> {
     const rows = db
-        .prepare("SELECT op_seq, block_id, payload FROM egress_block_state WHERE session_id = ? ORDER BY op_seq ASC")
+        .prepare("SELECT op_seq, flow_op_seq, block_id, payload FROM egress_block_state WHERE session_id = ? ORDER BY op_seq ASC")
         .all(sessionId) as unknown as EgressBlockStateRow[];
     const blocks = new Map<string, EgressBlockSnapshot>();
     for (const row of rows) {
@@ -295,12 +321,24 @@ export function egressBlockReplay(
 ): { blocks: Map<string, EgressBlockSnapshot>; kstate: string | null } {
     const rows = db
         .prepare(
-            "SELECT op_seq, row_type, block_id, payload, kstate_json FROM egress_block_flow WHERE session_id = ? AND op_seq <= ? ORDER BY op_seq ASC",
+            "SELECT op_seq, flow_op_seq, row_type, block_id, payload, kstate_json FROM egress_block_flow WHERE session_id = ? AND op_seq <= ? ORDER BY op_seq ASC",
         )
         .all(sessionId, x) as unknown as EgressBlockRow[];
     const blocks = new Map<string, EgressBlockSnapshot>();
     let kstate: string | null = null;
+    let prevSeq = 0;
     for (const row of rows) {
+        // Dual clocks: the block table numbers itself — its own op_seq must
+        // be dense (1,2,3,…). A gap means a missing row (corruption); unlike
+        // the flow table (whose rows can legally be truncated by compaction
+        // bases), the block flow is append-only with no row deletion, so the
+        // prefix is always complete. A point-forked child inherits a prefix
+        // (watermarks are non-decreasing, so flow_op_seq <= X is a prefix),
+        // hence dense too.
+        if (row.op_seq !== prevSeq + 1) {
+            throw new EgressBlockCorruptError(sessionId, `op_seq jumps from ${prevSeq} to ${row.op_seq}`);
+        }
+        prevSeq = row.op_seq;
         if (row.kstate_json !== null) kstate = row.kstate_json;
         if (row.row_type === "B") {
             let parsed: { entries?: Array<{ blockId: string; snapshot: EgressBlockSnapshot }> };
@@ -348,34 +386,39 @@ export function egressBlockCompact(
         seq = blockNextSeq(db, sessionId);
         const entries = Array.from(blocks.entries()).map(([blockId, snapshot]) => ({ blockId, snapshot }));
         const payload = JSON.stringify({ entries, watermark: seq });
-        db.prepare(INSERT_BLOCK_FLOW).run(sessionId, seq, "B", null, payload, kstateJson, nowMs);
+        db.prepare(INSERT_BLOCK_FLOW).run(sessionId, seq, flowWatermark(db, sessionId), "B", null, payload, kstateJson, nowMs);
     });
     return seq;
 }
 
-/** Point fork (#7577 D5): copy the parent's egress + block op logs UP TO (and
- *  including) op_seq wm to the child session_id inside ONE transaction.
- *  op_seq/log_seq are preserved verbatim, so the child inherits the parent's
- *  number space (nothing re-issued across the fork). wm = MAX(op_seq) is the
- *  whole-table copy (the existing egressFork special case). Pre-existing
- *  child rows are replaced (an idempotent re-fork of the same parent pair).
- *  Returns the number of egress_flow rows copied. */
+/** Point fork (#7577 D5, dual-clock ruling): wm is a FLOW watermark
+ *  (egress_flow's op_seq space). Copy the parent's egress op logs with
+ *  op_seq <= wm and the block op logs with flow_op_seq <= wm (the pointer
+ *  column — block rows carry their own op_seq clock, so filtering them by
+ *  their op_seq would align two unrelated clocks) to the child session_id,
+ *  inside ONE transaction. op_seq/log_seq are preserved verbatim, so the
+ *  child inherits the parent's number space (nothing re-issued across the
+ *  fork). wm >= the parent's flow MAX is the whole-copy special case (the
+ *  existing egressFork path). Pre-existing child rows are replaced (an
+ *  idempotent re-fork of the same parent pair). Returns the number of
+ *  egress_flow rows copied. */
 export function egressPointFork(db: SqliteDatabase, fromSessionId: string, toSessionId: string, wm: number): number {
     if (fromSessionId === toSessionId) throw new Error("egressPointFork: conflicting fork lineage (child equals parent)");
     return db.transaction(() => {
-        // #7577 (a): fork-to-now fast path. When wm covers the parent's
-        // shared high water, BOTH state replicas are already the correct
-        // child state (egress_state compacted as base + window, block state
-        // one row per live block) — copy all four tables straight by SQL.
-        // The replay below would instead materialize the child's egress_state
-        // as the FULL uncompacted flow (every historical B base row is a
-        // whole-view snapshot — ~8MB at 100k messages), making the fork
-        // transaction O(total history) and every later turn's prev-read a
-        // full-history JS replay until the child's first fold. Only a true
-        // point fork (wm < high water) needs the replay.
+        // #7577 (a): fork-to-now fast path. The flow clock is the reference
+        // clock: when wm covers the parent's flow high water, every block row
+        // (whose flow_op_seq pointer <= flow MAX by construction) is in
+        // scope, and BOTH state replicas are already the correct child state
+        // (egress_state compacted as base + window, block state one row per
+        // live block) — copy all four tables straight by SQL. The replay
+        // below would instead materialize the child's egress_state as the
+        // FULL uncompacted flow (every historical B base row is a whole-view
+        // snapshot — ~8MB at 100k messages), making the fork transaction
+        // O(total history) and every later turn's prev-read a full-history
+        // JS replay until the child's first fold. Only a true point fork
+        // (wm < flow high water) needs the replay.
         const parentFlowMax = (db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(fromSessionId) as { m: number }).m;
-        const parentBlockMax = (db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_block_flow WHERE session_id = ?").get(fromSessionId) as { m: number }).m;
-        const forkToNow = wm >= Math.max(parentFlowMax, parentBlockMax);
+        const forkToNow = wm >= parentFlowMax;
         const n = db
             .prepare(forkToNow
                 ? "SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?"
@@ -391,16 +434,16 @@ export function egressPointFork(db: SqliteDatabase, fromSessionId: string, toSes
                  SELECT ?, op_seq, log_seq, row_type, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ?`,
             ).run(toSessionId, fromSessionId);
             db.prepare(
-                `INSERT INTO egress_block_flow (session_id, op_seq, row_type, block_id, payload, kstate_json, created_at)
-                 SELECT ?, op_seq, row_type, block_id, payload, kstate_json, created_at FROM egress_block_flow WHERE session_id = ?`,
+                `INSERT INTO egress_block_flow (session_id, op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at)
+                 SELECT ?, op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at FROM egress_block_flow WHERE session_id = ?`,
             ).run(toSessionId, fromSessionId);
             db.prepare(
                 `INSERT INTO egress_state (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
                  SELECT ?, op_seq, log_seq, row_type, msgid, payload, bytes, created_at FROM egress_state WHERE session_id = ?`,
             ).run(toSessionId, fromSessionId);
             db.prepare(
-                `INSERT INTO egress_block_state (session_id, block_id, op_seq, payload, created_at)
-                 SELECT ?, block_id, op_seq, payload, created_at FROM egress_block_state WHERE session_id = ?`,
+                `INSERT INTO egress_block_state (session_id, block_id, op_seq, flow_op_seq, payload, created_at)
+                 SELECT ?, block_id, op_seq, flow_op_seq, payload, created_at FROM egress_block_state WHERE session_id = ?`,
             ).run(toSessionId, fromSessionId);
             return Number(n.c);
         }
@@ -409,9 +452,11 @@ export function egressPointFork(db: SqliteDatabase, fromSessionId: string, toSes
             `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
              SELECT ?, op_seq, log_seq, row_type, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ? AND op_seq <= ?`,
         ).run(toSessionId, fromSessionId, wm);
+        // Block rows align on the FLOW clock via their pointer column
+        // (dual clocks: their own op_seq is unrelated to wm).
         db.prepare(
-            `INSERT INTO egress_block_flow (session_id, op_seq, row_type, block_id, payload, kstate_json, created_at)
-             SELECT ?, op_seq, row_type, block_id, payload, kstate_json, created_at FROM egress_block_flow WHERE session_id = ? AND op_seq <= ?`,
+            `INSERT INTO egress_block_flow (session_id, op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at)
+             SELECT ?, op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at FROM egress_block_flow WHERE session_id = ? AND flow_op_seq <= ?`,
         ).run(toSessionId, fromSessionId, wm);
         // Rebuild the STATE replicas by replaying the flow tables up to wm
         // (the state tables are read-replicas of the latest snapshot per
@@ -426,13 +471,13 @@ export function egressPointFork(db: SqliteDatabase, fromSessionId: string, toSes
             ).run(toSessionId, row.op_seq, row.log_seq, row.row_type, row.msgid, row.payload, row.bytes, row.created_at);
         }
         const blockRows = db
-            .prepare("SELECT op_seq, row_type, block_id, payload, created_at FROM egress_block_flow WHERE session_id = ? AND op_seq <= ? ORDER BY op_seq ASC")
-            .all(toSessionId, wm) as unknown as { op_seq: number; row_type: string; block_id: string | null; payload: string; created_at: number }[];
+            .prepare("SELECT op_seq, flow_op_seq, row_type, block_id, payload, created_at FROM egress_block_flow WHERE session_id = ? AND flow_op_seq <= ? ORDER BY op_seq ASC")
+            .all(toSessionId, wm) as unknown as { op_seq: number; flow_op_seq: number; row_type: string; block_id: string | null; payload: string; created_at: number }[];
         for (const row of blockRows) {
             if (row.row_type === "B" || row.block_id === null) continue;
             db.prepare(
-                "INSERT OR REPLACE INTO egress_block_state (session_id, block_id, op_seq, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-            ).run(toSessionId, row.block_id, row.op_seq, row.payload, row.created_at);
+                "INSERT OR REPLACE INTO egress_block_state (session_id, block_id, op_seq, flow_op_seq, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ).run(toSessionId, row.block_id, row.op_seq, row.flow_op_seq, row.payload, row.created_at);
         }
         return Number(n.c);
     });

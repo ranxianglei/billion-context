@@ -1836,13 +1836,14 @@ export class UnifiedStore {
             }
 
             // #7577: EGRESS BLOCK LIFECYCLE LOG — record the block set for
-            // egress-on sessions (the block flow shares the egress_flow op_seq
-            // clock). Snapshots are built from the incoming blocks + the
-            // transcript-resolved coordinates collected above. Gated on the
-            // egress-on latch (set by resolveEgressAuthority) AND a non-envelope
-            // save (envelope imports preserve the stored lineage — the block
-            // flow is not updated for them). A live block leaving the set emits
-            // a terminal reaped U (D6), not a DELETE + orphan_blocks copy.
+            // egress-on sessions (dual clocks: the block table numbers itself;
+            // each row carries the flow watermark pointer). Snapshots are
+            // built from the incoming blocks + the transcript-resolved
+            // coordinates collected above. Gated on the egress-on latch (set
+            // by resolveEgressAuthority) AND a non-envelope save (envelope
+            // imports preserve the stored lineage — the block flow is not
+            // updated for them). A live block leaving the set emits a terminal
+            // reaped U (D6), not a DELETE + orphan_blocks copy.
             if (!skipIncomingBlocks) {
                 let egressOn = false;
                 try {
@@ -2325,8 +2326,10 @@ export class UnifiedStore {
         return egressBlockView(this.db, sessionId);
     }
 
-    /** Fork/rollback reconstruction of the block set at op_seq x (flow is
-     *  total), plus the kstate sidecar from the last row at/before x. */
+    /** Fork/rollback reconstruction of the block set at the block's OWN
+     *  op_seq x (dual clocks — this is egress_block_flow's sequence, not the
+     *  flow watermark), plus the kstate sidecar from the last row at/before
+     *  x. */
     egressBlockReplay(sessionId: string, x: number): { blocks: Map<string, EgressBlockSnapshot>; kstate: string | null } {
         return egressBlockReplay(this.db, sessionId, x);
     }
@@ -2335,18 +2338,19 @@ export class UnifiedStore {
         return egressBlockCompact(this.db, sessionId, blocks, kstateJson, nowMs);
     }
 
-    /** The shared op_seq high-water (MAX over egress_flow AND
-     *  egress_block_flow) — the point-fork watermark for "fork to now". */
+    /** The block table's own op_seq high-water (dual clocks — diagnostic
+     *  only; the point-fork watermark is the FLOW clock, egressStateMaxSeq,
+     *  because every block row's flow_op_seq pointer <= the flow MAX). */
     egressBlockMaxSeq(sessionId: string): number {
-        const flow = this.db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
         const block = this.db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_block_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
-        return Math.max(Number(flow.mx) || 0, Number(block.mx) || 0);
+        return Number(block.mx) || 0;
     }
 
     /** #7577 D5: point fork — copy the parent's egress + block op logs up to
-     *  (and including) op_seq wm to the child (one transaction; the child
-     *  inherits the parent's number space). wm = egressBlockMaxSeq is the
-     *  whole-table copy. */
+     *  (and including) FLOW watermark wm to the child (one transaction; the
+     *  child inherits the parent's number space). Block rows are selected by
+     *  their flow_op_seq pointer. wm = egressStateMaxSeq is the whole-copy
+     *  special case. */
     egressPointForkSession(parentId: string, childId: string, wm: number): boolean {
         return egressPointFork(this.db, parentId, childId, wm) > 0;
     }
@@ -4184,11 +4188,13 @@ export class UnifiedStore {
             // space and retired marks, nothing is re-issued across the
             // fork, and no other logic changes. No-op when the parent has
             // no egress rows (proxy-mode / egress-off sessions).
-            // #7577: the point fork copies ALL FOUR tables (egress_state,
-            // egress_flow, egress_block_state, egress_block_flow) — the
-            // block lifecycle log rides on the same op_seq clock, so the
-            // child inherits the parent's block set at the same watermark.
-            this.egressPointForkSession(parentId, childId, this.egressBlockMaxSeq(parentId));
+            // #7577 (dual clocks, owner ruling 2026-11-24): the watermark is
+            // the FLOW clock (egressStateMaxSeq — the flow table keeps its
+            // exclusive number pool). The point fork copies ALL FOUR tables
+            // (egress_state, egress_flow, egress_block_state, egress_block_flow):
+            // block rows align on wm via their flow_op_seq pointer, so the
+            // child inherits the parent's block set as of that flow point.
+            this.egressPointForkSession(parentId, childId, this.egressStateMaxSeq(parentId));
             this.db
                 .prepare(
                     `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)

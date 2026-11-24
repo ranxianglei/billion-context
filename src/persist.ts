@@ -2892,13 +2892,15 @@ export class SessionStore {
     /** #7577 D5 / review (c): egress-on sessions have no checkpoint substrate
      *  (checkpoints are retired for them), so the admin "create replica" path
      *  FORKS THE SESSION TO NOW instead — a full copy as of the current
-     *  shared high water: the four egress op-log tables (the content
-     *  authority) plus the unified kernel-state rows. The child is a new,
-     *  loadable session; the parent is never mutated. Forking at an EARLIER
-     *  op_seq is deliberately NOT supported: the unified kernel-state rows
-     *  only exist at *now*, so a point below the high water would pair
-     *  content-at-X with kernel-state-at-now (inconsistent). That needs the
-     *  point-reconstruction materializer — a follow-up, not this PR. */
+     *  flow high water (the FLOW clock is the reference clock — dual clocks,
+     *  owner ruling 2026-11-24): the four egress op-log tables (the content
+     *  authority; block rows align via their flow_op_seq pointer) plus the
+     *  unified kernel-state rows. The child is a new, loadable session; the
+     *  parent is never mutated. Forking at an EARLIER op_seq is deliberately
+     *  NOT supported: the unified kernel-state rows only exist at *now*, so a
+     *  point below the high water would pair content-at-X with
+     *  kernel-state-at-now (inconsistent). That needs the point-reconstruction
+     *  materializer — a follow-up, not this PR. */
     async forkEgressSnapshot(sessionId: string, childId?: string): Promise<{ childId: string; opSeq: number }> {
         await this.ready();
         // Resident if it is actively loaded; otherwise load the persisted
@@ -2934,10 +2936,12 @@ export class SessionStore {
             pendingRetrievals: [],
         };
         await this.persistForkSession(sessionId, child);
-        // #7577 (c-fix): report the SHARED high water (egress_flow +
-        // egress_block_flow) — the message-only max under-reports the child's
-        // true clock when the parent's last turn wrote block rows.
-        const opSeq = this.egressOpLogStore()?.egressBlockMaxSeq(cid) ?? 0;
+        // #7577 (dual clocks, owner ruling 2026-11-24): report the FLOW high
+        // water (egress_flow's MAX) — the reference clock for point forks.
+        // Block rows align to it via their flow_op_seq pointer; the block
+        // table's own op_seq space is self-contained and not part of the
+        // watermark.
+        const opSeq = this.egressOpLogStore()?.egressStateMaxSeq(cid) ?? 0;
         return { childId: cid, opSeq };
     }
 

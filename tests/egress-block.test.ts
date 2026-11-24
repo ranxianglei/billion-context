@@ -30,7 +30,7 @@ import {
     type EgressBlockOp,
     type EgressBlockSnapshot,
 } from "../src/storage/egress-block.ts";
-import { egressAppendTurn } from "../src/storage/egress-state.ts";
+import { egressAppendTurn, egressStateView, egressStateAt } from "../src/storage/egress-state.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-egress-block-hermetic-"));
@@ -141,28 +141,44 @@ test("reap semantics: terminal U row (reaped=1) instead of DELETE", () => {
     } finally { close(H); }
 });
 
-test("point fork: 4-table copy preserves op_seq, child inherits parent number space", () => {
+test("point fork: the block set aligns to the FLOW watermark via flow_op_seq (dual clocks)", () => {
     const H = open();
     try {
         const P = "parent";
-        const C = "child";
+        // flow point 1
+        egressAppendTurn(H.db, P, [
+            { type: "I", msgid: "m00001", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "a" },
+        ], 1_000, { baseSeq: 0 });
+        // block born — its flow_op_seq pointer is 1 (flow's MAX at write time)
         egressBlockAppend(H.db, P, [
             { type: "I", blockId: "b1", snapshot: snap() },
-        ], null, 1_000);
+        ], null, 1_500);
+        // flow point 2
+        egressAppendTurn(H.db, P, [
+            { type: "I", msgid: "m00002", after: "m00001", ref: "m00002", tokens: 4, typeTag: "text", bytes: "b" },
+        ], 2_000, { baseSeq: 1 });
+        // block updated at flow point 2
         egressBlockAppend(H.db, P, [
             { type: "U", blockId: "b1", snapshot: snap({ active: false }) },
-        ], null, 2_000);
-        // fork at op_seq 1
-        egressPointFork(H.db, P, C, 1);
-        const childView = egressBlockView(H.db, C);
+        ], null, 2_500);
+        // pointer sanity: I row → 1, U row → 2
+        const ptrs = H.db.prepare("SELECT row_type, flow_op_seq FROM egress_block_flow WHERE session_id = ? ORDER BY op_seq").all(P) as { row_type: string; flow_op_seq: number }[];
+        assert.deepEqual(ptrs.map((r) => [r.row_type, r.flow_op_seq]), [["I", 1], ["U", 2]]);
+        // fork at FLOW watermark 1 → only the I row is in scope (flow_op_seq <= 1)
+        egressPointFork(H.db, P, "child", 1);
+        const childView = egressBlockView(H.db, "child");
         assert.equal(childView.size, 1);
         assert.equal(childView.get("b1")!.active, true);
-        // child's op_seq should start after parent's op_seq 1
-        egressBlockAppend(H.db, C, [
+        // fork-to-now at FLOW watermark 2 (parent's flow MAX) → includes the U
+        egressPointFork(H.db, P, "child2", 2);
+        assert.equal(egressBlockView(H.db, "child2").get("b1")!.active, false);
+        // the child's block clock is ITS OWN: it inherited block op 1, so the
+        // next append numbers op 2 in the child's space (independent of the
+        // parent's block clock position)
+        egressBlockAppend(H.db, "child", [
             { type: "I", blockId: "b2", snapshot: snap({ tier: 2 }) },
         ], null, 3_000);
-        const childView2 = egressBlockView(H.db, C);
-        assert.equal(childView2.size, 2);
+        assert.equal(egressBlockView(H.db, "child").size, 2);
     } finally { close(H); }
 });
 
@@ -170,38 +186,37 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
     const H = open();
     try {
         const P = "parent-a";
-        // two message turns on the shared clock (op 1, 2)
+        // two message turns (flow ops 1, 2)
         egressAppendTurn(H.db, P, [
             { type: "I", msgid: "m00001", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "hello" },
         ], 1_000, { baseSeq: 0 });
         egressAppendTurn(H.db, P, [
             { type: "I", msgid: "m00002", after: "m00001", ref: "m00002", tokens: 4, typeTag: "text", bytes: "there" },
         ], 2_000, { baseSeq: 1 });
-        // a block birth (op 3 on the shared clock)
+        // a block birth (block op 1 on the block's OWN clock; flow_op_seq 2)
         egressBlockAppend(H.db, P, [{ type: "I", blockId: "blk_1", snapshot: snap() }], null, 3_000);
         // a fold: delete both messages → compaction in the same write
         egressAppendTurn(H.db, P, [
             { type: "D", start: "m00001", end: "m00002" },
-        ], 4_000, { baseSeq: 3 });
+        ], 4_000, { baseSeq: 2 });
 
-        const parentMax = Math.max(
-            (H.db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(P) as { m: number }).m,
-            (H.db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_block_flow WHERE session_id = ?").get(P) as { m: number }).m,
-        );
+        // The FLOW clock is the reference clock for fork watermarks (dual
+        // clocks) — the block table's own op_seq space is self-contained.
+        const parentMax = (H.db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(P) as { m: number }).m;
         const C = "child-a";
         egressPointFork(H.db, P, C, parentMax);
 
         // every one of the four tables is byte-identical to the parent's
         for (const [table, cols] of [
             ["egress_flow", "op_seq, log_seq, row_type, msgid, payload, bytes, created_at"],
-            ["egress_block_flow", "op_seq, row_type, block_id, payload, kstate_json, created_at"],
+            ["egress_block_flow", "op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at"],
             ["egress_state", "op_seq, log_seq, row_type, msgid, payload, bytes, created_at"],
-            ["egress_block_state", "block_id, op_seq, payload, created_at"],
+            ["egress_block_state", "block_id, op_seq, flow_op_seq, payload, created_at"],
         ] as const) {
             const q = (id: string) => H.db.prepare(`SELECT ${cols} FROM ${table} WHERE session_id = ? ORDER BY 1, 2`).all(id);
             assert.deepEqual(q(C), q(P));
         }
-        // the child continues the shared clock past the parent's high water
+        // the child continues the FLOW clock past the parent's high water
         egressAppendTurn(H.db, C, [
             { type: "I", msgid: "m00009", after: null, ref: "m00009", tokens: 2, typeTag: "text", bytes: "after fork" },
         ], 9_000, { baseSeq: parentMax });
@@ -209,9 +224,11 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
         assert.equal(childMax, parentMax + 1);
         assert.equal(egressBlockView(H.db, C).get("blk_1")!.active, true);
 
-        // a TRUE point fork (wm < high water) replays: tables truncated at wm.
-        // A separate NON-compacted parent, so rows 1,2 still exist to truncate at
-        // (the fold above already truncated P's flow to its B base row).
+        // a TRUE point fork (wm < flow high water) replays: tables truncated
+        // at the FLOW watermark; block rows align via flow_op_seq.
+        // A separate NON-compacted parent, so rows 1,2 still exist to
+        // truncate at (the fold above already truncated P's flow to its B
+        // base row).
         const P2 = "parent-a2";
         egressAppendTurn(H.db, P2, [
             { type: "I", msgid: "m00001", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "hello" },
@@ -219,11 +236,75 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
         egressAppendTurn(H.db, P2, [
             { type: "I", msgid: "m00002", after: "m00001", ref: "m00002", tokens: 4, typeTag: "text", bytes: "there" },
         ], 2_000, { baseSeq: 1 });
+        // blk_1's flow_op_seq pointer is 2 — it "exists at flow point 2"
         egressBlockAppend(H.db, P2, [{ type: "I", blockId: "blk_1", snapshot: snap() }], null, 3_000);
         const C2 = "child-a-point";
-        egressPointFork(H.db, P2, C2, 2); // before the block birth (op 3)
-        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?").get(C2) as { c: number }).c, 2);
-        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_block_flow WHERE session_id = ?").get(C2) as { c: number }).c, 0, "the block was born at op 3, past wm");
+        egressPointFork(H.db, P2, C2, 1); // at flow point 1, before the block's flow point
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?").get(C2) as { c: number }).c, 1);
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_block_flow WHERE session_id = ?").get(C2) as { c: number }).c, 0, "the block's flow point is 2, past wm=1");
+        // at flow point 2 the block IS in scope
+        const C3 = "child-a-point2";
+        egressPointFork(H.db, P2, C3, 2);
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_block_flow WHERE session_id = ?").get(C3) as { c: number }).c, 1);
+    } finally { close(H); }
+});
+
+test("interleave regression (the review-critical bug): flow stays DENSE when message and block ops alternate", () => {
+    const H = open();
+    try {
+        const S = "sess-interleave";
+        // turn 1: two messages
+        egressAppendTurn(H.db, S, [
+            { type: "I", msgid: "m00001", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "a" },
+            { type: "I", msgid: "m00002", after: "m00001", ref: "m00002", tokens: 4, typeTag: "text", bytes: "b" },
+        ], 1_000, { baseSeq: 0 });
+        // a fold turn lands a block at SAVE time (production write order:
+        // message rows at prepare, block rows at save)
+        egressBlockAppend(H.db, S, [{ type: "I", blockId: "blk_1", snapshot: snap() }], null, 1_500);
+        // turn 2: a NEW message after the block rows — under the OLD shared
+        // clock this row would have landed at op 4 (block took op 3), and
+        // applyOps' density check (`op_seq === prevSeq + 1`) threw "jumps
+        // from 2 to 4" on every subsequent egress read.
+        egressAppendTurn(H.db, S, [
+            { type: "I", msgid: "m00003", after: "m00002", ref: "m00003", tokens: 5, typeTag: "text", bytes: "c" },
+        ], 2_000, { baseSeq: 2 });
+        // ALL egress reads must work on the interleaved session — this is
+        // exactly what broke in production (read threw, recoverEgressBase
+        // truncated the just-written row every turn, the log froze).
+        const view = egressStateView(H.db, S);
+        assert.deepEqual(view.map((r) => r.msgid), ["m00001", "m00002", "m00003"]);
+        const at2 = egressStateAt(H.db, S, 2);
+        assert.deepEqual(at2.map((r) => r.msgid), ["m00001", "m00002"]);
+        // the flow table itself is dense: 1,2,3 — the block rows never
+        // consumed a flow number
+        const seqs = (H.db.prepare("SELECT op_seq FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { op_seq: number }[]).map((r) => r.op_seq);
+        assert.deepEqual(seqs, [1, 2, 3]);
+        // the block table numbered ITSELF: its own op 1, flow pointer 2
+        const blk = H.db.prepare("SELECT op_seq, flow_op_seq FROM egress_block_flow WHERE session_id = ?").get(S) as { op_seq: number; flow_op_seq: number };
+        assert.equal(blk.op_seq, 1);
+        assert.equal(blk.flow_op_seq, 2);
+    } finally { close(H); }
+});
+
+test("corrupt: a gap in the block table's OWN op_seq is reported (density)", () => {
+    const H = open();
+    try {
+        const S = "sess-block-density";
+        egressBlockAppend(H.db, S, [
+            { type: "I", blockId: "b1", snapshot: snap() },
+        ], null, 1_000);
+        egressBlockAppend(H.db, S, [
+            { type: "I", blockId: "b2", snapshot: snap({ tier: 2 }) },
+        ], null, 2_000);
+        egressBlockAppend(H.db, S, [
+            { type: "I", blockId: "b3", snapshot: snap({ tier: 3 }) },
+        ], null, 3_000);
+        // delete the MIDDLE block row (op 2) → a gap inside the replay
+        // window (rows 1,3) that must be reported (the block flow is
+        // append-only, so its own sequence is always dense; a gap means a
+        // missing row)
+        H.db.prepare("DELETE FROM egress_block_flow WHERE session_id = ? AND op_seq = 2").run(S);
+        assert.throws(() => egressBlockReplay(H.db, S, 3), EgressBlockCorruptError);
     } finally { close(H); }
 });
 

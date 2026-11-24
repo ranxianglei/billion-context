@@ -137,21 +137,19 @@ function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: 
     // compaction, so the flow maxima ARE the session's high-waters: the
     // op_seq ordering cursor and the canonical message-number cursor (I
     // rows only — B/D/U carry NULL and never advance it).
-    // #7577: the block lifecycle log (egress_block_flow) shares the SAME
-    // op_seq append clock as egress_flow (one turn writes both logs), so the
-    // op_seq cursor is the MAX over BOTH tables — a block-only turn advances
-    // the clock, and a later message-only turn must continue past it. The
-    // log_seq (canonical message number) stays egress_flow-only: block rows
-    // carry no numbers.
+    // #7577 (owner ruling 2026-11-24): DUAL CLOCKS — the block lifecycle log
+    // numbers itself (egress_block_flow.op_seq dense within its own table,
+    // see egress-block.ts); its rows carry flow_op_seq as a POINTER to this
+    // clock (flow's MAX at write time) for cross-table alignment at point
+    // forks. The flow table keeps its exclusive number pool: the op_seq and
+    // log_seq cursors are egress_flow-only, and its density invariant
+    // (#7574) stays intact regardless of what the block table does.
     //
     // #7574: must be read INSIDE the append transaction, never before it.
     const row = db
         .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o, COALESCE(MAX(log_seq), 0) AS n FROM egress_flow WHERE session_id = ?")
         .get(sessionId) as { o: number; n: number } | undefined;
-    const block = db
-        .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_block_flow WHERE session_id = ?")
-        .get(sessionId) as { o: number } | undefined;
-    const head = Math.max(Number(row?.o) || 0, Number(block?.o) || 0);
+    const head = Number(row?.o) || 0;
     let high = Number(row?.n) || 0;
     if (high === 0 && head > 0) {
         // No I row is left above the newest base (a compaction removes the

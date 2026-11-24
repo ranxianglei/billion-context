@@ -832,12 +832,12 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             // exist at now — an earlier point would pair content-at-X with
             // kernel-state-at-now, which is inconsistent).
             if (resident && resident.metadata["egressAuthority"] === true) {
-                // #7577 (c-fix): the high water is the SHARED op_seq clock —
-                // egressStateMaxSeq only sees egress_flow, so an opSeq between
-                // the message max and the shared max (a fold turn writes block
-                // rows after the message rows) would have been forked to now
-                // in silence instead of rejected.
-                const highWater = store.egressOpLogStore()?.egressBlockMaxSeq(parsed.sessionId) ?? 0;
+                // #7577 (dual clocks, owner ruling 2026-11-24): the point-fork
+                // watermark is the FLOW clock — egressStateMaxSeq (egress_flow's
+                // own MAX). Block rows carry their own op_seq clock plus a
+                // flow_op_seq pointer, so they align to this watermark with no
+                // separate high-water to chase.
+                const highWater = store.egressOpLogStore()?.egressStateMaxSeq(parsed.sessionId) ?? 0;
                 if (parsed.opSeq !== undefined) {
                     if (typeof parsed.opSeq !== "number" || !Number.isInteger(parsed.opSeq) || parsed.opSeq < 0) {
                         res.writeHead(400, { "content-type": "application/json" });

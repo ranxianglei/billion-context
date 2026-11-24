@@ -485,9 +485,14 @@ CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msg
  *  op_seq aligns the message view and the block set. Probe-first, no version
  *  bump (the tables never shipped, like the egress pair). */
 const EGRESS_BLOCK_DDL = `-- #7577: block lifecycle log (flow + state), self-contained bytes, kstate sidecar.
+-- Dual clocks (owner ruling 2026-11-24): the block tables number THEMSELVES
+-- (op_seq dense within egress_block_flow); flow_op_seq is the pointer to the
+-- egress_flow clock (its MAX at write time) used for cross-table alignment at
+-- point forks. egress_flow keeps its own exclusive number pool — untouched.
 CREATE TABLE IF NOT EXISTS egress_block_flow (
     session_id TEXT NOT NULL,
     op_seq INTEGER NOT NULL,
+    flow_op_seq INTEGER NOT NULL DEFAULT 0,
     row_type TEXT NOT NULL CHECK (row_type IN ('B','I','U')),
     block_id TEXT,
     payload TEXT NOT NULL,
@@ -500,6 +505,7 @@ CREATE TABLE IF NOT EXISTS egress_block_state (
     session_id TEXT NOT NULL,
     block_id TEXT NOT NULL,
     op_seq INTEGER NOT NULL,
+    flow_op_seq INTEGER NOT NULL DEFAULT 0,
     payload TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (session_id, block_id)
@@ -587,7 +593,19 @@ export function migrateSchema(db: {
     const hasEgressBlockFlow = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_block_flow'")
         .get();
-    if (!hasEgressBlockFlow) db.exec(EGRESS_BLOCK_DDL);
+    const blockCols = hasEgressBlockFlow
+        ? (db.prepare("PRAGMA table_info(egress_block_flow)").all() as unknown as { name?: unknown }[]).map((c) => c.name)
+        : [];
+    if (!hasEgressBlockFlow || !blockCols.includes("flow_op_seq")) {
+        // Never-shipped dev table; a dev DB that created the old-shape
+        // (shared-clock) layout is dropped and recreated (one step, same
+        // #7574 rule). Data loss is the accepted dev cost.
+        db.transaction(() => {
+            db.exec("DROP TABLE IF EXISTS egress_block_flow");
+            db.exec("DROP TABLE IF EXISTS egress_block_state");
+            db.exec(EGRESS_BLOCK_DDL);
+        });
+    }
     // 2×2 (#5874 brief, element-level world): the L1 world carries the
     // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
     // session-level witness_probe. Pure additive probe-first ALTER (a dev
