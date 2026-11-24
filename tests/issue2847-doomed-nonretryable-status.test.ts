@@ -176,8 +176,10 @@ test("e2e #2847: a mathematically-doomed payload answers NON-retryable 4xx seman
         // Everything else pinned by #2490 stays byte-identical in meaning:
         assert.equal(parsed.error?.code, "preflight_compress_failed", "same structured error code");
         assert.equal(parsed.error?.retryable, false, "body still says retryable:false");
-        assert.match(parsed.error?.message ?? "", /~2[23]\d{5} bytes/, "the byte math is in the operator-facing message");
-        assert.match(parsed.error?.message ?? "", /NOT forwarded even for evidence/, "the remedy wording is present");
+        // #7261: the doom probe now defers to post-fold judgment, so the message
+        // comes from the failFast path (compression attempted but insufficient).
+        assert.match(parsed.error?.message ?? "", /preflight compression could not bring it under/, "the compression failure is in the operator-facing message");
+        assert.match(parsed.error?.message ?? "", /NOT forwarded/, "the payload was not forwarded to the upstream");
         // Behavior unchanged: the doomed payload NEVER reaches the upstream.
         assert.ok(calls.length === 1 && calls[0]!.contentChars < 50_000, `only the seed turn reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))})`);
     } finally {

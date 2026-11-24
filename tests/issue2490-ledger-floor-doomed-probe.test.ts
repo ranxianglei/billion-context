@@ -290,10 +290,13 @@ test("e2e #2490 b: multi-MB core text beyond both doom bars fails fast instead o
         // #2847: 413 (was 502) — a mathematically-determined rejection must be
         // non-retryable at the status-code layer, or status-driven hosts retry
         // the identical doomed payload (3 crashes in 10s in the field).
-        assert.equal(r.status, 413, "doomed probe fails fast with NON-retryable 4xx semantics, not forwarded");
+        assert.equal(r.status, 413, "doomed payload fails fast with NON-retryable 4xx semantics, not forwarded");
         const body = await r.text();
-        assert.match(body, /~22\d{5} bytes/, "the byte math is in the operator-facing message");
-        assert.match(body, /NOT forwarded even for evidence/, "the remedy wording is present");
+        // #7261: the doom probe now defers to post-fold judgment, so the message
+        // comes from the failFast path (compression attempted but insufficient)
+        // rather than the old doom-probe byte-math wording.
+        assert.match(body, /preflight compression could not bring it under/, "the compression failure is in the operator-facing message");
+        assert.match(body, /NOT forwarded/, "the payload was not forwarded to the upstream");
 
         assert.ok(calls.length === 1 && calls[0]!.contentChars < 50_000, `only the seed turn reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))}) — never the 2.2MB payload`);
     } finally {

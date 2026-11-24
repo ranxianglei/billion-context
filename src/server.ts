@@ -4064,6 +4064,7 @@ export async function preflightCompressIfNeeded(
     // it never needs upstream evidence and must fold on the FIRST armed
     // request, so the #2313 estimate-only forward-once never skips it.
     const probeForEvidence = !growthArmed && !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
+    let doomProbeDeferred: { coreTextBytes: number; doomedMessage: string } | undefined;
     if (probeForEvidence) {
         // #2490: mathematically-doomed probe guard. The forward-once below bets
         // one request on "the estimator might be wrong about size"; that bet has
@@ -4094,37 +4095,36 @@ export async function preflightCompressIfNeeded(
         // path instead, without recording a persistent route refusal.
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
+            // #7261: the doom probe previously rejected here, BEFORE preflightCompress
+            // was ever attempted. The control experiment (same payload on a matching
+            // route → 200, foldable) proved the brick is entirely from the probe's
+            // route-anchored ordering, not the payload's compressibility. Defer the
+            // judgment to post-fold: run preflightCompress first, then re-check the
+            // doom threshold on the compressed result. If the fold cannot bring the
+            // payload under the threshold, the rejection still fires — but now it is
+            // a true "truly doomed" verdict, not a "we never tried" one.
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
-            log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(prepared.processedMessages)}`);
-            const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
-            // #2847: the rejection is mathematically deterministic, so the STATUS
-            // itself must carry the non-retryable semantics — a 502 says
-            // "transient gateway failure" to status-code-driven hosts and they
-            // retry the identical doomed payload anyway (field evidence: 3
-            // crashes in 10s, body `"retryable": false` notwithstanding; the
-            // 3rd attempt carried a 6.4MB payload after a representation flip).
-            // 413 mirrors the side-request guard's "cannot fit, NOT forwarded"
-            // convention and is terminal for every mainstream host. Same doom
-            // math, same message, same no-forward behavior — status only.
-            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
-            noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
-        }
-        const declaredWindow = typeof session.metadata.effectiveContextLimit === "number" && session.metadata.effectiveContextLimit > 0
-            ? session.metadata.effectiveContextLimit : 0;
-        const probeMeasurement = declaredWindow > 0 && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD"
-            ? measuredOutbound(prepared) : undefined;
-        const probeBlockedByEgress = probeMeasurement !== undefined
-            && probeMeasurement.tokens > Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
-        if (localRefusalHere) {
-            // #3846: bili already refused this scope locally — the estimate-only
-            // bet is spent. Fall through to fold/fail-fast instead of re-forwarding.
-            log("warn", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for evidence; falling through to fold/fail-fast (#3846)`);
-        } else if (probeBlockedByEgress) {
-            log("info", `[${session.id}] estimate-only probe would be refused by the local egress window fuse (~${Math.round(probeMeasurement!.tokens)} tokens); folding before forwarding instead of probing (#2313/#4079)`);
+            log("warn", `[${session.id}] preflight doom probe would reject (coreTextBytes=${coreTextBytes} > threshold ${Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)}) — deferring to post-fold judgment (#7261)`);
+            const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); preflight compression was attempted but could not reduce the payload below the doom threshold. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            doomProbeDeferred = { coreTextBytes, doomedMessage };
+            log("warn", `[${session.id}] preflight doom probe core-text profile: ${describeCoreTextDuplication(prepared.processedMessages)}`);
         } else {
-            log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
-            return prepared;
+            const declaredWindow = typeof session.metadata.effectiveContextLimit === "number" && session.metadata.effectiveContextLimit > 0
+                ? session.metadata.effectiveContextLimit : 0;
+            const probeMeasurement = declaredWindow > 0 && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD"
+                ? measuredOutbound(prepared) : undefined;
+            const probeBlockedByEgress = probeMeasurement !== undefined
+                && probeMeasurement.tokens > Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
+            if (localRefusalHere) {
+                // #3846: bili already refused this scope locally — the estimate-only
+                // bet is spent. Fall through to fold/fail-fast instead of re-forwarding.
+                log("warn", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for evidence; falling through to fold/fail-fast (#3846)`);
+            } else if (probeBlockedByEgress) {
+                log("info", `[${session.id}] estimate-only probe would be refused by the local egress window fuse (~${Math.round(probeMeasurement!.tokens)} tokens); folding before forwarding instead of probing (#2313/#4079)`);
+            } else {
+                log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
+                return prepared;
+            }
         }
     }
     // #3146: judge fit on the calibrated CJK-aware estimate for EVERY regime —
@@ -4369,6 +4369,23 @@ export async function preflightCompressIfNeeded(
     // #726: a preflight that did not end in failure clears any dead-end marker
     // — the state changed (conversation shrank, upstream recovered).
     if (!result.failure) delete session.metadata.preflightDeadEnd; // (#4079) legacy #726 field: purge any persisted marker so upgraded sessions start clean
+    // #7261: post-fold doom probe judgment. The pre-fold doom probe (above)
+    // deferred its rejection when the payload was over the threshold, so that
+    // preflightCompress could attempt to fold it. Now that the fold has run,
+    // re-check: if the post-fold payload is STILL over the doom threshold, the
+    // rejection fires — but now it is a true "truly doomed" verdict. If the fold
+    // brought it under the threshold, we proceed to the normal forward/fail-fast
+    // logic below.
+    if (doomProbeDeferred && !result.failure) {
+        const postFoldBytes = Math.round(result.payloadEstimate * DOOMED_PROBE_BYTES_PER_TOKEN);
+        const doomThreshold = Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN);
+        if (postFoldBytes > doomThreshold) {
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomProbeDeferred.doomedMessage} (post-fold estimate ~${postFoldBytes} bytes)`);
+            noteLocalRefusal(session, currentOrigin, model, limit);
+            return { failFast: true, status: 413, message: doomProbeDeferred.doomedMessage, retryable: false, respond: !res.writableEnded };
+        }
+        log("info", `[${session.id}] preflight doom probe deferred: post-fold estimate ~${postFoldBytes} bytes is under the doom threshold ${doomThreshold} — proceeding (#7261)`);
+    }
     // #2662: zero progress caused purely by queue drops (batches submitted, no
     // attempt dispatched) is scheduler congestion, not a chain failure — it
     // must not burn 10 minutes of auto-fold. Undefined for classic preflights.
