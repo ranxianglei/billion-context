@@ -1,6 +1,6 @@
 # billion-context
 
-<p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a> | <a href="./README.ja.md">日本語</a></p>
+<p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a> | <a href="./README.ja.md">日本語</a> | <a href="./README.ko.md">한국어</a></p>
 
 <p align="center"><strong>Context-compression plugin</strong> — <em>billion-context is all you need.</em></p>
 
@@ -729,9 +729,20 @@ bili sessions restore <id>       # bring an archived session back from the log l
 bili sessions foreign-blocks     # (#5312) list fold blocks whose covered messages never belonged to this transcript — dry-run; --apply reversibly archives them, --restore <sid>:<bid> brings one back
 bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
                                  # print the sweep plan (sessions past retention, zero-ref content rows, ~pages reclaimable), then run the same gc() the HTTP endpoint calls; --dry-run stops after the plan
+bili storage backup [--keep N]   # online-consistent index.db snapshot into <sessions>/backups/ (VACUUM INTO —
+                                 # never rewrites the source, no exclusive lock, safe while a proxy runs); the
+                                 # snapshot is quick_check-verified before it counts; keeps the newest N (default 3)
+bili storage repair [--from f.db] # with --from: verify the backup (quick_check + readable sessions), quarantine the
+                                 # broken index.db IN PLACE (index.db.corrupt-<ts>, evidence kept), copy the backup in
+                                 # (the backup itself stays untouched), verify again; without --from: salvage the
+                                 # corrupt file row-by-row into a freshly-migrated schema (bisects broken page ranges
+                                 # to single rows; a corrupt overflow cell nulls its own column, the rest of the row
+                                 # survives). Both swap paths refuse to run while another live process holds index.db.lock.
 ```
 
 `archive`/`restore`/`gc` require the unified store (`BILI_STORAGE_UNIFIED=sqlite|shadow|full` or `storage.unified` in the config file — the default is now pure sqlite) — legacy-only installs refuse with a hint. `--days` defaults to `storage.archiveAfterDays` (365). No scheduler: these run on demand. All commands accept `--json`.
+
+**Backup & repair (#7156, 2026-11-20 production incident).** A 3.2 GB index.db proved corrupt (foreign second writer, #7156) and the only recovery path was a hand-rolled `.recover`-equivalent plus manual file surgery — those two manual moves are now the `backup`/`repair` commands above. Operational discipline that keeps the incident from recurring: run `bili storage backup` on a schedule (the retention flag is the only state it keeps), and keep **exactly one** long-lived bili process per sessions dir — a second live writer is the corruption mode, and every storage command now detects a live foreign writer and refuses rather than contending.
 
 **Full vacuum is an offline operation on large databases (#4612).** `--vacuum full` (the default) rewrites the entire index.db under an exclusive write lock — O(db size), minutes to tens of minutes on multi-GB databases, with no intermediate progress (SQLite's VACUUM is atomic; it cannot be split). Running it while a proxy is serving from the same sessions dir starves that proxy's writes until its storage layer degrades, so `storage gc --vacuum full` **refuses to start when another live process holds the database** (`index.db.lock` pid discipline, #4175): the CLI exits 1 with an actionable message, the panel endpoint returns HTTP 409. Stop the other instance first (or wait for it to exit) and retry; for online-safe shrink use `--vacuum incremental`, which reclaims freed pages in short transactions without taking the exclusive lock. The zero-ref delete sweep itself is batched with per-batch progress output either way.
 

@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { dshBundleShadowWarning, globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
@@ -669,4 +669,96 @@ test("#1577: bili doctor reports a clean advisory state as 'none' and a failed s
     } finally {
         rmrf(base);
     }
+});
+
+// #6816: `bili doctor` warns when the built-in Claude Agent provider is
+// available but not routed through bili. RED first: no implementation yet.
+// The opencode lane is advisory-only: warnings never change the verdict.
+
+async function opencodeLaneFor6816(t: import("node:test").TestContext, opts: { version: string | null; providers?: Record<string, unknown> }): Promise<DoctorLane | undefined> {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-6816-"));
+    const ocCfg = path.join(base, "opencode.json");
+    const shimDir = path.join(base, "plugins", "billion-context");
+    // The lane verdict is "broken" when its target is missing, so materialize
+    // the shim the config entry points at (no package.json: no stale check).
+    mkdirSync(shimDir, { recursive: true });
+    writeFileSync(path.join(shimDir, "index.js"), "export default {};\n");
+    const ocData: Record<string, unknown> = { plugins: [shimDir] };
+    if (opts.providers !== undefined) ocData.providers = opts.providers;
+    writeFileSync(ocCfg, JSON.stringify(ocData, null, 2));
+    let bin: string;
+    if (opts.version !== null) {
+        bin = path.join(base, "fake-opencode");
+        writeFileSync(bin, `#!/bin/sh\necho 'opencode ${opts.version}'\n`);
+        chmodSync(bin, 0o755);
+    } else {
+        bin = "/nonexistent/bili-oc-6816-pin";
+    }
+    t.after(() => rmrf(base));
+    let lane: DoctorLane | undefined;
+    await mockFetch(() => new Response(JSON.stringify({ name: "billion-context", version: "999.0.0" }), { status: 200, headers: { "Content-Type": "application/json" } }))(async () => {
+        await withEnv({
+            HOME: path.join(base, "home"),
+            XDG_CONFIG_HOME: path.join(base, "xdg-config"),
+            XDG_DATA_HOME: path.join(base, "xdg-data"),
+            XDG_CACHE_HOME: path.join(base, "xdg-cache"),
+            XDG_STATE_HOME: path.join(base, "xdg-state"),
+            PI_CODING_AGENT_DIR: undefined, PI_HOME: undefined, DSH_HOME: undefined,
+            HERMES_HOME: undefined, KIMI_CODE_HOME: undefined, CODEX_HOME: undefined,
+            CLAUDE_CONFIG_DIR: undefined,
+            OPENCODE_CONFIG: ocCfg,
+            BILI_CLIENT_BIN: bin,
+        }, async () => {
+            const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143" });
+            lane = report.lanes.find((l) => l.agent === "opencode");
+        });
+    });
+    return lane;
+}
+
+test("#6816 doctor warns when the Claude Agent provider has no baseURL on a 2.x host", async (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const oc = await opencodeLaneFor6816(t, { version: "2.3.0" });
+    assert.equal(oc?.installed, true);
+    assert.equal(oc?.verdict, "ok", "advisory only — the warning must not flip the verdict");
+    assert.ok(oc?.warnings?.some((w) => w.includes("claude-agent") && w.includes("not routed")), `warnings: ${JSON.stringify(oc?.warnings)}`);
+});
+
+test("#6816 doctor stays silent when the Claude Agent provider is routed at the live lane port", async (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const oc = await opencodeLaneFor6816(t, { version: "2.3.0", providers: { "claude-agent": { settings: { baseURL: "http://127.0.0.1:18787/bili/https://api.anthropic.com" } } } });
+    assert.equal(oc?.verdict, "ok");
+    assert.ok(!oc?.warnings?.some((w) => w.includes("claude-agent")), `no claude-agent warning when routed: ${JSON.stringify(oc?.warnings)}`);
+});
+
+test("#6816 doctor warns when the Claude Agent provider points at a foreign baseURL", async (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const oc = await opencodeLaneFor6816(t, { version: "2.3.0", providers: { "claude-agent": { settings: { baseURL: "https://proxy.example.com/anthropic" } } } });
+    assert.equal(oc?.verdict, "ok", "advisory only");
+    assert.ok(oc?.warnings?.some((w) => w.includes("claude-agent") && w.includes("bypass")), `warnings: ${JSON.stringify(oc?.warnings)}`);
+});
+
+test("#6816 doctor warns when the Claude Agent baseURL points at a stale port", async (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const oc = await opencodeLaneFor6816(t, { version: "2.3.0", providers: { "claude-agent": { settings: { baseURL: "http://127.0.0.1:18788/bili/https://api.anthropic.com" } } } });
+    assert.equal(oc?.verdict, "ok", "advisory only");
+    assert.ok(oc?.warnings?.some((w) => w.includes("claude-agent") && w.includes("stale port")), `warnings: ${JSON.stringify(oc?.warnings)}`);
+});
+
+test("#6816 doctor stays silent on a 1.x host: no built-in Claude Agent provider there", async (t) => {
+    const oc = await opencodeLaneFor6816(t, { version: null });
+    assert.equal(oc?.installed, true);
+    assert.ok(!oc?.warnings?.some((w) => w.includes("claude-agent")), `no claude-agent warning on 1.x: ${JSON.stringify(oc?.warnings)}`);
 });

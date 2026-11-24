@@ -181,6 +181,14 @@ export const workerResolveHost: WorkerProbe = (host) =>
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            if (msg?.error === "ETIMEDOUT") {
+                // #7407: the inner deadline won — the worker's getaddrinfo may
+                // still be queued in its libuv pool, keeping the one-shot
+                // thread (and a pool slot) alive. Same termination as the
+                // outer deadline; other failure codes mean the lookup already
+                // settled, and the worker drains and exits on its own.
+                try { void worker?.terminate().catch(() => undefined); } catch { /* already gone */ }
+            }
             if (msg && msg.ok === true && Array.isArray(msg.addrs)) resolve(msg.addrs);
             else reject(Object.assign(new Error(`worker dns lookup failed (${String(msg?.error ?? "unknown")})`), { code: typeof msg?.error === "string" && msg.error ? msg.error : "EWORKERLOOKUP" }));
         });

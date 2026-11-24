@@ -100,7 +100,9 @@ test("#3806 detectCompactionOverlayGap: missing service provide -> no-service-pr
 });
 
 test("#3354 registerCompactionDisable: transform honors the entry predicate and preserves siblings", () => {
-    type Mw = (raw: unknown, next: () => unknown) => unknown;
+    // #7112: cordis' real binding — `this` is null, the fiber is the FIRST
+    // argument; the mock calls below pass it there.
+    type Mw = (fiber: unknown, next: () => unknown) => unknown;
     let mw: Mw | undefined;
     let options: unknown;
     // #3662: the transform acts only while bili-native declared the lane owned.
@@ -119,8 +121,8 @@ test("#3354 registerCompactionDisable: transform honors the entry predicate and 
             { name: "@deepseek-ai/dsh-tool-result-pruner" },
         ];
         const cfg: Record<string, unknown> = { plugins, isolate: { compaction: true } };
-        const self = { entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } };
-        const out = mw?.call(null, self, () => cfg) as { plugins?: Array<Record<string, unknown>>; isolate?: Record<string, unknown> };
+        const presetFiber = { entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } };
+        const out = mw?.call(null, presetFiber, () => cfg) as { plugins?: Array<Record<string, unknown>>; isolate?: Record<string, unknown> };
         assert.deepEqual(out.isolate, { compaction: true });
         assert.equal(out.plugins?.[0]?.disabled, true);
         assert.equal(out.plugins?.[1]?.disabled, true);
@@ -135,7 +137,7 @@ test("#3354 registerCompactionDisable: transform honors the entry predicate and 
         assert.equal(mw?.call(null, { entry: { options: { name: "other-entry" } } }, () => untouched), untouched);
         assert.equal(mw?.call(null, undefined, () => untouched), untouched);
         // next() returning nothing → verbatim passthrough
-        assert.equal(mw?.call(null, self, () => undefined), undefined);
+        assert.equal(mw?.call(null, presetFiber, () => undefined), undefined);
     } finally {
         _resetDshCompactionVerdictForTest();
     }

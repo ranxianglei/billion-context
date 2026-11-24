@@ -16,7 +16,9 @@ import {
 // globalThis telemetry channel so the durable boot note can state actual
 // coverage (patch-row misses are otherwise loader-log-only).
 
-type Mw = (raw: unknown, next: () => unknown) => unknown;
+// #7112: cordis' real binding — `this` is null, the fiber (the name carrier)
+// is the FIRST argument; the mock calls below pass it there.
+type Mw = (fiber: unknown, next: () => unknown) => unknown;
 
 function middleware(): Mw {
     let mw: Mw | undefined;

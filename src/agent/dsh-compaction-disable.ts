@@ -34,6 +34,18 @@
 // bili-native can surface which entries the overlay actually covered (the
 // bundle-patch gate rows may target ids a profile does not ship — their miss
 // is otherwise visible only in the host loader log).
+// #7190: runtime-registered presets (a plugin calling
+// ctx.agentPresets.register(definition) from JS after boot) bypass EVERY
+// config layer: dsh's registry mounts the definition's nested rows straight
+// into its in-memory PresetTree without the internal/config transform the
+// loader runs, and no boot-time file can name a row that does not exist yet.
+// The register() wrap extends the SAME disable verdict to that birth point —
+// definition.plugins rows carrying compaction packages are rewritten to
+// disabled:true before the registry mounts them. Without it the preset's
+// compaction engine is fully armed (per-step pressure + model-switch
+// pre-compaction + overflow recovery) while bili's wire guard refuses every
+// call: the #7062 refusal storm, the #7178 model-switch dead-end, and the
+// #7169 landed-checkpoint rebase clobber are all that engine firing.
 
 /** The two dsh packages whose backends must not instantiate while bili owns the lane. */
 const DSH_COMPACTION_BASIC_PACKAGE = "@deepseek-ai/dsh-compaction-basic";
@@ -106,6 +118,11 @@ export type DshCompactionGateTelemetry = {
     /** True once at least one covered entry is the factory agent-preset
      *  package (the only entry the pre-#4147 name filter ever reached). */
     sawFactoryPreset: boolean;
+    /** #7190: runtime preset registrations rewritten at register(). */
+    runtime?: Array<{ entry: string; rows: number }>;
+    /** #7190: the register() wrap is installed — from here a runtime zero is
+     *  a covered zero, not an unknown. */
+    runtimeWrapped?: boolean;
 };
 
 function noteGateCoverage(entryName: string, rows: number, isFactory: boolean): void {
@@ -122,6 +139,30 @@ function noteGateCoverage(entryName: string, rows: number, isFactory: boolean): 
     store[DSH_COMPACTION_GATE_TELEMETRY_KEY] = telemetry;
 }
 
+/** #7190: record a runtime preset registration rewritten at register()
+ *  (same max-across-calls discipline as the load-time coverage). */
+function noteRuntimePresetCoverage(entry: string, rows: number): void {
+    if (rows === 0) return;
+    const store = globalThis as Record<string, unknown>;
+    const current = store[DSH_COMPACTION_GATE_TELEMETRY_KEY] as DshCompactionGateTelemetry | undefined;
+    const telemetry: DshCompactionGateTelemetry = current ?? { covered: [], sawFactoryPreset: false };
+    const runtime = telemetry.runtime ?? [];
+    const existing = runtime.find((r) => r.entry === entry);
+    if (existing === undefined) telemetry.runtime = [...runtime, { entry, rows }];
+    else if (rows > existing.rows) existing.rows = rows;
+    store[DSH_COMPACTION_GATE_TELEMETRY_KEY] = telemetry;
+}
+
+/** #7190: the register() wrap installed in this process. */
+function noteRuntimeWrapped(): void {
+    const store = globalThis as Record<string, unknown>;
+    const current = store[DSH_COMPACTION_GATE_TELEMETRY_KEY] as DshCompactionGateTelemetry | undefined;
+    const telemetry: DshCompactionGateTelemetry = current ?? { covered: [], sawFactoryPreset: false };
+    if (telemetry.runtime === undefined) telemetry.runtime = [];
+    telemetry.runtimeWrapped = true;
+    store[DSH_COMPACTION_GATE_TELEMETRY_KEY] = telemetry;
+}
+
 /** Coverage record of the #3354 load-time overlay in this process (null =
  *  the transform has not rewritten any entry yet). */
 export function dshCompactionGateTelemetry(): DshCompactionGateTelemetry | null {
@@ -132,6 +173,30 @@ export function dshCompactionGateTelemetry(): DshCompactionGateTelemetry | null 
 /** Test hook: forget any recorded coverage. */
 export function _resetDshCompactionGateTelemetryForTest(): void {
     delete (globalThis as Record<string, unknown>)[DSH_COMPACTION_GATE_TELEMETRY_KEY];
+}
+
+/** #6770: one-line coverage summary shared by the durable profile notes (#3962)
+ *  and bili-native's first-request log line. Pure over the record; "no entry
+ *  rewritten" is the honest frame because preset configs resolve lazily. */
+export function compactionCoverageText(telemetry: DshCompactionGateTelemetry | null = dshCompactionGateTelemetry()): string {
+    let base: string;
+    if (telemetry === null || telemetry.covered.length === 0) {
+        base = "no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later)";
+    } else {
+        const entries = telemetry.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
+        base = `${telemetry.covered.length} preset ${telemetry.covered.length === 1 ? "entry" : "entries"} rewritten (${entries})`;
+    }
+    // #7190: the runtime dimension is stated only once the wrap is known to be
+    // installed — an absent runtimeWrapped key (older gate, or a host without
+    // the registry) means "unknown", never "gap".
+    if (telemetry?.runtimeWrapped) {
+        const runtime = telemetry.runtime ?? [];
+        const fragment = runtime.length === 0
+            ? "register() covered — no runtime preset registrations so far"
+            : `${runtime.length} runtime preset ${runtime.length === 1 ? "registration" : "registrations"} rewritten (${runtime.map((r) => `${r.entry}\u00d7${r.rows}`).join(", ")})`;
+        base = `${base}; ${fragment}`;
+    }
+    return base;
 }
 
 type PresetRow = { name?: unknown; group?: unknown; config?: unknown };
@@ -168,11 +233,76 @@ export function disableBasicCompaction(rows: readonly unknown[]): unknown[] {
     });
 }
 
+// #7190: registered symbol so the wrap marker survives the bundle/host realm
+// split and a re-apply never double-wraps the same registry instance.
+const PRESET_REGISTER_WRAP_MARK = Symbol.for("bili.dshPresetRegisterWrapped");
+
+type PresetRegistry = { register?: (definition: unknown) => Promise<unknown> } & Record<string, unknown>;
+
+function presetRegistryOf(ctx: CompactionDisableHost): PresetRegistry | undefined {
+    if (ctx.agentPresets !== undefined) return ctx.agentPresets;
+    if (typeof ctx.get !== "function") return undefined;
+    const candidate = ctx.get("agentPresets");
+    return candidate === null || typeof candidate !== "object" ? undefined : candidate as PresetRegistry;
+}
+
+/**
+ * #7190: extend the #4147 disable verdict to a RUNTIME-registered preset
+ * definition. Pure and identity-preserving: no compaction row — or the lane
+ * not declared owned — returns the definition byte-for-byte untouched, so the
+ * registry's own validation and mount see exactly what they would without the
+ * wrap.
+ */
+export function disableRuntimePresetCompaction(definition: unknown): unknown {
+    if (definition === null || typeof definition !== "object") return definition;
+    const def = definition as { id?: unknown; plugins?: unknown };
+    if (typeof def.id !== "string" || !Array.isArray(def.plugins)) return definition;
+    if (!isDshCompactionActive()) return definition;
+    const rows = countCompactionRows(def.plugins as readonly unknown[]);
+    if (rows === 0) return definition;
+    noteRuntimePresetCoverage(def.id.slice(0, 120), rows);
+    return { ...def, plugins: disableBasicCompaction(def.plugins as readonly unknown[]) };
+}
+
+/**
+ * #7190: wrap agentPresets.register() so a preset definition born AFTER boot
+ * (the only path a runtime preset takes) carries the same disabled compaction
+ * rows the load-time overlay writes for stock presets. Idempotent per instance
+ * (Symbol-for mark); degrades silently when the host exposes no registry —
+ * a host without it cannot runtime-register presets, so nothing is uncovered.
+ */
+export function installRuntimePresetCoverage(ctx: CompactionDisableHost): void {
+    const registry = presetRegistryOf(ctx);
+    if (registry === undefined || typeof registry.register !== "function") return;
+    if ((registry as Record<PropertyKey, unknown>)[PRESET_REGISTER_WRAP_MARK] === true) return;
+    const original = registry.register;
+    registry.register = (definition: unknown) => original.call(registry, disableRuntimePresetCompaction(definition));
+    (registry as Record<PropertyKey, unknown>)[PRESET_REGISTER_WRAP_MARK] = true;
+    noteRuntimeWrapped();
+}
+
 export type CompactionDisableHost = {
     on?: (event: string, listener: (raw: unknown, next: () => unknown) => unknown, options?: { global?: boolean }) => void;
     reflect?: { provide?: (name: string, value: unknown) => void } | undefined;
+    // #7190: dsh's preset registry (service 'agentPresets') — present only on
+    // profiles that ship it; optional like every other host surface here.
+    agentPresets?: PresetRegistry | undefined;
+    // #7190: cordis' generic service accessor (returns undefined for a
+    // non-provided service, per dsh's own tool-subagent usage).
+    get?: (name: string) => unknown;
 };
 type MiddlewareSelf = { entry?: { options?: { name?: unknown } } | undefined };
+
+/** Entry option name carried by the fiber that owns a config resolution.
+ *  The host dispatches `internal/config` as `waterfall('internal/config',
+ *  fiber, next)` — the first argument is the event NAME, so cordis binds no
+ *  `this` (vendor/cordis/src/events.ts:163 → thisArg null) and the listener
+ *  receives `(fiber, next)`. Reading `this` therefore always yields
+ *  undefined; the name lives on the first argument. */
+export function entryNameOf(fiber: unknown): string | undefined {
+    const name = (fiber as MiddlewareSelf | undefined)?.entry?.options?.name;
+    return typeof name === "string" && name.length > 0 ? name : undefined;
+}
 
 /** Register the load-time overlay + publish the gate. Runs from the always-on
  *  gate entry's apply() (dsh-compaction-gate.ts, #3662) — NOT from bili-native,
@@ -215,7 +345,7 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             if (!Array.isArray(config.plugins)) return resolved;
             const compactionRows = countCompactionRows(config.plugins);
             if (compactionRows === 0) return resolved;
-            const rawName = (fiber as MiddlewareSelf | null | undefined)?.entry?.options?.name;
+            const rawName = entryNameOf(fiber);
             const entryName = typeof rawName === "string" ? rawName : "unnamed-entry";
             noteGateCoverage(entryName.slice(0, 120), compactionRows, entryName === DSH_AGENT_PRESET_PACKAGE);
             return { ...config, plugins: disableBasicCompaction(config.plugins) };
@@ -223,6 +353,12 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
     }
     // Publish only after the middleware is registered; the host owns both lifetimes.
     ctx.reflect?.provide?.(BILI_COMPACTION_DISABLE_SERVICE, Object.freeze({ owner: "billion-context", issue: "#3354" }));
+    // #7190: the register() wrap covers the one row population no config layer
+    // can reach — runtime preset definitions. Bundles apply in composition
+    // order (this entry is inserted before profile plugins), so the wrap is in
+    // place before a plugin's register() runs; the verdict is honored per call,
+    // and the wrap is idempotent across re-apply.
+    installRuntimePresetCoverage(ctx);
 }
 
 type CompactionOverlayGap = "no-config-hook" | "no-service-provide";
@@ -238,4 +374,37 @@ export function detectCompactionOverlayGap(ctx: CompactionDisableHost): Compacti
     if (typeof ctx.on !== "function") return "no-config-hook";
     if (typeof ctx.reflect?.provide !== "function") return "no-service-provide";
     return null;
+}
+type HostPlaneEntry = {
+    options?: { id?: unknown; name?: unknown; disabled?: unknown; config?: unknown } | undefined;
+};
+
+/** Rows whose `auto:false` the bundle patch no longer owns in the COMPOSED
+ *  tree: a dsh patch replaces a row's whole `config`, and `compaction-basic`
+ *  defaults `auto` to true, so any later layer that restates this row (a hand
+ *  written profile patch, a later bundle, a partial #2474 snapshot) silently
+ *  re-arms native auto-compaction. Disabled rows are stock web-profile
+ *  behaviour and are not reported. Returns the offending entry ids so the
+ *  caller can alarm; empty = the declaration survived. */
+export function hostPlaneRowsMissingAutoFalse(entries: Iterable<unknown>): string[] {
+    const lost: string[] = [];
+    for (const raw of entries) {
+        if (raw === null || typeof raw !== "object") continue;
+        const options = (raw as HostPlaneEntry).options;
+        if (options === undefined || options.name !== DSH_COMPACTION_BASIC_PACKAGE) continue;
+        if (options.disabled === true) continue;
+        const config = options.config;
+        const auto = config !== null && typeof config === "object" && !Array.isArray(config)
+            ? (config as { auto?: unknown }).auto
+            : undefined;
+        if (auto === false) continue;
+        lost.push(typeof options.id === "string" && options.id.length > 0 ? options.id : DSH_COMPACTION_BASIC_PACKAGE);
+    }
+    return lost;
+}
+
+/** One-line alarm for the rows hostPlaneRowsMissingAutoFalse reported. */
+export function hostPlaneOverrideLostWarning(entryIds: readonly string[]): string {
+    const rows = entryIds.map((id) => JSON.stringify(id)).join(", ");
+    return `bili: the host-plane compaction-basic override is GONE (entry ${rows}): a later patch layer replaced that row's whole config, so "auto" fell back to its default true and dsh native auto-compaction is ARMED again. Restate "auto: false" in the LAST patch row that touches id compaction-basic, or remove that override (a landed checkpoint destroys the fold base).`;
 }

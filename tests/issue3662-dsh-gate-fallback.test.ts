@@ -19,14 +19,14 @@ const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const GATE_INSERT = `- insert:\n    - id: bili-native\n      name: billion-context\n    - id: bili-compaction-gate\n      name: billion-context/dsh-compaction-gate\n`;
 
 type GateHost = {
-    on?: (event: string, listener: (raw: unknown, next: () => unknown) => unknown, options?: { global?: boolean }) => void;
+    on?: (event: string, listener: (fiber: unknown, next: () => unknown) => unknown, options?: { global?: boolean }) => void;
     reflect?: { provide?: (name: string, value: unknown) => void } | undefined;
 };
 function mockGateHost() {
     const order: string[] = [];
     const provided: Array<{ name: string; value: unknown }> = [];
     let onOptions: { global?: boolean } | undefined;
-    let mw: ((raw: unknown, next: () => unknown) => unknown) | undefined;
+    let mw: ((fiber: unknown, next: () => unknown) => unknown) | undefined;
     const host: GateHost = {
         on: (event, listener, options) => {
             order.push(`on:${event}`);
@@ -45,10 +45,12 @@ function mockGateHost() {
         globalFlag: () => onOptions?.global === true,
     };
 }
-const PRESET_SELF = { entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } };
+// #7112: the fiber is the FIRST listener argument (cordis binds no `this`);
+// the mock calls below pass it there, not as `this`.
+const PRESET_FIBER = { entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } };
 // #5245: the host-plane compaction-basic entry — its resolved config is the
 // plugin's own config, which the bundle patch replaces wholesale with {auto:false}
-const BASIC_SELF = { entry: { options: { name: "@deepseek-ai/dsh-compaction-basic" } } };
+const BASIC_FIBER = { entry: { options: { name: "@deepseek-ai/dsh-compaction-basic" } } };
 function presetPlugins(): Array<Record<string, unknown>> {
     return [
         { name: "@deepseek-ai/dsh-compaction-basic", config: { auto: true } },
@@ -94,10 +96,10 @@ test("#3662: bili-native absent (disabled / kill-switched) — service still pro
         // the four presets resolvable instead of pending forever
         const raw = m.middleware();
         assert.equal(typeof raw, "function");
-        const mw = raw as (raw: unknown, next: () => unknown) => unknown;
+        const mw = raw as (fiber: unknown, next: () => unknown) => unknown;
         const plugins = presetPlugins();
         const cfg: Record<string, unknown> = { plugins, x: 1 };
-        const out = mw.call(null, PRESET_SELF, () => cfg) as Record<string, unknown>;
+        const out = mw.call(null, PRESET_FIBER, () => cfg) as Record<string, unknown>;
         assert.equal(out, cfg, "absent verdict must pass the resolved config through verbatim");
         for (const row of plugins) assert.equal(row.disabled, undefined);
     } finally {
@@ -114,19 +116,19 @@ test("#5245: bili-native absent — the static bundle-patch auto:false line is u
         const mw = m.middleware() as (raw: unknown, next: () => unknown) => unknown;
         // the bundle patch replaced the host-plane row's config wholesale with {auto:false}
         const patched: Record<string, unknown> = { auto: false };
-        const out = mw.call(null, BASIC_SELF, () => patched) as Record<string, unknown>;
+        const out = mw.call(null, BASIC_FIBER, () => patched) as Record<string, unknown>;
         assert.notEqual(out, patched, "the patched row must be rewritten, not passed through");
         assert.deepEqual(out, { auto: true }, "host-plane auto compaction restored to stock");
         assert.equal(patched.auto, false, "the input config must not be mutated");
         const multi: Record<string, unknown> = { auto: false, foo: "bar" };
-        assert.deepEqual(mw.call(null, BASIC_SELF, () => multi), { auto: true, foo: "bar" }, "other keys survive the restore");
+        assert.deepEqual(mw.call(null, BASIC_FIBER, () => multi), { auto: true, foo: "bar" }, "other keys survive the restore");
         // negatives: nothing to restore ⇒ identity passthrough
         const stock: Record<string, unknown> = { auto: true };
-        assert.equal(mw.call(null, BASIC_SELF, () => stock), stock, "already-stock row passes through verbatim");
+        assert.equal(mw.call(null, BASIC_FIBER, () => stock), stock, "already-stock row passes through verbatim");
         const otherEntry: Record<string, unknown> = { auto: false };
         assert.equal(mw.call(null, { entry: { options: { name: "@deepseek-ai/dsh-other" } } }, () => otherEntry), otherEntry, "only the compaction-basic entry is targeted");
         const arr = [{ auto: false }];
-        assert.equal(mw.call(null, BASIC_SELF, () => arr), arr, "array configs are not a compaction-basic shape");
+        assert.equal(mw.call(null, BASIC_FIBER, () => arr), arr, "array configs are not a compaction-basic shape");
     } finally {
         _resetDshCompactionVerdictForTest();
     }
@@ -140,7 +142,7 @@ test("#5245: verdict active — the static line stays authoritative, host plane 
         gate.apply(m.host);
         const mw = m.middleware() as (raw: unknown, next: () => unknown) => unknown;
         const patched: Record<string, unknown> = { auto: false };
-        assert.equal(mw.call(null, BASIC_SELF, () => patched), patched, "active verdict leaves the host-plane row exactly as the patch wrote it");
+        assert.equal(mw.call(null, BASIC_FIBER, () => patched), patched, "active verdict leaves the host-plane row exactly as the patch wrote it");
     } finally {
         _resetDshCompactionVerdictForTest();
     }
@@ -155,10 +157,10 @@ test("#3662: normal boot (verdict active) — the gate entry disables the compac
         assert.deepEqual(m.provided.map((p) => p.name), [BILI_COMPACTION_DISABLE_SERVICE]);
         const raw = m.middleware();
         assert.equal(typeof raw, "function");
-        const mw = raw as (raw: unknown, next: () => unknown) => unknown;
+        const mw = raw as (fiber: unknown, next: () => unknown) => unknown;
         const plugins = presetPlugins();
         const cfg: Record<string, unknown> = { plugins, x: 1 };
-        const out = mw.call(null, PRESET_SELF, () => cfg) as { plugins?: Array<Record<string, unknown>>; x?: number };
+        const out = mw.call(null, PRESET_FIBER, () => cfg) as { plugins?: Array<Record<string, unknown>>; x?: number };
         assert.equal(out.x, 1);
         assert.deepEqual(out.plugins?.[0]?.config, { auto: true });
         assert.equal(out.plugins?.[0]?.disabled, true);
