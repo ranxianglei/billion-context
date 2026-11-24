@@ -142,6 +142,7 @@ billion-context/
 │   ├── registry-snapshot.json    # Bundled full models.dev snapshot (offline floor)
 │   ├── session.ts                # Session model + in-memory store (bounded, MAX_SESSIONS)
 │   ├── session-id.ts             # Session identity: client value verbatim + persona fork fingerprint
+│   ├── session-title.ts          # Subagent dispatch prompt: prefix matcher + task strip for titles (#7590)
 │   ├── claude-lane-token.ts      # SubagentStart lane-token grammar (mint/extract, #5095)
 │   ├── session-resolve.ts        # #2944/#7525-GA order resolver: stamped id rides verbatim; #5095 lane-token fork
 │   ├── session-gc.ts             # Session-file GC, opt-in (sessions.gc.* / BILI_SESSION_GC*) (#1082)
