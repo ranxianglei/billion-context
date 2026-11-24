@@ -612,9 +612,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             signature: delta.signature,
                             raw: remapIndexInEvent(eventStr, ci),
                         } as ParsedStreamEvent;
-                    } else if (round === 1) {
+                    } else if (round === 1 || indexMap.has(upstreamIndex)) {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: round === 1 } as ParsedStreamEvent;
                     }
                 } else if (type === "content_block_stop") {
                     const upstreamIndex = (data.index as number) ?? 0;
