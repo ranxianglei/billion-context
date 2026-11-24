@@ -406,8 +406,13 @@ export type CompressSettings = {
      *  mcp catalog, agents-md baseline, runtime-context snapshot), so the
      *  same pattern machinery governs them: `"durable/*"` keeps the LATEST
      *  instance of every carrier (all four are cumulative snapshots — the
-     *  older catalogs/baselines fold away). Default when nothing is
-     *  configured: `durable/*` latest-per-identity in
+     *  older catalogs/baselines fold away). The agents-md carrier is the one
+     *  exception to "one identity per carrier": its mid-session REVISIONS
+     *  (`Updated|Additional instructions from:` / `Instructions removed:`)
+     *  project to `durable/agents-md-update/<path>` so a revision can never
+     *  demote the multi-file baseline it does not fully carry — latest-per-
+     *  path there means "the newest revision of EACH touched file" (#2447).
+     *  Default when nothing is configured: `durable/*` latest-per-identity in
      *  `protectedLatestTools` (pi-reference single-live-copy semantics —
      *  skill/MCP visibility can never be lost, superseded snapshots
      *  fold). */
@@ -432,12 +437,26 @@ export type CompressSettings = {
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedTools?: string[];
+    /** User-message text substrings that are NEVER compressed (kernel
+     *  `Config.isMessageProtected` hook). Built for long-lived agent sessions:
+     *  the current task prompt is often NOT the last user message (tool-result
+     *  / image user messages follow it), so the kernel's last-user protection
+     *  does not cover it. Once folded, a stale earlier user message can remain
+     *  as the only raw user turn and the model may resume that old task.
+     *  Hosts mark the current task with a stable literal (e.g. "【本轮消息】")
+     *  and list it here. Matching is literal substring on user-role text
+     *  messages; empty array is rejected; deepest level wins, whole-array
+     *  replace. */
+    protectedUserPatterns?: string[];
     /* (durable virtual paths) any pattern whose first path segment is
      *  `durable` takes over the whole durable policy for that lane
      *  (whole-identity takeover): bili attaches only the identity
      *  classifier and injects NO default — e.g. `"durable/agents-md"`
      *  protects just the workspace baseline while skill/mcp catalogs fold
-     *  normally. Unregistered lanes get no projection at all. */
+     *  normally. Note the agents-md revisions carry their own identity, so
+     *  that exact pattern leaves them foldable; add
+     *  `"durable/agents-md-update/*"` (or use `"durable/*"`) to keep the
+     *  whole family. Unregistered lanes get no projection at all. */
     /** Tool-name patterns EXCLUDED from the soft-protected recent zone —
      *  matching tool results inside the recent zone become compressible
      *  immediately instead of aging out first (kernel
@@ -3436,6 +3455,11 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         const v = obj[key];
         if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
         else (out as Record<string, unknown>)[key] = (v as string[]).map((x) => x.trim());
+    }
+    if ("protectedUserPatterns" in obj && obj.protectedUserPatterns !== undefined) {
+        const v = obj.protectedUserPatterns;
+        if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
+        else out.protectedUserPatterns = (v as string[]).map((x) => x.trim());
     }
     // neverPreserveRecentTools keeps the kernel semantics that an explicit
     // empty array is meaningful (excludes nothing — the #1198/#1277 escape

@@ -5,7 +5,7 @@ import { getStore, effectiveFileStorageMode } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
 import { configFileEpoch, loadConfigFile, loadNamedProviders } from "./config.js";
-import { applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
+import { applyCompressSettings, combineMessageProtectedPredicate, hasCompressSettings, resolveContextLimitValue, type ResolvedKernelConfig } from "./compress-settings.js";
 import { agentProviderRecipes } from "./agent-providers.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
@@ -873,7 +873,11 @@ type AnonymousPrefixAffinityStamp = {
 // it; a function value throws at the clone site (DataCloneError → 503
 // FORK_FAILED). Function fields are re-resolved at read time: effectiveConfig()
 // merges over the base kernelConfig, which carries them again (isToolProtected
-// #2578; isMessageProtected re-resolves from the lane id below).
+// #2578); isMessageProtected is rebuilt from the clone-safe
+// protectedUserPatterns data field (restoreProtectedUserPatterns below) —
+// without that restore the plugin tool path (compress/acp_status) would run
+// without the host predicate and protectedUserPatterns would be inert in
+// plugin mode.
 export function storeEffectiveConfig(session: Session, config: Config): void {
     const cloneSafe: Record<string, unknown> = { ...config };
     for (const key of Object.keys(cloneSafe)) {
@@ -938,9 +942,21 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
     // re-resolve the classifier AND the default `durable/*` policy from it at
     // read time; every consumer (plugin tool, nudge panel) then sees the same
     // protection the wire path used this turn.
+    const restored = restoreProtectedUserPatterns(base);
     const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
     const classifier = lane ? durableMessageToolPaths[lane] : undefined;
-    return classifier && !base.messagePathOf ? withDurableProtection(base, classifier) : base;
+    return classifier && !restored.messagePathOf ? withDurableProtection(restored, classifier) : restored;
+}
+
+/** Rebuild the host isMessageProtected predicate from the clone-safe
+ *  protectedUserPatterns data field after the stamp round-trip stripped the
+ *  function (storeEffectiveConfig drops all function fields). No-op when the
+ *  data field is absent — byte-identical legacy behavior. */
+function restoreProtectedUserPatterns(config: Config): Config {
+    const patterns = (config as ResolvedKernelConfig).protectedUserPatterns;
+    if (!patterns || patterns.length === 0) return config;
+    const isMessageProtected = combineMessageProtectedPredicate(config.isMessageProtected, patterns);
+    return isMessageProtected === config.isMessageProtected ? config : { ...config, isMessageProtected };
 }
 
 // #4383: a positive usage-grade anchor below this share of the billing-caliber

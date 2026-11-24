@@ -306,6 +306,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
+| `compress.protectedUserPatterns` | string[] | none | — | Literal substrings on user text messages: matching prompts never fold, even when they are not the latest user message. For host-marked current-task prompts in long-lived sessions. |
 | `compress.protectedTools` | string[] | none | — | Hard exclusion across all history: results of listed tools never fold. Path patterns (skill/<name>) select skills by name (#1947). |
 | `compress.protectedLatestTools` | string[] | none | — | Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns keep the latest instance per skill (skill/*, #1947). |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection). |
@@ -1582,6 +1583,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   - **Independent content** — each instance carries unique information no later result supersedes (opencode/pi `skill` loads, one-shot references): use `protectedTools`. Folding an old load loses its content permanently; protection keeps every load in context (#1109). Use `skill/<name>` path patterns to protect ONE orchestrator skill's every load while letting lighter skills fold (`protectedTools: ["skill/release-orchestrator"]`, #1947).
   - **Cumulative snapshots** — each newer result supersedes the older ones (a client's todo/task list): use `protectedLatestTools`. Protecting **all** instances of such a tool makes its history grow unboundedly — the exact failure #639 worked around by protecting only the latest.
   - Rule of thumb: low-frequency, high-value tools → `protectedTools`; chatty tools → never full-history protect (context grows without bound); cumulative-snapshot tools → `protectedLatestTools`.
+
+#### `protectedUserPatterns`
+
+- **Type:** `string[]` (literal text substrings, e.g. `["【本轮消息】"]`)
+- **Default:** `[]` *(none — opt in per host)*
+- **Status:** ACTIVE
+- **Description:** User-role text messages containing any listed literal substring are never compressed (mapped to kernel `Config.isMessageProtected`). Built for long-lived agent sessions where the current task prompt is **not the last user message**: tool-result and image user messages often follow it, so the kernel's last-user protection does not cover it. If that prompt is folded, a stale earlier user message can remain as the only raw user turn and the model may resume the old task. Hosts mark the live task with a stable literal (for example `【本轮消息】`) and list it here. Matching is literal substring (no glob); only user-role text messages are candidates; empty array is rejected; whole-array replace at the deepest defined level. Example: `{ "compress": { "protectedUserPatterns": ["【本轮消息】"] } }`.
 
 #### `neverPreserveRecentTools`
 
