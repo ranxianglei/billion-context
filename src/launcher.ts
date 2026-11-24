@@ -61,6 +61,7 @@ import { stateDir } from "./paths.js";
 import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
 import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
+import { dshProfileFromArgs } from "./dsh-channel.js";
 import { applyOmpFirstEventTimeout, applyOmpMessageThreadsOff, envMillis } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
@@ -3633,7 +3634,7 @@ export function writeDshAcpPatch(dshHome: string, entryName?: string): string | 
     writeOverlayFileAtomic(
         dir,
         ".bili-acp.patch.yml",
-        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n    - id: bili-compaction-gate\n      name: ${gateUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #3354/#3662: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the always-on bili-compaction-gate entry registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
+        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n    - id: bili-compaction-gate\n      name: ${gateUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #7154: keep in sync with dsh.bundle.patch.yml — /compact drives the host compaction call the #1729 wire guard refuses unconditionally, so on a bili-owned lane it can only fail (and dsh blames the model for it)\n- id: command-compact\n  disabled: true\n# #3354/#3662: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the always-on bili-compaction-gate entry registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
     );
     const file = path.join(dir, ".bili-acp.patch.yml");
     try {
@@ -7400,8 +7401,20 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const prevNodePath = env.NODE_PATH;
         env.NODE_PATH = prevNodePath !== undefined && prevNodePath.length > 0 ? `${dshNm}${path.delimiter}${prevNodePath}` : dshNm;
         let dshAcpPatch: string | undefined;
-        if (!dshNativeInstalled()) {
+        // #7155: ask about the profile this run is about to boot, not the
+        // machine. The machine-wide form made a bundle-less profile look
+        // installed whenever a sibling profile had the bundle: the overlay was
+        // skipped and the session ran with ZERO bili entries (no compression
+        // tools, no takeover, native compaction armed) while the note below
+        // described the other profile.
+        const targetProfile = dshProfileFromArgs(params.clientArgs);
+        if (!dshNativeInstalled(process.env, targetProfile)) {
             dshAcpPatch = writeDshAcpPatch(dshHomeDir, dshPluginEntry(dshOverlayHome ?? dshHomeDir));
+            if (targetProfile !== undefined && dshNativeInstalled()) {
+                console.error(
+                    `bili: profile "${targetProfile}" does not install billion-context (another profile on this machine does) — this run mounts the launcher overlay, so compression works for this session only. Install it permanently with: dsh plugin --profile ${targetProfile} add billion-context`,
+                );
+            }
         } else {
             // Unconditional (#3666): the #2028 allowDshCompaction opt-out was
             // removed, so a native install always leaves dsh compaction armed

@@ -49,7 +49,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { estimateCoreMessages } from "../preflight.js";
+import { formatForwardFieldSizes, estimateCoreMessages } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -971,6 +971,18 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             }
         }
         applyResign(headers, wireBody);
+    }
+    // #7587: make telemetry-bloat visible at the point where the final bytes
+    // are known. Parsing every request would be wasteful, so this runs only
+    // for debug sessions or oversized bodies — exactly the cases where the
+    // breakdown pays for itself.
+    const wireBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : wireBody.byteLength;
+    if (opts.debug || wireBytes >= 1024 * 1024) {
+        try {
+            const wireText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+            const sizes = formatForwardFieldSizes(JSON.parse(wireText));
+            if (sizes) log("info", `[${prepared?.session.id ?? "passthrough"}] [forward] field sizes: ${sizes}`);
+        } catch { /* non-JSON bodies keep the existing behavior */ }
     }
     try {
         checkOutboundBody(wireBody);
@@ -2918,7 +2930,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // `total` is always the true context size (see util.ts).
                 const rawUsage = prepared.protocol === "google" ? json.usageMetadata ?? json.usage : json.usage;
                 const u = (rawUsage ?? {}) as Record<string, unknown>;
-                const { total, cached, creation } = usageTotals(prepared.protocol, u);
+                const { total, cached, creation, context } = usageTotals(prepared.protocol, u);
                 const out = usageOutputTotal(prepared.protocol, u);
                 // #1547: settle through the shared path — stats AND the cache
                 // ledger. Before this, this branch updated stats only, so
@@ -2936,7 +2948,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         : typeof prepared.google?.model === "string" && prepared.google.model !== "" ? prepared.google.model
                         : typeof requestModelFromBody(wireBody, req) === "string" && requestModelFromBody(wireBody, req) !== "" ? requestModelFromBody(wireBody, req)
                         : undefined;
-                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation, model: settleModel });
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation, model: settleModel, context });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);

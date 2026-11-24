@@ -424,25 +424,20 @@ function refNum(ref: string): number {
 // clamp, the image-cost textSide) carries billed-caliber mass. Without it the
 // k̂ sample divides a bill that includes thinking by an estimate that
 // excludes it, and thinking-heavy routes learn an inflated factor.
-// #5116: the estimator runs on EVERY outbound turn over the RESENT full
-// history, so the CJK-aware scan is O(total conversation bytes) per request
-// and O(turns × bytes) per session — the single largest per-turn CPU item on
-// big-context lanes. A message's estimate is a pure function of its identity
-// (text + thinkingTokens), and kernel-minted ids are content digests, so an
-// id-keyed memo makes every call after the first a Map lookup: steady state
-// pays O(new messages) instead of O(full history) and repeated calls within
-// one turn (preflight arming, window gates, output clamp, relay) all hit.
+// #5116/#5130: reuse counts across repeated history and within one turn
+// instead of repeating the CJK-aware token scan. A hit must match the exact
+// counted text: canonical tool arguments can share an ID and length despite
+// having different counts (Unicode escapes versus literal CJK, #7208).
 // Only `h_` digest ids are cached — test fixtures and reserved ids
 // (`acp_summary_*`) may reuse an id across differing texts and bypass it.
-// Kernel ids are *logical* identity, not a digest of the counted text, so two
-// same-id messages can still differ in counted text: (a) converters seed
-// tool-call ids with canonicalToolArgs(args) (whitespace/key-order only — the
-// character multiset, and therefore the CJK-aware count, is unchanged) while
-// CoreMessage.text keeps the verbatim args; (b) view renders (renderTags,
-// snapshot render) rewrite text in place and keep ids. The key therefore also
-// carries text length: every length-changing rewrite misses (a safe recount),
-// and the canonicalization deltas from (a) are count-invariant by construction.
-const messageTokenMemo = new Map<string, number>();
+// Live messages own the immutable text/count entries. The global index is
+// weak so it cannot keep whole histories alive after their messages go away.
+interface MessageTokenEstimate {
+    text: string | undefined;
+    tokens: number;
+}
+const messageTokenMemo = new Map<string, WeakRef<MessageTokenEstimate>>();
+let messageTokenOwners = new WeakMap<CoreMessage, MessageTokenEstimate>();
 const MESSAGE_TOKEN_MEMO_CAP = 200_000;
 const KERNEL_MINTED_ID = /^h_[0-9a-f]{16}(?:_\d+)?$/;
 
@@ -453,14 +448,17 @@ export function estimateCoreMessages(messages: CoreMessage[]): number {
         if (KERNEL_MINTED_ID.test(id)) {
             const textLength = m.text === undefined ? -1 : m.text.length;
             const key = `${id}|${textLength}|${m.thinkingTokens ?? ""}`;
-            const cached = messageTokenMemo.get(key);
-            if (cached !== undefined) {
-                tokens += cached;
+            const cached = messageTokenMemo.get(key)?.deref();
+            if (cached !== undefined && cached.text === m.text) {
+                messageTokenOwners.set(m, cached);
+                tokens += cached.tokens;
                 continue;
             }
             const counted = countMessageTokens(m, defaultCountTokens);
             if (messageTokenMemo.size >= MESSAGE_TOKEN_MEMO_CAP) messageTokenMemo.clear();
-            messageTokenMemo.set(key, counted);
+            const entry = { text: m.text, tokens: counted };
+            messageTokenOwners.set(m, entry);
+            messageTokenMemo.set(key, new WeakRef(entry));
             tokens += counted;
         } else {
             tokens += countMessageTokens(m, defaultCountTokens);
@@ -471,6 +469,7 @@ export function estimateCoreMessages(messages: CoreMessage[]): number {
 
 export function clearEstimateCoreMessagesMemoForTests(): void {
     messageTokenMemo.clear();
+    messageTokenOwners = new WeakMap();
 }
 
 // #554: side requests bypass the pipeline (#388) and are forwarded VERBATIM,
@@ -496,6 +495,30 @@ const NON_MODEL_TOP_LEVEL_KEYS = new Set(["dsh_session_log", "dsh_plugin_package
 
 function isNonModelTopLevelKey(key: string): boolean {
     return NON_MODEL_TOP_LEVEL_KEYS.has(key) || key.startsWith("dsh_");
+}
+
+function formatBodySize(bytes: number): string {
+    if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)}MB`;
+    if (bytes >= 1024) return `${Math.round(bytes / 1024)}KB`;
+    return `${bytes}B`;
+}
+
+/**
+ * #7587: one-line breakdown of the outbound top-level fields, so a body
+ * bloated by transport-only telemetry (DSH's `dsh_session_log` is the
+ * motivating case) is visible without reverse-engineering the inbound log.
+ * `JSON.stringify` is used because it measures the bytes that actually go on
+ * the wire; non-model fields are marked so they are not mistaken for prompt.
+ */
+export function formatForwardFieldSizes(parsed: unknown): string | undefined {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const entries = Object.entries(parsed as Record<string, unknown>);
+    if (entries.length === 0) return undefined;
+    return entries.map(([key, value]) => {
+        const text = JSON.stringify(value) ?? "";
+        const bytes = Buffer.byteLength(text, "utf8");
+        return `${key}=${formatBodySize(bytes)}${isNonModelTopLevelKey(key) ? " (non-prompt)" : ""}`;
+    }).join(", ");
 }
 
 export function estimateRawBodyTokens(parsed: unknown): number {
