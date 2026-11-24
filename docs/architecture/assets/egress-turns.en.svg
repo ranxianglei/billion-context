@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="470" viewBox="0 0 1240 470">
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="470" viewBox="0 0 1240 470"><defs><marker id="ah" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L10,3 L0,6 z" fill="#3a5a8a"/></marker></defs>
 <rect width="1240" height="470" fill="#ffffff"/>
 <text x="40" y="36" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="16" font-weight="bold" fill="#1a2b4a">Egress plane: one turn (inbound = evidence, outbound = op-log authority)</text>
 <rect x="40" y="70" width="240" height="170" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
@@ -63,14 +63,14 @@
 <text x="1012" y="340" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_flow / egress_state</text>
 <text x="1012" y="355" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_block_flow / _state</text>
 <text x="1012" y="370" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">per-turn writes = new rows only</text>
-<line x1="280" y1="150" x2="340" y2="155" stroke="#3a5a8a" stroke-width="1.8"/>
+<line x1="280" y1="150" x2="340" y2="155" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
 <polygon points="340,155 331,151 331,159" fill="#3a5a8a"/>
-<text x="308" y="143" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">evidence</text><line x1="280" y1="345" x2="340" y2="345" stroke="#3a5a8a" stroke-width="1.8"/>
+<text x="308" y="143" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">evidence</text><line x1="280" y1="345" x2="340" y2="345" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
 <polygon points="340,345 331,341 331,349" fill="#3a5a8a"/>
-<text x="308" y="338" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">validate</text><line x1="485" y1="260" x2="485" y2="300" stroke="#3a5a8a" stroke-width="1.8"/>
-<polygon points="485,300 476,296 476,304" fill="#3a5a8a"/><line x1="630" y1="110" x2="686" y2="110" stroke="#3a5a8a" stroke-width="1.8"/>
-<polygon points="686,110 677,106 677,114" fill="#3a5a8a"/><text x="658" y="104" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="10.5" fill="#7a3b0f" text-anchor="end" font-weight="bold">served from the log, byte-identical</text><line x1="815" y1="160" x2="815" y2="220" stroke="#3a5a8a" stroke-width="1.8"/>
-<polygon points="815,220 806,216 806,224" fill="#3a5a8a"/><line x1="940" y1="340" x2="1000" y2="340" stroke="#3a5a8a" stroke-width="1.8"/>
+<text x="308" y="338" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">validate</text><line x1="485" y1="260" x2="485" y2="300" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<polygon points="485,300 476,296 476,304" fill="#3a5a8a"/><line x1="630" y1="110" x2="686" y2="110" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<polygon points="686,110 677,106 677,114" fill="#3a5a8a"/><text x="658" y="104" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="10.5" fill="#7a3b0f" text-anchor="end" font-weight="bold">served from the log, byte-identical</text><line x1="815" y1="160" x2="815" y2="220" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<polygon points="815,220 806,216 806,224" fill="#3a5a8a"/><line x1="940" y1="340" x2="1000" y2="340" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
 <polygon points="1000,340 991,336 991,344" fill="#3a5a8a"/>
 <text x="40" y="458" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#555">egress-on condition: egressPlane on and pluginMode and pinned and !sideRequest (egress-lane-io.ts). Any unrebuildable point: the whole turn degrades to legacy, never a partial swap.</text>
 </svg>
