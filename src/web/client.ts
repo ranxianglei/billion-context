@@ -166,11 +166,12 @@ export const WEB_CLIENT = `(function () {
         const pinMatch = /[?&]lang=([^&]*)/i.exec(search);
         const pinned = pinMatch && pinMatch[1] ? pinMatch[1] : null;
         if (pinned === "zh" || pinned === "zh-CN") locale = "zh-CN";
-        else if (pinned === "en") locale = "en";
+        else if (pinned === "en" || pinned === "ko") locale = pinned;
         else {
             const saved = localStorage.getItem("bili-language");
-            if (saved === "en" || saved === "zh-CN") locale = saved;
+            if (saved === "en" || saved === "zh-CN" || saved === "ko") locale = saved;
             else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
+            else if (/^ko([-_]|$)/i.test(navigator.language || "")) locale = "ko";
         }
     } catch (e) {}
     // #3373: when the panel is served through a host relay under a path
@@ -212,8 +213,14 @@ export const WEB_CLIENT = `(function () {
         if (packSelEl && prev && packNames.includes(prev)) packSelEl.value = prev;
         if (rerenderQuick) rerenderQuick();
     }
+    const LOCALE_CYCLE = ["zh-CN", "en", "ko"];
+    const LOCALE_NAMES = { "zh-CN": "中文", en: "English", ko: "한국어" };
+    function nextLocale() {
+        return LOCALE_CYCLE[(LOCALE_CYCLE.indexOf(locale) + 1) % LOCALE_CYCLE.length];
+    }
     function t(key, vars) {
         let text = MESSAGES[locale][key];
+        if (text === undefined && locale === "ko") text = MESSAGES.en[key];
         if (text === undefined) text = MESSAGES["zh-CN"][key];
         if (text === undefined) text = key;
         if (vars) for (const name of Object.keys(vars)) text = text.split("{" + name + "}").join(String(vars[name]));
@@ -441,6 +448,7 @@ export const WEB_CLIENT = `(function () {
         if (typeof v === "string") return v;
         if (v && typeof v === "object") {
             if (v[locale] !== undefined && typeof v[locale] === "string") return v[locale];
+            if (locale === "ko" && typeof v.en === "string") return v.en;
             if (v["zh-CN"] !== undefined && typeof v["zh-CN"] === "string") return v["zh-CN"];
             if (v.en !== undefined && typeof v.en === "string") return v.en;
             const vals = Object.values(v);
@@ -636,7 +644,7 @@ export const WEB_CLIENT = `(function () {
         document.querySelectorAll("[data-i18n-ph]").forEach((el) => { el.setAttribute("placeholder", t(el.getAttribute("data-i18n-ph"))); });
         document.querySelectorAll("[data-i18n-title]").forEach((el) => { el.setAttribute("title", t(el.getAttribute("data-i18n-title"))); });
         const tog = $("language-toggle");
-        if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
+        if (tog) tog.textContent = LOCALE_NAMES[nextLocale()];
         bindSessionColumns();
     }
 
@@ -3904,7 +3912,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (!mdBtn && !pngBtn) return;
         var safeId = String(d.id).replace(/[^A-Za-z0-9._-]/g, "_");
         var base = "billion-context-report-" + safeId;
-        var q = "session=" + encodeURIComponent(d.id) + "&mask=on&lang=" + (locale === "en" ? "en" : "zh-CN");
+        var q = "session=" + encodeURIComponent(d.id) + "&mask=on&lang=" + locale;
         if (mdBtn) mdBtn.addEventListener("click", async function () {
             busy(mdBtn, true);
             try {
@@ -5723,7 +5731,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     function initStaticHandlers() {
         const tog = $("language-toggle");
         if (tog) tog.addEventListener("click", () => {
-            locale = locale === "zh-CN" ? "en" : "zh-CN";
+            locale = nextLocale();
             try { localStorage.setItem("bili-language", locale); } catch (e) {}
             // #2321: a ?lang= pin would silently re-force the old language on a
             // plain reload — drop it so the manual choice sticks.
