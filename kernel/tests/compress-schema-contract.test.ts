@@ -174,14 +174,24 @@ test("empty content array: schema rejects, the parser degrades gracefully", () =
   assert.equal(parseCompressArgs({ content: [] }).ranges.length, 0);
 });
 
-test("the content description still teaches the line form and the string form", () => {
+test("the content description teaches line form ONLY (2026-11-23 single-format narrowing)", () => {
+  // 2026-11-23 (session 01a2040e, weak qwen3.8-27b): the dual-format prose
+  // ("…a JSON-encoded array as that string is also accepted") primed the model
+  // into a JSON array in the string, and after the first rejection it stopped
+  // emitting compress altogether. Line form is now the ONLY advertised format;
+  // the parser still honors the legacy shapes (acceptance, never advertised).
   const desc =
     (COMPRESS_PARAMETERS.properties as Record<string, { description?: string }>)
       .content.description ?? "";
   assert.ok(desc.includes("m00150–m00220"), "line-form header example kept");
+  assert.ok(desc.includes("ONE plain string"), "single plain-string form");
   assert.ok(
-    desc.includes("JSON-encoded array"),
-    "stringified-array form documented",
+    !desc.includes("JSON-encoded array"),
+    "stringified-array form no longer advertised",
+  );
+  assert.ok(
+    !desc.toLowerCase().includes("also accepted"),
+    "dual-format invitation removed",
   );
 });
 

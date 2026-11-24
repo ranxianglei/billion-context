@@ -265,7 +265,7 @@ function compact(parts: string[]): string[] {
  *  onto query-only surfaces (acp_status). So the reminder is now ONE static
  *  line — never expanded, never range-aware, identical for every nudge. */
 export const ONE_CALL_HINT =
-  "ONE call, ONE string — fold every range you keep into a single compress call: one JSON-escaped string holding one block per range ('m00150–m00220 topic' header line, then the summary). Ranges you still need can wait — they reappear in later nudges; never split the batch across separate calls.";
+  "ONE call, ONE string — fold every range you keep into a single compress call: one plain string holding one block per range ('m00150–m00220 topic' header line, then the summary). Ranges you still need can wait — they reappear in later nudges; never split the batch across separate calls.";
 
 /**
  * Extra guidance appended to the nudge when the lane speaks the Anthropic

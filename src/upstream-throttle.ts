@@ -234,7 +234,7 @@ function scanRequestModel(body: string | Uint8Array): string | undefined {
  *  checked on the body itself, so a rewritten/re-encoded body just re-scans
  *  (correctness before caching). */
 const bodyModelMemo = new WeakMap<object, { body: string | Uint8Array; model: string | undefined }>();
-/** Test surface (resetSessionOrderForTest precedent): count of real scans —
+/** Test surface (house precedent): count of real scans —
  *  pins "one scan, two consumers" without a perf harness. */
 let requestModelScanCount = 0;
 export function requestModelScanCountForTest(): number {
