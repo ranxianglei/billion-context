@@ -4837,12 +4837,22 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             dr.maxAttempts = n;
             d.compress.degenerateRetry = dr;
         }));
+        const degenNudgesRow = document.createElement("div");
+        degenNudgesRow.style.cssText = "display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap";
+        const degenNudgesLab = document.createElement("label");
+        degenNudgesLab.htmlFor = "quick-degen-nudges";
+        degenNudgesLab.style.cssText = "flex:0 1 auto;max-width:520px;align-self:center";
+        degenNudgesLab.textContent = t("cfg.q_degen_retry_nudges");
         const degenNudges = document.createElement("textarea");
+        degenNudges.id = "quick-degen-nudges";
         degenNudges.className = "editor mono";
         degenNudges.spellcheck = false;
         degenNudges.rows = 3;
         degenNudges.placeholder = t("cfg.q_degen_retry_nudges_ph");
         degenNudges.style.cssText = "flex:1 1 480px;max-width:720px";
+        degenNudgesRow.appendChild(degenNudgesLab);
+        degenNudgesRow.appendChild(degenNudges);
+        box.appendChild(degenNudgesRow);
         qCtrls.push(degenNudges);
         degenNudges.addEventListener("change", () => commit((d) => {
             const lines = degenNudges.value.split("\\n").map((s) => s.trim()).filter((s) => s.length > 0);
