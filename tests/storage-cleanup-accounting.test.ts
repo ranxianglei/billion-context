@@ -33,7 +33,7 @@ function input(id = "target", rich = false): IngestSessionInput {
         }] : [],
         refs: rich ? [0, 1].map((ord) => ({ ord, rawId: `m${ord}`, ref: `m0000${ord + 1}`, refNum: ord + 1 })) : [],
         deadRefs: rich ? [{ ord: 0, ref: "m00003", refNum: 3, recordedAt: 1 }] : [],
-        ccrEntries: rich ? [0, 1].map((ord) => ({ ord, key: `m0000${ord + 1}`, content, contentHash: sha256Hex(content) })) : [],
+        ccrEntries: rich ? [0, 1].map((ord) => ({ ord, key: `m0000${ord + 1}`, content, contentHash: sha256Hex(content), origContent: content, origHash: sha256Hex(content) })) : [],
     };
 }
 

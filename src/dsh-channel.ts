@@ -48,7 +48,8 @@ export function dshProfileDirs(env: NodeJS.ProcessEnv = process.env): string[] {
 export interface DshPatchEntry {
     /** Loader id as written in the `- id:` line (surrounding quotes stripped). */
     id: string;
-    /** True when the entry's own block carries an indented `disabled: true` line. */
+    /** True when the entry's own block carries an indented `disabled:` line
+     *  whose value declares the row off (isDisabledValue — #7128). */
     disabled: boolean;
     /** Package name as written in the entry's indented `name:` line (surrounding
      *  quotes stripped) — the package dsh actually loads for this loader id.
@@ -60,21 +61,47 @@ export interface DshPatchEntry {
  *  and forgiving — a malformed line simply yields no entry. A new `- id:` line
  *  or ANY other top-level list item closes the previous entry, so a stray
  *  `disabled:` or `name:` line cannot leak into the wrong block; only an
- *  INDENTED `disabled: true` inside the entry's own block counts as disabling
- *  it (#3838: the #2462 cost-advisory scan ignored the flag entirely and fired
- *  for explicitly disabled plugins), and only an INDENTED `name:` inside the
- *  block is captured as the entry's package identity (#7068: the advisory
- *  matched on the loader id alone and misfired for community plugins whose id
- *  collides — the `name` line is what dsh actually loads for that id). The
- *  first `name:` line of a block wins; the value is undefined when the entry
- *  carries none. Duplicate ids are kept per occurrence — callers decide how
- *  duplicates combine. The single source of truth for patch-layer enablement
- *  semantics: both the #2462 cost advisory and the #2861 host-plugin notice
- *  scan through this so they can never drift apart. */
+ *  INDENTED `disabled:` inside the entry's own block counts as disabling it
+ *  when its value declares the row off (#3838: the #2462 cost-advisory scan
+ *  ignored the flag entirely and fired for explicitly disabled plugins; the
+ *  value is evaluated by isDisabledValue, so `!!js`, YAML 1.1 `yes`/`on`, and
+ *  quoted forms count — #7128), and only an INDENTED `name:` inside the block
+ *  is captured as the entry's package identity (#7068: the advisory matched on
+ *  the loader id alone and misfired for community plugins whose id collides —
+ *  the `name` line is what dsh actually loads for that id). The first `name:`
+ *  line of a block wins; the value is undefined when the entry carries none.
+ *  Duplicate ids are kept per occurrence — callers decide how duplicates
+ *  combine. The single source of truth for patch-layer enablement semantics:
+ *  both the #2462 cost advisory and the #2861 host-plugin notice scan through
+ *  this so they can never drift apart. */
+/** #7128: is this `disabled:` value a "row is off" declaration?
+ *
+ *  The patch layer is YAML with one extension: dsh's loader also accepts
+ *  `disabled: !!js <expr>`, and the dump of a stock web profile carries four
+ *  such forms today. A text scan cannot evaluate an expression, so a declared
+ *  `!!js` value is treated as "the user turned this row off". That is the
+ *  safer error direction for both consumers: under-reporting a cost hint beats
+ *  nagging someone who already disabled the plugin, and the host-plugin notice
+ *  is suppressed exactly when the user acted. Plain booleans are still read
+ *  exactly, including YAML 1.1's `yes`/`on` and quoted forms. */
+function isDisabledValue(raw: string): boolean {
+    let v = raw.trim();
+    // A YAML comment needs whitespace before '#', so split there and keep the rest out.
+    const comment = v.indexOf(" #");
+    if (comment >= 0) v = v.slice(0, comment).trim();
+    if (v.length === 0) return false;
+    if (v.startsWith("!!js")) return true;
+    const quoted =
+        v.length > 1 &&
+        ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")));
+    if (quoted) v = v.slice(1, -1).trim();
+    return /^(?:true|yes|on)$/i.test(v);
+}
+
 export function parseDshPatchEntries(text: string): DshPatchEntry[] {
     const itemRe = /^\s*-\s*id\s*:\s*(\S+)/;
     const listItemRe = /^\s*-\s/;
-    const disabledRe = /^\s+disabled\s*:\s*true\b/;
+    const disabledRe = /^\s+disabled\s*:\s*(.*)$/;
     const nameRe = /^\s+name\s*:\s*(\S+)/;
     const out: DshPatchEntry[] = [];
     let current: DshPatchEntry | undefined;
@@ -93,15 +120,17 @@ export function parseDshPatchEntries(text: string): DshPatchEntry[] {
             current = undefined;
             continue;
         }
-        if (!current) continue;
-        if (disabledRe.test(line)) current.disabled = true;
-        if (current.name === undefined) {
-            const n = line.match(nameRe);
-            if (n) {
-                let v = n[1];
-                if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-                v = v.trim();
-                if (v.length > 0) current.name = v;
+        if (current) {
+            const disabled = line.match(disabledRe);
+            if (disabled && isDisabledValue(disabled[1] ?? "")) current.disabled = true;
+            if (current.name === undefined) {
+                const n = line.match(nameRe);
+                if (n) {
+                    let v = n[1];
+                    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+                    v = v.trim();
+                    if (v.length > 0) current.name = v;
+                }
             }
         }
     }
@@ -202,6 +231,31 @@ export function dshProfileDepSpec(profileDir: string): string | undefined {
 
 export function dshProfileDependsOnBili(profileDir: string): boolean {
     return dshProfileDepSpec(profileDir) !== undefined;
+}
+
+/** #7155: the profile a `dsh` argv boots, mirroring dsh's own parser — a bare
+ *  first argument abbreviates `--profile <name>` (except the `plugin`
+ *  subcommand, which takes its own required flag), otherwise the explicit
+ *  `--profile <name>` / `--profile=<name>` wins. undefined when the argv names
+ *  no profile; dsh itself then errors out, so callers fall back to the
+ *  machine-wide answer. The launcher needs this to ask "is THIS profile
+ *  installed" instead of "does any profile on this machine have a copy". */
+export function dshProfileFromArgs(args: readonly string[]): string | undefined {
+    const first = args[0];
+    if (first !== undefined && !first.startsWith("-") && first !== "plugin") return first;
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i]!;
+        if (arg === "--") break;
+        if (arg === "--profile") {
+            const value = args[i + 1];
+            return value !== undefined && value !== "" && !value.startsWith("-") ? value : undefined;
+        }
+        if (arg.startsWith("--profile=")) {
+            const value = arg.slice("--profile=".length);
+            return value !== "" ? value : undefined;
+        }
+    }
+    return undefined;
 }
 
 /** #2894: converge this profile's declared billion-context spec to the version

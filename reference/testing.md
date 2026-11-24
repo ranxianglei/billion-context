@@ -264,3 +264,28 @@ Three additional phases harden the #1628 failure class:
 - **Cache-lane doctor** — lays out an opencode cache lane
   (`npm/billion-context@latest/<ts>/node_modules/billion-context`) and asserts
   `doctor --json` resolves the update target to the running copy, not a global root.
+
+## E2E: Egress-Plane Perf Bench (`ACP_TEST_EG_BENCH`)
+
+`tests/egress-bench.test.ts` (dedicated CI lane `.github/workflows/ci-e2e-egbench.yml`,
+master push + `workflow_dispatch`): a hermetic growing-session benchmark that pins the
+egress plane's per-turn cost to O(live-window) (KDD #23, #7474).
+
+```bash
+ACP_TEST_EG_BENCH=1 node --import tsx --test tests/egress-bench.test.ts
+```
+
+- Gated by `ACP_TEST_EG_BENCH=1`; skips by default; the `npm test` glob does not cover it.
+- Hermetic by construction: in-process proxy on port 0, temp XDG root, loopback upstream —
+  no fixture registry, no port-range assumptions (#360), nothing shared with a running bili.
+- Shape: a pinned plugin conversation grown to ~30k ledger rows (100 msgs/turn, host-side
+  folds every 300 refs, live tail ~1800) driving the pf watermark channel exactly as the
+  production lanes do; steady = the second half of the run.
+- Verdict: median-of-3 steady p50/max within **+20%** of
+  `tests/e2e/bench/egress-bench.baseline.json` (calibration: 201/300 ms on the perf box).
+  A missing baseline prints the CALIBRATION numbers and passes — regenerate it only after
+  a deliberate storage-path change, with justification in the PR (same discipline as the
+  wire-contract goldens).
+- A regression back to a full-table ingest path (the pre-#7474 shape: O(total ledger) reads)
+  goes red well before a real 100k session would. The deep-dive 100k growing matrix lives in
+  the PR #6785 doc §6 (docs/pr-6785-unified-storage-and-flows.md).

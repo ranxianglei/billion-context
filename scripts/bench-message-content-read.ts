@@ -26,13 +26,11 @@ try {
         blocks: [], deadRefs: [], refs: [], ccrEntries: [],
     };
     store.ingestSession(input);
-    const selected = input.messages.filter((row) => row.seq % 2 === 1).map((row) => row.seq).reverse();
     const covered = Array.from({ length: Math.ceil(count / 100) }, (_, i) => [i * 100, Math.min(i * 100 + 49, count - 1)] as [number, number]);
     const uncovered = input.messages.filter((row) => row.seq % 100 >= 50).length;
     const backend = new SqliteBackend(store);
     const workloads: { name: string; rows: number; run(): unknown | Promise<unknown> }[] = [
         { name: "getMessages", rows: count, run: () => store.getMessages("benchmark") },
-        { name: "getMessagesAt", rows: selected.length, run: () => store.getMessagesAt("benchmark", selected) },
         { name: "uncoveredRows", rows: uncovered, run: () => store.uncoveredRows("benchmark", covered) },
         { name: "jsonlExport", rows: count, run: () => renderSessionJsonlFromTables(backend, "benchmark", false) },
     ];

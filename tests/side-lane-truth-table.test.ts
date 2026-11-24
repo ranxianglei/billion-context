@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { demoteGate, DSH_TITLE_SYSTEM_PREFIX, isDshTitleRequest, isSideRequest, resolveSideLane, SIDE_REQUEST_AGENTS, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
-import { PLUGIN_PURPOSE_CONVERSATION, pluginPurposeHeader } from "../src/plugin.ts";
+import { PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginPurposeHeader, pluginRequestAgentHeader } from "../src/plugin.ts";
 
 // #2170 measure 1: exhaustive truth-table pin for the two extracted lane
 // decision functions. These tables ARE the regression net: any future edit to
@@ -236,4 +236,36 @@ test("isSideRequest: the conversation sentinel normalizes to absent; only real p
         // and a real purpose on the same body still declares side
         assert.equal(isSideRequest(body, undefined, "session-title"), true);
     }
+});
+
+// #6884: pi's leg of the #6880 declaration. The "conversation" sentinel from
+// a PI-marked request is a FACT ("this is the session's main conversation
+// turn" — pi has no auxiliary-call concept, so an undeclared aux call cannot
+// exist), not an inference: handle.ts derives declaredPiMainTurn and rides
+// the #1699 explicit-"main" rung, so the agent becomes "main" and outranks
+// every body heuristic. The dsh leg of the SAME sentinel stays ≡ absent
+// (the #6880 pin above) — the asymmetry is the point.
+test("isSideRequest: the pi conversation sentinel declares main — side-shaped bodies stay main (#6884)", () => {
+    // reference: the derivation exactly as handle.ts applies it (both call
+    // sites share declaredPiMainTurn ? "main" : <agent>)
+    const classify = (headers: Record<string, string | string[] | undefined>, body: Record<string, unknown>) => {
+        const raw = pluginPurposeHeader(headers);
+        const declared = raw === PLUGIN_PURPOSE_CONVERSATION ? undefined : raw;
+        const declaredPiMainTurn = raw === PLUGIN_PURPOSE_CONVERSATION && pluginAgentHeader(headers) === "pi";
+        return isSideRequest(body, declaredPiMainTurn ? "main" : pluginRequestAgentHeader(headers), declared);
+    };
+    // the #388 killer shape: toolless body under the 200-token budget —
+    // pre-#6884 this demoted a declared pi main turn to the passthrough
+    const sideShaped = { max_tokens: 64, messages: [{ role: "user", content: "one-shot" }] };
+    // the fix: a declared pi main turn is NOT demoted by the shape
+    assert.equal(classify({ "x-bili-plugin": "pi", "x-bili-plugin-purpose": PLUGIN_PURPOSE_CONVERSATION }, sideShaped), false, "pi + sentinel outranks the budget heuristic");
+    // the asymmetry: the SAME sentinel from dsh stays ≡ absent — the heuristic still demotes
+    assert.equal(classify({ "x-bili-plugin": "dsh", "x-bili-plugin-purpose": PLUGIN_PURPOSE_CONVERSATION }, sideShaped), true, "dsh + sentinel is an inference, not a fact");
+    // a real pi purpose still declares side (declaration outranks the main turn)
+    assert.equal(classify({ "x-bili-plugin": "pi", "x-bili-plugin-purpose": "session-title" }, sideShaped), true);
+    // an UNstamped pi dispatch keeps the pre-#6884 behavior: the heuristic classifies
+    assert.equal(classify({ "x-bili-plugin": "pi" }, sideShaped), true);
+    // and the main rung is what does the work: an explicit "main" persona
+    // header was never demoted (the #1699 rung the sentinel now rides)
+    assert.equal(classify({ "x-bili-plugin": "pi", "x-bili-plugin-agent": "main" }, sideShaped), false);
 });
