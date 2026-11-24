@@ -38,6 +38,10 @@ import { maybeAdoptForkBlocks } from "../src/fork-adoption.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 process.env.BILI_PERSIST = "0";
+// #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+// off) — this suite reads the companion session ENVELOPE off disk, so pin
+// the dual-write writer explicitly.
+process.env.BILI_STORAGE_JSON_WRITER = "on";
 
 const LIMIT = 200_000;
 const META = { protocol: "openai" as const, upstreamOrigin: "http://upstream.example/v1" };
