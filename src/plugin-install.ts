@@ -1807,20 +1807,29 @@ function dshStatus(): string {
     return "not installed";
 }
 
-/** True when any profile carries the persistent native install — either the
- *  bundle-channel dep or a pre-unification managed block. The `bili dsh`
- *  launcher consults this before adding its own --patch overlay: cordis
- *  rejects duplicate loader entry ids across layers, so a second
- *  `id: bili-native` insert would hard-fail dsh boot whenever the persistent
- *  install is present. */
-export function dshNativeInstalled(env: NodeJS.ProcessEnv = process.env): boolean {
+/** True when the given profile (or, with no profile, ANY profile) carries the
+ *  persistent native install — either the bundle-channel dep or a
+ *  pre-unification managed block. The `bili dsh` launcher consults this
+ *  before adding its own --patch overlay.
+ *
+ *  #7155: the launcher must ask about the profile it is ABOUT TO BOOT, not
+ *  the machine. The old any-profile form made a bundle-less profile look
+ *  installed whenever a sibling profile had the bundle: the overlay was
+ *  skipped, the session ran with zero bili entries (no compression tools, no
+ *  takeover, native compaction armed) and the launch note described the OTHER
+ *  profile's state. Omitting `profile` keeps the machine-wide answer for the
+ *  callers that genuinely need it (status/tests). */
+export function dshNativeInstalled(env: NodeJS.ProcessEnv = process.env, profile?: string): boolean {
     let dirs: string[];
     try {
         dirs = dshProfileDirs(env);
     } catch {
         return false;
     }
-    return dirs.some((dir) => dshBundleInstalled(dir) || dshHasLegacyManagedBlock(dir));
+    const scoped = profile === undefined || profile === ""
+        ? dirs
+        : dirs.filter((dir) => path.basename(dir) === profile);
+    return scoped.some((dir) => dshBundleInstalled(dir) || dshHasLegacyManagedBlock(dir));
 }
 
 // — kimi ————————————————————————————————————————————————————————————————
