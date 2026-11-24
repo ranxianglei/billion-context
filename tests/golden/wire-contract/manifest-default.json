@@ -16,13 +16,13 @@
     "anthropic": [
       {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
         "input_schema": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -77,7 +77,7 @@
       },
       {
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings; protectedMass:true adds the attribution-only protected-mass line (off by default). Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -87,7 +87,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -104,6 +104,10 @@
             "archiveDetail": {
               "type": "boolean",
               "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            },
+            "protectedMass": {
+              "type": "boolean",
+              "description": "Off by default. Adds the PROTECTED MASS attribution line: token mass metered into usage but reachable by no compress offer (hard protection + the protected recent window). It explains, it does not offer work — pass it when asked where the uncompressible mass is."
             }
           }
         }
@@ -147,13 +151,13 @@
         "type": "function",
         "function": {
           "name": "compress",
-          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
+          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
           "parameters": {
             "type": "object",
             "properties": {
               "content": {
                 "type": "string",
-                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
               }
             }
           }
@@ -217,7 +221,7 @@
         "type": "function",
         "function": {
           "name": "acp_status",
-          "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+          "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings; protectedMass:true adds the attribution-only protected-mass line (off by default). Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -227,7 +231,7 @@
               },
               "view": {
                 "type": "string",
-                "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+                "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
               },
               "tool": {
                 "type": "string",
@@ -244,6 +248,10 @@
               "archiveDetail": {
                 "type": "boolean",
                 "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+              },
+              "protectedMass": {
+                "type": "boolean",
+                "description": "Off by default. Adds the PROTECTED MASS attribution line: token mass metered into usage but reachable by no compress offer (hard protection + the protected recent window). It explains, it does not offer work — pass it when asked where the uncompressible mass is."
               }
             }
           }
@@ -293,13 +301,13 @@
       {
         "type": "function",
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
         "parameters": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -357,7 +365,7 @@
       {
         "type": "function",
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings; protectedMass:true adds the attribution-only protected-mass line (off by default). Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -367,7 +375,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -384,6 +392,10 @@
             "archiveDetail": {
               "type": "boolean",
               "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            },
+            "protectedMass": {
+              "type": "boolean",
+              "description": "Off by default. Adds the PROTECTED MASS attribution line: token mass metered into usage but reachable by no compress offer (hard protection + the protected recent window). It explains, it does not offer work — pass it when asked where the uncompressible mass is."
             }
           }
         }

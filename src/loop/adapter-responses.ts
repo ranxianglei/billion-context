@@ -239,10 +239,10 @@ function buildMessageItemSequence(itemId: string, outputIndex: number, text: str
     return Buffer.from(
         [
             `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: outputIndex, item })}\n\n`,
-            `event: response.content_part.added\ndata: ${JSON.stringify({ type: "response.content_part.added", item_id: itemId, output_index: outputIndex, part })}\n\n`,
-            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", item_id: itemId, output_index: outputIndex, delta: text })}\n\n`,
-            `event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: itemId, output_index: outputIndex, text })}\n\n`,
-            `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: itemId, output_index: outputIndex, part: { type: "output_text", text } })}\n\n`,
+            `event: response.content_part.added\ndata: ${JSON.stringify({ type: "response.content_part.added", item_id: itemId, output_index: outputIndex, content_index: 0, part })}\n\n`,
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", item_id: itemId, output_index: outputIndex, content_index: 0, delta: text })}\n\n`,
+            `event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: itemId, output_index: outputIndex, content_index: 0, text })}\n\n`,
+            `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: itemId, output_index: outputIndex, content_index: 0, part: { type: "output_text", text } })}\n\n`,
             `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: outputIndex, item: doneItem })}\n\n`,
         ].join(""),
         "utf8",
@@ -415,12 +415,12 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             // identity filters, byte-verbatim (never rewritten; matches the
             // openai adapter's reasoning_filter and #1960/KDD#10).
             const reasoningFilters = new Map<string, { filter: TagEchoFilter; ref: { itemId: string; outputIndex: number; summaryIndex: number } }>();
-            let lastTextRef: { itemId: string; outputIndex: number } | null = null;
+            let lastTextRef: { itemId: string; outputIndex: number; contentIndex: unknown } | null = null;
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
                 const tail = tagFilter.flush();
                 if (tail.length > 0) {
                     const raw = lastTextRef
-                        ? rebuildResponsesEvent("response.output_text.delta", { type: "response.output_text.delta", item_id: lastTextRef.itemId, output_index: lastTextRef.outputIndex, delta: tail })
+                        ? rebuildResponsesEvent("response.output_text.delta", { type: "response.output_text.delta", item_id: lastTextRef.itemId, output_index: lastTextRef.outputIndex, content_index: lastTextRef.contentIndex, delta: tail })
                         : undefined;
                     yield { kind: "text", delta: tail, ...(raw ? { raw } : {}) } as ParsedStreamEvent;
                 }
@@ -547,7 +547,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
                         const outputIndex = typeof obj.output_index === "number" ? obj.output_index : 0;
                         const mapped = remapped.get(itemId);
-                        lastTextRef = { itemId: mapped ? mapped.id : itemId, outputIndex: mapped ? mapped.index : outputIndex };
+                        lastTextRef = { itemId: mapped ? mapped.id : itemId, outputIndex: mapped ? mapped.index : outputIndex, contentIndex: obj.content_index };
                         const clean = tagFilter.push(delta);
                         if (clean.length > 0) {
                             if (mapped) {
