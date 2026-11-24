@@ -5,7 +5,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter } from "../src/loop/index.ts";
-import { stripAcpTags, createTagEchoFilter, containsRenderTagText, containsToolCallXmlFragment, mayStartRenderTag, isOrphanMarkupText } from "../src/loop/tag-echo-filter.ts";
+import { stripAcpTags, createTagEchoFilter, containsDsmlCloseText, containsRenderTagText, containsToolCallXmlFragment, mayStartRenderTag, normalizeEchoArtifacts, isOrphanMarkupText } from "../src/loop/tag-echo-filter.ts";
 import { rewriteJsonResponse } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponse } from "../src/stream-openai.ts";
 import { rewriteResponsesJsonResponse } from "../src/stream-responses.ts";
@@ -1234,4 +1234,30 @@ test("#7685: legitimate prose is not affected by the DSML close strip", () => {
     assert.equal(stripAcpTags("normal prose without any tags"), "normal prose without any tags");
     assert.equal(stripAcpTags("a < b and c > d"), "a < b and c > d");
     assert.equal(stripAcpTags(`keep ${TAG("m00100")} this`), "keep  this");
+});
+
+test("#7683: whole-text gate probe engages on a DSML-only payload (literal and JSON-escaped)", () => {
+    // The non-streaming / event-level strip gates disjoin family probes; a
+    // DSML-only payload trips none of the acplike probes, so the DSML probe
+    // must carry it. Without it stripAcpTags is never invoked on these paths.
+    assert.equal(containsRenderTagText(DSML_ORPHAN_CLOSE_NO_SPACE("invoke")), false, "acplike probe alone misses DSML — the gap this test pins");
+    assert.equal(containsDsmlCloseText(DSML_ORPHAN_CLOSE_NO_SPACE("invoke")), true);
+    assert.equal(containsDsmlCloseText(DSML_ORPHAN_CLOSE_SPACE("calls")), true);
+    assert.equal(containsDsmlCloseText(`{"content":"${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")}"}`), true);
+    // Provider-serialized raw body: \x3c rides as \u003c (and \x3e as \u003e).
+    const escaped = `\\u003c/${DSML_PIPE}invoke\\u003e`;
+    assert.equal(containsDsmlCloseText(escaped), true);
+    assert.equal(containsDsmlCloseText(`\\u003c/${DSML_PIPE} invoke>`), true);
+    // Negative: prose and acplike tags stay out of the DSML probe.
+    assert.equal(containsDsmlCloseText("normal prose without any tags"), false);
+    assert.equal(containsDsmlCloseText(TAG("m00100")), false);
+    assert.equal(containsDsmlCloseText(`${LT}/acp>`), false);
+});
+
+test("#7683: normalizeEchoArtifacts strips a DSML orphan close (judge parity)", () => {
+    // The invariant judge normalizes by the same artifact set the outbound
+    // filters strip; a DSML-only exit must not read as a mid-history rewrite.
+    assert.equal(normalizeEchoArtifacts(DSML_ORPHAN_CLOSE_NO_SPACE("invoke")), "");
+    assert.equal(normalizeEchoArtifacts(`prose ${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")} tail`), "prose  tail");
+    assert.equal(normalizeEchoArtifacts("normal prose without any tags"), "normal prose without any tags");
 });

@@ -610,6 +610,7 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
 export function normalizeEchoArtifacts(text: string): string {
     if (
         !containsRenderTagText(text) &&
+        !containsDsmlCloseText(text) &&
         !containsMarkerLineText(text) &&
         !containsBiliInternalText(text)
     ) {
@@ -637,6 +638,18 @@ export function containsMarkerLineText(s: string): boolean {
 const RENDER_TAG_DETECT = new RegExp("\x3c\\/?" + NAME + "(?=[\\s>])|\\\\u003c\\/?" + NAME + "(?=[\\s>\\\\])|\x3c" + NAME + "\\s*\\/|\\\\u003c" + NAME + "\\s*\\/");
 export function containsRenderTagText(s: string): boolean {
     return RENDER_TAG_DETECT.test(s);
+}
+
+// #7683: whole-text pre-check for the DSML orphan close (DSML_CLOSE): the
+// non-streaming / event-level strip gates disjoin family probes to decide
+// whether stripAcpTags has work to do, and a DSML-only payload trips none of
+// the acplike probes — without this the whole-text paths leak the very shape
+// the streaming machine drops. Escape-tolerant like RENDER_TAG_DETECT: the
+// raw-body gate sites (plugin non-stream, responses event strings) see the
+// provider-serialized form where \x3c may ride as \u003c.
+const DSML_CLOSE_DETECT = new RegExp("\\\\u003c\\/" + DSML_PIPE + "[^<>]{0,32}(?:>|\\\\u003e)|\x3c\\/" + DSML_PIPE + "[^<>]{0,32}>");
+export function containsDsmlCloseText(s: string): boolean {
+    return DSML_CLOSE_DETECT.test(s);
 }
 
 // #2190: post-audit shape check — a bare ref immediately followed by ANY close
