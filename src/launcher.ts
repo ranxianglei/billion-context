@@ -5440,7 +5440,7 @@ async function quiesceSameLanePredecessor(
             // only honest outcome is an actionable refusal.
             if (s.inst.lane !== lane) {
                 throw new Error(
-                    `bili: refusing to spawn a second writer — the target port ${targetPort} is held by a running bili proxy (pid ${s.inst.pid}, ${s.inst.origin}, manual launch with no lane). A lane daemon spawning over the same shared sessions dir doubles the WAL writers and has corrupted indexes before (#7156); laddering to +1 would do that silently. Give the manual daemon its own port zone (start it with -p / a different BILI_PORT_ZONE) or stop it: kill ${s.inst.pid}`,
+                    `bili: refusing to spawn a second writer — the target port ${targetPort} is held by a running bili proxy (pid ${s.inst.pid}, ${s.inst.origin}, no lane declared). A lane daemon spawning over the same shared sessions dir doubles the WAL writers and has corrupted indexes before (#7156); laddering to +1 would do that silently. Give the daemon its own port zone (start it with -p / a different BILI_PORT_ZONE) or stop it: kill ${s.inst.pid}`,
                 );
             }
             const healthy = await fetchHealthInfoNoReuse(s.inst.origin);
@@ -5458,7 +5458,7 @@ async function quiesceSameLanePredecessor(
         }
         if (isPidAlive(s.inst.pid)) {
             throw new Error(
-                `bili: refusing to spawn a second writer — predecessor pid ${s.inst.pid} (port ${targetPort})${s.inst.lane === lane ? "" : ", manual launch with no lane"} closed its listener but is still draining after ${PREDECESSOR_DRAIN_GRACE_MS}ms; its final flush still writes the shared session store, so a new writer would corrupt the index (#7156). It exits on its own — retry the launch in a moment, or stop it now: kill ${s.inst.pid}`,
+                `bili: refusing to spawn a second writer — predecessor pid ${s.inst.pid} (port ${targetPort})${s.inst.lane === lane ? "" : ", no lane declared"} closed its listener but is still draining after ${PREDECESSOR_DRAIN_GRACE_MS}ms; its final flush still writes the shared session store, so a new writer would corrupt the index (#7156). It exits on its own — retry the launch in a moment, or stop it now: kill ${s.inst.pid}`,
             );
         }
     }

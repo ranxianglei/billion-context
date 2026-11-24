@@ -211,7 +211,7 @@ test("#7675: a live MANUAL daemon that the attach tiers veto REFUSES the lane la
     }
     assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second writer"), `actionable refusal: ${err instanceof Error ? err.message : String(err)}`);
     assert.ok(err instanceof Error && err.message.includes(String(process.pid)), "the refusal names the holder pid");
-    assert.ok(err instanceof Error && err.message.includes("manual launch with no lane"), "the refusal says what the holder is");
+    assert.ok(err instanceof Error && err.message.includes("no lane declared"), "the refusal says what the holder is");
     assert.ok(err instanceof Error && err.message.includes("BILI_PORT_ZONE") && err.message.includes("kill"), "the refusal carries both remedies");
     assert.equal(w.spawnCalls, 0, "no second writer may be spawned behind a live manual daemon");
 });

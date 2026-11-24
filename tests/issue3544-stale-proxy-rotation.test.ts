@@ -188,7 +188,7 @@ test("#3544 user-zone daemons are never touched by rotation", async () => {
         err = e;
     }
     assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second writer"), `refusal: ${err instanceof Error ? err.message : String(err)}`);
-    assert.ok(err instanceof Error && err.message.includes("manual launch with no lane"), "the refusal says what the holder is");
+    assert.ok(err instanceof Error && err.message.includes("no lane declared"), "the refusal says what the holder is");
     assert.equal(r, undefined, "no handle — the user's daemon is untouched and no second writer spawned");
 });
 

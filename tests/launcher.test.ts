@@ -1666,7 +1666,7 @@ test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is NOT 
     assert.equal(spawnCalls, 0, "no second writer may drift behind a live manual daemon (#7675)");
     assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second writer"),
         `actionable refusal: ${err instanceof Error ? err.message : String(err)}`);
-    assert.ok(err instanceof Error && err.message.includes("manual launch with no lane"), "the refusal names the holder's origin");
+    assert.ok(err instanceof Error && err.message.includes("no lane declared"), "the refusal names the holder's origin");
 });
 
 // The pre-#2877 behavior (ride the user-maintained daemon) is preserved behind
