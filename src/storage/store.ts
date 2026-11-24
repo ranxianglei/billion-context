@@ -31,6 +31,7 @@ import {
     egressStateRead,
     egressStateView,
     egressFork,
+    egressMessageHighWater,
     EgressStateCorruptError,
     type EgressOp,
     type EgressViewRow,
@@ -2127,10 +2128,13 @@ export class UnifiedStore {
             // Two cursors (egress-state.nextSeqs semantics): op_seq orders
             // EVERY row (B/I/D/U) and is the seqs-carrier guard; log_seq
             // numbers I rows only and is never reused across folds (D rows
-            // keep their log_seq gone), so MAX(log_seq) is the canonical
-            // message-count frontier — the base for world positions.
+            // keep their log_seq gone). The message frontier is the highest
+            // number EVER ISSUED — MAX(log_seq) over the rows, falling back
+            // to the newest base's highWater once a compaction physically
+            // removed the I rows it subsumes (#7574 leaves only the B row —
+            // the exact rule nextSeqs applies, egressMessageHighWater).
             // live.length understates it after any fold, so derive positions
-            // from log_seq, not the live view (discussions/7591 review L1:
+            // from it, not the live view (discussions/7591 review L1:
             // bookkeeping-only, but the persisted witness must stay truthful).
             // NOTE (review L2): the arm turn itself — runStage0 runs in the
             // lane BEFORE the egress flag is latched to the sessions row —
@@ -2138,10 +2142,10 @@ export class UnifiedStore {
             // is never read again; we deliberately do NOT pre-latch (that
             // would move arm timing for zero functional gain).
             const fr = (this.db
-                .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o, COALESCE(MAX(log_seq), 0) AS n FROM egress_flow WHERE session_id = ?")
-                .get(sid) as { o: number; n: number });
+                .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_flow WHERE session_id = ?")
+                .get(sid) as { o: number });
             const seqFrontier = fr.o;   // op-ordering cursor (seqs guard)
-            const msgFrontier = fr.n;   // canonical message frontier (positions)
+            const msgFrontier = egressMessageHighWater(this.db, sid);   // canonical message frontier (positions)
             const allKnown = incoming.length > 0 && incoming.every((id) => known.has(id));
             const seqsAtFrontier = seqs === null || seqs.every((s) => s <= seqFrontier);
             const newIds = incoming.filter((id) => !known.has(id));
