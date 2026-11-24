@@ -196,3 +196,19 @@ v6 是对上文 v5 水位线的一次**彻底重构**(owner 裁定 2026-11-04;PR
 **渲染快照平面(#5664)。** 三站模型(owner 裁定 2026-11-04):第 1 站 入站/身份 finalize(即上面的身份车道);第 2 站 快照——稳态命中轮每个新元素 APPEND 一行捕获;全量路径轮(arm / 计划审计 / fallback)对照已存行做 DIFF,增长时补尾;第 3 站 出站 emit——前缀行从磁盘逐字直通,只有有界窗口尾部每请求跑一遍内核 pass。治理保证:**G0** 字节等价是被**验证**的而非假设的——每个快速轮都在 scratch 状态克隆下重跑一遍有界内核 pass(最近 W 个冻结核 + 本回合新增核;W = `BILI_PF_RENDER_WINDOW`,默认 8、上限 64),把其映射出的前 F 个元素与最后 F 行已存行逐字节比对;任何不一致只当轮回退全量 legacy 路径(磁盘才是真值源)。**G1** 保守合取门——任一红色条件当轮回退未动过的全量 legacy pass 并重新捕获:红色时与「该特性不存在」结构上逐字节一致。红色原因词表(`renderPlaneGate`:not-engaged / arm-turn / title-gen / plane-unavailable / 压力 ≥ 模型上限 90% / snapshot-lane / fold-pending / absorb-active / ccr-on / markers / lane-dead / hydrate-failed / caps-mismatch / structural-pending / blocks-changed / audit-due:每 N 轮计划审计 / no-rows / no-plane-geometry / rows-misaligned —— 与代码一一对应、无遗漏)在 `tests/issue5664-render-snapshot.test.ts` 中逐条钉死。**G2** 捕获点 = 基线实际发出的那个数组(`rebuiltMessages`,system/ephemeral 注入之前);稳态捕获存原始字符串 + 解析缓存,前缀永不重解析或重字符串化。**G3** 死亡判决——校验和损坏的 checkpoint、结构发散的捕获、或任何无法核实的既有快照,永久杀死该 sid 的平面(持久化为 `kind='dead'` 日志行,跨重启存活)。**任何场景下禁止 recast**(owner 裁定 2026-11-05):任何需要重写/删除已存行的分歧——或死亡后的重建——都判死而非修复;字节安全来自停手,而不是猜坏字节。计划审计:每 `PF_RENDER_AUDIT_EVERY`(默认 8)个命中轮强制一次全量 legacy pass,其捕获 diff 端到端复验已存行;紧急压力(tokenCount ≥ 模型上限 90%)同样强制 legacy,因为接近天花板时 fold/expand 机制必须看到整个视图。Mirror LRU 预算:256 MiB 按字节计重,最旧世界先逐出(P7)。
 
 **放量与现状。** `rollout.features.watermarkV6MsgId`(env `BILI_ROLLOUT_WATERMARK_V6_MSG_ID`)按百分比放量时嵌套于 `pluginFullResendWatermark`(人群 ⊆ v5 灰度人群)且要求统一存储 sidecar;强制档(env 覆盖 / 显式 `enabled`)按钉死设计绕过嵌套检查(src/rollout.ts 头部注释,#5652 review F10 待 owner 裁定);`rollout.features.watermarkV6Render`(`BILI_ROLLOUT_WATERMARK_V6_RENDER`)同样嵌套于 `watermarkV6MsgId`。两者均为实验性、**默认关**——只能由显式放量开启。测试清单:`tests/fastpath-v6-msgid.test.ts`(hermetic 双代理 A/B:BUG-1/BUG-2 回归、四类故障、multi-world)、`tests/fastpath-v6-tail-window.test.ts`(窗口算术)、`tests/issue5664-render-snapshot.test.ts`(渲染红色原因钉 + 水合/死亡路径)、`tests/pf-channel.test.ts`(客户端 learn/echo/stale-retention)、`tests/lane-decisions-matrix.test.ts`(门矩阵,双向)。
+
+## Delta 重发 —— 水位快路径的尾切片形态
+
+上面的水位快路径只省了服务端对重发前缀的重复处理,客户端每轮仍然把**整个**历史上传。Delta 重发把上传也去掉:稳态轮客户端只发**新增**元素。
+
+线上形态(客户端 → 代理,共四个头,body 只剩尾部):`x-bili-pf-delta: 1` + `x-bili-pf-count: T`(新的元素总数)+ `x-bili-pf-tail-ids` = 锚点+新增的宿主 msgid,宽度恰好 L+1(L = T − stampT 个新元素,`tail-ids[0]` 锚定上一轮最后一个元素),`body.messages` = **恰好**这 L 个新元素(`[T-L .. T-1]`,无前置、无锚点)。锚点元素本身不在 body 里,只走头。
+
+服务端:`x-bili-pf-delta` 存在时 `evaluateDeltaResend`(src/server/fastpath.ts)在全量车道**之前**跑。重建:`view = 存好的前缀 cores + rekeyWindowCores(解析出的尾部)` → 产出与全量车道完全一致的 `FastpathHit` → 下游(stage-0 pin、kernel processTurn、ingest、快照、账本窗口)走的都是未改动的全量车道代码。
+
+重锚阶梯——任何不成立的声明返回 400 `pf_delta_reanchor` + `x-bili-msgid-mode: full`,**且不打** `x-bili-pf-seq`;客户端本轮改发全量形态,一个来回内收敛(KDD#15 一轮收敛)。门序:头值 / 灰度 / plugin 模式 / 有无种子 / model 一致 / 非多模态种子 / count 在场 / L ∈ [1..2048] / body 长度 == L / tail-ids 宽度 == L+1 / **锚点连续性**(有已知上一清单后强制:`tail-ids[0]` 必须等于上一轮最后一个申报 id;无尾清单的种子允许第一轮 delta 不验证开局,之后逐链)/ body 扫描总数 == L / 窗口转换形状。不做锚点字节重解析:锚点身份由账本/pin 侧(2×2 通道)校验,绝不用上一轮字节复核。
+
+编辑/删除上一轮**最后一条**消息会断锚链 → 400 重锚 → 全量形态。改写**更早**的历史不会:账本/pin 重叠检查在下一轮经 KDD#22「截断尾」降级(全量信号、重锚)接住,永不 400。
+
+灰度:`rollout.features.pluginDeltaResend`(默认 0 —— **关**)。delta body 对未上车的服务端不可处理,故保持 0 直到客户端发送端就位;env 覆盖 `BILI_ROLLOUT_PLUGIN_DELTA_RESEND`。带 `x-bili-pf-delta` 的请求打到灰度关的服务端得到同样的 400 重锚(rollout-off 门)——绝不静默错解。所有 pf-* 头保持上游 hop(转发模型前剥掉)。
+
+实测(10w 条原始会话,loopback):全量重发 15.9s/轮 → 12.7s/轮(入站 155MB → KB 量级;残余成本是整份渲染视图的出站重建——真实压缩场景见下)。压缩稳态(上下文 ≈ 10w token ≈ 400KB body):36ms/轮 全量 → 21ms/轮 delta;≈ 30w token ≈ 1.2MB body:128ms → 53ms。1w 条原始会话:880ms → 550ms。

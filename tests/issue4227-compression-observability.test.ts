@@ -196,7 +196,18 @@ test("#4227 wiring: internal-lane receipts judge on the round's own offer, not t
         unknownBaseline: true,
         log: (_l, m) => { logs.push(m); },
     };
-    const result = await preflightCompress(deps, messages);
+    const result = await (async () => {
+        // #2383's deterministic-digest regime is DEFAULT OFF (owner decision
+        // 2026-11-22). This marathon is DESIGNED to run inside it (port 9:
+        // the digest must never bill a model call) — opt in explicitly.
+        const prevDigest = process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST;
+        process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST = "1";
+        try { return await preflightCompress(deps, messages); }
+        finally {
+            if (prevDigest === undefined) delete process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST;
+            else process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST = prevDigest;
+        }
+    })();
     assert.ok(result.compressedRanges >= 2, `the marathon must fold at least twice (got ${result.compressedRanges}; ${JSON.stringify(result.failure)})`);
     const receipts = logs.filter((l) => l.startsWith("[acp-proxy: [Compressed"));
     assert.ok(receipts.length >= 2, `expected >=2 committed folds (got ${receipts.length})\n${logs.join("\n")}`);

@@ -70,12 +70,11 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // stamped by the previous response) the server stops re-parsing and
     // re-materializing the identical prefix and decodes only head + new tail.
     // Every verification miss degrades to the legacy full-parse path
-    // byte-identically. EXPERIMENTAL grey rollout at 5% (owner ruling
-    // 2026-11-02: default off, small cohort first, web switch + one-time
-    // intro notice ship alongside); force it per install with
-    // `rollout.features.pluginFullResendWatermark: true|false` (or a percent)
-    // / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1|0`.
-    pluginFullResendWatermark: { percent: 5 },
+    // byte-identically. GA: default ON (owner ruling 2026-11-22, PR #6785:
+    // ran the 5% grey since 2026-11-02 with no issues); opt out per install
+    // with `rollout.features.pluginFullResendWatermark: false` (or a percent)
+    // / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=0`.
+    pluginFullResendWatermark: { percent: 100 },
     // #5643 fastpath v6: (sessionid,msgid) composite-identity-driven
     // incremental lane. Replaces the count-watermark guesswork with a hard
     // identity channel: every body element carries its host msgid listwise,
@@ -130,8 +129,54 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // serve the outbound prefix from the server-owned transcript
     // (POST /__bili/plugin/render). The id-set algebra classifies vanishing
     // cohorts (compressed vs deleted) and detects generation switches.
-    // Default 0% — force on with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=1`.
-    pluginLaneServerHistory: { percent: 0 },
+    // GA (#6525/#6539, owner ruling 2026-11-13): pinned by default. The pin is
+    // the intended end-state of the msgid identity infrastructure — stamped
+    // ids become the recorded `messages.msg_id` so the resolve/settlement/fork
+    // consumers read real host identity, not content digests. The render
+    // endpoint it co-gates is inert until a client opts in (none calls it yet).
+    // Roll back with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=0`.
+    pluginLaneServerHistory: { percent: 100 },
+    // #7064 §8 (owner rulings 2026-11-18): steady-state turns ride the
+    // bounded tail (anchor + new cores) instead of re-sending the FULL msgid
+    // list every turn (the opencode 16KiB header budget died past ~1000
+    // messages); the full form survives only at bootstrap + reanchor. ALL
+    // stamping clients are covered (pi / dsh openai wire via
+    // x-bili-pf-tail-ids; opencode V1 anthropic + V2 responses via the
+    // x-bili-msg-ids channel carrying the tail — server two-form rule). The
+    // owner set it ON by default: it is a core part of the msgid storage
+    // structure, and every mismatch self-heals one round trip (degrade →
+    // full signal → reanchor). Roll back with
+    // `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL=0`. Requires
+    // pluginLaneServerHistory.
+    pluginMsgIdIncremental: { percent: 100 },
+    // #5403 family, delta arm: the client sends body.messages as the TAIL
+    // SLICE [T-L .. T-1] (anchor included) plus x-bili-pf-count = T and
+    // x-bili-pf-tail-ids (width L) — the server rebuilds the view from the
+    // stashed prefix cores + the small re-parsed slice. Inbound bytes drop
+    // from O(history) to O(delta). Every unsatisfiable claim is a 400
+    // re-anchor the client answers with a full-form resend (one-round
+    // convergence); flipping the key back to 0 400s every delta turn, which
+    // is the rollback path (clients converge to the full form within one
+    // turn). Default OFF until the shim send-sides ship — a delta body is
+    // unprocessable by older servers, so both ends must roll together.
+    // Force with `rollout.features.pluginDeltaResend: true` or
+    // `BILI_ROLLOUT_PLUGIN_DELTA_RESEND=1`.
+    pluginDeltaResend: { percent: 0 },
+    // #7398/#7439: the egress plane — ONE switch for the whole new path.
+    // ON: every lane (OpenAI/Anthropic/Responses/Google) records its
+    // outbound conversation view as sparse ops (I/D/U) into the
+    // egress_state/egress_flow dual tables (rows SELF-CONTAINED — message
+    // bytes ride the row, no content CAS, ruling 7439-1), serves the
+    // outbound core portion back from the op log (byte-identical by
+    // construction), and pinned plugin lanes take server authority — the
+    // kernel input is replayed from the flow (rulings 7439-3/5); a bounded
+    // backward ladder recovers to the newest healthy log point, and ANY
+    // unrebuildable/corrupt state degrades the turn to legacy (never a
+    // partial swap, never client-as-authority). OFF = legacy chain, zero
+    // rows, byte-identical to pre-feature.
+    // Force with `rollout.features.egressPlane: true` or
+    // `BILI_ROLLOUT_EGRESS_PLANE=1`.
+    egressPlane: { percent: 0 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
     // message identity aligned from their OWN local transcript/sqlite

@@ -1106,7 +1106,13 @@ const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
      *  child's own egress now comes from the aux-proxy handoff in the spawn path
      *  instead. The loopback exclusion that keeps the /bili/ leg direct when the
      *  child DOES carry a proxy lives in mergeLoopbackNoProxy (#3446). */
-    claude: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"], ownBaseUrlKeys: ["ANTHROPIC_VERTEX_BASE_URL"] },
+    claude: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"], ownBaseUrlKeys: ["ANTHROPIC_VERTEX_BASE_URL"],
+        /** #7439: let claude-code send its per-task class header
+         *  (`x-claude-code-request-class`) to bili — it is gated OFF under a
+         *  3rd-party base URL (i.e. bili) unless this env is set. The reader is
+         *  claudeRequestClassOf / the additive override in
+         *  claudeSubagentAgentId (src/session-id.ts). */
+        extras: [["CLAUDE_CODE_GATEWAY_HINT_HEADERS", "1"]] },
     codebuddy: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["CODEBUDDY_BASE_URL"] },
     /** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
      *  override env), so the launcher can only route it via cert MITM: its
@@ -5144,8 +5150,8 @@ function runCommandCapture(command: string, args: readonly string[], timeoutMs: 
  *  reused pid would inherit the dead occupant's observation history and get
  *  force-taken-over on first sight. Sources (all best-effort, zero new deps):
  *   linux: /proc/<pid>/stat field 22 (starttime, ticks since boot)
- *   win32: powershell Get-Process StartTime (cold start ~1-3s, observed >10s
- *     under c=4 CI load — budget 20s; rare path only, one lookup per cycle)
+ *   win32: powershell Get-Process StartTime (1-3s warm; 30s budget — a loaded
+ *          CI runner's cold start can exceed 10s, #6785)
  *   other POSIX: `ps -o lstart=`
  *  Failure → undefined → the key degrades to origin#pid (previous behavior); a
  *  stamp that appears or disappears across observations restarts the window
@@ -5164,7 +5170,7 @@ export async function processBirthStamp(pid: number): Promise<string | undefined
             return undefined;
         }
         if (process.platform === "win32") {
-            const out = await runCommandCapture("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToString('o')`], 20_000);
+            const out = await runCommandCapture("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToString('o')`], 30_000);
             const trimmed = out.trim();
             return trimmed === "" ? undefined : `ps-${trimmed}`;
         }

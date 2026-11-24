@@ -1,7 +1,7 @@
 import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
 import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
-import { maybeRunInvariantJudge } from "../invariant-judge.js";
+import { activeBlockCoveredIds, maybeRunInvariantJudge } from "../invariant-judge.js";
 import { repairResponsesAssistantOrdering, reanchorSeparatorManifest, separatorManifestAnchored, type SeparatorSlot } from "./responses-ordering.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
@@ -17,6 +17,7 @@ import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClient
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { rewrapCommandcodeBody } from "../commandcode-wire.js";
+import { rewrapZedEnvelope } from "../zed-wire.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
 import { builtinCompatRoles, builtinRoleRestorePoints, withRestoredRoles } from "../kiro.js";
@@ -48,7 +49,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { describeCoreTextDuplication, formatForwardFieldSizes, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -718,6 +719,12 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             wireBody = JSON.stringify(rewrapCommandcodeBody(JSON.parse(wireBody) as Record<string, unknown>, prepared.commandcode.meta));
         } catch { /* malformed flat body — pass through unchanged */ }
     }
+    // zed cloud wire: same final-boundary rewrap for the /completions envelope.
+    if (prepared?.zed && typeof wireBody === "string") {
+        try {
+            wireBody = JSON.stringify(rewrapZedEnvelope(JSON.parse(wireBody) as Record<string, unknown>, prepared.zed.meta));
+        } catch { /* malformed inner body — pass through unchanged */ }
+    }
     // #1421/#1683: outbound chain checkpoint — when egress stamping is enabled
     // (chainEgressStamp, DEFAULT OFF), every request THIS instance actually
     // processed leaves with a request-level stamp, so a downstream bili applies
@@ -778,7 +785,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // retry that dropped it would present flat OpenAI where the client's wire
     // expects the CLI envelope.
     const ccMetaForResend = prepared?.commandcode?.meta;
-    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active || ccMetaForResend !== undefined
+    const zedMetaForResend = prepared?.zed?.meta;
+    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active || ccMetaForResend !== undefined || zedMetaForResend !== undefined
         ? (b: Record<string, unknown>): Record<string, unknown> => {
             let out = b;
             if (compatProtocol && compatRoles) applyCompatRolesJson(out, compatProtocol, compatRoles);
@@ -787,6 +795,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // #3129: re-nest the rebuilt inner request into the CloudCode envelope.
             out = v1Active ? wrapV1Internal(out, v1Meta) : out;
             if (ccMetaForResend !== undefined) out = rewrapCommandcodeBody(out, ccMetaForResend);
+            if (zedMetaForResend !== undefined) out = rewrapZedEnvelope(out, zedMetaForResend);
             return out;
         }
         : undefined;
@@ -963,6 +972,18 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         }
         applyResign(headers, wireBody);
     }
+    // #7587: make telemetry-bloat visible at the point where the final bytes
+    // are known. Parsing every request would be wasteful, so this runs only
+    // for debug sessions or oversized bodies — exactly the cases where the
+    // breakdown pays for itself.
+    const wireBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : wireBody.byteLength;
+    if (opts.debug || wireBytes >= 1024 * 1024) {
+        try {
+            const wireText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+            const sizes = formatForwardFieldSizes(JSON.parse(wireText));
+            if (sizes) log("info", `[${prepared?.session.id ?? "passthrough"}] [forward] field sizes: ${sizes}`);
+        } catch { /* non-JSON bodies keep the existing behavior */ }
+    }
     try {
         checkOutboundBody(wireBody);
     } catch (err) {
@@ -1039,28 +1060,19 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             const fuseMeasured = measuredOutbound(prepared);
             const fuseRawTokens = fuseMeasured?.tokens;
             if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
-                log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
-                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
-                log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
-                if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
-                else {
-                    res.writeHead(413, { "content-type": "application/json" });
-                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
-                }
-                return;
+                // #7537 (owner ruling 2026-11-22): no estimate-based refusal —
+                // the bar here is a local window value that is often wrong-
+                // small. Log the measurement as evidence and forward; the
+                // upstream answers with its own real numbers (annotated in
+                // the upstream size-error branch below, same issue).
+                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; the #554 meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
+                log("info", `[${prepared.session.id}] egress window fuse profile (duplication): ${describeCoreTextDuplication(fuseMsgs)}`);
             }
             const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
             if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
-                const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
-                log("warn", `413: [${prepared.session.id}] egress window fuse core-text profile: ${describeCoreTextDuplication(fuseMsgs)}`);
-                const fuseMessage = `outbound core text alone is ~${fuseBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${fuseFloorTokens} tokens vs the effective model window ${declaredWindow} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); no upstream can accept it, so the send was stopped at the egress fuse instead of being forwarded (#4068/#4079). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
-                log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
-                if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
-                else {
-                    res.writeHead(413, { "content-type": "application/json" });
-                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
-                }
-                return;
+                // #7537: byte-math profile over the local window bar — log and
+                // forward, same ruling as above.
+                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound core text alone is ~${fuseBytes} bytes (≥ ~${Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN)} tok at the densest observed density, #2122) vs the effective model window ${declaredWindow} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
             }
         }
     }
@@ -1241,6 +1253,9 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // which would accuse the client of an insertion bili itself made.
             ...(separatorOwnershipUnknown ? { separatorOwnershipUnknown: true } : {}),
             ...(renderTailStart !== undefined ? { renderTailStart } : {}),
+            // #4401: active-block coverage — in the plugin carrier regime the
+            // covered cells' absence is the fold itself, not a drop.
+            coveredIds: activeBlockCoveredIds(prepared.session.state),
         });
         const sentSlot = lastForwardedBody(prepared.session);
         if (sentSlot !== undefined && ownedSeparatorCores !== undefined) sentSlot.ownedSeparatorCores = ownedSeparatorCores;
@@ -1756,6 +1771,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // probe-forward gate) treat the arm as current-route evidence
             // instead of demoting it against a stale settle origin.
             s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl);
+            if (typeof reqModel === "string" && reqModel !== "") s.stats.lastInputTokensModel = reqModel;
             // #1110: record the arm SEPARATELY so the side-request guard
             // can read it without ever touching the nudge baseline. The guard
             // keeps the CEILING even when the baseline books a measured or
@@ -1832,6 +1848,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 s.stats.lastInputTokensSource = "overflow-arm";
                 s.stats.overflowArmTokens = arm; // #1110: guard reads this, not the baseline
                 s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl); // #2313: same-route evidence, see the window branch above
+                if (typeof reqModel === "string" && reqModel !== "") s.stats.lastInputTokensModel = reqModel;
             }
             log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of judging window ${judging} and payload estimate), nothing learned (#987): ${info.message}`);
         }
@@ -2159,6 +2176,32 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // here depends on it.
         const terminalCause = rejectionDiagnosticSuffix(bodyText);
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}${terminalCause}`);
+        // #7537 (owner ruling 2026-11-22): local estimate-refusals are gone —
+        // when the UPSTREAM itself rejects the body as too large, its verdict
+        // is authoritative. bili logs its own measurement as evidence and marks
+        // the response non-retryable via HEADERS so status-code-driven hosts
+        // don't retry-loop an unchanged body the upstream already rejected
+        // (burning rate limits). Log always; headers only for non-stream, not-
+        // yet-sent responses. The upstream BODY passes through byte-identical:
+        // verbatim pass-through is a pinned contract (#1195 B,
+        // request-input-lifetime), so no body merge. The anti-loop protection
+        // for the truly-doomed payload lives in preflight's evidence branch
+        // (deterministic exhaustion against a proven wall → local 413 after
+        // the arm stamps, #496/#767/#857).
+        const SIZE_ERROR_RE = /request entity too large|payload.*too (large|big)|body too (large|big)|too many (tokens|messages|bytes)|exceeds? (the |a |your )?(maximum|limit|allowed|context)|context (length|window|size)|input is too long|maximum context length|token (limit|count|budget)|content is too long|message\[?s?\]?.*(too long|exceed)/i;
+        const upstreamSizeVerdict = upstream.status === 413 || (upstream.status === 400 && SIZE_ERROR_RE.test(bodyText));
+        if (prepared && upstreamSizeVerdict) {
+            const sizeMeasured = measuredOutbound(prepared);
+            const declaredWindow = typeof prepared.session.metadata.effectiveContextLimit === "number" && prepared.session.metadata.effectiveContextLimit > 0
+                ? prepared.session.metadata.effectiveContextLimit
+                : 0;
+            const inboundBytes = typeof wireBody === "string" ? wireBody.length : wireBody ? wireBody.length : 0;
+            log("warn", `[${errSid}] upstream size verdict ${upstream.status} (authoritative per #7537): bili measured outbound ~${sizeMeasured?.tokens?.toLocaleString("en-US") ?? "n/a"} TEXT tokens${sizeMeasured?.breakdown ? ` (${measuredBreakdownClause(sizeMeasured.breakdown)})` : ""}, inbound ${inboundBytes.toLocaleString("en-US")} bytes, effective window ${declaredWindow.toLocaleString("en-US")} (model=${prepared.model ?? "unknown"}); marking non-retryable via headers to stop host retry loops — the upstream body passes through verbatim`);
+            if (!res.headersSent && req.method !== "GET" && req.method !== "HEAD") {
+                respHeaders["x-bili-cause"] = "upstream-size";
+                respHeaders["x-bili-retryable"] = "false";
+            }
+        }
         if (prepared?.session && prepared.nudgeStampsBefore && upstream.status >= 400 && upstream.status < 500) rejectNudge(prepared.session, prepared.nudgeStampsBefore, upstream.status);
         // #4204: feed this send's FINAL verdict. A model-scoped KeyRing 429 is
         // selected only by its structured code plus exact request-model match;
@@ -2472,7 +2515,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     try {
         // #1295: commandcode streams terminate with their own finish event —
         // no fake-completion shape exists to buffer-and-retry (#371 off).
-        if (prepared !== null && prepared.stream && !prepared.commandcode && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
+        if (prepared !== null && prepared.stream && !prepared.commandcode && !prepared.zed && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
             // #1900: retry from wireBody — the exact bytes this request's main
             // attempt shipped (post wireTransform and any same-request re-send),
             // never the raw client body: upstream may have rejected those raw
@@ -2532,7 +2575,13 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             opencodeLogId: upstream.headers.get("x-opencode-log-id") ?? undefined,
             cfRay: upstream.headers.get("cf-ray") ?? undefined,
         };
-        if (prepared && prepared.resetAfterSuccess) {
+        if (prepared && prepared.zed) {
+            // zed cloud wire: NDJSON response — raw byte passthrough, no
+            // parsing, no usage accounting (request side is the only side bili
+            // rewrites on this lane; an in-stream loop is structurally
+            // unreachable, #3177 reasoning).
+            await pipeThrough(responseBody, res);
+        } else if (prepared && prepared.resetAfterSuccess) {
             const [toClient, toObserve] = responseBody.tee();
             const observed = observeResponsesTerminalState(toObserve, prepared.stream);
             const tagLog = (msg: string) => log("info", `[${prepared.session.id}] ${msg}`);
@@ -2941,7 +2990,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 const billed = typeof total === "number" ? total : 0;
                 if (billed > 0 || reportedCached !== null) {
                     // Use the send-time capture; settlement is not another send.
-                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation });
+                    // Model stamp (identity fast path): prepared.model is only
+                    // populated on some lanes — fall back to the same
+                    // body-derived derivation the throttle uses.
+                    const settleModel = typeof prepared.model === "string" && prepared.model !== "" ? prepared.model
+                        : typeof prepared.google?.model === "string" && prepared.google.model !== "" ? prepared.google.model
+                        : typeof requestModelFromBody(wireBody, req) === "string" && requestModelFromBody(wireBody, req) !== "" ? requestModelFromBody(wireBody, req)
+                        : undefined;
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation, model: settleModel });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);

@@ -399,9 +399,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     }
     if (breaker) {
         extra.push("");
-        extra.push(`COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: ${breaker.n} / ${breaker.threshold}. Disarms on one successful compress or ${breaker.decayMinutes} min without further failures.`);
+        extra.push(`COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: ${breaker.n} / ${breaker.threshold}. Disarms on one substantial compress (a trivial one that saves almost nothing does not count) or ${breaker.decayMinutes} min without further failures.`);
         if (substrateDestroyed) {
-            extra.push("Last failures were attributed to substrate-destruction (an out-of-band history rewrite). The Compressible-ranges list above was re-derived from the CURRENT resent view: per the receipt, compress ONLY a range listed there — one success clears this breaker. If no ranges are listed, continue the task without compressing.");
+            extra.push("Last failures were attributed to substrate-destruction (an out-of-band history rewrite). The Compressible-ranges list above was re-derived from the CURRENT resent view: per the receipt, compress ONLY a range listed there — one substantial success clears this breaker. If no ranges are listed, continue the task without compressing.");
         } else {
             extra.push("The Compressible-ranges list above was re-derived from the current view — the table is live; it is the earlier attempts that failed, not these ranges. Per the failure receipt: do not attempt to compress now; continue the task.");
         }

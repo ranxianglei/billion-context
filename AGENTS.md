@@ -26,6 +26,38 @@
 | GitHub | https://github.com/ranxianglei/billion-context |
 | License | MIT |
 
+### Supported Hosts — Official Source & Binary Locations
+
+When auditing host behavior (plugin APIs, tool-call-id exposure, compaction seams, wire quirks), clone the source repos from THIS table — never guess the location. Lane semantics (launcher / MITM / config seam / native tool lane) are documented per client in docs/clients.md.
+
+| Host (lane name) | Mode | Official source / binary |
+|---|---|---|
+| pi | native tool lane + launcher | [earendil-works/pi](https://github.com/earendil-works/pi) (pi.dev) |
+| omp (oh-my-pi) | native tool lane (pi factory) | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) (omp.sh) |
+| dsh (deepseek-harness) | native tool lane | [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) |
+| opencode | native tool lane (V1 plugin API) | [anomalyco/opencode](https://github.com/anomalyco/opencode) (opencode.ai) |
+| kimi (Kimi Code) | native tool lane + MITM | [MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code) (kimi.com) |
+| hermes (Hermes Agent) | native Python plugin | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
+| zcode (Z.ai) | native tool lane | [zai-org/ZCode](https://github.com/zai-org/ZCode) (z.ai) |
+| claude (Claude Code) | native MCP lane | closed (Anthropic): https://claude.com/product/claude-code |
+| codex (Codex CLI) | launcher + MCP shell | [openai/codex](https://github.com/openai/codex) |
+| gemini (Gemini CLI) | launcher | [google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli) |
+| qwen (Qwen Code) | launcher / MITM | [QwenLM/qwen-code](https://github.com/QwenLM/qwen-code) |
+| copilot (Copilot CLI) | launcher (closed Go binary) | [github/copilot-cli](https://github.com/github/copilot-cli) |
+| aider | MITM | [Aider-AI/aider](https://github.com/Aider-AI/aider) |
+| goose | launcher | [aaif-goose/goose](https://github.com/aaif-goose/goose) |
+| crush (Charm) | MITM | [charmbracelet/crush](https://github.com/charmbracelet/crush) (charm.land/crush) |
+| zed | MITM | [zed-industries/zed](https://github.com/zed-industries/zed) (zed.dev) |
+| jcode (JCode) | MITM (Rust; no plugin seam, #962) | [1jehuang/jcode](https://github.com/1jehuang/jcode) |
+| qoder (Qoder CLI) | MITM / launcher | closed: https://qoder.com · https://download.qoder.com/qoder-app/releases/latest/Qoder-linux-amd64.deb |
+| workbuddy / codebuddy (Tencent) | config seam (workbuddy, #7456) / launcher (codebuddy) | closed: https://workbuddy.ai · https://download.codebuddy.ai · https://codebuddy.cn |
+| trae (Trae CLI) | MITM | closed: https://trae.ai |
+| iflow (iFlow CLI) | launcher | https://iflow.cn |
+| mcode (MiniMax Code) | MITM (event hooks only, #1050) | closed: https://minimax.io |
+| amp (Amp CLI) | MITM (closed Go, #1049) | closed: https://ampcode.com |
+| kiro (AWS Kiro CLI) | MITM | closed (Rust shell + Node agent server) |
+| antigravity (Google) | launcher (closed Go; additive-only plugin surface, #2115) | closed (Google) |
+
 ## 2. Architecture
 
 ### Module Map
@@ -53,13 +85,27 @@ Tier A entries are every-session rules and stay in full below. Tier B entries ca
 12. **资格判定与执行共用单一投影 (shared unit-projection judgment, #3236) (Tier B)** — whether a range is foldable has exactly ONE definition: `projectUnit` (`kernel/src/unit-projection.ts`), returning the projection OR the ready-to-throw fatal error. The apply side throws it byte-identically; recommend re-screens final merged units and demotes fatal units to gaps (no re-merge after filtering — anti-oscillation); `acp_status` flags rows additively (never drops). Judgment MUST run on the EXACT array class `applyCompression` executes on — hosts whose render view differs pass `applyView` / `StatusReportOptions.originalMessages`. Full text: design-decisions.md #12.
 13. **出站历史渲染:快照即会话 (snapshot render — #3756, D-lane) (Tier B)** — 绑定 session id 且统一存储可读的会话，出站**前缀**由服务端正史渲染（消息身份 = 服务端行 `seq`）；尾巴保持客户端逐字。**任何失步（开关关/无活跃块/存储不可读/链不上）整轮回退 legacy——降级，不猜**；永不复活已覆盖行；观测（`reconcileFoldCoverage`）与渲染刻意分离。规则推论：凡讨论「覆盖 id 失配/destroyed 误诊/断缓存」类 bug，先问是否 D 车道——那类病理在 D 上结构性不存在。Full text: design-decisions.md #13.
 14. **verif 模块:kernel 决策核的求解器验证 (#3848, PR #3853) (Tier B)** — `verif/` 把守护清单（`verif/guarded-files.ts` Tier A）的真实 TS 翻译成 SMT，cvc5/z3 找反例，反例必须回放真代码复现。**改守护清单文件：常规测试之外必须过 `tests/verif-subset-guard.test.ts`（秒级）+ 涉及的 `tests/verif-bug*`/`verif-generic-*`/`verif-induction-*`**（无求解器环境自动 skip）。新语法先让翻译器支持；例外登记 `verif/exceptions.ts`（过期即红）。教义：`verif/README.md`。Full text: design-decisions.md #14.
-15. **全量重发水位快路径 (full-resend watermark — #5403/#5418, rollout `pluginFullResendWatermark` 5% 灰度) (Tier B)** — 服务端在成功响应盖 `x-bili-pf-seq`（messages 元素数，零分配结构扫描测出）；客户端回带 `x-bili-pf-count` + `x-bili-pf-tail-ids`（宿主 msgid；v4 下 K 取自**服务端账本**）。命中 = 上一轮 canonical cores + 仅尾窗 [K..T) 新解析（跳整包 parse/转换/钉存——#5403 OOM 生产者）。**任何疑点整轮走原封未动的 legacy 全量路径并重新盖戳**（客户端一轮收敛）；5 次连续可证实 miss ⇒ 熔断持有一小时。诚实边界：保元素数的前缀字节改写**不可检测**（§7.4 人工评审档）；多模态尾部入缓存后该段历史永久回 legacy 轮；pf-* 是协议头不是 hop 头（转发上游前剥，`UPSTREAM_HOP_HEADERS`）。与增量车道可同开、按请求形状分轨不双处理（anthropic wire→增量 divert；openai 形→水位）。Full text: design-decisions.md #15.
+15. **全量重发水位快路径 (full-resend watermark — #5403/#5418, rollout `pluginFullResendWatermark`，2026-11-22 起默认 100%（GA；此前 5% 灰度）) (Tier B)** — 服务端在成功响应盖 `x-bili-pf-seq`（messages 元素数，零分配结构扫描测出）；客户端回带 `x-bili-pf-count` + `x-bili-pf-tail-ids`（宿主 msgid；v4 下 K 取自**服务端账本**）。命中 = 上一轮 canonical cores + 仅尾窗 [K..T) 新解析（跳整包 parse/转换/钉存——#5403 OOM 生产者）。**任何疑点整轮走原封未动的 legacy 全量路径并重新盖戳**（客户端一轮收敛）；5 次连续可证实 miss ⇒ 熔断持有一小时。诚实边界：保元素数的前缀字节改写**不可检测**（§7.4 人工评审档）；多模态尾部入缓存后该段历史永久回 legacy 轮；pf-* 是协议头不是 hop 头（转发上游前剥，`UPSTREAM_HOP_HEADERS`）。与增量车道可同开、按请求形状分轨不双处理（anthropic wire→增量 divert；openai 形→水位）。Full text: design-decisions.md #15.
 16. **Notice surface: one registry, three sources, B>A>S shadow (#5548) (Tier B)** — every web-UI banner flows through ONE loop consuming `mergedNotices()`: **S**=built-in (`src/notices.ts`, dead-key-guarded) / **A**=remote feed (`announcements/remote.json`, ~3-min poll, fail-open) / **B**=local files (`<config dir>/announcements/*.json`); equal ids shadow B>A>S. **Exactly ONE banner channel exists — no bespoke feed fetchers, dismissal stores, or inline banners.** Adding a builtin = `src/notices.ts` entry + en/zh i18n pair + registry-test row (+ config yaml seed + `gen-config-docs` when a knob ships). Dismissal receipts live in unified storage (`kv_store` namespace `notices`). Full text: design-decisions.md #16.
 17. **消息身份公用设施 (sessionid+msgid) 生产/消费声明 (#5826) (Tier B)** — sessionid+msgid 是跨四车道的公用设施，**改任何一处前必须读懂生产与消费来源**（完整地图 `docs/msgid-infrastructure.md`）。生产：宿主铸稳定 UUID（`acp_summary_*` 为 kernel 保留命名空间，宿主 id 不得占用）；采集器只做拿到+初筛；四种传输载体**全部转发上游前剥除**。消费五方：统一存储 `messages.msg_id`（唯一 id 事实源）/ session-resolve 末档 #5719 / 结算 membership #4805 / 增量车道 #4491 / 水位尾连续性 v2-v4。校验规则**六份镜像副本**（宿主 bundle 禁 import server 模块的结构性约束）：`tests/msgid-rule-parity.test.ts` 钉死每份副本判决——**改任何一份规则必须先过该测试（有意分歧须显式重钉+写明理由）**。Full text: design-decisions.md #17.
 
 ### #18 — 身份信道接线：所有车道接进同一采集缝，消费者永不直读客户端存储 (#5825) (Tier B)
 
 身份信号来源只有三类：**宿主写入**（msgid body 字段 / 信封 `msgIds` / pf 头）、**宿主盖戳头**（opencode V2 `x-bili-msg-ids`）、**自包含采集器**（`src/identity-harvest.ts` 注册表 + `src/identity-<client>.ts` 适配器；双门：env `BILI_IDENTITY_HARVEST` 或灰度键 `rollout.features.identityChannelHarvest`，均默认关 × 仅回环来源）。**消费者（#5719 归属档 / pin-行链路 / membership / 水位）只从统一缝取数**：handle 入口每请求按「body 字段 > 盖戳头 > 采集」取一次快照——绝不新增「逐调用点单独取数」。新车道 = 新适配器文件 + barrel 一行登记 + 文档一行；适配器自包含、整轮退化（任一环节不判定 ⇒ 该轮整体回退接线前路径，绝不做部分映射）。车道状态表与信任边界：docs/identity-channels.md；身份判定逻辑：docs/session-identity-resolution.md。Full text: design-decisions.md #18.
+
+19. **不用本地估算拒发:超窗一律转发,上游的大小判决才是权威 (no estimate-based size refusal — #7537, owner 裁定 2026-11-22) (Tier A)** — bili 本地判「这个包超过模型窗口 → 413 拒发」的整条机制已废除:本地窗口值本身就常常错(fallback 窗口,#7205),估算 × 错窗口 = 乘性误差,拒掉的往往是上游本来能收的包(#7167/#7382/#2490/#2847 家族);被拒绝的字节没有进过任何上游,错误信息只有本地估算、没有上游的真实号码。新契约:**该折的照折(fold-first 不变),折完一律转发;上游以真实号码拒绝时(413 / 大小类 400),bili 把自己的实测证据(出站 token 数+分维度 breakdown+入站字节+有效窗口)打进日志并在响应上标记 `x-bili-retryable: false`(JSON 体可解析时并入 `bili_evidence` + `error.retryable=false`),防止按状态码驱动的重试循环烧配额**。**保留的本地拒发只有两种:非估算类**——消息条数门(`BILI_MAX_MESSAGES`,真实 wire 约束)与 5GiB 纯字节 sanity cap(资源保护)。实现:src/server.ts 四处 413 拒发点 + src/server/relay.ts 出口熔丝两道大小门(计数门保留);测试钉在 tests/issue7537-preflight-passthrough.test.ts 及既有 preflight 套件的重钉。Full text: design-decisions.md #20.
+
+### #21 — id 存储去重与 msgid 生命周期梳理（#7064, owner 裁定 2026-11-17） (Tier B)
+
+msgid 真身只有 `messages.msg_id` 一处，`l1_world`/`fold_journal`/`egress_snapshot` 里的 id 清单 JSON 全是投影，已全部降级为「区间引用 + 防伪指纹」：l1_world = 尾 512/头 32 id 窗 + count + max_pos（身份闸门→记账游标，中段不可见）；fold_journal = [start_seq,end_seq] + input_hash（原文行防伪指纹，按区间重扫重推）；egress_snapshot = 水位线以下存活行聚合指纹。（本 PR 后续：`fold_journal`/`egress_snapshot` 两表在合入前整体退役（bc51c9445，7439 裁定）——v2 基座最终只剩 `l1_world`，egress 状态由 `egress_state`/`egress_flow` op log 承担；上句对两表的形态描述是退役前的中间形态，留作历史。）**D1 永不判分叉**（判决最强动作是 reanchor 一条 UPDATE，永不 reject/400/reset）；**D2 conversation-bound 跳过 id 判定**（宿主身份行的 sid 游标纯记账，R3 故障永不触发，短/缺 msgid 只降级 + 日志）；**D3 尾锚常活**（水位命中轮同样 pin + 刷新游标；stage-0 推进 bump revisionEpoch，snapFlush epoch 证明看见推进——fork 拿不到过期父 revision）。改 l1/fold_journal/egress 任何一处前先读 discussion #7064 与本条目——三表回答的是同一个问题（「我缓存的和账本还对得上吗」），不需要 id 清单本身。Full text: design-decisions.md 21.
+
+### #22 — msgid pin 通道增量化：稳态只发尾部，快照轮才发全量（#7064 §8, owner 裁定 2026-11-18） (Tier B)
+
+全量 msgid 清单不再每轮发送：稳态靠既有有界通道 `x-bili-pf-tail-ids`（锚点+新增，≤2048，`?` 占位）携带增量，服务端从前缀**从账本 live 行重盖**（ingest 是 INSERT OR IGNORE on (session_id,seq)——位置上的 msg_id 只写一次，不从账本重盖 kernel ref 空间会漂）。接受规则（2026-11-19 定型：尾部对齐重叠段逐行对账）：清单声明覆盖连续尾段 [T-L, T-1]，与账本的重叠段 [T-L, C-1] 逐行相等（任一行漂移⇒降级，永不 reject）；新增核（重叠之后）逐槽筛查；稳态形态（锚点+新增，L=N+1）= 单行重叠特例 = 原锚点检查，行为不变；**超长会话（>2048）截断尾清单同样可 pin**——重叠段更长、证明更强，「退回全量」退化为「发你有的」，全量不再是必需。任何失配降级 "full" 信号、下轮重锚（D1 家族）。全量形式不删、**全量优先**：只有快照轮（启动账本空 / 压缩/fork 后重锚）发全量。客户端经响应头 `x-bili-msgid-mode: incremental|full` 学 mode（与 x-bili-pf-seq 同头发出、4xx 即清、pf 状态机单学习点 pfLearnStamp）；抑制单点 pfSuppressFullMsgIds（wire 短于最近实测 T ⇒ 压缩 ⇒ 清 mode + 发全量）。灰度 `pluginMsgIdIncremental` 首发时默认 0（off = 字节级同改前）；phase 2 起默认 100（见本条末尾）；opencode 暂留全量（phase 2：core-aligned 列表跳过 leading system 而 /responses T 计 wire，tail off-by-one）。改 pin/信号/tail-ids 任何一处前先读 discussion #7064 §8 与本条目。Full text: design-decisions.md 22. **phase 2（owner 裁定 2026-11-18：全客户端覆盖 + 默认开）**：两形态规则上移到申报通道本身——数组长度 = 视图长度 ⇒ 全量（既有路径），短数组 ⇒ 合法尾部形态（漂移类：只降级发「full」，永不 400；R3 故障只来自全量数组的坏内容；**空账本上的短数组：条目本身坏掉（空串/超长/保留前缀/空白控制字符/重复）= 采集故障，沿用旧 R3 400 路径；条目正常的短数组 = 账本丢了的增量客户端（#7574，owner 2026-11-23 改判）——这一轮照常处理（不 pin、内容派生 id），响应发 `full` 信号，下一轮全量重建账本，不再 400**）；body 短数组优先于 pf-tail-ids header。responses/anthropic 车道都接受尾部形态并发 `x-bili-msgid-mode`；opencode V1/V2 已接线（`pfIdTailForm` prevIds 前缀延伸校验，shrink/rewrite 回落全量；core-aligned 列表对 hoist 后 core 计数天然对齐，**无偏移**）；omp 无全量申报面（delta 车道天然增量）、claude/codex/google 无申报 = 覆盖完整；`pluginMsgIdIncremental` **默认 100**（回滚 env `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL=0`，失配一轮自愈）。
+
+### #23 — egress-on 会话以 op log 为唯一正史、messages 投影惰性化 + 窗口 re-anchor delta（#7474/#7475，owner 裁定 2026-11-22） (Tier B)
+
+10w 行实测两臂稳态 p50 都 ~2s：每回合存储开销正比于 messages 账本总行数而非新增行数。owner 裁定「本 PR 目的就是把 egress_flow 升为唯一正史、messages 降级为惰性投影」：(1) pin 通道单一读入口 `snapPinLiveIds`——egress-on 读 `egress_state`（有界 serving 读、log_seq 序、排除 `EGRESS_SYSTEM_MSGID`），无 op log 会话与 `snapMsgIdLiveIds` 字节等价，op log 损坏降级回 messages 账本（pin 路径永不抛）——KDD #21「msgid 真身」对 egress-on 会话改指 `egress_flow` I 行 msgid（wire 不变、#21/#22 裁决不动）；(2) egress-on 停止逐轮统一 ingest（门 = `metadata.egressAuthority` ∧ `egressPlane` 开）：逐轮磁盘写只剩 egress_flow I 行，messages = 惰性投影（回滚/恢复/web 读时一次性 O(n) 重建），flow 损坏硬失败独立不变；(3) 窗口 re-anchor delta（OFF 臂同受益）：pf 滑动尾窗逐行经**事务内**索引 identity 探针解析（既有行保 seq、新行续 MAX(seq)、疑点 = 逐字节改前全量路径），取代 0.5-0.8s@10w 的每 HIT 轮 O(全表) re-ingest。改 pin 数据源/egress 存储门/window 规划前读 design-decisions.md #23 与 discussion #7439。Full text: design-decisions.md #23。
 
 ### Install-Lane & Update-Ownership Contract (#1196)
 
