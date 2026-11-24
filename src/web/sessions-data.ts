@@ -85,6 +85,9 @@ interface WebSessionSummary {
     hasLedger?: boolean;
     /** Display-name fallback: collapsed lead of the first compression block's topic/summary. */
     firstBlockHint?: string;
+    /** Parent session for a subagent/derived session, when the host stamped
+     *  metadata.derivedFromSessionId (or the legacy derivedFrom key). */
+    parentSessionId?: string;
     /** Which client produced this session: plugin agents stamp metadata.pluginAgent,
      *  non-plugin clients get a sniffed/UA-derived metadata.clientHint (server.ts #1426). */
     clientHint?: string;
@@ -955,6 +958,9 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     const firstBlockHint = firstBlockTopicLead(s.state.blocks) ?? "";
     // #1426: which client this session came from (plugin stamp wins, then sniff/UA hint).
     const metaRec = s.metadata as Record<string, unknown>;
+    // Host-stamped parent for a subagent/derived session. New sessions
+    // stamp derivedFromSessionId; keep derivedFrom as the legacy fallback.
+    const parentSessionId = str(metaRec["derivedFromSessionId"]) ?? str(metaRec["derivedFrom"]);
     // #2155: active self-heal state (zombie plugin degrade / nudge
     // suppression) — surface it so the web list can badge the session.
     const shRaw = metaRec["selfHeal"];
@@ -1018,6 +1024,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),
         ...(firstBlockHint ? { firstBlockHint } : {}),
+        ...(parentSessionId ? { parentSessionId } : {}),
         ...(hasFolds ? { grossSaved, netSaved, repayCost, summaryCost, foldCount } : {}),
         ...(typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? { model: s.metadata.lastModel } : {}),
         ...(costUsd !== undefined ? { costUsd } : {}),
@@ -1103,6 +1110,9 @@ interface SessionPageQuery {
     protocol?: string;
     client?: string;
     state?: SessionPageState;
+    /** "top" excludes derived sessions; "child" keeps only sessions with a
+     *  parentSessionId. Unknown values are ignored, like the other facets. */
+    kind?: "top" | "child";
     page?: number;
     pageSize: number;
 }
@@ -1140,6 +1150,8 @@ export async function buildSessionPage(query: SessionPageQuery): Promise<Session
         }
         if (protocol && (s.protocol ?? "unknown").toLowerCase() !== protocol) return false;
         if (client && (s.clientHint ?? "").toLowerCase() !== client) return false;
+        if (query.kind === "top" && s.parentSessionId) return false;
+        if (query.kind === "child" && !s.parentSessionId) return false;
         if (query.state === "live" && (!s.live || s.restored)) return false;
         if (query.state === "history" && s.live && !s.restored) return false;
         return true;
