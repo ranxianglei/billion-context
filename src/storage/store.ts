@@ -4351,9 +4351,13 @@ export class UnifiedStore {
                 }
                 // Materialize a minimal parent skeleton row (the same
                 // pattern as the #7591 R3-latch upsert in snap.ts) so the
-                // child's lineage pair points at a durable row. A later
-                // full ingest of the parent fills the remaining columns;
-                // the upsert never reparents an existing pair (COALESCE).
+                // child's lineage pair points at a durable row. The JSON
+                // columns keep their DDL defaults ('{}'): an egress-on
+                // parent's unified leg is frozen (persist.ts
+                // egressProjectionFrozen), so no full ingest ever fills
+                // them — the egress op log is the parent's authority and
+                // the skeleton row is a lineage anchor only. The upsert
+                // never reparents an existing pair (COALESCE).
                 this.db.prepare(`INSERT OR IGNORE INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)`).run(parentId, Date.now(), Date.now());
             }
             if (existing !== null) {
