@@ -91,11 +91,19 @@ export function upstreamTimeoutMs(): number {
 // explicit Agent per timeout value so the transport layer matches the watchdog
 // instead of firing first.
 const directDispatchers = new Map<string, Agent>();
+let directCaIdentity: string | undefined;
 
 function directDispatcher(timeoutMs: number): Agent {
     // #3776: key on the CA identity too so a configured/rotated network.caFile
     // rotates the cached Agent (and its connect.ca) instead of reusing a stale trust set.
-    const key = `${timeoutMs}\u0000${upstreamCaIdentity()}`;
+    const caIdentity = upstreamCaIdentity();
+    if (caIdentity !== directCaIdentity) {
+        // Retire the old identity's pools without aborting their in-flight responses.
+        // Keeping every rotated identity here otherwise retains Agents and CA material forever.
+        closeDirectDispatchers();
+        directCaIdentity = caIdentity;
+    }
+    const key = `${timeoutMs}\u0000${caIdentity}`;
     let agent = directDispatchers.get(key);
     if (!agent) {
         const ca = upstreamExtraCa();
@@ -105,11 +113,16 @@ function directDispatcher(timeoutMs: number): Agent {
     return agent;
 }
 
-export function _resetFetchUtilForTest(): void {
+function closeDirectDispatchers(): void {
     for (const agent of directDispatchers.values()) {
         try { void agent.close().catch(() => undefined); } catch { /* already closed */ }
     }
     directDispatchers.clear();
+    directCaIdentity = undefined;
+}
+
+export function _resetFetchUtilForTest(): void {
+    closeDirectDispatchers();
     _resetUpstreamCaForTest();
 }
 
