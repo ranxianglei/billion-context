@@ -2841,12 +2841,6 @@ export class SessionStore {
 
     async createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base"; resident?: Session } = {}): Promise<CheckpointRow> {
         const shadow = this.liveShadow();
-        // #7577 D5: egress-on sessions do not use checkpoints — the admin
-        // API does a point copy (egressPointFork) instead. Guard here so a
-        // stray call cannot create a checkpoint for an egress-on session.
-        if (opts.resident && opts.resident.metadata["egressAuthority"] === true) {
-            throw new Error(`[storage] createReplica: session ${sessionId} is egress-on — use the point-fork path instead`);
-        }
         // #7439 P2: egress-on sessions have a frozen messages projection —
         // viewForAsync returns the arm-time snapshot, not the live content.
         // When the caller passes the resident session, use it directly
@@ -2858,6 +2852,14 @@ export class SessionStore {
             const view = await shadow.viewForAsync(sessionId);
             if (!view) throw new Error(`[storage] session ${sessionId} is not in the unified index (unknown, or never persisted under this mode)`);
             record = viewToRecord(view);
+        }
+        // #7577 D5: egress-on sessions do not use checkpoints — the admin
+        // API does a point copy (egressPointFork) instead. Guard on the
+        // PERSISTED record's metadata (resident build or unified view, both
+        // carry it) so a stray call cannot create a checkpoint for an
+        // egress-on session whether or not it is currently loaded.
+        if (record.metadata?.["egressAuthority"] === true) {
+            throw new Error(`[storage] createReplica: session ${sessionId} is egress-on — use the point-fork path instead`);
         }
         // CCR originals must survive the rollback the replica exists for:
         // the live content-store sidecar (not just what the unified index

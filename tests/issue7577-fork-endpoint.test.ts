@@ -152,3 +152,41 @@ test("(c) rejections: not-egress-on and already-exists both throw (both directio
         _resetSessionsForTest();
     }
 });
+
+test("(c) guard: a NON-resident egress-on session is rejected by createReplica (D5 — no checkpoint for egress-on, loaded or not)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-egress-fork-guard-"));
+    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60000 });
+    try {
+        const ready = await store.waitForReplicas(5000);
+        assert.ok(ready, "unified store ready");
+        _setStoreForTest(store);
+        _resetSessionsForTest();
+
+        // egress-on parent, persisted but NOT loaded (non-resident) — the
+        // admin endpoint's resident probe misses it, and the old resident-only
+        // guard would have let a checkpoint row through for it.
+        const seed = createSession("parent-nr");
+        seed.metadata["egressAuthority"] = true;
+        assert.ok(store.flushSync(seed), "parent persisted");
+        assert.equal(peekSession("parent-nr"), undefined, "parent is non-resident");
+
+        await assert.rejects(
+            () => store.createReplica("parent-nr"),
+            /use the point-fork path/,
+            "non-resident egress-on session is rejected by the guard",
+        );
+        assert.equal((await store.listReplicas("parent-nr")).length, 0, "no checkpoint row was created for the egress-on session");
+
+        // both directions (#3617): a non-resident egress-OFF session still
+        // takes the checkpoint path — the guard must not over-reject.
+        const plain = createSession("plain-nr");
+        assert.ok(store.flushSync(plain), "plain session persisted");
+        assert.equal(peekSession("plain-nr"), undefined, "plain is non-resident");
+        const row = await store.createReplica("plain-nr");
+        assert.ok(row.cp_id, "non-resident egress-off session still checkpoints");
+        assert.equal((await store.listReplicas("plain-nr")).length, 1, "exactly one checkpoint row");
+    } finally {
+        store.closeQuietly();
+        _resetSessionsForTest();
+    }
+});
