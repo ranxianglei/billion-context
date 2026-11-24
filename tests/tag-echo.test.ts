@@ -1261,3 +1261,47 @@ test("#7683: normalizeEchoArtifacts strips a DSML orphan close (judge parity)", 
     assert.equal(normalizeEchoArtifacts(`prose ${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")} tail`), "prose  tail");
     assert.equal(normalizeEchoArtifacts("normal prose without any tags"), "normal prose without any tags");
 });
+
+test("#7683: a DSML close inside an unclosed echo's interior does not disarm the markup verdict", () => {
+    // The unclosed-echo retry gate counts a frame's released text as markup
+    // when the LAST drop verdict leaves interior (#6034 last-write-wins). A
+    // mangled close arms that verdict ("whatever the frame still releases
+    // after the dead unit is suspect markup"); a DSML close dropped later in
+    // the same frame is NOT an acplike span resolution, so its drop must not
+    // carry the span-resolution "false" that would reclassify the interior as
+    // the answer and kill the retry (plugin-empty-turn-retry pins the
+    // end-to-end direction of this exact fixture).
+    const pad = " ".repeat(120);
+    const full = `${OPEN}tokens="247" type="text"\x3e m00693${LT}/cp\x3e${pad}\n${pad}\n <parameter name="i">Checking pocket CLI surface${DSML_ORPHAN_CLOSE_SPACE("parameter")}`;
+    const verdicts: boolean[] = [];
+    const f = createTagEchoFilter(undefined, undefined, undefined, undefined, (v) => verdicts.push(v));
+    const out = f.push(full) + f.flush();
+    assert.equal(out, `${pad}\n${pad}\n <parameter name="i">Checking pocket CLI surface`, "the interior is released, the DSML close is stripped");
+    assert.deepEqual(verdicts, [true, true], "open + mangled close arm the verdict; the DSML drop delivers none");
+});
+
+test("#7683: a DSML close after a settled acplike unit keeps the answer verdict", () => {
+    // The #6034 direction must stay intact: a complete refs-only unit (a valid
+    // 4+-digit ref body) dies whole and the text around it counts as the
+    // answer. A DSML close dropped after the unit must not flip that verdict
+    // back to markup.
+    const full = `${LT}acp\x3em00123${CLOSE} ${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")} tail`;
+    const verdicts: boolean[] = [];
+    const f = createTagEchoFilter(undefined, undefined, undefined, undefined, (v) => verdicts.push(v));
+    const out = f.push(full) + f.flush();
+    assert.equal(out, `  tail`, "the prose survives, the unit and the DSML close are stripped");
+    assert.deepEqual(verdicts, [false], "the settled unit delivers the answer verdict; the DSML drop delivers none");
+});
+
+test("#7683: a DSML-only turn delivers no verdict at all", () => {
+    // The issue's real case: the whole turn is DSML template tokens. Each
+    // close is self-contained and unrelated to any acplike span — the answer
+    // ledger's flag must be untouched (the retry then fires on the stripped
+    // echo alone, with nothing counted as the answer).
+    const full = `${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")}${DSML_ORPHAN_CLOSE_NO_SPACE("calls")}`;
+    const verdicts: boolean[] = [];
+    const f = createTagEchoFilter(undefined, undefined, undefined, undefined, (v) => verdicts.push(v));
+    const out = f.push(full) + f.flush();
+    assert.equal(out, "");
+    assert.deepEqual(verdicts, [], "no acplike span is involved, so no verdict is delivered");
+});

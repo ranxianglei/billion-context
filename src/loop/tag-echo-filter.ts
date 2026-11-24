@@ -1140,9 +1140,15 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
      *  close that releases its prose body), or does the artifact die whole /
      *  release content (false: complete refs-only units, dead orphans, a
      *  refs-only close, discarded payloads)? Default false; only the sites
-     *  below that provably leave or release interior pass true. */
-    const recordDrop = (snippet: string, duringDrain = false, leavesInterior = false) => {
-        onDropVerdict?.(leavesInterior);
+     *  below that provably leave or release interior pass true. A drop with
+     *  deliverVerdict=false touches no verdict at all: the DSML close (#7683)
+     *  is self-contained but is NOT an acplike span resolution — it cannot
+     *  close a pending acplike open, so it must not carry the span-resolution
+     *  "false" that would disarm a mangled-close's "suspect markup" arming
+     *  (the unclosed-echo retry tests in plugin-empty-turn-retry pin that
+     *  direction). */
+    const recordDrop = (snippet: string, duringDrain = false, leavesInterior = false, deliverVerdict = true) => {
+        if (deliverVerdict) onDropVerdict?.(leavesInterior);
         droppedAny = true;
         if (duringDrain) {
             if (onDrop && !drainNoticed) {
@@ -1157,9 +1163,9 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
         }
     };
     /** One self-contained artifact resolved by a single drop call. */
-    const drop = (snippet: string, duringDrain = false, leavesInterior = false) => {
+    const drop = (snippet: string, duringDrain = false, leavesInterior = false, deliverVerdict = true) => {
         dropCount += 1;
-        recordDrop(snippet, duringDrain, leavesInterior);
+        recordDrop(snippet, duringDrain, leavesInterior, deliverVerdict);
     };
     /** Any drop inside a live swallow session — the session counts once. */
     const dropSwallowSpan = (snippet: string, duringDrain = false, leavesInterior = false) => {
@@ -1554,6 +1560,12 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
                 swallowReleases = !wrapped && !toolTyped;
                 swallowBareOpen = bare;
                 swallowed = "";
+            } else if (m === d) {
+                // #7683: the DSML close drops without a verdict (see
+                // recordDrop) — it is not an acplike span resolution, so its
+                // drop must not disarm a mangled-close's "suspect markup"
+                // arming earlier in this frame.
+                drop(m[0], false, false, false);
             } else {
                 drop(m[0]);
             }
