@@ -321,7 +321,7 @@ function looseCloseEnd(s: string): number {
 // both modes agree on where the span dies. The termination still routes
 // through drop(), i.e. the existing [tag-echo] warn callback (owner §4(b)).
 const DEGEN_CLOSE_NAME = /^[^<>]{1,32}>/;
-// #7685: DeepSeek's tool-call template delimiter (the DSML pipe, fullwidth
+// #7683: DeepSeek's tool-call template delimiter (the DSML pipe, fullwidth
 // U+FF5C wrapping "DSML") leaks into visible prose when the model emits its own
 // template tokens as text instead of structured tool calls — the serving layer
 // fails to parse them and returns them as text. The close form `</｜｜DSML｜｜name>`
@@ -674,7 +674,7 @@ export function mayStartRenderTag(s: string): boolean {
     // tails), so it is tested directly: a chunk with a complete mangled open
     // must engage the machine to drop it. DSML_CLOSE is likewise a complete
     // tag (has both `</` and `>`), so it is tested directly rather than via
-    // PARTIAL_TAIL (#7685).
+    // PARTIAL_TAIL (#7683).
     return RENDER_TAG_DETECT.test(s) || MANGLED_OPEN.test(s) || DSML_CLOSE.test(s) || PARTIAL_TAIL.test(s);
 }
 
@@ -1386,7 +1386,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
             // drop it in place, no swallow (a following close dies via
             // LONE_CLOSE on its own).
             const g = MANGLED_OPEN.exec(buf);
-            // #7685: an orphan DSML close (DeepSeek's tool-call template
+            // #7683: an orphan DSML close (DeepSeek's tool-call template
             // delimiter leaking as text) is a complete tag — drop it in place.
             const d = DSML_CLOSE.exec(buf);
             let m: RegExpExecArray | null = null;

@@ -1192,7 +1192,7 @@ test("#2769: flush() can return non-orphan prose after a non-empty release with 
     assert.equal(isOrphanMarkupText(tail), false, "that content is NOT orphan markup — the pipe must count it as prose");
 });
 
-// #7685: DeepSeek's tool-call template delimiter (the DSML pipe, fullwidth
+// #7683: DeepSeek's tool-call template delimiter (the DSML pipe, fullwidth
 // U+FF5C wrapping "DSML") leaks into visible prose when the model emits its
 // own template tokens as text. The close form `</｜｜DSML｜｜name>` is an
 // orphan close (no matching open, no ref body) that the existing acplike
@@ -1201,18 +1201,18 @@ test("#2769: flush() can return non-orphan prose after a non-empty release with 
 const DSML_ORPHAN_CLOSE_NO_SPACE = (name: string) => `${LT}/${DSML_PIPE}${name}>`;
 const DSML_ORPHAN_CLOSE_SPACE = (name: string) => `${LT}/${DSML_PIPE} ${name}>`;
 
-test("#7685: stripAcpTags drops an orphan DSML close (no space)", () => {
+test("#7683: stripAcpTags drops an orphan DSML close (no space)", () => {
     assert.equal(stripAcpTags(DSML_ORPHAN_CLOSE_NO_SPACE("invoke")), "");
     assert.equal(stripAcpTags(DSML_ORPHAN_CLOSE_NO_SPACE("calls")), "");
     assert.equal(stripAcpTags(`prose ${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")} tail`), "prose  tail");
 });
 
-test("#7685: stripAcpTags drops an orphan DSML close (with space)", () => {
+test("#7683: stripAcpTags drops an orphan DSML close (with space)", () => {
     assert.equal(stripAcpTags(DSML_ORPHAN_CLOSE_SPACE("invoke")), "");
     assert.equal(stripAcpTags(DSML_ORPHAN_CLOSE_SPACE("calls")), "");
 });
 
-test("#7685: streaming filter matches stripAcpTags for an orphan DSML close at every split position", () => {
+test("#7683: streaming filter matches stripAcpTags for an orphan DSML close at every split position", () => {
     const cases = [
         DSML_ORPHAN_CLOSE_NO_SPACE("invoke"),
         DSML_ORPHAN_CLOSE_NO_SPACE("calls"),
@@ -1230,7 +1230,7 @@ test("#7685: streaming filter matches stripAcpTags for an orphan DSML close at e
     }
 });
 
-test("#7685: legitimate prose is not affected by the DSML close strip", () => {
+test("#7683: legitimate prose is not affected by the DSML close strip", () => {
     assert.equal(stripAcpTags("normal prose without any tags"), "normal prose without any tags");
     assert.equal(stripAcpTags("a < b and c > d"), "a < b and c > d");
     assert.equal(stripAcpTags(`keep ${TAG("m00100")} this`), "keep  this");
