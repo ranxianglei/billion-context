@@ -64,7 +64,16 @@
 // over from the real carrier: the echo gets pinned, the real carrier demotes
 // to foldable, one compression later the forged/partial copy is the only
 // survivor. The role gate is checked first in every classifier below.
+//
+// FIFTH durable carrier, the one exception to "user channel": dsh's in-history
+// system-prompt update rides the SYSTEM role (dshSystemPromptPath). It has no
+// text marker to match — a prompt is arbitrary prose — so its evidence is the
+// wire role itself, which neither a human (user channel) nor the model
+// (assistant channel) can produce. It is consulted before the marker
+// classifiers in the lane chain: a prompt that merely quotes a marker is
+// still the prompt, and must not take a real carrier's latest slot.
 
+import { SUMMARY_HEADER, hasUnrecoverableMediaPayload } from "acp-kernel";
 import type { Config, CoreMessage } from "acp-kernel";
 
 /** Projects a plain-text message to a canonical `durable/<name>` virtual tool
@@ -169,6 +178,81 @@ export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
+/** dsh in-history system-prompt identity: on routes whose model reads a later
+ *  `system` message as the effective prompt (systemPromptUpdate "in-history" —
+ *  llm-deepseek's Messages route, and llm-pi-ai for catalog models declaring
+ *  supportsMidConvoSystemMessages; #6193 reports the chat-completions shape
+ *  from production), the dsh agent loop does not rewrite node 0 when the
+ *  rendered prompt changes: it APPENDS a complete system message after the
+ *  cached history (source: deepseek-harness MIT packages/core/agent-loop/src/
+ *  runtime-context.ts SystemPromptProjection.project; wire shape packages/llm/
+ *  llm-deepseek/src/serialize.ts — { role: "system", content: [{ type:
+ *  "text", text }] } after the user turn, only a LEADING system reaches the
+ *  top-level field). The newest instance IS the prompt in force and the host
+ *  sends nothing new until the text changes again, so one fold of it leaves
+ *  the model on the stale head prompt for the rest of that stretch; superseded
+ *  copies are dead weight and fold under the latest-per-identity default.
+ *  The evidence is the ROLE, not a marker: the wire role is stamped by the
+ *  host serializer, human input always rides the user channel and model
+ *  output the assistant channel, so neither can produce this shape (#2766
+ *  holds a fortiori) — and the head prompt never reaches the fold space as a
+ *  core, so a system-role core here is an in-history one. Three exclusions
+ *  keep the identity to the prompt alone. (1) Structured systems
+ *  (tool_addition / tool_removal deltas, directive-only messages) already
+ *  have the kernel's hard pin; hasUnrecoverableMediaPayload is REUSED so the
+ *  two rules are disjoint by construction, and a tool delta arriving after
+ *  the prompt cannot take its latest slot. (2) bili's own summary carrier is
+ *  rendered role system (KDD #7) and is never host state. (3) An empty node
+ *  supplies no prompt — decided on the host's bytes where the core carries
+ *  its wire sidecar (hostSentSystemText). dsh core has no other plain-text
+ *  system producer: its only developer-role emitter (agent-loop tool-registry
+ *  updates) carries tool blocks exclusively. A developer message WITH text
+ *  would share this identity where the serializer splits the text off the
+ *  tool blocks (llm-pi-ai on chat-completions and responses: its own plain
+ *  system / developer item); no such emitter is evidenced. */
+export function dshSystemPromptPath(msg: CoreMessage): string | undefined {
+    return msg.role === "system" && msg.contentType === "text" && typeof msg.text === "string" &&
+        !msg.text.startsWith(SUMMARY_HEADER) && !hasUnrecoverableMediaPayload(msg) && hostSentSystemText(msg, msg.text)
+        ? "durable/system-prompt"
+        : undefined;
+}
+
+/** Whether the host put any non-whitespace text in this system message,
+ *  read off the verbatim wire sidecar that the Messages, chat-completions
+ *  and responses codecs attach to an in-history system (rawAnthropicMessage,
+ *  rawOpenaiMessage, rawResponsesItem; the field names follow the kernel's
+ *  MediaSidecar) instead of off `text`. `text` is not the host's bytes in
+ *  two places. (1) The Messages codec gives an empty system message the
+ *  placeholder text "[system]" (kernel/src/wire/anthropic.ts
+ *  systemMessageText; the same value seeds the id), so `content: ""` and a
+ *  single empty text block read as non-empty: taken at face value such a
+ *  node holds this identity and, arriving after the prompt in force, its
+ *  latest slot, and the prompt is foldable again. (2) In a view rendered
+ *  with ref tags (processTurn renderTags) a numbered message's `text` starts
+ *  with its tag, so an empty node reads as non-empty there on all three
+ *  wires and skews the protection set of whatever classifies that view.
+ *  A core without a sidecar is judged on `text`, as before. The caller
+ *  asks hasUnrecoverableMediaPayload first, so a sidecar that reaches
+ *  this is plain text for the kernel and each of its blocks is one whose
+ *  text the codec read into `text`; it is read the same way here. On the
+ *  Messages and chat-completions wires a missing or null value is empty
+ *  and any other value is stringified (the codec did the same conversion
+ *  at decode, so it cannot throw here); on the responses wire the kernel
+ *  admits string text only. The blank node is therefore the only thing
+ *  this takes out of what `text` matched. A string is not copied: this
+ *  runs on every protection check. */
+function hostSentSystemText(msg: CoreMessage, text: string): boolean {
+    const sidecars = msg as { rawAnthropicMessage?: unknown; rawOpenaiMessage?: unknown; rawResponsesItem?: unknown };
+    const raw = sidecars.rawAnthropicMessage ?? sidecars.rawOpenaiMessage ?? sidecars.rawResponsesItem;
+    if (raw == null) return /\S/.test(text);
+    const content = (raw as { content?: unknown }).content;
+    if (typeof content === "string") return /\S/.test(content);
+    return Array.isArray(content) && content.some((part) => {
+        const partText = (part as { text?: unknown } | null)?.text;
+        return partText != null && /\S/.test(String(partText));
+    });
+}
+
 /** #2286 wire shape (AUTO_INJECTED_NOTIFICATION_PREFIXES in src/server.ts):
  *  the dsh agent loop injects one timestamp notice before each turn,
  *  "Time sampled while preparing turn N, step M: <ts> …". Kept local — this
@@ -177,7 +261,7 @@ const TIME_CONTEXT_MARKER = "Time sampled while preparing turn";
 
 /** dsh per-turn time-context carrier (#5142, superseding #5109's naming):
  *  the timestamp notice injected before each turn (marker above).
- *  Deliberately FOLDABLE by design — unlike the four durable carriers it
+ *  Deliberately FOLDABLE by design — unlike the durable carriers it
  *  carries no state beyond its own turn and must NEVER be pinned, so its
  *  path lives in the oneshot/ namespace where no protection pattern matches
  *  it (kernel-foldable) while still riding dshDurableToolPath. Its problem is
@@ -365,14 +449,19 @@ function startsWithAsciiCI(hay: string, needle: string): boolean {
     return true;
 }
 
-/** dsh lane classifier: any of the twelve evidence-backed identities → its
- *  canonical path (four durable carriers + eight foldable one-shot injections).
+/** dsh lane classifier: any of the thirteen evidence-backed identities → its
+ *  canonical path (five durable carriers + eight foldable one-shot injections).
  *  Every classified message loses Rule-3 last-user anchor eligibility (#5109/
  *  #5173); only `durable/*` paths are actually pinned by the default policy —
  *  the oneshot/ families ride here purely so an injection can never displace
- *  the newest human request from the protected zone. */
+ *  the newest human request from the protected zone. The system-prompt
+ *  identity is consulted FIRST: it is decided by role alone, the twelve
+ *  below by text markers evidenced on the user channel only, and prompt
+ *  prose that quotes one of those markers must neither lose its own pin nor
+ *  take a real carrier's latest slot. */
 function dshDurableToolPath(msg: CoreMessage): string | undefined {
     return (
+        dshSystemPromptPath(msg) ??
         dshSkillCatalogPath(msg) ??
         dshWorkspaceInstructionsPath(msg) ??
         dshRuntimeContextPath(msg) ??
@@ -429,7 +518,15 @@ export function withDurableProtection(config: Config, classifier: DurableMessage
  *  durable instances under the latest-per-identity policy included (a folded
  *  old skill-catalog snapshot never comes back either). Their absence from
  *  later resends is expected host behavior, accounted out of drift, NEVER
- *  pinned. Same KDD #9 discipline: per-host entries with traffic evidence. */
+ *  pinned. Same KDD #9 discipline: per-host entries with traffic evidence.
+ *  durable/system-prompt is deliberately NOT listed: its superseded copies
+ *  were unclassified history before that identity existed, and their drift
+ *  accounting stays exactly as it was until retirement evidence is measured.
+ *  Consequence, also unchanged: this chain has no system-role step, so
+ *  system-role text containing a carrier marker is still accounted under
+ *  that marker's path here while the slot chain above calls it the prompt.
+ *  The two answer different questions (may this id vanish from a resend /
+ *  may this message fold) and agree on every user-channel carrier. */
 export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
     dsh: (msg) =>
         dshSkillCatalogPath(msg) ??
@@ -447,7 +544,8 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
- *  exact marker strings of the twelve dsh classifiers above (fifteen markers:
+ *  exact marker strings of the twelve marker-based dsh classifiers above (the
+ *  role-decided system-prompt identity has none; fifteen markers:
  *  the runtime-context family contributes two — the pre-0.2.2-rc.3 "Current
  *  runtime context" literal and the 0.2.2-rc.3 lead-in without its trailing
  *  colon, which both the first-snapshot and re-send intros share, #7085 — the
