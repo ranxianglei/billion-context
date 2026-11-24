@@ -26,6 +26,10 @@
 //   zcode    ~/.zcode/cli/config.json  hooks.enabled + SessionStart hook +
 //            mcp.servers.bili (stdio MCP); provider-store routing happens
 //            per-session, see src/zcode/ (no URL frozen at install time)
+//   workbuddy ~/.workbuddy/settings.json  env.CODEBUDDY_BASE_URL wraps the
+//            product endpoint into the resident proxy + autoCompactEnabled
+//            gate (pure wire mode — desktop-spawned CLI sessions run with
+//            --strict-mcp-config, so no host tool face is possible, #7456)
 // Installers throw on failure (bad/locked config, missing host CLI); the CLI
 // layer catches, prints `bili plugin: <msg>` and exits 1.
 
@@ -39,7 +43,7 @@ import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError
 import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome, readClaudeSettings } from "./client-config.js";
 import { stripBiliWrappers, vertexBaseUrlForLocation } from "./vertex.js";
 import { resolveClaudeNativePort } from "./config.js";
-import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
+import { isPidAlive, isProxyInstanceFile, lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { piNpmCopyRoot } from "./pi-channel.js";
 import { clearOwnerLaneBackoff, fetchRegistryVersion } from "./update.js";
@@ -85,7 +89,7 @@ export function portableHookCommand(exe: string, args: string[] = []): string {
     return /\s/.test(head) ? [`& "${head}"`, ...tail].join(" ") : [head, ...tail].join(" ");
 }
 
-export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode"] as const;
+export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode", "workbuddy"] as const;
 export type PluginAgent = (typeof PLUGIN_AGENTS)[number];
 
 export function selfPackageRoot(): string {
@@ -1803,20 +1807,29 @@ function dshStatus(): string {
     return "not installed";
 }
 
-/** True when any profile carries the persistent native install — either the
- *  bundle-channel dep or a pre-unification managed block. The `bili dsh`
- *  launcher consults this before adding its own --patch overlay: cordis
- *  rejects duplicate loader entry ids across layers, so a second
- *  `id: bili-native` insert would hard-fail dsh boot whenever the persistent
- *  install is present. */
-export function dshNativeInstalled(env: NodeJS.ProcessEnv = process.env): boolean {
+/** True when the given profile (or, with no profile, ANY profile) carries the
+ *  persistent native install — either the bundle-channel dep or a
+ *  pre-unification managed block. The `bili dsh` launcher consults this
+ *  before adding its own --patch overlay.
+ *
+ *  #7155: the launcher must ask about the profile it is ABOUT TO BOOT, not
+ *  the machine. The old any-profile form made a bundle-less profile look
+ *  installed whenever a sibling profile had the bundle: the overlay was
+ *  skipped, the session ran with zero bili entries (no compression tools, no
+ *  takeover, native compaction armed) and the launch note described the OTHER
+ *  profile's state. Omitting `profile` keeps the machine-wide answer for the
+ *  callers that genuinely need it (status/tests). */
+export function dshNativeInstalled(env: NodeJS.ProcessEnv = process.env, profile?: string): boolean {
     let dirs: string[];
     try {
         dirs = dshProfileDirs(env);
     } catch {
         return false;
     }
-    return dirs.some((dir) => dshBundleInstalled(dir) || dshHasLegacyManagedBlock(dir));
+    const scoped = profile === undefined || profile === ""
+        ? dirs
+        : dirs.filter((dir) => path.basename(dir) === profile);
+    return scoped.some((dir) => dshBundleInstalled(dir) || dshHasLegacyManagedBlock(dir));
 }
 
 // — kimi ————————————————————————————————————————————————————————————————
@@ -2209,6 +2222,180 @@ function zcodeStatus(): string {
     return status;
 }
 
+// — workbuddy (#7456) ————————————————————————————————————————————————————————
+// WorkBuddy Desktop (Electron) embeds a CodeBuddy Code CLI fork: every agent
+// session — the desktop-hosted sidecar and manual CLI runs — is that CLI, so
+// its model traffic can be routed through bili by wrapping the endpoint in
+// the user settings file. The CLI resolves `env.CODEBUDDY_BASE_URL` from
+// settings BEFORE process.env (per-key settings read, decompiled evidence in
+// issue #7456), which is what makes the desktop path work despite the app
+// spawning its CLI with an explicit env allowlist. Pure wire mode by design:
+// desktop-spawned sessions run with --strict-mcp-config, which blocks every
+// user/project/local MCP scope, so a host tool face (MCP entry, plugin
+// header) is impossible for the app's own sessions — compression rides the
+// proxy instead.
+
+/** WorkBuddy's product endpoint — the upstream baked in when no relay is
+ *  configured and the settings file carries no base URL of its own. */
+export const WORKBUDDY_DEFAULT_UPSTREAM = "https://www.workbuddy.ai";
+
+/** <WORKBUDDY_CONFIG_DIR | CODEBUDDY_CONFIG_DIR | ~/.workbuddy> — the CLI
+ *  resolves the config home in exactly this order. */
+export function workbuddyConfigDir(env: NodeJS.ProcessEnv = process.env): string {
+    const raw = (env.WORKBUDDY_CONFIG_DIR || env.CODEBUDDY_CONFIG_DIR)?.trim();
+    return raw !== undefined && raw.length > 0 ? raw : path.join(os.homedir(), ".workbuddy");
+}
+
+export function workbuddySettingsFile(env: NodeJS.ProcessEnv = process.env): string {
+    return path.join(workbuddyConfigDir(env), "settings.json");
+}
+
+/** True for a base-URL value written by a bili managed block: loopback
+ *  /bili/-wrapped upstream. Same ownership rule as the claude lane — any
+ *  port matches, so an older install's port is rewritten, not orphaned. */
+export function isBiliWorkbuddyBaseUrl(value: unknown): boolean {
+    if (typeof value !== "string") return false;
+    return /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5}\/bili\/https?:\/\//.test(value);
+}
+
+/** The inverse of the wrap: strip a bili wrapper (any loopback port) from a
+ *  base URL. Returns undefined for anything not written by us. */
+function unwrapBiliWbBaseUrl(value: string): string | undefined {
+    const m = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5}\/bili\/(https?:\/\/.+)$/.exec(value);
+    return m ? m[1] : undefined;
+}
+
+/** Upstream to bake at INSTALL time: an explicit BILI_WORKBUDDY_UPSTREAM relay wins
+ *  (documented user override); otherwise preserve the relay a previous
+ *  install wrapped; otherwise the product endpoint. A foreign, un-wrapped
+ *  value is never fed back as an upstream — apply skips foreign values. */
+export function workbuddyInstallUpstream(existingBaseUrl: unknown, env: NodeJS.ProcessEnv = process.env): string {
+    const relay = env.BILI_WORKBUDDY_UPSTREAM?.trim();
+    if (relay !== undefined && relay.length > 0) return relay.replace(/\/+$/, "");
+    const raw = typeof existingBaseUrl === "string" ? existingBaseUrl.trim() : "";
+    return (raw.length > 0 ? unwrapBiliWbBaseUrl(raw) : undefined) ?? WORKBUDDY_DEFAULT_UPSTREAM;
+}
+
+/** The loopback origin the managed block bakes in: an explicit BILI_WORKBUDDY_PROXY
+ *  override, else the resident default (manual `bili start`, the panel). The
+ *  block is static config with no per-session bootstrap, so it pins the
+ *  resident — a lane-zone port would die with its session. */
+export function workbuddyNativeOrigin(env: NodeJS.ProcessEnv = process.env): string {
+    const explicit = env.BILI_WORKBUDDY_PROXY?.trim();
+    if (explicit !== undefined && explicit.length > 0) return explicit.replace(/\/+$/, "");
+    return "http://127.0.0.1:8787";
+}
+
+/** Install-time liveness for the warning: a proxy instance is recorded AND
+ *  its origin matches the one the managed block pins AND its pid is alive.
+ *  Origin-matching keeps the check honest — a live LANE-zone instance on
+ *  another port does not make the pinned origin reachable, and a dead pid
+ *  with a stale record does not fake health. */
+function pinnedOriginLive(origin: string): boolean {
+    const inst = readProxyInstanceFile();
+    if (inst === undefined || inst.origin !== origin) return false;
+    if (!isProxyInstanceFile(inst)) return true;
+    return isPidAlive(inst.pid);
+}
+
+/** Pure merge of the #7456 managed block into parsed settings (install
+ *  path). Never clobbers user keys: a foreign CODEBUDDY_BASE_URL is reported
+ *  and skipped, not overwritten (same rule as the claude lane); an explicit
+ *  `autoCompactEnabled: true` is honored. Returns the mutated copy plus human
+ *  notes. Exported for tests. */
+export function applyWorkbuddyManagedSettings(settings: Record<string, unknown>, opts: { origin: string; upstream: string; relay?: string }): { data: Record<string, unknown>; notes: string[] } {
+    const data = structuredClone(settings);
+    const notes: string[] = [];
+    const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : {}) as Record<string, unknown>;
+    const cur = env.CODEBUDDY_BASE_URL;
+    const prefix = opts.origin.replace(/\/+$/, "") + "/bili/";
+    const target = prefix + opts.upstream;
+    const isRelayMatch = opts.relay !== undefined && opts.relay.length > 0 && typeof cur === "string" && cur.replace(/\/+$/, "") === opts.relay.replace(/\/+$/, "");
+    const isWrappingCur = typeof cur === "string" && unwrapBiliWbBaseUrl(target) === cur.replace(/\/+$/, "");
+    if (cur === undefined || cur === null || isBiliWorkbuddyBaseUrl(cur) || isRelayMatch || isWrappingCur) {
+        if (cur !== target) {
+            env.CODEBUDDY_BASE_URL = target;
+            notes.push("env.CODEBUDDY_BASE_URL pinned to the bili proxy");
+        }
+        const gated = data.autoCompactEnabled;
+        if (gated === undefined || gated === null) {
+            data.autoCompactEnabled = false;
+            notes.push("autoCompactEnabled=false (bili owns compression; manual compaction survives)");
+        } else if (gated === false) {
+            // Already gated — an earlier install or the user set it.
+        } else if (gated === true) {
+            notes.push("autoCompactEnabled left untouched (explicit true — host auto-compact stays on)");
+        } else {
+            notes.push(`autoCompactEnabled left untouched (foreign value ${JSON.stringify(gated)})`);
+        }
+    } else {
+        notes.push(`env.CODEBUDDY_BASE_URL left untouched (foreign value ${JSON.stringify(cur)} — unset it or set BILI_WORKBUDDY_UPSTREAM, then reinstall)`);
+        notes.push("autoCompactEnabled left untouched (bili proxy bypassed — foreign CODEBUDDY_BASE_URL)");
+    }
+    if (Object.keys(env).length > 0) data.env = env;
+    return { data, notes };
+}
+
+export function stripWorkbuddyManagedSettings(settings: Record<string, unknown>): { data: Record<string, unknown>; removed: string[] } {
+    const data = structuredClone(settings);
+    const removed: string[] = [];
+    const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : undefined) as Record<string, unknown> | undefined;
+    if (env !== undefined) {
+        if (isBiliWorkbuddyBaseUrl(env.CODEBUDDY_BASE_URL)) {
+            delete env.CODEBUDDY_BASE_URL;
+            removed.push("env.CODEBUDDY_BASE_URL");
+        }
+        if (Object.keys(env).length === 0) delete data.env;
+    }
+    if (data.autoCompactEnabled === false) {
+        delete data.autoCompactEnabled;
+        removed.push("autoCompactEnabled");
+    }
+    return { data, removed };
+}
+
+function workbuddyInstall(): string {
+    const file = workbuddySettingsFile();
+    const settings = readJson(file);
+    const cur = (settings.env as Record<string, unknown> | undefined)?.CODEBUDDY_BASE_URL;
+    const origin = workbuddyNativeOrigin();
+    const { data, notes } = applyWorkbuddyManagedSettings(settings, { origin, upstream: workbuddyInstallUpstream(cur), relay: process.env.BILI_WORKBUDDY_UPSTREAM?.trim() });
+    if (JSON.stringify(data) !== JSON.stringify(settings)) writeJson(file, data);
+    if (!pinnedOriginLive(origin)) notes.push(`no bili proxy reachable at ${origin} — start a resident bili (panel or 'bili start') first; WorkBuddy sessions cannot reach their model until it is up`);
+    return `wrote the billion-context WorkBuddy routing into ${file} (${notes.join("; ")}) — start or restart WorkBuddy to activate`;
+}
+
+function workbuddyRemove(): string {
+    const file = workbuddySettingsFile();
+    const notes: string[] = [];
+    try {
+        const { data, removed } = stripWorkbuddyManagedSettings(readJson(file));
+        if (removed.length > 0) {
+            writeJson(file, data);
+            for (const r of removed) notes.push(`removed ${r}`);
+        }
+    } catch {}
+    return notes.length > 0 ? `removed the billion-context WorkBuddy lane (${notes.join("; ")}) — restart WorkBuddy to finish` : "not installed";
+}
+
+function workbuddyStatus(): string {
+    let installed = false;
+    let origin: string | undefined;
+    let gated = false;
+    try {
+        const doc = readJson(workbuddySettingsFile());
+        const cur = (doc.env as Record<string, unknown> | undefined)?.CODEBUDDY_BASE_URL;
+        if (typeof cur === "string" && isBiliWorkbuddyBaseUrl(cur)) {
+            installed = true;
+            const i = cur.indexOf("/bili/");
+            origin = i > 0 ? cur.slice(0, i) : undefined;
+        }
+        gated = doc.autoCompactEnabled === false;
+    } catch {}
+    if (!installed) return "not installed";
+    return `installed${origin !== undefined ? ` (routing ${origin})` : ""}${gated ? " (auto-compact gated)" : ""}`;
+}
+
 // — doctor (#1235) —————————————————————————————————————————————————————
 
 /** Structured per-lane presence for `bili doctor`: what the lane's entries
@@ -2524,6 +2711,15 @@ export function inspectLanePresence(agent: PluginAgent): LanePresence {
         } catch {}
         return out;
     }
+    if (agent === "workbuddy") {
+        try {
+            const cur = (readJson(workbuddySettingsFile()).env as Record<string, unknown> | undefined)?.CODEBUDDY_BASE_URL;
+            if (typeof cur === "string" && isBiliWorkbuddyBaseUrl(cur)) {
+                return { installed: true, pointers: [`env.CODEBUDDY_BASE_URL=${cur}`], targets: [], form: "managed-block" };
+            }
+        } catch {}
+        return laneAbsent();
+    }
     // zcode
     const doc = readJson(zcodeUserConfigFile());
     const sessionStart = zcodeAsPlain(zcodeAsPlain(doc.hooks)?.events)?.SessionStart;
@@ -2556,11 +2752,11 @@ export function isPluginAgent(value: string): value is PluginAgent {
 }
 
 export function pluginInstall(agent: PluginAgent, opts: { withMcp?: boolean } = {}): string {
-    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : agent === "kimi" ? kimiInstall() : agent === "hermes" ? hermesInstall() : agent === "zcode" ? zcodeInstall() : opencodeInstall(opts.withMcp === true);
+    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : agent === "kimi" ? kimiInstall() : agent === "hermes" ? hermesInstall() : agent === "zcode" ? zcodeInstall() : agent === "workbuddy" ? workbuddyInstall() : opencodeInstall(opts.withMcp === true);
 }
 
 export function pluginRemove(agent: PluginAgent): string {
-    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : agent === "hermes" ? hermesRemove() : agent === "zcode" ? zcodeRemove() : opencodeRemove();
+    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : agent === "hermes" ? hermesRemove() : agent === "zcode" ? zcodeRemove() : agent === "workbuddy" ? workbuddyRemove() : opencodeRemove();
 }
 
 /** #2155 uninstall guardrail (advisory half): `bili plugin remove <agent>`
@@ -2624,6 +2820,7 @@ export function pluginStatusAll(): PluginStatusRow[] {
         ["kimi", kimiStatus],
         ["hermes", hermesStatus],
         ["zcode", zcodeStatus],
+        ["workbuddy", workbuddyStatus],
     ];
     return checks.map(([agent, check]) => {
         let copyVersion: string | undefined;
@@ -2658,6 +2855,7 @@ export const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     kimi: "the global bili install (plugin points at its dist)",
     hermes: "the global bili install (sidecar points at its dist); `bili plugin update hermes` re-copies the plugin",
     zcode: "the global bili install (hook/MCP point at its dist)",
+    workbuddy: "the resident bili proxy (pure config routing — no copy to update)",
 };
 
 /** Render `bili plugin list` as an aligned table with a version column (#2325).

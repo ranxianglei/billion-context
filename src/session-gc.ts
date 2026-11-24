@@ -264,10 +264,20 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         // deletion loses.
         const companion = file.slice(0, -".json".length) + companionSuffix;
         let compSt: Stats | undefined;
+        let companionStatFailed = false;
         try {
-            const s = await stat(companion);
-            if (s.isFile()) compSt = s;
-        } catch { /* no companion */ }
+            compSt = await stat(companion);
+        } catch (error) {
+            // Only absence proves there are no companion bytes to account
+            // for. A transient failure must not turn them into orphaned data
+            // that the second pass can delete after removing this session.
+            companionStatFailed = (error as NodeJS.ErrnoException)?.code !== "ENOENT";
+        }
+        if (companionStatFailed || (compSt && !compSt.isFile())) {
+            loggerLog("info", `[gc] kept session ${path.relative(dir, file)}: companion ${path.basename(companion)} cannot be inspected as a file`);
+            result.kept++;
+            continue;
+        }
         if (compSt) {
             const stored = contentStoreTokens(await store.readRawFile(companion));
             if (stored === null) {
