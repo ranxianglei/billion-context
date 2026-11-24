@@ -51,17 +51,17 @@ test("#7233 never overwrites an existing export, even under a name race", () => 
     }
 });
 
-test("#7233 reveal is on by default and can be disabled in config", () => {
+test("#7233 reveal is opt-in and can be enabled in config", () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-handoff-"));
     const previous = process.env.BILI_CONFIG_FILE;
     try {
         process.env.BILI_CONFIG_FILE = join(dir, "missing.json");
-        assert.equal(handoffRevealEnabled(), true);
+        assert.equal(handoffRevealEnabled(), false);
 
         const config = join(dir, "billion-context.json");
-        writeFileSync(config, JSON.stringify({ handoff: { reveal: false } }), "utf8");
+        writeFileSync(config, JSON.stringify({ handoff: { reveal: true } }), "utf8");
         process.env.BILI_CONFIG_FILE = config;
-        assert.equal(handoffRevealEnabled(), false);
+        assert.equal(handoffRevealEnabled(), true);
     } finally {
         if (previous === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = previous;

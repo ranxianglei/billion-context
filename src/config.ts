@@ -2723,11 +2723,11 @@ export function loadConfigFile(): FileConfig {
     return value;
 }
 
-/** #7233: reveal-after-export is on unless the config explicitly disables it. */
+/** #7233 option C: reveal-after-export is opt-in. */
 export function handoffRevealEnabled(): boolean {
     const block = loadConfigFile().handoff;
-    return !(block && typeof block === "object" && !Array.isArray(block)
-        && (block as { reveal?: unknown }).reveal === false);
+    return Boolean(block && typeof block === "object" && !Array.isArray(block)
+        && (block as { reveal?: unknown }).reveal === true);
 }
 
 /** #2960⑥ (config epoch): stable identity of the config FILE SOURCE right now —

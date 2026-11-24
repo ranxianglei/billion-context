@@ -153,7 +153,7 @@
 | `opencode.inline` | boolean | false | BILI_OPENCODE_INLINE | opencode 内联压缩通道（#3278 移植；需手动开启——按 #4687 决定，默认仍是派生代理）：opencode 插件的压缩在进程内完成——不派生代理进程、无临时端口、无 MITM 证书；模型流量与 /__bili/ 工具面由进程内引擎经伪源站服务（已在 Bun 宿主验证）。设 true（或 BILI_OPENCODE_INLINE=1）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili opencode-inline` 一键车道。 |
 | `plugin.snapshotCapBytes` | number | 104857600 (100 MiB) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | 限制每个插件会话为公开 fork API 保留的原始线路历史快照字节数（#2017 D-B）；超限时会话直接失败关闭（409），而不是保留无界原始副本。默认值已从 16 MiB 上调（#2394 G3）；0 完全禁用保留。 |
 | `snapshot.shadow` | boolean | true | BILI_SNAPSHOT_SHADOW | 快照渲染影子观测开关（#3756 后续）：在每个激活的代理轮次上计算快照视图但不使用它（出站字节仍走 legacy 路径），与实际发送内容对比分类差异，并记录由 web 面板和 snapshot-shadow 诊断主题展示的每会话计数器。默认开启（渲染车道本身仍灰度钉在 0%，影子车道是纯观测）。 |
-| `handoff.reveal` | boolean | true | — | Web 面板交接 .md 导出把文件写入系统 Downloads 后，在文件管理器中定位该文件（Windows explorer /select、macOS open -R、其他平台 xdg-open <dir>）。无法打开文件管理器（无头环境、无文件管理器）时导出不会失败——文件照常写入，toast 显示路径。无头/机器人配置设为 false（#7233）。 |
+| `handoff.reveal` | boolean | false | — | Web 面板交接 .md 导出把文件写入系统 Downloads 后，可选地在文件管理器中定位该文件（Windows explorer /select、macOS open -R、其他平台 xdg-open <dir>）。无法打开文件管理器（无头环境、无文件管理器）时导出不会失败——文件照常写入，toast 显示路径。默认关闭；设为 true 才启用，适合桌面用户（#7233）。 |
 
 **MITM 通道**
 
@@ -2620,7 +2620,7 @@ bili export <id> --full --output handoff.md
 
 ### 从 Web UI 导出交接文档（#7233）
 
-交接面板里现有的 **下载 .md** 按钮位置和文件名不变，但改由服务端把同一份 Markdown 写到系统 Downloads，并在文件管理器中定位该文件（`explorer /select,<path>`、`open -R <path>` 或 `xdg-open <dir>`）。如果无法打开文件管理器（无头环境、权限不足），文件仍会写入，toast 会显示路径。无头/机器人配置可在配置文件里设 `handoff.reveal: false`；默认是 `true`。
+交接面板里现有的 **下载 .md** 按钮位置和文件名不变，但改由服务端把同一份 Markdown 写到系统 Downloads，并可选地在文件管理器中定位该文件（`explorer /select,<path>`、`open -R <path>` 或 `xdg-open <dir>`）。如果无法打开文件管理器（无头环境、权限不足），文件仍会写入，toast 会显示路径。默认关闭；在配置文件里设 `handoff.reveal: true` 才启用，适合桌面用户。
 
 这是故障恢复路径：导出交接文档、在该工作区开新会话、附上文件即可，不用再去 Downloads 里翻 UUID 文件名。
 
