@@ -121,6 +121,11 @@ test("reader: one unparseable block summary CAS row degrades the view instead of
     const plan = planIngest(seed("target"));
     assert.equal(store.ingestSession(plan, undefined, { completeLog: true }), true);
 
+    // #7439-2: block summaries now ride the inline blocks.summary_bytes column
+    // (getBlocks reads COALESCE(summary_bytes, CAS)) — poison the inline bytes
+    // the view actually reads, plus the now-shadowed CAS row, so the surface is
+    // unparseable whichever source wins.
+    db.prepare("UPDATE blocks SET summary_bytes = X'7b6f6f7073' WHERE session_id = ? AND block_id = ?").run("target", "b0");
     const row = db.prepare("SELECT summary_hash FROM blocks WHERE session_id = ? AND block_id = ?").get("target", "b0") as { summary_hash: string };
     db.prepare("UPDATE content SET bytes = X'7b6f6f7073' WHERE hash = ?").run(row.summary_hash);
 
@@ -170,13 +175,16 @@ test("verify-sample: one unparseable block content row marks drift instead of fa
     const plan = planIngest(seed("target"));
     assert.equal(store.ingestSession(plan, undefined, { completeLog: true }), true);
 
-    // Poison the CAS body of block b0's full summary — the sibling parse
-    // site of the message row above, reached through the verifier's block
-    // replay (BatchedViewVerification.addBlocks). The CAS is insert-if-absent,
-    // so the poisoned row survives the re-ingest and the sampled read-back
-    // is the surface that sees it.
-    const row = db.prepare("SELECT summary_hash FROM blocks WHERE session_id = ? AND block_id = ?").get("target", "b0") as { summary_hash: string };
-    db.prepare("UPDATE content SET bytes = X'7b6f6f7073' WHERE hash = ?").run(row.summary_hash);
+    // Poison the "one" CAS body of block b0 — the sibling parse site of the
+    // message row above, reached through the verifier's block replay
+    // (BatchedViewVerification.addBlocks). #7439-2 moved the full summary onto
+    // the inline blocks.summary_bytes column, which the re-ingest rewrites
+    // (COALESCE(excluded, stored)) — a poisoned summary no longer survives the
+    // re-ingest to be sampled. The "one" content still rides the CAS only
+    // (insert-if-absent), so it survives the re-ingest and is the surface the
+    // sampled read-back sees.
+    const row = db.prepare("SELECT one_hash FROM blocks WHERE session_id = ? AND block_id = ?").get("target", "b0") as { one_hash: string };
+    db.prepare("UPDATE content SET bytes = X'7b6f6f7073' WHERE hash = ?").run(row.one_hash);
 
     const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" }, (record) => record as LegacySessionLike);
     assert.ok(shadow);
