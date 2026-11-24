@@ -69,7 +69,7 @@ export function applyMsgIdPin(msgs: BiliMessage[], ids: string[]): BiliMessage[]
  *  grouping can't express the envelope: any core lacks a non-negative
  *  integer wireIndex, or the index range has a gap (a vanished wire element
  *  has no group head to carry its host id → safe degrade to content-derived). */
-export type WirePinGroups = {
+type WirePinGroups = {
     /** Lowest wireIndex present (openai/responses hoist the leading
      *  system/developer run, so the first surviving core may start past 0). */
     min: number;
