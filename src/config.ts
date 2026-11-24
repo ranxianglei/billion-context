@@ -2348,16 +2348,20 @@ type FileConfig = {
          *  unset (JSON writing resumes; index-only sessions keep loading via
          *  the boot union, and replicas/restore re-materialize envelopes). */
         jsonWriter?: string;
-        /** WAL reclamation cap for index.db-wal (#3250), in bytes: every
-         *  completed checkpoint truncates the WAL file back to this size.
-         *  NOT a per-session data quota — data lands in index.db as it is
-         *  written and the WAL only stages frames between checkpoints, so
-         *  session count/size does not scale this. Higher = rarer truncate
-         *  IO but more steady disk use and a longer crash-replay tail.
-         *  Env BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES wins; default
-         *  8388608 (8 MiB); a non-positive/non-integer value falls back to
-         *  the file/default tier. Applied when the store opens (lane boot) —
-         *  hot edits apply on the next restart. */
+        /** WAL reclamation cap for index.db-wal (#3250), in bytes. 0 (default,
+         *  #7674) = unlimited: the engine does NOT truncate the WAL file after
+         *  a checkpoint (it sits at its historical high-water mark; frames
+         *  still converge via the periodic/flush PASSIVE checkpoints) — the
+         *  pre-#7674 8 MiB default made the engine truncate the WAL internally
+         *  after every completed checkpoint, an implicit floor-reclaim that no
+         *  JS-side guard covers and that pulls the WAL out from under live peer
+         *  connections sharing the sessions dir (#2671) — the #7156 damage
+         *  shape. A POSITIVE value N: every completed checkpoint truncates the
+         *  WAL back to N. NOT a per-session data quota — data lands in index.db
+         *  as it is written. Env BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES wins;
+         *  a non-positive/non-integer value falls back to the file/default tier.
+         *  Applied when the store opens (lane boot) — hot edits apply on the
+         *  next restart. */
         walJournalSizeLimitBytes?: number;
         /** #3901/#3463: session retention window in days for the GC age
          *  sweep (archive + tombstone + CAS release). 0 disables; env
