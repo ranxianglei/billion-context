@@ -307,6 +307,7 @@ test("a re-sent pair quoting an active block's range is its carrier: the fold sw
   const carriers: Array<[string, string]> = [
     ["flat {startId,endId}", JSON.stringify({ startId: "m00001", endId: "m00003", topic: "head", summary: "fold the spent head" })],
     ["{content:[…]} array", JSON.stringify({ content: [{ startId: "m00001", endId: "m00003", topic: "head", summary: "fold the spent head" }] })],
+    ["line form (current wire)", JSON.stringify({ content: "m00001–m00003 head\nfold the spent head" })],
   ];
   for (const [label, callText] of carriers) {
     const messages = build("call_echo_1", callText);
@@ -332,6 +333,20 @@ test("a re-sent pair quoting an active block's range is its carrier: the fold sw
   assert.equal(out.result.errors.length, 0, `negative: unexpected errors: ${out.result.errors.join("; ")}`);
   const r = hideConsumedCompressCalls(out.state, messages, isMcp);
   assert.deepEqual(r.newlySweptCallIds, ["call_fail_9"], "true failure residue at/after the fold is swept");
+
+  // Negative control for the line form: a line-form call whose quoted range
+  // matches NO active block is still swept (recognition is exact, not
+  // "any line-form text is exempt").
+  const lineMessages = build(
+    "call_fail_line",
+    JSON.stringify({ content: "m00001–m00002 head\nwrong end ref" }),
+  );
+  const lineState = createInitialState();
+  lineState.messageRefs = assignRefs(lineMessages, { existing: lineState.messageRefs, nextIndex: 1 }).map;
+  const lineOut = fold(lineMessages, lineState);
+  assert.equal(lineOut.result.errors.length, 0, `line negative: unexpected errors: ${lineOut.result.errors.join("; ")}`);
+  const lineR = hideConsumedCompressCalls(lineOut.state, lineMessages, isMcp);
+  assert.deepEqual(lineR.newlySweptCallIds, ["call_fail_line"], "line-form failure quoting no active range is swept");
 });
 
 test("the fold marker survives the full pipeline: sync-blocks carries it to the hide node (#3769)", () => {
