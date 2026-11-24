@@ -11,6 +11,7 @@ import {
     type NudgeDecision,
 } from "acp-kernel";
 import { createHash } from "node:crypto";
+import { isNonModelTopLevelKey } from "./agent/media-bytes.js";
 import { yieldToEventLoop } from "./yield-loop.js";
 import { bufferedSseEvents } from "./sse-util.js";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
@@ -488,16 +489,6 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // the #496/#1800 billing arbitration. OpenAI chat `image_url.url`, Anthropic
 // `source.data` and Gemini `inline_data.data` were already excluded.
 const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
-// DSH official-API extension plugins attach transport-only top-level sibling fields
-// (such as `dsh_session_log` up to 8 MiB and `dsh_plugin_packages`) that consume 0 model
-// tokens and are stripped/ignored before inference, whereas nested fields inside
-// `messages[]` remain model-visible and must still be counted.
-const NON_MODEL_TOP_LEVEL_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
-
-function isNonModelTopLevelKey(key: string): boolean {
-    return NON_MODEL_TOP_LEVEL_KEYS.has(key) || key.startsWith("dsh_");
-}
-
 function formatBodySize(bytes: number): string {
     if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)}MB`;
     if (bytes >= 1024) return `${Math.round(bytes / 1024)}KB`;
