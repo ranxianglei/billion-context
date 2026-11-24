@@ -12,6 +12,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
 import { buildTriggerForgeBody } from "../src/codex-compact.ts";
+import { noteOutboundContextEstimates } from "../src/cache-ledger.ts";
 
 // Issue #321 PR-E2: conditional interception + forgery of codex's native
 // compaction requests. When BILI_CODEX_COMPACT=intercept, the client is codex,
@@ -501,6 +502,32 @@ test("e2e #332 (trigger form): intercept + healthy ACP + oversized payload → f
         assert.ok(text.includes("fc_bili_"), "forged compaction item");
         assert.ok(text.includes("resp_bili_"), "forged response id");
         assert.equal(h.bodies.length, afterSetup, "upstream NOT contacted (preflight no longer interferes with the forge)");
+    });
+});
+
+test("e2e (trigger form): upper bound from a send without usage cannot veto interception", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 4_400 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+        const session = listSessions().find((s) => s.meta.label === SESSION)!;
+        assert.equal(session.stats.lastInputTokensSource, "usage");
+        assert.ok(session.stats.lastInputTokens < 13_500);
+        noteOutboundContextEstimates(session, {
+            upperBound: 13_800,
+            scaledText: 4_600,
+            imageTokens: 0,
+            calibrated: true,
+        });
+
+        const response = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...bigConversation(), { type: "compaction_trigger" }] }),
+        });
+        const body = await response.text();
+        assert.equal(response.status, 200);
+        assert.match(body, /fc_bili_/);
+        assert.match(body, /response\.completed/);
+        assert.equal(h.bodies.length, afterSetup, "the oversized trigger never reached upstream");
     });
 });
 

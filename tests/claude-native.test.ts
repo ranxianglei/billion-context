@@ -731,6 +731,9 @@ test("isClaudeHostArgv: exact matches only — never the hook itself or lookalik
     assert.equal(isClaudeHostArgv(["timeout", "40", "claude", "-p", "hi"]), false);
     assert.equal(isClaudeHostArgv(["/bin/sh", "-c", "claude"]), false);
     assert.equal(isClaudeHostArgv(["claude-doctor"]), false);
+    assert.equal(isClaudeHostArgv(["/home/x/.local/share/claude/versions/2.1.323", "--print", "--sdk-url", "https://api.anthropic.com/v1/code/sessions/cse_x"]), true);
+    assert.equal(isClaudeHostArgv(["/home/x/.local/share/claude/versions/2.1.323.tmp"]), false);
+    assert.equal(isClaudeHostArgv(["/opt/other/versions/2.1.323"]), false);
     assert.equal(isClaudeHostArgv(["claudeworkflow"]), false);
     // node with unrelated args must not match just because `claude` appears
     // inside a longer path/argument.

@@ -93,6 +93,14 @@ export interface UnitProjectionInput {
 export interface UnitProjectionFatal {
   kind: "zone" | "split";
   error: Error;
+  /** #7596: set only by the fresh-fold path where the integrity withdrawal
+   *  left the range with NOTHING foldable (not a merge). applySingleRange
+   *  treats this as a no-op success with a warning instead of throwing —
+   *  killing the whole batch over one doomed range made the model re-pay
+   *  full-context reads on every retry until the breaker fired. The merge
+   *  split fatals (excluded-merge / actionable split) do NOT set it and stay
+   *  hard errors. */
+  degradable?: boolean;
 }
 
 export interface UnitProjection {
@@ -379,9 +387,13 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       ? shared.anchorMessage
       : lastUserAnchor(input.messages, coveredMessageIds(input.state), input.config);
     const anchorRef = anchorMsg ? input.state.messageRefs.byRaw[anchorMsg.id] : undefined;
+    // 2026-11-18 (owner): the anchor QUOTES user speech inside a system
+    // receipt that carries no <acp> time tag on the wire — weak models have
+    // read the quote as the user's LATEST message (ti_an incident 2026-11-17).
+    // Label the quote's origin so it cannot pass for a fresh instruction.
     const anchorNote =
       anchorRef && anchorRef !== "BLOCKED"
-        ? ` Last-user anchor: ${anchorRef} "${(anchorMsg!.text ?? "").replace(/\s+/g, " ").slice(0, 40)}".`
+        ? ` Last-user anchor (historical quote, NOT a new user message): ${anchorRef} "${(anchorMsg!.text ?? "").replace(/\s+/g, " ").slice(0, 40)}".`
         : "";
     warnings.push(
       `Excluded ${hitProtectedRaw.length} protected message(s) ${hitRefs.join(
@@ -472,6 +484,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
           return finish({
             fatal: {
               kind: "split",
+              degradable: true,
               error: new Error(
                 `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
               ),

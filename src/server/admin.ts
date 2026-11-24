@@ -23,6 +23,7 @@ import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
+import { r3FaultTracker } from "../snapshot/plane.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { dismissUpgradeNotice } from "../pck-notice.js";
@@ -695,6 +696,111 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             return;
         }
     }
+    // #6785 review: R3 breaker latch visibility + operator escape hatch.
+    // A latched raw session id degrades to the legacy path PERSISTENTLY
+    // (it survives restarts) and nothing else clears it — the operator
+    // must be able to see which sids are stuck (and since when) and unstick
+    // one that latched in error. Loopback-gated like every /__bili/ route;
+    // 501 in legacy mode (same discipline as /__bili/replicas).
+    if (req.method === "GET" && (req.url === "/__bili/snapshot/r3-latches" || req.url?.startsWith("/__bili/snapshot/r3-latches?"))) {
+        const store = getStore();
+        if (!store.replicasAvailable()) {
+            res.writeHead(501, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+            return;
+        }
+        const latched = store.snapR3LatchedList();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, count: latched.length, latched }));
+        return;
+    }
+    if (req.method === "POST" && req.url === "/__bili/snapshot/r3-unlatch") {
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessRaw?: unknown };
+            if (typeof parsed.sessRaw !== "string" || parsed.sessRaw.length === 0) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected { sessRaw: string } — take the raw id from GET /__bili/snapshot/r3-latches" }));
+                return;
+            }
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+                return;
+            }
+            // Clear BOTH latch planes: the persisted row (by raw id) and the
+            // in-memory breaker — for every sid the row can resolve to. The
+            // latch row's ledger_id can still be the sessRaw placeholder
+            // (first fault before any stage-0 run) while the breaker is
+            // keyed by the real sid, so clear both resolvable keys (plus the
+            // raw id itself, which is the sid in the common no-conversation
+            // case). clearLatched on a non-latched key is a no-op.
+            const ledgerId = store.snapR3LatchClear(parsed.sessRaw);
+            const keys = new Set<string>([parsed.sessRaw]);
+            if (ledgerId !== null) keys.add(ledgerId);
+            const convSid = store.snapSidOfRaw(parsed.sessRaw);
+            if (convSid !== null) keys.add(convSid);
+            for (const k of keys) r3FaultTracker.clearLatched(k);
+            log("info", `[admin] POST /__bili/snapshot/r3-unlatch sessRaw=${parsed.sessRaw.slice(0, 12)}… ledgerId=${ledgerId ?? "no-row"} in-memory-keys=[${[...keys].join(", ")}]`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, persistedRowCleared: ledgerId !== null, ledgerId: ledgerId ?? undefined }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    // #7574: outbound op-log latch visibility + operator escape hatch. A
+    // session whose log is this session's content authority fails EVERY turn
+    // (500 egress_flow_unreadable) once the log does not replay. The latch is
+    // saved with the session, so it survives restarts, and before this there
+    // was no way to see which sessions are stuck or to unstick one. Same
+    // shape as the R3 latch routes above: loopback-gated, 501 in legacy mode.
+    if (req.method === "GET" && (req.url === "/__bili/egress/latches" || req.url?.startsWith("/__bili/egress/latches?"))) {
+        const latched = listSessions()
+            .filter((s) => s.metadata?.["egressFlowUnreadable"] === true)
+            .map((s) => ({ sessionId: s.id, lastSeen: s.lastSeen }));
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, count: latched.length, latched }));
+        return;
+    }
+    if (req.method === "POST" && req.url === "/__bili/egress/reset") {
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown };
+            if (typeof parsed.sessionId !== "string" || parsed.sessionId.length === 0) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected { sessionId: string } — take the id from GET /__bili/egress/latches" }));
+                return;
+            }
+            const store = getStore()?.egressOpLogStore() ?? null;
+            if (!store) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+                return;
+            }
+            // Drop the whole log of this session. The next turn starts a fresh
+            // one from what the client sends (the turn is recorded, never
+            // swapped, until the log has caught up). A session that is not
+            // loaded right now clears its latch on its next turn: "latched +
+            // no rows" is what the lane reads as "was reset".
+            const hadLog = store.egressStateMaxSeq(parsed.sessionId) > 0;
+            store.deleteEgressOps(parsed.sessionId);
+            const live = peekSession(parsed.sessionId);
+            if (live) {
+                delete live.metadata["egressFlowUnreadable"];
+                delete live.metadata["egressAuthority"];
+            }
+            log("info", `[admin] POST /__bili/egress/reset session=${parsed.sessionId.slice(0, 12)}… hadLog=${hadLog} sessionLoaded=${live !== undefined}`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, hadLog, sessionLoaded: live !== undefined }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
     // #2671 Phase 2: replica/checkpoint management over the unified store.
     // Loopback-gated like every /__bili/ route; 501 in legacy mode so the
     // operator knows the knob, not the URL, is what is missing.
@@ -723,6 +829,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 const row = await store.createReplica(parsed.sessionId, {
                     label: typeof parsed.label === "string" ? parsed.label : undefined,
                     pinned: parsed.pinned === true,
+                    resident,
                 });
                 res.writeHead(201, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, replica: serializeReplica(row) }));
@@ -1414,7 +1521,8 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
             u.searchParams.has("q") ||
             u.searchParams.has("protocol") ||
             u.searchParams.has("client") ||
-            u.searchParams.has("state");
+            u.searchParams.has("state") ||
+            u.searchParams.has("kind");
         if (paged) {
             const rawSize = Number(u.searchParams.get("pageSize"));
             const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
@@ -1422,12 +1530,15 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
             const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
             const rawState = u.searchParams.get("state");
             const state = rawState === "live" || rawState === "history" ? rawState : undefined;
+            const rawKind = u.searchParams.get("kind");
+            const kind = rawKind === "top" || rawKind === "child" ? rawKind : undefined;
             body = {
                 ...(await buildSessionPage({
                     q: u.searchParams.get("q") ?? undefined,
                     protocol: u.searchParams.get("protocol") ?? undefined,
                     client: u.searchParams.get("client") ?? undefined,
                     state,
+                    kind,
                     page,
                     pageSize,
                 })),

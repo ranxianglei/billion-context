@@ -811,6 +811,16 @@ elif SCENARIO.startswith("attach"):
         no_session_result = ctx.tools.get("compress", {}).get("handler")({}, task_id="t1")
         # #2072 negative leg: the model-transcribed conversation_id channel stays UNFLAGGED
         transcribed_result = ctx.tools.get("compress", {}).get("handler")({"conversation_id": "transcribed-9"}, task_id="t2")
+        # #7514: the pre_tool_call hook smuggles the host's tool_call_id into the dispatch args for
+        # our tools only; the handler strips it into the top-level toolCallId slot.
+        pre_hook = ctx.hooks.get("pre_tool_call")
+        hook_ours = pre_hook(tool_name="compress", args={"startId": "m00001", "endId": "m00010"}, tool_call_id="call-abc-123")
+        hook_foreign = pre_hook(tool_name="terminal", args={"command": "ls"}, tool_call_id="call-abc-123")
+        hook_noid = pre_hook(tool_name="compress", args={}, tool_call_id="")
+        # the host shallow-merges the hook's args into the dispatch args (hermes_cli/plugins.py)
+        merged = {"startId": "m00001", "endId": "m00010"}
+        merged.update((hook_ours or {}).get("args") or {})
+        id_result = ctx.tools.get("compress", {}).get("handler")(merged, session_id="sess-1", task_id="t3")
         out.update({
             "round1_none": round1 is None,
             "req_unmutated": req == frozen,
@@ -824,6 +834,10 @@ elif SCENARIO.startswith("attach"):
             "tool_result": tool_result,
             "no_session_result": no_session_result,
             "transcribed_result": transcribed_result,
+            "pre_hook_ours": hook_ours,
+            "pre_hook_foreign": hook_foreign,
+            "pre_hook_noid": hook_noid,
+            "id_result": id_result,
         })
 elif SCENARIO == "defer-fallback":
     # Hermes registers the ACP tools natively but its tool_search layer DEFERS the toolset, so the
@@ -1247,6 +1261,10 @@ interface DriverOut {
     tool_result?: string;
     no_session_result?: string;
     transcribed_result?: string;
+    pre_hook_ours?: { action?: string; args?: Record<string, unknown> } | null;
+    pre_hook_foreign?: unknown;
+    pre_hook_noid?: unknown;
+    id_result?: string;
     mitm_kind?: string;
     mitm_domains?: string[];
     mitm_warnings?: string[];
@@ -1371,7 +1389,7 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
         assert.deepEqual(out!.toolsets, ["billion-context"]);
         assert.deepEqual(out!.middlewares, ["llm_request"]);
-        assert.deepEqual(out!.hooks, ["pre_api_request"]);
+        assert.deepEqual(out!.hooks, ["pre_api_request", "pre_tool_call"]);
         assert.deepEqual(out!.commands, {
             acp: "Show bili context-compression status for this session",
             "acp-cache": "Prompt-cache reconciliation (same report as the acp_cache tool)",
@@ -1416,8 +1434,18 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tool_calls, [
             { conversationId: "sess-1", tool: "compress", args: {}, nativeCaller: true },
             { conversationId: "transcribed-9", tool: "compress", args: { conversation_id: "transcribed-9" } },
+            // #7514: the smuggled key never rides the model-visible args; the real id lands in
+            // the top-level toolCallId slot (the first two calls stay UNFLAGGED — no id, no key).
+            { conversationId: "sess-1", tool: "compress", args: { startId: "m00001", endId: "m00010" }, nativeCaller: true, toolCallId: "call-abc-123" },
         ]);
         assert.equal(out!.transcribed_result, "compressed 3 blocks");
+        // #7514: the pre_tool_call hook smuggles the host's tool_call_id into the dispatch args
+        // for our tools only — a foreign tool and an empty id get nothing (fail closed).
+        assert.deepEqual(out!.pre_hook_ours, { action: "modify", args: { _tool_call_id: "call-abc-123" } },
+            "our tool + a call id -> modify directive carrying the smuggle key");
+        assert.equal(out!.pre_hook_foreign, null, "a foreign tool never gets the smuggle key");
+        assert.equal(out!.pre_hook_noid, null, "no call id -> no smuggle");
+        assert.equal(out!.id_result, "compressed 3 blocks");
         assert.deepEqual(out!.runtime_info, [{ agent: "hermes", model: "test-model", maxOutput: 4096, source: "hermes-native" }]);
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.

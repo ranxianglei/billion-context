@@ -506,6 +506,17 @@ two small node scripts that do the work around the client:
   `BILLION_CONTEXT_PROXY` is set (attach mode owns the proxy) or
   `BILI_PROVIDER_REWRITES` is defined. Opt-out: `BILI_NATIVE_ZCODE=0`.
 
+## WorkBuddy (Tencent desktop app)
+
+WorkBuddy Desktop is an Electron app (`@genie/workbuddy-desktop`) that embeds a CodeBuddy Code CLI fork: every agent session — the desktop-hosted sidecar and manual terminal runs — is that CLI. The app spawns the CLI with an explicit env allowlist, so shell exports never reach it; but the CLI reads `env.CODEBUDDY_BASE_URL` from its user settings file *before* process.env — and that file is the seam (#7456):
+
+- **Install:** `bili plugin install workbuddy` writes `~/.workbuddy/settings.json` (config home overridable via `WORKBUDDY_CONFIG_DIR` / `CODEBUDDY_CONFIG_DIR`): wraps `env.CODEBUDDY_BASE_URL` into the resident proxy (`http://127.0.0.1:8787/bili/https://www.workbuddy.ai`) and sets `autoCompactEnabled: false`, switching off WorkBuddy's own auto-compaction so bili owns compression (manual compaction survives). A foreign `CODEBUDDY_BASE_URL` is reported and left untouched; an explicit `autoCompactEnabled: true` is honored; every write snapshots the previous state to `.bili-bak`. The install warns loudly when no live proxy is recorded at the pinned origin.
+- **Remove:** `bili plugin remove workbuddy` strips exactly what the install wrote; user keys stay.
+- **Wire mode only (no host tool face).** Compression rides the proxy (`acp_summary`), like every OpenAI-wire lane. A host MCP tool face is *impossible* for the app's own sessions: the desktop-spawned CLI sidecar runs with `--strict-mcp-config`, which blocks user/project/local MCP scopes, and a globally stamped plugin-mode header would degrade exactly those sessions (the zcode degraded mode, #4344). A terminal-only MCP face is a possible v2 follow-up (dual tool-surface tradeoff).
+- **Keep a resident bili running** (panel or `bili start`): the settings block pins the resident origin — there is no per-session bootstrap. bili on a custom port: set `BILI_WORKBUDDY_PROXY=http://127.0.0.1:<port>` before installing; `BILI_WORKBUDDY_UPSTREAM=https://<relay>` wraps your own relay instead of `https://www.workbuddy.ai`.
+- **Status:** the `workbuddy` row of `bili plugin list` / `bili doctor` reports the routing origin and the auto-compact gate.
+- **Known limitations:** routing takes effect on WorkBuddy restart (settings load at CLI session start). Auth (SSO bearer + `X-User-Id`) is added by the embedded CLI and passes through the `/bili/` forward untouched; model traffic has no TLS pinning or client signing, so no cert-MITM is needed. App login/SSO traffic goes through the browser and never touches bili.
+
 ## Codex (OpenAI Codex CLI)
 
 **Temporary catalog outages (#3993).** For authenticated `GET https://chatgpt.com/backend-api/codex/models` requests routed through Bili, a last-valid complete catalog can cover transport failures and HTTP 500/502/503/504. This prevents transient discovery failure from discarding Codex's known context/tool capabilities. The private cache is under the existing XDG cache directory (`codex-model-catalog-v1`); it is isolated by full URL/client version and credential/account/org/project fingerprints, contains no raw credentials, and is limited to 1 MiB per catalog, 16 entries and six hours. Online discovery always takes precedence; offline hits do not extend age. With a usable cache the network/body deadline is four seconds. Caller cancellation, 401/403, other explicit errors and invalid/empty catalogs do not become cached success. Cold, expired or changed-credential requests still need successful discovery. Offline replay does not clear the upstream circuit or prove inference reachability. No inference payload, compression mode or configured context limit is changed.
@@ -1016,6 +1027,27 @@ launcher. Opt-out: `BILI_NATIVE_OPENCODE=0`. If no proxy can be made
 healthy, requests go direct (uncompressed) with a one-time warning and
 recover automatically. Under a `bili opencode` launch this entry is skipped
 entirely (the launcher owns the proxy).
+
+### Built-in Claude Agent provider (2.x)
+
+OpenCode 2.x ships a built-in **Claude Agent** provider (`claude-agent/*`) that drives a local Claude Code CLI. That child calls Anthropic directly — it makes no request *from* OpenCode — so the plugin's HTTP-hook routing never sees its traffic and its sessions would otherwise run uncompressed. On a 2.x host, `bili plugin install opencode` routes it by writing `providers.claude-agent.settings.baseURL` in your opencode config, pinned to the live opencode lane port:
+
+```json
+{
+  "providers": {
+    "claude-agent": {
+      "settings": {
+        "baseURL": "http://127.0.0.1:<port>/bili/https://api.anthropic.com"
+      }
+    }
+  }
+}
+```
+
+- **Existing installs** — re-run `bili plugin install opencode`; the entry is written at install time, so a pre-existing config is not retro-routed.
+- **Port drift** — if the opencode lane port changes, the pinned URL goes stale; `bili doctor` warns on the opencode lane and a re-run re-pins it.
+- **Your own proxy** — a non-bili `baseURL` is left untouched (it's yours, not ours to clobber).
+- **Known limitation** — compression works, but the `mcp__opencode__*` bili tools still have no session state in these sessions: the proxy keys the session by the Claude Code child's id, not OpenCode's `ses_…` id.
 
 ### OpenAI Responses WebSockets (V2)
 
