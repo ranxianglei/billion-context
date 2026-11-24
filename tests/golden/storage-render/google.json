@@ -95,12 +95,12 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "8c99a1540a10bb893417d7b93e4585c99d2c377a58f04507ba93c19a0543a2f1",
- "stateDigestAligned": "be01b446825036ee80e90987e88c29242afda211a78e5efdce27b01688cbd449",
+ "stateDigest": "723cfc0096bb6b1a81fd3dd143a7d506806f870ef00f889e7ee6829f3d696098",
+ "stateDigestAligned": "0017ba03fc657b625eb0425c34591eda67acf3bbbe4248e2901fe9c9968bde73",
  "sectionDigests": {
   "state": "e5cccb797d2918a2",
   "blockContents": "473264d9df8ba338",
-  "stats": "a55e8d84d5808231",
+  "stats": "9830bb7537328268",
   "metadata": "ea5ad310ea118420"
  },
  "stateKeyDigests": {

@@ -808,10 +808,10 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url === "/__bili/memory") return await sendMemoryReport(res);
     if (req.method === "POST" && req.url === "/__bili/replicas") {
         try {
-            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown; label?: unknown; pinned?: unknown };
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown; label?: unknown; pinned?: unknown; opSeq?: unknown };
             if (typeof parsed.sessionId !== "string" || !parsed.sessionId) {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: false, error: "expected { sessionId: string, label?: string, pinned?: boolean }" }));
+                res.end(JSON.stringify({ ok: false, error: "expected { sessionId: string, label?: string, pinned?: boolean, opSeq?: number }" }));
                 return;
             }
             const store = getStore();
@@ -824,6 +824,43 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             // the checkpoint freezes what the caller just saw, not the last
             // debounced write.
             const resident = peekSession(parsed.sessionId);
+            // #7577 D5 / review (c): egress-on sessions have no checkpoint
+            // substrate — fork the session to NOW (a full, loadable copy: the
+            // four egress op-log tables + the unified kernel-state rows) instead
+            // of freezing a checkpoint row. op_seq is accepted for API shape;
+            // only the current high water is supported (kernel-state rows only
+            // exist at now — an earlier point would pair content-at-X with
+            // kernel-state-at-now, which is inconsistent).
+            if (resident && resident.metadata["egressAuthority"] === true) {
+                // #7577 (dual clocks, owner ruling 2026-11-24): the point-fork
+                // watermark is the FLOW clock — egressStateMaxSeq (egress_flow's
+                // own MAX). Block rows carry their own op_seq clock plus a
+                // flow_op_seq pointer, so they align to this watermark with no
+                // separate high-water to chase.
+                const highWater = store.egressOpLogStore()?.egressStateMaxSeq(parsed.sessionId) ?? 0;
+                if (parsed.opSeq !== undefined) {
+                    if (typeof parsed.opSeq !== "number" || !Number.isInteger(parsed.opSeq) || parsed.opSeq < 0) {
+                        res.writeHead(400, { "content-type": "application/json" });
+                        res.end(JSON.stringify({ ok: false, error: "opSeq must be a non-negative integer" }));
+                        return;
+                    }
+                    if (parsed.opSeq < highWater) {
+                        res.writeHead(400, { "content-type": "application/json" });
+                        res.end(JSON.stringify({ ok: false, error: `point fork at op_seq ${parsed.opSeq} is not supported — kernel-state rows only exist at the current high water (${highWater}); earlier points need the point-reconstruction materializer (follow-up)` }));
+                        return;
+                    }
+                }
+                try {
+                    const { childId, opSeq } = await store.forkEgressSnapshot(parsed.sessionId);
+                    res.writeHead(201, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: true, pointFork: true, sessionId: childId, opSeq, restoredFrom: parsed.sessionId }));
+                } catch (err) {
+                    const msg = String(err);
+                    res.writeHead(msg.includes("already exists") ? 409 : 500, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: false, error: msg }));
+                }
+                return;
+            }
             if (resident) await store.writeNow(resident);
             try {
                 const row = await store.createReplica(parsed.sessionId, {
@@ -835,8 +872,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 res.end(JSON.stringify({ ok: true, replica: serializeReplica(row) }));
             } catch (err) {
                 const msg = String(err);
-                res.writeHead(msg.includes("not in the unified index") ? 404 : 500, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: false, error: msg }));
+                // A NON-RESIDENT egress-on session reaches createReplica's
+                // guard (it can only fork a resident session) — map it to a
+                // load-it-first 503, not a generic 500.
+                res.writeHead(msg.includes("not in the unified index") ? 404 : msg.includes("use the point-fork path") ? 503 : 500, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: msg.includes("use the point-fork path") ? `${msg} — load the session first, then POST again` : msg }));
             }
             return;
         } catch (err) {
@@ -1521,7 +1561,8 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
             u.searchParams.has("q") ||
             u.searchParams.has("protocol") ||
             u.searchParams.has("client") ||
-            u.searchParams.has("state");
+            u.searchParams.has("state") ||
+            u.searchParams.has("kind");
         if (paged) {
             const rawSize = Number(u.searchParams.get("pageSize"));
             const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
@@ -1529,12 +1570,15 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
             const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
             const rawState = u.searchParams.get("state");
             const state = rawState === "live" || rawState === "history" ? rawState : undefined;
+            const rawKind = u.searchParams.get("kind");
+            const kind = rawKind === "top" || rawKind === "child" ? rawKind : undefined;
             body = {
                 ...(await buildSessionPage({
                     q: u.searchParams.get("q") ?? undefined,
                     protocol: u.searchParams.get("protocol") ?? undefined,
                     client: u.searchParams.get("client") ?? undefined,
                     state,
+                    kind,
                     page,
                     pageSize,
                 })),
@@ -1772,7 +1816,7 @@ async function sendSessionReport(res: http.ServerResponse, url: string): Promise
         res.end(JSON.stringify({ error: `unknown session: ${id}` }));
         return;
     }
-    const opts = { mask: q.get("mask") !== "off", lang: q.get("lang") === "en" ? "en" : "zh-CN" };
+    const opts = { mask: q.get("mask") !== "off", lang: q.get("lang") === "en" || q.get("lang") === "ko" ? String(q.get("lang")) : "zh-CN" };
     if (q.get("format") === "svg") {
         const r = buildSessionReportSvg(detail, opts);
         res.writeHead(200, { "content-type": "application/json" });
