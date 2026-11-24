@@ -234,7 +234,7 @@ export function claudeAnthropicPersonaOrderApplies(headers: Record<string, strin
     return resolveWireClientProfile(wireClientSignals(headers)).personaOrderKeyed;
 }
 
-const SUBAGENT_START_CONTEXT_RE = /^\s*(?:<system-reminder>\s*)?SubagentStart hook additional context:/;
+const SUBAGENT_START_CONTEXT_RE = /^\s*(?:\x3csystem-reminder\x3e\s*)?SubagentStart hook additional context:/;
 
 function extractClaudeLaneToken(content: unknown, requireSubagentStartPrefix: boolean): string | undefined {
     if (typeof content === "string") {
