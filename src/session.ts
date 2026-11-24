@@ -5,7 +5,7 @@ import { getStore, effectiveFileStorageMode } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
 import { configFileEpoch, loadConfigFile, loadNamedProviders } from "./config.js";
-import { applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
+import { applyCompressSettings, combineMessageProtectedPredicate, hasCompressSettings, resolveContextLimitValue, type ResolvedKernelConfig } from "./compress-settings.js";
 import { agentProviderRecipes } from "./agent-providers.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
@@ -28,6 +28,22 @@ export type BlockContent = {
     one: BlockView | null;
     full: BlockView;
 };
+
+/** The compression-time snapshot of a block, or undefined when there is none.
+ *  The unified index stores a placeholder for blocks whose legacy record had no
+ *  snapshot ({ one: null, full: { text: block.summary, count: 0 } }, see
+ *  completeBlockContents in src/storage/ingest.ts) so every block row has a view;
+ *  replay serves it back. It is not a snapshot: readers must treat it like a
+ *  missing entry (decompress collects from the live messages, the web view says
+ *  "no snapshot") or a migrated session returns the summary as the block's content. */
+export function blockContentSnapshot(
+    contents: { get(blockId: string): BlockContent | undefined },
+    block: { blockId: string; summary?: string },
+): BlockContent | undefined {
+    const content = contents.get(block.blockId);
+    if (content !== undefined && content.one === null && content.full.count === 0 && content.full.text === block.summary) return undefined;
+    return content;
+}
 
 /** #3050 R3 ②b: block-contents map that folds away to (almost) nothing once
  *  a save has captured it, and re-materializes from the store on the first
@@ -618,11 +634,27 @@ export type Session = {
           *  Absent on factors published before this field existed → reads
           *  treat it as compatible and retire it through normal rollover. */
          calibratedEstimateModel?: string;
+         /** #5952: provenance of the published calibratedEstimate —
+          *  "text-only-v1" when every sample in calibrationRing came from a
+          *  text-only final wire estimate (per-request capture pair); absent
+          *  for factors trained on the legacy shared prepare slot, whose
+          *  evidence may include image-billed usage. The read gate
+          *  (currentCalibrationFactor) only applies a factor carrying this
+          *  stamp. Persisted so a restart doesn't silently re-arm a stale
+          *  mixed-modal multiplier; reset at native-compaction boundaries
+          *  with the rest of the baseline stats. */
+         calibratedEstimateProvenance?: string;
          /** #1933 F1 / #2117 B: evidence ring behind calibratedEstimate —
           *  the recent admitted raw samples for ONE origin+model (max 3).
           *  Persisted so a restart doesn't re-arm the warmup delay; reset at
-          *  native-compaction boundaries with the rest of the baseline stats. */
-         calibrationRing?: { origin: string; model?: string; values: number[] };
+          *  native-compaction boundaries with the rest of the baseline stats.
+          *  #5952: provenances[i] is the provenance of values[i] —
+          *  "text-only-v1" for a sample from a text-only final wire
+          *  estimate, undefined for a legacy shared-slot sample. The
+          *  published factor's provenance is "text-only-v1" only when every
+          *  value in the window carries it; one legacy sample in the window
+          *  keeps the factor inert until the window flushes it out. */
+         calibrationRing?: { origin: string; model?: string; values: number[]; provenances?: (string | undefined)[] };
         /** #1933 F1: pending pairing input — local estimate of the LAST
          *  prepared outbound in BILLED caliber (estimateCoreMessages +
          *  system/tools overhead + image reserve, defaultCountTokens rate;
@@ -848,7 +880,11 @@ type AnonymousPrefixAffinityStamp = {
 // it; a function value throws at the clone site (DataCloneError → 503
 // FORK_FAILED). Function fields are re-resolved at read time: effectiveConfig()
 // merges over the base kernelConfig, which carries them again (isToolProtected
-// #2578; isMessageProtected re-resolves from the lane id below).
+// #2578); isMessageProtected is rebuilt from the clone-safe
+// protectedUserPatterns data field (restoreProtectedUserPatterns below) —
+// without that restore the plugin tool path (compress/acp_status) would run
+// without the host predicate and protectedUserPatterns would be inert in
+// plugin mode.
 export function storeEffectiveConfig(session: Session, config: Config): void {
     const cloneSafe: Record<string, unknown> = { ...config };
     for (const key of Object.keys(cloneSafe)) {
@@ -913,9 +949,21 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
     // re-resolve the classifier AND the default `durable/*` policy from it at
     // read time; every consumer (plugin tool, nudge panel) then sees the same
     // protection the wire path used this turn.
+    const restored = restoreProtectedUserPatterns(base);
     const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
     const classifier = lane ? durableMessageToolPaths[lane] : undefined;
-    return classifier && !base.messagePathOf ? withDurableProtection(base, classifier) : base;
+    return classifier && !restored.messagePathOf ? withDurableProtection(restored, classifier) : restored;
+}
+
+/** Rebuild the host isMessageProtected predicate from the clone-safe
+ *  protectedUserPatterns data field after the stamp round-trip stripped the
+ *  function (storeEffectiveConfig drops all function fields). No-op when the
+ *  data field is absent — byte-identical legacy behavior. */
+function restoreProtectedUserPatterns(config: Config): Config {
+    const patterns = (config as ResolvedKernelConfig).protectedUserPatterns;
+    if (!patterns || patterns.length === 0) return config;
+    const isMessageProtected = combineMessageProtectedPredicate(config.isMessageProtected, patterns);
+    return isMessageProtected === config.isMessageProtected ? config : { ...config, isMessageProtected };
 }
 
 // #4383: a positive usage-grade anchor below this share of the billing-caliber
@@ -1859,6 +1907,8 @@ export function resetSessionCompression(session: Session): void {
     delete session.stats.calibratedEstimateOrigin;
     // #2117 B: same boundary — the factor's model provenance dies with it.
     delete session.stats.calibratedEstimateModel;
+    // #5952: same boundary — the factor's text-only provenance dies with it.
+    delete session.stats.calibratedEstimateProvenance;
     delete session.stats.calibrationRing;
     delete session.stats.lastLocalTextEstimate;
     delete session.stats.lastLocalTextEstimateOrigin;

@@ -179,8 +179,8 @@ test("dshRuntimeContextPath: projects both snapshot variants to durable/runtime-
     assert.equal(dshRuntimeContextPath(msg("text", undefined)), undefined, "missing text is safe");
     const dshClassifier = durableMessageToolPaths["dsh"];
     assert.ok(dshClassifier, "dsh lane is registered");
-    assert.equal(dshClassifier!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
-    assert.equal(dshClassifier!(msg("text", "Instructions from: AGENTS.md")), "durable/agents-md", "lane entry still covers the #2447 baseline shape");
+    assert.equal(dshClassifier!(msg("text", "\x3csystem-reminder\x3e\n\x3cavailable_skills\x3e\n- name: x\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
+    assert.equal(dshClassifier!(msg("text", "\x3csystem-reminder\x3e\nInstructions from: AGENTS.md\n\x3c/system-reminder\x3e")), "durable/agents-md", "lane entry still covers the #2447 baseline shape");
     assert.equal(dshClassifier!(msg("text", RT_MSG)), "durable/runtime-context", "lane entry covers the #2481 snapshot shape");
     assert.equal(dshClassifier!(msg("text", RT_MSG_NEW)), "durable/runtime-context", "lane entry covers the #7085 reworded snapshot shape");
     assert.equal(dshClassifier!(msg("text", RT_MSG_NEW_RESEND)), "durable/runtime-context", "lane entry covers the #7085 re-send intro shape");
