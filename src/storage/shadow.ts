@@ -930,7 +930,18 @@ export class UnifiedShadow {
                 builder.addStateFields(store.getStateFields(id) ?? {});
                 // The builder preserves every MERGE_STATE_FIELDS key; its
                 // generic state declaration only needs widening here.
-                return builder.finish() as LegacySessionLike;
+                const view = builder.finish();
+                // #7577 (b): egress-on sessions do not persist tsStamps (it is
+                // trimmed on write — see ingest.ts KSTATE_TRIM_FIELDS); re-derive
+                // it from the live egress view (row.msgid IS the kernel raw id,
+                // row.ts the first-observed wall clock) so the kernel's <acp
+                // time=> stamps survive restarts. The async (MySQL) leg has no
+                // egress tables — the egress plane is the SQLite lane only.
+                if (view.metadata["egressAuthority"] === true && view.state.tsStamps === undefined) {
+                    const derived = store.egressTsStamps(id);
+                    if (derived !== null) view.state.tsStamps = derived;
+                }
+                return view as LegacySessionLike;
             });
             if (!unified) return null;
             warnTailGaps(id, unified as unknown as { tailGaps?: number });

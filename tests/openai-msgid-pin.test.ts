@@ -49,6 +49,7 @@ test("openai wire: biliMsgIds never reach the upstream; rows carry client ids on
     test.after(() => rmSync(dir, { recursive: true, force: true }));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = "full";
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     const savedRollout = process.env[ROLLOUT_ENV];
     process.env[ROLLOUT_ENV] = "1";
     try {
