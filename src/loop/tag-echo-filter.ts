@@ -191,7 +191,7 @@ const SELF_CLOSE = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?\\/>");
 // ref): a dead unit NEVER consumes the whitespace around it (it is content),
 // in either mode, so chunk-split parity needs no cross-push whitespace
 // memory.
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "(?:\\s*(?:[\\u2013\\u2014,\\-]\\s*)?(?:m\\d{0,3})?)?\\s*|(?<![\\w>])\\s*m\\d{0,3})$");
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "(?:\\s*(?:[\\u2013\\u2014,\\-]\\s*)?(?:m\\d{0,3})?)?\\s*|(?<![\\w>])\\s*m\\d{0,3}|\x3c\/\uFF5C(?:\uFF5C(?:D(?:S(?:M(?:L(?:\uFF5C(?:\uFF5C[^<>]{0,32})?)?)?)?)?)?)?)$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
 // The mangled \x3c<name>=… form counts too: once the `=` is there the tail is
@@ -321,6 +321,16 @@ function looseCloseEnd(s: string): number {
 // both modes agree on where the span dies. The termination still routes
 // through drop(), i.e. the existing [tag-echo] warn callback (owner §4(b)).
 const DEGEN_CLOSE_NAME = /^[^<>]{1,32}>/;
+// #7685: DeepSeek's tool-call template delimiter (the DSML pipe, fullwidth
+// U+FF5C wrapping "DSML") leaks into visible prose when the model emits its own
+// template tokens as text instead of structured tool calls — the serving layer
+// fails to parse them and returns them as text. The close form `</｜｜DSML｜｜name>`
+// is a complete tag (has both `</` and `>`), so it dies in place. The name is a
+// short tool word (invoke/calls/parameter); {0,32} mirrors the LONE_CLOSE
+// close-side bound. The DSML pipe is fullwidth (U+FF5C), a different code point
+// from the ASCII pipe (U+007C), so it cannot appear in legitimate prose.
+const DSML_PIPE = "\uFF5C\uFF5CDSML\uFF5C\uFF5C";
+const DSML_CLOSE = new RegExp("\x3c\\/" + DSML_PIPE + "[^<>]{0,32}>");
 // Single bare ref, exactly one (#2190 DEGEN_PAIR body rule); standalone const so
 // this stays valid when the master REF_* token constants churn (#2025 stack compat, #2229).
 const SINGLE_REF_BODY = /^\s*m\d{4,}\s*$/;
@@ -537,6 +547,7 @@ function stripPass(text: string, dropToolCallEmission: boolean, requestText: str
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(MANGLED_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
+        .replace(new RegExp(DSML_CLOSE.source, "g"), "")
     // #2862: dead ref-close units (ref + unterminated close head, mid-text or
     // at EOF). Position matters twice: BEFORE the truncate passes — TRUNC_CLOSE
     // eats the \x3c/name tail first and would leave the bare ref behind (the
@@ -648,8 +659,10 @@ export function containsEchoResidue(s: string): boolean {
 export function mayStartRenderTag(s: string): boolean {
     // MANGLED_OPEN carries its own ">" (PARTIAL_TAIL only sees unterminated
     // tails), so it is tested directly: a chunk with a complete mangled open
-    // must engage the machine to drop it.
-    return RENDER_TAG_DETECT.test(s) || MANGLED_OPEN.test(s) || PARTIAL_TAIL.test(s);
+    // must engage the machine to drop it. DSML_CLOSE is likewise a complete
+    // tag (has both `</` and `>`), so it is tested directly rather than via
+    // PARTIAL_TAIL (#7685).
+    return RENDER_TAG_DETECT.test(s) || MANGLED_OPEN.test(s) || DSML_CLOSE.test(s) || PARTIAL_TAIL.test(s);
 }
 
 // #2190: a BROADER ambiguous head, used by the streaming gate and the filter's
@@ -1360,8 +1373,11 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
             // drop it in place, no swallow (a following close dies via
             // LONE_CLOSE on its own).
             const g = MANGLED_OPEN.exec(buf);
+            // #7685: an orphan DSML close (DeepSeek's tool-call template
+            // delimiter leaking as text) is a complete tag — drop it in place.
+            const d = DSML_CLOSE.exec(buf);
             let m: RegExpExecArray | null = null;
-            for (const cand of [p, s, o, c, r, g]) {
+            for (const cand of [p, s, o, c, r, g, d]) {
                 if (cand && (m === null || cand.index < m.index)) m = cand;
             }
             // An opening whose attribute list never terminates (see
