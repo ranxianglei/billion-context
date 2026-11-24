@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -31,6 +31,18 @@ export function uniqueHandoffPath(
 
 /** Downloads is the destination the existing button used; keep it. */
 function defaultDownloadsDir(): string {
+    if (process.platform === "linux") {
+        try {
+            // Respect XDG user dirs when the desktop has localized Downloads.
+            const dir = execFileSync("xdg-user-dir", ["DOWNLOADS"], {
+                encoding: "utf8",
+                timeout: 1000,
+            }).trim();
+            if (dir && dir !== os.homedir()) return dir;
+        } catch {
+            // xdg-user-dir is optional; fall back to the conventional path.
+        }
+    }
     return path.join(os.homedir(), "Downloads");
 }
 
@@ -66,7 +78,29 @@ export function writeHandoffExport(
     dir: string = defaultDownloadsDir(),
 ): string {
     fs.mkdirSync(dir, { recursive: true });
-    const filePath = uniqueHandoffPath(dir, sessionId);
-    fs.writeFileSync(filePath, markdown, { encoding: "utf8", mode: 0o600 });
-    return filePath;
+    const name = handoffExportName(sessionId);
+    const ext = path.extname(name);
+    const stem = name.slice(0, name.length - ext.length);
+    for (let n = 0; n < 10_000; n++) {
+        const filePath = path.join(dir, n === 0 ? name : `${stem} (${n})${ext}`);
+        let fd: number;
+        try {
+            // "wx" makes name reservation and creation one atomic operation, so
+            // concurrent exports of the same session cannot overwrite each other.
+            fd = fs.openSync(filePath, "wx", 0o600);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+            throw error;
+        }
+        try {
+            fs.writeFileSync(fd, markdown, "utf8");
+        } catch (error) {
+            fs.closeSync(fd);
+            fs.rmSync(filePath, { force: true });
+            throw error;
+        }
+        fs.closeSync(fd);
+        return filePath;
+    }
+    throw new Error("too many handoff exports for this session");
 }
