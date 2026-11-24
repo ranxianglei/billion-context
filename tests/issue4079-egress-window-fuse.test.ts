@@ -311,8 +311,12 @@ test("e2e #6844 both-ways: a model-hidden DSH top-level field no longer meters t
 
         // Gate discipline (#3617): an UNKNOWN top-level field is still metered
         // — the exemption is a documented-field allowlist, not a hole in the
-        // fuse — and the 413 names the field dominating the `other` bucket
-        // (#6844 item 3), so the next unknown field needs no manual arithmetic.
+        // meter. Post-#7537 the fuse no longer refuses locally: it measures
+        // and logs, then forwards, and the UPSTREAM's own size verdict
+        // (413) passes through annotated — exactly the both-ways pin the
+        // #4079/#5000/#4543 tests carry. The "top field: custom_extension ~N"
+        // naming (#6844 item 3) now rides the fuse profile / upstream
+        // size-verdict log (measuredBreakdownClause), not the 413 response.
         const doomed = await fetch(ctx.url, {
             method: "POST",
             headers: { ...ctx.headers },
@@ -322,11 +326,13 @@ test("e2e #6844 both-ways: a model-hidden DSH top-level field no longer meters t
                 custom_extension: "E".repeat(5_000_000),
             }),
         });
-        assert.equal(doomed.status, 413, `an oversized unknown field must still stop at the fuse (got ${doomed.status})`);
-        const parsed = JSON.parse(await doomed.text()) as { error?: { code?: string; message?: string } };
-        assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself");
-        assert.match(parsed.error?.message ?? "", /top field: custom_extension ~[\d,]+/, "the 413 names the field dominating the other bucket");
-        assert.equal(calls.length, 1, "the unknown-field body never reached the upstream");
+        const doomedBody = await doomed.text();
+        const parsed = JSON.parse(doomedBody) as { error?: { code?: string; message?: string } };
+        assert.equal(doomed.status, 413, `the upstream's size verdict must pass through (got ${doomed.status}): ${doomedBody.slice(0, 300)}`);
+        assert.match(parsed.error?.message ?? "", /upstream says: request entity too large/, "the 413 is the UPSTREAM's message, not a local refusal");
+        assert.equal(doomed.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
+        assert.equal(doomed.headers.get("x-bili-retryable"), "false", "non-retryable — the unknown field's mass won't change on retry");
+        assert.equal(calls.length, 2, "the unknown-field body WAS forwarded — the fuse measures and logs, it does not judge (#7537)");
     } finally {
         await close();
         rmrf(root);
