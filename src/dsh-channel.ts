@@ -62,10 +62,34 @@ interface DshPatchEntry {
  *  callers decide how duplicates combine. The single source of truth for
  *  patch-layer enablement semantics: both the #2462 cost advisory and the
  *  #2861 host-plugin notice scan through this so they can never drift apart. */
+/** #7128: is this `disabled:` value a "row is off" declaration?
+ *
+ *  The patch layer is YAML with one extension: dsh's loader also accepts
+ *  `disabled: !!js <expr>`, and the dump of a stock web profile carries four
+ *  such forms today. A text scan cannot evaluate an expression, so a declared
+ *  `!!js` value is treated as "the user turned this row off". That is the
+ *  safer error direction for both consumers: under-reporting a cost hint beats
+ *  nagging someone who already disabled the plugin, and the host-plugin notice
+ *  is suppressed exactly when the user acted. Plain booleans are still read
+ *  exactly, including YAML 1.1's `yes`/`on` and quoted forms. */
+function isDisabledValue(raw: string): boolean {
+    let v = raw.trim();
+    // A YAML comment needs whitespace before '#', so split there and keep the rest out.
+    const comment = v.indexOf(" #");
+    if (comment >= 0) v = v.slice(0, comment).trim();
+    if (v.length === 0) return false;
+    if (v.startsWith("!!js")) return true;
+    const quoted =
+        v.length > 1 &&
+        ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")));
+    if (quoted) v = v.slice(1, -1).trim();
+    return /^(?:true|yes|on)$/i.test(v);
+}
+
 export function parseDshPatchEntries(text: string): DshPatchEntry[] {
     const itemRe = /^\s*-\s*id\s*:\s*(\S+)/;
     const listItemRe = /^\s*-\s/;
-    const disabledRe = /^\s+disabled\s*:\s*true\b/;
+    const disabledRe = /^\s+disabled\s*:\s*(.*)$/;
     const out: DshPatchEntry[] = [];
     let current: DshPatchEntry | undefined;
     for (const line of text.split(/\r?\n/)) {
@@ -83,7 +107,10 @@ export function parseDshPatchEntries(text: string): DshPatchEntry[] {
             current = undefined;
             continue;
         }
-        if (current && disabledRe.test(line)) current.disabled = true;
+        if (current) {
+            const disabled = line.match(disabledRe);
+            if (disabled && isDisabledValue(disabled[1] ?? "")) current.disabled = true;
+        }
     }
     if (current) out.push(current);
     return out;
