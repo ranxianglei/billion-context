@@ -1593,7 +1593,7 @@ describe("reconcileFoldCoverage model-switch churn (#2636)", () => {
         assert.equal(logs.filter((l) => l.level === "error").length, 0, "sanctioned reasoning drop must not escalate");
         assert.equal(session.metadata.foldDriftStreak, undefined, "tolerated drop accrues no destroy streak");
         assert.equal(session.metadata.foldDriftEscalated, undefined, "the latch must not set on a healthy fold");
-        assert.equal(logs.filter((l) => /covered reasoning core\(s\) dropped by the host/.test(l.msg)).length, 5, "each tolerated pass reports info once");
+        assert.equal(logs.filter((l) => l.level === "warn" && /covered reasoning core\(s\) dropped by the host/.test(l.msg)).length, 5, "each tolerated pass reports warn once with the cache cost named");
     });
 
     test("reasoning drop plus one honest user edit still never escalates (#2193 follow-up)", () => {

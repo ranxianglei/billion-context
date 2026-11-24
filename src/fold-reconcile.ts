@@ -2533,8 +2533,8 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             opts.log("warn",
                 `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + realUnmatched.length} covered id(s) missing${expectedNote}, ${plan.claims.size} matchable by anchor (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} resynced` : ""}, ${plan.byTool} toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} twin` : ""}${plan.bySim > 0 ? `, ${plan.bySim} simhash` : ""}${plan.byOrder > 0 ? `, ${plan.byOrder} order-bracket` : ""}, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
         } else if (reasoningOnlyDrop) {
-            opts.log("info",
-                `${tag}[fold-reconcile] ${realUnmatched.length} covered reasoning core(s) dropped by the host (cross-model replay discards structured thinking; every text/tool core intact) — fold substrate healthy, tolerated (#2193 follow-up)`);
+            opts.log("warn",
+                `${tag}[fold-reconcile] ${realUnmatched.length} covered reasoning core(s) dropped by the host (cross-model replay discards structured thinking; every text/tool core intact) — fold substrate healthy, but while the missing count moves the outbound body is rewritten mid-history each pass → prompt cache frozen (per-request re-pay) (#2193 follow-up, #7687)`);
         } else if (markerChurnExplained) {
             // #2815: the per-pass "no anchor match" warn names mutation or
             // client-side deletion — both WRONG for marker-mint churn. Note
