@@ -211,6 +211,31 @@ export function dshProfileDependsOnBili(profileDir: string): boolean {
     return dshProfileDepSpec(profileDir) !== undefined;
 }
 
+/** #7155: the profile a `dsh` argv boots, mirroring dsh's own parser — a bare
+ *  first argument abbreviates `--profile <name>` (except the `plugin`
+ *  subcommand, which takes its own required flag), otherwise the explicit
+ *  `--profile <name>` / `--profile=<name>` wins. undefined when the argv names
+ *  no profile; dsh itself then errors out, so callers fall back to the
+ *  machine-wide answer. The launcher needs this to ask "is THIS profile
+ *  installed" instead of "does any profile on this machine have a copy". */
+export function dshProfileFromArgs(args: readonly string[]): string | undefined {
+    const first = args[0];
+    if (first !== undefined && !first.startsWith("-") && first !== "plugin") return first;
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i]!;
+        if (arg === "--") break;
+        if (arg === "--profile") {
+            const value = args[i + 1];
+            return value !== undefined && value !== "" && !value.startsWith("-") ? value : undefined;
+        }
+        if (arg.startsWith("--profile=")) {
+            const value = arg.slice("--profile=".length);
+            return value !== "" ? value : undefined;
+        }
+    }
+    return undefined;
+}
+
 /** #2894: converge this profile's declared billion-context spec to the version
  *  bili just installed IN PLACE (the dsh desktop lane — #1575). The desktop
  *  copy's node_modules entry is swapped by bili's own tarball installer while
