@@ -3054,10 +3054,16 @@ const mergeBranch = (
           return { kind: "str", t: recv.t.at(ctx.ToInt(idx)) };
         }
         case "trim": {
-          // Exact on the decision our guarded files make with trim: whether
-          // the result is EMPTY. trim(s) == "" ⟺ s ∈ ws*; for non-ws strings
-          // the value is returned unchanged (identity approximation —
-          // stripRenderTags(text).trim() === "" is the only consumer).
+          // Concrete fold: exact for a known string (parse-compress-input's
+          // stripFence/parseStringInput consume the VALUE of trim, not just the
+          // emptiness decision, so the identity approximation below would leak
+          // an ITE that downstream startsWith/lastIndexOf cannot fold).
+          const c = strConst.get(recv.t);
+          if (c !== undefined) return { kind: "str", t: ctx.String.val(c.trim()) };
+          // Symbolic: exact on the decision our guarded files make with trim —
+          // whether the result is EMPTY. trim(s) == "" ⟺ s ∈ ws*; for non-ws
+          // strings the value is returned unchanged (identity approximation —
+          // stripRenderTags(text).trim() === "" is the only symbolic consumer).
           const wsStar = ctx.app1("re.*", wsCharClass(), "RegLan") as Term;
           const inWs = ctx.app2("str.in_re", recv.t, wsStar, "Bool") as Bool<"main">;
           return iteVal(inWs, { kind: "str", t: ctx.String.val("") }, recv);
