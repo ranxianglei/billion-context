@@ -175,8 +175,9 @@ const isBunRuntime = typeof process !== "undefined" && process.versions != null 
 const openReadOnly = isBunRuntime
     ? (p) => new (require(BUN_SQLITE_SPEC).Database)(p, { readonly: true })
     : (p) => new (require(SQLITE_SPEC).DatabaseSync)(p, { readOnly: true });
+let db;
 try {
-    const db = openReadOnly(workerData.path);
+    db = openReadOnly(workerData.path);
     const rows = db.prepare("PRAGMA quick_check").all();
     db.close();
     const verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
@@ -191,6 +192,13 @@ try {
     const c = String((err && err.code) || "").toUpperCase();
     const corrupt = c === "SQLITE_CORRUPT" || c === "SQLITE_NOTADB" || m.includes("database disk image is malformed") || m.includes("file is not a database");
     parentPort.postMessage(corrupt ? { ok: false, corrupt: true, error: m } : { ok: false, error: m });
+    // #6785 CI: the read-only handle must be released on the error path too —
+    // a throwing quick_check left it open until the worker thread tore down, and
+    // a concurrent rmSync of the test's temp dir raced that teardown (EPERM on
+    // windows-latest). The verdict is already posted above, so close is best-effort.
+    if (db) {
+        try { db.close(); } catch { /* verdict already posted; close is best-effort */ }
+    }
 }
 `;
 
