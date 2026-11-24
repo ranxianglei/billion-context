@@ -469,14 +469,31 @@ test("plugin chat emits an in-band error when the retry degenerates too", async 
     const refetch = () => Promise.resolve(streamOf([chatChunk({ role: "assistant" }), chatStop(), DONE]));
     await pipePluginChatWithStrip(streamOf(unclosedEchoTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
     const text = out.join("");
-    assert.ok(
-        text.includes("[ACP] stream error"),
-        "the client is told, rather than left with an empty turn the host never reports",
-    );
-    // The error block closes the turn for the client; the retry stream's own
-    // terminator still follows it, which the client ignores because it stopped at
-    // the error's.
+    // #5958: an exhausted retry is a FAILURE, not a completed turn. The default
+    // streamErrorShape is "protocol", so the client gets the wire-native error
+    // frame — and, critically, NO finish_reason:"stop" terminal that a host like
+    // DSH would book as stop/completed while the task is still unfinished.
+    assert.ok(text.includes('"code":"stream_error"'), "a protocol-native error frame marks the turn as failed");
+    assert.ok(!text.includes('"finish_reason":"stop"'), "an exhausted retry must NOT be serialized as a successful completion");
+    assert.ok(!text.includes("[ACP] stream error"), "the legacy completed-turn error shape is off by default");
+    // The error's own terminal plus the retry stream's trailing terminator both
+    // close the turn; the client stops at the error either way.
     assert.equal((text.match(/\[DONE\]/g) ?? []).length, 2, "the error's terminal, then the retry's trailing terminator");
+});
+
+test("plugin chat keeps the legacy completed-turn shape when streamErrorShape is \"completion\"", async () => {
+    const out: string[] = [];
+    const refetch = () => Promise.resolve(streamOf([chatChunk({ role: "assistant" }), chatStop(), DONE]));
+    await pipePluginChatWithStrip(
+        streamOf(unclosedEchoTurn()), makeRes(out), "openai", makeSession(), undefined, refetch,
+        undefined, undefined, undefined, undefined, undefined, "completion",
+    );
+    const text = out.join("");
+    // The opt-in escape hatch restores the #870/#2689 shape: the error text rides
+    // inside a well-formed completed turn (finish_reason:"stop") for hosts that
+    // need it visible as turn content rather than a protocol error frame.
+    assert.ok(text.includes("[ACP] stream error"), "the legacy in-band error text is present on opt-in");
+    assert.ok(text.includes('"finish_reason":"stop"'), "the legacy completed-turn terminal is preserved on opt-in");
 });
 
 /** Parse the emitted SSE text back into {event, data} pairs (test-side only). */
@@ -504,7 +521,12 @@ function sseEvents(raw: string): { event: string; data: Record<string, unknown> 
 test("plugin chat (anthropic) #870: the in-band error block is well-formed at the next free index", async () => {
     const out: string[] = [];
     const refetch = () => Promise.resolve(streamOf(anthropicEchoOnlyTurn()));
-    await pipePluginChatWithStrip(streamOf(anthropicEchoOnlyTurn()), makeRes(out), "anthropic", makeSession(), undefined, refetch);
+    // #2689 pins the OPT-IN completion shape: hosts that set streamErrorShape:
+    // "completion" get the well-formed block lifecycle (ZCode schema compat).
+    await pipePluginChatWithStrip(
+        streamOf(anthropicEchoOnlyTurn()), makeRes(out), "anthropic", makeSession(), undefined, refetch,
+        undefined, undefined, undefined, undefined, undefined, "completion",
+    );
     const text = out.join("");
     assert.ok(text.includes("[ACP] stream error"), "#870 fired");
 
@@ -537,4 +559,17 @@ test("plugin chat (anthropic) #870: the in-band error block is well-formed at th
     assert.notEqual(ownStartPos, -1, "owning start located");
     const priorIndices = new Set(events.slice(0, ownStartPos).filter((e) => e.event === "content_block_start").map((e) => e.data["index"]));
     assert.equal(idx, priorIndices.size, `error block opened at the next free index (got ${idx}, expected ${priorIndices.size})`);
+});
+
+test("plugin chat (anthropic) defaults to a native error event, not a synthetic completion", async () => {
+    const out: string[] = [];
+    const refetch = () => Promise.resolve(streamOf(anthropicEchoOnlyTurn()));
+    await pipePluginChatWithStrip(streamOf(anthropicEchoOnlyTurn()), makeRes(out), "anthropic", makeSession(), undefined, refetch);
+    const text = out.join("");
+    // Default streamErrorShape="protocol": the exhausted retry surfaces as the
+    // Anthropic-native error event — NOT a synthetic content_block carrying the
+    // error text (that is the completion-only shape pinned above for opt-in hosts).
+    assert.ok(text.includes("event: error"), "a native Anthropic error event marks the failure");
+    assert.ok(text.includes('"code":"stream_error"'), "the error carries the stream_error code");
+    assert.ok(!text.includes("[ACP] stream error"), "no synthetic completed-turn error block by default");
 });

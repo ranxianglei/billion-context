@@ -19,6 +19,13 @@ export function defaultConfig(
       minGrowthRatio: 0.45,
       emergencyThresholdPct: 0.95,
       tier2GrowthMultiplier: 1.5,
+      // Phantom-pressure guard ON by default: pressure-band injection waits
+      // for a usage-grade meter reading when the host reports one is absent.
+      requireUsageSampleForPressure: true,
+      // #5865 backstop bound: the wait above lasts at most this many
+      // consecutive estimate-grade rounds; a never-reporting upstream must not
+      // starve its pressure nudges forever (0 = no holding at all).
+      maxEstimateHoldRounds: 2,
     },
     promotionThreshold: 5,
     truncate: { threshold: 0.95, terminalEscapeAfter: 3 },

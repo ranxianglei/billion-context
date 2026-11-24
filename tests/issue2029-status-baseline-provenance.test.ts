@@ -153,7 +153,14 @@ test("#2029: plugin status nudge + panel feed the provenance-aware baseline", as
             const r = mockRes();
             await handlePluginStatus(session.id, r.res, deps);
             assert.equal(r.status, 200, `${sc.name}: status answered`);
-            assert.deepStrictEqual(seen, [sc.expected], `${sc.name}: nudge recompute tokenCount`);
+            // #7463's protected-mass audit adds one relaxed offer pass on
+            // this surface (normalRanges reuses the nudge call's offer) —
+            // the contract is that EVERY kernel call on a status reader
+            // feeds the provenance-aware baseline, not that there is
+            // exactly one call (same contract as the acp_status surface
+            // above, #4331).
+            assert.ok(seen.length >= 1 && seen.every((v) => v === sc.expected),
+                `${sc.name}: every kernel call fed the provenance-aware baseline (got ${JSON.stringify(seen)})`);
             const panel = JSON.parse(r.body).panel as string | undefined;
             assert.ok(panel, `${sc.name}: panel rendered`);
             if (sc.panelPct !== undefined) {

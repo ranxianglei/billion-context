@@ -38,9 +38,9 @@ function* rewriteResponsesJsonSteps(body: unknown, ctx: RewriteCtx): Generator<J
     // Absorb signature in whole text (m00885): drop only when the request
     // actually instructed the model about absorb.
     const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
-    const requestText = JSON.stringify(ctx.messages);
     if (containsRenderTagText(probe) || containsMarkerLineText(probe) || containsBiliInternalText(probe) || (absorbArmed && containsToolCallEmissionText(probe))) {
         ctx.log(`[tag-echo] stripped: non-stream responses output ACP echo (render tags/markers/internal artifacts): ${probe.slice(0, 120).replace(/\n/g, " ")}`);
+        const requestText = absorbArmed ? JSON.stringify(ctx.messages) : undefined;
         stripResponsesText(b, absorbArmed, requestText);
     }
     let converted = false;

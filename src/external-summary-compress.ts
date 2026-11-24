@@ -89,11 +89,12 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
         }).join("\n\n");
         if (!content.trim()) continue;
         const covered = new Set(blocks.flatMap((block) => block.effectiveMessageIds));
+        const directBlockIds = new Set(blocks.flatMap((block) => block.directBlockIds));
         const reference = JSON.stringify({
             submittedSummaryHint: range.summary,
             currentContext: messages.filter((message, index) => !covered.has(message.id)
                 && (message.role === "user" || index >= messages.length - 5)).map(({ role, text }) => ({ role, text })),
-            otherSummaries: state.blocks.filter((candidate) => candidate.active && !blocks.some((block) => block.directBlockIds.includes(candidate.blockId)))
+            otherSummaries: state.blocks.filter((candidate) => candidate.active && !directBlockIds.has(candidate.blockId))
                 .map(({ topic, summary }) => ({ topic, summary })),
         });
         valid.push(range);

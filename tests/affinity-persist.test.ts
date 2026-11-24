@@ -132,6 +132,53 @@ test("sustained mutations cannot starve the write — max-delay budget (#1834)",
     }
 });
 
+test("persist.debounceMs knob is honored — a larger window defers the write (#6058)", async () => {
+    // #6058: this writer used its own hardcoded 500ms instead of the persist.*
+    // knobs the main session writer honors. With debounce=1500 the old code
+    // wrote at ~500ms; the wired knob defers past the 700ms mark below.
+    process.env.BILI_PERSIST_DEBOUNCE_MS = "1500";
+    try {
+        scheduleAffinityPersist();
+        const file = path.join(tmp, "billion-context", "prefix-affinity.json");
+        await new Promise((r) => setTimeout(r, 700));
+        assert.ok(!fs.existsSync(file), "with debounce=1500 the old hardcoded 500ms must NOT have fired");
+        const deadline = Date.now() + 2_500;
+        while (Date.now() < deadline && !fs.existsSync(file)) {
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        assert.ok(fs.existsSync(file), "the write still lands after the 1500ms knob window");
+    } finally {
+        delete process.env.BILI_PERSIST_DEBOUNCE_MS;
+        flushPrefixAffinity();
+    }
+});
+
+test("persist.maxDelayMs knob is honored — a small cap beats a huge debounce under sustained traffic (#6058)", async () => {
+    // The reported field scenario: continuous mutations. With debounce=5000
+    // the OLD code first wrote at ~5s (its hardcoded max-delay budget); with
+    // maxDelay=400 the write must land within ~1.5s.
+    process.env.BILI_PERSIST_DEBOUNCE_MS = "5000";
+    process.env.BILI_PERSIST_MAX_DELAY_MS = "400";
+    try {
+        const file = path.join(tmp, "billion-context", "prefix-affinity.json");
+        const start = Date.now();
+        let sawFile = false;
+        while (Date.now() - start < 1_500) {
+            scheduleAffinityPersist();
+            await new Promise((r) => setTimeout(r, 100));
+            if (fs.existsSync(file)) {
+                sawFile = true;
+                break;
+            }
+        }
+        assert.ok(sawFile, "maxDelay=400 must force the write within ~1.5s despite debounce=5000");
+    } finally {
+        delete process.env.BILI_PERSIST_DEBOUNCE_MS;
+        delete process.env.BILI_PERSIST_MAX_DELAY_MS;
+        flushPrefixAffinity();
+    }
+});
+
 test("writeSnapshot unions with on-disk chains instead of clobbering a sibling instance's (#1724)", () => {
     const m6 = messages(6);
     const a = prefixAffinity.resolve(m6);

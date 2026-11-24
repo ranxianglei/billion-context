@@ -87,6 +87,7 @@ or object form:
     "asyncTimeoutMinutes": 30,
     "thinkingLevel": "medium",
     "notifyIfRead": "skip",
+    "notifyStructured": false,
     "displayUsage": "separate",
     "forceEnable": false,
     "fleetShortcut": "ctrl+alt+d",
@@ -102,7 +103,7 @@ or object form:
 |-----|------|---------|---------|
 | `delegate` | `boolean \| object` | enabled | Master switch. `false` removes the three tools, the system-prompt section and the fleet shortcut (new session required). |
 | `delegate.enabled` | boolean | `true` | Same as above, object form. |
-| `delegate.forceEnable` | boolean | `false` | Keep `acp_delegate` active even when a project-scope pi-subagents install would otherwise stand it down (#415). Env `PI_ACP_DELEGATE_FORCE_ENABLE=true/false` overrides. |
+| `delegate.forceEnable` | boolean | `false` | Keep `acp_delegate` active even when a pi-subagents install (either scope) would otherwise stand it down (#415, widened to user-scope in #5637). Env `PI_ACP_DELEGATE_FORCE_ENABLE=true/false` overrides. |
 | `delegate.displayUsage` | `"separate" \| "merged"` | `"separate"` | `"separate"`: delegate tokens tracked outside the main session totals (own footer block). `"merged"`: folded into the tool-result usage field. Legacy flat alias: top-level `"displayUsage"`. |
 | `delegate.maxDepth` | number | `2` | Max nesting depth (main → child → grandchild). `1` = no nested delegation. Propagated to children via `PI_ACP_DELEGATE_MAX_DEPTH`. Env override: `PI_ACP_DELEGATE_MAX_DEPTH`. |
 | `delegate.syncTimeoutMinutes` | number \| null | `5` | Hard timeout for synchronous delegates. `0`/`null` disables. Env: `PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES`. |
@@ -112,6 +113,7 @@ or object form:
 | `delegate.thinkingLevel` | string | unset | Global default thinking level (off\|minimal\|low\|medium\|high\|xhigh\|max). Priority: per-call > role > global > Pi default. |
 | `delegate.agents` | object | unset | Per-role defaults: `{ "<role>": { "model": "provider/id", "thinkingLevel": "…" } }`. Invalid models fall back to the parent model with a warning (never fail). |
 | `delegate.notifyIfRead` | `"skip" \| "always"` | `"skip"` | Skip the completion notification when the model already read the result file after the run finished. |
+| `delegate.notifyStructured` | boolean | `false` | Deliver notifications as typed custom messages carrying a versioned `details` envelope (runId/status/agent + launch provenance: originToolCallId/sourceSessionId), so third-party UIs tie each notice to its launching turn without parsing prose (#5750). Model-visible text and steer delivery are unchanged; hosts without `sendMessage` fall back to plain text automatically. |
 | `delegate.fleetShortcut` | string | `"ctrl+alt+d"` | TUI shortcut for the fleet inspector. `""` disables keyboard registration (`/acp-fleet` still works). Moved off `ctrl+alt+f`, which pi-subagents also claims (#412). |
 | `delegatePrompt` | string \| null | built-in | Replace (string) or remove (`null`) the `ACP_DELEGATE NOTIFICATIONS` system-prompt appendix. |
 | `debug` | boolean | `false` | Debug-level events in `~/.pi/acp.log` (shared with billion-context-pi). Env `ACP_DEBUG=1` too. |
@@ -125,7 +127,7 @@ A change to any `delegate.*` key takes effect on a **new session** (tools regist
 If you also run [pi-subagents](https://github.com/nicobailon/pi-subagents) (or similar), two overlapping sub-agent systems make the model's choice noisier. Detection happens at session start:
 
 - **Project-scope install** (`<cwd>/.pi/npm/node_modules/pi-subagents` or `<cwd>/.pi/extensions/pi-subagents`) → `acp_delegate` **stands down automatically** for that project (tools, shortcut and prompt section skipped); a reminder points at `/acp-subagents` (from billion-context-pi) so the third-party agents still get ACP compression.
-- **User-scope-only install** (`~/.pi/npm`, user extensions dir) → `acp_delegate` stays active; a warning is logged instead.
+- **User-scope install** (`~/.pi/npm`, user extensions dir) → `acp_delegate` stands down automatically too (#5637) — a user-scope install loads in every project, so leaving it active would duplicate the surface everywhere.
 - Keep both anyway: `{ "delegate": { "forceEnable": true } }`.
 - Drop this package entirely: `pi remove npm:billion-context-pi-subagents`.
 

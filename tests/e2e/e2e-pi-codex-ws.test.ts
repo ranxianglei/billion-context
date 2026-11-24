@@ -32,7 +32,7 @@ process.env.NODE_ENV = "test";
 
 const PI_BIN = process.env.E2E_PI_BIN ?? "pi";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
-const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/pi-native.js");
+const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/billion-context.js");
 const TMO = Number(process.env.E2E_TMO ?? 180_000);
 const WORK_ROOT = path.join(process.cwd(), "tmp");
 fs.mkdirSync(WORK_ROOT, { recursive: true });
@@ -52,7 +52,7 @@ function piAvailable(): boolean {
 const skipReason = !run
     ? "set ACP_TEST_E2E_PI_WS=1 (real pi + local mock WS upstream; deterministic, zero tokens)"
     : !fs.existsSync(PI_NATIVE_ENTRY)
-        ? "dist/agent/pi-native.js missing — run `npm run build` first"
+        ? "dist/agent/billion-context.js missing — run `npm run build` first"
         : !piAvailable()
             ? `pi binary "${PI_BIN}" not found on PATH`
             : undefined;
@@ -257,6 +257,10 @@ function cleanEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     for (const key of Object.keys(env)) {
         if (key.startsWith("BILI") || key.startsWith("BILLION_CONTEXT") || key.startsWith("ACP_")) delete env[key];
     }
+    // #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+    // off) — this suite asserts the legacy JSON persistence surface, so pin
+    // the dual-write writer explicitly.
+    env.BILI_STORAGE_JSON_WRITER = "on";
     // NODE_TEST_CONTEXT stands down pi-native inside node:test; the spawned pi
     // is a real client, not a test context (same rationale as e2e-native-pi).
     for (const key of ["NODE_EXTRA_CA_CERTS", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "NODE_OPTIONS", "NODE_TEST_CONTEXT"]) delete env[key];
@@ -342,6 +346,10 @@ function piRun(
             cwd: ctx.piCwd,
             env: {
                 ...cleanEnv(opts.extraEnv),
+                // Pure-SQLite is the default storage writer now (2026-11-13):
+                // this lane asserts the JSONL session envelopes — pin dual-write
+                // so coverage does not depend on the default.
+                BILI_STORAGE_JSON_WRITER: "1",
                 PI_CODING_AGENT_DIR: ctx.piAgentDir,
                 XDG_CONFIG_HOME: ctx.xdg.config,
                 XDG_CACHE_HOME: ctx.xdg.cache,
@@ -722,7 +730,14 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
         assert.ok(r.stdout.includes("WS_E2E_OK"));
     };
 
-    ok("X warmup", await piRun(ctxX, "alpha marker ALPHA_X_SEED"));
+    // #5428 flipped the pi lane's DEFAULT posture to inline (in-process proxy):
+    // left unpinned, X's proxy would die with its pi process and unregister its
+    // instance record — nothing left to discover, nothing for Y to attach to.
+    // This scenario pins the legacy spawn/attach posture it was built on;
+    // scenarios A–D intentionally ride the new inline default.
+    const legacyPosture: NodeJS.ProcessEnv = { BILI_PI_INLINE: "0" };
+
+    ok("X warmup", await piRun(ctxX, "alpha marker ALPHA_X_SEED", { extraEnv: legacyPosture }));
     const origin = proxyOriginOf(ctxX);
     assert.ok(origin, "X's proxy origin discovered from its instance record");
     // Y attaches to X's proxy (real subagent posture: inherited
@@ -733,7 +748,7 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
 
     // Same tool args ({}) from both sessions, interleaved.
     const [xStatus, yStatus] = await Promise.all([
-        piRun(ctxX, "WS_STATUS alpha status", { resume: true }),
+        piRun(ctxX, "WS_STATUS alpha status", { resume: true, extraEnv: legacyPosture }),
         piRun(ctxY, "WS_STATUS beta status", { resume: true, extraEnv: yEnv }),
     ]);
     ok("X status", xStatus);
@@ -763,7 +778,7 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
 
     // Concurrent plain turns, same proxy, no cross-talk afterwards.
     const [xFin, yFin] = await Promise.all([
-        piRun(ctxX, "concurrent X tail", { resume: true }),
+        piRun(ctxX, "concurrent X tail", { resume: true, extraEnv: legacyPosture }),
         piRun(ctxY, "concurrent Y tail", { resume: true, extraEnv: yEnv }),
     ]);
     ok("X concurrent", xFin);

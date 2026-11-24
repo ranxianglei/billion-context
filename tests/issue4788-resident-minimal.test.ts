@@ -207,7 +207,7 @@ test("(c) hard cap under sustained activity: boundaries drop, in-flight skips, w
         delete process.env.BILI_SESSION_RESIDENT_HARD_MAX_BYTES;
         try {
             assert.equal(sessionResidentHardMaxBytes(), sessionResidentMaxBytes(), "default = pool soft cap");
-            assert.equal(sessionResidentHardMaxBytes(), 536_870_912);
+            assert.equal(sessionResidentHardMaxBytes(), 4_294_967_296);
         } finally {
             process.env.BILI_SESSION_RESIDENT_HARD_MAX_BYTES = saved;
         }

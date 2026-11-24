@@ -66,15 +66,18 @@ test("#1029-②: no-valid-ranges failure is self-contained on line 1 (no danglin
     assert.match(marker, /❌ \[ACP\] Compression FAILED.*Rejected entries: entry 0:/, "marker carries the complete failure");
 });
 
-test("#1029-②: repeated identical malformed calls escalate via the repeat-failure guard", () => {
+test("#1029-②: repeated identical malformed calls escalate (2nd+ collapse to a one-liner that still counts)", () => {
     const ctx = makeCtx([textMsg("raw_1", "assistant", "a".repeat(800))]);
     const bad = () => applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002" }] }), ctx).text;
     const first = bad();
     assert.ok(first.startsWith("[Compression FAILED"), first);
     assert.ok(!first.includes("Repeat-failure guard"), "first attempt has no escalation");
+    assert.ok(!first.includes("FAILED again"), "first attempt is the full receipt, not the one-liner");
     const second = bad();
-    assert.match(second, /Repeat-failure guard/);
+    assert.ok(second.startsWith("[Compression FAILED again"), `second attempt collapses to the one-liner, got: ${second.slice(0, 120)}`);
     assert.match(second, /2 time\(s\)/);
+    assert.doesNotMatch(second, /compress takes ONE 'content' STRING/, "one-liner must not repeat the format lecture");
+    assert.match(second, /FIRST failed receipt above/, "one-liner points back at the full receipt");
 });
 
 test("#1029-③: zero-block rejection inlines the current ref span (stale refs from another generation)", () => {
@@ -92,8 +95,13 @@ test("#1029-③: zero-block rejection inlines the current ref span (stale refs f
         ctx,
     ).text;
     assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
-    assert.match(out, /\[Current context: 3 visible message\(s\), refs m00001–m00003, \d+ active block\(s\)\./, "current span inlined");
-    assert.match(out, /refs inside this span|acp_status/i, "points at actionable refs or acp_status");
+    // The span line is PERSISTED in visible history with every failure receipt,
+    // so it must self-label as a point-in-time snapshot — a long session
+    // otherwise accumulates stale copies with different max refs that a weak
+    // model reads as simultaneously true (2026-11-17, session 01a1e89d:
+    // phantom endpoints m02383/m02489 aimed at a "frontier" that never existed).
+    assert.match(out, /\[Context snapshot at the moment of THIS receipt — point-in-time only: refs are minted continuously, so every earlier copy of this line in the transcript is stale, and the newest copy is the current frontier\. 3 visible message\(s\), refs m00001–m00003, \d+ active block\(s\)\./, "snapshot span inlined and labeled point-in-time");
+    assert.match(out, /newest such snapshot|acp_status/i, "points at actionable refs or acp_status");
 });
 
 test("#1029-①: incoming history resends are stripped of ACP status marker lines", () => {

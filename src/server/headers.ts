@@ -1,3 +1,5 @@
+import { BILI_HOST_RECOVERY_OWNER_HEADER } from "../util.js";
+
 /** Session ids are client-provided verbatim (#286) — sanitize before using
  *  one in a debug-dump FILENAME so a hostile value cannot escape the dir. */
 export function safeSessionId(id: string | undefined): string {
@@ -26,6 +28,8 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     // #1117: bili-internal passthrough marker (native fetch patch → proxy);
     // never meaningful to a real upstream.
     "x-bili-passthrough",
+    // OMP host owns recovery; consume this marker before provider egress.
+    BILI_HOST_RECOVERY_OWNER_HEADER,
     // #5418: watermark fastpath handshake — client→proxy watermark claim and
     // proxy→client measured total. Pure billing-plane bookkeeping; the A/B
     // golden (tests/issue5403-watermark-fastpath.test.ts) pins that neither
@@ -33,6 +37,23 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     "x-bili-pf-count",
     "x-bili-pf-seq",
     "x-bili-pf-tail-ids",
+    "x-bili-pf-delta",
+    // #5658: incremental-lane turn correlation id — the native plugin stamps it
+    // on a diverted model request alongside x-bili-plugin-turn to correlate the
+    // applied-seq ack. Pure host↔bili bookkeeping; like the pf-* handshake
+    // headers above it must never reach a model endpoint, so strip at egress.
+    "x-bili-turn-id",
+    // #5825: stamped msgid channel — opencode V2 (and any host that can't
+    // rewrite its body) rides the host message ids here, comma-joined. Pure
+    // host↔bili bookkeeping like the pf-* handshake above; the real upstream
+    // must never see it.
+    "x-bili-msg-ids",
+    // zed cloud lane marker: stamped by the /completions envelope classifier in
+    // handle() so the prepare* layers can tell the zed wire apart (its response
+    // is NDJSON byte-passthrough, so the model-side compress surface is off).
+    // Pure bili-internal bookkeeping like the pf-* handshake above; the real
+    // upstream must never see it.
+    "x-bili-zed-lane",
     "te",
     "trailer",
     "upgrade",
@@ -93,7 +114,7 @@ export function buildForwardHeaders(headers: Record<string, string>): Record<str
     for (const [k, v] of Object.entries(headers)) {
         // expect: undici fetch rejects it with UND_ERR_NOT_SUPPORTED — dropped
         // here so no egress path can forward it (#5369).
-        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host" || k.toLowerCase() === "expect") continue;
+        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host" || k.toLowerCase() === "expect" || k.toLowerCase() === BILI_HOST_RECOVERY_OWNER_HEADER) continue;
         out[k] = v;
     }
     out["content-type"] = "application/json";

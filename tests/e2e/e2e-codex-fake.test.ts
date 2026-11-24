@@ -118,7 +118,7 @@ type Ctx = {
 	work: string;
 	codexCwd: string;
 	codexHome: string;
-	xdg: { config: string; cache: string; state: string };
+	xdg: { config: string; cache: string; state: string; data: string };
 	port: number;
 	fakePort: number;
 	reqLog: string;
@@ -135,7 +135,7 @@ async function startCtx(contextWindow: number, fakeEnv: Record<string, string> =
 		work,
 		codexCwd: fs.mkdtempSync(path.join(CWD_ROOT, "cwd-")),
 		codexHome: path.join(work, "codex-home"),
-		xdg: { config: path.join(work, "xdg-config"), cache: path.join(work, "xdg-cache"), state: path.join(work, "xdg-state") },
+		xdg: { config: path.join(work, "xdg-config"), cache: path.join(work, "xdg-cache"), state: path.join(work, "xdg-state"), data: path.join(work, "xdg-data") },
 		port: await freePort(),
 		fakePort: await freePort(),
 		reqLog: path.join(work, "fake-requests.jsonl"),
@@ -143,7 +143,7 @@ async function startCtx(contextWindow: number, fakeEnv: Record<string, string> =
 		resumed: false,
 		turnCount: 0,
 	};
-	for (const d of [ctx.codexHome, ctx.xdg.config, ctx.xdg.cache, ctx.xdg.state]) fs.mkdirSync(d, { recursive: true });
+	for (const d of [ctx.codexHome, ctx.xdg.config, ctx.xdg.cache, ctx.xdg.state, ctx.xdg.data]) fs.mkdirSync(d, { recursive: true });
 
 	await assertPortDead(ctx.fakePort); // #1689: prove still free right before the child binds it
 	const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
@@ -177,6 +177,7 @@ async function startCtx(contextWindow: number, fakeEnv: Record<string, string> =
 				XDG_CONFIG_HOME: ctx.xdg.config,
 				XDG_CACHE_HOME: ctx.xdg.cache,
 				XDG_STATE_HOME: ctx.xdg.state,
+				XDG_DATA_HOME: ctx.xdg.data,
 				BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
 				...windowEnv(contextWindow),
 			},
@@ -250,9 +251,13 @@ test("overflow: compression really happens in codex; bulk folded, sentinels reta
 	// warmup fail-fast 502, preflight still engages early. 10k/12k were
 	// calibrated on the old under-counting estimate or reported tokens and
 	// 502 on the warmup turn once the system prompt counts. The 600-line
-	// filler (~5k tokens) makes the crossing decisive by turn 2 so repeated
-	// folds fit inside the five load turns; the forwarded payload must stay
-	// bounded as a result (assertion below).
+	// filler (~5k tokens) makes the crossing decisive by turn 2; the warmup
+	// fold then carries sentinels into every later payload (assertions below).
+	// NOTE #7545/#7546 ("转发前折叠一次性门槛"): the preflight fold is ONE-SHOT
+	// per session — later over-window turns are forwarded as-is by design
+	// (overflow recovery = #1195 in-request refold + egress fuse), so this
+	// test asserts exactly one summary call plus the gate log line, not
+	// repeated folding.
 	const ctx = await startCtx(18_000);
 	t.after(() => teardown(ctx));
 
@@ -267,17 +272,19 @@ test("overflow: compression really happens in codex; bulk folded, sentinels reta
 
 	const log = logs(ctx);
 	assert.match(log, /preflight compressed|compress requested|\[Compressed m\d/, "a real compression event must occur once context exceeds the window");
+	assert.match(log, /one-shot fold is already spent/, "after the one preflight fold, later over-window turns must be blocked by the #7545 gate (forwarded as-is) — a missing line means the gate never engaged");
 
 	const oracle = readOracle(ctx.reqLog);
-	assert.ok(oracle.some((o) => o.isSummary), "summarization must call the upstream at least once");
 	const summaries = oracle.filter((o) => o.isSummary);
-	assert.ok(summaries.length >= 2, `expected repeated summarization as context accumulated (got ${summaries.length})`);
+	assert.equal(summaries.length, 1, `the #7545 one-shot gate folds exactly once; a second summary call means the gate leaked (got ${summaries.length})`);
 	const mains = oracle.filter((o) => !o.isSummary);
 	assert.ok(mains.length >= 2, "expected several forwarded requests");
 	const lens = mains.map((m) => m.inputLen);
 	const minLen = Math.min(...lens);
 	const peak = Math.max(...lens);
-	assert.ok(peak <= minLen * 1.3, `despite ~20KB filler injected on every load turn the forwarded payload must stay bounded (min=${minLen}, peak=${peak}); unbounded growth would mean compression is not folding the bulk`);
+	const fillerBytes = [2, 3, 4, 5].reduce((acc, k) => acc + filler(k, 600).length, 0);
+	assert.ok(peak > minLen, `post-gate turns are forwarded raw, so the wire must grow across the load turns (min=${minLen}, peak=${peak})`);
+	assert.ok(peak < minLen + fillerBytes, `post-gate growth must be bounded by one copy of the raw fillers (min=${minLen}, peak=${peak}, filler=${fillerBytes} bytes) — exceeding it means history is being duplicated, not just forwarded`);
 
 	const lastMain = allInputText(mains[mains.length - 1].input);
 	assert.match(lastMain, /\[Compressed conversation section\]/, "final payload must carry the summary block");
@@ -375,8 +382,9 @@ test("#1802: a hostile user .env cannot reroute a bili-launched codex", { skip: 
 		config: path.join(work, "xdg-config"),
 		cache: path.join(work, "xdg-cache"),
 		state: path.join(work, "xdg-state"),
+		data: path.join(work, "xdg-data"),
 	};
-	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state]) fs.mkdirSync(d, { recursive: true });
+	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state, xdg.data]) fs.mkdirSync(d, { recursive: true });
 	const fakePort = await freePort();
 	const reqLog = path.join(work, "fake-requests.jsonl");
 	t.after(() => { for (const pid of [fake?.pid]) if (pid) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } } });
@@ -433,6 +441,7 @@ test("#1802: a hostile user .env cannot reroute a bili-launched codex", { skip: 
 			XDG_CONFIG_HOME: xdg.config,
 			XDG_CACHE_HOME: xdg.cache,
 			XDG_STATE_HOME: xdg.state,
+			XDG_DATA_HOME: xdg.data,
 			BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
 			BILI_CLIENT_BIN: CODEX_BIN,
 			E2E_UPSTREAM_KEY: "fake",
@@ -488,8 +497,9 @@ test("#1965: a clean bili exit writes the run's state back into the real home; n
 		config: path.join(work, "xdg-config"),
 		cache: path.join(work, "xdg-cache"),
 		state: path.join(work, "xdg-state"),
+		data: path.join(work, "xdg-data"),
 	};
-	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state]) fs.mkdirSync(d, { recursive: true });
+	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state, xdg.data]) fs.mkdirSync(d, { recursive: true });
 	const fakePort = await freePort();
 	const reqLog = path.join(work, "fake-requests.jsonl");
 	let fake: ReturnType<typeof spawn> | undefined;
@@ -535,6 +545,7 @@ test("#1965: a clean bili exit writes the run's state back into the real home; n
 			XDG_CONFIG_HOME: xdg.config,
 			XDG_CACHE_HOME: xdg.cache,
 			XDG_STATE_HOME: xdg.state,
+			XDG_DATA_HOME: xdg.data,
 			BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
 			BILI_CLIENT_BIN: CODEX_BIN,
 			E2E_UPSTREAM_KEY: "fake",
@@ -582,6 +593,7 @@ test("#1965: a clean bili exit writes the run's state back into the real home; n
 			XDG_CONFIG_HOME: xdg.config,
 			XDG_CACHE_HOME: xdg.cache,
 			XDG_STATE_HOME: xdg.state,
+			XDG_DATA_HOME: xdg.data,
 			E2E_UPSTREAM_KEY: "fake",
 			RUST_LOG: "error",
 		},
@@ -616,12 +628,26 @@ test("#2195: two sequential bili launches keep every thread in the real home", {
 	const work = fs.mkdtempSync(path.join(WORK_ROOT, "e2e-codex-2195-"));
 	const codexCwd = fs.mkdtempSync(path.join(CWD_ROOT, "cwd-"));
 	const codexHome = path.join(work, "codex-home");
+	// XDG_DATA_HOME is pinned like the other three XDG vars: without it the
+	// spawned proxies write their session index to the MACHINE-GLOBAL
+	// $XDG_DATA_HOME/billion-context/sessions/index.db (#5082's one-db-per-
+	// machine topology). This lane's CI job is a bare `runs-on: ubuntu-latest`
+	// — no container — and GitHub's shared-pool runners run several jobs of
+	// several repos side by side under the same user, so every concurrently
+	// billed proxy on that runner shares this one index.db. #2195 hit exactly
+	// this: t3's fresh proxy threw "database is locked" from the pre-pragma
+	// quick_check (no busy handler yet) because a sibling job's proxy held the
+	// write lock, and the launcher burned its 60 s health budget (run
+	// 43557997361, e2e-fake-codex @ 0db33059). Every other e2e lane already
+	// pins a per-test data dir (e2e-native-pi / dsh / opencode / pi-codex-ws);
+	// this file was the exception.
 	const xdg = {
 		config: path.join(work, "xdg-config"),
 		cache: path.join(work, "xdg-cache"),
 		state: path.join(work, "xdg-state"),
+		data: path.join(work, "xdg-data"),
 	};
-	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state]) fs.mkdirSync(d, { recursive: true });
+	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state, xdg.data]) fs.mkdirSync(d, { recursive: true });
 	const fakePort = await freePort();
 	let fake: ReturnType<typeof spawn> | undefined;
 	t.after(() => { if (fake?.pid) { try { process.kill(fake.pid, "SIGKILL"); } catch { /* gone */ } } });
@@ -667,6 +693,7 @@ test("#2195: two sequential bili launches keep every thread in the real home", {
 				XDG_CONFIG_HOME: xdg.config,
 				XDG_CACHE_HOME: xdg.cache,
 				XDG_STATE_HOME: xdg.state,
+				XDG_DATA_HOME: xdg.data,
 				BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
 				BILI_CLIENT_BIN: CODEX_BIN,
 				E2E_UPSTREAM_KEY: "fake",
@@ -754,6 +781,7 @@ test("#2195: two sequential bili launches keep every thread in the real home", {
 			XDG_CONFIG_HOME: xdg.config,
 			XDG_CACHE_HOME: xdg.cache,
 			XDG_STATE_HOME: xdg.state,
+			XDG_DATA_HOME: xdg.data,
 			E2E_UPSTREAM_KEY: "fake",
 			RUST_LOG: "error",
 		},
@@ -787,8 +815,9 @@ async function runProfileCase(
 		config: path.join(work, "xdg-config"),
 		cache: path.join(work, "xdg-cache"),
 		state: path.join(work, "xdg-state"),
+		data: path.join(work, "xdg-data"),
 	};
-	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state]) fs.mkdirSync(d, { recursive: true });
+	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state, xdg.data]) fs.mkdirSync(d, { recursive: true });
 	fs.writeFileSync(path.join(codexHome, "config.toml"), opts.configToml);
 	for (const [name, text] of Object.entries(opts.profileFiles ?? {})) fs.writeFileSync(path.join(codexHome, `${name}.config.toml`), text);
 	const reqLogs = opts.fakePorts.map((_, i) => path.join(work, `fake-requests-${i}.jsonl`));
@@ -818,6 +847,7 @@ async function runProfileCase(
 			XDG_CONFIG_HOME: xdg.config,
 			XDG_CACHE_HOME: xdg.cache,
 			XDG_STATE_HOME: xdg.state,
+			XDG_DATA_HOME: xdg.data,
 			BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
 			BILI_CLIENT_BIN: CODEX_BIN,
 			E2E_UPSTREAM_KEY: "fake",
@@ -956,8 +986,9 @@ test("#2222: shared state — the live db stays in the real home across bili and
 		config: path.join(work, "xdg-config"),
 		cache: path.join(work, "xdg-cache"),
 		state: path.join(work, "xdg-state"),
+		data: path.join(work, "xdg-data"),
 	};
-	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state]) fs.mkdirSync(d, { recursive: true });
+	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state, xdg.data]) fs.mkdirSync(d, { recursive: true });
 	const fakePort = await freePort();
 	let fake: ReturnType<typeof spawn> | undefined;
 	t.after(() => { if (fake?.pid) { try { process.kill(fake.pid, "SIGKILL"); } catch { /* gone */ } } });
@@ -1005,6 +1036,7 @@ test("#2222: shared state — the live db stays in the real home across bili and
 				XDG_CONFIG_HOME: xdg.config,
 				XDG_CACHE_HOME: xdg.cache,
 				XDG_STATE_HOME: xdg.state,
+				XDG_DATA_HOME: xdg.data,
 				BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
 				BILI_CLIENT_BIN: CODEX_BIN,
 				E2E_UPSTREAM_KEY: "fake",
@@ -1084,6 +1116,7 @@ test("#2222: shared state — the live db stays in the real home across bili and
 			XDG_CONFIG_HOME: xdg.config,
 			XDG_CACHE_HOME: xdg.cache,
 			XDG_STATE_HOME: xdg.state,
+			XDG_DATA_HOME: xdg.data,
 			E2E_UPSTREAM_KEY: "fake",
 			RUST_LOG: "error",
 		},
@@ -1112,8 +1145,9 @@ test("#3203: two concurrent bili codex sessions on ONE CODEX_HOME both run and k
 		config: path.join(work, "xdg-config"),
 		cache: path.join(work, "xdg-cache"),
 		state: path.join(work, "xdg-state"),
+		data: path.join(work, "xdg-data"),
 	};
-	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state]) fs.mkdirSync(d, { recursive: true });
+	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state, xdg.data]) fs.mkdirSync(d, { recursive: true });
 	const fakePort = await freePort();
 	let fake: ReturnType<typeof spawn> | undefined;
 	t.after(() => { if (fake?.pid) { try { process.kill(fake.pid, "SIGKILL"); } catch { /* gone */ } } });
@@ -1160,6 +1194,7 @@ test("#3203: two concurrent bili codex sessions on ONE CODEX_HOME both run and k
 				XDG_CONFIG_HOME: xdg.config,
 				XDG_CACHE_HOME: xdg.cache,
 				XDG_STATE_HOME: xdg.state,
+				XDG_DATA_HOME: xdg.data,
 				BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
 				BILI_CLIENT_BIN: CODEX_BIN,
 				E2E_UPSTREAM_KEY: "fake",
@@ -1278,6 +1313,7 @@ test("#3203: two concurrent bili codex sessions on ONE CODEX_HOME both run and k
 			XDG_CONFIG_HOME: xdg.config,
 			XDG_CACHE_HOME: xdg.cache,
 			XDG_STATE_HOME: xdg.state,
+			XDG_DATA_HOME: xdg.data,
 			E2E_UPSTREAM_KEY: "fake",
 			RUST_LOG: "error",
 		},

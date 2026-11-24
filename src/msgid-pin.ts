@@ -44,7 +44,64 @@ export function applyMsgIdPin(msgs: BiliMessage[], ids: string[]): BiliMessage[]
     return msgs.map((m, i) => ({ ...m, id: ids[i] }));
 }
 
+// #5719: the lane resolver's identity input — same degrade-over-mispair
+// discipline as validateMsgIds but WITHOUT the length-equals-messages
+// contract: the fork-exit rung only needs ANY overlap between the incoming
+// ids and a key's recorded ledger, so a short/partial array is still
+// evidence. Absent or malformed → undefined → callers take exactly the
+// pre-#5719 path (strict pinning stays with validateMsgIds' full check).
+export function incomingMsgIdsOf(body: unknown): string[] | undefined {
+    if (typeof body !== "object" || body === null) return undefined;
+    const raw = (body as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    if (!Array.isArray(raw) || raw.length === 0) return undefined;
+    for (const v of raw) {
+        if (typeof v !== "string" || v.length === 0 || v.length > MAX_ID_LEN) return undefined;
+        if (v.startsWith(RESERVED_PREFIX)) return undefined;
+        if (/\s|[\u0000-\u001f\u007f]/.test(v)) return undefined;
+    }
+    return raw as string[];
+}
+
+// #5825 stamped-header channel: hosts that cannot rewrite the body they send
+// (opencode V2 — ids live on the structured event, not in the wire JSON) ride
+// them comma-joined on `x-bili-msg-ids`. Parsed into the SAME light contract
+// as incomingMsgIdsOf so downstream consumers see one shape; full strictness
+// stays at pin time (validateMsgIds). Absent / oversized / malformed →
+// undefined → exactly the pre-channel path.
+const STAMPED_HEADER_MAX_TOTAL_BYTES = 64 * 1024; // host-side budget is 16KiB; parse headroom above it
+const STAMPED_HEADER_MAX_IDS = 4096;
+
+export function incomingMsgIdsHeader(headerValue: string | string[] | undefined): string[] | undefined {
+    const raw = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+    if (typeof raw !== "string" || raw.length === 0) return undefined;
+    if (raw.length > STAMPED_HEADER_MAX_TOTAL_BYTES) return undefined;
+    const list = raw.split(",").filter((s) => s.length > 0);
+    if (list.length === 0 || list.length > STAMPED_HEADER_MAX_IDS) return undefined;
+    return incomingMsgIdsOf({ [MSG_IDS_BODY_FIELD]: list });
+}
+
 type SeqValidation = { ok: true; seqs: number[] } | { ok: false; reason: string };
+
+// #5874 2×2 (brief 19544722, Part A): the SEQS half of the dual-channel
+// identity (biliLedgerSeqs, #4316 layer 3 transport). Lenient read like
+// incomingMsgIdsOf — absent/malformed → undefined → callers take exactly
+// the pre-2×2 path (the strict pin stays with validateMsgSeqs).
+export function incomingSeqsOf(body: unknown): number[] | undefined {
+    if (typeof body !== "object" || body === null) return undefined;
+    const raw = (body as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
+    if (!Array.isArray(raw) || raw.length === 0) return undefined;
+    for (const v of raw) {
+        if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 1) return undefined;
+    }
+    return raw as number[];
+}
+
+/** #7064 §8: the pin-mode signal the server stamps on the response — tells
+ *  the client what it may send NEXT turn: "incremental" (the ledger pins the
+ *  prefix; ride only x-bili-pf-tail-ids, suppress the full list) or "full"
+ *  (send the full id list — bootstrap / reanchor / this turn degraded).
+ *  Rides with the existing watermark response headers (same chokepoint). */
+export const MSGID_MODE_HEADER = "x-bili-msgid-mode";
 
 /** Strict validation for the seq stamp array: 1-based positive integers,
  *  exactly one per message. Non-monotonic or non-contiguous values are

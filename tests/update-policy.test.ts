@@ -7,7 +7,7 @@
  *  ③ remote policy fetch: ETag cache, 304, failure fallback          — §E
  *  ④ overrides by version/range; hold/blocked/pinned each tested     — §C, §G, §H
  *  ⑤ security: file cannot induce arbitrary version/URL installs     — §A5, §G, §H6
- *  ⑥ docs live in CONFIGURATION.md (not testable here)
+ *  ⑥ docs live in docs/configuration.md (not testable here)
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";

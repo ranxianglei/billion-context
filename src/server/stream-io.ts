@@ -31,6 +31,63 @@ export async function readStreamToBuffer(stream: ReadableStream<Uint8Array>, max
     return Buffer.concat(chunks);
 }
 
+/** Buffer a response only while it fits the inspection budget. On overflow,
+ *  replay the retained prefix and continue streaming without dropping bytes. */
+export async function bufferStreamIfFits(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<Buffer | ReadableStream<Uint8Array>> {
+    const reader = stream.getReader();
+    const chunks: Buffer[] = [];
+    let kept = 0;
+    let handedOff = false;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) return Buffer.concat(chunks, kept);
+            if (value.byteLength === 0) continue;
+            if (kept + value.byteLength <= maxBytes) {
+                chunks.push(Buffer.from(value));
+                kept += value.byteLength;
+                continue;
+            }
+            let ended = false;
+            const replay = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    for (const chunk of chunks) controller.enqueue(chunk);
+                    chunks.length = 0;
+                    controller.enqueue(value);
+                },
+                async pull(controller) {
+                    try {
+                        const next = await reader.read();
+                        if (ended) return;
+                        if (next.done) {
+                            ended = true;
+                            reader.releaseLock();
+                            controller.close();
+                        } else {
+                            controller.enqueue(next.value);
+                        }
+                    } catch (error) {
+                        if (!ended) {
+                            ended = true;
+                            reader.releaseLock();
+                            controller.error(error);
+                        }
+                    }
+                },
+                async cancel(reason) {
+                    ended = true;
+                    try { await reader.cancel(reason); }
+                    finally { reader.releaseLock(); }
+                },
+            });
+            handedOff = true;
+            return replay;
+        }
+    } finally {
+        if (!handedOff) reader.releaseLock();
+    }
+}
+
 export function bufferToStream(buf: Buffer): ReadableStream<Uint8Array> {
     return new ReadableStream<Uint8Array>({
         start(controller) {
@@ -74,16 +131,28 @@ export function awaitDrain(res: DrainableResponse): Promise<void> {
 
 export async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<void> {
     const reader = stream.getReader();
+    let completed = false;
+    const cancel = (): void => { void reader.cancel().catch(() => {}); };
+    res.once("close", cancel);
+    res.once("error", cancel);
     try {
+        if (res.destroyed || res.writableEnded) return;
         for (;;) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done) {
+                completed = true;
+                break;
+            }
             if (res.destroyed || res.writableEnded) break;
             if (!res.write(Buffer.from(value))) {
                 await awaitDrain(res);
             }
         }
     } finally {
+        res.removeListener("close", cancel);
+        res.removeListener("error", cancel);
+        // A tee branch can wait for its sibling's cancellation. Do not hold cleanup on it.
+        if (!completed) cancel();
         reader.releaseLock();
         res.end();
     }
@@ -92,21 +161,12 @@ export async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.
 export async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string, name: string): Promise<void> {
     const { mkdirSync, createWriteStream } = await import("node:fs");
     const { join } = await import("node:path");
+    const { pipeline } = await import("node:stream/promises");
     try {
         mkdirSync(dir, { recursive: true });
         const ws = createWriteStream(join(dir, name));
-        ws.on("error", (e) => { logDumpFailure("SSE stream dump", e); });
-        const reader = stream.getReader();
-        try {
-            for (;;) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                ws.write(Buffer.from(value));
-            }
-        } finally {
-            reader.releaseLock();
-            ws.end(() => gcDumpDirIfConfigured(dir));
-        }
+        await pipeline(stream, ws);
+        gcDumpDirIfConfigured(dir);
     } catch (err) {
         logDumpFailure("SSE stream dump", err);
     }

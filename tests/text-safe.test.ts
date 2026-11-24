@@ -65,10 +65,11 @@ test("#1615 repro B: fingerprint with tail cut on a low surrogate round-trips JS
     JSON.parse(JSON.stringify({ line }));
 });
 
-test("fingerprint: ASCII summaries are byte-identical to the pre-fix format", () => {
+test("fingerprint: excerpts embedded WITHOUT head/tail labels (2026-11-18)", () => {
     const summary = "plain ascii summary with no emoji inside";
     const line = summaryFingerprintLine("b3", summary);
-    assert.equal(line, ` \u00b7 b3 full summary ${summary.length}ch \u00b7 head "${summary.slice(0, 30)}" \u2026 tail "${summary.slice(-100)}"`);
+    assert.equal(line, ` \u00b7 b3 full summary ${summary.length}ch "${summary.slice(0, 30)} \u2026 ${summary.slice(-100)}"`);
+    assert.ok(!line.includes("head ") && !line.includes("tail "), "no head/tail labels — the 'only the ends were stored' reading (#2544)");
 });
 
 test("fingerprint: emoji fully inside a window is preserved verbatim", () => {
@@ -174,8 +175,9 @@ test("#2957: scrubLoneSurrogateEscapes stays within a bounded heap on a large un
 test("family gate: no raw negative string slices outside the allowlist", () => {
     const allowlist = new Map<string, RegExp[]>([
         ["src/conflict-watch.ts", [/events\.slice\(-10\)/]], // array receiver
+        ["src/context-analysis.ts", [/a\.injects\.slice\(-50\)/, /a\.harvests\.slice\(-50\)/]], // array receiver (#5963 context-analysis view)
         ["src/web/client.ts", [/conflicts\.slice\(-10\)/]], // array receiver (#2102 session-detail card)
-        ["src/web/report.ts", [/lines\.slice\(-12\)/, /folds\.slice\(-15\)/]], // array receiver (#3099 session-report tables)
+        ["src/web/report.ts", [/lines\.slice\(-12\)/, /folds\.slice\(-15\)/, /evs\.slice\(-30\)/, /rec\.events \|\| \[\]\)\.slice\(-10\)/]], // array receiver (#3099 session-report tables; #6729 recovery tables)
         ["src/text-safe.ts", [/\.slice\(/]], // the clamped implementation itself
     ]);
     const srcDir = path.join(import.meta.dirname, "..", "src");

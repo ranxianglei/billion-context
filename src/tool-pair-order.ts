@@ -40,21 +40,27 @@ export function hoistTrappedToolItems<T extends ToolPairItem>(items: T[]): T[] {
     }
     if (callPos.size === 0) return items;
 
-    // For each non-tool item p, find the earliest call c < p whose output o > p.
-    // Such an item is "trapped" between that call and its output.
+    const groups: Array<{ start: number; end: number }> = [];
+    for (const [id, start] of callPos) {
+        const end = outPos.get(id);
+        if (end === undefined || end <= start) continue;
+        const previous = groups.at(-1);
+        if (previous && start < previous.end) previous.end = Math.max(previous.end, end);
+        else groups.push({ start, end });
+    }
+    if (groups.length === 0) return items;
+
+    // Overlapping pairs form one group: hoisting into an earlier pair would create a new trap.
     const hoistBefore = new Array<number | null>(n).fill(null);
     let anyTrapped = false;
+    let groupIndex = 0;
     for (let p = 0; p < n; p++) {
         const t = items[p].type;
         if (isCall(t) || isOutput(t)) continue;
-        let target = -1;
-        for (const [id, c] of callPos) {
-            const o = outPos.get(id);
-            if (o === undefined || !(c < p && o > p)) continue;
-            if (target === -1 || c < target) target = c;
-        }
-        if (target >= 0) {
-            hoistBefore[p] = target;
+        while (groupIndex < groups.length && groups[groupIndex].end <= p) groupIndex++;
+        const group = groups[groupIndex];
+        if (group && group.start < p) {
+            hoistBefore[p] = group.start;
             anyTrapped = true;
         }
     }
@@ -73,7 +79,7 @@ export function hoistTrappedToolItems<T extends ToolPairItem>(items: T[]): T[] {
     for (let p = 0; p < n; p++) {
         if (hoistBefore[p] !== null) continue;
         const batch = pendingByTarget.get(p);
-        if (batch) result.push(...batch);
+        if (batch) for (const item of batch) result.push(item);
         result.push(items[p]);
     }
     return result;

@@ -53,19 +53,26 @@ test("ingest verify ignores messageRefs key-order divergence (#4986)", async () 
         try {
             const session = loadCorpusCase(seed, "folded", "corpus-folded", "anthropic");
 
-            // Precondition: the corpus exhibits the divergent shape — the
-            // row order (byRaw key order, what finishPlan stores as ord)
-            // projects byRef to a DIFFERENT key sequence than the live map's
-            // own key order. Without this the test would pass vacuously.
+            // Precondition: the test needs the divergent shape — the row
+            // order (byRaw key order, what finishPlan stores as ord) projects
+            // byRef to a DIFFERENT key sequence than the live map's own key
+            // order. Without it the test would pass vacuously.
+            // #5608-D: cold load no longer renumbers (alignment defers to the
+            // next post-fold save), so the historical trigger of the
+            // divergence is gone and the divergent in-memory order is built
+            // explicitly instead: identical content, reversed key insertion.
             const byRaw = session.state.messageRefs.byRaw;
             const byRef = session.state.messageRefs.byRef;
             const rowOrderProjectedRefs = Object.keys(byRaw)
                 .map((rawId) => byRaw[rawId])
                 .filter((ref) => ref !== "BLOCKED" && byRef[ref] !== undefined);
+            const reversedByRef: Record<string, string> = {};
+            for (const ref of Object.keys(byRef).reverse()) reversedByRef[ref] = byRef[ref];
+            session.state.messageRefs.byRef = reversedByRef;
             assert.notEqual(
-                Object.keys(byRef).join("\u0000"),
+                Object.keys(reversedByRef).join("\u0000"),
                 rowOrderProjectedRefs.join("\u0000"),
-                "folded corpus must carry byRef key order != stored refs-row order",
+                "in-memory byRef key order must != stored refs-row order",
             );
 
             const store = new SessionStore({ dir, debounceMs: 1, enabled: true });

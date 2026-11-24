@@ -363,7 +363,7 @@ test("sessions warm/resident budgets: file tier + env precedence (#2803)", () =>
     // #3050 R3 ②-0: warm set is off by default (lazy first touch) — set warmMax to opt back in
     assert.equal(knobs.sessionWarmMax(), 0);
     assert.equal(knobs.sessionWarmMaxBytes(), 64 * 1024 * 1024);
-    assert.equal(knobs.sessionResidentMaxBytes(), 512 * 1024 * 1024);
+    assert.equal(knobs.sessionResidentMaxBytes(), 4 * 1024 * 1024 * 1024);
 
     setConfig({ sessions: { warmMax: 3, warmMaxBytes: 123456, residentMaxBytes: 777 } });
     assert.equal(knobs.sessionWarmMax(), 3);
@@ -380,7 +380,7 @@ test("sessions warm/resident budgets: file tier + env precedence (#2803)", () =>
     setConfig({ sessions: { warmMax: -2, warmMaxBytes: "big", residentMaxBytes: -1 } });
     assert.equal(knobs.sessionWarmMax(), 0);
     assert.equal(knobs.sessionWarmMaxBytes(), 64 * 1024 * 1024);
-    assert.equal(knobs.sessionResidentMaxBytes(), 512 * 1024 * 1024);
+    assert.equal(knobs.sessionResidentMaxBytes(), 4 * 1024 * 1024 * 1024);
 
     withEnv({ BILI_SESSION_WARM_MAX: "5", BILI_SESSION_WARM_MAX_BYTES: "999", BILI_SESSION_RESIDENT_MAX_BYTES: "42" }, () => {
         assert.equal(knobs.sessionWarmMax(), 5);

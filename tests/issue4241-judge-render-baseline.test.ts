@@ -249,13 +249,16 @@ test("#4241: render turn with a host-side history edit — judge reconciles agai
                 assert.ok(v.ok, `main-lane verdict must be clean on a render turn: ${JSON.stringify(v.violations[0])}`);
             }
 
-            // teeth: same shape, but the outbound DROPS the last client tail
-            // row (exitCores.length - 2: the engine appends its trailing nudge
-            // as the final wire message, so the last tail row sits one before
-            // it) — the part the render lane owns byte-intact. The rendered
-            // PREFIX is exempt by design (#4241: cross-turn prefix stability
-            // is seamLcp's/shadow's job); the tail drop must fire.
-            _setInvariantJudgeFaultForTest((exitCores: CoreMessage[]) => exitCores.filter((_, i) => i !== exitCores.length - 2));
+            // teeth: same shape, but the outbound DROPS the client's newest
+            // tail row (the TAIL_B message this turn just sent) — the part the
+            // render lane owns byte-intact: entry[rts..] is byte-promised, the
+            // rendered PREFIX is exempt by design (#4241: cross-turn prefix
+            // stability is seamLcp's/shadow's job); the tail drop must fire.
+            // Locate the row BY CONTENT, not by wire position: since #5772 the
+            // render covers the previous turn's tail too (tailStart advanced),
+            // so a hardcoded "length - 2" can land inside the exempt prefix
+            // (or on an appended nudge) and the teeth would never fire.
+            _setInvariantJudgeFaultForTest((exitCores: CoreMessage[]) => exitCores.filter((c) => !String((c as { text?: string; content?: unknown }).text ?? (c as { content?: unknown }).content ?? "").includes("TAIL_B_")));
             verdicts.length = 0;
             const r3 = await turn(h, [...full2, { role: "user", content: "And one more. " + "TAIL_B_".repeat(80) }], label, null);
             assert.equal(r3.status, 200, r3.body);

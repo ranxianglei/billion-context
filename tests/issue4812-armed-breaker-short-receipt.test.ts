@@ -62,7 +62,7 @@ function validArgs(startId: string, endId: string) {
     return JSON.parse(JSON.stringify({ content: [{ startId, endId, summary: SUMMARY }] }));
 }
 
-test("#4812: parse-failure receipts collapse to a short refusal once the breaker climbs past the arm moment", () => {
+test("#4812: parse-failure receipts collapse per-repeat once the breaker climbs past the arm moment", () => {
     const ctx = makeCtx(fixtureMessages());
 
     const f1 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
@@ -70,13 +70,20 @@ test("#4812: parse-failure receipts collapse to a short refusal once the breaker
     assert.match(f1, /compress takes ONE 'content' STRING/, "failure 1 carries the full format lecture");
     assert.ok(!f1.includes("CIRCUIT BREAKER"), "failure 1 not armed");
 
+    // 2nd identical parse failure: the one-liner replaces the lecture — the
+    // field loop stacked a 200-word receipt per retry; one counter, stated
+    // once, pointing back at the FIRST receipt that still teaches.
     const f2 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
-    assert.match(f2, /compress takes ONE 'content' STRING/, "failure 2 still carries the lecture");
+    assert.ok(f2.startsWith("[Compression FAILED again"), `failure 2 collapses to the one-liner (got: ${f2.slice(0, 120)})`);
+    assert.match(f2, /2 time\(s\)/, "one-liner carries the repeat count");
+    assert.doesNotMatch(f2, /compress takes ONE 'content' STRING/, "no repeated lecture on repeats");
     assert.ok(!f2.includes("CIRCUIT BREAKER"), "failure 2 not armed");
 
     const f3 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
-    assert.match(f3, /COMPRESS CIRCUIT BREAKER: 3 consecutive/, "arm moment keeps its verbatim paragraph");
-    assert.match(f3, /compress takes ONE 'content' STRING/, "arm-moment receipt keeps the full lecture (unchanged)");
+    assert.ok(f3.startsWith("[Compression FAILED again"), `failure 3 stays on the one-liner (got: ${f3.slice(0, 120)})`);
+    assert.match(f3, /3 time\(s\)/, "count keeps climbing on the one-liner");
+    assert.match(f3, /COMPRESS CIRCUIT BREAKER: 3 consecutive/, "arm-moment paragraph rides the one-liner verbatim");
+    assert.doesNotMatch(f3, /compress takes ONE 'content' STRING/, "arm-moment receipt no longer repeats the lecture");
 
     const f4 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
     assert.ok(f4.startsWith("[Compression refused:"), `failure 4 collapses (got: ${f4.slice(0, 120)})`);
@@ -84,8 +91,10 @@ test("#4812: parse-failure receipts collapse to a short refusal once the breaker
     assert.doesNotMatch(f4, /compress takes ONE 'content' STRING/, "no full lecture past the arm moment");
     assert.doesNotMatch(f4, /COMPRESS CIRCUIT BREAKER: 4 consecutive/, "no repeated verbatim paragraph either");
     assert.doesNotMatch(f4, /acp_status/, "no contradictory order beside the loop-noise stop (#2360)");
-    assert.match(f4, /\{startId, endId, summary\}/, "keeps a one-line format reminder");
-    assert.match(f4, /disarms on one successful fold or 10 minutes/, "states the disarm conditions");
+    assert.match(f4, /'content' is ONE string holding every range/, "keeps a one-line format reminder");
+    assert.doesNotMatch(f4, /\{startId, endId, summary\}/, "reminder no longer teaches the retired JSON-array shape (2026-11-23 single-format narrowing)");
+    assert.doesNotMatch(f4, /must be a non-empty array/, "reminder no longer teaches the retired raw-array shape");
+    assert.match(f4, /disarms on one substantial fold \(a trivial one that saves almost nothing does not count\) or 10 minutes/, "states the disarm conditions (#7300: a trivial fold does not count)");
     assert.ok(f4.length < 700, `short refusal stays small (got ${f4.length} chars)`);
 
     const f5 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;

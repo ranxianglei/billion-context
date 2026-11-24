@@ -227,7 +227,7 @@ os.environ.pop("BILI_CONFIG_FILE", None)
 for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES",
           "BILLION_CONTEXT_PLUGIN", "BILI_PROVIDER_REWRITES",
           "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
-          "ALL_PROXY", "all_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE"):
+          "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE"):
     os.environ.pop(k, None)
 
 RECORDED = {"tool": [], "runtime_info": [], "watcher": [], "health": [], "status": []}
@@ -368,6 +368,34 @@ def install_sidecar(bad):
     with open(os.path.join(PLUGIN_DIR, "bili.json"), "w") as f:
         json.dump({"proxyScript": script, "nodePath": os.environ["BC_NODE"]}, f)
 
+def write_dist(base_dir):
+    d = os.path.join(base_dir, "billion-context", "dist")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "index.js")
+    with open(p, "w") as f:
+        f.write("// dummy bili dist entry point\n")
+    os.chmod(p, 0o755)  # npm chmods the bin it links onto; \`bili\` must be executable on PATH
+    return p
+
+def stub_bili(bin_dir, target):
+    p = os.path.join(bin_dir, "bili")
+    if os.path.exists(p):
+        os.remove(p)
+    os.symlink(target, p)
+    return p
+
+def clean_node_bin():
+    # A bin dir holding ONLY a node shim. The "no bili anywhere" assertions must hold against a
+    # PATH that has node but no bili; the node's own bin dir is NOT safe for that, because a real
+    # global install puts its \`bili\` symlink next to \`node\` on the standard npm layout.
+    d = os.path.join(BASE, "cleanbin")
+    os.makedirs(d, exist_ok=True)
+    node = os.path.join(d, "node")
+    if os.path.lexists(node):
+        os.remove(node)
+    os.symlink(os.environ["BC_NODE"], node)
+    return d
+
 # --- #2905 instance-record fixtures (identity fields discovery now checks) ---
 
 def fp_of(bad):
@@ -499,7 +527,45 @@ elif SCENARIO.startswith("gate-"):
     os.environ[envvar] = "http://127.0.0.1:1" if envvar == "BILLION_CONTEXT_PROXY" else "0"
     mod.register(ctx)
 elif SCENARIO == "no-sidecar":
+    # Hermetic: a \`bili\` on the machine's own PATH must not turn "no dist anywhere" into a
+    # resolution — the ladder's last rung is asserted against a PATH that holds node only.
+    # clean_node_bin(), not the node's own dir: a real global install sits next to node there.
+    os.environ["PATH"] = clean_node_bin()
     mod.register(ctx)
+elif SCENARIO == "load-sidecar":
+    # #6672: the sidecar resolution ladder, first hit wins and nothing is ever written.
+    before = sorted(os.listdir(PLUGIN_DIR))
+    res = {}
+    install_sidecar(False)
+    res["sidecar"] = mod.load_sidecar()
+    os.remove(os.path.join(PLUGIN_DIR, "bili.json"))
+    global_dist = write_dist(os.path.join(BASE, "global"))
+    write_dist(os.path.join(PLUGIN_DIR, "node_modules"))
+    res["bundled"] = mod.load_sidecar()
+    shutil.rmtree(os.path.join(PLUGIN_DIR, "node_modules"))
+    if os.name == "nt":
+        res["path"] = res["path_wrapper"] = res["none"] = "skip"
+    else:
+        bin_dir = os.path.join(BASE, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        # node_dir must hold node but NO bili: clean_node_bin(), not the node's own bin dir,
+        # which on a standard install also carries the real global \`bili\` symlink.
+        node_dir = clean_node_bin()
+        wrapper = os.path.join(BASE, "wrapper.sh")
+        with open(wrapper, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(wrapper, 0o755)
+        stub_bili(bin_dir, global_dist)
+        os.environ["PATH"] = bin_dir + os.pathsep + node_dir
+        res["path"] = mod.load_sidecar()
+        # A shell wrapper is not the dist: the realpath+.js guard falls through to inert.
+        stub_bili(bin_dir, wrapper)
+        res["path_wrapper"] = mod.load_sidecar()
+        os.remove(os.path.join(bin_dir, "bili"))
+        os.environ["PATH"] = node_dir
+        res["none"] = mod.load_sidecar()
+    out["sidecar_resolution"] = res
+    out["plugin_dir_unchanged"] = sorted(os.listdir(PLUGIN_DIR)) == before
 elif SCENARIO == "spawn-fail":
     install_sidecar(True)
     mod.register(ctx)
@@ -568,6 +634,9 @@ elif SCENARIO == "slow-boot-fail":
 elif SCENARIO == "slow-boot-unload":
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    # #5991 negative direction: the host's own proxy must survive an unload that lands BEFORE
+    # routing ever happened — the _shutdown env gate must stay a no-op, not wipe pre-existing keys.
+    os.environ["HTTPS_PROXY"] = "http://user-proxy.example:9999"
     mod.REGISTER_WAIT_S = 0.2
     mod.BOOTSTRAP_BUDGET_S = 5.0
     SLOW["enabled"] = True
@@ -742,6 +811,16 @@ elif SCENARIO.startswith("attach"):
         no_session_result = ctx.tools.get("compress", {}).get("handler")({}, task_id="t1")
         # #2072 negative leg: the model-transcribed conversation_id channel stays UNFLAGGED
         transcribed_result = ctx.tools.get("compress", {}).get("handler")({"conversation_id": "transcribed-9"}, task_id="t2")
+        # #7514: the pre_tool_call hook smuggles the host's tool_call_id into the dispatch args for
+        # our tools only; the handler strips it into the top-level toolCallId slot.
+        pre_hook = ctx.hooks.get("pre_tool_call")
+        hook_ours = pre_hook(tool_name="compress", args={"startId": "m00001", "endId": "m00010"}, tool_call_id="call-abc-123")
+        hook_foreign = pre_hook(tool_name="terminal", args={"command": "ls"}, tool_call_id="call-abc-123")
+        hook_noid = pre_hook(tool_name="compress", args={}, tool_call_id="")
+        # the host shallow-merges the hook's args into the dispatch args (hermes_cli/plugins.py)
+        merged = {"startId": "m00001", "endId": "m00010"}
+        merged.update((hook_ours or {}).get("args") or {})
+        id_result = ctx.tools.get("compress", {}).get("handler")(merged, session_id="sess-1", task_id="t3")
         out.update({
             "round1_none": round1 is None,
             "req_unmutated": req == frozen,
@@ -755,6 +834,10 @@ elif SCENARIO.startswith("attach"):
             "tool_result": tool_result,
             "no_session_result": no_session_result,
             "transcribed_result": transcribed_result,
+            "pre_hook_ours": hook_ours,
+            "pre_hook_foreign": hook_foreign,
+            "pre_hook_noid": hook_noid,
+            "id_result": id_result,
         })
 elif SCENARIO == "defer-fallback":
     # Hermes registers the ACP tools natively but its tool_search layer DEFERS the toolset, so the
@@ -819,7 +902,7 @@ elif SCENARIO.startswith("mitm-"):
     os.makedirs(libdir, exist_ok=True)
     with open(os.path.join(libdir, "_bcminiyaml.py"), "w") as f:
         f.write(MINI_YAML_PARSER)
-    if kind in ("pyyaml", "parse"):
+    if kind in ("pyyaml", "parse", "top-level"):
         with open(os.path.join(libdir, "yaml.py"), "w") as f:
             f.write(YAML_STUB_SRC)
     if kind == "ruamel":
@@ -834,17 +917,47 @@ elif SCENARIO.startswith("mitm-"):
     if kind == "none":
         sys.modules["ruamel"] = None  # block the host's ruamel too — nothing may resolve on any host
     sys.path.insert(0, libdir)
-    cfg_text = (
-        "providers:\n"
-        "  openrouter:\n"
-        "    base_url: https://openrouter.ai/api/v1\n"
-        "  legacy:\n"
-        "    url: https://legacy.example.com/v1\n"
-    ) if kind != "parse" else "providers:\n  broken line without any colon\n"
-    with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
-        f.write(cfg_text)
+    if kind == "top-level":
+        # #6022: documented stock shape — top-level base_url next to provider:, no providers map.
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(
+                "provider: nous\n"
+                "base_url: https://inference-api.example.com/v1\n"
+            )
+        out["tl_domains"] = mod.mitm_domains_from_config()
+        out["tl_pbu"] = {
+            "active": mod._provider_base_url("nous"),
+            "unnamed": mod._provider_base_url(None),
+            "other": mod._provider_base_url("other"),
+        }
+        # Mixed shape: per-provider entries win for their own name; top-level answers active/unnamed only.
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(
+                "provider: alpha\n"
+                "providers:\n"
+                "  beta:\n"
+                "    base_url: https://beta.example.com/v1\n"
+                "base_url: https://alpha.example.com/v1\n"
+            )
+        out["mix_domains"] = mod.mitm_domains_from_config()
+        out["mix_pbu"] = {
+            "active": mod._provider_base_url("alpha"),
+            "named": mod._provider_base_url("beta"),
+            "missing": mod._provider_base_url("missing"),
+            "unnamed": mod._provider_base_url(None),
+        }
+    else:
+        cfg_text = (
+            "providers:\n"
+            "  openrouter:\n"
+            "    base_url: https://openrouter.ai/api/v1\n"
+            "  legacy:\n"
+            "    url: https://legacy.example.com/v1\n"
+        ) if kind != "parse" else "providers:\n  broken line without any colon\n"
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(cfg_text)
+        out["mitm_domains"] = mod.mitm_domains_from_config()
     out["mitm_kind"] = kind
-    out["mitm_domains"] = mod.mitm_domains_from_config()
     out["mitm_warnings"] = list(WARNINGS)
 elif SCENARIO == "retry-recover":
     # #4644: attempt 1 hits a still-booting proxy; the backoff retry lands when it comes up.
@@ -906,17 +1019,21 @@ elif SCENARIO == "origin-death":
         ready.wait(10)
     out["death_initial_ready"] = (mod._state.get("bootstrap") or {}).get("state")
     out["death_env_routed"] = os.environ.get("HTTPS_PROXY")
+    out["death_http_routed"] = os.environ.get("HTTP_PROXY")
     SLOW["enabled"] = True
     def release_later():
         __import__("time").sleep(1.5)
         SLOW["release"].set()
     threading.Thread(target=release_later, daemon=True).start()
     gap_values = []
+    http_gap = []
     saw_gap = False
     end = __import__("time").monotonic() + 20
     while __import__("time").monotonic() < end:
         v = os.environ.get("HTTPS_PROXY")
         gap_values.append(v)
+        if v != ORIGIN:
+            http_gap.append(os.environ.get("HTTP_PROXY"))
         if v != ORIGIN:
             saw_gap = True
         rec = mod._state.get("bootstrap") or {}
@@ -927,6 +1044,8 @@ elif SCENARIO == "origin-death":
     rec = mod._state.get("bootstrap") or {}
     out["death_final_state"] = rec.get("state")
     out["death_final_env"] = os.environ.get("HTTPS_PROXY")
+    out["death_http_gap"] = list(dict.fromkeys(http_gap))
+    out["death_final_http"] = os.environ.get("HTTP_PROXY")
     out["death_tools"] = sorted(ctx.tools.keys())
     out["death_register_calls"] = sum(ctx.reg_counts.values())
     out["death_warnings"] = [w for w in WARNINGS if "is gone" in w]
@@ -1057,6 +1176,24 @@ elif SCENARIO == "registry-find":
           "zzz-own": {"origin": ORIGIN, "pid": 4242, "instanceId": "zzz-own", "startedAt": 999}})
     out["rf_dup_pid"] = (mod._find_spawned_in_registry(4242) or {}).get("instance_id")
     out["rf_none"] = mod._find_spawned_in_registry(None)
+elif SCENARIO == "ready-unload":
+    # #5991: env is routed to the live origin while ready, then the host unloads mid-session —
+    # the process-global routing must be restored (or dropped), not left pointing at a port the
+    # plugin no longer serves; a leftover HTTPS_PROXY breaks every LLM call in the process.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
+    os.makedirs(ca_dir, exist_ok=True)
+    with open(os.path.join(ca_dir, "root-ca.pem"), "w") as f:
+        f.write("dummy-ca\n")
+    with open(os.path.join(ca_dir, "combined-ca.pem"), "w") as f:
+        f.write("dummy-combined-ca\n")
+    user_proxy = "http://user-proxy.example:9999"   # pre-existing host routing — must survive unload
+    os.environ["HTTPS_PROXY"] = user_proxy
+    os.environ["https_proxy"] = user_proxy
+    mod.register(ctx)
+    out["env_routed"] = os.environ.get("HTTPS_PROXY") == ORIGIN
+    ctx.run_unload()
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -1068,6 +1205,9 @@ out.update({
     "pid": os.getpid(),
     "env_https_proxy": os.environ.get("HTTPS_PROXY"),
     "env_https_proxy_lc": os.environ.get("https_proxy"),
+    "env_http_proxy": os.environ.get("HTTP_PROXY"),
+    "env_http_proxy_lc": os.environ.get("http_proxy"),
+    "env_no_proxy": os.environ.get("NO_PROXY"),
     "env_ca_bundle": os.environ.get("HERMES_CA_BUNDLE"),
     "env_ssl_cert_file": os.environ.get("SSL_CERT_FILE"),
     "marker_left": os.path.exists(os.path.join(os.environ["XDG_STATE_HOME"], "billion-context", "proxy-starting")),
@@ -1096,6 +1236,9 @@ interface DriverOut {
     hooks: string[];
     env_https_proxy?: string | null;
     env_https_proxy_lc?: string | null;
+    env_http_proxy?: string | null;
+    env_http_proxy_lc?: string | null;
+    env_no_proxy?: string | null;
     env_ca_bundle?: string | null;
     env_ssl_cert_file?: string | null;
     marker_left?: boolean;
@@ -1118,9 +1261,17 @@ interface DriverOut {
     tool_result?: string;
     no_session_result?: string;
     transcribed_result?: string;
+    pre_hook_ours?: { action?: string; args?: Record<string, unknown> } | null;
+    pre_hook_foreign?: unknown;
+    pre_hook_noid?: unknown;
+    id_result?: string;
     mitm_kind?: string;
     mitm_domains?: string[];
     mitm_warnings?: string[];
+    tl_domains?: string[];
+    tl_pbu?: Record<string, string | null>;
+    mix_domains?: string[];
+    mix_pbu?: Record<string, string | null>;
     commands?: Record<string, string>;
     tools_after_reenable?: string[];
     state_after_reenable?: string;
@@ -1166,6 +1317,7 @@ interface DriverOut {
     env_after_unload?: string | null;
     mw_after_unload_none?: boolean;
     acp_after_unload?: string | null;
+    env_routed?: boolean;
     register_calls?: number;
     retry_state?: string;
     retry_attempt?: number;
@@ -1183,6 +1335,9 @@ interface DriverOut {
     death_gap_values?: Array<string | null>;
     death_final_state?: string;
     death_final_env?: string | null;
+    death_http_routed?: string | null;
+    death_http_gap?: Array<string | null>;
+    death_final_http?: string | null;
     death_tools?: string[];
     death_register_calls?: number;
     death_warnings?: string[];
@@ -1201,6 +1356,8 @@ interface DriverOut {
     rf_dead?: unknown;
     rf_dup_pid?: string | null;
     rf_none?: unknown;
+    sidecar_resolution?: Record<string, { script: string; node: string } | null | string>;
+    plugin_dir_unchanged?: boolean;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -1232,7 +1389,7 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
         assert.deepEqual(out!.toolsets, ["billion-context"]);
         assert.deepEqual(out!.middlewares, ["llm_request"]);
-        assert.deepEqual(out!.hooks, ["pre_api_request"]);
+        assert.deepEqual(out!.hooks, ["pre_api_request", "pre_tool_call"]);
         assert.deepEqual(out!.commands, {
             acp: "Show bili context-compression status for this session",
             "acp-cache": "Prompt-cache reconciliation (same report as the acp_cache tool)",
@@ -1241,6 +1398,9 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.req_unmutated, true);
         assert.equal(out!.env_https_proxy, out!.origin);
         assert.equal(out!.env_https_proxy_lc, out!.origin);
+        assert.equal(out!.env_http_proxy, out!.origin, "a plain-http provider base_url is routed too");
+        assert.equal(out!.env_http_proxy_lc, out!.origin);
+        assert.equal(out!.env_no_proxy, "127.0.0.1,localhost,::1", "loopback stays direct");
         assert.match(out!.env_ca_bundle!, /root-ca\.pem$/);
         assert.match(out!.env_ssl_cert_file!, /combined-ca\.pem$/, "#1375: ambient trust rides the combined bundle");
         const h1 = out!.first_headers!;
@@ -1274,8 +1434,18 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tool_calls, [
             { conversationId: "sess-1", tool: "compress", args: {}, nativeCaller: true },
             { conversationId: "transcribed-9", tool: "compress", args: { conversation_id: "transcribed-9" } },
+            // #7514: the smuggled key never rides the model-visible args; the real id lands in
+            // the top-level toolCallId slot (the first two calls stay UNFLAGGED — no id, no key).
+            { conversationId: "sess-1", tool: "compress", args: { startId: "m00001", endId: "m00010" }, nativeCaller: true, toolCallId: "call-abc-123" },
         ]);
         assert.equal(out!.transcribed_result, "compressed 3 blocks");
+        // #7514: the pre_tool_call hook smuggles the host's tool_call_id into the dispatch args
+        // for our tools only — a foreign tool and an empty id get nothing (fail closed).
+        assert.deepEqual(out!.pre_hook_ours, { action: "modify", args: { _tool_call_id: "call-abc-123" } },
+            "our tool + a call id -> modify directive carrying the smuggle key");
+        assert.equal(out!.pre_hook_foreign, null, "a foreign tool never gets the smuggle key");
+        assert.equal(out!.pre_hook_noid, null, "no call id -> no smuggle");
+        assert.equal(out!.id_result, "compressed 3 blocks");
         assert.deepEqual(out!.runtime_info, [{ agent: "hermes", model: "test-model", maxOutput: 4096, source: "hermes-native" }]);
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.
@@ -1593,6 +1763,38 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.env_https_proxy, null);
     });
 
+    test("no sidecar: resolves the dist from a host-managed copy, then from `bili` on PATH (#6672)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("load-sidecar");
+        assert.ok(out, err);
+        const res = out!.sidecar_resolution!;
+        const scriptOf = (v: unknown): string | null => (v && typeof v === "object" ? (v as { script: string }).script : null);
+        // 1. the installer's sidecar still wins untouched
+        assert.match(scriptOf(res.sidecar)!, /[/\\]proxy\.js$/, "bili.json stays the first hit");
+        // 2. a host-managed copy in the plugin's own node_modules
+        assert.match(
+            scriptOf(res.bundled)!,
+            /[/\\]node_modules[/\\]billion-context[/\\]dist[/\\]index\.js$/,
+            "no sidecar: the plugin resolves the dist its own npm install put there",
+        );
+        if (process.platform !== "win32") {
+            // 3. the global install, reached through `bili` on PATH (realpath onto dist/index.js)
+            assert.match(
+                scriptOf(res.path)!,
+                /[/\\]global[/\\]billion-context[/\\]dist[/\\]index\.js$/,
+                "no sidecar, no local copy: the reference lane's global dist is resolved off PATH",
+            );
+            // 3b. a shell wrapper named bili is not the dist — the realpath+.js guard keeps it inert
+            assert.equal(res.path_wrapper, null, "a non-.js entry point falls through instead of spawning it");
+            // 4. nothing anywhere is still inert
+            assert.equal(res.none, null);
+        }
+        assert.equal(out!.plugin_dir_unchanged, true, "resolution is read-only: no sidecar is ever written");
+    });
+
     test("spawn failure: child dies -> inert, env untouched, starting marker cleaned up", () => {
         if (!PY) {
             console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
@@ -1684,6 +1886,10 @@ describe("python plugin runtime (subprocess)", () => {
         assert.ok(out, err);
         assert.equal(out!.death_initial_ready, "ready");
         assert.equal(out!.death_env_routed, out!.origin);
+        assert.equal(out!.death_http_routed, out!.origin);
+        assert.ok(out!.death_http_gap!.length > 0 && !out!.death_http_gap!.includes(out!.origin),
+            "HTTP_PROXY is unrouted with the HTTPS pair, not left pointing at the dead origin");
+        assert.equal(out!.death_final_http, out!.origin);
         assert.ok(out!.death_gap_values!.includes("http://user-proxy.example:9999"),
             "the unroute RESTORED the pre-existing user proxy instead of deleting the key");
         assert.equal(out!.death_final_state, "ready", "the watchdog re-bootstrapped a healthy origin");
@@ -1722,7 +1928,8 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_after_unload, [], "no register_tool after unload — the host would drop it anyway");
         assert.equal(out!.unload_thread_alive, false, "the bootstrap thread exits on the stop event");
         assert.equal(out!.state_after_unload, "stopped");
-        assert.equal(out!.env_after_unload, null);
+        assert.equal(out!.env_after_unload, "http://user-proxy.example:9999",
+            "the host's own proxy survives an unload that never routed (#5991)");
         assert.equal(out!.mw_after_unload_none, true);
         assert.match(out!.acp_after_unload!, /plugin unloaded/);
     });
@@ -1736,6 +1943,18 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.state_after_reenable, "ready");
         assert.equal(out!.env_after_reenable, out!.origin, "traffic is routed again");
         assert.equal(out!.origin_after_reenable, out!.origin);
+    });
+
+    test("unload with routed env: the process-global proxy is restored to the host's own values (#5991)", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("ready-unload");
+        assert.ok(out, err);
+        assert.equal(out!.env_routed, true, "register() routed traffic through the origin first");
+        assert.equal(out!.env_https_proxy, "http://user-proxy.example:9999",
+            "the host's own proxy is restored verbatim, not left at the plugin's origin port");
+        assert.equal(out!.env_https_proxy_lc, "http://user-proxy.example:9999");
+        assert.equal(out!.env_ca_bundle, null, "a key we added is dropped, not left pointing into our CA dir");
+        assert.equal(out!.env_ssl_cert_file, null);
     });
 });
 
@@ -1869,5 +2088,30 @@ describe("MITM-domain discovery (#2838)", () => {
         assert.equal(out!.mitm_warnings?.length, 1, "exactly one warning");
         assert.match(out!.mitm_warnings![0], /could not parse/);
         assert.match(out!.mitm_warnings![0], /blind-tunnel/);
+    });
+
+    // #6022: the documented stock shape is a top-level base_url next to provider: (no providers map) —
+    // it must be discovered, and _provider_base_url must answer it for the active/unnamed provider only.
+    test("top-level base_url: whitelisted AND scoped to the active provider", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("mitm-top-level");
+        assert.ok(out, err);
+        assert.deepEqual(out!.tl_domains, ["inference-api.example.com"]);
+        assert.deepEqual(out!.tl_pbu, {
+            active: "https://inference-api.example.com/v1",
+            unnamed: "https://inference-api.example.com/v1",
+            other: null,
+        });
+        assert.deepEqual(out!.mix_domains, ["beta.example.com", "alpha.example.com"]);
+        assert.deepEqual(out!.mix_pbu, {
+            active: "https://alpha.example.com/v1",
+            named: "https://beta.example.com/v1",
+            missing: null,
+            unnamed: "https://alpha.example.com/v1",
+        });
+        assert.deepEqual(out!.mitm_warnings, [], "happy path must not warn");
     });
 });

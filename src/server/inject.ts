@@ -1,13 +1,38 @@
 import type { Config, PackSurface, Prompts, ToolPrompts } from "acp-kernel";
-import { applyAcpToolOverrides, defaultPrompts } from "acp-kernel";
+import { applyAcpToolOverrides, buildBlockOpsSystemPrompt, defaultPrompts } from "acp-kernel";
 import type { ProxyOptions } from "../config.js";
 import { type AnthropicRequestBody, type GoogleFunctionDeclaration, type GoogleTool, type OpenAITool } from "acp-kernel/wire";
 import { appendSystemText } from "../util.js";
 import { absorbEnabled, absorbToolName } from "../absorb.js";
-import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, packOwnsDescription, ptcNoteMode, withAcpNotes, withAcpNotesOpenAI, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { blockOpsEnabled } from "../acp-block-ops.js";
+import { PROXY_TOOL_NAMES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, packOwnsDescription, ptcNoteMode, withAcpNotes, withAcpNotesOpenAI, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections, withExternalSummaryTools } from "../external-summary-surface.js";
 import { forceTextProtocol as knobForceTextProtocol, renderNone as knobRenderNone } from "../knobs.js";
 import { GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
+
+export const CODEX_EXEC_EXEMPT_NOTE = " This proxy-provided tool has no functions.exec SDK binding: call it DIRECTLY as a normal tool call using its declared name and namespace. Do not invoke it through tools.* inside functions.exec; the proxy executes the direct call server-side.";
+
+// Hint detection must not widen the shared omnibus reachability gate (#5592).
+function hasCodexExec(tools: readonly unknown[], namespace = ""): boolean {
+    for (const value of tools) {
+        if (value === null || typeof value !== "object") continue;
+        const tool = value as { type?: unknown; name?: unknown; tools?: unknown };
+        const name = typeof tool.name === "string" ? tool.name : "";
+        const qualifiedName = namespace ? `${namespace}.${name}` : name;
+        if ((tool.type === "custom" || tool.type === "function") && qualifiedName === "functions.exec") return true;
+        if (!Array.isArray(tool.tools)) continue;
+        if (tool.type === "namespace" && name && hasCodexExec(tool.tools, qualifiedName)) return true;
+        if (tool.type === "additional_tools" && hasCodexExec(tool.tools, namespace)) return true;
+    }
+    return false;
+}
+
+function withCodexExecNotes<T extends { name?: string; description?: string }>(tools: readonly T[], skip: ReadonlySet<string>): T[] {
+    return tools.map((tool) => typeof tool.name === "string" && PROXY_TOOL_NAMES.has(tool.name)
+        && !skip.has(tool.name) && typeof tool.description === "string"
+        ? { ...tool, description: tool.description + CODEX_EXEC_EXEMPT_NOTE }
+        : tool);
+}
 
 export function injectSystem(
     parsed: AnthropicRequestBody,
@@ -26,7 +51,7 @@ export function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const parts: string[] = [];
     let acpStandingPushed = false;
-    if (opts.compress.injectTool && !suppressCompressPrompt) { parts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), mcpDialectNote))); acpStandingPushed = true; }
+    if (opts.compress.injectTool && !suppressCompressPrompt) { parts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), mcpDialectNote, blockOpsEnabled(config)))); acpStandingPushed = true; }
     else if (!knobRenderNone()) {
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
         const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, messageTimestampSections(surface?.promptSections));
@@ -36,6 +61,9 @@ export function injectSystem(
     // byte-stable once detected; never on a view that carries no ACP surface.
     if (generationBoundaryActive && acpStandingPushed) parts.push(GENERATION_BOUNDARY_NOTE);
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
+    // #5765: block-lifecycle tools ride as a separate appended section only
+    // when enabled (default off) — byte-stable like the absorb section.
+    if (opts.compress.injectTool && blockOpsEnabled(config)) parts.push(buildBlockOpsSystemPrompt("function"));
     if (parts.length === 0) return parsed.system;
     // #1876: APPEND the prompt as a trailing block (client blocks byte-exact)
     // instead of merging everything into one block via kernel buildSystem.
@@ -118,6 +146,8 @@ export function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: re
     // #920 rule via mergeOwnedTools: bili owns these names (see core above).
     // #3252: exempt note when the client tools are run_code-shaped.
     const mode = ptcNoteMode((tools ?? []).map((t) => (t as { name?: string })?.name));
-    const base = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(toolsToAdd, toolPrompts), externalOn), mode, packOwnsDescription(toolPrompts));
+    const ownedDescriptions = packOwnsDescription(toolPrompts);
+    let base = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(toolsToAdd, toolPrompts), externalOn), mode, ownedDescriptions);
+    if (hasCodexExec(tools ?? [])) base = withCodexExecNotes(base, ownedDescriptions);
     return mergeOwnedTools<unknown>(tools, base, [], (t) => (t as { name?: string })?.name);
 }

@@ -21,12 +21,19 @@ process.env.NODE_ENV = "test";
 // are exercised against the file's own fake servers, exactly like CI.
 const realHome = process.env.HOME;
 const realProxyEnv = process.env.BILLION_CONTEXT_PROXY;
+const realConfigFileEnv = process.env.BILI_CONFIG_FILE;
 process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-"));
 delete process.env.BILLION_CONTEXT_PROXY;
+// #5659: the pi.commands default surface is ["acp", "acp-cache"] — this file also drives
+// /acp-rule registration, so opt the full surface in explicitly.
+process.env.BILI_CONFIG_FILE = path.join(process.env.HOME!, "billion-context.json");
+fs.writeFileSync(process.env.BILI_CONFIG_FILE, JSON.stringify({ pi: { commands: true } }));
 process.on("exit", () => {
     try { fs.rmSync(process.env.HOME!, { recursive: true, force: true }); } catch { /* best effort */ }
     process.env.HOME = realHome;
     if (realProxyEnv !== undefined) process.env.BILLION_CONTEXT_PROXY = realProxyEnv;
+    if (realConfigFileEnv !== undefined) process.env.BILI_CONFIG_FILE = realConfigFileEnv;
+    else delete process.env.BILI_CONFIG_FILE;
 });
 
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus, destinationRoutedThroughProxy } from "../src/agent/shared.ts";
@@ -764,6 +771,7 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         assert.equal(headers["x-bili-plugin"], "pi");
         assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
         assert.equal(headers["x-bili-plugin-context-window"], "1000000");
+        assert.equal(headers["x-bili-plugin-purpose"], "conversation", "#6884: every pi dispatch is a declared main turn (pi has no aux calls)");
         assert.equal(pi.tools.length, 2);
         assert.equal(pi.tools[0]!.name, "compress");
         assert.deepEqual(pi.tools[0]!.parameters, { type: "object", properties: { content: { type: "array" } }, required: ["content"] });
@@ -862,6 +870,7 @@ test("#1214: before_provider_headers awaits tool registration — one-shot (-p) 
         const again: Record<string, string> = {};
         await pi.events.get("before_provider_headers")!({ headers: again }, fakeCtx(proxy));
         assert.equal(again["x-bili-plugin"], "pi");
+        assert.equal(again["x-bili-plugin-purpose"], "conversation", "#6884: one-shot `pi -p` sessions are main turns too");
     } finally {
         await proxy.close();
     }
@@ -878,6 +887,7 @@ test("before_provider_headers stamps after a session_start prewarm too", async (
         await pi.events.get("before_provider_headers")!({ headers: late }, fakeCtx(proxy));
         assert.equal(late["x-bili-plugin"], "pi");
         assert.equal(late["x-bili-plugin-conversation"], "sess-42");
+        assert.equal(late["x-bili-plugin-purpose"], "conversation");
     } finally {
         await proxy.close();
     }
@@ -2198,8 +2208,8 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginRemove("claude"), /not installed/);
 
         const rows = pluginStatusAll();
-        assert.equal(rows.length, 9);
-        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode"]);
+        assert.equal(rows.length, 10);
+        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode", "workbuddy"]);
     });
     rmrf(home);
 });
@@ -2479,7 +2489,7 @@ test("plugin list survives a broken host config (per-row error, no crash)", asyn
     await withEnv(hintEnv(home, piAgentDir), async () => {
         fs.writeFileSync(path.join(home, ".claude.json"), "{ broken json");
         const rows = pluginStatusAll();
-        assert.equal(rows.length, 9);
+        assert.equal(rows.length, 10);
         // #964: claude status never throws — a broken .claude.json just means
         // "MCP face unreadable" (false); the managed block reads settings.json
         // separately, so the row degrades to not-installed instead of error.

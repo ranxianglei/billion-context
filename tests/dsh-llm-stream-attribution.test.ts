@@ -10,7 +10,7 @@
  * loses: retry chains, agentless side-calls, disposed initiator scopes.
  */
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, before } from "node:test";
@@ -25,14 +25,19 @@ import {
     apply,
     forkChildVerdict,
     _resetRegisterForTest,
+    _resetCompactionCoverageNoteForTest,
     _settleNativeForTest,
     _stateBeforeSendForTest,
+    _nativeStateForTest,
+    _resetRoutedForTest,
     _stateHeadersForTest,
     _stateTakeoverGateForTest,
     type PluginContext,
     type ForkChildVerdict,
 } from "../src/agent/dsh-native.ts";
 import { __resetConversationRecallForTests } from "../src/agent/conversation-recall.ts";
+import { installNativeWebSocketIntercept, _resetForTest as resetWsIntercept } from "../src/agent/native-ws-intercept.ts";
+import { WebSocket, WebSocketServer } from "ws";
 
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 
@@ -106,7 +111,7 @@ function runWaterfall(
     return composed(options, () => base()) as AsyncIterable<number>;
 }
 
-async function withSetup(fn: (handle: CtxHandle) => Promise<void>): Promise<void> {
+async function withSetup(fn: (handle: CtxHandle, proxy: MockProxy) => Promise<void>): Promise<void> {
     __resetConversationRecallForTests();
     const home = mkdtempSync(join(tmpdir(), "dsh-llm-stream-"));
     const saved: Record<string, string | undefined> = {};
@@ -121,7 +126,7 @@ async function withSetup(fn: (handle: CtxHandle) => Promise<void>): Promise<void
     try {
         await apply(handle.ctx);
         await waitFor(() => handle.registered.length === 1, "attach tool registration");
-        await fn(handle);
+        await fn(handle, proxy);
     } finally {
         await _settleNativeForTest();
         proxy.server.close();
@@ -165,6 +170,61 @@ async function startMockProxy(): Promise<MockProxy> {
     const port = typeof address === "object" && "port" in address ? address.port : 0;
     return { origin: `http://127.0.0.1:${port}`, server };
 }
+
+test("DSH Codex WS receives scoped plugin identity and reuses the attributed socket", { timeout: 15_000 }, async () => {
+    await withSetup(async (handle, proxy) => {
+        const original = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+        const wss = new WebSocketServer({ noServer: true });
+        const upgrades: import("node:http").IncomingMessage[] = [];
+        const frames: string[] = [];
+        proxy.server.on("upgrade", (req, socket, head) => {
+            upgrades.push(req);
+            wss.handleUpgrade(req, socket, head, peer => {
+                peer.on("message", data => { frames.push(String(data)); peer.send("ack"); });
+            });
+        });
+        let socket: WebSocket | undefined;
+        try {
+            Object.defineProperty(globalThis, "WebSocket", { configurable: true, writable: true, value: WebSocket });
+            installNativeWebSocketIntercept(_nativeStateForTest());
+            const Ctor = globalThis.WebSocket as unknown as new (url: string, options: { headers: Record<string, string> }) => WebSocket;
+            handle.setInitiator(undefined);
+            for (let turn = 0; turn < 2; turn++) {
+                const iterator = runWaterfall(handle.events, { sessionId: "ws-scoped-session" }, async function* () {
+                    if (socket === undefined) {
+                        socket = new Ctor("wss://chatgpt.com/backend-api/codex/responses", { headers: { "session-id": "provider-session" } });
+                        await new Promise<void>((resolve, reject) => {
+                            socket!.addEventListener("open", () => resolve(), { once: true });
+                            socket!.addEventListener("error", reject, { once: true });
+                        });
+                    }
+                    const ack = new Promise<void>((resolve, reject) => {
+                        socket!.addEventListener("message", () => resolve(), { once: true });
+                        socket!.addEventListener("error", reject, { once: true });
+                    });
+                    socket.send(JSON.stringify({ type: "response.create", model: "test-model", input: [{ role: "user", content: `test turn ${turn}` }] }));
+                    await ack;
+                    yield turn;
+                });
+                for await (const value of iterator) assert.equal(value, turn);
+            }
+            assert.equal(upgrades.length, 1);
+            assert.equal(upgrades[0].url, "/bili/https://chatgpt.com/backend-api/codex/responses");
+            assert.equal(upgrades[0].headers["x-bili-plugin"], "dsh");
+            assert.equal(upgrades[0].headers["x-bili-plugin-conversation"], "ws-scoped-session");
+            assert.equal(upgrades[0].headers["session-id"], "provider-session");
+            assert.equal(frames.length, 2);
+        } finally {
+            socket?.close();
+            for (const peer of wss.clients) peer.terminate();
+            await new Promise<void>(resolve => wss.close(() => resolve()));
+            resetWsIntercept();
+            _resetRoutedForTest();
+            if (original !== undefined) Object.defineProperty(globalThis, "WebSocket", original);
+            else Reflect.deleteProperty(globalThis, "WebSocket");
+        }
+    });
+});
 
 function headersOf(init: { headers?: unknown }): Record<string, string> {
     const raw = init.headers;
@@ -341,5 +401,97 @@ test("agentless compaction dispatch (sessionId, no initiator) is attributed", as
         await it.next();
         assert.ok(verdict !== false && verdict !== undefined, "compaction lane is attributed via the request sid");
         assert.equal(stamped["x-bili-plugin-conversation"], "sess-compaction");
+        // #6880: the declared purpose rides its own header on the same dispatch.
+        assert.equal(stamped["x-bili-plugin-purpose"], "compaction");
+    });
+});
+
+test("#6880: the dispatch purpose is captured into the scope and stamped per fetch", async (t) => {
+    await withSetup(async (handle) => {
+        const gate = _stateTakeoverGateForTest();
+        const beforeSend = _stateBeforeSendForTest();
+        const headersFor = _stateHeadersForTest();
+        assert.ok(gate);
+        assert.ok(beforeSend);
+        assert.ok(headersFor);
+        const stamps: Record<string, string>[] = [];
+        const base = async function* (): AsyncIterable<number> {
+            const init: { headers?: Record<string, string> } = { headers: {} };
+            await gate(MODEL_URL, { bytes: 200 }, init);
+            await beforeSend(MODEL_URL, init);
+            stamps.push({ ...(headersFor?.(MODEL_URL) ?? {}), ...headersOf(init) });
+            yield 1;
+        };
+        handle.setInitiator(undefined);
+
+        // 1. declared purpose: stamped verbatim next to the conversation header.
+        {
+            const it = runWaterfall(handle.events, { sessionId: "sess-review", purpose: "auto-review" }, base)[Symbol.asyncIterator]();
+            await it.next();
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-conversation"], "sess-review");
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], "auto-review");
+        }
+        // 2. ordinary conversation leaves purpose unset → the "conversation"
+        //    sentinel is stamped (presence is the v2 declaration; the server
+        //    normalizes the sentinel back to "no declared purpose", so it is
+        //    never a side request).
+        {
+            const it = runWaterfall(handle.events, { sessionId: "sess-main" }, base)[Symbol.asyncIterator]();
+            await it.next();
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-conversation"], "sess-main");
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], "conversation");
+        }
+        // 3. hostile/odd values degrade to the main-turn sentinel — never a
+        //    bad header, never a declared aux purpose.
+        for (const junk of ["", 42, { a: 1 }, "bad\x00control", "a".repeat(65), "has space", "non-ascii-\u00e9"] as unknown[]) {
+            stamps.length = 0;
+            const it = runWaterfall(handle.events, { sessionId: "sess-junk", purpose: junk }, base)[Symbol.asyncIterator]();
+            await it.next();
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], "conversation", `junk purpose ${JSON.stringify(String(junk).slice(0, 20))} degrades to the sentinel, never the raw value`);
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-conversation"], "sess-junk");
+        }
+    });
+});
+
+// #6770: the durable profile note that used to carry the coverage reading stays
+// silent wherever profileContext.startedBundles cannot be read (the observed
+// state on every host we checked), so the reading rides the first routed
+// request instead. This pins the wiring itself — that it fires, and that it
+// fires exactly once per process.
+test("#6770: compaction overlay coverage is logged once on the first routed request", { timeout: 15_000 }, async () => {
+    await withSetup(async (handle) => {
+        const previousState = process.env.XDG_STATE_HOME;
+        const state = mkdtempSync(join(tmpdir(), "dsh-coverage-note-"));
+        process.env.XDG_STATE_HOME = state;
+        const logFile = join(state, "billion-context", "bili.log");
+        const coverageLines = (): number =>
+            existsSync(logFile) ? readFileSync(logFile, "utf8").split("compaction overlay coverage").length - 1 : 0;
+        const gate = _stateTakeoverGateForTest();
+        assert.ok(gate, "takeover gate is installed after apply()");
+        const base = async function* (): AsyncIterable<number> {
+            await gate(MODEL_URL, { bytes: 200 }, { headers: {} });
+            yield 1;
+        };
+        try {
+            _resetCompactionCoverageNoteForTest();
+            handle.setInitiator("sess-coverage");
+            for await (const _chunk of runWaterfall(handle.events, { sessionId: "sess-coverage" }, base)) {
+                /* drain */
+            }
+            assert.equal(coverageLines(), 1, "the first routed request carries the coverage readout");
+            assert.match(
+                readFileSync(logFile, "utf8"),
+                /no preset entry rewritten in this process/,
+                "an untouched overlay reports the lazy-resolution frame, not a bare zero",
+            );
+            for await (const _chunk of runWaterfall(handle.events, { sessionId: "sess-coverage" }, base)) {
+                /* drain */
+            }
+            assert.equal(coverageLines(), 1, "a second routed request must not repeat the reading (once per process)");
+        } finally {
+            if (previousState === undefined) delete process.env.XDG_STATE_HOME;
+            else process.env.XDG_STATE_HOME = previousState;
+            rmSync(state, { recursive: true, force: true });
+        }
     });
 });
