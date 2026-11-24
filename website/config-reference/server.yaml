@@ -602,6 +602,22 @@ entries:
     desc_en: "OpenCode inline lane (#3278 port; OPT-IN — the default stays the spawned proxy, per owner decision on #4687): the opencode plugin's compression runs IN-PROCESS — no spawned proxy, no ephemeral port, no MITM certs; model traffic and the /__bili/ tool surface are served by an in-process engine through a pseudo-origin (verified on the Bun host). Set true (or BILI_OPENCODE_INLINE=1) to enable. Resolved env > file; an explicit inline choice always beats an announced attach target, an absent choice falls back to attach/spawn as before. `bili opencode-inline` is the one-command lane."
     desc_zh: "opencode 内联压缩通道（#3278 移植；需手动开启——按 #4687 决定，默认仍是派生代理）：opencode 插件的压缩在进程内完成——不派生代理进程、无临时端口、无 MITM 证书；模型流量与 /__bili/ 工具面由进程内引擎经伪源站服务（已在 Bun 宿主验证）。设 true（或 BILI_OPENCODE_INLINE=1）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili opencode-inline` 一键车道。"
     desc_ja: "OpenCode インラインレーン（#3278 ポート；オプトイン — #4687 におけるオーナーの決定に従い、デフォルトはスポンされたプロキシのまま）: opencode プラグインの圧縮はインプロセスで実行されます — スポンされたプロキシなし、エフェメラルポートなし、MITM 証明書なし；モデルトラフィックと /__bili/ ツールサーフェスは擬似オリジンを通じてインプロセスエンジンによって提供されます（Bun ホストで検証済み）。有効にするには true（または BILI_OPENCODE_INLINE=1）を設定します。解決順序は env > file；明示的なインライン選択は常に ANNOUNCED アタッチターゲットよりも優先され、選択が欠如している場合は従来どおりアタッチ/スポンにフォールバックします。`bili opencode-inline` はワンコマンドレーンです。"
+  - key: plugin.snapshotCapBytes
+    type: number
+    default: "104857600 (100 MiB)"
+    env: BILI_PUBLIC_SNAPSHOT_CAP_BYTES
+    group: behavior
+    desc_en: "Caps the raw wire-history snapshot retained per plugin session for the public fork API (#2017 D-B); beyond it the session fails closed (409) instead of retaining an unbounded raw copy. Default raised from 16 MiB (#2394 G3); 0 disables retention entirely."
+    desc_zh: "限制每个插件会话为公开 fork API 保留的原始线路历史快照字节数（#2017 D-B）；超限时会话直接失败关闭（409），而不是保留无界原始副本。默认值已从 16 MiB 上调（#2394 G3）；0 完全禁用保留。"
+    desc_ja: "公開 fork API 用にプラグインセッションごとに保持する生ワイヤー履歴スナップショットの上限（#2017 D-B）。超過すると無界の生コピーを保持する代わりにセッションはクローズドに失敗（409）します。デフォルトは 16 MiB から引き上げられました（#2394 G3）。0 で保持を完全に無効化します。"
+  - key: snapshot.shadow
+    type: boolean
+    default: "true"
+    env: BILI_SNAPSHOT_SHADOW
+    group: behavior
+    desc_en: "Snapshot-render SHADOW observability switch (#3756 follow-up): compute the snapshot view on every armed proxy turn WITHOUT using it (outbound bytes stay the legacy path), classify the diff against what was actually sent, and record per-session counters surfaced by the web panel + the snapshot-shadow diagnostics topic. ON by default (the render lane itself stays rollout-gated at 0%, so the shadow lane is pure observation)."
+    desc_zh: "快照渲染影子观测开关（#3756 后续）：在每个激活的代理轮次上计算快照视图但不使用它（出站字节仍走 legacy 路径），与实际发送内容对比分类差异，并记录由 web 面板和 snapshot-shadow 诊断主题展示的每会话计数器。默认开启（渲染车道本身仍灰度钉在 0%，影子车道是纯观测）。"
+    desc_ja: "スナップショットレンダリングのシャドウ観測スイッチ（#3756 フォローアップ）。アームされたプロキシターンごとにスナップショットビューを計算しますが使用はしません（送信バイトはレガシーパスのまま）、実際に送信した内容との差分を分類し、Web パネルと snapshot-shadow 診断トピックで表示されるセッションごとのカウンターを記録します。デフォルト ON（レンダリングレーン自体はロールアウトゲート 0% のままで、シャドウレーンは純粋な観測です）。"
   - key: mitm.enabled
     type: boolean
     default: "true"
