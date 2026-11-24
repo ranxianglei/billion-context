@@ -4247,7 +4247,7 @@ function buildSession(parsed: PersistedSession): Session {
     // Read grouped shape (v2+); fall back to flat fields for v1 files.
     const meta = parsed.meta ?? {};
     const stats = parsed.stats ?? {};
-    return {
+    const session: Session = {
         id: parsed.id,
         meta: {
             protocol: meta.protocol ?? parsed.protocol,
@@ -4355,6 +4355,17 @@ function buildSession(parsed: PersistedSession): Session {
         persisted: true,
         pendingRetrievals: [],
     };
+    // #7670: the pendingFoldUsage latch is intentionally NOT restored (see the
+    // stats comment above), so the [acp-drift] fold-coverage alert is off on
+    // the first post-load request — the exact round that could destroy the fold
+    // (client resends mutated/truncated history losing covered ids → block
+    // silently active:false, no log). Warn whenever a session with active fold
+    // blocks is loaded so the operator knows the alert is off.
+    const activeFoldBlocks = session.state.blocks.filter((b) => b.active).length;
+    if (activeFoldBlocks > 0) {
+        loggerLog("warn", `[persist] ${session.id}: loaded ${activeFoldBlocks} active fold block(s) with pendingFoldUsage latch NOT restored — the [acp-drift] fold-coverage alert is off on the first post-load request; a fold destroyed in that round will not be logged (#7670)`);
+    }
+    return session;
 }
 
 export function isValidRecord(parsed: unknown): parsed is PersistedSession {
