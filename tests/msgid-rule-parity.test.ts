@@ -22,7 +22,7 @@ import { _screenMsgIdsForTest } from "../src/agent/incremental-client.js";
 // (owner 2026-11-04, PR #5652 review follow-up) — collectors clear the whole
 // table on any hole. The constant survives ONLY on the server wire-decode side
 // (legacy/v5 traffic may still carry "?" segments), hence the fastpath import.
-import { _parseTailIdsForTest, PF_SLOT_UNKNOWN } from "../src/server/fastpath.js";
+import { _parseTailIdsForTest } from "../src/server/fastpath.js";
 
 const GOOD = "h_deadbeefcafe0001";
 const GOOD2 = "h_cafebabe12345678";

@@ -830,6 +830,7 @@ export async function prepareOpenai(
         }
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
+        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         // #4166: re-voice ONLY bili's own summary carriers (isRenderedSummaryMessage).
         // Client-origin mid system/developer messages (DSH tool_addition and
         // friends) are conversation data — they re-emit verbatim through the
