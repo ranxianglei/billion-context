@@ -54,6 +54,7 @@ import {
     snapR3LatchedReadOnSession,
     snapR3LatchClear,
     snapR3LatchClearOnSession,
+    snapR3LatchWrite,
     snapR3LatchWriteOnSession,
     snapR3LatchedList,
     snapR3LatchedListOnSessions,
@@ -2320,12 +2321,23 @@ export class UnifiedStore {
 
     /** #6181 M3: persist the R3 breaker latch (best-effort — a failed
      *  write degrades to the in-memory latch, which still fires this
-     *  process). Identity consolidation (discussions/7591): new latches
-     *  land on the SESSIONS row for every session (the l1 placeholder row
-     *  and its rebind ceremony are retired with the write). */
+     *  process). Identity consolidation (discussions/7591, owner ruling
+     *  2026-11-24): the carrier switch is GATED on egressPlane — when it is
+     *  on, new latches land on the SESSIONS row (of record); when it is off,
+     *  the legacy l1_world carrier (placeholder-row ritual) is used, so
+     *  behavior is byte-identical to pre-migration until the switch flips.
+     *  Read / clear / list stay dual-carrier (a superset, always correct). */
     snapR3Latch(sid: string): void {
         try {
-            snapR3LatchWriteOnSession(this.db, sid, Date.now());
+            if (featureEnabled("egressPlane")) {
+                snapR3LatchWriteOnSession(this.db, sid, Date.now());
+            } else {
+                // egressPlane off → legacy l1 carrier, byte-identical to
+                // pre-migration: the l1 row is keyed by the SESSION RAW id
+                // (conversation id for conv-bound sessions), matching the
+                // `snapR3Latched` read path.
+                snapR3LatchWrite(this.db, this.snapSessRawOf(sid), Date.now());
+            }
         } catch { /* best-effort — see above */ }
     }
 

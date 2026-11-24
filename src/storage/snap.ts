@@ -174,12 +174,12 @@ export function snapR3LatchedRead(db: DbLike, sessRaw: string): boolean {
 }
 
 /** #6181 M3: persist the R3 breaker latch onto the l1_world row.
- *  @deprecated discussions/7591 — no live caller. The latch now lands on the
- *  SESSIONS row ({@link snapR3LatchWriteOnSession}); this l1 writer survives
- *  only to document the legacy placeholder-row shape that the egress-off
- *  "red" rebind branch of `snapStage0` still repairs (pre-migration rows).
- *  Kept (not deleted) so that history stays grep-able; drop it with the l1
- *  table in the later release. */
+ *  Legacy carrier — used by `UnifiedStore.snapR3Latch` when egressPlane is
+ *  OFF (discussions/7591 owner ruling 2026-11-24): with the switch off the
+ *  latch lands here exactly as pre-migration; with it on, new latches land
+ *  on the SESSIONS row ({@link snapR3LatchWriteOnSession}) instead. Also the
+ *  row shape the egress-off "red" rebind branch of `snapStage0` repairs
+ *  (pre-migration rows). Drop with the l1 table in the later release. */
 export function snapR3LatchWrite(db: DbLike, sessRaw: string, nowMs: number): void {
     // Upsert — the first fault of a fresh session happens BEFORE its stage-0
     // snapL1Record call (the R3 check runs at pin validation), so an

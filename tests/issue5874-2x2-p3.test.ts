@@ -496,17 +496,25 @@ test("M3.2: the R3 latch placeholder is RETIRED (discussions/7591) — new latch
     // Conversation binding: ledger sid "sid-cb" → raw conversation id "conv-cb".
     const db = (a as unknown as { db: DbLike }).db;
     db.exec("INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES ('default', 'conv-cb', 'sid-cb', 0)");
-    // NEW CONTRACT (2026-11-23 identity-tables-consolidate): the latch fires
-    // on the sessions row — no l1 placeholder is ever created, so the
-    // raw→wrong-ledger trap is structurally impossible for new latches.
-    a.snapR3Latch("sid-cb");
-    assert.equal(db.prepare("SELECT sess_raw FROM l1_world WHERE sess_raw = ?").get("conv-cb"), undefined, "no l1 placeholder row is created anymore");
-    assert.equal(a.snapR3Latched("sid-cb"), true, "the latch is readable via the sessions row");
-    // The operator unlatches (POST /__bili/snapshot/r3-unlatch {sessRaw}).
-    assert.equal(a.snapR3LatchClear("conv-cb"), null, "no l1 row, no sessions row for the RAW id → nothing persisted to clear");
-    assert.equal(a.snapR3LatchClear("sid-cb"), "sid-cb", "clearing by the ledger sid hits the sessions row");
+    // NEW CONTRACT (2026-11-23 identity-tables-consolidate; owner ruling
+    // 2026-11-24 GATES the sessions-row latch carrier on egressPlane): with
+    // the switch on, the latch fires on the sessions row — no l1 placeholder
+    // is ever created, so the raw→wrong-ledger trap is structurally
+    // impossible for new latches.
+    const _prevEgress = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+    try {
+        a.snapR3Latch("sid-cb");
+        assert.equal(db.prepare("SELECT sess_raw FROM l1_world WHERE sess_raw = ?").get("conv-cb"), undefined, "no l1 placeholder row is created anymore");
+        assert.equal(a.snapR3Latched("sid-cb"), true, "the latch is readable via the sessions row");
+        // The operator unlatches (POST /__bili/snapshot/r3-unlatch {sessRaw}).
+        assert.equal(a.snapR3LatchClear("conv-cb"), null, "no l1 row, no sessions row for the RAW id → nothing persisted to clear");
+        assert.equal(a.snapR3LatchClear("sid-cb"), "sid-cb", "clearing by the ledger sid hits the sessions row");
+    } finally {
+        if (_prevEgress === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE; else process.env.BILI_ROLLOUT_EGRESS_PLANE = _prevEgress;
+    }
     // The next turn: conv-bound bookkeeping — an empty stored set anchors
-    // (no red, no rebind needed).
+    // (no red, no rebind needed). Flag-independent (sid-cb is not egress-on).
     assert.equal(a.snapStage0("sid-cb", ["m1"]).decision.mode, "anchor");
     // LEGACY GUARD: a PRE-UPGRADE placeholder (written by the old code path,
     // ledger_id = sessRaw, witness_probe "") must STILL self-heal — old

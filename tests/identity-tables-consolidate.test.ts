@@ -196,6 +196,50 @@ test("S2: legacy l1 latches stay readable (fallback) and the roster is the union
     }
 });
 
+/** Owner ruling 2026-11-24 (discussions/7591): the latch CARRIER switch is gated
+ *  on egressPlane — with it OFF, `snapR3Latch` must write the LEGACY l1_world
+ *  carrier (placeholder-row shape, byte-identical to pre-migration), not the
+ *  sessions row. This is what keeps the PR from changing any behavior until
+ *  the owner flips egressPlane. */
+test("S2 (owner ruling 2026-11-24): egressPlane OFF → latch writes the legacy l1 carrier, nothing on sessions", () => {
+    const h = openStore();
+    const sid = "sess-r3-flag-off-l1";
+    try {
+        // the file forces egressPlane ON at module load; flip it off here
+        // (featureEnabled re-reads the env on every call).
+        delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+        try {
+            h.store.snapR3Latch(sid);
+            // legacy l1 carrier: the placeholder row, byte-identical to pre-migration
+            const l1 = h.db.prepare("SELECT ledger_id, witness_probe, r3_latched_at FROM l1_world WHERE sess_raw = ?").get(sid) as { ledger_id: string; witness_probe: string; r3_latched_at: number };
+            assert.ok(l1, "egressPlane off → the latch lands on the legacy l1_world carrier");
+            assert.equal(l1.ledger_id, sid, "the placeholder row carries sessRaw as ledger_id (pre-migration shape)");
+            assert.equal(l1.witness_probe, "", "witness_probe stays the empty sentinel (pre-migration shape)");
+            assert.ok(l1.r3_latched_at > 0, "the latch value is on the l1 column");
+            // and NOTHING on the sessions carrier
+            const sess = h.db.prepare("SELECT session_id FROM sessions WHERE session_id = ?").get(sid);
+            assert.equal(sess, undefined, "no sessions row is created on the flag-off path");
+            // still readable through the dual-carrier read (sessions ?? l1 fallback)
+            assert.equal(h.store.snapR3Latched(sid), true, "the flag-off latch is readable via the l1 fallback");
+            // conv-bound session: the flag-off l1 write must key by the
+            // conversation RAW id (not the ledger sid) — matching the read
+            // path and pre-migration byte-for-byte (regression guard).
+            h.db.prepare("INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES (?, ?, ?, 0)")
+                .run("default", "conv-ro", "sid-ro");
+            h.store.snapR3Latch("sid-ro");
+            const l1ro = h.db.prepare("SELECT ledger_id FROM l1_world WHERE sess_raw = ?").get("conv-ro") as { ledger_id: string } | undefined;
+            assert.ok(l1ro, "the conv-bound flag-off latch is keyed by the conversation raw id");
+            assert.equal(l1ro.ledger_id, "conv-ro", "placeholder ledger_id = sessRaw (pre-migration shape)");
+            assert.equal(h.db.prepare("SELECT sess_raw FROM l1_world WHERE sess_raw = ?").get("sid-ro"), undefined, "NOT keyed by the ledger sid");
+            assert.equal(h.store.snapR3Latched("sid-ro"), true, "readable via the l1 fallback (keyed by sessRaw)");
+        } finally {
+            process.env.BILI_ROLLOUT_EGRESS_PLANE = "1"; // restore for the rest of the file
+        }
+    } finally {
+        closeStore(h);
+    }
+});
+
 test("S3: egress-on stage-0 is stateless — echo/anchor against the op log, no l1 row, reset is a no-op", () => {
     const h = openStore();
     const sid = "sess-egress-stateless-stage0";
