@@ -641,6 +641,19 @@ export function coreToAnthropic(
           current.blocks.push(m.rawAnthropicBlock as AnthropicBlock);
           break;
         }
+        // Cross-lane image: no foreign raw block to reuse — rebuild the
+        // native block from the media sidecars (never the "[image]" text).
+        if (m.imageBase64 && m.imageMediaType) {
+          current.blocks.push({
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: m.imageMediaType,
+              data: m.imageBase64,
+            },
+          });
+          break;
+        }
         current.blocks.push({ type: "text", text: m.text ?? "", ...cc(m.id) });
         break;
       }
@@ -667,11 +680,19 @@ export function coreToAnthropic(
         });
         break;
       case "reasoning":
-        current.blocks.push({
-          type: "thinking",
-          thinking: m.text ?? "",
-          ...(m.thinkingSignature ? { signature: m.thinkingSignature } : {}),
-        });
+        if (m.thinkingSignature) {
+          current.blocks.push({
+            type: "thinking",
+            thinking: m.text ?? "",
+            signature: m.thinkingSignature,
+          });
+        } else if ((m.text ?? "").length > 0) {
+          // Unsigned reasoning (cross-lane, or a lane whose model emits no
+          // signatures): the Anthropic API rejects unsigned thinking blocks,
+          // so degrade to a visible text block — pi's requiresThinkingAsText
+          // parity. Same-lane signed behavior is unchanged.
+          current.blocks.push({ type: "text", text: m.text ?? "" });
+        }
         break;
     }
   }

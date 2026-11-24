@@ -462,11 +462,16 @@ export function conversationSignalGoogle(
 
 /** A reasoning core: its raw thought part verbatim (text refreshed — the
  *  kernel re-renders core text with ref tags/truncation), else a
- *  reconstructed `{thought:true}` part carrying the sidecar signature. */
+ *  reconstructed `{thought:true}` part carrying the sidecar signature.
+ *  Unsigned + no raw (cross-lane, or a lane whose model emits no thought
+ *  signatures) degrades to a PLAIN text part: Gemini 3 validates thought
+ *  signatures, so an unsigned thought part rejects the whole request —
+ *  pi's parity is to ship the text without the thought flag. */
 function reasoningPart(m: BiliMessage): GooglePart {
   const text = m.text ?? "";
   const head = rawParts(m)[0];
   if (head) return { ...head, text, thought: true };
+  if (!m.googleThoughtSignature) return { text };
   return {
     text,
     thought: true,
