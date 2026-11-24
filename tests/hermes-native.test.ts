@@ -902,7 +902,7 @@ elif SCENARIO.startswith("mitm-"):
     os.makedirs(libdir, exist_ok=True)
     with open(os.path.join(libdir, "_bcminiyaml.py"), "w") as f:
         f.write(MINI_YAML_PARSER)
-    if kind in ("pyyaml", "parse", "top-level"):
+    if kind in ("pyyaml", "parse", "top-level", "model"):
         with open(os.path.join(libdir, "yaml.py"), "w") as f:
             f.write(YAML_STUB_SRC)
     if kind == "ruamel":
@@ -946,6 +946,45 @@ elif SCENARIO.startswith("mitm-"):
             "missing": mod._provider_base_url("missing"),
             "unnamed": mod._provider_base_url(None),
         }
+    elif kind == "model":
+        # #7063: Hermes 0.23+ shape — the active endpoint nested under model:, no providers map.
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(
+                "model:\n"
+                "  provider: deepseek\n"
+                "  base_url: https://api.deepseek.com/v1\n"
+            )
+        out["model_domains"] = mod.mitm_domains_from_config()
+        out["model_pbu"] = {
+            "active": mod._provider_base_url("deepseek"),
+            "unnamed": mod._provider_base_url(None),
+            "other": mod._provider_base_url("other"),
+        }
+        # Mixed shape: providers map + model block — the model block's host is additive to the map's.
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(
+                "providers:\n"
+                "  beta:\n"
+                "    base_url: https://beta.example.com/v1\n"
+                "model:\n"
+                "  provider: deepseek\n"
+                "  base_url: https://api.deepseek.com/v1\n"
+            )
+        out["mix_domains"] = mod.mitm_domains_from_config()
+        out["mix_pbu"] = {
+            "named": mod._provider_base_url("beta"),
+            "model": mod._provider_base_url("deepseek"),
+            "unnamed": mod._provider_base_url(None),
+        }
+        # A scalar "model: <name>" (a bare model name) is not a block — no host from it, no crash;
+        # the top-level base_url still answers.
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(
+                "model: deepseek-flash\n"
+                "provider: deepseek\n"
+                "base_url: https://api.deepseek.com/v1\n"
+            )
+        out["scalar_domains"] = mod.mitm_domains_from_config()
     else:
         cfg_text = (
             "providers:\n"
@@ -1272,6 +1311,9 @@ interface DriverOut {
     tl_pbu?: Record<string, string | null>;
     mix_domains?: string[];
     mix_pbu?: Record<string, string | null>;
+    model_domains?: string[];
+    model_pbu?: Record<string, string | null>;
+    scalar_domains?: string[];
     commands?: Record<string, string>;
     tools_after_reenable?: string[];
     state_after_reenable?: string;
@@ -2112,6 +2154,32 @@ describe("MITM-domain discovery (#2838)", () => {
             missing: null,
             unnamed: "https://alpha.example.com/v1",
         });
+        assert.deepEqual(out!.mitm_warnings, [], "happy path must not warn");
+    });
+
+    // #7063: the Hermes 0.23+ shape nests the active endpoint under model: — it must be discovered,
+    // and _provider_base_url must answer it for the model's provider / unnamed only (additive to a
+    // providers map; a scalar model: is not a block).
+    test("model: block: whitelisted AND scoped to the model's provider", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("mitm-model");
+        assert.ok(out, err);
+        assert.deepEqual(out!.model_domains, ["api.deepseek.com"]);
+        assert.deepEqual(out!.model_pbu, {
+            active: "https://api.deepseek.com/v1",
+            unnamed: "https://api.deepseek.com/v1",
+            other: null,
+        });
+        assert.deepEqual(out!.mix_domains, ["beta.example.com", "api.deepseek.com"]);
+        assert.deepEqual(out!.mix_pbu, {
+            named: "https://beta.example.com/v1",
+            model: "https://api.deepseek.com/v1",
+            unnamed: "https://api.deepseek.com/v1",
+        });
+        assert.deepEqual(out!.scalar_domains, ["api.deepseek.com"], "scalar model: contributes no host; top-level still answers");
         assert.deepEqual(out!.mitm_warnings, [], "happy path must not warn");
     });
 });

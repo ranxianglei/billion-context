@@ -4226,6 +4226,68 @@ test("parseHermesYaml: top-level base_url next to provider: is the stock config 
     assert.deepEqual(Object.keys(dup.providers).sort(), ["alpha"]);
 });
 
+test("parseHermesYaml: model: block nests the active endpoint (Hermes 0.23+, #7063)", () => {
+    // Hermes 0.23+ shape: no providers map — provider + endpoint nested under model:.
+    const modelOnly = parseHermesYaml([
+        "model:",
+        "  provider: Deepseek",
+        "  base_url: https://api.deepseek.com/v1",
+    ].join("\n"));
+    assert.equal(modelOnly.providers.Deepseek?.api, "https://api.deepseek.com/v1",
+        "model block base_url attributes to the model's provider");
+
+    // No provider in the block → synthetic "model" entry.
+    const unnamed = parseHermesYaml("model:\n  base_url: https://m.example.com/v1\n");
+    assert.equal(unnamed.providers["model"]?.api, "https://m.example.com/v1");
+
+    // A scalar `model: <name>` (bare model name) is not a block — the top-level
+    // base_url still answers, and no synthetic model entry appears.
+    const scalar = parseHermesYaml([
+        "model: deepseek-flash",
+        "provider: deepseek",
+        "base_url: https://api.deepseek.com/v1",
+    ].join("\n"));
+    assert.equal(scalar.providers.deepseek?.api, "https://api.deepseek.com/v1",
+        "scalar model: is not a block; top-level base_url attributes to provider");
+    assert.equal(scalar.providers["model"], undefined, "no synthetic model entry for a scalar");
+
+    // Coexists with a providers map: keep BOTH hosts routable (a missing entry = blind tunnel).
+    const mixed = parseHermesYaml([
+        "providers:",
+        "  beta:",
+        "    base_url: https://beta.example.com/v1",
+        "model:",
+        "  provider: deepseek",
+        "  base_url: https://api.deepseek.com/v1",
+    ].join("\n"));
+    assert.equal(mixed.providers.beta?.api, "https://beta.example.com/v1");
+    assert.equal(mixed.providers.deepseek?.api, "https://api.deepseek.com/v1",
+        "model block URL lands under the model's provider name");
+
+    // Model provider DOES have an entry with a different URL: never overwrite.
+    const both = parseHermesYaml([
+        "providers:",
+        "  deepseek:",
+        "    base_url: https://map.example.com/v1",
+        "model:",
+        "  provider: deepseek",
+        "  base_url: https://model.example.com/v1",
+    ].join("\n"));
+    assert.equal(both.providers.deepseek?.api, "https://map.example.com/v1", "existing entry survives");
+    assert.equal(both.providers["model"]?.api, "https://model.example.com/v1");
+
+    // Same URL in both shapes → deduped to one entry.
+    const dup = parseHermesYaml([
+        "providers:",
+        "  deepseek:",
+        "    base_url: https://same.example.com/v1",
+        "model:",
+        "  provider: deepseek",
+        "  base_url: https://same.example.com/v1",
+    ].join("\n"));
+    assert.deepEqual(Object.keys(dup.providers).sort(), ["deepseek"]);
+});
+
 test("parseHermesYaml: quoted endpoint values survive (new URL() rejects quotes)", () => {
     const q = parseHermesYaml([
         "providers:",

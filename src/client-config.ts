@@ -1565,15 +1565,17 @@ export function readOmpConfig(ompHome: string): OmpConfig {
 
 /** Minimal line-based YAML reader for hermes config.yaml: collects provider
  *  entries from the v12 `providers:` dict (provider key -> `api:` url), the
- *  legacy `custom_providers:` list (- name: ... / base_url: ...), and the stock
+ *  legacy `custom_providers:` list (- name: ... / base_url: ...), the stock
  *  top-level `base_url`/`url`/`api` next to `provider:` (#6022 — the active
- *  provider's endpoint when no providers entry covers it). Anything else in the
- *  file is ignored — only name -> endpoint URL pairs matter for launcher route
+ *  provider's endpoint when no providers entry covers it), and the `model:`
+ *  block's nested `provider:` + `base_url`/`url`/`api` (#7063 — Hermes 0.23+
+ *  nests the active endpoint under model:). Anything else in the file is
+ *  ignored — only name -> endpoint URL pairs matter for launcher route
  *  discovery. */
 export function parseHermesYaml(text: string): HermesConfig {
     const result: HermesConfig = { providers: {} };
     const candidates = new Map<string, string>();
-    type Mode = "none" | "dict" | "list";
+    type Mode = "none" | "dict" | "list" | "model";
     let mode: Mode = "none";
     let sectionIndent = -1;
     let entryIndent = -1;
@@ -1595,6 +1597,22 @@ export function parseHermesYaml(text: string): HermesConfig {
         const um = /^(base_url|url|api):\s*(\S+)/.exec(line);
         if (um && !(um[1] in topLevel)) topLevel[um[1] as "base_url" | "url" | "api"] = unquote(um[2]);
     };
+    // The `model:` block nests the active endpoint under model: (Hermes 0.23+ shape, #7063):
+    //   model:
+    //     provider: Deepseek
+    //     base_url: https://api.deepseek.com/v1
+    // Same capture rules as the top-level shape, scoped to the block's indented lines. A scalar
+    // `model: <name>` (a bare model name) is not a block and never enters this mode.
+    const modelTopLevel: Partial<Record<"base_url" | "url" | "api", string>> = {};
+    let modelProvider = "";
+    const captureModel = (line: string): void => {
+        if (!modelProvider) {
+            const pm = /^provider:\s*["']?([A-Za-z0-9_.-]+)/.exec(line);
+            if (pm) modelProvider = pm[1];
+        }
+        const um = /^(base_url|url|api):\s*(\S+)/.exec(line);
+        if (um && !(um[1] in modelTopLevel)) modelTopLevel[um[1] as "base_url" | "url" | "api"] = unquote(um[2]);
+    };
     for (const rawLine of text.split(/\r?\n/)) {
         const trimmed = rawLine.trim();
         if (!trimmed || trimmed.startsWith("#")) continue;
@@ -1610,6 +1628,9 @@ export function parseHermesYaml(text: string): HermesConfig {
                 sectionIndent = indent;
                 entryIndent = -1;
                 current = null;
+            } else if (/^model:\s*(#.*)?$/.test(trimmed)) {
+                mode = "model";
+                sectionIndent = indent;
             } else if (indent === 0) {
                 captureTopLevel(trimmed);
             }
@@ -1628,6 +1649,9 @@ export function parseHermesYaml(text: string): HermesConfig {
             } else if (/^custom_providers:\s*(#.*)?$/.test(trimmed)) {
                 mode = "list";
                 sectionIndent = indent;
+            } else if (/^model:\s*(#.*)?$/.test(trimmed)) {
+                mode = "model";
+                sectionIndent = indent;
             } else if (indent === 0) {
                 captureTopLevel(trimmed);
             }
@@ -1645,7 +1669,7 @@ export function parseHermesYaml(text: string): HermesConfig {
                 const apiMatch = /^(base_url|url|api):\s*(\S+)/.exec(trimmed);
                 if (apiMatch) candidates.set(`${current}\u0000${apiMatch[1]}`, unquote(apiMatch[2]));
             }
-        } else {
+        } else if (mode === "list") {
             // Legacy list: "- name: x" opens an entry; nested base_url/api/url lines.
             const dashMatch = /^-\s+(.*)$/.exec(trimmed);
             if (dashMatch) {
@@ -1659,6 +1683,9 @@ export function parseHermesYaml(text: string): HermesConfig {
                 const urlMatch = /^(?:base_url|api|url):\s*(\S+)/.exec(trimmed);
                 if (urlMatch) result.providers[current].api = unquote(urlMatch[1]);
             }
+        } else if (mode === "model") {
+            // The `model:` block's indented lines: capture provider + base_url/url/api.
+            captureModel(trimmed);
         }
     }
     for (const name of Object.keys(result.providers)) {
@@ -1677,6 +1704,18 @@ export function parseHermesYaml(text: string): HermesConfig {
             let name = activeProvider && !taken.has(activeProvider) ? activeProvider : "top-level";
             while (taken.has(name)) name += "-x";
             result.providers[name] = { api: topLevelUrl };
+        }
+    }
+    // The `model:` block's endpoint (Hermes 0.23+ shape, #7063): the active model's host, kept
+    // routable like the top-level shape — a missing route means blind-tunneled, uncompressed traffic.
+    const modelUrl = modelTopLevel.base_url ?? modelTopLevel.url ?? modelTopLevel.api;
+    if (modelUrl !== undefined) {
+        const covered = Object.values(result.providers).some((p) => p.api === modelUrl);
+        if (!covered) {
+            const taken = new Set(Object.keys(result.providers));
+            let name = modelProvider && !taken.has(modelProvider) ? modelProvider : "model";
+            while (taken.has(name)) name += "-x";
+            result.providers[name] = { api: modelUrl };
         }
     }
     return result;
