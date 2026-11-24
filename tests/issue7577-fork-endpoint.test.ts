@@ -72,7 +72,9 @@ test("(c) forkEgressSnapshot: egress-on parent forks to now — loadable, conten
         const recorded = recordEgressTurn({ store: ops, sessionId: "parent-eg", prev: undefined, conversation: msgs, systemText: "sys", nowMs: 1000 });
         // the view carries the system row too; assert the two message rows are present
         assert.ok(recorded.some((r) => r.msgid === "m1") && recorded.some((r) => r.msgid === "m2"), "m1 and m2 recorded on the parent");
-        const parentHighWater = ustore.egressStateMaxSeq("parent-eg");
+        // #7577 (c-fix): the oracle is the SHARED high water (block rows ride
+        // the same clock) — identical here because this parent has no blocks.
+        const parentHighWater = ustore.egressBlockMaxSeq("parent-eg");
         assert.ok(parentHighWater >= 1, "parent has egress history");
 
         // --- fork to now ------------------------------------------------------

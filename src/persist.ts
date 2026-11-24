@@ -2934,7 +2934,10 @@ export class SessionStore {
             pendingRetrievals: [],
         };
         await this.persistForkSession(sessionId, child);
-        const opSeq = this.egressOpLogStore()?.egressStateMaxSeq(cid) ?? 0;
+        // #7577 (c-fix): report the SHARED high water (egress_flow +
+        // egress_block_flow) — the message-only max under-reports the child's
+        // true clock when the parent's last turn wrote block rows.
+        const opSeq = this.egressOpLogStore()?.egressBlockMaxSeq(cid) ?? 0;
         return { childId: cid, opSeq };
     }
 

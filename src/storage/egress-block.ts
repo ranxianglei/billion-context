@@ -238,21 +238,25 @@ export function egressBlockAppend(
     nowMs: number,
 ): number[] {
     if (ops.length === 0) return [];
-    // Validate against the current state replica: duplicate I and U on a
-    // missing target are corrupt (the block log is append-only; a block is
-    // born exactly once).
-    const current = egressBlockView(db, sessionId);
-    for (const op of ops) {
-        const existing = current.get(op.blockId);
-        if (op.type === "I" && existing !== undefined) {
-            throw new EgressBlockCorruptError(sessionId, `duplicate I for block ${op.blockId}`);
-        }
-        if (op.type === "U" && existing === undefined) {
-            throw new EgressBlockCorruptError(sessionId, `U for missing block ${op.blockId}`);
-        }
-    }
-    const firstOpSeq = blockNextSeq(db, sessionId);
+    // #7577 (b-fix): the state replica read (validation) and the next op_seq
+    // are read INSIDE the write transaction — the same discipline the message
+    // log established in #7574: never read before the transaction.
+    let firstOpSeq = 0;
     db.transaction(() => {
+        // Validate against the current state replica: duplicate I and U on a
+        // missing target are corrupt (the block log is append-only; a block is
+        // born exactly once).
+        const current = egressBlockView(db, sessionId);
+        for (const op of ops) {
+            const existing = current.get(op.blockId);
+            if (op.type === "I" && existing !== undefined) {
+                throw new EgressBlockCorruptError(sessionId, `duplicate I for block ${op.blockId}`);
+            }
+            if (op.type === "U" && existing === undefined) {
+                throw new EgressBlockCorruptError(sessionId, `U for missing block ${op.blockId}`);
+            }
+        }
+        firstOpSeq = blockNextSeq(db, sessionId);
         for (let i = 0; i < ops.length; i++) {
             const op = ops[i];
             const opSeq = firstOpSeq + i;
@@ -337,10 +341,13 @@ export function egressBlockCompact(
     kstateJson: string | null,
     nowMs: number,
 ): number {
-    const seq = blockNextSeq(db, sessionId);
-    const entries = Array.from(blocks.entries()).map(([blockId, snapshot]) => ({ blockId, snapshot }));
-    const payload = JSON.stringify({ entries, watermark: seq });
+    let seq = 0;
     db.transaction(() => {
+        // #7577 (b-fix): read the next op_seq inside the transaction
+        // (#7574 discipline — never before it).
+        seq = blockNextSeq(db, sessionId);
+        const entries = Array.from(blocks.entries()).map(([blockId, snapshot]) => ({ blockId, snapshot }));
+        const payload = JSON.stringify({ entries, watermark: seq });
         db.prepare(INSERT_BLOCK_FLOW).run(sessionId, seq, "B", null, payload, kstateJson, nowMs);
     });
     return seq;
