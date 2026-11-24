@@ -1,5 +1,5 @@
 import { defaultCountTokens, orderedRefPair, type CompressionBlock } from "acp-kernel";
-import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
+import { blockContentSnapshot, listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
 import { fileNameMatchesId, getStore, isValidRecord, _resetStoreForTest, relPathFor } from "../persist.js";
@@ -1768,7 +1768,7 @@ function snapshotRefIndexFor(session: Session, block: CompressionBlock): Map<str
     if (direct.length === 0) return null;
     let content: BlockContent | undefined;
     try {
-        content = session.blockContents.get(block.blockId);
+        content = blockContentSnapshot(session.blockContents, block);
     } catch {
         return null;
     }
@@ -1922,7 +1922,7 @@ export async function buildBlockContent(id: string, blockId: string, view: Block
     if (!block) return { ok: false, reason: "unknown-block" };
     let content: BlockContent | undefined;
     try {
-        content = session.blockContents.get(blockId);
+        content = blockContentSnapshot(session.blockContents, block);
     } catch (error) {
         // #3917: a corrupt/unreadable content store must not 500 the panel —
         // report it as "no snapshot" and let the UI explain.
