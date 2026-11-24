@@ -148,7 +148,9 @@ test("one arming rule for the four lanes: plane on, plugin lane, pinned, not a s
     assert.equal(armed(false, true, false), false, "a plain proxy session is never on the log");
     assert.equal(armed(true, false, false), false, "a plugin turn without a pin has no server-side identity");
     assert.equal(armed(true, true, true), false, "a title request (or any side request) never touches the log");
-    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    // GA (2026-11-24): "unset" now resolves ON (percent 100), so "off" must
+    // be FORCED — env "0" wins over the bucket.
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     assert.equal(armed(true, true, false), false, "plane off: nothing arms");
     process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
 });

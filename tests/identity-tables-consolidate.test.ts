@@ -206,8 +206,9 @@ test("S2 (owner ruling 2026-11-24): egressPlane OFF → latch writes the legacy 
     const sid = "sess-r3-flag-off-l1";
     try {
         // the file forces egressPlane ON at module load; flip it off here
-        // (featureEnabled re-reads the env on every call).
-        delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+        // (featureEnabled re-reads the env on every call). GA (2026-11-24):
+        // "unset" resolves ON, so "off" is forced with an explicit "0".
+        process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
         try {
             h.store.snapR3Latch(sid);
             // legacy l1 carrier: the placeholder row, byte-identical to pre-migration

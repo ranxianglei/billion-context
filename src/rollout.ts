@@ -140,9 +140,17 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // unrebuildable/corrupt state degrades the turn to legacy (never a
     // partial swap, never client-as-authority). OFF = legacy chain, zero
     // rows, byte-identical to pre-feature.
-    // Force with `rollout.features.egressPlane: true` or
-    // `BILI_ROLLOUT_EGRESS_PLANE=1`.
-    egressPlane: { percent: 0 },
+    // GA (owner ruling 2026-11-24, wrap-up PR of the #7439 series): default
+    // ON for every install — the egress plane is the end-state
+    // identity/storage architecture (op log = the single authority for
+    // egress-on sessions; #7577 block tables, #7581/#7617 identity
+    // consolidation). The per-lane degrade ladder and the legacy
+    // byte-faithful path stay as-is, so the worst case of any hit-path bug
+    // is a degraded turn, never wrong bytes. Installs that want the old
+    // behavior opt out with `rollout.features.egressPlane: false` (or a
+    // percent) / `BILI_ROLLOUT_EGRESS_PLANE=0` (env wins over config) — the
+    // entry stays in the registry exactly for that rollback surface.
+    egressPlane: { percent: 100 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
     // message identity aligned from their OWN local transcript/sqlite
