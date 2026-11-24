@@ -1701,6 +1701,19 @@ export function dropSessionForGc(id: string): boolean {
     return true;
 }
 
+/** #7271 M2: remove a session from the in-memory map unconditionally
+ *  (ignoring the inFlight check). Used for orphan cleanup: the session was
+ *  created by prefix-affinity for a dsh compaction request that was refused,
+ *  and never processed a real request (stats.requests === 0). Safe to remove
+ *  while the creating request is still in flight because releaseInFlight
+ *  operates on the session object directly, not the map. */
+export function removeOrphanSession(id: string): boolean {
+    const s = sessions.get(id);
+    if (!s) return false;
+    sessions.delete(id);
+    return true;
+}
+
 // #760b: unified canonical session id. Every session exposes a stable pfa-* id
 // that MCP tools route by, independent of what the client calls itself.
 // Anonymous sessions already ARE pfa-* (PFA-minted session.id), so their
