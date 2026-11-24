@@ -96,12 +96,19 @@ test("#1024: catalog parity — every key in every locale with matching placehol
     }
     for (const key of zhKeys) {
         assert.deepEqual(placeholders(MESSAGES.en[key]), placeholders(MESSAGES["zh-CN"][key]), `placeholder mismatch for "${key}"`);
+        assert.deepEqual(placeholders(MESSAGES.ko[key]), placeholders(MESSAGES.en[key]), `ko placeholder mismatch for "${key}"`);
     }
 });
 
 test("#1024: no Chinese residue in English translations", () => {
     for (const [key, value] of Object.entries(MESSAGES.en)) {
         assert.ok(!han.test(value), `English value for "${key}" still contains Chinese: ${value}`);
+    }
+});
+
+test("#1024: no Chinese residue in Korean translations", () => {
+    for (const [key, value] of Object.entries(MESSAGES.ko)) {
+        assert.ok(!han.test(value), `Korean value for "${key}" still contains Chinese: ${value}`);
     }
 });
 
@@ -354,6 +361,9 @@ test("#2321: ?lang= pin outranks stored choice and browser default (real client)
     assert.equal((await runClient(undefined, "en-US", null)).lang, "en", "no pin: en navigator still resolves en");
     assert.equal((await runClient(undefined, "zh-CN", "en")).lang, "en", "no pin: stored choice still beats navigator");
     assert.equal((await runClient(undefined, "zh-CN", null)).lang, "zh-CN", "no pin: nothing stored falls back to zh-CN");
+    assert.equal((await runClient("?embed=1&lang=ko", "en-US", "en")).lang, "ko", "pin ko beats both stored en and en navigator");
+    assert.equal((await runClient(undefined, "zh-CN", "ko")).lang, "ko", "no pin: stored ko beats navigator");
+    assert.equal((await runClient(undefined, "ko-KR", null)).lang, "ko", "no pin: ko navigator resolves ko");
 });
 
 test("#2321: language toggle drops the ?lang= pin so the manual choice sticks", async () => {
@@ -363,6 +373,17 @@ test("#2321: language toggle drops the ?lang= pin so the manual choice sticks", 
     assert.ok(tog, "language toggle rendered");
     assert.ok(tog!.handlers.click, "toggle has a click handler");
     tog!.handlers.click!();
-    assert.deepEqual(r.storageSet, [["bili-language", "zh-CN"]], "manual choice persisted");
+    assert.deepEqual(r.storageSet, [["bili-language", "ko"]], "manual choice persisted");
     assert.equal(r.location.href, "/__bili/?embed=1#/overview", "navigation keeps other params but strips the lang pin");
+});
+
+test("language toggle cycles zh-CN → en → ko → zh-CN and labels the next language", async () => {
+    for (const [from, next, label] of [["zh-CN", "en", "English"], ["en", "ko", "한국어"], ["ko", "zh-CN", "中文"]] as const) {
+        const r = await runClient(`?embed=1&lang=${from}`, "zh-CN", null);
+        assert.equal(r.lang, from);
+        const tog = r.els.get("language-toggle")!;
+        assert.equal(tog.textContent, label, `toggle on ${from} names ${next}`);
+        tog.handlers.click!();
+        assert.deepEqual(r.storageSet, [["bili-language", next]], `${from} toggles to ${next}`);
+    }
 });

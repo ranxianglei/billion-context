@@ -71,23 +71,89 @@ import type { Config, CoreMessage } from "acp-kernel";
  *  path (or undefined when the message is no durable carrier). */
 type DurableMessageClassifier = (msg: CoreMessage) => string | undefined;
 
+/** The machine frame every dsh durable injection is wrapped in
+ *  (\x3csystem-reminder\x3e … \x3c/system-reminder\x3e). Both producers that
+ *  own a durable carrier emit the COMPLETE frame themselves —
+ *  dsh-tool-skill's renderCatalogMessage/renderCatalogUpdate and
+ *  dsh-agent-instructions' buildInstructionText ("This producer owns the
+ *  complete <system-reminder> frame") — so the frame is a stable property of
+ *  the carrier, not of some outer host wrapper. */
+const SYSTEM_REMINDER_FRAME = "\x3csystem-reminder\x3e";
+
+/** True when the message OPENS the system-reminder frame. The marker-only
+ *  match this replaces could not tell a real injection from a message that
+ *  merely QUOTES one (#7153): a human paste or a subagent report carrying the
+ *  block took the newest instance of `durable/<name>`, so it was pinned
+ *  forever AND the real carrier lost the identity (latest-per-identity) —
+ *  and Rule 3 stopped treating the quoting message as the last human request
+ *  (#5109), which strands the live ask outside the protected zone. A future
+ *  producer that stops emitting the frame degrades to a MISS (the carrier
+ *  folds as ordinary history): the direction this file prefers over a false
+ *  positive. */
+function opensSystemReminderFrame(text: string): boolean {
+    return text.trimStart().startsWith(SYSTEM_REMINDER_FRAME);
+}
+
 /** dsh skill-catalog identity (#2419): the durable catalog message injected
  *  by dsh-tool-skill (a \x3csystem-reminder\x3e carrying the
  *  \x3cavailable_skills\x3e block; source: asar dsh-tool-skill/lib/index.js,
  *  createUserMessage({ source: { kind: "skill-catalog" } })). The marker is
- *  matched on its own rather than on the wrapper so a future wrapper change
- *  cannot silently disarm the classifier; a false positive is benign (a
- *  matching message simply stays visible) and the marker is DSH-specific
- *  XML. Re-emitted only when the visible skill set CHANGES, so the newest
- *  instance is the source of truth (`protectedLatestTools` candidate).
+ *  matched INSIDE the frame rather than on its own (#7153): the bare marker
+ *  also matches a human paste or a relay report that quotes the block, and
+ *  under latest-per-identity such a quote takes the identity over from the
+ *  real catalog — it gets pinned forever while the catalog folds. Re-emitted
+ *  only when the visible skill set CHANGES, so the newest instance is the
+ *  source of truth (`protectedLatestTools` candidate).
  *  #2766: assistant-role messages are never carriers — every carrier is a
  *  host injection into the user channel, so a model ECHO of the marker must
  *  not project (under latest-per-identity it would take the identity over
  *  from the real carrier and get it folded away). */
 export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
-    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cavailable_skills\x3e")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string"
+        && opensSystemReminderFrame(msg.text) && msg.text.includes("\x3cavailable_skills\x3e")
         ? "durable/skill-catalog"
         : undefined;
+}
+
+/** dsh workspace-instructions REVISION identity: the reconciliation shapes of
+ *  the #2447 carrier — @deepseek-ai/dsh-agent-instructions' changedSectionText
+ *  emits one message per changed file, framed by the same
+ *  \x3csystem-reminder\x3e wrapper but with a lowercase marker (or a different
+ *  verb) than the baseline's `Instructions from:`:
+ *    `Updated instructions from: <path>`      — file content edited
+ *    `Additional instructions from: <path>`   — a file discovered LATER (its
+ *                                               content was never in the
+ *                                               baseline at all)
+ *    `Instructions removed: <path>`           — the file no longer applies
+ *  These are NOT ordinary consumable history, which is what the earlier
+ *  case-sensitive match assumed. baselineIdentity excludes file CONTENT
+ *  (lib/index.js:39: projectRoot + discovery/budget config only), so a
+ *  mid-session edit never re-emits a baseline — the revision is the ONLY
+ *  carrier of the change. Folding it leaves the pinned, superseded baseline in
+ *  context and drops the correction: the model keeps obeying rules the user
+ *  already rewrote, and cannot tell it lost the update. That is strictly worse
+ *  than folding both (then the model at least knows it has no rules).
+ *
+ *  IDENTITY IS PER PATH, deliberately not one shared `durable/agents-md`
+ *  bucket: the default policy is latest-per-identity (protectedLatestTools),
+ *  so a shared bucket would let the newest revision DEMOTE the baseline — and
+ *  a baseline merges EVERY discovered file into one message, while a revision
+ *  carries only its own file. On a multi-file session that trade loses rules:
+ *  measured on a real base+d1 pair, the baseline carried 2 files (global +
+ *  project root) and the `Additional` revision carried 1, so a shared bucket
+ *  would have gone from "keep 2, lose 1" to "keep 1, lose 2". Per-path
+ *  identities keep each file's newest version and bound the pinned set to
+ *  "one baseline + one revision per touched file".
+ *
+ *  `durable/*` still matches the suffixed path: matchToolPath compares only
+ *  the first segment for a `<prefix>/*` pattern. Matched case-sensitively on
+ *  purpose: the three shapes are fixed DSH template literals, so case folding
+ *  would only grow the false-positive surface. #2766 role gate as above. */
+function agentsMdRevisionPath(text: string): string | undefined {
+    const m = /^\s*\x3csystem-reminder\x3e\s*(?:(?:Updated|Additional)\s+instructions\s+from|Instructions\s+removed)\s*:[ \t]*([^\n]+)/.exec(text);
+    if (m === null) return undefined;
+    const path = m[1]!.trim();
+    return path.length > 0 ? `durable/agents-md-update/${path}` : undefined;
 }
 
 /** dsh workspace-instructions identity (#2447): the durable AGENTS.md baseline
@@ -98,17 +164,27 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
  *  createUserMessage). The host re-emits the baseline only when
  *  baselineIdentity (projectRoot + discovery/budget config, NOT file contents)
  *  changes, so one fold of it silently kills hard constraints like "read X
+
  *  before any web access" forever. Marker-over-wrapper rationale as #2419.
- *  The match is case-sensitive on purpose — reconciliation change messages
- *  use lowercase variants ("Updated instructions from:") that remain ordinary
- *  consumable history. At most ~one such baseline lives per session
- *  (replacements are rare identity changes), so pinning every match is
- *  bounded. #2766: assistant-role messages are never carriers (see
- *  dshSkillCatalogPath). */
+ *  At most ~one such baseline lives per session (replacements are rare
+ *  identity changes), so pinning every match is bounded. #2766: assistant-role
+ *  messages are never carriers (see dshSkillCatalogPath).
+ *
+ *  THE SAME CARRIER HAS A SECOND SHAPE — its REVISIONS (see
+ *  agentsMdRevisionPath above): the baseline projects to `durable/agents-md`,
+ *  each mid-session revision to its own per-path identity. The baseline marker
+ *  stays case-sensitive for a different reason than before: the revision
+ *  shapes are classified FIRST, because a revision body can itself contain the
+ *  uppercase label (a user documenting bili's matching string puts
+ *  `Instructions from:` inside their own AGENTS.md) and would otherwise be
+ *  mistaken for a baseline. */
 export function dshWorkspaceInstructionsPath(msg: CoreMessage): string | undefined {
-    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:")
-        ? "durable/agents-md"
-        : undefined;
+    if (msg.role === "assistant" || msg.contentType !== "text" || typeof msg.text !== "string") return undefined;
+    // #7153: require the <system-reminder> frame so a human pasting a rule file
+    // ("Instructions from: AGENTS.md" quoted in prose) stays ordinary history;
+    // agentsMdRevisionPath enforces the leading frame for revisions itself.
+    if (!opensSystemReminderFrame(msg.text)) return undefined;
+    return agentsMdRevisionPath(msg.text) ?? (msg.text.includes("Instructions from:") ? "durable/agents-md" : undefined);
 }
 
 /** dsh mcp-catalog identity (#2446): the durable MCP-server catalog injected
@@ -227,13 +303,19 @@ export function dshPastedImagePath(msg: CoreMessage): string | undefined {
  *  background job ("background job <id> (…) finished [status: …, exit code:
  *  N]. Read its output with job_output."), one per job completion (×39 in the
  *  #5139 session). One-shot like time-context: resent only while the notice
- *  is fresh, then gone forever after use. Prefix match (asciiCI, trimmed) on
- *  the machine-generated lead-in; the phrasing is dsh-specific and a plain
- *  user question starting that way stays on the wire, so a misclassification
- *  never becomes an accounting effect (same benign-FP argument as
- *  dshPastedImagePath). #2766: assistant-role messages are never carriers. */
+ *  is fresh, then gone forever after use. The match requires the job ID after
+ *  the lead-in (#7153) — the bare prefix also matches ordinary English
+ *  ("background jobs keep failing because …"), and a misclassified HUMAN
+ *  message loses its Rule-3 anchor role and folds as a one-shot carrier.
+ *  All three emitter shapes keep matching (packages/jobs/tool-jobs/src/
+ *  index.ts): inline "background job <id> (kind: label) finished …",
+ *  truncated "background job <id>\\n[notice truncated]…", compact
+ *  "background job <id>\\nDone; job_output." — hence " (" / EOL. #2766:
+ *  assistant-role messages are never carriers. */
+const TOOL_JOB_NOTICE_RE = /^background job \S+(?: \(|$|\r?\n)/i;
+
 export function dshToolJobNoticePath(msg: CoreMessage): string | undefined {
-    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && startsWithAsciiCI(msg.text.trim(), "background job")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && TOOL_JOB_NOTICE_RE.test(msg.text.trim())
         ? "oneshot/tool-job-notice"
         : undefined;
 }
@@ -266,15 +348,20 @@ export function dshMnemonPath(msg: CoreMessage): string | undefined {
  *  more." / " was stopped before it finished." / " ran out of room before it
  *  finished."), spliced into the PARENT session as a user-role message when a
  *  child settles. One-shot: emitted once per settlement and never re-sent —
- *  retirement accounted via oneShotCarrierPaths. Prefix match (asciiCI) on the
- *  leading-trimmed text INCLUDING the marker's trailing space, which keeps
- *  human prose merely starting with the words ("Background subagents are
- *  handy") unmatched. Slot exclusion is the point (#5173): a settlement notice
+ *  retirement accounted via oneShotCarrierPaths. The match requires the
+ *  settlement ENDING after the child id (#7153): the bare `Background
+ *  subagent ` lead-in also matches human prose that names a subagent
+ *  ("Background subagent X is stuck again — why?"), and a misclassified human
+ *  message loses its Rule-3 anchor role. All six endings the emitter can
+ *  produce stay matched (finished / was stopped / ran out of room / declined /
+ *  failed / ended). Slot exclusion is the point (#5173): a settlement notice
  *  landing right after the newest human request steals the Rule-3 last-user
  *  anchor (#5109). #2766: assistant-role messages are never carriers. */
+const SUBAGENT_SETTLED_RE = /^background subagent .+? (?:finished|was stopped|ran out of room|declined|failed|ended)\b/i;
+
 export function dshSubagentSettledPath(msg: CoreMessage): string | undefined {
     return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" &&
-        startsWithAsciiCI(msg.text.trimStart(), "Background subagent ")
+        SUBAGENT_SETTLED_RE.test(msg.text.trim())
         ? "oneshot/subagent-settled"
         : undefined;
 }
@@ -447,17 +534,22 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
- *  exact marker strings of the twelve dsh classifiers above (fifteen markers:
- *  the runtime-context family contributes two — the pre-0.2.2-rc.3 "Current
- *  runtime context" literal and the 0.2.2-rc.3 lead-in without its trailing
- *  colon, which both the first-snapshot and re-send intros share, #7085 — the
- *  mnemon family contributes two, the image-offload family contributes two), so a
- *  unified-store row can be screened with cheap substring checks BEFORE
- *  JSON.parse (rows may carry megabytes of base64 media). Lockstep with the
- *  classifiers is enforced in tests/issue5142-expected-rebase.test.ts. */
+ *  exact marker strings of the twelve dsh classifiers above (eighteen markers:
+ *  the workspace-instructions family contributes four, the runtime-context
+ *  family two — the pre-0.2.2-rc.3 "Current runtime context" literal and the
+ *  0.2.2-rc.3 lead-in without its trailing colon, which both the
+ *  first-snapshot and re-send intros share, #7085 — the mnemon family
+ *  contributes two, the agent-relay family two, the image-offload family
+ *  two), so a unified-store row can be screened with cheap substring checks
+ *  BEFORE JSON.parse (rows may carry megabytes of base64 media). Lockstep
+ *  with the classifiers is enforced in
+ *  tests/issue5142-expected-rebase.test.ts. */
 export const dshCarrierRawMarkers: readonly string[] = [
     "\x3cavailable_skills\x3e",
     "Instructions from:",
+    "Updated instructions from:",
+    "Additional instructions from:",
+    "Instructions removed:",
     "Current runtime context",
     "The following information describes your current session",
     "\x3cmcp_catalog\x3e",

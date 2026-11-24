@@ -351,7 +351,10 @@ pure-stdlib Python module shipped inside the npm package:
   point hermes' httpx stack at it via `HTTPS_PROXY` / `https_proxy` +
   `SSL_CERT_FILE` (bili's combined CA bundle — current hermes resolves ambient
   trust there; `HERMES_CA_BUNDLE` stays set for older builds) —
-  `~/.hermes/config.yaml` is never touched. Provider https hosts are read from hermes' config and whitelisted
+  `~/.hermes/config.yaml` is never touched. `NO_PROXY`/`no_proxy` default to
+  keeping loopback and hermes' own code/dependency hosts (github.com, pypi,
+  npm registries) direct so the host's git/uv/npm children never ride the lane
+  (#6862); an operator-set value wins. Provider https hosts are read from hermes' config and whitelisted
   for MITM; everything else blind-tunnels exactly like launcher mode. If no
   proxy can be made healthy, the plugin stands down silently and traffic goes
   direct (no compression, no dead port).

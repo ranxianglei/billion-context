@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import type { PathLike } from "node:fs";
 import { rmrf } from "./tmp-rm.ts";
+import { acquireDistFixtureLock } from "./dist-fixture-lock.ts";
 import { supportsFileSymlink } from "./platform-capabilities.ts";
 type SymlinkKind = "dir" | "file" | "junction";
 import net from "node:net";
@@ -469,6 +470,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
     // when running tests from a checkout without a prior build.
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const stubbed = !fs.existsSync(distAgent);
     if (stubbed) {
         fs.mkdirSync(path.dirname(distAgent), { recursive: true });
@@ -553,6 +555,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (stubbed) fs.rmSync(distAgent, { force: true });
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -585,6 +588,7 @@ test("runLaunch pi #5428: -s posture override reaches the child env over a hosti
     // when running tests from a checkout without a prior build.
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const stubbed = !fs.existsSync(distAgent);
     if (stubbed) {
         fs.mkdirSync(path.dirname(distAgent), { recursive: true });
@@ -646,6 +650,7 @@ test("runLaunch pi #5428: -s posture override reaches the child env over a hosti
         if (prevInline === undefined) delete process.env.BILI_PI_INLINE;
         else process.env.BILI_PI_INLINE = prevInline;
         if (stubbed) fs.rmSync(distAgent, { force: true });
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -664,6 +669,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
 
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const distBackup = `${distAgent}.bak-test`;
     const distExisted = fs.existsSync(distAgent);
     if (distExisted) fs.renameSync(distAgent, distBackup);
@@ -724,6 +730,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (distExisted) fs.renameSync(distBackup, distAgent);
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -873,6 +880,16 @@ test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real con
             String(childEnv!.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")),
             "combined CA bundle exported (#1375)",
         );
+        // #6862: hermes' own toolchain children (git/uv/npm update runners, shell tasks) inherit
+        // HTTPS_PROXY and must not ride the lane for code/dependency hosts — the default NO_PROXY
+        // keeps loopback + those hosts direct. Model hosts are not listed, so model traffic still
+        // rides the lane.
+        assert.ok(
+            (childEnv!.NO_PROXY ?? "").includes("github.com") && (childEnv!.NO_PROXY ?? "").includes("pypi.org")
+                && (childEnv!.NO_PROXY ?? "").includes("127.0.0.1"),
+            "#6862: default NO_PROXY keeps loopback + non-model code/dependency hosts direct",
+        );
+        assert.equal(childEnv!.no_proxy, childEnv!.NO_PROXY, "lowercase NO_PROXY variant matches");
         assert.equal(childEnv!.HERMES_HOME, hermesHome, "user-set real home survives to the child");
         assert.equal(fs.existsSync(`${hermesHome}-bili`), false, "no hermes overlay dir");
         const after = fs.statSync(path.join(hermesHome, "config.yaml"));
@@ -910,6 +927,7 @@ test("runLaunch pi #535: refuses launch when ONLY https (hand-wrapped) rewrites 
 
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const distBackup = `${distAgent}.bak-test`;
     const distExisted = fs.existsSync(distAgent);
     if (distExisted) fs.renameSync(distAgent, distBackup);
@@ -927,6 +945,7 @@ test("runLaunch pi #535: refuses launch when ONLY https (hand-wrapped) rewrites 
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (distExisted) fs.renameSync(distBackup, distAgent);
+        releaseFixture();
         rmrf(home);
     }
 });
