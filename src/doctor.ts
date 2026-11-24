@@ -256,16 +256,19 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
     if (agent === "dsh" && presence.profiles !== undefined) {
         return presence.profiles.map((p) => {
             const missing = p.bundleInstalled && p.copyVersion === undefined;
+            const noBundleDecl = p.bundleInstalled && p.bundleDeclared === false;
             const row: DoctorLane = {
                 ...base,
                 agent: `dsh:${p.name}`,
                 installed: true,
                 detail: p.spec !== undefined ? `dep spec: ${p.spec}${p.pinned ? " (local pin — dev lane, manual)" : ""}` : "(no dep spec)",
                 copyVersion: p.copyVersion,
-                verdict: laneVerdict({ installed: true, targetMissing: missing, frozen: p.pinned, copyVersion: p.copyVersion, registryVersion }),
+                verdict: laneVerdict({ installed: true, targetMissing: missing || noBundleDecl, frozen: p.pinned, copyVersion: p.copyVersion, registryVersion }),
             };
             if (row.verdict === "frozen") row.reason = "local-pin dep spec — no live update path; point it at a registry version or rebuild manually (AGENTS.md install-lane contract)";
-            else if (row.verdict === "broken") row.reason = "profile depends on billion-context but the bundle copy is missing — rerun 'bili plugin install dsh'";
+            else if (row.verdict === "broken") row.reason = noBundleDecl
+                ? "the profile's billion-context copy declares no dsh.bundle in its package.json — dsh skips the bundle at boot (\"declares no dsh.bundle\"); reinstall a copy that declares it: 'dsh plugin --profile <name> add billion-context'"
+                : "profile depends on billion-context but the bundle copy is missing — rerun 'bili plugin install dsh'";
             const shadow = dshBundleShadowWarning({ packageName: ctx.packageName, globalInstallDir: ctx.global.installDir, globalDiskVersion: ctx.global.diskVersion, profileName: p.name, bundleInstalled: p.bundleInstalled, profileCopyVersion: p.copyVersion });
             if (shadow !== undefined) row.warnings = [...(row.warnings ?? []), shadow];
             return row;

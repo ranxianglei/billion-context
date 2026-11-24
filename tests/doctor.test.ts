@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { dshBundleShadowWarning, globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
 import { PLUGIN_AGENTS, inspectLanePresence } from "../src/plugin-install.ts";
+import { dshCopyDeclaresBundle } from "../src/dsh-channel.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> | void {
@@ -203,6 +204,86 @@ test("inspectLanePresence dsh: local pin flags a frozen dev lane, registry pin r
             assert.equal(main?.pinned, false);
             assert.equal(main?.copyVersion, "0.1.140");
             assert.equal(laneVerdict({ installed: true, targetMissing: false, frozen: false, copyVersion: main?.copyVersion, registryVersion: "999.0.0" }), "stale");
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
+test("#7644: dshCopyDeclaresBundle — true only when the copy declares a dsh.bundle object", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-dsh-decl-"));
+    try {
+        const copy = (name: string, pkg: Record<string, unknown>): string => {
+            const dir = path.join(base, name);
+            mkdirSync(dir, { recursive: true });
+            writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.216", ...pkg }));
+            return dir;
+        };
+        assert.equal(dshCopyDeclaresBundle(copy("ok", { dsh: { bundle: { patch: "./dsh.bundle.patch.yml" } } })), true, "dsh.bundle object → true");
+        assert.equal(dshCopyDeclaresBundle(copy("nodecl", {})), false, "no dsh field → false");
+        assert.equal(dshCopyDeclaresBundle(copy("dshnobundle", { dsh: { client: { platform: "web" } } })), false, "dsh present, bundle missing → false");
+        assert.equal(dshCopyDeclaresBundle(copy("badbundle", { dsh: { bundle: "not-an-object" } })), false, "dsh.bundle not an object → false");
+        assert.equal(dshCopyDeclaresBundle(copy("nullbundle", { dsh: { bundle: null } })), false, "dsh.bundle null → false");
+        assert.equal(dshCopyDeclaresBundle(path.join(base, "missing")), undefined, "no readable package.json → undefined");
+    } finally {
+        rmrf(base);
+    }
+});
+
+test("#7644: inspectLanePresence dsh populates bundleDeclared from the resolved copy", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-dsh-bundle-"));
+    try {
+        const dshHome = path.join(base, "dsh");
+        const webDir = path.join(dshHome, "profiles", "web");
+        const webCopy = path.join(webDir, "node_modules", "billion-context");
+        const goodDir = path.join(dshHome, "profiles", "good");
+        const goodCopy = path.join(goodDir, "node_modules", "billion-context");
+        mkdirSync(webCopy, { recursive: true });
+        mkdirSync(goodCopy, { recursive: true });
+        writeFileSync(path.join(webDir, "package.json"), JSON.stringify({ dependencies: { "billion-context": "^0.1.216" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+        writeFileSync(path.join(webCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.216" }));
+        writeFileSync(path.join(goodDir, "package.json"), JSON.stringify({ dependencies: { "billion-context": "^0.1.216" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+        writeFileSync(path.join(goodCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.216", dsh: { bundle: { patch: "./dsh.bundle.patch.yml" } } }));
+        withEnv({ DSH_HOME: dshHome }, () => {
+            const p = inspectLanePresence("dsh");
+            const web = p.profiles?.find((x) => x.name === "web");
+            assert.equal(web?.bundleDeclared, false, "web copy declares no dsh.bundle");
+            const good = p.profiles?.find((x) => x.name === "good");
+            assert.equal(good?.bundleDeclared, true, "good copy declares dsh.bundle");
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
+test("#7644: runDoctor reports a dsh lane broken when the resolved copy declares no dsh.bundle, healthy when it does", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-dsh-run-"));
+    const runWithFetch = mockFetch(() => new Response(JSON.stringify({ name: "billion-context", version: "999.0.0" }), { status: 200, headers: { "content-type": "application/json" } }));
+    try {
+        const dshHome = path.join(base, "dsh");
+        // Profile "web": the copy declares NO dsh.bundle → broken (the #7643 case).
+        const webDir = path.join(dshHome, "profiles", "web");
+        const webCopy = path.join(webDir, "node_modules", "billion-context");
+        mkdirSync(webCopy, { recursive: true });
+        writeFileSync(path.join(webDir, "package.json"), JSON.stringify({ dependencies: { "billion-context": "^0.1.216" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+        writeFileSync(path.join(webCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.216" }));
+        // Profile "good": the copy DECLARES dsh.bundle → not broken.
+        const goodDir = path.join(dshHome, "profiles", "good");
+        const goodCopy = path.join(goodDir, "node_modules", "billion-context");
+        mkdirSync(goodCopy, { recursive: true });
+        writeFileSync(path.join(goodDir, "package.json"), JSON.stringify({ dependencies: { "billion-context": "^0.1.216" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+        writeFileSync(path.join(goodCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.216", dsh: { bundle: { patch: "./dsh.bundle.patch.yml" } } }));
+        await runWithFetch(async () => {
+            await withEnv({ ...doctorSandboxEnv(base), DSH_HOME: dshHome }, async () => {
+                const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.216" });
+                const web = report.lanes.find((l) => l.agent === "dsh:web");
+                assert.ok(web, "dsh:web lane present");
+                assert.equal(web?.verdict, "broken", "a copy that declares no dsh.bundle is broken");
+                assert.match(web?.reason ?? "", /dsh\.bundle/, "reason must name the missing dsh.bundle declaration");
+                const good = report.lanes.find((l) => l.agent === "dsh:good");
+                assert.ok(good, "dsh:good lane present");
+                assert.notEqual(good?.verdict, "broken", "a copy that declares dsh.bundle is not broken");
+            });
         });
     } finally {
         rmrf(base);
