@@ -291,6 +291,17 @@ export type CompactionDisableHost = {
 };
 type MiddlewareSelf = { entry?: { options?: { name?: unknown } } | undefined };
 
+/** Entry option name carried by the fiber that owns a config resolution.
+ *  The host dispatches `internal/config` as `waterfall('internal/config',
+ *  fiber, next)` — the first argument is the event NAME, so cordis binds no
+ *  `this` (vendor/cordis/src/events.ts:163 → thisArg null) and the listener
+ *  receives `(fiber, next)`. Reading `this` therefore always yields
+ *  undefined; the name lives on the first argument. */
+export function entryNameOf(fiber: unknown): string | undefined {
+    const name = (fiber as MiddlewareSelf | undefined)?.entry?.options?.name;
+    return typeof name === "string" && name.length > 0 ? name : undefined;
+}
+
 /** Register the load-time overlay + publish the gate. Runs from the always-on
  *  gate entry's apply() (dsh-compaction-gate.ts, #3662) — NOT from bili-native,
  *  whose disable/kill-switch must not take the service with it. The provide
@@ -302,7 +313,7 @@ type MiddlewareSelf = { entry?: { options?: { name?: unknown } } | undefined };
 export function registerCompactionDisable(ctx: CompactionDisableHost): void {
     if (typeof ctx.on === "function") {
         // Preset entries must carry the gate: sibling imports may finish out of order.
-        ctx.on("internal/config", function (this: MiddlewareSelf, _raw: unknown, next: () => unknown): unknown {
+        ctx.on("internal/config", function (fiber: unknown, next: () => unknown): unknown {
             const resolved = next();
             // #3662: honor the process verdict — without an active declaration
             // from bili-native every row passes through stock.
@@ -316,7 +327,7 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             if (!Array.isArray(config.plugins)) return resolved;
             const compactionRows = countCompactionRows(config.plugins);
             if (compactionRows === 0) return resolved;
-            const rawName = this?.entry?.options?.name;
+            const rawName = entryNameOf(fiber);
             const entryName = typeof rawName === "string" ? rawName : "unnamed-entry";
             noteGateCoverage(entryName.slice(0, 120), compactionRows, entryName === DSH_AGENT_PRESET_PACKAGE);
             return { ...config, plugins: disableBasicCompaction(config.plugins) };
