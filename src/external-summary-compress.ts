@@ -36,7 +36,7 @@ function withOptionalSummaries(input: unknown): unknown {
 
 /** Fingerprint of the conversation's raw message ids. Catches in-place state
  *  mutation (new message added/removed) without firing on bookkeeping
- *  markDirty, which bumps revisionEpoch without touching messageRefs. (#7657) */
+ *  markDirty, which bumps revisionEpoch without touching messageRefs. (#7655) */
 function stateFingerprint(state: CompressionState): string {
     return Object.keys(state.messageRefs.byRaw).sort().join("\n");
 }
