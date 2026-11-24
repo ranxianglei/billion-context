@@ -437,6 +437,17 @@ export type CompressSettings = {
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedTools?: string[];
+    /** User-message text substrings that are NEVER compressed (kernel
+     *  `Config.isMessageProtected` hook). Built for long-lived agent sessions:
+     *  the current task prompt is often NOT the last user message (tool-result
+     *  / image user messages follow it), so the kernel's last-user protection
+     *  does not cover it. Once folded, a stale earlier user message can remain
+     *  as the only raw user turn and the model may resume that old task.
+     *  Hosts mark the current task with a stable literal (e.g. "【本轮消息】")
+     *  and list it here. Matching is literal substring on user-role text
+     *  messages; empty array is rejected; deepest level wins, whole-array
+     *  replace. */
+    protectedUserPatterns?: string[];
     /* (durable virtual paths) any pattern whose first path segment is
      *  `durable` takes over the whole durable policy for that lane
      *  (whole-identity takeover): bili attaches only the identity
@@ -3415,6 +3426,11 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         const v = obj[key];
         if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
         else (out as Record<string, unknown>)[key] = (v as string[]).map((x) => x.trim());
+    }
+    if ("protectedUserPatterns" in obj && obj.protectedUserPatterns !== undefined) {
+        const v = obj.protectedUserPatterns;
+        if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
+        else out.protectedUserPatterns = (v as string[]).map((x) => x.trim());
     }
     // neverPreserveRecentTools keeps the kernel semantics that an explicit
     // empty array is meaningful (excludes nothing — the #1198/#1277 escape
