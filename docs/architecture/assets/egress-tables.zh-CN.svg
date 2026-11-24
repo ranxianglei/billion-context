@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="470" viewBox="0 0 1240 470">
+<rect width="1240" height="470" fill="#ffffff"/>
+<text x="40" y="36" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="16" font-weight="bold" fill="#1a2b4a">egress 平面表关系（双时钟 + 单向指针）</text>
+<rect x="40" y="70" width="360" height="170" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="52" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_flow —— 消息操作日志（权威）</text>
+<text x="52" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq)，底线之上表内稠密（#7574）</text>
+<text x="52" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">row_type: I 插入 / D 删除 / U 更新 / B base</text>
+<text x="52" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">I 行: msgid + log_seq（规范号，永不复用）</text>
+<text x="52" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">B 行: payload {entries, highWater}</text>
+<text x="52" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">＝该点存活视图 + 消息前沿</text>
+<text x="52" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">压实：物理删除最新 base 以下的行</text>
+<text x="52" y="200" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">（保留底线：低于 base 的点位 fork 被拒绝）</text>
+<rect x="40" y="270" width="360" height="100" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="52" y="290" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_state —— 读副本</text>
+<text x="52" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq)；按 log_seq 排序</text>
+<text x="52" y="325" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">每次写入同事务内从 flow 重放</text>
+<text x="52" y="340" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">snapPinLiveIds / serving 读命中它；有界</text>
+<rect x="460" y="70" width="360" height="170" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="472" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_block_flow —— 块历史（独立编号池）</text>
+<text x="472" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq) —— 自己的时钟</text>
+<text x="472" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">row_type: I 块诞生 / U 变更 / B 压实</text>
+<text x="472" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">快照: {tier, startMsgid, startSeq,</text>
+<text x="472" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">endMsgid, endSeq, supersedesBlockId,</text>
+<text x="472" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">active, reaped, one, full}</text>
+<text x="472" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">one = 块全文（full = 完整 JSON）</text>
+<text x="472" y="200" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">kstate 边车：残差字段清单</text>
+<rect x="460" y="270" width="360" height="90" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="472" y="290" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_block_state —— 每块最新快照</text>
+<text x="472" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, block_id)；同一指针</text>
+<text x="472" y="325" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">decompress 按需取全文读这里，不读 flow</text>
+<rect x="880" y="70" width="320" height="110" rx="8" fill="#e8f6ec" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="892" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">sessions.r3_latched_at（#7617）</text>
+<text x="892" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">R3 身份故障 latch；NULL/0 = 未 latch</text>
+<text x="892" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">双载体：读 ?? l1_world 旧列</text>
+<text x="892" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">清除：两个载体都清</text>
+<rect x="880" y="220" width="320" height="140" rx="8" fill="#f3f3f3" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="892" y="240" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">conversations（退役中）</text>
+<text x="892" y="260" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">宿主身份认领表</text>
+<text x="892" y="275" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress-on 不再需要（身份无状态）</text>
+<text x="892" y="290" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">物理 DROP 在退役登记（deprecations.md）</text>
+<line x1="400" y1="320" x2="456" y2="320" stroke="#3a5a8a" stroke-width="1.8"/><polygon points="456,320 447,316 447,324" fill="#3a5a8a"/><line x1="820" y1="70" x2="464" y2="70" stroke="#3a5a8a" stroke-width="1.8"/><polygon points="464,70 455,66 455,74" fill="#3a5a8a"/>
+<text x="640" y="52" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">flow_op_seq = 写入时刻 flow.MAX(op_seq)</text><text x="640" y="66" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#7a3b0f" text-anchor="middle">单调不减 ⇒ &lt;= X 是前缀；点位 fork 用它过滤块行</text>
+<rect x="880" y="390" width="320" height="60" rx="8" fill="#fff6e6" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="892" y="410" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">为什么是双时钟</text>
+<text x="892" y="430" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">共用时钟：折叠块行落在 flow 行之后 2 个 op_seq</text>
+<text x="892" y="445" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">⇒ 击穿 flow 密度不变量（review 否决）</text>
+</svg>

@@ -1,66 +1,109 @@
-# egress 平面(egressPlane)—— 专项文档
+# egress 平面（egressPlane）——专项文档
 
-> #7439 系列的终态:egress-on 会话的出站对话 **op log 是唯一权威**。本页是单一入口——它干什么、由哪些开关控制、开关之间怎么依赖、表结构、操作手册、PR/提案时间线。英文: [egress-plane.md](./egress-plane.md)。退役面清单见 [deprecations.md](./deprecations.md);存储模块页: [architecture/storage.md](./architecture/storage.md)。
+> #7439 系列的终态：对 **egress-on** 会话，出站对话的**操作日志（op log）是唯一权威**。一站式参考：做什么、为什么、表结构、每轮机制、性能账、fork/回退、设计决策、开关家族、操作手册、PR 时间线。EN: [egress-plane.md](./egress-plane.md)。退役面登记：[deprecations.zh-CN.md](./deprecations.zh-CN.md) · 存储模块：[architecture/storage.zh-CN.md](./architecture/storage.zh-CN.md) · 块表细节：[egress-block-flow.zh-CN.md](./egress-block-flow.zh-CN.md)。
 
-## 它是什么
+![egress 平面：一轮的入站与出站](./architecture/assets/egress-turns.zh-CN.svg)
+![egress 平面表关系图](./architecture/assets/egress-tables.zh-CN.svg)
+![egress 平面 fork 与回退](./architecture/assets/egress-fork.zh-CN.svg)
 
-对 **egress-on** 会话,bili 把每一轮的出站对话视图记成稀疏 op log(I/D/U 行,消息字节随行走行、自包含、无内容 CAS,裁定 7439-1),出站核心消息部分**直接从日志回供**,按构造字节一致。带 pin 的插件车道进一步取**服务端权威**:kernel 输入从 flow 回放(裁定 7439-3/5)。旧的"从客户端字节重新推导"链路保留为降级目标,不再是事实源。
+## 1. 入站 vs 出站 —— 一轮的两个方向
 
-由此定义架构的推论(KDD #23):
+插件车道的一轮是两个相反的字节流：
 
-- **`egress_flow` 的 I 行是消息唯一正史**(msgid + 永不重发的 `log_seq`);`messages` 表降级为**惰性投影**,回滚/web 读/恢复时一次性重建。
-- 会话 JSON 信封**在 bootstrap 时冻结**(index-only 落盘);`kstate` 裁到残差字段清单(可派生字段全部剔除)。
-- `tsStamps`/token 统计改为**加载时从 flow 回放派生**,不再持久化。
-- 身份(stage-0)对 egress-on 会话是**无状态**的——从 op log 前沿现算,不需要 `l1_world` 游标(#7617)。
+- **入站**（客户端 → bili）：插件宿主**每轮重发整段对话**（宿主的历史是它自己的真源，#2092 契约），并给每个元素盖 **msgid** 信封——宿主↔bili 私有，**转发上游前全部剥除**（永不出现在模型线上）。对 egress-on 会话，入站流从「权威」降级为**证据**：喂给 stage-0/pin 通道做校验；它与 op log 不一致 ⇒ 该轮降级，**入站永远不能写日志**。
+- **出站**（bili → 客户端）：回复/下一轮视图的核心消息部分**从 op log 直接提供**，按构造字节一致，不再从客户端重发字节重新推导。kernel（压缩引擎）的输入是**从 flow 重放的**（服务端权威，裁定 7439-3）——折叠决策在日志的视图上计算，宿主无法靠改写重发内容操纵压缩。
 
-## 开关家族与依赖关系
+一句话：**客户端照旧全量发送（入站），但 bili 不再信它来产出出站视图（出站）**。旧的「从客户端字节重新推导」链路保留为降级目标——任何不可重建点把**整轮**降级为 legacy，绝不部分替换。
 
-| 开关 | 缺省 | 在 egress 家族里的角色 |
+## 2. 为什么 op log 能当正史（设计决策）
+
+| # | 决策 | 为什么成立 |
 |---|---|---|
-| `rollout.features.egressPlane` | **100(开,GA 2026-11-24)** | **总开关**。对符合条件的会话 arm 平面。退出:`false`/百分比 / `BILI_ROLLOUT_EGRESS_PLANE=0`。 |
-| `storage.unified`(full/shadow) | — | **前置。** 仅 SQLite 车道;op log 在 unified store 里(`store.egressOpLogStore()`)。没有 unified store ⇒ 平面无处可写,保持空转。 |
-| `pluginLaneServerHistory` | 100(GA) | **pin**:服务端历史 + msgid 身份。没有 pin,`egressAuthority` 永不 arm——平面静默空转。 |
-| `pluginMsgIdIncremental` | 100(GA) | pin 通道的稳态尾部形态(依赖 `pluginLaneServerHistory`)。 |
-| `pluginFullResendWatermark` | 100(GA) | 同族快路径优化(跳过重新解析已校验一致的前缀)。 |
-| `snapshotRender`(D-lane) | 0 | **不是 egress**。服务*未 arm* 的插件会话。egress-on 轮次按构造绕过它(`src/server/snapshot-render.ts:529`: `if (deps.pluginMode) return clientMsgs`)——已 arm 的插件会话从 op log 回供。 |
-| `pluginIncrementalTurns` | 0 | 完全不是 egress——客户端自选的线路协议(#3248)。 |
+| 7439-1 | **自包含行**——消息字节直接挂在 `I` 行上（不 join 内容 CAS）。 | 日志必须能脱离整库单独重放（fork、恢复、审计）。 |
+| 7439-2 | **块的读/写侧落 blocks 表**——`summary_bytes` 内联块摘要；`start_msgid`/`end_msgid` 在折叠时一次性对齐到 flow 的 msgid 坐标。 | 折叠产物写在 kernel 读取的地方；每轮不做跨表身份对账。 |
+| 7439-3/5 | **服务端权威 + 硬失败**——kernel 输入从 flow 重放；日志**没有任何健康点**时响亮地硬失败，而不是静默地拿客户端字节应答。 | 「答错但没声音」正是本平面要消灭的失败模式；响亮的 500 + 恢复日志可接受。 |
+| KDD #23 | **`messages` 降级为惰性投影**——egress-on 会话停止逐轮统一 ingest；messages 表只在平面回滚 / web 读 / 恢复时一次性 O(n) 重建。 | 存储开销曾正比于 messages 账本**总行数**（~20µs/行，10w 行 2× 双账本放大）。op log 每轮写入 = O(新增消息)，serving 读被压实有界。 |
+| 双时钟（#7581） | **块表自己编号**；每个块行用 `flow_op_seq` 指向 flow 时钟（单调不减 ⇒ `<= X` 是前缀）。 | 共用一个时钟时，折叠的块行（**保存时**写）落在该轮最后一条 flow 行（**准备时**写）之后两个 op_seq 处，下一轮第一次读就击穿 flow 的密度不变量。两时钟 + 单向指针让两张表各自稠密、互不阻塞。 |
+| 无状态身份（#7617） | egress-on 的 stage-0 直接从 op log 前沿计算（`MAX(op_seq)` + 最新 base 的 high water），无 `l1_world` 游标、无 resync。 | 日志本身已经是身份账本——第二个游标就是第三个时钟。R3 故障 latch 迁到 `sessions.r3_latched_at`（与旧列双载体读/清）。 |
 
-**arm 规则**(`src/server/egress-lane-io.ts`,`egressAuthorityArmed`):`featureEnabled("egressPlane") && pluginMode && pinned && !sideRequest` —— 四条线路车道一个规则;side 请求(标题生成、压缩、小预算)永不触碰日志。
+**为什么压缩（折叠）能在 flow 上做。** 折叠就是一组操作：`D` × 被覆盖原文 + `I`（摘要消息——它是上下文，所以进 flow）+ 同一事务里一条 `B` base。摘要的**块对象**（生命周期 active/superseded/reaped、覆盖区间、被覆盖原文的 `one`/`full` 全文）住在**块表**里——flow 记「上下文现在是什么」，块表记「折叠做了什么得到它」。按需取全文（`decompress`）读块行，不读 flow。折叠的压实**物理删除** base 以下的 flow 行（保留底线：低于最新 base 的点位 fork 在 point-reconstruction materializer 落地前被拒绝）。
 
-**静默半态是写进文档的,不是藏着掖着**:`egressPlane` 开但 `pluginLaneServerHistory` 关时,没有会话 arm,什么都不发生(无行、无日志)——平面空转。上表四个 msgid 族开关缺省都是 100,所以这种半态只能由运维显式退出造成。开关删除(硬编码开)在退役登记里,以 GA 稳定为前提([deprecations.md](./deprecations.md))。
+## 3. 表结构（SQLite，`src/storage/schema.ts`；probe-first DDL，GA 前从未随版本发布）
 
-## 表(SQLite,`src/storage/schema.ts`)
+| 表 | 主键 | 作用 | 关键列 |
+|---|---|---|---|
+| `egress_flow` | `(session_id, op_seq)` | **消息**操作日志。保留底线之上表内稠密（#7574 不变量；恢复 = 一步步回退到最新健康 base）。最新 `B` base 以下的行由压实物理删除。 | `row_type` I/D/U/B · I 行：`msgid`、`log_seq`（规范消息号，永不复用）、`ref`、`tokens`、`bytes`、`role`、`type_tag` · B 行：payload `{entries, highWater}`（压实 base = 该点存活视图 + 消息前沿） |
+| `egress_state` | `(session_id, op_seq)` | 存活视图的**读副本**（每次写入同事务内从 flow 重放；按 `log_seq` 排序、`msgid` 上有索引）。被压实有界。 | 同 I 行形状；`snapPinLiveIds`/serving 读命中它 |
+| `egress_block_flow` | `(session_id, op_seq)` | 追加式**块**历史。**独立编号池**（双时钟）。 | `row_type` I/U/B · 快照 payload `{tier, startMsgid, startSeq, endMsgid, endSeq, supersedesBlockId, active, reaped, one, full}` · **`flow_op_seq`** = 写入时刻 flow 的 `MAX(op_seq)`（跨表指针）· kstate 边车（残差字段清单） |
+| `egress_block_state` | `(session_id, block_id)` | 每块最新快照（同一指针）。 | 快照 payload + `flow_op_seq` |
+| `sessions.r3_latched_at` | — | R3 身份故障 latch 载体（#7617）。NULL/0 = 未 latch。 | 双载体：读 `?? l1_world.r3_latched_at`，清**两个都清** |
+| `conversations` | — | 宿主身份认领表。egress-on 会话不再需要认领行（身份无状态）；物理 DROP 在退役登记。 | |
 
-| 表 | 角色 | 要点 |
+保留规则：flow/state 被压实**剪到最新 B base 为止**（保留底线）；block_flow 追加式（压实路径 `egressBlockCompact` 存在但尚无生产调用方，见遗留）。
+
+## 4. 一轮的生命周期
+
+1. **准备**——插件轮到达，车道仲裁选中 egress 路径；**`recordEgressTurn`** 把本轮出站视图与上一轮 diff，**立即（准备阶段，不是保存）追加 I/D/U 行到 flow**——单事务：事务内 `nextSeqs`（密度安全，#7574）、并发写守卫、若本轮有删除（折叠）则**同事务写 B base + 物理剪枝**。
+2. **Pin**——pin 通道用 op log 存活视图校验宿主的 msgid 信封（`snapPinLiveIds`，有界 serving 读）。失配 ⇒ 该轮降级（发 full 信号，下轮重锚），永不拒绝。
+3. **Kernel**——kernel 输入**从 flow 重放**（服务端权威）。折叠决策 = 下一轮的 flow 操作 + **块表操作**（摘要块生命周期的 I/U，带 `one`/`full`）。
+4. **上游**——回复中继；pf 头盖章。
+5. **保存**——会话信封保存为**仅索引**（bootstrap 起冻结）；**块记录器**把 `state.blocks` 与 `egress_block_state` diff，追加块 I/U 行，每行盖 `flow_op_seq = flow.MAX(op_seq)`。无逐轮统一 ingest（KDD #23）。
+6. **重启**——加载时重放 flow → `egress_state`（有界）；`tsStamps`/token 统计**从重放推导**，不再持久化；kstate 只留残差清单。尾部损坏时 `recoverEgressBase` 逐步回退（跨过每个健康 base 截断）直到健康点；无任何健康点 ⇒ 响亮硬失败（7439-5）。
+
+## 5. 为什么更快
+
+| 之前（每轮，10w 行会话） | 之后 |
+|---|---|
+| 统一 ingest O(**总** messages 行数) ≈ p50 2s，双账本 2× | 每轮写入 = **仅新增 flow 行** |
+| 每个水位 HIT 轮 O(全表) re-ingest 0.5–0.8s | 滑动尾窗 **re-anchor delta**：逐行索引 identity 探针，**在写事务内**裁决；任何疑点 = 改前的全量路径 |
+| serving 读打在不断增长的 messages 账本上 | **有界 serving 读**——存活视图被压实 base 保持紧凑 |
+| `tsStamps`/token 统计随 kernel 状态一起持久化 | **加载时从 flow 重放推导**（kstate 残差裁剪到残差字段清单） |
+| 每次身份判定读写 `l1_world` 游标 + resync | **无状态 stage-0** 从 op log 前沿计算 |
+
+让这一切成立的不变量：**serving 路径需要的每个读都被压实有界**；剩下的唯一 O(n) 路径（投影重建）只在回滚/web 读/恢复时各跑一次，不再逐轮。
+
+## 6. Fork 与回退
+
+- **Fork-to-now**（默认）：四张表逐字拷贝 + `sessions`；子会话两时钟各自独立继续。
+- **真·点位 fork**（水位 `wm` = flow 的 `op_seq`）：拷 flow 行 `op_seq <= wm`，拷**块行 `flow_op_seq <= wm`**（用指针而不是块自己的编号——这正是双时钟存在的意义），然后重放重建两个 state 副本。低于最新 base ⇒ 拒绝（400），直到 point-reconstruction materializer 落地——那些行是被压实按设计删掉的。
+- **回滚/降级**（关掉平面开关，或跑旧二进制）：messages 表的**惰性投影从 flow 一次性 O(n) 重建**；legacy 读者（messages + 信封）看到的会话字节完整。egress 行保留；重新开启零迁移（日志仍在最前）。
+- **降级安全性**：egress-on 会话 bootstrap 后**没有信封行**——旧二进制读不了它；所以升级只能向前，回滚走投影重建这条路，而不是「读旧文件」。
+
+## 7. 开关家族与依赖
+
+| 旗标 | 默认 | 在 egress 家族里的角色 |
 |---|---|---|
-| `egress_flow` | 只追加消息 op log(I/D/U/B 行) | PK `(session_id, op_seq)`,**表内连续**(#7574 不变量;恢复 = 回退到最新健康基,`recoverEgressBase`)。I 行携带 `log_seq`——规范、永不重发的消息编号。 |
-| `egress_state` | 活视图的读副本 | `(session_id, log_seq)`;由压缩(B 基)限界。 |
-| `egress_block_flow` | 只追加**块**历史(I/U/B 行)—— #7581 | **自己的编号池**(双时钟,owner 裁定 2026-11-24);每行携带 `flow_op_seq` = 写入时刻 flow 的 `MAX(op_seq)`(指针,单调不减 ⇒ `flow_op_seq <= X` 是前缀)。 |
-| `egress_block_state` | 每块最新快照 | `(session_id, block_id)`;同一指针。 |
-| `sessions.r3_latched_at` | R3 身份故障 latch 载体(#7617) | NULL/0 = 未 latch。双载体读(`??` 回退旧 `l1_world` 列)、双载体清(两者都清),哪个二进制 latch 的都能用;旧载体的物理 DROP 在退役登记里。 |
-| `conversations` | 宿主身份认领表 | egress-on 会话不再需要它(身份无状态化);物理 DROP 在退役登记里。 |
+| `rollout.features.egressPlane` | **100（开，2026-11-24 GA）** | 总开关。对合格会话 arm 平面。退出口：`false`/百分比 / `BILI_ROLLOUT_EGRESS_PLANE=0`。 |
+| `storage.unified`（full/shadow） | — | **前置**。仅 SQLite 车道；op log 住在统一存储里。无统一存储 ⇒ 平面无处可写，静默空转。 |
+| `pluginLaneServerHistory` | 100（GA） | **Pin**：服务端历史 + msgid 身份。没有 pin，`egressAuthority` 永不 arm——平面静默空转。 |
+| `pluginMsgIdIncremental` | 100（GA） | pin 通道的稳态尾部形态（依赖 `pluginLaneServerHistory`）。 |
+| `pluginFullResendWatermark` | 100（GA） | 同家族的快路径优化（跳过对已验证相同前缀的重解析）。 |
+| `snapshotRender`（D-lane） | 0 | **不是 egress**。服务未 arm 的插件会话；egress-on 轮按构造绕过它（`src/server/snapshot-render.ts`：`if (deps.pluginMode) return clientMsgs`）。退役触发条件见 [deprecations.zh-CN.md](./deprecations.zh-CN.md)。 |
+| `pluginIncrementalTurns` | 0 | 与 egress 无关——客户端 opt-in 的 wire 协议（#3248）。 |
 
-完整 DDL + 行/载荷形态:[egress-block-flow.md](./egress-block-flow.md)(块表)与 [#6785 文档 §6](../pr-6785-unified-storage-and-flows.md#6-round-2)(flow/state)。
+**Arm 规则**（`src/server/egress-lane-io.ts`）：`featureEnabled("egressPlane") && pluginMode && pinned && !sideRequest`——四条 wire 车道同一条规则；side 请求（标题生成、压缩调用、小预算）永不碰日志。
 
-## 操作手册
+**静默半状态是被写出来的，不是藏起来的**：`egressPlane` 开 + `pluginLaneServerHistory` 关 ⇒ 什么都不 arm，什么都不发生。四个 msgid 家族旗标默认都是 100，所以这种情况只能由运维显式关掉造成。删开关（硬编码开）在退役登记里，以 GA 稳定为前提。
 
-- **开关在哪读(解析优先级):** 环境变量 `BILI_ROLLOUT_EGRESS_PLANE`(`"0"`/`"false"` = 关,其他值 = 开)→ 配置文件 `$XDG_CONFIG_HOME/billion-context/billion-context.json`(默认 `~/.config/billion-context/billion-context.json`),键 `rollout.features.egressPlane`(`true`/`false`,或 `{ "percent": n }` 灰度)→ 代码缺省(`src/rollout.ts`):GA 翻转落地前 0 = 关,落地后 100 = 开。要开只需这一处——前置是 `storage.unified`,标准安装已经设好。
-- **整平面退出:** `BILI_ROLLOUT_EGRESS_PLANE=0`(env 优先于 config)或 `"rollout": {"features": {"egressPlane": false}}`。效果:新轮次回到 legacy 链路;已有 egress 行保留(惰性投影重建仍读它们)。
-- **降级行为(无需干预):** 任何不可重建行、损坏日志点、探针失败,只让**该轮**降级到 legacy 链路——绝不部分替换、绝不客户端当权威。**任何健康点都没有**时该轮大声硬失败(裁定 7439-5)。
-- **点式 fork:** `POST /__bili/replicas`(201 = 点式 fork 已建 / 503 = 不在驻留集 / 400 = 点在最新基之下——基下点被拒,直到点重建物化器跟进落地)。fork-to-now 逐字复制四张表;真正的点式 fork 按 `flow_op_seq <= wm` 过滤块行。
-- **R3 latch 卡住:** 查 `SELECT r3_latched_at FROM sessions WHERE session_id = ?`(旧二进制回退查 `l1_world.r3_latched_at`);清除走 store 的 clear 路径,**两个载体都清**。
-- **GC / 归档:** egress-on 会话**整体排除**在按龄 GC 之外,手动归档(`bili sessions archive`)被**拒绝**——归档格式还装不下 op log(跟进项;在此之前归档 egress-on 会话会把它的内容困死)。
-- **诊断:** `/__bili/status` 显示存储状态;恢复事件(截断基、降级轮)在代理日志里是响的。
+## 8. 操作手册
 
-## PR / 提案时间线
+- **on/off 在哪读（解析序）**：env `BILI_ROLLOUT_EGRESS_PLANE`（`"0"`/`"false"` = 关，其他值 = 开）→ 配置文件 `$XDG_CONFIG_HOME/billion-context/billion-context.json`（默认 `~/.config/billion-context/billion-context.json`）键 `rollout.features.egressPlane`（`true`/`false` 或 `{"percent": n}`）→ 代码默认（`src/rollout.ts`）：**100（GA）**。开启不需要别的（`storage.unified` 标准安装已设）。
+- **整体退出**：`BILI_ROLLOUT_EGRESS_PLANE=0`（env 优先于 config）或 `"rollout": {"features": {"egressPlane": false}}`。新轮走 legacy；已有行保留（投影重建仍读它们）。
+- **降级（无需动作）**：任何不可建行 / 损坏点 / 探针失败 ⇒ **该轮**降级 legacy。完全没有健康点 ⇒ 响亮硬失败。
+- **点位 fork**：`POST /__bili/replicas`——201 点位 fork / 503 非驻留 / 400 低于最新 base。Fork-to-now 四表逐字拷贝。
+- **R3 latch 卡住**：`SELECT r3_latched_at FROM sessions WHERE session_id = ?`（旧二进制另查 `l1_world`）；清除**两个载体都清**。
+- **GC / 归档**：egress-on 会话**完全排除在按龄 GC 之外**，手动归档（`bili sessions archive`）**被拒绝**——归档格式尚未承载 op log（遗留项）。
+- **诊断**：`/__bili/status`；恢复事件（回退截断、降级轮）在代理日志里响。
+
+## 9. PR / 提案时间线
 
 | 时间 | 内容 |
 |---|---|
-| 讨论 [#7439](https://github.com/ranxianglei/billion-context/discussions/7439) | 系列起源;五条 owner 裁定(自包含行;块表读写侧;服务端权威 + flow 回放;块表对齐;无健康点硬失败)。 |
-| KDD #23(#7474/#7475,2026-11-22) | op log = 唯一正史,`messages` 惰性投影,re-anchor delta。 |
-| #7574 | op log 完整性:事务内序号读取、`recoverEgressBase` 回退、并发写者拒绝。 |
-| 讨论 [#7577](https://github.com/ranxianglei/billion-context/discussions/7577) / #7581(已合) | `egress_block_flow`/`egress_block_state`(双时钟)、checkpoint 退役 → 点式 fork、kstate 裁剪。 |
-| 讨论 [#7591](https://github.com/ranxianglei/billion-context/discussions/7591) / #7617(已合) | 身份收拢:无状态 stage-0、R3 latch → `sessions`、conversations 对 egress-on 退役、GC/手动归档护栏。 |
-| **本 PR(GA,2026-11-24)** | `egressPlane` 缺省 0 → 100。每次 CI 都在全量跑平面;上面的退出项就是回滚面。 |
+| 讨论 [#7439](https://github.com/ranxianglei/billion-context/discussions/7439) | 系列起源；五条 owner 裁定（自包含行；块读写侧；服务端权威 + flow 重放；块表对齐；无健康点硬失败）。 |
+| KDD #23（#7474/#7475，2026-11-22） | op log = 唯一正史、`messages` 惰性投影、re-anchor delta。 |
+| #7574 | op log 完整性：事务内 seq 读、`recoverEgressBase` 回退、并发写拒绝、密度不变量。 |
+| [#7577](https://github.com/ranxianglei/billion-context/discussions/7577) / **#7581**（已合并） | `egress_block_flow`/`egress_block_state`（**双时钟**——共用时钟方案在 review 中被否：它会在第一次折叠时击穿 flow 密度）、checkpoint 退役 → 点位 fork、kstate 裁剪。 |
+| [#7591](https://github.com/ranxianglei/billion-context/discussions/7591) / **#7617**（已合并） | 身份收拢：无状态 stage-0、R3 latch → `sessions`、conversations 对 egress-on 退役、GC/手动归档守卫。 |
+| **#7659（本 PR，GA 2026-11-24）** | `egressPlane` 默认 0 → 100；本文档；[deprecations.zh-CN.md](./deprecations.zh-CN.md)；KDD #24。此后每次 CI 都是全量对平面的真实暴露。 |
 
-**开放跟进项**(有跟踪,不阻塞 GA):点重建物化器(最新基之下的 fork 点);归档格式获得 op log(在此之前 egress-on 归档被拒);`egressBlockCompact`/`Replay` 还没有生产调用方(块日志压缩);退役身份载体的物理 DROP 批次。
+**遗留**（已跟踪，不挡 GA）：point-reconstruction materializer（低于最新 base 的 fork 点）；归档格式承载 op log；`egressBlockCompact`/`Replay` 的生产调用方；退役身份载体的物理 DROP 批次；按退役登记表删开关（硬编码开）。

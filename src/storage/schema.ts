@@ -481,9 +481,12 @@ CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msg
  *  block-set read replica (PK (session_id, block_id), one latest snapshot per
  *  block; compaction may physically trim it). SELF-CONTAINED BYTES (D2,
  *  ruling 7439-1): the one/full block content is inlined in the payload —
- *  zero content-CAS refs, zero hash columns. op_seq shares the SAME append
- *  clock as egress_flow (one transaction per turn writes both logs), so any
- *  op_seq aligns the message view and the block set. Probe-first, no version
+ *  zero content-CAS refs, zero hash columns. DUAL CLOCKS (owner ruling
+ *  2026-11-24): the block tables number THEMSELVES (op_seq dense within
+ *  egress_block_flow); flow_op_seq is the pointer to the flow clock (its
+ *  MAX at write time) used for cross-table alignment at point forks — the
+ *  original shared-clock design was rejected in review because it broke the
+ *  flow's density invariant on the first fold. Probe-first, no version
  *  bump (the tables never shipped, like the egress pair). */
 const EGRESS_BLOCK_DDL = `-- #7577: block lifecycle log (flow + state), self-contained bytes, kstate sidecar.
 -- Dual clocks (owner ruling 2026-11-24): the block tables number THEMSELVES

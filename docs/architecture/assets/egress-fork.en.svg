@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="470" viewBox="0 0 1240 470">
+<rect width="1240" height="470" fill="#ffffff"/>
+<text x="40" y="36" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="16" font-weight="bold" fill="#1a2b4a">Fork and rollback</text>
+<rect x="40" y="70" width="220" height="90" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="52" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">Parent session</text>
+<text x="52" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_flow + state</text>
+<text x="52" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">block_flow + block_state</text>
+<text x="52" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">sessions row</text>
+<rect x="340" y="60" width="400" height="100" rx="8" fill="#e8f6ec" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="352" y="80" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">Fork-to-now (default)</text>
+<text x="352" y="100" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">All four tables copied verbatim + sessions</text>
+<text x="352" y="115" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Child continues both clocks independently</text>
+<rect x="340" y="200" width="400" height="170" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="352" y="220" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">True point fork (watermark wm = flow op_seq)</text>
+<text x="352" y="240" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">flow rows: op_seq &lt;= wm</text>
+<text x="352" y="255" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">block rows: flow_op_seq &lt;= wm (the pointer,</text>
+<text x="352" y="270" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">not the block's own number — that's the</text>
+<text x="352" y="285" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">whole point of dual clocks)</text>
+<text x="352" y="300" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">then rebuild both state replicas by replay</text>
+<text x="352" y="315" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Below the newest base ⇒ refused (400):</text>
+<text x="352" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">those rows were pruned by design</text>
+<rect x="820" y="70" width="380" height="130" rx="8" fill="#f3e6f5" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="832" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">Rollback / downgrade (opt-out or old binary)</text>
+<text x="832" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">The lazy messages projection is rebuilt</text>
+<text x="832" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">one-time, O(n), from the flow</text>
+<text x="832" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Legacy readers see a byte-complete session;</text>
+<text x="832" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress rows stay; re-enable is zero migration</text>
+<rect x="820" y="240" width="380" height="120" rx="8" fill="#f3e6f5" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="832" y="260" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">Degrade ladder (per turn)</text>
+<text x="832" y="280" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Any unrebuildable row / corrupt point /</text>
+<text x="832" y="295" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">probe failure ⇒ the WHOLE turn goes legacy,</text>
+<text x="832" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">never a partial swap</text>
+<text x="832" y="325" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">No healthy point ⇒ loud hard fail (7439-5)</text>
+<line x1="260" y1="100" x2="336" y2="100" stroke="#3a5a8a" stroke-width="1.8"/><polygon points="336,100 327,96 327,104" fill="#3a5a8a"/><line x1="260" y1="130" x2="336" y2="260" stroke="#3a5a8a" stroke-width="1.8"/><polygon points="336,260 327,256 327,264" fill="#3a5a8a"/><text x="298" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#7a3b0f" text-anchor="middle" font-weight="bold">wm = a past point</text><line x1="740" y1="130" x2="816" y2="130" stroke="#3a5a8a" stroke-width="1.8"/><polygon points="816,130 807,126 807,134" fill="#3a5a8a"/><text x="778" y="120" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#7a3b0f" text-anchor="middle" font-weight="bold">opt-out / old version</text><rect x="340" y="400" width="860" height="55" rx="8" fill="#fff6e6" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="352" y="420" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">Retention floor = the newest B base</text>
+<text x="352" y="440" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">History below it is physically deleted ⇒ forks below it are refused (never guessed); block rows always follow the flow pointer, so point slices never cross tables</text>
+</svg>

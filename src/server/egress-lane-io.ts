@@ -41,7 +41,7 @@
 // the lane's OUTBOUND system text (post-injection), so system drift is
 // visible as a +U op on that row.
 //
-// Rollout gate (egressPlane, default 0) and each lane's arming condition
+// Rollout gate (egressPlane, default 100 since the 2026-11-24 GA) and each lane's arming condition
 // are owned by the caller.
 
 import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, type EgressOpLogStore } from "../storage/egress-record.js";
