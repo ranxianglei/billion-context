@@ -194,14 +194,20 @@ function prefixCompare(a: Buffer, b: Buffer): { rel: "append" | "diverge"; offse
     return { rel: "diverge", offset: n, extra: b.length - a.length };
 }
 
+// Wire offsets are UTF-8 bytes; JSON spans and string slices use UTF-16.
+// A differing byte can be inside a multibyte code point, so begin evidence at
+// its leading byte instead of decoding a partial prefix as a replacement char.
+function textOffsetAtByte(body: Buffer, offset: number): number {
+    let start = offset;
+    while (start > 0 && start < body.length && (body[start]! & 0xc0) === 0x80) start--;
+    return body.subarray(0, start).toString("utf8").length;
+}
+
 // #3476: true iff `prev` is fully covered by the common prefix (length `lcp`)
 // plus some common suffix — i.e. its middle residual is EMPTY — while `cur`
-// carries extra bytes in that middle. That is a SEMANTIC append: no prior byte
-// moved or changed, only new bytes landed between a stable head and a stable
-// trailer (e.g. a single giant message whose interior container grows, with a
-// fixed trailer shifting right). A genuine rewrite leaves a non-empty residual
-// on the shorter side, so it is never matched here — this cannot mask a real
-// mid-history break.
+// carries extra bytes in that middle. The caller must also check that the
+// insertion is inside one existing message: adding a whole message to the
+// middle of history has this byte shape too, but breaks the shared prefix.
 function isMidInsertionAppend(prev: Buffer, cur: Buffer, lcp: number): boolean {
     if (cur.length <= prev.length || lcp >= prev.length) return false;
     const room = prev.length - lcp;
@@ -218,6 +224,31 @@ interface MsgArrayInfo {
     items: unknown[];
 }
 
+function rootArrayStart(text: string, key: string): number {
+    let depth = 0;
+    let found = -1;
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i]!;
+        if (c === '"') {
+            const start = i++;
+            while (i < text.length) {
+                if (text[i] === "\\") { i += 2; continue; }
+                if (text[i] === '"') break;
+                i++;
+            }
+            if (depth !== 1) continue;
+            let value = i + 1;
+            while (value < text.length && " \t\n\r".includes(text[value]!)) value++;
+            if (text[value] !== ":" || JSON.parse(text.slice(start, i + 1)) !== key) continue;
+            value++;
+            while (value < text.length && " \t\n\r".includes(text[value]!)) value++;
+            found = text[value] === "[" ? value : -1;
+        } else if (c === "{" || c === "[") depth++;
+        else if (c === "}" || c === "]") depth--;
+    }
+    return found;
+}
+
 function msgArrayInfo(text: string): MsgArrayInfo | null {
     let parsed: unknown;
     try { parsed = JSON.parse(text); } catch { return null; }
@@ -226,16 +257,8 @@ function msgArrayInfo(text: string): MsgArrayInfo | null {
     for (const key of MSG_KEYS) {
         const arr = obj[key];
         if (!Array.isArray(arr)) continue;
-        const re = new RegExp(`"${key}"\\s*:\\s*\\[`, "g");
-        let firstStart = -1;
-        let m: RegExpExecArray | null;
-        while ((m = re.exec(text)) !== null) {
-            const start = m.index + m[0].length - 1;
-            if (firstStart < 0) firstStart = start;
-            const spans = elementSpans(text, start);
-            if (spans.length === arr.length) return { key, spans, items: arr };
-        }
-        if (firstStart >= 0) return { key, spans: elementSpans(text, firstStart), items: arr };
+        const start = rootArrayStart(text, key);
+        if (start >= 0) return { key, spans: elementSpans(text, start), items: arr };
     }
     return null;
 }
@@ -281,6 +304,7 @@ function elementSpans(text: string, arrStart: number): Array<[number, number]> {
             while (i < len && text[i] !== "," && text[i] !== "]") i++;
         }
         spans.push([s, i]);
+        while (i < len && " \t\n\r".includes(text[i]!)) i++;
         if (text[i] === ",") i++;
         else break;
     }
@@ -341,6 +365,7 @@ export function compareWires(aBody: Buffer, bBody: Buffer): WireRel {
         };
     }
     const O = byteRel.offset;
+    const textOffset = textOffsetAtByte(bBody, O);
     const ia = msgArrayInfo(aText);
     const ib = msgArrayInfo(bText);
     if (ia && ib && ia.key === ib.key && ia.items.length > 0 && ib.items.length >= ia.items.length) {
@@ -354,20 +379,20 @@ export function compareWires(aBody: Buffer, bBody: Buffer): WireRel {
             }
             if (sharedOk) {
                 const lastEnd = ib.spans[n - 1]![1];
-                if (O >= lastEnd) {
+                if (textOffset >= lastEnd) {
                     return {
                         rel: "append", byteOffset: O, extra: byteRel.extra, preArray: false,
                         append: { kind: ib.items.length > ia.items.length ? "json-tail" : "tail-fields", countA: ia.items.length, countB: ib.items.length },
                     };
                 }
-                if (O < ib.spans[0]![0]) {
+                if (textOffset < ib.spans[0]![0]) {
                     return { rel: "diverge", byteOffset: O, extra: byteRel.extra, append: null, preArray: true };
                 }
                 // O sits in the glue between two shared elements: tolerate
                 // whitespace/comma-only reshaping (pretty vs compact).
                 let gi = -1;
                 for (let i = 0; i < n - 1; i++) {
-                    if (O >= ib.spans[i]![1] && O <= ib.spans[i + 1]![0]) { gi = i; break; }
+                    if (textOffset >= ib.spans[i]![1] && textOffset <= ib.spans[i + 1]![0]) { gi = i; break; }
                 }
                 if (gi >= 0) {
                     const strip = (s: string) => s.replace(/[,\s]/g, "");
@@ -387,18 +412,40 @@ export function compareWires(aBody: Buffer, bBody: Buffer): WireRel {
     // logical unit extending in place (auto-review FILTERED_HISTORY + fixed
     // PENDING_ACTION trailer). Byte-wise a mid-body insertion; semantically an
     // append. Recognize it instead of flagging a rewrite.
-    if (isMidInsertionAppend(aBody, bBody, O)) {
-        return {
-            rel: "append", byteOffset: O, extra: byteRel.extra, preArray: false,
-            append: { kind: "mid-insert", countA: ia?.items.length ?? 0, countB: ib?.items.length ?? 0 },
-        };
+    if (ia && ib && ia.key === ib.key && isMidInsertionAppend(aBody, bBody, O)) {
+        const added = bText.length - aText.length;
+        if (ia.items.length === ib.items.length && ia.spans.some(([start, end], index) => {
+            const current = ib.spans[index];
+            return textOffset > start && textOffset < end
+                && current?.[0] === start && current[1] === end + added;
+        })) {
+            return {
+                rel: "append", byteOffset: O, extra: byteRel.extra, preArray: false,
+                append: { kind: "mid-insert", countA: ia.items.length, countB: ib.items.length },
+            };
+        }
+        // An empty history has no existing element to extend. Inserting at
+        // its closing bracket is still an ordinary first tail append.
+        if (ia.items.length === 0) {
+            const start = rootArrayStart(aText, ia.key);
+            const close = aText.indexOf("]", start + 1);
+            if (textOffset > start && textOffset <= close && rootArrayStart(bText, ib.key) === start) {
+                return {
+                    rel: "append", byteOffset: O, extra: byteRel.extra, preArray: false,
+                    append: { kind: "json-tail", countA: 0, countB: ib.items.length },
+                };
+            }
+        }
     }
-    return { rel: "diverge", byteOffset: O, extra: byteRel.extra, append: null, preArray: false };
+    const arrayStart = ib ? rootArrayStart(bText, ib.key) : -1;
+    return { rel: "diverge", byteOffset: O, extra: byteRel.extra, append: null, preArray: arrayStart >= 0 && textOffset < arrayStart };
 }
 
 export interface UsageSample { ts: number; input: number; cached: number; }
 
-const USAGE_LINE_RE = /^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})?) \[[a-z]+\] \[([^\]]+)\] (?:\[plugin\] )?\[acp-usage\](?: round \d+)? input=(\d+) cached=(\d+)/;
+const USAGE_LINE_RE = /^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})?) \[[a-z]+\] ((?:\[[^\]]+\] )+)\[acp-usage\](?: round \d+)? input=(\d+) cached=(\d+)/;
+const USAGE_LOG_TAGS_RE = /^(?:\[sess=[^\]]+\] )?\[v=[^\]]+\] /;
+const USAGE_SESSION_RE = /^\[([^\]]+)\] (?:\[plugin\] )?$/;
 
 export async function parseUsageLog(file: string): Promise<Map<string, UsageSample[]>> {
     const bySession = new Map<string, UsageSample[]>();
@@ -410,9 +457,14 @@ export async function parseUsageLog(file: string): Promise<Map<string, UsageSamp
     for await (const line of readLogLines([file], { onError: (_f, e) => { readError ??= e; } })) {
         const m = USAGE_LINE_RE.exec(line);
         if (!m) continue;
+        // Current logger attribution precedes the explicit usage session.
+        // Strip it before parsing that session, so a missing id cannot fall
+        // back to the version tag and a request scope cannot steal attribution.
+        const session = USAGE_SESSION_RE.exec(m[2]!.replace(USAGE_LOG_TAGS_RE, ""));
+        if (!session) continue;
         const ts = Date.parse(m[1]!);
         if (Number.isNaN(ts)) continue;
-        const sid = safeSessionId(m[2]!);
+        const sid = safeSessionId(session[1]!);
         const list = bySession.get(sid) ?? [];
         list.push({ ts, input: Number(m[3]), cached: Number(m[4]) });
         bySession.set(sid, list);
@@ -434,11 +486,12 @@ const USAGE_SKEW_MS = 50;
 function alignUsage(outTs: number[], samples: UsageSample[]): UsageSample[][] {
     // A usage line belongs to the latest request whose dump predates it —
     // responses (and their usage logs) always land after the request dump.
+    // Both inputs are sorted by time, so each request need only be visited once.
     const assigned: UsageSample[][] = outTs.map(() => []);
+    let request = -1;
     for (const s of samples) {
-        for (let i = outTs.length - 1; i >= 0; i--) {
-            if (outTs[i]! <= s.ts + USAGE_SKEW_MS) { assigned[i]!.push(s); break; }
-        }
+        while (request + 1 < outTs.length && outTs[request + 1]! <= s.ts + USAGE_SKEW_MS) request++;
+        if (request >= 0) assigned[request]!.push(s);
     }
     return assigned;
 }
@@ -487,8 +540,9 @@ function classifyPair(index: number, tsA: number, tsB: number, aOut: DumpContent
             : passthroughPair ? "client" : "both";
         const bText = bOut.body.toString("utf8");
         const info = msgArrayInfo(bText);
-        const loc = info ? locateMessage(info.items, info.spans, outRel.byteOffset) : { index: null, roleType: null };
-        const snip = snippetAround(bText, outRel.byteOffset);
+        const textOffset = textOffsetAtByte(bOut.body, outRel.byteOffset);
+        const loc = info ? locateMessage(info.items, info.spans, textOffset) : { index: null, roleType: null };
+        const snip = snippetAround(bText, textOffset);
         divergence = { offset: outRel.byteOffset, messageIndex: loc.index, roleType: loc.roleType, before: snip.before, after: snip.after };
         if (outRel.preArray) notes.push("divergence before the message array (field-level change)");
         if (inRel && inRel.rel === "diverge") incomingDivergenceOffset = inRel.byteOffset;

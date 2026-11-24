@@ -128,5 +128,5 @@ test("fold receipt names the anchor when the zone brushes the protected range (#
   assert.ok(!block.effectiveMessageIds.includes("p7"), "real request never folds");
   const warn = result.result.warnings.find((w) => w.startsWith("Excluded"));
   assert.ok(warn, `expected an exclusion warning, got: ${JSON.stringify(result.result.warnings)}`);
-  assert.match(warn, /Last-user anchor: m00007 "current live request: run the migration "/, "receipt names the anchor ref + first 40 chars");
+  assert.match(warn, /Last-user anchor \(historical quote, NOT a new user message\): m00007 "current live request: run the migration "/, "receipt names the anchor ref + first 40 chars");
 });

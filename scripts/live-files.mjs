@@ -57,6 +57,9 @@ export const LIVE_FILES = [
     // both spawn the corrupt-index-child helper (unified-store cold-load
     // corruption probes, #4216/#4249 follow-ups); append-only per the note above
     "tests/storage-engine-proofs.test.ts",
+    // lock-holder CHILD process parks on a hermetic mkdtemp index.db (#2195
+    // release-gate pin); binds no ports — zone slot is a formality
+    "tests/storage-open-busy-lock.test.ts",
     "tests/web-storage-banner.test.ts",
     // #4434 (split-brain surface): spawns bili CLI children against a throwaway
     // origin; own probe server is listen(0) so only the zone band matters
@@ -139,6 +142,25 @@ export const LIVE_FILES = [
     "tests/pack-install.test.ts",
     // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
     "tests/ci-janitor-fork-heads.test.ts",
+    // Heap-bounded log readers in isolated children; private files, no sockets.
+    "tests/web-logs-query.test.ts",
+    // Native-zstd absence is simulated in an isolated Node child; it binds
+    // no sockets and changes only that child's built-in module exports.
+    "tests/content-encoding-zstd.test.ts",
+    // One Linux-only Node child reads fixture system CAs and exits within 10s;
+    // no child ports or network I/O. In-process HTTPS fixtures use listen(0).
+    "tests/upstream-ca-default-trust.test.ts",
+    // #7156: the close-time cache-refresh gate test spawns ONE bare `node -e`
+    // dummy child purely as a live PID holder for the <db>.lock fixture — no
+    // ports, no servers, mkdtemp-isolated per test, SIGKILL'd in t.after, so
+    // the zone band is irrelevant; the entry is for the tripwire, like
+    // #5046/#4612.
+    "tests/storage-integrity-cache.test.ts",
+    // #7156: the only child is spawnSync("true") in freshDeadPid() — a
+    // guaranteed-dead pid for the stale-lock fixture; no ports, no servers,
+    // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
+    // for the tripwire, like #5046/#4612.
+    "tests/storage-backup-repair.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

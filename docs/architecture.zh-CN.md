@@ -23,7 +23,7 @@
 |---|---|---|---|
 | `storage` | 统一 SQLite 存储（表族 / kstate / ckpt / GC） | [storage.zh-CN.md](./architecture/storage.zh-CN.md) · [EN](./architecture/storage.md) | ✅ |
 | `pipeline` | 请求管道（handle / prepare-* / relay / inject） | [pipeline.zh-CN.md](./architecture/pipeline.zh-CN.md) · [EN](./architecture/pipeline.md) | ✅ |
-| `lanes` | 宿主车道（dsh / pi / opencode / codex / 裸代理 + lane-decisions） | [lanes.zh-CN.md](./architecture/lanes.zh-CN.md) · [EN](./architecture/lanes.md) | ✅ |
+| `lanes` | 宿主车道（dsh / pi / opencode / codex / 裸代理 + lane-decisions；Pi Anthropic 全量请求兼容） | [lanes.zh-CN.md](./architecture/lanes.zh-CN.md) · [EN](./architecture/lanes.md) | ✅ |
 | `kernel` | 压缩内核（acp-kernel：折叠 / 摘要 / ref 账本） | [kernel.zh-CN.md](./architecture/kernel.zh-CN.md) · [EN](./architecture/kernel.md) | ✅ |
 | `identity` | 会话与消息身份（session id / persona fork / msgid 通道） | [identity.zh-CN.md](./architecture/identity.zh-CN.md) · [EN](./architecture/identity.md) | ✅ |
 | `fastpaths` | 快路径（增量车道 / v5 watermark / D-lane 快照渲染） | [fastpaths.zh-CN.md](./architecture/fastpaths.zh-CN.md) · [EN](./architecture/fastpaths.md) | ✅ |

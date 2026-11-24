@@ -17,11 +17,19 @@ import { normalizeUpstreamOrigin } from "../src/util.ts";
 // exhaustion now forwards once for upstream arbitration instead of failing
 // fast locally. This pin asserts the LOCAL futility-skip contract, so it
 // carries a settled usage baseline to keep testing the evidence-driven path.
+// Identity-fast-path update: a bare CURRENT-ORIGIN usage baseline would open
+// the fast path ("trust upstream reality over local doom-math") and forward,
+// so the seed additionally arms a stated upstream wall (overflowArmTokens) —
+// the upstream has declared the window is HARD, which demotes the fast path
+// and restores the 413 futility contract under test. (An estimate-grade or
+// foreign-origin baseline instead demotes the floor to 0 and opens the #2313
+// forward-once evidence probe — also not the contract this pin targets.)
 function seedEvidence(upstreamPort: number, sessionId: string): void {
     const s = getSession(sessionId);
     s.stats.lastInputTokens = 100;
     s.stats.lastInputTokensSource = "usage";
     s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(`http://127.0.0.1:${upstreamPort}`);
+    s.stats.overflowArmTokens = 30_000; // stated wall → fast path demoted (#3450)
 }
 
 // #1841: when the cumulative mass of ALL foldable content cannot close the gap
@@ -157,7 +165,7 @@ function bulkTokens(repeat: number, pairs: number): number {
     return Math.round((pairs * (22 * repeat + 45)) / 4);
 }
 
-test("#1841 A: a payload whose foldable pool cannot close the gap skips the round with zero summary calls", async () => {
+test("#1841 A: a payload whose foldable pool cannot close the gap skips the round with zero summary calls (stated wall → evidence 413 survives #7537)", async () => {
     CALLS = [];
     summaryResponder = () => ({ content: SUMMARY_TEXT, finishReason: "stop" });
     const p = await boot();
@@ -181,13 +189,53 @@ test("#1841 A: a payload whose foldable pool cannot close the gap skips the roun
         seedEvidence(p.upstreamPort, "issue1841-futility-skip");
         const resp = await post(p, "issue1841-futility-skip", messages);
         const body = await resp.text();
-        assert.equal(resp.status, 413, `a futile round must fail fast non-retryably (#3461): HTTP ${resp.status} ${body.slice(0, 240)}`);
+        // The seed arms a STATED upstream wall (overflowArmTokens = the
+        // window): the upstream itself declared this ceiling hard. A payload
+        // over a proven wall with nothing more that can fold is an EVIDENCE
+        // refusal — it survives the #7537 estimate-refusal removal (#3461).
+        assert.equal(resp.status, 413, `a futile round against a proven wall must fail fast non-retryably: HTTP ${resp.status} ${body.slice(0, 240)}`);
         const json = JSON.parse(body) as { error?: { code?: string; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         assert.match(json.error?.message ?? "", /futile round/, `names the futility verdict (got: ${json.error?.message})`);
         assert.match(json.error?.message ?? "", /maximum possible saving/, `quotes the pool bound (got: ${json.error?.message})`);
         assert.equal(CALLS.filter((c) => c.summary).length, 0, "a skipped round must spend ZERO summarization calls");
         assert.equal(CALLS.length, 0, "the over-window payload must not be forwarded either");
+    } finally {
+        await p.cleanup();
+    }
+});
+
+test("#1841 A2 (#7537): the SAME futile payload with NO stated wall is FORWARDED — no local estimate-refusal", async () => {
+    CALLS = [];
+    summaryResponder = () => ({ content: SUMMARY_TEXT, finishReason: "stop" });
+    const p = await boot();
+    try {
+        // Same fixture as A, but the session carries NO overflow-arm wall
+        // (no seed): the futility verdict rests on bili's own estimate only.
+        // #7537 (owner ruling): that estimate no longer answers a local 413 —
+        // the payload is forwarded and the upstream decides (this mock
+        // accepts → 200). Zero summarization calls: the skipped round still
+        // skips; only the refusal goes away.
+        const REPEAT = 3157;
+        const poolTok = 4 * 440;
+        const est = bulkTokens(REPEAT, 2) + poolTok;
+        assert.ok(est > WINDOW && est - WINDOW > poolTok * 1.2, `fixture must be futile (${est} vs ${WINDOW}, pool ${poolTok})`);
+        const messages: Record<string, unknown>[] = [
+            plain("user", "OLD_WORK_A ".repeat(160)),
+            plain("assistant", "ANSWER_A ".repeat(160)),
+            ...bashPair(1, REPEAT),
+            ...bashPair(2, REPEAT),
+            plain("user", "OLD_WORK_B ".repeat(160)),
+            plain("assistant", "ANSWER_B ".repeat(160)),
+            plain("user", "ok"),
+            plain("assistant", "done"),
+        ];
+        const resp = await post(p, "issue1841-futility-nowall", messages);
+        const body = await resp.text();
+        assert.equal(resp.status, 200, `a futile round with no proven wall now forwards (#7537): HTTP ${resp.status} ${body.slice(0, 240)}`);
+        assert.ok(body.includes("forwarded answer"), "the model reply must reach the client");
+        assert.equal(CALLS.filter((c) => c.summary).length, 0, "a skipped round must spend ZERO summarization calls");
+        assert.equal(CALLS.length, 1, "the over-window payload is forwarded exactly once (the upstream is the size authority)");
     } finally {
         await p.cleanup();
     }

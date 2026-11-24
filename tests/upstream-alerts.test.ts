@@ -383,10 +383,15 @@ test("#1682: transport failure appears in /__bili/overview and clears on recover
         const a1 = await overviewAlerts(proxyPort);
         assert.equal(a1.length, 1);
         assert.equal(a1[0].kind, "connect-refused");
+        assert.equal(a1[0].code, "ECONNREFUSED");
         assert.equal(a1[0].host, `127.0.0.1:${deadPort}`);
         assert.equal(a1[0].count, 1);
         assert.ok(typeof a1[0].hint === "string" && a1[0].hint.length > 0);
         assert.equal(a1[0].firstSeen, a1[0].lastSeen);
+        const healthResponse = await fetch(`http://127.0.0.1:${proxyPort}/__bili/upstreams`);
+        assert.equal(healthResponse.status, 200);
+        const health = await healthResponse.json() as ReturnType<typeof getUpstreamHealthReport>;
+        assert.equal(health.upstreams[0]?.code, "ECONNREFUSED");
 
         // 2) second failure → same entry, count bumped, no stacking
         const r2 = await chatPost(proxyPort, deadPort, "ep-alerts-1");
@@ -602,6 +607,32 @@ test("#1682: banner renders active alerts, dismisses per instance, hides on reco
         const h3 = await runWebClient(base, "#/overview", storage);
         await waitFor(() => h3.els.has("alerts-banner"), "third overview poll");
         assert.equal(h3.els.get("alerts-banner")!.hidden, true);
+    } finally {
+        await close(proxy);
+        _resetUpstreamAlertsForTest();
+    }
+});
+
+test("banner drops the skipped-proxy advice when the latest failure did not skip a proxy", async () => {
+    _resetUpstreamAlertsForTest();
+    const url = "https://relay.example.com/v1/messages";
+    const error = netError("UND_ERR_CONNECT_TIMEOUT");
+    const deadPort = await freePort();
+    const { proxy, proxyPort } = await startProxyFor(deadPort, false);
+    const base = `http://127.0.0.1:${proxyPort}`;
+    try {
+        recordUpstreamAlert(url, error, false, { proxy: "http://127.0.0.1:7890", source: "HTTPS_PROXY" });
+        const first = await runWebClient(base, "#/overview", new Map());
+        await waitFor(() => first.els.get("alerts-banner")?.hidden === false, "initial skipped-proxy banner");
+        assert.match(first.els.get("alerts-banner")!.children[1].children[0].textContent, /127\.0\.0\.1:7890/);
+
+        recordUpstreamAlert(url, error, true);
+        const current = await runWebClient(base, "#/overview", new Map());
+        await waitFor(() => current.els.get("alerts-banner")?.hidden === false, "current failure banner");
+        const message = current.els.get("alerts-banner")!.children[1].children[0].textContent;
+        assert.match(message, /relay\.example\.com \(connect-timeout ×2/);
+        assert.ok(!message.includes("127.0.0.1:7890"));
+        assert.ok(!message.includes("HTTPS_PROXY"));
     } finally {
         await close(proxy);
         _resetUpstreamAlertsForTest();

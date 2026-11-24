@@ -55,6 +55,8 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
+const requireSync = createRequire(import.meta.url);
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORK = process.env.PLUGIN_LANES_WORK || path.join(process.env.WORKDIR || process.cwd(), "plugin-lanes");
@@ -70,6 +72,39 @@ const MODEL1 = {
 // comma-separated MODEL1_MODEL (host wrapper passes a pair) — register every id,
 // drive with the first (matches Lane A's model rotation semantics).
 const MODEL_IDS = String(MODEL1.model).split(",").map((s) => s.trim()).filter(Boolean);
+
+// GATE_SNAPBASE / GATE_SNAPSHOT_RENDER (#6785 verification): flip the
+// candidate's new-plane rollouts LIVE through the CONFIG tier —
+// rollout.features.<name>=true (a forced-on shorthand the rollout resolver
+// honors above bucketing). The env tier (BILI_ROLLOUT_*) does NOT reach the
+// lane proxies: cleanEnv() strips BILI_* from the spawn env by design
+// (2026-11-16 gate run 3 showed snapshotRender=off(bucket) with the env set).
+//
+// GATE_SNAPBASE: the EGRESS op-log plane — successor of the retired snapBase
+// v2 plane (bc51c9445, ruling 7439: `storage.snapBase.*` left the config
+// surface, `rollout.egressPlane` is the one switch). Unset/0/off = off
+// (byte-identical gate); any other value ("all" or a protocol cohort list)
+// forces egressPlane=true. The egress plane has NO per-protocol cohort
+// surface (one switch for all lanes, ruling 7439), so every on-value turns
+// the whole plane on.
+// GATE_SNAPSHOT_RENDER: snapshotRender plus the msgid-plane rollouts that
+// ship with this candidate (pluginMsgIdIncremental, identityChannelHarvest).
+export function gateRolloutCfg() {
+  const snap = String(process.env.GATE_SNAPBASE || "");
+  const render = String(process.env.GATE_SNAPSHOT_RENDER || "");
+  const snapOn = !!snap && snap !== "0" && snap.toLowerCase() !== "off";
+  const renderOn = !!render && render !== "0" && render.toLowerCase() !== "off";
+  if (!snapOn && !renderOn) return {};
+  const features = {};
+  if (snapOn) features.egressPlane = true;
+  if (renderOn)
+    Object.assign(features, {
+      snapshotRender: true,
+      pluginMsgIdIncremental: true,
+      identityChannelHarvest: true,
+    });
+  return { rollout: { features } };
+}
 const MODEL_MAIN = MODEL_IDS[0];
 const AGENTS = (process.env.GATE_AGENTS || "dsh,pi,codex,opencode,claude")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -100,6 +135,10 @@ if (!TGZ || !REPO || !MODEL1.base || !MODEL1.model) {
 }
 
 const results = [];
+// Recorders spawned for in-flight lanes (lane -> handle), killed from
+// main()'s catch when a lane aborts before its own teardown (2026-11-14
+// leak fix). A Map because lanes run concurrently (2026-11-15 parallel gate).
+const activeRec = new Map();
 // #3475: lanes whose upstream lacks the protocol door — degraded verdict,
 // excluded from the failure tally (see runLane's env-blocked rule).
 const BLOCKED = new Map(); // lane -> { kind: "env" | "client", reason }
@@ -135,7 +174,7 @@ function readJsonl(file) {
 // corpus (same deterministic shape as scripts/release-gate-local.mjs —
 // 40 sections, codeword canaries double as fold-recall probes)
 // ---------------------------------------------------------------------------
-const CODEWORDS = [
+export const CODEWORDS = [
   "KOAPEL", "TRIVANE", "MURENOK", "SALDIRA", "VEKTRUM", "OLPHANE", "QUIMERA", "ZANDREL",
   "FEROVIK", "LUMETRA", "GHORVAL", "NEXAPIL", "TAVRUON", "SILMADE", "PROVANE", "WEXILOR",
   "ANDRIKE", "MOLVANE", "KESTRIUM", "ULFARON", "BRAVINEK", "TORSELI", "IMMERAL", "DAXUVEN",
@@ -144,7 +183,7 @@ const CODEWORDS = [
 ];
 const S = (i) => `S${String(i + 1).padStart(2, "0")}`;
 const sectionTitle = (i) => `TITLE: GATE-MARK-${S(i)}-${CODEWORDS[i]}`;
-function buildCorpus(targetTokens) {
+export function buildCorpus(targetTokens) {
   const wordsPerSection = Math.max(150, Math.round((targetTokens * 0.72) / 40));
   const out = ["# GATE CORPUS — plugin-lanes fixture (deterministic)", ""];
   for (let s = 0; s < 40; s++) {
@@ -271,6 +310,7 @@ async function runLane(agent, recipe) {
         },
       },
       compress: { preserveRecentTokens: 0 },
+      ...gateRolloutCfg(),
     }, null, 2));
   writeWindow(BIG_WINDOW);
 
@@ -280,8 +320,13 @@ async function runLane(agent, recipe) {
   console.log(`-- lane ${agent}: recorder :${recPort} -> ${MODEL1.base}`);
   const rec = spawn("node", [path.join(HERE, "upstream-recorder.mjs")], {
     env: { ...process.env, RECORDER_PORT: String(recPort), RECORDER_TARGET: MODEL1.base, RECORDER_OUT: recOut },
-    stdio: ["ignore", "ignore", "inherit"], detached: true,
+    // stderr to a per-lane file: inheriting the lane's log pipe meant a
+    // detached recorder surviving an aborted lane held the entrypoint's
+    // `| tee` pipe open and wedged the whole gate (2026-11-14, 3h hang).
+    stdio: ["ignore", "ignore", fs.openSync(path.join(laneDir, "recorder.stderr.log"), "a")],
+    detached: true,
   });
+  activeRec.set(agent, rec);
 
   const baseEnv = cleanEnv({
     HOME: path.join(laneDir, "home"),
@@ -350,7 +395,7 @@ async function runLane(agent, recipe) {
     // the corpus middle — models sometimes elide it despite the chunk-read
     // instruction (observed in proxy mode). Verify the precondition at t1
     // instead of letting downstream recalls fail for fixture reasons.
-    const t1 = await recipe.turn(ctx, `Read corpus.md in your cwd fully (~1300 lines). Your read tool may truncate or ELIDE the middle of a long file (e.g. claude-code's Read shows head+tail with "... N lines elided ...") — read in sequential chunks (offset 1, 201, 401, …, ~200 lines each, or equivalent line-range calls) until you have seen EVERY line including the middle; do not stop at a truncation or elision. Then reply with ONLY the TITLE lines of sections S40 and S07 (one per line). Do not run any other tool or command.`, sid, "t1");
+    const t1 = await recipe.turn(ctx, `Read corpus.md in your cwd fully (it is ${fs.readFileSync(path.join(laneDir, "work", "corpus.md"), "utf8").split("\n").length} lines — do not stop early because the file looks shorter than you expected). Your read tool may truncate or ELIDE the middle of a long file (e.g. claude-code's Read shows head+tail with "... N lines elided ...") — read in sequential chunks (offset 1, 201, 401, …, ~200 lines each, or equivalent line-range calls) until you have seen EVERY line including the middle; do not stop at a truncation or elision. Then reply with ONLY the TITLE lines of sections S40 and S07 (one per line). Do not run any other tool or command.`, sid, "t1");
     fs.writeFileSync(path.join(ctx.laneDir, `turn-t1.txt`), t1.out || "");
     record(agent, "t1 read @ big window completes", t1.ok, t1.why.slice(0, 160));
     record(agent, "S40 marker answered (t1)", MARK_RE(39).test(t1.out), `"${t1.out.trim().slice(0, 80)}"`);
@@ -579,22 +624,46 @@ async function runLane(agent, recipe) {
     allTools.slice(0, 10).join(",") || "no tools seen");
 
   if (recipe.type === "native") {
-    // authoritative claim: payload.metadata.pluginAgent in the session files
-    // (durable-message-guards.ts binding), corroborated by the window-source
-    // log line that only exists on plugin lanes.
+    // authoritative claim: the bound pluginAgent in the session metadata.
+    // Carrier: pure-SQLite is the storage default since 2026-11-13 (the JSONL
+    // envelopes are no longer written unless dual-write is pinned), so read
+    // sessions.metadata_json in index.db FIRST and keep the JSONL envelope
+    // scan as fallback for older candidates / dual-write lanes.
+    const claimFromIndexDb = (sessRoot) => {
+      const dbFile = path.join(sessRoot, "index.db");
+      if (!fs.existsSync(dbFile)) return null;
+      try {
+        const { DatabaseSync } = requireSync("node:sqlite");
+        const db = new DatabaseSync(`file:${dbFile}?mode=ro`, { readOnly: true });
+        try {
+          const rows = db.prepare(
+            "SELECT metadata_json FROM sessions WHERE metadata_json LIKE '%pluginAgent%' ORDER BY rowid DESC LIMIT 10"
+          ).all();
+          for (const r of rows) {
+            try { const m = JSON.parse(r.metadata_json); if (m?.pluginAgent) return m.pluginAgent; } catch {}
+          }
+        } finally { db.close(); }
+        return null;
+      } catch { return null; }
+    };
     let claim = null;
+    let claimSrc = "";
     const sessRoot = path.join(ctx.laneDir, "xdg/data/billion-context/sessions");
     if (fs.existsSync(sessRoot)) {
-      for (const f of fs.readdirSync(sessRoot, { recursive: true })) {
-        if (!String(f).endsWith(".json")) continue;
-        try {
-          const meta = JSON.parse(fs.readFileSync(path.join(sessRoot, String(f)), "utf8"))?.payload?.metadata;
-          if (meta?.pluginAgent) { claim = meta.pluginAgent; break; }
-        } catch {}
+      claim = claimFromIndexDb(sessRoot);
+      if (claim) claimSrc = "index.db";
+      if (!claim) {
+        for (const f of fs.readdirSync(sessRoot, { recursive: true })) {
+          if (!String(f).endsWith(".json")) continue;
+          try {
+            const meta = JSON.parse(fs.readFileSync(path.join(sessRoot, String(f)), "utf8"))?.payload?.metadata;
+            if (meta?.pluginAgent) { claim = meta.pluginAgent; claimSrc = "jsonl"; break; }
+          } catch {}
+        }
       }
     }
     record(agent, "plugin lane claimed (x-bili-plugin)", claim === recipe.pluginAgent,
-      claim ? `session metadata.pluginAgent=${claim}` : `no pluginAgent in session files; log source=plugin=${/source=plugin/.test(log)}`);
+      claim ? `session metadata.pluginAgent=${claim} (${claimSrc})` : `no pluginAgent in index.db or session files; log source=plugin=${/source=plugin/.test(log)}`);
   } else {
     record(agent, "prefix lane tools via proxy+manifest", allTools.length > 0, `${allTools.length} tool names on wire`);
   }
@@ -613,6 +682,7 @@ async function runLane(agent, recipe) {
   ctx.killInstances();
   if (ctx.proxy) { try { process.kill(-ctx.proxy.pid, "SIGKILL"); } catch {} }
   try { process.kill(-rec.pid, "SIGKILL"); } catch {}
+  activeRec.delete(agent);
 }
 
 async function startManualProxy(ctx, args) {
@@ -1063,12 +1133,28 @@ async function main() {
     console.log("plugin-lanes: skipped (GATE_SKIP=p)");
     process.exit(0);
   }
-  for (const agent of AGENTS) {
-    const recipe = RECIPES[agent];
-    if (!recipe) { record(agent, "recipe", false, "unknown agent"); continue; }
-    console.log(`\n===== plugin lane: ${agent} (${recipe.type}) =====`);
-    try { await runLane(agent, recipe); } catch (e) { record(agent, "lane", false, String(e).slice(0, 400)); }
+  // Lanes are fully independent (own recorder port, XDG dirs, per-agent
+  // BILI_ZONE_PORT ladder) and each agent is one model consumer at a time,
+  // so they run concurrently to cut wall time. In-flight count is capped by
+  // GATE_P_CONC (default 4) — combined with restart-lanes' default 2 that
+  // keeps total concurrent consumers within the shared upstream's headroom.
+  const PAR = Math.max(1, parseInt(process.env.GATE_P_CONC || "4", 10));
+  const laneQueue = [...AGENTS];
+  async function laneWorker() {
+    while (laneQueue.length > 0) {
+      const agent = laneQueue.shift();
+      const recipe = RECIPES[agent];
+      if (!recipe) { record(agent, "recipe", false, "unknown agent"); continue; }
+      console.log(`\n===== plugin lane: ${agent} (${recipe.type}) =====`);
+      try { await runLane(agent, recipe); } catch (e) {
+        record(agent, "lane", false, String(e).slice(0, 400));
+        const r = activeRec.get(agent);
+        try { if (r) process.kill(-r.pid, "SIGKILL"); } catch {}
+        activeRec.delete(agent);
+      }
+    }
   }
+  await Promise.all(Array.from({ length: Math.min(PAR, laneQueue.length) }, () => laneWorker()));
   // #3475: env-blocked lanes (upstream lacks the protocol door) keep their
   // degraded verdict — FAIL records from turn-dependent assertions are honest
   // output but excluded from the gate tally, mirroring the opencode2/#3461 rule.
@@ -1086,4 +1172,10 @@ async function main() {
   console.log(`\nplugin-lanes: ${counted.length - failed.length}/${counted.length} passed${BLOCKED.size ? ` (${[...BLOCKED.keys()].map((l) => `${l}:${BLOCKED.get(l).kind}`).join(", ")})` : ""}`);
   process.exit(failed.length ? 1 : 0);
 }
-main();
+// Import guard: restart-lanes.mjs imports { buildCorpus, CODEWORDS } from THIS
+// file. An unguarded top-level main() would re-run the entire P-lane suite as an
+// import side effect inside the restart-lanes process (2026-11-15 gate run:
+// doubled dsh/pi P lanes in the same $WORK dirs -> npm ENOTEMPTY install races,
+// a sibling pi recorder killed via the shared instance registry, and the
+// side-effect suite's process.exit(1) becoming the R process's exit code).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();

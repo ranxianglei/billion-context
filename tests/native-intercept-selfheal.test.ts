@@ -50,6 +50,30 @@ async function withHeal<T>(fn: (ctx: { sink: string[]; rearm: (v: typeof fetch) 
     }
 }
 
+test("native headersFor stamps a host recovery owner on the routed proxy request", async () => {
+    const captured: Headers[] = [];
+    const saved = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+        captured.push(new Headers(init?.headers));
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const { _resetForTest } = await import("../src/agent/native-intercept.js");
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        headersFor: () => ({ "x-bili-host-recovery-owner": "omp" }),
+    };
+    _resetForTest();
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        await globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: "{}" });
+        assert.equal(captured[0]?.get("x-bili-host-recovery-owner"), "omp");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
 test("#1158 self-heal: third-party reset to a frozen bare fetch re-chains and keeps routing through bili", async () => {
     const bareSink: string[] = [];
     const { sink } = await withHeal(async ({ rearm, fetch }) => {
@@ -635,6 +659,37 @@ test("#2827: first web-access adoption writes nothing to the host terminal and r
             await globalThis.fetch("https://api.example.invalid/v1/messages", { method: "POST" });
         });
     });
+    assertNoTerminalBili(out, err);
+    const diags = lines.filter(l => l.includes("[native-client]"));
+    assert.equal(diags.length, 1);
+    assert.match(diags[0], /\[info\] \[v=[^\]]+\] \[native-client\] \[bili-native\] adopted pi-web-access proxy fetch as downstream \(supported coexistence, #2435\)/);
+    assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages"]);
+});
+
+// #6829: pi-web-access 0.46+ marks its wrapper with the SHARED flag only
+// (`__piWebAccessSharedProxyFetch`) — the old flag propagates only when the
+// wrapped fetch already has it. The guard must recognize the shared marker
+// as the same supported coexistence handshake (#2435), not an unknown
+// third-party install, and the marker must be visible through the re-chained
+// top so the wrapper's own install guard does not re-install.
+test("#6829: a shared-marker pi-web-access install is quietly adopted as coexistence", async () => {
+    const nativeSink: string[] = [];
+    const { warns, logs, errors, out, err, lines } = await withDiagnosticsCapture(async () => {
+        await withScope(fakeFetch(nativeSink), async () => {
+            installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+            const base = globalThis.fetch;
+            const wrapper = (async (input: string | URL | Request, init?: RequestInit) => base(input, init)) as typeof fetch;
+            Object.defineProperty(wrapper, "__piWebAccessSharedProxyFetch", { value: true });
+            globalThis.fetch = wrapper;
+            // Marker visible through the re-chained top (forwarded, not lost).
+            assert.equal(Reflect.get(globalThis.fetch, "__piWebAccessSharedProxyFetch"), true);
+            const res = await globalThis.fetch("https://api.example.invalid/v1/messages", { method: "POST" });
+            assert.equal(res.status, 200);
+        });
+    });
+    assert.equal(warns.length, 0);
+    assert.equal(logs.length, 0);
+    assert.equal(errors.length, 0);
     assertNoTerminalBili(out, err);
     const diags = lines.filter(l => l.includes("[native-client]"));
     assert.equal(diags.length, 1);

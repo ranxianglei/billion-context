@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
+import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { resolveArchiveAfterDays } from "../src/knobs.ts";
 
 /**
@@ -165,6 +166,46 @@ test("gc(): age sweep archives only past-retention sessions; dormant shared rows
             store as unknown as { db: { prepare: (q: string) => { all: () => { bytes?: unknown }[] } } }
         ).db.prepare("SELECT bytes FROM content").all().length;
         assert.ok(contentLeft === 1, `released exclusive content collected inline (left=${contentLeft})`);
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});
+
+test("#6317: failed archive sweep leaves no archive line; restore uses the newest entry", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-failed-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        store.ingestSession(planIngest(mkSession("sess-A", [mkMsg("m-a", "old body ".repeat(50))])));
+        const archiveDir = path.join(dir, "archive");
+        const logPath = path.join(archiveDir, UnifiedStore.ARCHIVE_LOG_NAME);
+        fs.mkdirSync(archiveDir, { recursive: true });
+
+        const second = openSqliteDatabase(path.join(dir, "index.db")).db;
+        second.exec("BEGIN IMMEDIATE");
+        try {
+            assert.throws(
+                () => store.archiveSession("sess-A", { archiveDir }),
+                /database is locked/,
+                "archive fails while another writer holds the lock",
+            );
+        } finally {
+            second.exec("ROLLBACK");
+            second.close();
+        }
+        assert.ok(!fs.existsSync(logPath), "failed archive must not append a stale line");
+
+        store.ingestSession(planIngest(mkSession("sess-A", [mkMsg("m-a", "old body ".repeat(50)), mkMsg("m-a2", "new body ".repeat(50))])));
+        const archived = store.archiveSession("sess-A", { archiveDir });
+        assert.ok(archived.ok);
+        const lines = fs.readFileSync(logPath, "utf8").split("\n").filter((l) => l.trim());
+        assert.equal(lines.length, 1, "only the successful archive writes a line");
+        const dump = JSON.parse(lines[0]) as { messages?: { msg_id?: string }[] };
+        assert.deepEqual(dump.messages?.map((m) => m.msg_id), ["m-a", "m-a2"]);
+
+        const restored = store.restoreArchived("sess-A", { archiveDir });
+        assert.ok(restored.ok);
+        assert.deepEqual(store.getMessages("sess-A").map((m) => m.msgId), ["m-a", "m-a2"], "restore returns the newest dump");
         store.close();
     } finally {
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }

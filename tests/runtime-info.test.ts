@@ -546,3 +546,42 @@ describe("runtime-info pre-first-request status (#955)", () => {
         assert.equal(json.conversationId, "conv-pre-1");
     });
 });
+
+// Client-minted child conversations: a runtime-info lookup for a child id must
+// resolve the nearest reporting ancestor (see pluginRuntimeInfoForConversation).
+describe("runtime-info: child conversations inherit the parent's report", () => {
+    beforeEach(() => _resetPluginStateForTest());
+
+    it("a `:side:` ephemeral turn resolves the parent's window and output cap", () => {
+        recordPluginRuntimeInfo({ agent: "omp", model: "astra", contextWindow: 1_000_000, maxOutput: 128_000, conversationId: "sid-parent", source: "client-config", ts: 1 });
+        const hit = pluginRuntimeInfoForConversation("sid-parent:side:15b3f37086a59857", "astra");
+        assert.equal(hit?.contextWindow, 1_000_000);
+        assert.equal(hit?.maxOutput, 128_000);
+    });
+
+    it("`:side:conversation:` and `:sub:` ids resolve too, including nested ones", () => {
+        recordPluginRuntimeInfo({ agent: "omp", model: "astra", contextWindow: 262_144, conversationId: "sid-parent", source: "client-config", ts: 1 });
+        assert.equal(pluginRuntimeInfoForConversation("sid-parent:side:conversation:0f3d", "astra")?.contextWindow, 262_144);
+        assert.equal(pluginRuntimeInfoForConversation("sid-parent:sub:agent-7", "astra")?.contextWindow, 262_144);
+        assert.equal(pluginRuntimeInfoForConversation("sid-parent:side:abc:sub:agent-7", "astra")?.contextWindow, 262_144);
+    });
+
+    it("the model gate still holds: a child on a different model inherits nothing", () => {
+        recordPluginRuntimeInfo({ agent: "omp", model: "astra", contextWindow: 262_144, conversationId: "sid-parent", source: "client-config", ts: 1 });
+        assert.equal(pluginRuntimeInfoForConversation("sid-parent:side:abc", "gemini"), undefined);
+    });
+
+    it("a child that reported its own window keeps it — inheritance never overrides a direct hit", () => {
+        recordPluginRuntimeInfo({ agent: "omp", model: "astra", contextWindow: 262_144, conversationId: "sid-parent", source: "client-config", ts: 1 });
+        recordPluginRuntimeInfo({ agent: "omp", model: "astra", contextWindow: 65_536, conversationId: "sid-parent:side:abc", source: "client-config", ts: 2 });
+        assert.equal(pluginRuntimeInfoForConversation("sid-parent:side:abc", "astra")?.contextWindow, 65_536);
+    });
+
+    it("no prefix matching: an unrelated id or a marker with no tail stays a miss", () => {
+        recordPluginRuntimeInfo({ agent: "omp", model: "astra", contextWindow: 262_144, conversationId: "sid-parent", source: "client-config", ts: 1 });
+        assert.equal(pluginRuntimeInfoForConversation("sid-parent2:side:abc", "astra"), undefined);
+        assert.equal(pluginRuntimeInfoForConversation("sid-parentx", "astra"), undefined);
+        assert.equal(pluginRuntimeInfoForConversation("sid-parent:side:", "astra"), undefined);
+        assert.equal(pluginRuntimeInfoForConversation("sid-parent:sideways:abc", "astra"), undefined);
+    });
+});
