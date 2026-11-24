@@ -333,6 +333,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.absorb.excludeTools` | string[] | [] | — | Tool names excluded from absorption. |
 | `compress.absorb.toolName` | string | "absorb" | — | Registered name of the absorb tool. |
 | `compress.absorb.mediaOnly` | boolean | true | — | Restrict absorption to tool results that carry media (images). Image bytes are exempt from minToolTokens since they are not counted in text. Set false to restore legacy full-text absorption of any large result. |
+| `compress.degenerateRetry.maxAttempts` | integer (0–5) | 1 | — | Degenerate-terminal retry budget (#7666): when a turn reaches its terminal with nothing client-visible (tag-echoed away, draft/announcement tail), the proxy re-issues the agent's own request with a trailing user NUDGE appended. The nudge rides the retry body only — it is never persisted into session state and never replayed on the client's next request. 0 = off (a degenerate turn then passes through bare), 1 = once (pre-#7666 behavior), max 5; attempt i sends `nudges[i]` (cycling when the list is shorter). Independent of the zero-byte-cut re-issue (#2171) — a turn may spend one of each. Cost per attempt is near zero when the prefix cache hits; when the budget is exhausted on the chat lane the client gets the in-band #870 error, on the responses lane the empty turn passes through. Merges deepest-wins per provider/model like every other compress field. |
+| `compress.degenerateRetry.nudges` | string[] (1–8) | 3 built-in | — | Custom nudge sentences for degenerate-terminal retries (#7666); retry i sends sentence i (cycling). Blank/unset = the built-in rotation, whose first entry is the default continuation nudge. |
 | `compress.blockOps.enabled` | boolean | false | — | Enable the three block-lifecycle tools (injection + prompt + manifest). Off = no tools, no prompt section, zero per-request cost. |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | Enable the content-cache-and-retrieve block. |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | Minimum estimated token size of a tool result eligible for CCR storage. |
@@ -1651,6 +1653,19 @@ Optional surface blocks: `prompts` (inline rule-text overrides), `nudgeSections`
   - `excludeTools: string[]` — tool-name patterns never absorbed. **Known limitation:** a no-op on tool *results* until [ranxianglei/acp-kernel#213](https://github.com/ranxianglei/acp-kernel/issues/213) ships (wire projections don't carry `toolName` on results, so the kernel's name guard can't fire).
   - `toolName: string` — rename the injected tool (default `"absorb"`); the advertised/injected schema, the system-prompt section and per-session adjudication all follow the name in both lanes. **Lane governance (#1359):** plugin mode governs the *entire* `absorb` block by the **base** config, so a renamed tool is advertised under that name and executed under it (they can never diverge); provider/model-level `absorb.*` overrides are **proxy-lane-only** (the proxy injects and adjudicates the merged name). A load-time warning lists any provider/model `absorb.*` field whose value diverges from base.
   Injection follows the wire's native-tool surface: proxy mode injects the tool (under the per-request resolved name) + a system-prompt section on the anthropic/openai/responses native-tools wires, plugin mode advertises it in the plugin manifest **only while enabled** (hosts register the manifest's tools verbatim — advertising a disabled tool breaks them, #1192; the MCP shell picks it up for free). Responses **marker/text-protocol** routes are not supported (no native tool surface — the REQUIRED absorb instruction would be unsatisfiable), and title-generation requests (`max_tokens ≤ 200`) skip injection like the compress prompt does. Absorbed pairs stay hidden across restarts (persisted in the session state).
+
+#### `degenerateRetry`
+
+- **Type:** `object` (`{ maxAttempts?, nudges? }`) — sub-fields merge deepest-wins (global → provider → model)
+- **Default:** unset = `{ maxAttempts: 1 }` with the built-in nudge rotation (pre-#7666 behavior)
+- **Status:** ACTIVE
+
+**Description:** the retry budget for degenerate terminal turns — turns that reach their completion with nothing client-visible (the tag-echo shape, a compression-draft or bare-announcement tail). Each attempt re-issues the agent's own forwarded body with a trailing user nudge appended (`src/degenerate-retry.ts`); the mutation never touches session state, so the nudge is transient — the client's next request is byte-identical to what it would have been. Sub-fields:
+
+- `maxAttempts` (integer 0–5, default 1) — how many nudge re-issues one turn may spend. 0 disables degenerate retries entirely (the turn passes through bare). Exhausted budget: the chat lane emits the in-band #870 error ("…after the continuation nudge" / "…after N continuation nudges"), the responses lane passes the empty turn through.
+- `nudges` (string[], 1–8, default: the 3 built-in sentences) — sentence for attempt i (cycling when shorter). The built-in rotation starts with the default continuation nudge ("Your previous response ended without a tool call. Continue now: …").
+
+Independent of the zero-byte-cut re-issue (#2171), which keeps its own one-shot budget. See #7666 / #6034 for the failure family and the local 7-day data (85 degenerate arms, 93% rescued by the single-attempt retry).
 
 #### `blockOps`
 

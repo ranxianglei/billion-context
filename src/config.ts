@@ -691,6 +691,33 @@ export type CompressSettings = {
      *  Real edits never match (normalized text differs) and honestly
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
+    /** #7666: degenerate-terminal-turn retry budget and nudge wording. When a
+     *  turn reaches its terminal with nothing usable (tag-echo emptying, bare
+     *  announcement, draft tail), the pipe re-issues the same request with a
+     *  TRANSIENT continuation nudge appended as a trailing user turn — the nudge
+     *  never touches session state, so it is neither persisted nor replayed on
+     *  the client's next request. Merged sub-field-wise across the three levels
+     *  like `absorb` (per-model wording differences are the point).
+     *  - `maxAttempts` (default 1, integer 0..5): how many nudge re-issues one
+     *    turn may spend. 0 = OFF — a degenerate terminal passes through as an
+     *    empty completed turn with no retry and no in-band error (the #5897
+     *    opt-out without an env var). 1 = pre-#7666 behavior byte-for-byte.
+     *    The degenerate budget is INDEPENDENT of the zero-byte-cut re-issue
+     *    (#2171): each keeps its own one-shot, so a turn may now spend one of
+     *    each. On exhaustion the chat lane emits the #870 in-band error naming
+     *    the attempts spent; the responses lane passes the turn through.
+     *  - `nudges` (optional, 1..8 non-empty strings): nudge sentence list —
+     *    attempt i sends nudges[i], cycling when the list is shorter than
+     *    maxAttempts. Absent = built-in list (src/degenerate-retry.ts).
+     *    Cost note: the nudge is appended at the tail, so the prefix cache still
+     *    hits — each extra attempt costs roughly one generation, not one
+     *    full-context read. */
+    degenerateRetry?: {
+        /** Max nudge re-issues per turn. Integer 0..5; absent = 1. */
+        maxAttempts?: number;
+        /** Nudge sentence list; the i-th attempt uses the i-th sentence. */
+        nudges?: string[];
+    };
 };
 /** #5079: governs every prompt_cache_key BILI ITSELF writes to an egress body
  *  (chat-wire conversation-id stamping, Responses-wire identity injection).
@@ -2611,6 +2638,8 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "reconcile", "streamSummary", "externalSummary",
     // #3635: summary-length caps — previously accepted nowhere, silently dropped.
     "maxSummaryLength", "minSummaryLength",
+    // #7666: degenerate-terminal retry budget + nudge wording.
+    "degenerateRetry",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -3483,6 +3512,29 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 }
             }
             if (ok) out.absorb = cleaned;
+        }
+    }
+    if ("degenerateRetry" in obj && obj.degenerateRetry !== undefined) {
+        const d = obj.degenerateRetry;
+        if (!d || typeof d !== "object" || Array.isArray(d)) {
+            ok = false;
+        } else {
+            const dobj = d as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["degenerateRetry"]> = {};
+            if ("maxAttempts" in dobj) {
+                const v = dobj.maxAttempts;
+                // #7666: 0 = off is meaningful, so stricter than takeNumber;
+                // 5 caps the UI/UX contract (each failed attempt still costs a
+                // full generation + ~15-30s of wall time before #870).
+                if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v > 5) ok = false;
+                else cleaned.maxAttempts = v;
+            }
+            if ("nudges" in dobj) {
+                const v = dobj.nudges;
+                if (!Array.isArray(v) || v.length < 1 || v.length > 8 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
+                else cleaned.nudges = (v as string[]).map((s) => s.trim());
+            }
+            if (ok) out.degenerateRetry = Object.keys(cleaned).length > 0 ? cleaned : undefined;
         }
     }
     if ("blockOps" in obj && obj.blockOps !== undefined) {
