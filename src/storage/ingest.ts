@@ -584,10 +584,12 @@ function finishPlan(
           })
         : [];
 
-    // #7577 D4: egress-on sessions derive tsStamps/tokenSnapshot from the
-    // egress flow replay (the I rows carry the wall-clock ts); lastPassIds is
-    // a self-heal field. Exclude them from the kstate column to keep it
-    // bounded (<2KB residual sidecar).
+    // #7577 D4: egress-on sessions do not persist tsStamps/tokenSnapshot/
+    // lastPassIds in the kstate column: tsStamps is derived on load from the
+    // egress view (the I rows carry the kernel raw msgid + first-observed
+    // wall-clock ts), tokenSnapshot is recomputed by the kernel's render
+    // pass, and lastPassIds self-heals after the first compress pass.
+    // Excluding them keeps the column bounded (<2KB residual sidecar).
     const egressOn = session.metadata["egressAuthority"] === true;
     const KSTATE_TRIM_FIELDS = new Set(["tsStamps", "tokenSnapshot", "lastPassIds"]);
     const kstateRaw: Record<string, unknown> = {};
