@@ -730,6 +730,7 @@ export const WEB_CLIENT = `(function () {
         const href = "#/session/" + encodeURIComponent(s.id);
         return '<a class="slink" href="' + href + '"><span class="row-title clip w-title' + (named ? "" : " faint") + '">' + escapeHtml(name) + "</span>"
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
+            + (s.parentSessionId ? ' <span class="badge proto" title="' + escapeHtml(t("ses.badge_child_tip")) + '">' + t("ses.badge_child") + "</span>" : "")
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
 + (s.keepalive ? ' <span class="badge live" style="background:#3b6d8a" title="' + escapeHtml(t("det.keepalive_tip") + " · " + s.keepalive.tierLabel + " · " + (s.keepalive.cadenceMs >= 60_000 ? Math.round(s.keepalive.cadenceMs / 60_000) + "min" : Math.round(s.keepalive.cadenceMs / 1000) + "s") + (s.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(s.keepalive.lastHitAt).toISOString()) : "")) + '">' + t("det.keepalive_short") + "×" + s.keepalive.pingCount + "</span>" : "")
@@ -1847,11 +1848,13 @@ function changelogCatOf(rawLine) {
         const protocol = filterValue("ses-protocol");
         const client = filterValue("ses-client");
         const state = filterValue("ses-state");
+        const kind = filterValue("ses-kind");
         return API_ROOT + "/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE +
             (q ? "&q=" + encodeURIComponent(q) : "") +
             (protocol ? "&protocol=" + encodeURIComponent(protocol) : "") +
             (client ? "&client=" + encodeURIComponent(client) : "") +
-            (state ? "&state=" + encodeURIComponent(state) : "");
+            (state ? "&state=" + encodeURIComponent(state) : "") +
+            (kind ? "&kind=" + encodeURIComponent(kind) : "");
     }
     function filterValue(id) {
         const el = $(id);
@@ -1893,7 +1896,7 @@ function changelogCatOf(rawLine) {
     }
     function hasActiveFilters() {
         const q = (($("ses-search") && $("ses-search").value) || "").trim();
-        return Boolean(q || filterValue("ses-protocol") || filterValue("ses-client") || filterValue("ses-state"));
+        return Boolean(q || filterValue("ses-protocol") || filterValue("ses-client") || filterValue("ses-state") || filterValue("ses-kind"));
     }
     function updatePager() {
         const prev = $("ses-prev");
@@ -1921,7 +1924,7 @@ function changelogCatOf(rawLine) {
     function resetSessionFilters() {
         const search = $("ses-search");
         if (search) search.value = "";
-        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
+        ["ses-protocol", "ses-client", "ses-state", "ses-kind"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
         return refreshSessions(false, 1);
     }
     function renderSessionTable() {
@@ -5739,7 +5742,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         }
         const sref = $("ses-refresh");
         if (sref) sref.addEventListener("click", () => refreshSessions(true, sesPage));
-        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => {
+        ["ses-protocol", "ses-client", "ses-state", "ses-kind"].forEach((id) => {
             const el = $(id);
             if (el) el.addEventListener("change", () => refreshSessions(false, 1));
         });
