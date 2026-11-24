@@ -19,7 +19,7 @@ import { createEngineContext, type EngineContext } from "./server.js";
 import { handle } from "./server/handle.js";
 import { withFetchTransport } from "./fetch-transport.js";
 import type { FetchOptions } from "./fetch-util.js";
-import { log as loggerLog, muteStderrLeg } from "./logger.js";
+import { log as loggerLog, muteStderrLeg, getAbortOrigin, abortMidStreamLine } from "./logger.js";
 import { buildProxyFailureResponse, isExpectedFailFast } from "./upstream-fail.js";
 
 /** Pseudo-origin of the inline lane. Never DNS-resolved: any request reaching
@@ -305,7 +305,7 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
                 const msg = String(err);
                 const e = err as { name?: string; message?: string };
                 const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
-                if (clientAbort && !abortSurfaced) ctx.log("info", `client aborted mid-stream: ${msg}`);
+                if (clientAbort && !abortSurfaced) ctx.log("info", abortMidStreamLine(msg, getAbortOrigin(res)));
                 // #2465/#5663: classified transport deaths are already fully described on
                 // one line (kind/code/errno/syscall/address/hint) — stack frames add no signal.
                 else if (err instanceof Error && (err as Error & { biliTransportFailure?: boolean }).biliTransportFailure === true) ctx.log("error", msg);
@@ -339,7 +339,7 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
             const e = err as { name?: string; message?: string };
             if ((e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && res.destroyed) {
                 abortSurfaced = true;
-                ctx.log("info", `client aborted mid-stream: ${String(err)}`);
+                ctx.log("info", abortMidStreamLine(String(err), getAbortOrigin(res)));
             }
             throw err;
         } finally {
@@ -372,7 +372,7 @@ function makeHttpDispatch(ctx: EngineContext): InlineEngine["dispatchHttp"] {
             const msg = String(err);
             const e = err as { name?: string; message?: string };
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
-            if (clientAbort) ctx.log("info", `client aborted mid-stream: ${msg}`);
+            if (clientAbort) ctx.log("info", abortMidStreamLine(msg, getAbortOrigin(res)));
             else if (err instanceof Error && err.stack) ctx.log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
             else ctx.log("error", msg);
             if (res.destroyed) return;

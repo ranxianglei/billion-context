@@ -99,7 +99,7 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp, setAbortOrigin, getAbortOrigin, abortMidStreamLine } from "./logger.js";
 import { configureLogRetention } from "./log-retention.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
@@ -831,7 +831,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // With the client already gone it is logged as info instead of
             // feeding the context-free [error] AbortError storm.
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
-            if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
+            if (clientAbort) log("info", abortMidStreamLine(msg, getAbortOrigin(res)));
             // #2465/#5663: classified transport deaths are already fully described on
             // one line (kind/code/errno/syscall/address/hint) — stack frames were pure
             // noise in field EHOSTUNREACH storms (305 failures × 7).
@@ -4507,6 +4507,7 @@ export async function preflightCompressIfNeeded(
     registerRequestAbort(res, clientAbort);
     res.on("close", () => {
         if (!res.writableEnded) {
+            setAbortOrigin(res, "client-disconnect");
             clientAbort.abort();
             noteClientAbort(session);
         }
