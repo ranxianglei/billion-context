@@ -499,8 +499,9 @@ function finishPlan(
     const seqById = new Map<string, number>();
     for (const e of log) if (!seqById.has(e.msgId)) seqById.set(e.msgId, e.seq);
 
+    const completedViews = completeBlockContents(session.blockContents, session.state.blocks);
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
-        const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
+        const views = completedViews.get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
         const summaryJson = JSON.stringify(full);
