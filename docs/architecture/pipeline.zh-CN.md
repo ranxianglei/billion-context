@@ -1,6 +1,6 @@
 # 模块：请求管道（`src/server` + `src/loop`）
 
-> [架构总览](../architecture.zh-CN.md) 的一个模块 · English: [pipeline.md](./pipeline.md) · 截至 2026-11-10，master
+> [架构总览](../architecture.zh-CN.md) 的一个模块 · English: [pipeline.md](./pipeline.md) · 截至 2026-11-15，candidate
 
 ![请求管道模块](./assets/pipeline.zh-CN.svg)
 （位图备选：[pipeline.zh-CN.png](./assets/pipeline.zh-CN.png)）
@@ -28,6 +28,8 @@
 **出站。** `stream-*` 按 wire 改写上游 SSE（块框架、cache-control 断点 #1637、`wire-body` 尾 user 回合补位）。请求侧另有用户可注册的 `egressTransforms[]` 管道（`src/egress-transforms.ts`，#6003）：ESM 插件在所有会话处理之后、re-sign/v1Wrap 之前改写每个出站模型请求体——逐插件 fail-open，可经 `/__bili/config/reload` 热重载，未配置时严格 no-op。协议头（pf-*/信封）永不出代理——上游 hop 头白名单剥掉它们。
 
 **闸门与恢复。** `preflight.ts`（hold 宽限、死路冷却）、`reasoning-guard`（签名载荷永不进折叠输入）、`request-body-budget`（收/解/发字节预算，可用性大于性能 #3128）、`content-encoding`（解压炸弹守卫，413）。错误形态：`stream-error`（最小 SSE 错误+收尾）、`fake-completion`（可选重试提示）、`degenerate-turn` / `degenerate-retry`、`exit-matrix`（wire 出口 × 关注点，#588）。
+
+**常驻规则与提醒。** 宿主只有在实际注入的常驻提示包含同一条完整规则时，才从 nudge 中移除重复文本；规则缺失或被改写时保留完整 fallback，用户引用不作为覆盖证据。成功且标明已创建块的压缩回执足以继续任务；结果缺失、含糊或选择新范围时仍需查询状态。短提醒尾句只提供指导，不作为删除依据：用户引用与无法区分的真实重放均保留。
 
 ## 关键入口
 

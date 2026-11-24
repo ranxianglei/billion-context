@@ -55,10 +55,11 @@ import {
     buildCompressSystemPrompt,
     buildCompressHybridSystemPrompt,
     defaultPrompts,
+    renderNudgeText,
     ACP_TOOL_NAMES,
     COMPRESS_TOOL_NAME,
 } from "acp-kernel";
-import type { CompressPromptSections, Prompts, SectionOverride, ToolPrompts } from "acp-kernel";
+import type { CompressPromptSections, NudgeDecision, NudgePromptSections, Prompts, RenderedNudge, SectionOverride, ToolPrompts } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 import { EXTERNAL_SUMMARY_NOTE } from "./external-summary-surface.js";
@@ -761,7 +762,7 @@ export function withFirstSightDrain(text: string, reason: string | undefined, ex
 // chain carriers and panel wrappers. Kept exported here for compatibility
 // with existing importers.
 export { MARKER_INTEGRITY_NOTE, MARKER_SILENCE_CLAUSE } from "./marker/anchors.js";
-import { MARKER_INTEGRITY_NOTE, MARKER_SILENCE_CLAUSE } from "./marker/anchors.js";
+import { MARKER_INTEGRITY_NOTE, MARKER_SILENCE_CLAUSE, NUDGE_STANDING_REMINDER } from "./marker/anchors.js";
 
 /** Append the marker-integrity rule to a nudge or system-prompt text.
  *  The anti-forgery segment is unconditional (unlike withStagedCompressGuidance):
@@ -796,4 +797,32 @@ const SUMMARY_BUDGET_NOTE =
  *  budget rule cannot apply (#4460). */
 export function withSummaryBudgetNote(text: string, external: boolean): string {
     return text + (external ? EXTERNAL_SUMMARY_NOTE : SUMMARY_BUDGET_NOTE);
+}
+
+/** Append only host notes absent from the emitted standing text. The short
+ *  reminder is guidance, not proof that echoed user content may be deleted. */
+export function withNudgeNotes(text: string, standingText: string, external: boolean, visibilityMarkers = true): string {
+    const budgetNote = external ? EXTERNAL_SUMMARY_NOTE : SUMMARY_BUDGET_NOTE;
+    const budgeted = standingText.includes(budgetNote) ? text : text + budgetNote;
+    const markerCovered = standingText.includes(MARKER_INTEGRITY_NOTE)
+        && (!visibilityMarkers || standingText.includes(MARKER_SILENCE_CLAUSE));
+    return markerCovered ? budgeted + NUDGE_STANDING_REMINDER : withMarkerIntegrityNote(budgeted, visibilityMarkers);
+}
+
+/** Reuse only complete rules present in the host's actual outbound standing
+ *  text. Missing, disabled, or differently worded pack sections keep the kernel
+ *  fallback intact. Supply renderer inputs rather than trimming its output, so
+ *  ranges, tier guidance, custom sections, and protocol advice stay kernel-owned. */
+export function renderHostNudgeText(
+    decision: NudgeDecision,
+    standingText: string,
+    prompts: Prompts = defaultPrompts,
+    sections?: NudgePromptSections,
+    protocol?: Parameters<typeof renderNudgeText>[3],
+): RenderedNudge {
+    const nudgePrompts = { ...prompts };
+    for (const key of ["compressPhilosophy", "howToCompressRules"] as const) {
+        if (prompts[key].trim() && standingText.includes(prompts[key])) nudgePrompts[key] = "";
+    }
+    return renderNudgeText(decision, nudgePrompts, sections, protocol);
 }

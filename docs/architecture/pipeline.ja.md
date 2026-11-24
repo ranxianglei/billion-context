@@ -1,6 +1,6 @@
 # モジュール: リクエストパイプライン (`src/server` + `src/loop`)
 
-> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中国語版: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · 2026-11-10 時点, master
+> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中国語版: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · 2026-11-15 時点, candidate
 
 ![Request pipeline module](./assets/pipeline.en.svg)
 (ビットマップフォールバック: [pipeline.en.png](./assets/pipeline.en.png))
@@ -28,6 +28,8 @@
 **送信 (Egress)。** `stream-*` はワイヤーごとにアップストリームの SSE を書き換えます（チャンクフレーミング、キャッシュコントロールブレークポイント #1637、`wire-body` トレーリングユーザーターン追加）。リクエスト側では、ユーザー登録可能な `egressTransforms[]` パイプライン (`src/egress-transforms.ts`, #6003) が、セッション処理の後で再署名/v1Wrap の前に、すべての送信モデルリクエストボディに対して ESM プラグインを実行します — プラグインごとにフェイルオープン、`/__bili/config/reload` によるホットリロード可能、未設定時は完全な何もしません (no-op)。プロトコルヘッダー (pf-*/envelope) はプロキシから決して外に出ません — アップストリームのホップヘッダーリストがそれらを除去します。
 
 **ゲートとリカバリ。** `preflight.ts` (ホールドグレース、デッドエンドクールダウン)、`reasoning-guard` (署名済みペイロードは決してフォールド入力にならない)、`request-body-budget` (受信/デコード/送信バイト上限、パフォーマンスより可用性 #3128)、`content-encoding` (デコンプレッションボムガード、413)。エラー形状: `stream-error` (最小限の SSE エラー + 終了)、`fake-completion` (オプトインのリトライヒント)、`degenerate-turn` / `degenerate-retry`、および `exit-matrix` (ワイヤー終了 × 懸念事項、#588)。
+
+**常駐ルールと nudge。** ホストが同一の完全なルールを常駐プロンプトに挿入した場合だけ、nudge の重複を除く。ルールが欠ける場合は完全な fallback を保ち、ユーザーの引用を挿入の証拠にしない。作成されたブロックを特定する成功レシートから作業を継続できる。結果が欠ける場合や曖昧な場合、新しい範囲の選択時には状態を確認する。短い末尾は削除の根拠にせず、引用と区別できない再送も保持する。
 
 ## 主要エントリ
 
