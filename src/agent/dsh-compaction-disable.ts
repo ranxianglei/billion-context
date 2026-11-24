@@ -238,9 +238,37 @@ const PRESET_REGISTER_WRAP_MARK = Symbol.for("bili.dshPresetRegisterWrapped");
 type PresetRegistry = { register?: (definition: unknown) => Promise<unknown> } & Record<string, unknown>;
 
 function presetRegistryOf(ctx: CompactionDisableHost): PresetRegistry | undefined {
-    if (ctx.agentPresets !== undefined) return ctx.agentPresets;
-    if (typeof ctx.get !== "function") return undefined;
-    const candidate = ctx.get("agentPresets");
+    // A cordis context is a proxy whose READ of an uninjected service property
+    // throws ("cannot get property ... without inject"). This gate entry
+    // declares `inject: []`, so a direct property read took the whole entry's
+    // apply() down on hosts that ship the registry, which aborted the preset
+    // rows and surfaced as "Unknown agent preset: standard". The generic
+    // accessor is the supported probe; the property read stays as a fallback
+    // for host stubs that expose the service without one. Every read below
+    // goes through readOrUndefined: on a cordis proxy even `ctx.get` itself
+    // throws when the fiber does not inject it.
+    const accessor = readOrUndefined(() => ctx.get);
+    if (typeof accessor === "function") {
+        // strict=false: a provider whose fiber is still activating is exactly
+        // the case this wrap wants (it must be in place before plugins register).
+        const viaAccessor = asPresetRegistry(readOrUndefined(() => accessor.call(ctx, "agentPresets", false)));
+        if (viaAccessor !== undefined) return viaAccessor;
+    }
+    return asPresetRegistry(readOrUndefined(() => ctx.agentPresets));
+}
+
+/** Read a host surface that may be a throwing proxy, treating any rejection as
+ *  absence. The gate entry's contract is best-effort coverage, so a refused
+ *  probe degrades to "no registry" instead of failing apply(). */
+function readOrUndefined(read: () => unknown): unknown {
+    try {
+        return read();
+    } catch {
+        return undefined;
+    }
+}
+
+function asPresetRegistry(candidate: unknown): PresetRegistry | undefined {
     return candidate === null || typeof candidate !== "object" ? undefined : candidate as PresetRegistry;
 }
 
@@ -273,9 +301,16 @@ export function installRuntimePresetCoverage(ctx: CompactionDisableHost): void {
     const registry = presetRegistryOf(ctx);
     if (registry === undefined || typeof registry.register !== "function") return;
     if ((registry as Record<PropertyKey, unknown>)[PRESET_REGISTER_WRAP_MARK] === true) return;
-    const original = registry.register;
-    registry.register = (definition: unknown) => original.call(registry, disableRuntimePresetCompaction(definition));
-    (registry as Record<PropertyKey, unknown>)[PRESET_REGISTER_WRAP_MARK] = true;
+    // A host-owned registry may be frozen or a proxy that rejects writes; the
+    // coverage is best-effort by contract, so a refused patch degrades to the
+    // load-time overlay instead of failing this entry's apply().
+    try {
+        const original = registry.register;
+        registry.register = (definition: unknown) => original.call(registry, disableRuntimePresetCompaction(definition));
+        (registry as Record<PropertyKey, unknown>)[PRESET_REGISTER_WRAP_MARK] = true;
+    } catch {
+        return;
+    }
     noteRuntimeWrapped();
 }
 
@@ -286,8 +321,9 @@ export type CompactionDisableHost = {
     // profiles that ship it; optional like every other host surface here.
     agentPresets?: PresetRegistry | undefined;
     // #7190: cordis' generic service accessor (returns undefined for a
-    // non-provided service, per dsh's own tool-subagent usage).
-    get?: (name: string) => unknown;
+    // non-provided service, per dsh's own tool-subagent usage). `strict=false`
+    // also reports a service whose provider fiber is still activating.
+    get?: (name: string, strict?: boolean) => unknown;
 };
 type MiddlewareSelf = { entry?: { options?: { name?: unknown } } | undefined };
 
