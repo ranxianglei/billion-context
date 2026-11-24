@@ -1,13 +1,20 @@
 // #4204 — egress-side 429 throttle governor.
 //
-// Problem: a concurrency-style provider limit (z.ai GLM coding plan: ~9-18
-// allowed in parallel, dynamic, no Retry-After) plus a host that re-drives a
-// failed turn every few seconds with the full history. bili forwarded every
-// re-driven request, so the retry stream itself occupied the provider's slots
-// and pinned the WHOLE account at the limit for minutes — every other session
-// failed too, until the client (and proxy process) was restarted.
+// OFF BY DEFAULT (#6639/#5853 decision): upstream 429s are forwarded to the
+// client untouched — the host owns the retry decision — and bili only logs a
+// warn per observed 429. The governor below is an opt-in escape hatch for
+// accounts where an unbounded host retry storm pins a SHARED concurrency-style
+// limit and starves the other sessions on the same credential.
 //
-// Fix: consecutive 429s create a local hold by origin+credential. A verified
+// Problem (when enabled): a concurrency-style provider limit (z.ai GLM coding
+// plan: ~9-18 allowed in parallel, dynamic, no Retry-After) plus a host that
+// re-drives a failed turn every few seconds with the full history. bili
+// forwarded every re-driven request, so the retry stream itself occupied the
+// provider's slots and pinned the WHOLE account at the limit for minutes —
+// every other session failed too, until the client (and proxy process) was
+// restarted.
+//
+// Fix (enabled mode): consecutive 429s create a local hold by origin+credential. A verified
 // KeyRing model-endpoint refusal is keyed by origin+credential+request-model;
 // account quota and every ambiguous/unrecognized 429 remain origin+credential.
 // Further sends covered by that scope are answered LOCALLY instead of forwarded:
@@ -227,7 +234,7 @@ function scanRequestModel(body: string | Uint8Array): string | undefined {
  *  checked on the body itself, so a rewritten/re-encoded body just re-scans
  *  (correctness before caching). */
 const bodyModelMemo = new WeakMap<object, { body: string | Uint8Array; model: string | undefined }>();
-/** Test surface (resetSessionOrderForTest precedent): count of real scans —
+/** Test surface (house precedent): count of real scans —
  *  pins "one scan, two consumers" without a perf harness. */
 let requestModelScanCount = 0;
 export function requestModelScanCountForTest(): number {
@@ -371,12 +378,22 @@ function parseRetryAfterMs(headerValue: string | null, now: number): number | nu
 
 function holdKey(url: string, headers: Record<string, string>): { key: string; host: string; cred: string | undefined } {
     let host = url;
+    let cred = credentialFingerprint(headers);
     try {
-        host = new URL(url).host;
+        const parsed = new URL(url);
+        host = parsed.host;
+        // Native Google model RPCs also accept query API keys. Keep header
+        // identities unchanged and do not guess between conflicting values.
+        if (cred === undefined && /\/models\/[^/]+:(?:generateContent|streamGenerateContent|countTokens)$/.test(parsed.pathname)) {
+            const values = [...parsed.searchParams.getAll("key"), ...parsed.searchParams.getAll("$key")];
+            const queryKey = values[0];
+            if (queryKey !== undefined && values.every(value => value === queryKey)) {
+                cred = credentialFingerprint({ "x-goog-api-key": queryKey });
+            }
+        }
     } catch { /* opaque url — key by the raw value */ }
     // Multi-account safety (#2131 fingerprint): two credentials on the same
     // origin are independent rate-limit pools and must not hold each other.
-    const cred = credentialFingerprint(headers);
     return { key: cred === undefined ? host : `${host}\u0000${cred}`, host, cred };
 }
 
@@ -529,6 +546,21 @@ function createHoldState(
         provisional,
         ...(provisionalRequestModel === undefined ? {} : { provisionalRequestModel }),
     };
+}
+
+/** Governor disabled (#6639): the 429 is forwarded to the client as-is — the
+ *  host owns the retry decision. Say so once per observed 429 so an operator
+ *  can tell in the log that bili did NOT intercept it. */
+function logThrottle429Passthrough(
+    host: string,
+    model: string | undefined,
+    retryAfterHeader: string | null,
+    now: number,
+): void {
+    const raMs = parseRetryAfterMs(retryAfterHeader, now);
+    const raNote = raMs !== null ? `, upstream Retry-After ~${Math.round(raMs / 1000)}s (passed through, client decides)` : "";
+    const modelNote = model === undefined || model.length === 0 ? "" : ` for model "${model}"`;
+    loggerLog("warn", `[acp-proxy] [429-passthrough] ${host}${modelNote}: upstream 429 forwarded to the client unchanged (429 governor disabled — no local hold, no 424)${raNote} (#4204/#6639)`);
 }
 
 function logThrottle429(state: HoldState, retryAfterHeader: string | null, now: number): void {
@@ -739,8 +771,12 @@ export function noteUpstreamThrottle429(
     modelScope?: string,
     probeToken?: symbol,
 ): void {
-    if (!throttle429Enabled()) return;
     const { key, host, cred } = holdKey(url, headers);
+    if (!throttle429Enabled()) {
+        logThrottle429Passthrough(host, modelScope, retryAfterHeader, now);
+        releaseProbeToken(probeToken, now, key);
+        return;
+    }
     releaseProbeToken(probeToken, now, key);
     const scopeModel = modelScope === undefined || modelScope.length === 0 ? undefined : modelScope;
     const stateKey = scopeModel === undefined ? key : modelHoldKey(key, scopeModel);
@@ -782,6 +818,8 @@ export function beginProvisionalUpstreamThrottle429(
 ): (modelScope?: string) => void {
     if (!throttle429Enabled()) {
         reservation?.release();
+        const { host } = holdKey(url, headers);
+        logThrottle429Passthrough(host, requestModel, retryAfterHeader, now);
         return () => undefined;
     }
     const { key, host, cred } = holdKey(url, headers);

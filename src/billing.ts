@@ -56,12 +56,10 @@ export function parseBillingSettings(value: unknown): BillingSettings | undefine
     if (value === undefined || value === null) return undefined;
     if (typeof value !== "object" || Array.isArray(value)) return undefined;
     const root = value as Record<string, unknown>;
-    // Root-key check runs BEFORE the optional-prices branch: a misplaced root
-    // field must reject the block even when a valid prices map is present
-    // (#7263 — the check used to live only in the prices-absent branch, so
-    // `{ prices: {...}, cacheRead: 0.3 }` was accepted with the field lost).
     for (const k of Object.keys(root)) if (k !== "prices") return undefined;
-    if (root["prices"] === undefined) return { prices: {} };
+    if (root["prices"] === undefined) {
+        return { prices: {} };
+    }
     if (root["prices"] === null || typeof root["prices"] !== "object" || Array.isArray(root["prices"])) return undefined;
     const prices: Record<string, BillingPrice> = {};
     for (const [key, entry] of Object.entries(root["prices"] as Record<string, unknown>)) {
@@ -109,9 +107,11 @@ function nonNegNumStrict(v: unknown): number | undefined | typeof REJECT {
  *  reload path funnels through it) and by nothing else. Keeps deep settle
  *  sites free of options plumbing, mirroring the registry costCache pattern. */
 let overridePrices: Record<string, BillingPrice> = {};
+let overrideCostRows: CostsShape | null = null;
 
 export function setBillingOverrides(prices: Record<string, BillingPrice> | undefined): void {
     overridePrices = prices ?? {};
+    overrideCostRows = overrideCosts();
 }
 
 export function billingOverrides(): Record<string, BillingPrice> {
@@ -132,9 +132,8 @@ function overrideCosts(): CostsShape | null {
 
 export function resolveBillingPrice(model: string | undefined, host?: string): ResolvedBillingPrice | undefined {
     if (!model) return undefined;
-    const costs = overrideCosts();
-    if (costs !== null) {
-        const hit = scanRegistryCostRow(costs, model, host, { conflictHint: "billing.prices" });
+    if (overrideCostRows !== null) {
+        const hit = scanRegistryCostRow(overrideCostRows, model, host, { conflictHint: "billing.prices" });
         if (hit) return finalize(hit.row, "config");
     }
     const row = peekRegistryCostRow(model, host);

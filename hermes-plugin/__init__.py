@@ -1390,14 +1390,21 @@ def make_tool_handler(tool_name: str) -> Callable[..., str]:
         # the args conversation_id fallback is model-transcribed and must keep
         # the #1685 witness precedence (no nativeCaller flag on that channel).
         session_id = kwargs.get("session_id")
+        # #7514: the on_pre_tool_call hook smuggles the host's tool_call_id in as
+        # _tool_call_id — transport, not tool input: strip before forwarding so it
+        # never rides in the model-visible args.
+        clean_args = dict(args or {})
+        tool_call_id = clean_args.pop("_tool_call_id", None)
         conversation = session_id or (args or {}).get("conversation_id")
         if not origin:
             return json.dumps({"error": "billion-context proxy is not available in this session"})
         if not conversation:
             return json.dumps({"error": "no hermes session id — cannot bind the compression conversation"})
-        body: Dict[str, Any] = {"conversationId": str(conversation), "tool": tool_name, "args": args or {}}
+        body: Dict[str, Any] = {"conversationId": str(conversation), "tool": tool_name, "args": clean_args}
         if session_id:
             body["nativeCaller"] = True
+        if isinstance(tool_call_id, str) and tool_call_id:
+            body["toolCallId"] = tool_call_id
         status, payload = http_post_json(
             origin.rstrip("/") + "/__bili/plugin/tool",
             body,
@@ -1738,6 +1745,22 @@ def report_runtime_info(model: str, max_output: Optional[int], context_window: O
         pass
 
 
+def on_pre_tool_call(*, tool_name: str = "", args: Any = None, tool_call_id: str = "", **_: Any) -> Optional[Dict[str, Any]]:
+    """pre_tool_call modifier (#7514): the host drops tool_call_id before dispatch
+    (hermes-agent model_tools.py builds dispatch_kwargs without it) but fires this hook
+    WITH it; smuggle it through args for OUR tools only, so the handler can bind the
+    server-side fold to the wire call — the unique-carrier check then matches the
+    model's own compress call on resend and the redundant inline anchor stops
+    rendering. The key is stripped again in make_tool_handler before forwarding."""
+    try:
+        names = _state.get("tool_names")
+        if not tool_call_id or not names or tool_name not in names:
+            return None
+        return {"action": "modify", "args": {"_tool_call_id": tool_call_id}}
+    except Exception:
+        return None
+
+
 def on_pre_api_request(*, session_id: str = "", model: str = "", max_tokens: Any = None, **_: Any) -> None:
     """pre_api_request observer (fires AFTER llm_request middleware): remember the session's
     max output tokens for the NEXT request's header, and report runtime info to the proxy."""
@@ -1903,6 +1926,8 @@ def register(ctx: Any) -> None:
         #    after that is ignored, so a slow proxy bootstrap must never sit in this path.
         ctx.register_middleware("llm_request", on_llm_request)
         ctx.register_hook("pre_api_request", on_pre_api_request)
+        # #7514: carry the host's tool_call_id into our tool handlers (see on_pre_tool_call).
+        ctx.register_hook("pre_tool_call", on_pre_tool_call)
         # In-session slash commands; hosts without PluginContext.register_command
         # (older builds) skip them — tools keep working, only the command entries are absent.
         if hasattr(ctx, "register_command"):
