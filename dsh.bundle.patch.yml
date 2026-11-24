@@ -30,6 +30,17 @@
 - id: compaction-basic
   config:
     auto: false
+# #7154: `/compact` drives the SAME host-side compaction call bili's wire
+# guard refuses unconditionally (#1729) — on a lane bili owns the command has
+# no outcome except failure, and dsh reports that failure as "Compaction could
+# not produce a useful summary", which blames the model for a policy refusal.
+# Stand it down with the same static semantics as the `auto: false` row above
+# (a kill-switched bili-native does not bring it back either). To get the
+# command back, set `disabled: false` for this id in the profile's own
+# cordis.patch.yml — be aware every invocation is still refused at the wire.
+# Keep in sync with the launcher overlay (writeDshAcpPatch).
+- id: command-compact
+  disabled: true
 # #2605: DSH's default retry whitelist omits MALFORMED_RESPONSE, so one
 # sampling flake that breaks a tool-call argument JSON kills the whole turn
 # unretried. A patch replaces the targeted row's WHOLE config (no deep

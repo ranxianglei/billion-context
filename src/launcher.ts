@@ -61,6 +61,7 @@ import { stateDir } from "./paths.js";
 import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
 import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
+import { dshProfileFromArgs } from "./dsh-channel.js";
 import { applyOmpFirstEventTimeout, applyOmpMessageThreadsOff, envMillis } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
 import { log as teeLog, logTimestamp } from "./logger.js";
@@ -1052,6 +1053,15 @@ interface EnvClientPreset {
 }
 
 const LAUNCHER_LOOPBACK_NO_PROXY = "localhost,127.0.0.1,::1";
+
+// #6862: hermes' own toolchain children (git/uv/npm update runners, shell tasks) inherit the
+// routed env and would ride the lane for code/dependency hosts the MITM whitelist does not cover —
+// a flaky lane egress or a dead port then takes the host's whole toolchain down. Keep those hosts
+// direct (mirrors the hermes-plugin default; same host list). Model hosts are NOT in this list, so
+// model traffic still rides the lane.
+const HERMES_NONMODEL_NO_PROXY = ("github.com,api.github.com,objects.githubusercontent.com,"
+    + "codeload.github.com,pypi.org,files.pythonhosted.org,registry.npmjs.org");
+const HERMES_DEFAULT_NO_PROXY = LAUNCHER_LOOPBACK_NO_PROXY + "," + HERMES_NONMODEL_NO_PROXY;
 
 const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
     codex: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
@@ -3632,7 +3642,7 @@ export function writeDshAcpPatch(dshHome: string, entryName?: string): string | 
     writeOverlayFileAtomic(
         dir,
         ".bili-acp.patch.yml",
-        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n    - id: bili-compaction-gate\n      name: ${gateUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #7111: keep in sync with dsh.bundle.patch.yml — the four preset rows are no longer gated on the gate service (a fail-closed inject bricked session creation); the always-on bili-compaction-gate entry reconciles them after load instead\n# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
+        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n    - id: bili-compaction-gate\n      name: ${gateUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #7154: keep in sync with dsh.bundle.patch.yml — /compact drives the host compaction call the #1729 wire guard refuses unconditionally, so on a bili-owned lane it can only fail (and dsh blames the model for it)\n- id: command-compact\n  disabled: true\n# #7111: keep in sync with dsh.bundle.patch.yml — the four preset rows are no longer gated on the gate service (a fail-closed inject bricked session creation); the always-on bili-compaction-gate entry reconciles them after load instead\n# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
     );
     const file = path.join(dir, ".bili-acp.patch.yml");
     try {
@@ -7315,6 +7325,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // carrier is present (anonymous requests are accepted, #286).
         env = stripInheritedProxy(process.env);
         env.HTTPS_PROXY = origin;
+        // #6862: keep hermes' own toolchain children (git/uv/npm update runners, shell tasks) off
+        // the lane for code/dependency hosts — they inherit HTTPS_PROXY and a flaky lane egress or
+        // dead port then takes the host's whole toolchain down. Model hosts are not listed, so
+        // model traffic still rides the lane.
+        env.NO_PROXY = HERMES_DEFAULT_NO_PROXY;
+        env.no_proxy = HERMES_DEFAULT_NO_PROXY;
         env.HERMES_CA_BUNDLE = ca;
         env.SSL_CERT_FILE = resolveCombinedCaPath(process.env);
         if (routes.httpRewrites.length === 0 && routes.httpsDomains.length === 0) {
@@ -7399,8 +7415,20 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const prevNodePath = env.NODE_PATH;
         env.NODE_PATH = prevNodePath !== undefined && prevNodePath.length > 0 ? `${dshNm}${path.delimiter}${prevNodePath}` : dshNm;
         let dshAcpPatch: string | undefined;
-        if (!dshNativeInstalled()) {
+        // #7155: ask about the profile this run is about to boot, not the
+        // machine. The machine-wide form made a bundle-less profile look
+        // installed whenever a sibling profile had the bundle: the overlay was
+        // skipped and the session ran with ZERO bili entries (no compression
+        // tools, no takeover, native compaction armed) while the note below
+        // described the other profile.
+        const targetProfile = dshProfileFromArgs(params.clientArgs);
+        if (!dshNativeInstalled(process.env, targetProfile)) {
             dshAcpPatch = writeDshAcpPatch(dshHomeDir, dshPluginEntry(dshOverlayHome ?? dshHomeDir));
+            if (targetProfile !== undefined && dshNativeInstalled()) {
+                console.error(
+                    `bili: profile "${targetProfile}" does not install billion-context (another profile on this machine does) — this run mounts the launcher overlay, so compression works for this session only. Install it permanently with: dsh plugin --profile ${targetProfile} add billion-context`,
+                );
+            }
         } else {
             // Unconditional (#3666): the #2028 allowDshCompaction opt-out was
             // removed, so a native install always leaves dsh compaction armed

@@ -111,6 +111,11 @@ export interface EgressViewRow {
     /** The kernel-space role (rebuild needs it; the diff keys on msgid so a
      *  role-only drift is impossible — kernel ids are one-shot). */
     role?: string;
+    /** First-observed wall clock (epoch ms) — stamped on the message's I row
+     *  (#7577 D3). A msgid is inserted exactly once (kernel ids are one-shot),
+     *  so the I row IS the first observation; spine rows inherit it. Optional:
+     *  pre-#7577 dev rows (the tables never shipped) lack it. */
+    ts?: number;
 }
 
 type EgressOpType = "B" | "I" | "D" | "U";
@@ -127,13 +132,16 @@ interface EgressStateRow {
 const INSERT_STATE = `INSERT INTO egress_state (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
 const INSERT_FLOW = `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
 
-function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: number } {
-    // egress_flow is the record and a superset of egress_state after every
-    // compaction, so the flow maxima ARE the session's high-waters: the
-    // op_seq ordering cursor and the canonical message-number cursor (I
-    // rows only — B/D/U carry NULL and never advance it).
-    //
-    // #7574: must be read INSIDE the append transaction, never before it.
+/** The canonical message frontier: the highest number ever ISSUED
+ * (retired messages included — I rows only advance it, B/D/U never do).
+ * MAX(log_seq) over the flow rows is the fast answer, but a compaction
+ * physically removes the I rows its newest base subsumes (#7574), so the
+ * moment right after a fold the flow can hold a base row ONLY — the
+ * high-water then lives in the base payload (entries' inline numbers and
+ * the explicit highWater field). Callers reading the frontier OUTSIDE the
+ * append transaction must go through this fallback; the next append's
+ * validation replay reports an unreadable base. */
+export function egressMessageHighWater(db: SqliteDatabase, sessionId: string): number {
     const row = db
         .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o, COALESCE(MAX(log_seq), 0) AS n FROM egress_flow WHERE session_id = ?")
         .get(sessionId) as { o: number; n: number } | undefined;
@@ -160,7 +168,28 @@ function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: 
             }
         }
     }
-    return { opSeq: head + 1, num: high + 1 };
+    return high;
+}
+
+function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: number } {
+    // egress_flow is the record and a superset of egress_state after every
+    // compaction, so the flow maxima ARE the session's high-waters: the
+    // op_seq ordering cursor and the canonical message-number cursor (I
+    // rows only — B/D/U carry NULL and never advance it).
+    // #7577 (owner ruling 2026-11-24): DUAL CLOCKS — the block lifecycle log
+    // numbers itself (egress_block_flow.op_seq dense within its own table,
+    // see egress-block.ts); its rows carry flow_op_seq as a POINTER to this
+    // clock (flow's MAX at write time) for cross-table alignment at point
+    // forks. The flow table keeps its exclusive number pool: the op_seq and
+    // log_seq cursors are egress_flow-only, and its density invariant
+    // (#7574) stays intact regardless of what the block table does.
+    //
+    // #7574: must be read INSIDE the append transaction, never before it.
+    const row = db
+        .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_flow WHERE session_id = ?")
+        .get(sessionId) as { o: number } | undefined;
+    const head = Number(row?.o) || 0;
+    return { opSeq: head + 1, num: egressMessageHighWater(db, sessionId) + 1 };
 }
 
 interface InsertOp {
@@ -172,6 +201,9 @@ interface InsertOp {
     typeTag: string;
     bytes: string;
     role?: string;
+    /** First-observed wall clock (epoch ms) — stamped by recordEgressTurn
+     *  (#7577 D3); the I row is the message's birth, so this is its ts. */
+    ts?: number;
 }
 interface DeleteOp {
     type: "D";
@@ -219,6 +251,7 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
             num += 1;
             const entry: EgressViewRow = { num, msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, bytes: op.bytes };
             if (op.role !== undefined) entry.role = op.role;
+            if (op.ts !== undefined) entry.ts = op.ts;
             view.splice(at + 1, 0, entry);
         } else if (op.type === "D") {
             const s = idxOf(op.start);
@@ -320,7 +353,7 @@ function writeOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], firstO
         const opSeq = firstOpSeq + i;
         if (op.type === "I") {
             num += 1;
-            writeOp(db, sessionId, opSeq, num, "I", op.msgid, JSON.stringify({ after: op.after, ref: op.ref, tokens: op.tokens, type: op.typeTag, role: op.role }), op.bytes, nowMs);
+            writeOp(db, sessionId, opSeq, num, "I", op.msgid, JSON.stringify({ after: op.after, ref: op.ref, tokens: op.tokens, type: op.typeTag, role: op.role, ts: op.ts }), op.bytes, nowMs);
         } else if (op.type === "D") {
             writeOp(db, sessionId, opSeq, null, "D", null, JSON.stringify({ start: op.start, end: op.end }), null, nowMs);
         } else {
@@ -621,6 +654,7 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
                 bytes: row.bytes,
             };
             if (p.role !== undefined) entry.role = p.role as string;
+            if (typeof p.ts === "number") entry.ts = p.ts;
             // `after: null` = the row goes to the FRONT — it was the first
             // row of the view the diff described (a replaced system prompt).
             // #7574: this replay used to append it at the end, so the stored

@@ -156,6 +156,14 @@ export function recordEgressTurn(args: {
     const next = buildEgressViewRows(conversation, systemText);
     const ops = diffEgressView(prev, next);
     if (ops.length === 0) return prev;
+    // #7577 D3: stamp the first-observed wall clock on each I row BEFORE the
+    // append — writeOps persists op.ts into the I row's payload. A msgid is
+    // inserted exactly once (kernel ids are one-shot), so the I row IS the
+    // message's birth: ts is fixed at first observation and spine rows inherit
+    // it through the replay. This is what lets tsStamps be derived from a
+    // flow replay (keyed by the I row's msgid = the kernel raw id) instead of
+    // persisted as a kstate map.
+    for (const op of ops) if (op.type === "I" && op.ts === undefined) op.ts = nowMs;
     return store.egressAppendTurn(sessionId, ops, baseSeq ?? store.egressStateMaxSeq(sessionId), nowMs);
 }
 
