@@ -177,10 +177,17 @@ test("#6641: LAYER-BYPASSED section renders when a host plugin reports a client-
     const clean = handleAcpStatus({}, ctx).text;
     assert.ok(!clean.includes("LAYER-BYPASSED"), "no section when no bypass has been reported");
 
+    // Log the SAME endpoint twice: total reports = 2 but distinct endpoints = 1.
+    // The headline must say "1 distinct model endpoint", not "2" — the report
+    // total and the distinct count only diverge when an endpoint is reported
+    // more than once (multiple host processes), which is exactly the case the
+    // original text got wrong.
+    logUnroutedModelEndpoint("https://custom-wire.example/api/agent/v3/llm_utils_chat");
     logUnroutedModelEndpoint("https://custom-wire.example/api/agent/v3/llm_utils_chat");
     const out = handleAcpStatus({}, ctx).text;
     const line = out.split("\n").find((l) => l.startsWith("LAYER-BYPASSED"));
     assert.ok(line, "section present when a bypass has been reported");
+    assert.ok(line!.includes("1 distinct model endpoint"), "headline uses the distinct endpoint count, not the report total");
     assert.ok(line!.includes("llm_utils_chat"), "example endpoint rendered from the live count");
     assert.ok(line!.includes("modelEndpointPatterns"), "remedy names the config key");
     assert.ok(line!.includes("the unroutedModelEndpoints field of GET /__bili/stats"), "pointer names the stats field explicitly");

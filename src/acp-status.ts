@@ -645,7 +645,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             .map(([ep, n]) => `${ep}×${n}`)
             .join(", ");
         extra.push("");
-        extra.push(`LAYER-BYPASSED (instance-level, #6641): ${unrt.total} distinct model endpoint(s) were sent DIRECT (uncompressed) by the host plugin because their path is not a recognized model endpoint (${top}). Those sessions never entered the proxy, so their cache ledger is empty and compression is INACTIVE for them. To compress such a lane: declare the endpoint in "modelEndpointPatterns" in billion-context.json (e.g. {"match":"https://<host>/api/agent/v3/llm_utils_chat","wire":"openai"}), then restart the host. Exact per-endpoint counts: the unroutedModelEndpoints field of GET /__bili/stats.`);
+        extra.push(`LAYER-BYPASSED (instance-level, #6641): ${Object.keys(unrt.endpoints).length} distinct model endpoint(s) were sent DIRECT (uncompressed) by the host plugin because their path is not a recognized model endpoint (${top}). Those sessions never entered the proxy, so their cache ledger is empty and compression is INACTIVE for them. To compress such a lane: declare the endpoint in "modelEndpointPatterns" in billion-context.json (e.g. {"match":"https://<host>/api/agent/v3/llm_utils_chat","wire":"openai"}), then restart the host. Exact per-endpoint counts: the unroutedModelEndpoints field of GET /__bili/stats.`);
     }
     return toolOk(extra.length > 0 ? `${base}\n${extra.join("\n")}` : base);
 }
