@@ -52,6 +52,7 @@ import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgIdP
 import { tryIncrementalPin } from "../snapshot/stage0.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
+import { currentCalibrationFactor } from "../util.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { egressAuthorityArmed, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
@@ -318,6 +319,9 @@ export async function prepareAnthropic(
             tools: parsed.tools,
             imageTokens: inboundImageTokens,
             storedOverhead: typeof session.metadata.systemPromptTokens === "number" ? session.metadata.systemPromptTokens : undefined,
+            calibrationFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel),
+            calibrationOrigin: session.stats.calibratedEstimateOrigin,
+            currentOrigin: upstreamOrigin,
         });
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.

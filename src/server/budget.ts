@@ -214,6 +214,13 @@ export interface ThinkingMassInput {
      *  the inbound body because it captures the proxy-injected ACP content that
      *  was actually billed last turn. Ignored when not a positive finite number. */
     storedOverhead?: number;
+    /** Active per-route estimator scale k̂ (currentCalibrationFactor) + provenance
+     *  so the visible text+overhead baseline is compared against providerInputTokens
+     *  in billed units and the residual is stored back in local-estimate units,
+     *  preventing double multiplication when preflight/output-clamp apply k̂. */
+    calibrationFactor?: number;
+    calibrationOrigin?: string;
+    currentOrigin?: string;
 }
 
 /** Project the hidden thinking mass onto signature-only reasoning messages.
@@ -235,7 +242,11 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
     const overhead = typeof input.storedOverhead === "number" && Number.isFinite(input.storedOverhead) && input.storedOverhead > 0
         ? input.storedOverhead
         : countSystemAndToolsTokens(input.systemText, input.tools);
-    const gap = Math.max(0, input.providerInputTokens - estimateCoreMessages(msgs) - overhead - Math.max(0, input.imageTokens));
+    const effK = applyEstimateCalibration(1, input.calibrationFactor, input.calibrationOrigin, input.currentOrigin);
+    const localBase = estimateCoreMessages(msgs) + overhead;
+    const billedGap = Math.max(0, input.providerInputTokens - localBase * effK - Math.max(0, input.imageTokens));
+    if (billedGap <= 0) return 0;
+    const gap = Math.round(billedGap / effK);
     if (gap <= 0) return 0;
     const totalSig = targets.reduce((s, t) => s + t.sig, 0);
     let assigned = 0;
