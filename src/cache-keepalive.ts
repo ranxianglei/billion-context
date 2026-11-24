@@ -176,6 +176,7 @@ interface KeepaliveEntry {
     lastHitAt?: number;
     timerId: ReturnType<typeof setTimeout> | undefined;
     pingInFlight: boolean;
+    pingController?: AbortController;
 }
 
 const registry = new Map<string, KeepaliveEntry>();
@@ -345,6 +346,7 @@ function armInternal(inp: KeepaliveArmInput): void {
         pingInFlight: false,
     };
     registry.set(inp.sessionId, entry);
+    prev?.pingController?.abort();
     entry.timerId = scheduleFn(() => {
         void firePing(entry);
     }, entry.cadenceMs);
@@ -372,52 +374,63 @@ async function firePing(entry: KeepaliveEntry): Promise<void> {
         return;
     }
     entry.pingInFlight = true;
+    const controller = new AbortController();
+    entry.pingController = controller;
+    // Keep cancellation live until the response body is consumed. Relay the
+    // deadline without AbortSignal.any, which is absent in early Node 20.
+    const timeout = AbortSignal.timeout(PING_TIMEOUT_MS);
+    const onTimeout = () => controller.abort(timeout.reason);
+    timeout.addEventListener("abort", onTimeout, { once: true });
     entry.lastPingAt = clock();
-    let resp: Response;
     try {
-        resp = await sendPing(entry);
-    } catch (err) {
+        let resp: Response;
+        try {
+            resp = await sendPing(entry, controller.signal);
+        } catch (err) {
+            handleFailure(entry, `network: ${err instanceof Error ? err.message : String(err)}`);
+            return;
+        }
+        if (registry.get(entry.sessionId) !== entry) return;
+        let text: string;
+        try {
+            text = await resp.text();
+        } catch (err) {
+            if (resp.status !== 429) {
+                handleFailure(entry, `response body: ${err instanceof Error ? err.message : String(err)}`);
+                return;
+            }
+            text = "";
+        }
+        if (registry.get(entry.sessionId) !== entry) return;
+        if (!resp.ok) {
+            if (resp.status === 429) {
+                disarm(entry.sessionId, "rate-limited(429)");
+                return;
+            }
+            handleFailure(entry, `http ${resp.status}: ${text.slice(0, 200)}`);
+            return;
+        }
+        let usage: Record<string, unknown> | undefined;
+        try {
+            const j = JSON.parse(text) as { usage?: unknown };
+            if (j && typeof j === "object" && j.usage && typeof j.usage === "object") usage = j.usage as Record<string, unknown>;
+        } catch {
+            usage = undefined;
+        }
+        const cached = usage ? usageTotals("anthropic", usage).cached : undefined;
+        entry.pingCount += 1;
+        if (typeof cached === "number" && cached > 0) {
+            entry.failStreak = 0;
+            entry.lastHitAt = clock();
+            loggerLog("info", `[${entry.sessionId}] [keepalive] ping#${entry.pingCount} hit=${cached}tok`);
+            reschedule(entry);
+        } else {
+            disarm(entry.sessionId, "prefix-dead(cache_read=0)");
+        }
+    } finally {
+        timeout.removeEventListener("abort", onTimeout);
         entry.pingInFlight = false;
-        handleFailure(entry, `network: ${err instanceof Error ? err.message : String(err)}`);
-        return;
-    }
-    entry.pingInFlight = false;
-    if (registry.get(entry.sessionId) !== entry) return;
-    let text: string;
-    try {
-        text = await resp.text();
-    } catch (err) {
-        if (resp.status !== 429) {
-            handleFailure(entry, `response body: ${err instanceof Error ? err.message : String(err)}`);
-            return;
-        }
-        text = "";
-    }
-    if (registry.get(entry.sessionId) !== entry) return;
-    if (!resp.ok) {
-        if (resp.status === 429) {
-            disarm(entry.sessionId, "rate-limited(429)");
-            return;
-        }
-        handleFailure(entry, `http ${resp.status}: ${text.slice(0, 200)}`);
-        return;
-    }
-    let usage: Record<string, unknown> | undefined;
-    try {
-        const j = JSON.parse(text) as { usage?: unknown };
-        if (j && typeof j === "object" && j.usage && typeof j.usage === "object") usage = j.usage as Record<string, unknown>;
-    } catch {
-        usage = undefined;
-    }
-    const cached = usage ? usageTotals("anthropic", usage).cached : undefined;
-    entry.pingCount += 1;
-    if (typeof cached === "number" && cached > 0) {
-        entry.failStreak = 0;
-        entry.lastHitAt = clock();
-        loggerLog("info", `[${entry.sessionId}] [keepalive] ping#${entry.pingCount} hit=${cached}tok`);
-        reschedule(entry);
-    } else {
-        disarm(entry.sessionId, "prefix-dead(cache_read=0)");
+        entry.pingController = undefined;
     }
 }
 
@@ -439,7 +452,7 @@ function reschedule(entry: KeepaliveEntry): void {
     }, entry.cadenceMs);
 }
 
-async function sendPing(entry: KeepaliveEntry): Promise<Response> {
+async function sendPing(entry: KeepaliveEntry, signal: AbortSignal): Promise<Response> {
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(entry.headers)) {
         const lk = k.toLowerCase();
@@ -453,7 +466,7 @@ async function sendPing(entry: KeepaliveEntry): Promise<Response> {
         method: "POST",
         headers,
         body: buildPingBody(entry.body),
-        signal: AbortSignal.timeout(PING_TIMEOUT_MS),
+        signal,
     };
     if (entry.dispatcher) init.dispatcher = entry.dispatcher;
     return await fetch(entry.upstreamUrl, init as RequestInit) as Response;
@@ -464,6 +477,7 @@ function disarm(sessionId: string, reason: string): void {
     if (!entry) return;
     registry.delete(sessionId);
     if (entry.timerId !== undefined) cancelFn(entry.timerId);
+    entry.pingController?.abort();
     loggerLog("info", `[${sessionId}] [keepalive] disarmed reason=${reason} pings=${entry.pingCount}`);
 }
 

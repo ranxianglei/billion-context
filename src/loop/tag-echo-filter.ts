@@ -226,7 +226,7 @@ const TRUNC_REF_CLOSE = new RegExp("m\\d{4,}\\s*\\x3c\\/([a-zA-Z]{0,32})$");
 // close terminates — those belong to the existing close rules. The
 // [\w>] lookbehind mirrors ORPHAN_REF_CLOSE: word-adjacent runs (xm01233) and
 // runs right after a tag terminator (\x3e, #644) are not this unit.
-const DEAD_REF_CLOSE = new RegExp("(?<![\\w>])m\\d{4,}\\s*\\x3c\\/[a-zA-Z]{0,32}(?![a-zA-Z])(?![^\\x3c\\x3e]{0,32}\\x3e)", "g");
+const DEAD_REF_CLOSE = new RegExp("(?<![\\w>])" + REFS_RUN + "\\s*\\x3c\\/[a-zA-Z]{0,32}(?![a-zA-Z])(?![^\\x3c\\x3e]{0,32}\\x3e)", "g");
 // The wrapped-turn imitation: the model opens a render tag and writes its
 // payload where the attributes are still open, so the attribute list runs into
 // a `<` instead of ending at its `>`. The recorded shape (architect session
@@ -1054,7 +1054,7 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
     };
 }
 
-export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boolean) => void, onResidueWarn?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string): TagEchoFilter {
+export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boolean) => void, onResidueWarn?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string, onDropVerdict?: (leavesInterior: boolean) => void): TagEchoFilter {
     let held = "";
     /** Settled prose deferred alongside a NON-definite tag-head tail: it
      *  carries a dead ref-close unit whose verdict is content-determined
@@ -1107,7 +1107,16 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
     // below (spent by the response's FIRST drop) left it with no line at all.
     // It gets its own one-shot budget so a held head at EOF is always audible.
     let drainNoticed = false;
-    const recordDrop = (snippet: string, duringDrain = false) => {
+    /** #6034 (option E): delivered on EVERY drop (the one-shot notices above
+     *  only reach the first) — does this dropped artifact leave interior
+     *  bytes behind that a consumer's answer ledger must count as markup
+     *  (true: a session-start open whose body verdict is still open, and a
+     *  close that releases its prose body), or does the artifact die whole /
+     *  release content (false: complete refs-only units, dead orphans, a
+     *  refs-only close, discarded payloads)? Default false; only the sites
+     *  below that provably leave or release interior pass true. */
+    const recordDrop = (snippet: string, duringDrain = false, leavesInterior = false) => {
+        onDropVerdict?.(leavesInterior);
         droppedAny = true;
         if (duringDrain) {
             if (onDrop && !drainNoticed) {
@@ -1122,17 +1131,17 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
         }
     };
     /** One self-contained artifact resolved by a single drop call. */
-    const drop = (snippet: string, duringDrain = false) => {
+    const drop = (snippet: string, duringDrain = false, leavesInterior = false) => {
         dropCount += 1;
-        recordDrop(snippet, duringDrain);
+        recordDrop(snippet, duringDrain, leavesInterior);
     };
     /** Any drop inside a live swallow session — the session counts once. */
-    const dropSwallowSpan = (snippet: string, duringDrain = false) => {
+    const dropSwallowSpan = (snippet: string, duringDrain = false, leavesInterior = false) => {
         if (!swallowSessionCounted) {
             dropCount += 1;
             swallowSessionCounted = true;
         }
-        recordDrop(snippet, duringDrain);
+        recordDrop(snippet, duringDrain, leavesInterior);
     };
     /** #2862: strip dead ref-close units (ref + unterminated close head) from
      *  a span about to be RELEASED as prose; each unit is one self-contained
@@ -1190,7 +1199,17 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
                 if (swallowReleases) {
                     const dspan = degenCloseAfterRef(combined);
                     if (dspan !== null) {
-                        dropSwallowSpan(combined.slice(0, dspan.end));
+                        // #6034: a single-ref body terminates on ANY short close (#2190),
+                        // so this path also carries the CLEAN echo (proper close name).
+                        // Verdict by name: the proper close is a well-formed kernel tag
+                        // quote — nothing left behind, the frame stays an answer; a
+                        // mangled close name is the unclosed-echo shape (the model opened
+                        // a render tag and botched the close), so whatever the frame still
+                        // releases after the dead unit is suspect markup — exactly as the
+                        // one-shot era armed it (the unclosed-echo retry tests in
+                        // plugin-empty-turn-retry pin that direction).
+                        const mangledClose = !combined.startsWith("\x3c/acp\x3e", dspan.start);
+                        dropSwallowSpan(combined.slice(0, dspan.end), false, mangledClose);
                         swallowed = "";
                         swallowUntilClose = false;
                         buf = combined.slice(dspan.end);
@@ -1254,10 +1273,10 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
                         const t = TRUNC_OPEN.exec(inner);
                         if (t !== null) {
                             out += stripDeadRefCloses(inner.slice(0, t.index));
-                            dropSwallowSpan(combined.slice(t.index, span.end));
+                            dropSwallowSpan(combined.slice(t.index, span.end), false, true);
                             buf = combined.slice(span.end);
                         } else {
-                            dropSwallowSpan(combined.slice(span.start, span.end));
+                            dropSwallowSpan(combined.slice(span.start, span.end), false, true);
                             buf = inner + combined.slice(span.end);
                         }
                     }
@@ -1296,6 +1315,10 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
                         swallowed = "";
                         swallowUntilClose = false;
                         buf = combined;
+                        // #644: the over-budget tail is content, not the tag's
+                        // interior — un-arm any pending verdict so the released
+                        // payload counts as the answer (#6034 class).
+                        onDropVerdict?.(false);
                         if (onResidueWarn && containsEchoResidue(combined)) onResidueWarn(combined);
                         continue;
                     }
@@ -1480,7 +1503,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
                     continue;
                 }
                 swallowSessionCounted = false;
-                recordDrop(m[0]);
+                recordDrop(m[0], false, true);
                 // An odd number of quotes means the opening's attribute list
                 // never closed: the model wrapped its turn inside the value (the
                 // sibling shape opens with such a value and then runs into a `<`,

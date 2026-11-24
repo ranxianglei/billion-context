@@ -573,7 +573,15 @@ function currentRefsSnapshot(ctx: RewriteCtx): string {
     }
     if (!loId || !hiId) return "";
     const activeBlocks = ctx.session.state.blocks.filter((b) => b.active).length;
-    return ` [Context snapshot at the moment of THIS receipt — point-in-time only: refs are minted continuously, so every earlier copy of this line in the transcript is stale, and the newest copy is the current frontier. ${ctx.messages.length} visible message(s), refs ${loId}–${hiId}, ${activeBlocks} active block(s). Refs restart at m00001 after a session-generation change — request only refs inside the newest such snapshot, or call acp_status for exact compressible ranges.]`;
+    // 2026-11-24 (session 01a2076a, qwen3.8-27b): the previous wording put the
+    // visible count BEFORE the span ("134 visible message(s), refs m00001–
+    // m01643") and a weak model read it as "134 messages BEYOND m01643" — it
+    // then aimed compress calls at m01643+134=m01777 and other phantom
+    // endpoints (six over-shoots in one session, each clamped). The count is a
+    // SUBSET of the span: state the span + "nothing above hiId exists" FIRST,
+    // then the visible count as an explicit subset — the two numbers must
+    // never read as adjacent ranges.
+    return ` [Context snapshot at the moment of THIS receipt — point-in-time only: refs are minted continuously, so every earlier copy of this line in the transcript is stale, and the newest copy is the current frontier. Refs minted so far: ${loId}–${hiId}; the newest message is ${hiId} — refs are minted in order and never pre-allocated, so NOTHING numbered above ${hiId} exists. Currently visible: ${ctx.messages.length} message(s)${activeBlocks > 0 ? ` and ${activeBlocks} active block(s) (their folded refs sit inside the same range)` : ""} — every visible ref is a SUBSET of ${loId}–${hiId}, not a tail beyond it. Refs restart at m00001 after a session-generation change — request only refs inside the newest such snapshot, or call acp_status for exact compressible ranges.]`;
 }
 
 // #1294 P1: one-line integrity fingerprint per created/updated block — exact
