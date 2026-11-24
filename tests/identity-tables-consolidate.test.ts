@@ -346,6 +346,22 @@ test("S2 (review M1): a session latched in BOTH carriers clears both — the leg
     }
 });
 
+test("S5 (review): MANUAL archive of an egress-on session is refused at the archiveSession chokepoint (op log not exported = data loss)", () => {
+    const h = openStore();
+    const sid = "sess-manual-archive-egress";
+    try {
+        egressOnRow(h.db, sid, Date.now() - 100 * 86_400_000, ["m1", "m2"]);
+        const out = h.store.archiveSession(sid, { archiveDir: path.join(h.dir, "archive") });
+        assert.equal(out.ok, false, "the archive refuses an egress-on session");
+        assert.match(out.reason ?? "", /egress-on/, "the reason names the missing op-log export");
+        assert.equal((h.db.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sid) as { status: string }).status, "active", "the session is untouched");
+        assert.equal((h.db.prepare("SELECT count(*) AS n FROM egress_flow WHERE session_id = ?").get(sid) as { n: number }).n, 2, "the op log is intact");
+        assert.equal((h.db.prepare("SELECT count(*) AS n FROM messages WHERE session_id = ?").get(sid) as { n: number }).n, 0, "nothing was deleted");
+    } finally {
+        closeStore(h);
+    }
+});
+
 test("S4 (review L3): an egress-on (conversation-bound) session DEGRADES on an R3 identity fault instead of 400ing", () => {
     // The S4 contract: for an egress-on session the lane passes convBound from
     // the in-memory metadata (pluginAgent != null) because there is no

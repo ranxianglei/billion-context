@@ -3216,6 +3216,16 @@ export class UnifiedStore {
     archiveSession(sessionId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
         const row = this.getSessionRow(sessionId);
         if (!row) return { ok: false, reason: "not-found" };
+        // Identity consolidation (discussions/7591): the GC age-sweep excludes
+        // egress-on sessions; the MANUAL paths (unifiedArchiveSession —
+        // `bili sessions archive`) share this chokepoint and would otherwise
+        // hit the same data loss: the export carries the messages/blocks
+        // projection (frozen at the arm turn for these sessions) while the
+        // egress op log — the sole content authority — is neither exported
+        // nor re-imported by restoreSession. Refuse until the archive format
+        // carries the op log (follow-up, same batch as the l1/conversations
+        // physical DROP).
+        if (this.isEgressOnSession(sessionId)) return { ok: false, reason: "egress-on session: the archive format does not carry the egress op log yet — refusing (follow-up)" };
         // #3901 review: sessions are small and numerous — a per-session file
         // per archive would spray tiny files across the archive dir. One
         // append-only JSONL holds every archived session, one line each.
