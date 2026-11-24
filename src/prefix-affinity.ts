@@ -264,7 +264,7 @@ function sortKeys(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(sortKeys);
     if (value && typeof value === "object") {
         const record = value as Record<string, unknown>;
-        const out: Record<string, unknown> = {};
+        const out: Record<string, unknown> = Object.create(null);
         for (const key of Object.keys(record).sort()) out[key] = sortKeys(record[key]);
         return out;
     }
@@ -289,7 +289,7 @@ function canonicalize(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(canonicalize);
     if (value && typeof value === "object") {
         const record = value as Record<string, unknown>;
-        const out: Record<string, unknown> = {};
+        const out: Record<string, unknown> = Object.create(null);
         for (const key of Object.keys(record).sort()) {
             if (key === "cache_control") continue; // #2188: transport-layer hint, not content
             out[key] = canonicalize(record[key]);
@@ -622,7 +622,26 @@ export class PrefixAffinityResolver {
         const hashes = fingerprints.hashes;
         const incomingDepth = hashes.length;
         const messages = normalizeAffinityMessages(input);
-        const v1Hashes = chainHashes(messages);
+        // v1 (raw-wire) products are consumable in exactly two situations:
+        // a pre-#2791 chain is still tracked — identified or not (the
+        // orphan-suspect scan at the new-session path also reads v1Hashes
+        // for identified hv1 entries) — or the neutral projection is empty
+        // (incomingDepth === 0): the degenerate-request guard below and the
+        // mint path's tailHash are anchored on the raw domain, so a
+        // machinery-only request (user content the projection drops — client
+        // markers, image placeholders, empty content) keeps its pre-#2791
+        // deterministic mint instead of flipping to the #286 400. In the
+        // steady state (incomingDepth > 0 without an hv1 chain) both the
+        // progressive chainHashes pass and the perItemHashes lineage pass
+        // are dead work — every consumer is guarded by v1Depth > 0 or by an
+        // hv1 entry existing — and skipping them is zero behavior change
+        // (those consumers take their exact v1Depth === 0 branch) instead of
+        // paying two O(n²)-bytes passes per anonymous request.
+        let hasHv1 = false;
+        for (const entry of this.trackedChains.values()) {
+            if (entry.hv === 1) { hasHv1 = true; break; }
+        }
+        const v1Hashes = (hasHv1 || incomingDepth === 0) ? chainHashes(messages) : [];
         const v1Depth = v1Hashes.length;
         if (incomingDepth === 0 && v1Depth === 0) return null;
         const tailHash = incomingDepth > 0 ? hashes[incomingDepth - 1]! : v1Hashes[v1Depth - 1]!;
@@ -785,6 +804,8 @@ export class PrefixAffinityResolver {
         //  the raw-wire products for pre-upgrade chains (UI/debug only —
         //  never used for matching).
         let lineage = this.lineageOf(storedItemHashes, incomingDepth);
+        // v1Depth > 0 implies hasHv1 (chainHashes only ran then), so the raw
+        // lineage scan has at least one hv1 chain to fork/truncate against.
         if (lineage === undefined && v1Depth > 0) {
             lineage = this.lineageOf(perItemHashes(messages).slice(-MAX_STORED_ITEMS), v1Depth);
         }

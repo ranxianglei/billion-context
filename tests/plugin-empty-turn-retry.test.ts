@@ -505,8 +505,9 @@ test("plugin chat emits an in-band error when the retry degenerates too", async 
     assert.equal((text.match(/\[DONE\]/g) ?? []).length, 2, "the error's terminal, then the retry's trailing terminator");
     // #4913 item 3: the fatal log names the signal that qualified the attempt,
     // measured on the RETRY pass (accumulators are reset when the retry takes
-    // over), not inherited from the first attempt.
-    const fatal = logs.find((l) => l.includes("again after the retry"));
+    // over), not inherited from the first attempt. #7666 reworded the budget
+    // spent as "after N continuation nudge(s)".
+    const fatal = logs.find((l) => l.includes("continuation nudge(s)"));
     assert.ok(fatal, `the fatal retry log is present, got: ${JSON.stringify(logs)}`);
     assert.ok(fatal.includes("sawThinking=true"), `the qualifying signal is named, got: ${fatal}`);
     assert.ok(fatal.includes("releasedMarkupChars=0"), "the first attempt's released markup is not inherited into the retry's verdict");
@@ -541,7 +542,7 @@ test("plugin chat: a retry attempt the model left genuinely bare passes through 
     assert.equal((text.match(/\[DONE\]/g) ?? []).length, 1, "a single terminal closes the turn");
     const bare = logs.find((l) => l.includes("bare on the retry pass"));
     assert.ok(bare, `the bare-on-retry log is present, got: ${JSON.stringify(logs)}`);
-    assert.ok(!logs.some((l) => l.includes("again after the retry")), "no fatal verdict for a bare second attempt");
+    assert.ok(!logs.some((l) => l.includes("continuation nudge(s)")), "no fatal verdict for a bare second attempt");
 });
 
 test("plugin chat (chat wire): a thinking-only second attempt dies with the qualifying signal logged (#4913)", async () => {
@@ -563,7 +564,7 @@ test("plugin chat (chat wire): a thinking-only second attempt dies with the qual
     const text = out.join("");
     assert.equal(calls, 1, "one retry, then the fatal verdict");
     assert.ok(text.includes('"code":"stream_error"'), "the #870 in-band failure is emitted");
-    const fatal = logs.find((l) => l.includes("again after the retry"));
+    const fatal = logs.find((l) => l.includes("continuation nudge(s)"));
     assert.ok(fatal, `the fatal retry log is present, got: ${JSON.stringify(logs)}`);
     assert.ok(fatal.includes("sawThinking=true"), `the retry's own thinking qualifies the verdict, got: ${fatal}`);
     assert.ok(!fatal.includes("first attempt thought"), "the verdict is measured, not inherited from the first attempt's bytes");
@@ -707,6 +708,7 @@ test("plugin chat: an exhausted degenerate retry passes through when degenerateT
         undefined,
         undefined,
         false,
+        undefined,
         "passthrough",
     );
     const text = out.join("");
@@ -740,6 +742,7 @@ test("plugin chat: an exhausted degenerate retry still dies when degenerateTurn=
         undefined,
         undefined,
         false,
+        undefined,
         "error",
     );
     assert.equal(calls, 1);

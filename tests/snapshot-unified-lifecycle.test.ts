@@ -9,12 +9,13 @@ process.env.XDG_STATE_HOME = root;
 
 const { _setStoreForTest, _resetStoreForTest } = await import("../src/persist.js");
 const affinity = await import("../src/affinity-persist.js");
-const order = await import("../src/order-persist.js");
 type SessionStore = import("../src/persist.js").SessionStore;
 
+// 2026-11-23: the second writer (session-order) retired with the
+// trust-stamped-id GA — this parameterized suite now runs against the
+// surviving affinity writer.
 const writers = [
     { name: "prefix-affinity", hydrate: affinity.hydrateAffinityUnified, flush: affinity.flushPrefixAffinity, schedule: affinity.scheduleAffinityPersist, reset: affinity._resetAffinityPersistForTest },
-    { name: "session-order", hydrate: order.hydrateOrderUnified, flush: order.flushOrderSkeletons, schedule: order.scheduleOrderPersist, reset: order._resetOrderPersistForTest },
 ];
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
