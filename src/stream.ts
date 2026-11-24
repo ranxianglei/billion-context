@@ -187,7 +187,7 @@ function normalizedSpecKey(ranges: ParsedRange[]): string {
         .sort()
         .join(",");
 }
-function recordCompressFailure(session: Session, key: string, repeatAdvice?: string): string {
+function recordCompressFailure(session: Session, key: string, repeatAdvice?: string, deterministic = true): string {
     if (!key) return "";
     const prev = session.metadata[FAIL_STREAK_KEY];
     const keys = Array.isArray(prev) ? prev.filter((k): k is string => typeof k === "string") : [];
@@ -198,6 +198,7 @@ function recordCompressFailure(session: Session, key: string, repeatAdvice?: str
     markDirty(session);
     if (occurrences < 2) return "";
     const advice = repeatAdvice ?? "Call acp_status and follow its current eligibility advice; continue the task if no eligible ranges remain.";
+    if (!deterministic) return ` [Repeat-failure guard: this spec has failed ${occurrences} time(s) in this session because external summarization failed. Changing ranges alone does not repair the summary service. ${advice}]`;
     return ` [Repeat-failure guard: you have now requested this exact spec ${occurrences} time(s) in this session and it keeps failing with the same error. Repeating it deterministically fails the same way until the visible context changes — do NOT re-issue it. ${advice}]`;
 }
 function clearCompressFailures(session: Session): void {
@@ -320,6 +321,7 @@ function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: stri
     const now = Date.now();
     let streak = readCompressLoopStreak(ctx.session);
     if (streak && now - streak.lastAt > COMPRESS_LOOP_DECAY_MS) streak = undefined;
+    if (streak && (streak.cause === "external-summary") !== (forcedCause === "external-summary")) streak = undefined;
     const n = (streak?.n ?? 0) + 1;
     // #2432: persist the failure cause on the streak so surfaces OUTSIDE the
     // receipt (acp_status) can react to a substrate/stale-ref verdict at n=1
@@ -338,6 +340,7 @@ function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: stri
     } else {
         ctx.log(`[warn: compress-loop] failure ${n} in armed streak (last spec: ${label})`);
     }
+    if (freshCause === "external-summary") return externalSummaryPauseParagraph(n);
     if (freshCause.startsWith("substrate-destruction")) {
         return substrateDestructionPauseParagraph(n);
     }
@@ -366,6 +369,35 @@ export function compressBreakerDetail(session: Session): { n: number; threshold:
     if (!s || s.n < COMPRESS_LOOP_THRESHOLD) return undefined;
     if (Date.now() - s.lastAt > COMPRESS_LOOP_DECAY_MS) return undefined;
     return { n: s.n, threshold: COMPRESS_LOOP_THRESHOLD, decayMinutes: Math.round(COMPRESS_LOOP_DECAY_MS / 60000), ...(s.cause !== undefined ? { cause: s.cause } : {}) };
+}
+
+function externalSummaryPauseParagraph(n: number): string {
+    return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session. External summary requests are paused; changing ranges does not repair a failed summary service. Continue the task without compressing. Requests may resume after the external summary configuration or resolved credentials change, or after 10 minutes of cooldown. One successful fold clears the failure streak.]`;
+}
+
+export function externalSummaryBreakerRefusal(ctx: RewriteCtx, planFingerprint: string, ranges: readonly { summaryMaxChars?: number }[] = []): string {
+    const caps = [...new Set(ranges.map((range) => Math.min(range.summaryMaxChars ?? Infinity, ctx.config.compress.maxSummaryLength)))].sort((a, b) => a - b);
+    const fingerprint = createHash("sha256").update(JSON.stringify([
+        planFingerprint, ctx.config.compress.minSummaryLength, ctx.config.compress.maxSummaryLength, caps,
+    ])).digest("hex");
+    const key = "externalSummaryConfigHash";
+    const previous = ctx.session.metadata[key];
+    const streak = readCompressLoopStreak(ctx.session);
+    if (streak?.cause === "external-summary" && ((typeof previous === "string" && previous !== fingerprint) || Date.now() - streak.lastAt > COMPRESS_LOOP_DECAY_MS)) {
+        clearCompressFailures(ctx.session);
+        clearCompressLoopStreak(ctx.session);
+    }
+    if (previous !== fingerprint) {
+        ctx.session.metadata[key] = fingerprint;
+        markDirty(ctx.session);
+    }
+    const detail = compressBreakerDetail(ctx.session);
+    return detail?.cause === "external-summary" ? externalSummaryPauseParagraph(detail.n) : "";
+}
+
+export function recordExternalSummaryFailure(ctx: RewriteCtx, ranges: ParsedRange[], advice: string): string {
+    const key = normalizedSpecKey(ranges);
+    return recordCompressFailure(ctx.session, key, advice, false) + noteCompressLoopFailure(ctx, key, undefined, "external-summary");
 }
 
 export function compressBreakerArmed(session: Session): boolean {
