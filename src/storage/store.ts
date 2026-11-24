@@ -4323,12 +4323,30 @@ export class UnifiedStore {
             if (initial && existing !== null) throw new Error("cloneSessionRows: conflicting fork lineage (child already exists)");
             const parent = this.getSessionRow(parentId);
             if (parent === null) {
-                // A legacy-only parent has no ledger to clone. Still create
-                // the prepared child atomically rather than falling back to
-                // an unchecked upsert after releasing this transaction.
-                if (!initial) return false;
-                if (!this.ingestSession(initial, undefined, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
-                return true;
+                // #7658: an egress-on-from-birth parent has NO unified
+                // sessions row — #7474 P2 froze every unified leg
+                // (persist.ts egressProjectionFrozen), so ingestSession
+                // never ran — but its egress op log IS the ledger (ruling
+                // 7439). The legacy-only early return below would silently
+                // drop the R-B whole-table copy and the lineage pair: the
+                // child would re-bootstrap from client bytes, re-issue the
+                // number space, and lose the retired marks and the parent
+                // link. Detect it by the flow watermark.
+                if (this.egressStateMaxSeq(parentId) === 0) {
+                    // A legacy-only parent has no ledger to clone. Still
+                    // create the prepared child atomically rather than
+                    // falling back to an unchecked upsert after releasing
+                    // this transaction.
+                    if (!initial) return false;
+                    if (!this.ingestSession(initial, undefined, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
+                    return true;
+                }
+                // Materialize a minimal parent skeleton row (the same
+                // pattern as the #7591 R3-latch upsert in snap.ts) so the
+                // child's lineage pair points at a durable row. A later
+                // full ingest of the parent fills the remaining columns;
+                // the upsert never reparents an existing pair (COALESCE).
+                this.db.prepare(`INSERT OR IGNORE INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)`).run(parentId, Date.now(), Date.now());
             }
             if (existing !== null) {
                 // The pair, not the presence of messages, identifies a replay.
