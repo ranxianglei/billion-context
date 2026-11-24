@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="470" viewBox="0 0 1240 470"><defs><marker id="ah" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L10,3 L0,6 z" fill="#3a5a8a"/></marker></defs>
+<rect width="1240" height="470" fill="#ffffff"/>
+<text x="40" y="36" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="16" font-weight="bold" fill="#1a2b4a">Egress plane: one turn (inbound = evidence, outbound = op-log authority)</text>
+<rect x="40" y="70" width="240" height="170" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="52" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">① Inbound (client → bili)</text>
+<text x="52" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Host resends its FULL conversation</text>
+<text x="52" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">every turn (#2092 contract)</text>
+<text x="52" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">per-element msgid envelopes</text>
+<text x="52" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">stripped before anything goes</text>
+<text x="52" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">upstream (never on the model wire)</text>
+<text x="52" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress-on: inbound is EVIDENCE —</text>
+<text x="52" y="200" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">disagreement degrades the turn,</text>
+<text x="52" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">it can never write the log</text>
+<rect x="40" y="280" width="240" height="130" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="52" y="300" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">② Pin + stage-0 (stateless)</text>
+<text x="52" y="320" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">pin channel validates the msgid</text>
+<text x="52" y="335" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">envelope against the op-log live</text>
+<text x="52" y="350" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">view (bounded read)</text>
+<text x="52" y="365" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">frontier = MAX(op_seq) + newest-base</text>
+<text x="52" y="380" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">highWater</text>
+<text x="52" y="395" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">mismatch → full signal, re-anchor</text>
+<rect x="340" y="70" width="290" height="190" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="352" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">③ recordEgressTurn (prepare)</text>
+<text x="352" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">diffs this turn's view vs the previous</text>
+<text x="352" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">appends I/D/U rows IMMEDIATELY (not</text>
+<text x="352" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">at save); one transaction: in-tx</text>
+<text x="352" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">nextSeqs (#7574) + concurrent-writer</text>
+<text x="352" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">guard</text>
+<text x="352" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">fold ⇒ B base + physical prune of</text>
+<text x="352" y="200" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">subsumed rows (retention floor)</text>
+<text x="352" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">the summary message = an I row</text>
+<rect x="340" y="300" width="290" height="90" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="352" y="320" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">④ kernel (server authority)</text>
+<text x="352" y="340" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">kernel input replayed from the flow</text>
+<text x="352" y="355" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">(ruling 7439-3)</text>
+<text x="352" y="370" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">fold = next turn's flow ops +</text>
+<text x="352" y="385" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">block-table I/U (lifecycle + one/full)</text>
+<rect x="690" y="70" width="250" height="90" rx="8" fill="#e8f6ec" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="702" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">⑤ Upstream</text>
+<text x="702" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">reply relayed, pf headers stamped</text>
+<text x="702" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">inbound bytes forwarded only now</text>
+<rect x="690" y="220" width="250" height="170" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="702" y="240" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">⑥ Save (only two writes left)</text>
+<text x="702" y="260" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">envelope frozen (index-only since</text>
+<text x="702" y="275" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">bootstrap)</text>
+<text x="702" y="290" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">block recorder diffs state.blocks</text>
+<text x="702" y="305" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">⇒ appends block I/U rows, each</text>
+<text x="702" y="320" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">stamped flow_op_seq =</text>
+<text x="702" y="335" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">flow.MAX(op_seq) (dual-clock pointer)</text>
+<text x="702" y="350" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">no per-turn unified ingest (KDD #23)</text>
+<rect x="1000" y="70" width="200" height="190" rx="8" fill="#e8f6ec" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="1012" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">⑦ Restart / recovery</text>
+<text x="1012" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">replay flow → egress_state (bounded)</text>
+<text x="1012" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">tsStamps / token stats derived</text>
+<text x="1012" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">from the replay</text>
+<text x="1012" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">kstate = residual list only</text>
+<text x="1012" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">corrupt tail: recoverEgressBase</text>
+<text x="1012" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">walks back base by base</text>
+<text x="1012" y="200" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">no healthy point ⇒ loud hard fail</text>
+<text x="1012" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">(7439-5)</text>
+<rect x="1000" y="300" width="200" height="110" rx="8" fill="#fff6e6" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="1012" y="320" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">Tables (see egress-tables)</text>
+<text x="1012" y="340" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_flow / egress_state</text>
+<text x="1012" y="355" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_block_flow / _state</text>
+<text x="1012" y="370" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">per-turn writes = new rows only</text>
+<line x1="280" y1="150" x2="340" y2="155" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+
+<text x="308" y="143" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">evidence</text><line x1="280" y1="345" x2="340" y2="345" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+
+<text x="308" y="338" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">validate</text><line x1="485" y1="260" x2="485" y2="300" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<line x1="630" y1="110" x2="686" y2="110" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="658" y="104" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="10.5" fill="#7a3b0f" text-anchor="end" font-weight="bold">served from the log, byte-identical</text><line x1="815" y1="160" x2="815" y2="220" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<line x1="940" y1="340" x2="1000" y2="340" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+
+<text x="40" y="458" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#555">egress-on condition: egressPlane on and pluginMode and pinned and !sideRequest (egress-lane-io.ts). Any unrebuildable point: the whole turn degrades to legacy, never a partial swap.</text>
+</svg>
