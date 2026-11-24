@@ -138,7 +138,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     tail_json         LONGTEXT NOT NULL DEFAULT ('{}'),
     ccr_json          LONGTEXT NULL,
     last_ingested_seq BIGINT NULL,
-    orphans_json      LONGTEXT NULL
+    orphans_json      LONGTEXT NULL,
+    r3_latched_at     BIGINT NULL
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS content (
@@ -444,6 +445,21 @@ export class MysqlBackend implements StorageBackend {
                 }
                 if (!have.has("end_msgid")) {
                     await conn.query("ALTER TABLE blocks ADD COLUMN end_msgid VARCHAR(255) NULL");
+                }
+            }
+            // 身份表收拢 (discussions/7591): the R3 breaker latch moves onto
+            // the sessions row (NULL/0 = not latched, else epoch-ms). Same
+            // probe-first discipline as the blocks block above: every
+            // pre-existing table picks it up, fresh installs get it from
+            // the DDL; no version bump.
+            {
+                const [cols] = (await conn.query(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS " +
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sessions'",
+                )) as unknown as [Row[]];
+                const have = new Set(cols.map((r) => str(r.COLUMN_NAME)));
+                if (!have.has("r3_latched_at")) {
+                    await conn.query("ALTER TABLE sessions ADD COLUMN r3_latched_at BIGINT NULL");
                 }
             }
             // Stamp advances but never downgrades: a future library stamped
@@ -2510,7 +2526,17 @@ export class MysqlBackend implements StorageBackend {
                     s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
                     s.updated_at AS updatedAt, s.status AS status,
                     (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
-                    (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
+                    (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt,
+                    (SELECT JSON_UNQUOTE(JSON_EXTRACT(b.payload_json, '$.topic')) FROM blocks b
+                       WHERE b.session_id = s.session_id
+                         AND (JSON_EXTRACT(b.payload_json, '$.topic') IS NOT NULL
+                              OR JSON_EXTRACT(b.payload_json, '$.summary') IS NOT NULL)
+                       ORDER BY b.ord LIMIT 1) AS firstTopic,
+                    (SELECT JSON_UNQUOTE(JSON_EXTRACT(b.payload_json, '$.summary')) FROM blocks b
+                       WHERE b.session_id = s.session_id
+                         AND (JSON_EXTRACT(b.payload_json, '$.topic') IS NOT NULL
+                              OR JSON_EXTRACT(b.payload_json, '$.summary') IS NOT NULL)
+                       ORDER BY b.ord LIMIT 1) AS firstSummary
               FROM sessions s`,
         )) as unknown as Row[][];
         return rows.map((r) => {
@@ -2533,6 +2559,11 @@ export class MysqlBackend implements StorageBackend {
                 contextTokens,
                 updatedAt: num(r.updatedAt),
                 status: str(r.status ?? "active"),
+                // #7595: raw fields for the display-title fallback (merged
+                // `title` above is unchanged for existing consumers).
+                hostTitle: r.hostTitle !== null && r.hostTitle !== undefined ? str(r.hostTitle) : undefined,
+                firstTopic: nullableStr(r.firstTopic),
+                firstSummary: nullableStr(r.firstSummary),
             };
         });
     }
