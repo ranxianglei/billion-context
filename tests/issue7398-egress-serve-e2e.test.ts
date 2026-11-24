@@ -72,9 +72,11 @@ test("egress serve-from-log: served bytes == legacy bytes, text and tool alike (
     test.after(() => rmSync(dir, { recursive: true, force: true }));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = "full";
-    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
     const savedPlane = process.env.BILI_ROLLOUT_EGRESS_PLANE;
-    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    // Session A is the "rollouts off — pure legacy control" arm. GA
+    // (2026-11-24): "unset" resolves ON, so the control forces "0"
+    // explicitly (env wins over the 100 default).
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     const logs: string[] = [];
     setLogCapture((_lvl, m) => { logs.push(m); });
     try {

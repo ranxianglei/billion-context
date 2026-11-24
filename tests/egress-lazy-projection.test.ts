@@ -154,8 +154,9 @@ test("snapPinLiveIds: with the plane switched off the op log is not consulted, e
         view = recordEgressTurn({ store: H.adapter, sessionId: "s4", prev: view, conversation: [M("m1", "alpha"), M("m2", "beta")], systemText: "sys", nowMs: 2 });
         assert.deepEqual(H.store.snapPinLiveIds("s4"), ["m1", "m2"], "plane on: ids from the op log");
         // the plane is turned off (an install that rolls the feature back):
-        // the session goes back to the messages ledger like any other
-        delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+        // the session goes back to the messages ledger like any other.
+        // GA (2026-11-24): "unset" resolves ON, so the rollback is forced "0".
+        process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
         assert.equal(featureEnabled("egressPlane"), false, "precondition: the plane is off");
         assert.deepEqual(H.store.snapPinLiveIds("s4"), H.store.snapMsgIdLiveIds("s4"), "plane off: messages ledger, the op log is ignored");
         // on again: the log is picked up where it was
