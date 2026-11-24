@@ -22,7 +22,6 @@ import { createHash } from "node:crypto";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -76,7 +75,6 @@ async function startRig(upstreamHandler: UpstreamHandler = chatCompletionUpstrea
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetSessionOrderForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",

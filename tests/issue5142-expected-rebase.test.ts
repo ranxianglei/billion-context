@@ -430,7 +430,7 @@ describe("#5142 carrier classifier units", () => {
         // tool-jobs notice production shape (#5142 reporter sample, command redacted):
         const job = 'background job bash-abc123 (bash: "echo ok") finished [status: completed, exit code: 0]. Read its output with job_output.';
         assert.equal(dshToolJobNoticePath(mk("user", job)), "oneshot/tool-job-notice");
-        assert.equal(dshToolJobNoticePath(mk("user", " Background Job abc finished.")), "oneshot/tool-job-notice", "asciiCI prefix like the other auto-injected families");
+        assert.equal(dshToolJobNoticePath(mk("user", ' Background Job bash-abc123 (bash: "echo ok") finished [status: completed].')), "oneshot/tool-job-notice", "asciiCI prefix like the other auto-injected families");
         assert.equal(dshToolJobNoticePath(mk("assistant", job)), undefined, "assistant echo must never classify (#2766)");
         assert.equal(dshToolJobNoticePath(mk("user", "the background job failed again")), undefined, "marker mid-text is not a carrier");
         // request-image handle annotation (#5142 residual, production sample):
@@ -469,15 +469,33 @@ describe("#5142 carrier classifier units", () => {
     test("dshCarrierRawMarkers stay in lockstep with the dsh lane classifiers", () => {
         const cls = oneShotCarrierPaths.dsh;
         assert.ok(cls !== undefined, "dsh lane must have a classifier registry entry");
-        assert.ok(dshCarrierRawMarkers.length >= 16, "sixteen raw markers for the thirteen known dsh carrier families (runtime-context, mnemon, image-offload each contribute two; #7264 skill-load one)");
+        assert.ok(dshCarrierRawMarkers.length >= 19, "nineteen raw markers for the thirteen known dsh carrier families (workspace-instructions contributes four; runtime-context, mnemon, image-offload each contribute two; #7264 skill-load one)");
         // Markers that only occur mid-template need their fixed left context to
         // be a standalone classifiable shape (the relay wrapper's sender-id slot
         // varies, so the joint alone cannot classify).
         const MARKER_CONTEXT: Record<string, string> = {
             " sent a message: ": "Agent session-1",
+            // #7153: the two durable producers own a complete system-reminder
+            // frame, so the marker alone is no longer a classifiable shape.
+            "\x3cavailable_skills\x3e": "\x3csystem-reminder\x3e\n",
+            "Instructions from:": "\x3csystem-reminder\x3e\n",
+            // #4922: the workspace-instructions classifiers are anchored AND
+            // require a non-empty path after the colon, so those markers also
+            // need a sample path appended (their real rows always carry one).
+            "Updated instructions from:": "\x3csystem-reminder\x3e ",
+            "Additional instructions from:": "\x3csystem-reminder\x3e ",
+            "Instructions removed:": "\x3csystem-reminder\x3e ",
+        };
+        const MARKER_SUFFIX: Record<string, string> = {
+            "background job": ' bash-1 (bash: "true") finished [status: completed]',
+            "Background subagent ": "session-1 finished.",
+            "Updated instructions from:": "/x/AGENTS.md",
+            "Additional instructions from:": "/x/AGENTS.md",
+            "Instructions removed:": "/x/AGENTS.md",
         };
         for (const marker of dshCarrierRawMarkers) {
-            const msg = { id: "lk", role: "user" as const, contentType: "text" as const, text: `${MARKER_CONTEXT[marker] ?? ""}${marker}` } as CoreMessage;
+            const text = `${MARKER_CONTEXT[marker] ?? ""}${marker}${MARKER_SUFFIX[marker] ?? ""}`;
+            const msg = { id: "lk", role: "user" as const, contentType: "text" as const, text } as CoreMessage;
             assert.notEqual(cls(msg), undefined, `marker ${JSON.stringify(marker)} no longer matches any dsh classifier`);
         }
     });

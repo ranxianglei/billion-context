@@ -68,16 +68,34 @@ const MIN_SEAM_RUN = 2;
 /** #3658 canonical identity signature minus the hash: the tuple the kernel
  *  derives message ids from. Equal signature ⇒ same logical message even
  *  when the id bytes were re-minted by an upgrade. Image cores share the
- *  "[image]" text, so the sidecar length rides the signature (same image ⇒
- *  same bytes ⇒ same length; different images practically always differ). */
+ *  "[image]" text, so the image BYTES ride the signature (see #4390). */
 export function identitySig(m: BiliMessage): string {
     const text = typeof m.text === "string" ? m.text : "";
     // #4390: hash the image BYTES, never the length — same-size screenshots
     // used to collide and chain a false seam (silent truncation). The walk
     // only touches the tail region, so per-request hashing is bounded; a
     // 24-hex prefix is far beyond collision reach for seam evidence.
-    const img = m.imagePart === true ? `|img:${sha256Hex(m.imageBase64 ?? "").slice(0, 24)}` : "";
+    const img = m.imagePart === true ? `|img:${imageSigPart(m.imageBase64)}` : "";
     return `${m.role}|${m.contentType}|${m.toolName ?? ""}|${text}${img}`;
+}
+
+/** The 24-hex image identity, robust to the media-OFFLOADED storage form:
+ *  persisted rows carry {"$media": sha256Hex(bytes)} instead of the bytes
+ *  (#3762), and that hash IS the identity — so both forms sign identically.
+ *  Anything else degrades to a stable stringify. Never throws: a signature
+ *  helper throwing takes the whole seam walk (and turn) down. */
+function imageSigPart(v: unknown): string {
+    if (typeof v === "string") return v.length > 0 ? sha256Hex(v).slice(0, 24) : "none";
+    if (typeof v === "object" && v !== null) {
+        const h = (v as { $media?: unknown }).$media;
+        if (typeof h === "string" && h.length >= 24) return h.slice(0, 24);
+        try {
+            return `s${sha256Hex(JSON.stringify(v) ?? "").slice(0, 24)}`;
+        } catch {
+            return "unserializable";
+        }
+    }
+    return "none";
 }
 
 /** Test seam (#4390): the seam fingerprint under test — see identitySig. */
@@ -96,10 +114,14 @@ interface ViewRow {
 
 interface SnapshotRenderDeps {
     sessionId: string;
-    /** #3812: plugin lanes are client-authoritative by design (the plugin
-     *  contract carries the host's own history management — divert paths,
-     *  incremental turns). They bypass this engine entirely: no render, no
-     *  degrade marker, nothing observed. */
+    /** #3812: plugin lanes bypass this engine's RENDER (no snapshot render,
+     *  no degrade marker, nothing observed) — the D-lane stays off for them.
+     *  NOTE (7439 ruling 5, 2026-11-21): "client-authoritative by design" is
+     *  OVERRIDDEN for pinned plugin sessions on the OpenAI wire — the
+     *  egress-authority seam in prepare-openai.ts serves their kernel input
+     *  from the op-log (server bytes win, client resends are the identity
+     *  channel). This bypass only means the D-lane render below never runs;
+     *  the egress plane is a different surface. */
     pluginMode?: boolean;
     log?: (level: string, msg: string) => void;
 }
@@ -174,11 +196,12 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
     //       bytes never ride the outbound and are never read. A covered row
     //       with corrupt bytes therefore cannot degrade the render.
     let rows: ViewRow[] = [];
+    let bySeq = new Map<number, ViewRow>();
     try {
         const light = store.unifiedMessageIdRows(session.id);
         const seqs = store.unifiedTailSeqs(session.id);
         if (!light || light.length === 0 || !seqs || seqs.length === 0) return { reason: "transcript-empty" };
-        const bySeq = new Map<number, ViewRow>();
+        bySeq = new Map<number, ViewRow>();
         for (const row of light) bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId });
         for (const seq of seqs) {
             const v = bySeq.get(seq);
@@ -189,6 +212,7 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
         return { reason: "transcript-error" };
     }
     if (rows.length === 0) return { reason: "transcript-empty" };
+
 
     // #4052: the covered-region map must exist BEFORE the chain — the signature
     // fallback must not offer covered rows as bind targets (see the bySig filter
@@ -502,7 +526,7 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
     // live view — every early-return / degrade / shadow path leaves it unset,
     // which is exactly when the outbound is raw client bytes (legacy I1/I2 applies).
     delete session.metadata["snapshotRenderTailStart"];
-    if (deps.pluginMode) return clientMsgs; // plugin lane: client-authoritative by design, not a degradation
+    if (deps.pluginMode) return clientMsgs; // plugin lane: D-lane render stays off (see 7439 ruling 5 note above)
     const live = featureEnabled("snapshotRender");
     const shadow = !live && shadowLaneEnabled();
     if (!live && !shadow) return clientMsgs;
