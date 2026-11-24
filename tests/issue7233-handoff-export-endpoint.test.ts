@@ -18,6 +18,7 @@ process.env.BILI_STORAGE_UNIFIED = "legacy";
 process.env.BILI_PERSIST_ZSTD = "0";
 
 const { handleAdminRoute } = await import("../src/server/admin.ts");
+const { getSession, _resetSessionsForTest } = await import("../src/session.ts");
 
 type CtxT = Parameters<typeof handleAdminRoute>[2];
 function makeCtx(): CtxT {
@@ -73,4 +74,22 @@ test("#7233 malformed session id is treated as unknown, not a crash", async () =
         makeCtx(),
     );
     assert.equal(out.code, 404, `expected 404, got ${out.code}: ${out.body}`);
+});
+
+test("#7233 a session without renderable handoff Markdown is a 409", async () => {
+    const session = getSession("no-handoff", { protocol: "openai" });
+    Object.defineProperty(session.metadata, "handoffResponse", {
+        configurable: true,
+        get(): never {
+            throw new Error("handoff render failed");
+        },
+    });
+    try {
+        const { res, out } = mkRes();
+        await handleAdminRoute(postReq("no-handoff"), res, makeCtx());
+        assert.equal(out.code, 409, `expected 409, got ${out.code}: ${out.body}`);
+        assert.match(out.body ?? "", /no handoff markdown/);
+    } finally {
+        _resetSessionsForTest();
+    }
 });
