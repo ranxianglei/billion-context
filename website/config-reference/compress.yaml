@@ -393,6 +393,17 @@ entries:
     desc_ja: "ツール結果を短い要約に即時蒸留するオプトイン機能；元データはコンテンツストアに保存される。デフォルトでは画像を含む結果のみが対象となる。"
     site_en: "<code>absorb</code> — opt-in instant distillation of tool results into short abstracts; originals go to the content store; by default only image-bearing results qualify (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, mediaOnly (default true), toolName \"absorb\"</span>)."
     site_zh: "<code>absorb</code> —— 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库；默认仅图片类结果参与（<span class='mech'>enabled, minToolTokens(默认 1000), contextThresholdPct, excludeTools, mediaOnly(默认 true), toolName \"absorb\"</span>）。"
+  - key: compress.degenerateRetry
+    type: object
+    default: "1 attempt (built-in nudge)"
+    group: compress
+    id: co.degenerateRetry
+    render: obj-item
+    desc_en: "Retry budget and nudge sentences for turns that end with zero client-visible output (degenerate terminal turns). The continuation nudge rides the retry body only — it is never persisted into session state and never replayed on the client's next request."
+    desc_zh: "零可见输出回合（退化终端回合）的重试预算与 nudge 句配置。续接 nudge 只附在重试请求体上——不写入会话状态，客户端下一轮不重放。"
+    desc_ja: "クライアントに見える出力がゼロで終わるターンのリトライ予算と nudge 文の設定。継続 nudge はリトライ本文にのみ付加され、永続化も次のリクエストでの再生もされない。"
+    site_en: "<code>degenerateRetry</code> — retry budget for zero-visible-output turns; the continuation nudge rides the retry body only, never persisted (<span class='mech'>maxAttempts (default 1, 0 = off, max 5), nudges (1–8 custom sentences)</span>)."
+    site_zh: "<code>degenerateRetry</code> —— 零可见输出回合的重试预算；续接 nudge 只附在重试请求体上、不持久化（<span class='mech'>maxAttempts(默认 1，0=关，上限 5)、nudges(1–8 句自定义)</span>）。"
   - key: compress.blockOps
     type: object
     default: "off"
@@ -545,6 +556,20 @@ entries:
     desc_en: "Restrict absorption to tool results that carry media (images). Image bytes are exempt from minToolTokens since they are not counted in text. Set false to restore legacy full-text absorption of any large result."
     desc_zh: "仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。"
     desc_ja: "メディア（画像）を伴うツール結果に吸収を制限する。画像バイトはテキストにカウントされないため、minToolTokens の対象外となる。false に設定すると、従来の大規模結果の全文吸収が有効になる。"
+  - key: compress.degenerateRetry.maxAttempts
+    type: integer
+    default: "1"
+    group: compress
+    desc_en: "Degenerate-terminal retry budget (#7666): when a turn ends with nothing client-visible, the agent's own request is re-issued with a trailing user nudge. 0 = off (the turn passes through bare), 1 = once (pre-#7666 behavior), max 5; attempt i sends nudges[i] (cycling). Independent of the zero-byte-cut re-issue (#2171) — a turn may spend one of each."
+    desc_zh: "空回合重试预算（#7666）：回合以客户端零可见输出收尾时，把 agent 自己的原请求追加一条尾部 user nudge 后重发。0=关（空回合直接放行），1=一次（#7666 前的默认行为），上限 5；第 i 次发 nudges[i]（短了循环）。与断流重发（#2171）预算独立——同一回合各可花一次。"
+    desc_ja: "退化ターンのリトライ予算（#7666）：クライアントに見える出力が何もないターン終了時に、agent の元のリクエストに末尾ユーザー nudge を追加して再発行する。0 = 無効（そのターンは素通し）、1 = 1 回（#7666 以前の動作）、最大 5；i 回目の試行で nudges[i] を送信（リストが短ければ循環）。ゼロバイト切断の再発行（#2171）とは予算が独立——1 ターンでそれぞれ 1 回まで。"
+  - key: compress.degenerateRetry.nudges
+    type: "string[]"
+    default: "3 built-in"
+    group: compress
+    desc_en: "Custom nudge sentences for degenerate-terminal retries (#7666); retry i sends sentence i (cycling when shorter). Unset = the built-in rotation, whose first entry is the default continuation nudge."
+    desc_zh: "自定义空回合重试 nudge 句（#7666）；第 i 次重试发第 i 句（短了循环）。不填 = 内置轮换，首句即默认续接 nudge。"
+    desc_ja: "退化ターンリトライ用のカスタム nudge 文（#7666）；i 回目のリトライで i 番目の文を送信（短ければ循環）。未設定 = 組み込みローテーション（先頭はデフォルトの継続 nudge）。"
   - key: compress.blockOps.enabled
     type: boolean
     default: "false"

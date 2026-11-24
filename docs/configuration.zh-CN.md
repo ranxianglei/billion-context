@@ -318,6 +318,7 @@
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
 | `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
 | `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。 |
+| `compress.degenerateRetry` | object | 1 attempt (built-in nudge) | — | 零可见输出回合（退化终端回合）的重试预算与 nudge 句配置。续接 nudge 只附在重试请求体上——不写入会话状态，客户端下一轮不重放。 |
 | `compress.blockOps` | object | off | — | 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，关闭时线上字节与 #5765 之前完全一致。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
 | `compress.search` | object | off | — | search_context 的检索行为设置；当前含 planAware 重排。 |
@@ -334,8 +335,8 @@
 | `compress.absorb.excludeTools` | string[] | [] | — | 排除出吸收范围的工具名。 |
 | `compress.absorb.toolName` | string | "absorb" | — | absorb 工具的注册名。 |
 | `compress.absorb.mediaOnly` | boolean | true | — | 仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。 |
-| `compress.degenerateRetry.maxAttempts` | integer (0–5) | 1 | — | 空回合重试预算（#7666）：回合以“客户端看不到任何东西”收尾（被 tag-echo 剥光、压缩草稿/空承诺尾巴）时，代理把 agent 自己的原请求追加一条尾部 user NUDGE 后重发。nudge 只附在重试请求体上——不写入会话状态，客户端下一轮请求字节不变。0=关（空回合直接放行），1=一次（#7666 前行为），上限 5；第 i 次发 `nudges[i]`（列表短了就循环）。与断流重发（#2171）预算独立——同一回合各可花一次。前缀缓存命中时每次成本近零；预算耗尽后 chat 车道向客户端发 #870 in-band 错误，responses 车道放行空回合。与其余 compress 字段一样按 provider/model 逐字段最深合并。 |
-| `compress.degenerateRetry.nudges` | string[] (1–8) | 内置 3 句 | — | 自定义空回合重试 nudge 句（#7666）；第 i 次重试发第 i 句（短了循环）。不填=内置轮换，首句即默认续接 nudge。 |
+| `compress.degenerateRetry.maxAttempts` | integer | 1 | — | 空回合重试预算（#7666）：回合以客户端零可见输出收尾时，把 agent 自己的原请求追加一条尾部 user nudge 后重发。0=关（空回合直接放行），1=一次（#7666 前的默认行为），上限 5；第 i 次发 nudges[i]（短了循环）。与断流重发（#2171）预算独立——同一回合各可花一次。 |
+| `compress.degenerateRetry.nudges` | string[] | 3 built-in | — | 自定义空回合重试 nudge 句（#7666）；第 i 次重试发第 i 句（短了循环）。不填 = 内置轮换，首句即默认续接 nudge。 |
 | `compress.blockOps.enabled` | boolean | false | — | 启用三个压缩块生命周期工具（注入 + prompt + manifest）。关闭 = 无工具、无 prompt 段、零每请求开销。 |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | 启用内容缓存与回取块。 |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | 可进入 CCR 存储的工具结果的最小估算 token 大小。 |

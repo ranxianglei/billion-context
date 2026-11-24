@@ -315,6 +315,7 @@
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | ウィンドウが埋まるにつれて成長の通知を送信する（グローバルレベルのみ）。 |
 | `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | 2048文字を超える完了ラウンドの推論実行を破棄する（デフォルトで drop: true）；厳格な推論を要求するアップストリームでは drop: false が必要。 |
 | `compress.absorb` | object | opt-in (disabled) | — | ツール結果を短い要約に即時蒸留するオプトイン機能；元データはコンテンツストアに保存される。デフォルトでは画像を含む結果のみが対象となる。 |
+| `compress.degenerateRetry` | object | 1 attempt (built-in nudge) | — | クライアントに見える出力がゼロで終わるターンのリトライ予算と nudge 文の設定。継続 nudge はリトライ本文にのみ付加され、永続化も次のリクエストでの再生もされない。 |
 | `compress.blockOps` | object | off | — | 圧縮ブロック管理用のブロックライフサイクルツール（acp_retire / acp_restore / acp_rewrite）のオプトイン；デフォルト無効により、#5765 以前のワイヤーとバイト単位で同一を維持する。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | コンテンツキャッシュと取得：大きな出力はセッションの隣接にロスカレスで保存され、先頭抜粋とポインタに置き換えられ、acp_retrieve 経由で取得される；上限や退避は行われない。 |
 | `compress.search` | object | off | — | search_context の検索動作設定；現在、planAware リランキングを保持している。 |
@@ -331,8 +332,8 @@
 | `compress.absorb.excludeTools` | string[] | [] | — | 吸収から除外されるツール名。 |
 | `compress.absorb.toolName` | string | "absorb" | — | 吸収ツールの登録名。 |
 | `compress.absorb.mediaOnly` | boolean | true | — | メディア（画像）を伴うツール結果に吸収を制限する。画像バイトはテキストにカウントされないため、minToolTokens の対象外となる。false に設定すると、従来の大規模結果の全文吸収が有効になる。 |
-| `compress.degenerateRetry.maxAttempts` | integer (0–5) | 1 | — | 空ターンのリトライ予算（#7666）：ターンが「クライアントに見える出力ゼロ」で終端に達したとき（tag-echo で全剥され、圧縮ドラフト／宣言のみの末尾）、プロキシは agent 自身のリクエストに尾部 user NUDGE を追加して再送出する。nudge はリトライ本体にのみ乗り — セッション状態には永続化されず、クライアントの次リクエストには再现されない。0 = 無効（空ターンはそのまま通過）、1 = 1回（#7666 以前のスレの動作）、最大 5；i 回目の試行は `nudges[i]` を送出（リストが短いと循環）。ゼロバイト切断の再送出（#2171）とは独立 — 同じターンでそれぞれ 1 回まで使える。プレフィックスキャッシュがヒットすれば試行あたりのコストはほぼゼロ；予算枯渇時、chat レーンは #870 のインバンドエラーを送り、responses レーンは空ターンを通過させる。他の compress フィールド同様にグローバル → プロバイダー → モデルでフィールドごとにマージされる。 |
-| `compress.degenerateRetry.nudges` | string[] (1–8) | 組み込み 3 文 | — | 空ターンリトライ用のカスタム nudge 文（#7666）；i 回目は i 文目を送出（短いと循環）。未設定 = 組み込みローテーション（先頭が既定の継続 nudge）。 |
+| `compress.degenerateRetry.maxAttempts` | integer | 1 | — | 退化ターンのリトライ予算（#7666）：クライアントに見える出力が何もないターン終了時に、agent の元のリクエストに末尾ユーザー nudge を追加して再発行する。0 = 無効（そのターンは素通し）、1 = 1 回（#7666 以前の動作）、最大 5；i 回目の試行で nudges[i] を送信（リストが短ければ循環）。ゼロバイト切断の再発行（#2171）とは予算が独立——1 ターンでそれぞれ 1 回まで。 |
+| `compress.degenerateRetry.nudges` | string[] | 3 built-in | — | 退化ターンリトライ用のカスタム nudge 文（#7666）；i 回目のリトライで i 番目の文を送信（短ければ循環）。未設定 = 組み込みローテーション（先頭はデフォルトの継続 nudge）。 |
 | `compress.blockOps.enabled` | boolean | false | — | 3 つのブロックライフサイクルツール（インジェクション + プロンプト + マニフェスト）を有効にする。Off = ツールなし、プロンプトセクションなし、リクエストごとのコストゼロ。 |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | コンテンツキャッシュおよび取得ブロックを有効にする。 |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | CCR ストレージの対象となるツール結果の最小推定トークンサイズ。 |
