@@ -427,6 +427,23 @@ export async function fetchStatusLatest(proxyBase: string): Promise<Record<strin
     return json as Record<string, unknown>;
 }
 
+/** Manifest version probe: the raw `{ version, commit }` behind
+ *  fetchProxyVersion's display string. #6899: the display string appends
+ *  ` (commit)`, which parseSemVer rejects — any caller that COMPARES
+ *  versions must use this and compare on the clean `version` field, never
+ *  on the display string. Same soft-fail contract as fetchProxyVersion:
+ *  undefined when the manifest is unreachable or carries no version. */
+export async function fetchProxyManifestVersion(proxyBase: string, init?: RequestInit): Promise<{ version: string; commit?: string } | undefined> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, init, STATUS_TIMEOUT_MS);
+    if (!ok || !json || typeof json !== "object") return undefined;
+    const m = json as { version?: unknown; commit?: unknown };
+    const version = m.version;
+    if (typeof version !== "string" || version.length === 0) return undefined;
+    const commit = m.commit;
+    if (typeof commit === "string" && commit.length > 0) return { version, commit };
+    return { version };
+}
+
 /** Liveness + version probe for status UIs: same loopback origin as the
  *  status endpoint, so a 404 status + a live manifest means "proxy up,
  *  conversation not seen yet" — an armed-but-idle state, not an error.
@@ -435,17 +452,15 @@ export async function fetchStatusLatest(proxyBase: string): Promise<Record<strin
  *  keep-alive socket keeps being answered by a resident that already closed
  *  its listener and is merely draining, which reads as a false "alive"). */
 export async function fetchProxyVersion(proxyBase: string, init?: RequestInit): Promise<string | undefined> {
-    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, init, STATUS_TIMEOUT_MS);
-    if (!ok || !json || typeof json !== "object") return undefined;
-    const m = json as { version?: unknown; commit?: unknown };
-    const version = m.version;
-    if (typeof version !== "string" || version.length === 0) return undefined;
+    const manifest = await fetchProxyManifestVersion(proxyBase, init);
+    if (manifest === undefined) return undefined;
     // Append the build commit so status surfaces show WHICH build answers,
-    // matching /__bili/status and `--version` (they all include it). Consumers
-    // only display or liveness-check this string — none parses it.
-    const commit = m.commit;
-    if (typeof commit === "string" && commit.length > 0) return `${version} (${commit})`;
-    return version;
+    // matching /__bili/status and `--version` (they all include it). This
+    // string is for DISPLAY and liveness checks only — it is NOT a version:
+    // the ` (commit)` suffix does not parse as semver (#6899), so callers
+    // that compare versions must use fetchProxyManifestVersion and compare
+    // on the clean `version` field.
+    return manifest.commit !== undefined ? `${manifest.version} (${manifest.commit})` : manifest.version;
 }
 
 /** #1603: one-line staleness warning for status UIs — the on-disk install is
