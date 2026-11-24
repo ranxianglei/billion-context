@@ -34,9 +34,10 @@ function releaseThrottleErrorReader(reader: ReadableStreamDefaultReader<Uint8Arr
 // turn and the host aborts it. The pipe can still re-issue the SAME body
 // (plus this nudge) because it holds the upstream URL and the forwarded
 // headers, and it can splice the retry's content into the open client stream.
-// Bounded to one attempt per turn; the body mutation never touches session
-// state, so the nudge is neither persisted nor replayed on the client's next
-// request.
+// Bounded by the configured degenerate budget (compress.degenerateRetry.
+// maxAttempts, default 1 — pre-#7666 behavior); the body mutation never
+// touches session state, so each nudge is neither persisted nor replayed on
+// the client's next request.
 // Wording covers BOTH retry shapes: the empty-turn shape (#732/#821) and the
 // draft-tail shape (#2303, visible prose ending in a compression-draft closing
 // tag) — both are "ended without a tool call". #7235: the old "take your next
@@ -47,10 +48,21 @@ function releaseThrottleErrorReader(reader: ReadableStreamDefaultReader<Uint8Arr
 export const DEGENERATE_RETRY_NUDGE =
     "[billion-context] Your previous response ended without a tool call. If you intended to call a tool or give an answer, do so now; if no response is needed, output nothing.";
 
+/** #7666: built-in nudge rotation when the user configured no `nudges` list.
+ *  Attempt i sends the i-th sentence (cycling), so repeated attempts do not
+ *  present the model with a byte-identical prompt. Each sentence keeps the
+ *  same contract as DEGENERATE_RETRY_NUDGE: push the pending action or an
+ *  explicit final answer. */
+export const DEFAULT_DEGENERATE_RETRY_NUDGES: readonly string[] = [
+    DEGENERATE_RETRY_NUDGE,
+    "Please continue with the unfinished task.",
+    "You stopped before acting. Finish now: issue the pending tool call, or state your final answer in one line.",
+];
+
 /** The retry body: the forwarded body with the continuation nudge appended as a
  *  trailing user turn. Null when the body cannot carry one. */
-export function injectContinuationNudge(protocol: WireProtocol, body: string | Buffer, model?: string): string | null {
-    return appendTrailingUserText(protocol, body, DEGENERATE_RETRY_NUDGE, model);
+export function injectContinuationNudge(protocol: WireProtocol, body: string | Buffer, model?: string, nudge: string = DEGENERATE_RETRY_NUDGE): string | null {
+    return appendTrailingUserText(protocol, body, nudge, model);
 }
 
 interface ContinuationRetryOpts {
@@ -69,6 +81,11 @@ interface ContinuationRetryOpts {
     log: (level: string, msg: string) => void;
     /** Log prefix, normally the session id. */
     label: string;
+    /** #7666: nudge sentence list for multi-attempt turns — attempt i sends
+     *  nudges[i] (cycling when shorter than the budget). Absent/empty = the
+     *  built-in DEFAULT_DEGENERATE_RETRY_NUDGES rotation. The budget itself
+     *  (how many attempts) is enforced by the pipe, not here. */
+    nudges?: readonly string[];
     /** #1884: re-sign the retry body before it hits the wire (armed re-sign
      *  lane only; undefined on unsigned traffic). The retry body carries an
      *  injected continuation nudge, so the previous signature is stale. */
@@ -134,6 +151,12 @@ async function readSmallThrottleErrorBody(response: Response): Promise<Uint8Arra
  *  already gone) — the caller then passes the original empty turn through
  *  unchanged. */
 export function makeContinuationRefetch(opts: ContinuationRetryOpts): ContinuationRefetch {
+    const nudges = opts.nudges && opts.nudges.length > 0 ? opts.nudges : DEFAULT_DEGENERATE_RETRY_NUDGES;
+    // #7666: self-counted attempt index for nudge rotation. The pipe only ever
+    // calls this within its configured budget, so the index can never run past
+    // what the user allowed; the modulo keeps a short list cycling instead of
+    // stalling on a missing sentence.
+    let attempt = 0;
     const refetch = async (): Promise<ReadableStream<Uint8Array> | null> => {
         if (opts.signal.aborted) return null;
         // A body whose final input item is a compaction trigger must never be
@@ -152,7 +175,9 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): Continuati
                 /* unparseable body: injectContinuationNudge below reports and skips */
             }
         }
-        const retryBody = injectContinuationNudge(opts.protocol, opts.body, opts.model);
+        const attemptNudge = nudges[attempt % nudges.length];
+        attempt += 1;
+        const retryBody = injectContinuationNudge(opts.protocol, opts.body, opts.model, attemptNudge);
         if (retryBody === null) {
             opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry skipped: request body carries no turn array`);
             return null;
@@ -240,6 +265,8 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): Continuati
                     classificationReservation.release();
                     classificationReservation = undefined;
                     r.clearTimer();
+                    // A discarded body has no consumer; do not wait for a tee sibling to cancel.
+                    void r.response.body?.cancel().catch(() => undefined);
                 }
                 opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry rejected (HTTP ${r.response.status}); passing the empty turn through`);
                 return null;

@@ -20,7 +20,7 @@ import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPON
 import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
 import { isForeignMembership } from "./request-membership.js";
 import { billInputUsage } from "./billing.js";
-import { normalizeUpstreamOrigin } from "./util.js";
+import { CALIBRATION_PROVENANCE_TEXT_ONLY, normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
@@ -529,6 +529,11 @@ type Capture = {
     sentBody?: SeamSlot;
     inBody?: InboundSlot;
     imageFacts?: ForwardedImageFacts;
+    // #5952: the calibration pair for THIS send — final wire text estimate
+    // (no image reserve) + the image reserve of the same body, noted at the
+    // relay main-lane send chokepoint. The settle that bills this body
+    // consumes exactly this entry instead of the shared prepare slot.
+    calibration?: { estimate: number; imageTokens: number; origin?: string; model?: string };
 };
 const captures = new AsyncLocalStorage<Capture>();
 let captureOrder = 0;
@@ -546,6 +551,7 @@ export async function withCacheCapture<T>(session: Session | undefined, fn: () =
                 delete capture.sentBody;
                 delete capture.inBody;
                 delete capture.imageFacts;
+                delete capture.calibration;
             }
         }
     });
@@ -770,10 +776,19 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
     // sharing a 512 KiB prefix apart. Re-noting a byte-identical payload (the
     // non-streaming settle path) reuses the prior slot's count/full instead of
     // re-deriving them.
+    // #7149 batch3-1 (delta anchoring): the byte-identical re-note inherits the
+    // prior digest via a pure byte compare — ZERO hashing on the common path.
+    // Changed/new bodies keep the full-body digest: `bd` is the ground-truth
+    // equality proof (#2131) and the ONLY equality proof once the payload
+    // exceeds BODY_FULL_CAP (nothing is retained), so a delta descriptor cannot
+    // replace it without breaking settle's be decision. View-ID anchoring is
+    // not available here — the send chokepoints hold the wire string, not the
+    // stored canonical views (those live in the storage layer).
     const buf = Buffer.from(body, "utf8");
-    const digest = createHash("sha256").update(buf).digest("hex");
     const transient = pendingCapture(session);
     const prior = transient.sentBody;
+    const sameBytes = prior !== undefined && prior.bytes === buf.byteLength && prior.full !== null && prior.full.equals(buf);
+    const digest = sameBytes ? prior.digest : createHash("sha256").update(buf).digest("hex");
     const samePayload = prior !== undefined && prior.digest === digest;
     transient.sentBody = {
         order: ++captureOrder,
@@ -850,6 +865,22 @@ export function noteForwardedImageFacts(session: Session, facts: ForwardedImageF
     const capture = captures.getStore();
     if (capture?.session === session) { capture.imageFacts = facts; return; }
     imageFactsLastSent.set(session, facts);
+}
+
+/** #5952: the per-request calibration pair for THIS send — the final wire
+ *  text estimate (textOverhead, no image reserve) + the image reserve of
+ *  the same body, noted at the relay main-lane send chokepoint next to
+ *  noteOutboundContextEstimates. The next settleUsageReport /
+ *  settleOverflowCalibration consumes exactly this entry (same pairing
+ *  guarantee as the seam forensics): a concurrent request's prepare can no
+ *  longer overwrite the estimate a settle reads, and an image-bearing
+ *  sample can no longer train the text multiplier. Outside a capture there
+ *  is no per-request owner for the pair, so it is dropped, never parked on
+ *  the session where a later settle could misread it as this request's —
+ *  lanes outside the capture (loop/plugin) keep the legacy shared slot. */
+export function noteCalibrationPair(session: Session, pair: { estimate: number; imageTokens: number; origin?: string; model?: string }): void {
+    const capture = captures.getStore();
+    if (capture?.session === session) { capture.calibration = pair; return; }
 }
 
 function settleImageLearning(session: Session, billedTotal: number): void {
@@ -1822,10 +1853,25 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
     const settleOrigin = normalizeUpstreamOrigin(upstream);
     const pendingCalibOrigin = session.stats.lastCalibrationPolicyOrigin !== undefined ? normalizeUpstreamOrigin(session.stats.lastCalibrationPolicyOrigin) : undefined;
     const calibPolicy = pendingCalibOrigin === settleOrigin ? session.stats.lastCalibrationPolicy : undefined;
-    const pendingEst = session.stats.lastLocalTextEstimate;
-    const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
+    // #5952: the per-request capture pair wins over the shared prepare slot —
+    // it is the final wire estimate of the request THIS report bills, noted
+    // at the send chokepoint. Consumed once: the settle that reads it owns
+    // it, so a concurrent settle can never re-read it as its own.
+    const capture = captures.getStore();
+    const capturePair = capture?.session === session ? capture.calibration : undefined;
+    if (capture?.session === session) delete capture.calibration;
+    // An image-bearing sample carries no text-only signal: it must not train
+    // the text multiplier at all — not even through the legacy slot, which a
+    // concurrent prepare may have left holding another request's estimate.
+    if (capturePair !== undefined && capturePair.imageTokens > 0) return;
+    const pendingEst = capturePair !== undefined ? capturePair.estimate : session.stats.lastLocalTextEstimate;
+    const pendingOrigin = capturePair !== undefined ? normalizeUpstreamOrigin(capturePair.origin) : normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
     if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
         const rawSample = billed / pendingEst;
+        // #5952: provenance of THIS sample — text-only only when it arrived
+        // on a capture pair. A legacy shared-slot sample carries none, so a
+        // ring holding one stays mixed until the window flushes it out.
+        const sampleProvenance = capturePair !== undefined ? CALIBRATION_PROVENANCE_TEXT_ONLY : undefined;
         // #2117 B: the ring is keyed by route AND model — tokenizers bill
         // differently across models, so a mid-session model switch starts a
         // FRESH ring instead of blending two models' billing scales into one
@@ -1835,8 +1881,10 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
         // whose load whitelist drops the model fields (#2141) — continues
         // and ADOPTS the first known model. Discarding it would clear a
         // provenance-matched published k̂ on the first post-restart settle
-        // (the #2129 regression class).
-        const settleModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
+        // (the #2129 regression class). The capture pair's model, when
+        // known, is this request's own — it outranks the session's
+        // last-known model (#5952).
+        const settleModel = capturePair?.model !== undefined ? capturePair.model : (typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined);
         let ring = session.stats.calibrationRing;
         if (!ring || ring.origin !== settleOrigin || (ring.model !== undefined && settleModel !== undefined && ring.model !== settleModel)) {
             ring = { origin: settleOrigin, model: settleModel, values: [] };
@@ -1845,7 +1893,16 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
         }
         if (rawSample >= CALIBRATION_SAMPLE_MIN && rawSample <= CALIBRATION_SAMPLE_MAX) {
             ring.values.push(rawSample);
-            if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) ring.values.shift();
+            // #5952: provenances ride in lockstep with values — a legacy
+            // ring restored without the array pads with undefined, so the
+            // publish verdict below stays aligned with the window.
+            if (ring.provenances === undefined) ring.provenances = [];
+            while (ring.provenances.length < ring.values.length - 1) ring.provenances.push(undefined);
+            ring.provenances.push(sampleProvenance);
+            if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) {
+                ring.values.shift();
+                ring.provenances.shift();
+            }
             const spread = Math.max(...ring.values) / Math.min(...ring.values);
             if (ring.values.length >= 2 && spread <= CALIBRATION_CONSISTENCY_RATIO) {
                 const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
@@ -1855,6 +1912,7 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
                     delete session.stats.calibratedEstimate;
                     delete session.stats.calibratedEstimateOrigin;
                     delete session.stats.calibratedEstimateModel;
+                    delete session.stats.calibratedEstimateProvenance;
                 } else {
                     const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
                     session.stats.calibratedEstimate = calibPolicy?.max !== undefined ? Math.min(clamped, calibPolicy.max) : clamped;
@@ -1862,14 +1920,22 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
                     // Provenance is the ring's model key, not this sample's stamp —
                     // an unknown-model settle continues a model-keyed ring without
                     // blanking the established provenance. Stays inside the publish
-                    // branch: the disabled path above clears all three fields and
+                    // branch: the disabled path above clears all four fields and
                     // must not re-stamp one of them (#3211 review).
                     session.stats.calibratedEstimateModel = ring.model;
+                    // #5952: the published factor's provenance is the ring's —
+                    // "text-only-v1" only when every value in the window
+                    // carries it. A single legacy sample in the window keeps
+                    // the factor inert until the window flushes it out.
+                    const ringProvenance = ring.provenances !== undefined && ring.provenances.length === ring.values.length && ring.provenances.every((p) => p === CALIBRATION_PROVENANCE_TEXT_ONLY) ? CALIBRATION_PROVENANCE_TEXT_ONLY : undefined;
+                    if (ringProvenance !== undefined) session.stats.calibratedEstimateProvenance = ringProvenance;
+                    else delete session.stats.calibratedEstimateProvenance;
                 }
             } else {
                 delete session.stats.calibratedEstimate;
                 delete session.stats.calibratedEstimateOrigin;
                 delete session.stats.calibratedEstimateModel;
+                delete session.stats.calibratedEstimateProvenance;
             }
         }
         session.stats.calibrationRing = ring;
@@ -1923,7 +1989,7 @@ export function noteOutboundContextEstimates(
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number; model?: string; context?: number },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
@@ -1951,7 +2017,9 @@ export function settleUsageReport(
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
         // context the NEXT request will actually carry (see stream.ts applyRanges).
-        session.stats.lastInputTokens = Math.max(0, s.total - (session.stats.compressCreditTokens ?? 0));
+        // An advisor reply bills several model calls; the context is what its last one read.
+        const contextTotal = s.context !== undefined && s.context > 0 ? s.context : s.total;
+        session.stats.lastInputTokens = Math.max(0, contextTotal - (session.stats.compressCreditTokens ?? 0));
         // #1569: calibration anchor for estimate-grade turns — written ONLY by
         // real upstream usage reports (all three response shapes funnel here),
         // never by estimate-grade samples or arming paths; dropped at native-
@@ -1971,6 +2039,17 @@ export function settleUsageReport(
         // it to demote the baseline when the current request routes elsewhere.
         const settleOrigin = normalizeUpstreamOrigin(s.upstream);
         if (settleOrigin !== undefined) session.stats.lastInputTokensOrigin = settleOrigin;
+        // Identity-fast-path: stamp which MODEL measured this baseline — the
+        // gate refuses to trust acceptance evidence across a model switch.
+        // Lanes that settle without an explicit model (streamed plugin pipes)
+        // fall back to metadata.lastModel: prepare re-covers it with the
+        // CURRENT request's model on every request, so in the normal case it
+        // is exactly this request's model (a concurrent interleaving can only
+        // produce one conservative demotion — the safe direction).
+        const stampedModel = typeof s.model === "string" && s.model !== "" ? s.model
+            : typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel
+            : undefined;
+        if (stampedModel !== undefined) session.stats.lastInputTokensModel = stampedModel;
         // #1933 F1: consume the pending pair — the local text estimate of the
         // payload THIS report bills, recorded at prepare time. Same route
         // required. Admitted samples (plausibility band) accumulate in a
@@ -1983,7 +2062,7 @@ export function settleUsageReport(
         // only ever overflows never settles a usage report, so without this the
         // local estimator's calibre never self-corrects and the same "fits"
         // verdict re-forwards the same doomed body forever.
-        ingestCalibrationPair(session, s.total, s.upstream);
+        ingestCalibrationPair(session, contextTotal, s.upstream);
         // #1820: a real usage-grade sample supersedes the post-rebuild meter
         // anchor immediately — no need to wait out its prepare budget.
         clearPostRebuildAnchor(session);
