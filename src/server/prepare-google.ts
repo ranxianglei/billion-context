@@ -4,7 +4,7 @@ import { renderNudgeText, viableRanges } from "acp-kernel";
 import { recordNudgeInject } from "../cache-ledger.js";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
-import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, applyWireMsgIdPin, validateMsgIds, validateWireMsgIds, wirePinGroups } from "../msgid-pin.js";
 import { featureEnabled } from "../rollout.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
@@ -166,9 +166,18 @@ export async function prepareGoogle(
         let msgidPinned = false;
         if (pluginMode && incomingMsgIds !== undefined) {
             if (featureEnabled("pluginLaneServerHistory")) {
-                const v = validateMsgIds(incomingMsgIds, msgs.length);
+                // #7439 follow-up: per-CORE or per-WIRE-ELEMENT full list
+                // (dual-mode, same rule as stage0 — a split group guarantees
+                // element count < core count, no ambiguity).
+                const wireG = (() => { const g = wirePinGroups(msgs); return g !== null && g.split ? g : null; })();
+                const wireHit = wireG !== null && Array.isArray(incomingMsgIds) && incomingMsgIds.length === wireG.size;
+                const v = wireHit
+                    ? validateWireMsgIds(incomingMsgIds, wireG!)
+                    : validateMsgIds(incomingMsgIds, msgs.length);
                 if (v.ok) {
-                    msgs = applyMsgIdPin(msgs, v.ids);
+                    msgs = wireHit
+                        ? applyWireMsgIdPin(msgs, wireG!, v.ids)
+                        : applyMsgIdPin(msgs, v.ids);
                     originalMessages = msgs;
                     msgidPinned = true;
                 } else {

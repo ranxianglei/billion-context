@@ -48,7 +48,7 @@ import { effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgIdPin, applyMsgSeqStamps, validateMsgIds, validateMsgSeqs } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgIdPin, applyMsgSeqStamps, applyWireMsgIdPin, validateMsgIds, validateMsgSeqs, validateWireMsgIds, wirePinGroups } from "../msgid-pin.js";
 import { tryIncrementalPin } from "../snapshot/stage0.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
@@ -256,10 +256,15 @@ export async function prepareAnthropic(
                 // screen; any mismatch degrades to the full signal, never
                 // rejects — opencode V1's anthropic-wire header is the
                 // steady-state consumer).
-                const idsFullForm = Array.isArray(incomingMsgIds) && incomingMsgIds.length === msgs.length ? (incomingMsgIds as string[]) : undefined;
-                const v = idsFullForm === undefined ? undefined : validateMsgIds(idsFullForm, msgs.length);
+                // #7439 follow-up: the full list is per-CORE or per-WIRE-
+                // ELEMENT (dual-mode, same rule as stage0 — a split group
+                // guarantees element count < core count, no ambiguity).
+                const wireG = (() => { const g = wirePinGroups(msgs); return g !== null && g.split ? g : null; })();
+                const idsFullForm = Array.isArray(incomingMsgIds) && (incomingMsgIds.length === msgs.length || (wireG !== null && incomingMsgIds.length === wireG.size)) ? (incomingMsgIds as string[]) : undefined;
+                const wireHit = wireG !== null && Array.isArray(incomingMsgIds) && incomingMsgIds.length === wireG.size && incomingMsgIds.length !== msgs.length;
+                const v = idsFullForm === undefined ? undefined : (wireHit ? validateWireMsgIds(idsFullForm, wireG!) : validateMsgIds(idsFullForm, msgs.length));
                 if (v !== undefined && v.ok) {
-                    msgs = applyMsgIdPin(msgs, v.ids);
+                    msgs = wireHit ? applyWireMsgIdPin(msgs, wireG!, v.ids) : applyMsgIdPin(msgs, v.ids);
                     originalMessages = msgs;
                     noteMsgIdObservation(session, v.ids, msgs, log, sessionId);
                     msgidPinMode = "incremental";

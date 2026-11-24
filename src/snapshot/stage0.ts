@@ -37,7 +37,7 @@
 import type { BiliMessage } from "acp-kernel/wire";
 import { getStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
-import { applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { applyMsgIdPin, applyWireMsgIdPin, validateMsgIds, validateWireMsgIds, wirePinGroups } from "../msgid-pin.js";
 import { checkR3Identity, FoundationRejectError, r3FaultTracker } from "./plane.js";
 
 export interface Stage0Input {
@@ -127,7 +127,17 @@ export function runStage0(opts: Stage0Input): Stage0Result {
     // just stop sending the full list in steady state (the client derives
     // the tail from its own previous full list, pfIdTailForm).
     const declaredIds = Array.isArray(incomingMsgIds) ? (incomingMsgIds as string[]) : null;
-    const fullForm = declaredIds !== null && declaredIds.length === msgs.length;
+    // #7439 follow-up (cross-lane switching): WIRE-granularity form — the
+    // host stamps one id per wire ELEMENT even when the kernel splits an
+    // element into N cores (agentic text+tool_calls). The dual-mode is
+    // unambiguous by construction: every host that CAN'T prove the split
+    // only ever emits the per-core length, so a declared length that
+    // matches the group count (not the core count) IS the wire form.
+    const wireG = (() => {
+        const g = wirePinGroups(msgs);
+        return g !== null && g.split ? g : null;
+    })();
+    const fullForm = declaredIds !== null && (declaredIds.length === msgs.length || (wireG !== null && declaredIds.length === wireG.size));
     const bodyTail = declaredIds !== null && !fullForm && declaredIds.length > 0 ? declaredIds : null;
     // #7064 §8: the incremental pin is its OWN rollout on top of the lane's
     // (the full-list pin below is untouched). Off = byte-identical to
@@ -166,9 +176,17 @@ export function runStage0(opts: Stage0Input): Stage0Result {
     if (pluginMode && declaredIds !== null) {
         if (rollout) {
             if (fullForm) {
-            const v = validateMsgIds(declaredIds, msgs.length);
+            // Wire form when the declared length is the GROUP count (a split
+            // group guarantees group count < core count, so the two modes
+            // never overlap); per-core form byte-identical to before.
+            const wireHit = wireG !== null && declaredIds.length !== msgs.length;
+            const v = wireHit
+                ? validateWireMsgIds(declaredIds, wireG!)
+                : validateMsgIds(declaredIds, msgs.length);
             if (v.ok) {
-                pinned = applyMsgIdPin(msgs, v.ids);
+                pinned = wireHit
+                    ? applyWireMsgIdPin(msgs, wireG!, v.ids)
+                    : applyMsgIdPin(msgs, v.ids);
             } else if (armed) {
                 // #7064 D2: conversation-bound sids never take the R3 fault
                 // path — the host conversation identity IS the identity and
