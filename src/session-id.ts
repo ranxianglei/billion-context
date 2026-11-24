@@ -234,36 +234,73 @@ export function claudeAnthropicPersonaOrderApplies(headers: Record<string, strin
     return resolveWireClientProfile(wireClientSignals(headers)).personaOrderKeyed;
 }
 
-/** #5095 (D1-C): extract the bili SubagentStart lane token from an Anthropic
- *  request's messages. The hook injects the token into the dispatch's FIRST
- *  user message, so the scan stops at the first user message — a marker
- *  pasted by the user into a LATER message must never fork the main
- *  conversation off its raw key. Content shapes: bare string, or a block
- *  array where only `type:"text"` blocks are scanned (the hook context may
- *  sit inside a <system-reminder> wrapper; the marker is matched as a
- *  substring, so the wrapper shape does not matter). Returns undefined when
- *  absent — the overwhelmingly common case (main turns, other hosts,
- *  un-upgraded installs) keeps resolution byte-identical to before. */
-export function claudeSubagentLaneTokenOf(messages: unknown): string | undefined {
-    if (!Array.isArray(messages)) return undefined;
-    for (const msg of messages) {
-        if (msg === null || typeof msg !== "object") continue;
-        const m = msg as { role?: unknown; content?: unknown };
-        if (m.role !== "user") continue;
-        if (typeof m.content === "string") return claudeLaneTokenIn(m.content);
-        if (Array.isArray(m.content)) {
-            for (const block of m.content) {
-                if (block === null || typeof block !== "object") continue;
-                const b = block as { type?: unknown; text?: unknown };
-                if (b.type === "text" && typeof b.text === "string") {
-                    const tok = claudeLaneTokenIn(b.text);
-                    if (tok !== undefined) return tok;
-                }
+const SUBAGENT_START_CONTEXT_RE = /^\s*(?:<system-reminder>\s*)?SubagentStart hook additional context:/;
+
+function extractClaudeLaneToken(content: unknown, requireSubagentStartPrefix: boolean): string | undefined {
+    if (typeof content === "string") {
+        if (requireSubagentStartPrefix && !SUBAGENT_START_CONTEXT_RE.test(content)) return undefined;
+        return claudeLaneTokenIn(content);
+    }
+    if (Array.isArray(content)) {
+        for (const block of content) {
+            if (block === null || typeof block !== "object") continue;
+            const b = block as { type?: unknown; text?: unknown };
+            if (b.type === "text" && typeof b.text === "string") {
+                if (requireSubagentStartPrefix && !SUBAGENT_START_CONTEXT_RE.test(b.text)) continue;
+                const tok = claudeLaneTokenIn(b.text);
+                if (tok !== undefined) return tok;
             }
         }
-        return undefined;
     }
     return undefined;
+}
+
+/** #5095 (D1-C): extract the bili SubagentStart lane token from an Anthropic
+ *  request's opening turn. Older Claude Code builds inject SubagentStart
+ *  additionalContext inside the first `user` message; Claude Code 2.1.330
+ *  delivers it in an immediately following `role:"system"` message (`messages[1]`)
+ *  whose text starts with `SubagentStart hook additional context:`.
+ *
+ *  Positional + carrier bounds:
+ *  - Only the first `user` message and (when no `assistant` message precedes
+ *    it) contiguous `role:"system"` messages immediately following it are
+ *    inspected; scanning stops at the first non-`system` entry after that
+ *    `user` message (e.g. `assistant` or a second `user` message), so later
+ *    turns can never fork a running session.
+ *  - `role:"system"` messages are matched ONLY on text blocks starting with
+ *    `SubagentStart hook additional context:`, so main-session `SessionStart`
+ *    hooks (e.g. memory plugins recalling prior text) cannot trigger a fork.
+ *  - When both the first `user` message and an immediately following
+ *    `SubagentStart` `role:"system"` carrier contain tokens, the `SubagentStart`
+ *    carrier wins so user-quoted markers cannot preempt the hook's token. */
+export function claudeSubagentLaneTokenOf(messages: unknown): string | undefined {
+    if (!Array.isArray(messages)) return undefined;
+    let firstUserIdx = -1;
+    let seenAssistant = false;
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        if (msg === null || typeof msg !== "object") continue;
+        const role = (msg as { role?: unknown }).role;
+        if (role === "user") {
+            firstUserIdx = i;
+            break;
+        }
+        if (role === "assistant") seenAssistant = true;
+    }
+    if (firstUserIdx === -1) return undefined;
+    const firstUser = messages[firstUserIdx] as { content?: unknown };
+    const userTok = extractClaudeLaneToken(firstUser.content, false);
+    if (!seenAssistant) {
+        for (let i = firstUserIdx + 1; i < messages.length; i++) {
+            const msg = messages[i];
+            if (msg === null || typeof msg !== "object") break;
+            const m = msg as { role?: unknown; content?: unknown };
+            if (m.role !== "system") break;
+            const sysTok = extractClaudeLaneToken(m.content, true);
+            if (sysTok !== undefined) return sysTok;
+        }
+    }
+    return userTok;
 }
 
 /** #1916/#1307/#1314: whether the persona fingerprint (session id + system

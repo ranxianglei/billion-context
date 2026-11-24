@@ -17,7 +17,7 @@
 // What remains is exactly the wire-visible key contract:
 //
 //   1. A valid #5095 dispatch lane token (the bili SubagentStart hook's
-//      per-dispatch token riding the first user message) keys the request
+//      per-dispatch token riding the opening turn) keys the request
 //      onto its own per-dispatch lane:
 //            <rawId>|sub:<fp16(personaTag)>:t:<token>
 //      (two-segment <rawId>|sub:t:<token> when the tag is empty) —

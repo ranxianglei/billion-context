@@ -20,7 +20,8 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 // the persona text alone — and PARALLEL dispatches of the SAME subagent type
 // (identical system text → identical fingerprint) merge onto ONE lane. The
 // bili-managed SubagentStart hook mints a per-dispatch token that rides the
-// dispatch's first user message; the resolver keys on it deterministically.
+// dispatch's opening turn (the first user message or an immediately following
+// role:"system" SubagentStart carrier); the resolver keys on it deterministically.
 // GA discipline (#7525): every row below has its negative — with no valid
 // token on the wire, the stamped id rides verbatim (no lane of any kind).
 // The legacy per-fingerprint/per-fragment fallback lanes were retired with
@@ -61,7 +62,7 @@ test("#5095 grammar: mint / validate / extract", () => {
     assert.equal(claudeLaneTokenIn("no marker here"), undefined);
 });
 
-test("#5095 extractor: only the FIRST user message is scanned", () => {
+test("#5095 extractor: first user message is scanned; later user messages ignored", () => {
     const tok = mintClaudeLaneToken();
     const marker = `${LANE_TOKEN_MARKER}${tok}`;
     // string content
@@ -83,6 +84,143 @@ test("#5095 extractor: only the FIRST user message is scanned", () => {
     assert.equal(claudeSubagentLaneTokenOf(undefined), undefined);
     assert.equal(claudeSubagentLaneTokenOf([]), undefined);
     assert.equal(claudeSubagentLaneTokenOf([{ role: "user", content: null }]), undefined);
+});
+
+test("#5095 extractor: opening role:system SubagentStart carrier (Claude Code 2.1.330 shape)", () => {
+    const tok = mintClaudeLaneToken();
+    const otherTok = mintClaudeLaneToken();
+    const marker = `${LANE_TOKEN_MARKER}${tok}`;
+    const otherMarker = `${LANE_TOKEN_MARKER}${otherTok}`;
+    // Claude Code 2.1.330 shape: messages[0] is user (CLAUDE.md + task prompt),
+    // messages[1] is role:"system" carrying SubagentStart hook additionalContext
+    // alongside tool_addition blocks, followed by assistant/user turns.
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "user", content: [{ type: "text", text: "<system-reminder>CLAUDE.md</system-reminder>" }, { type: "text", text: "audit slice A" }] },
+            { role: "system", content: [{ type: "text", text: `SubagentStart hook additional context: ${marker}\n\nThe following tools just became available:` }, { type: "tool_addition", tool: { type: "tool_reference", name: "Read" } }] },
+            { role: "assistant", content: "starting audit" },
+            { role: "user", content: "continue" },
+        ]),
+        tok,
+    );
+    // string content on opening role:"system" SubagentStart carrier
+    assert.equal(
+        claudeSubagentLaneTokenOf([{ role: "user", content: "task" }, { role: "system", content: `SubagentStart hook additional context: ${marker}` }]),
+        tok,
+    );
+    // SubagentStart carrier with <system-reminder> wrapper and another hook's text prepended
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "user", content: "task" },
+            { role: "system", content: [{ type: "text", text: `<system-reminder>SubagentStart hook additional context: ## Memory routing\n${marker}</system-reminder>` }] },
+        ]),
+        tok,
+    );
+    // multiple consecutive opening role:"system" messages immediately after first user
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "user", content: "task" },
+            { role: "system", content: "deferred tools list" },
+            { role: "system", content: [{ type: "text", text: `SubagentStart hook additional context: ${marker}` }] },
+            { role: "assistant", content: "reply" },
+        ]),
+        tok,
+    );
+    // PRECEDENCE: SubagentStart role:"system" carrier beats a token quoted inside messages[0] user prompt
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "user", content: `debug why ${otherMarker} collided` },
+            { role: "system", content: [{ type: "text", text: `SubagentStart hook additional context: ${marker}` }] },
+        ]),
+        tok,
+    );
+    // NEGATIVE (main-session guard): SessionStart hook recalling a valid token must NOT match
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "user", content: "continue work" },
+            { role: "system", content: [{ type: "text", text: `SessionStart hook additional context: [Memory] recalled ${marker}` }] },
+        ]),
+        undefined,
+    );
+    // NEGATIVE (main-session guard): SessionStart quoting the SubagentStart prefix mid-text must NOT match
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "user", content: "continue work" },
+            { role: "system", content: `SessionStart hook additional context: notes mention SubagentStart hook additional context: ${marker}` },
+        ]),
+        undefined,
+    );
+    // NEGATIVE: role:"system" WITHOUT SubagentStart prefix must NOT match
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "user", content: "task" },
+            { role: "system", content: `plain system note ${marker}` },
+        ]),
+        undefined,
+    );
+    // NEGATIVE: system-only or leading role:"system" before first user must NOT match
+    assert.equal(
+        claudeSubagentLaneTokenOf([{ role: "system", content: `SubagentStart hook additional context: ${marker}` }]),
+        undefined,
+    );
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "system", content: `SubagentStart hook additional context: ${marker}` },
+            { role: "user", content: "task" },
+        ]),
+        undefined,
+    );
+    // NEGATIVE: role:"system" AFTER the first assistant reply must never fork
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "user", content: "first turn" },
+            { role: "system", content: "SessionStart hook additional context: clean" },
+            { role: "assistant", content: "reply" },
+            { role: "system", content: `SubagentStart hook additional context: ${marker}` },
+        ]),
+        undefined,
+    );
+    // NEGATIVE: role:"system" AFTER a second user message or null/non-system separator must never fork
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "user", content: "first turn" },
+            { role: "user", content: "second turn" },
+            { role: "system", content: `SubagentStart hook additional context: ${marker}` },
+        ]),
+        undefined,
+    );
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "user", content: "first turn" },
+            null,
+            { role: "system", content: `SubagentStart hook additional context: ${marker}` },
+        ]),
+        undefined,
+    );
+    // NEGATIVE: role:"system" AFTER a leading assistant message (with or without intervening user) must not fork
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "assistant", content: "hi" },
+            { role: "system", content: `SubagentStart hook additional context: ${marker}` },
+        ]),
+        undefined,
+    );
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "assistant", content: "hi" },
+            { role: "user", content: "first turn" },
+            { role: "system", content: `SubagentStart hook additional context: ${marker}` },
+        ]),
+        undefined,
+    );
+    // NEGATIVE: non-text blocks inside role:"system" are not scanned
+    assert.equal(
+        claudeSubagentLaneTokenOf([
+            { role: "user", content: "clean" },
+            { role: "system", content: [{ type: "tool_addition", text: `SubagentStart hook additional context: ${marker}` }] },
+        ]),
+        undefined,
+    );
 });
 
 test("#5095 hook output: one token per invocation, valid JSON contract", () => {
@@ -195,11 +333,22 @@ function anthropicStream(): string {
     );
 }
 
-function startMockUpstream(): http.Server {
-    const server = http.createServer((_req, res) => {
-        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-        res.write(anthropicStream());
-        res.end();
+function startMockUpstream(captured?: Record<string, unknown>[]): http.Server {
+    const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+        req.on("end", () => {
+            if (captured !== undefined) {
+                try {
+                    captured.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+                } catch {
+                    // ignore non-JSON
+                }
+            }
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            res.write(anthropicStream());
+            res.end();
+        });
     });
     server.listen(0, "127.0.0.1");
     return server;
@@ -275,6 +424,27 @@ function tokenedHistory(prefix: string, turns: number, token: string): Msg[] {
     return [{ role: "user", content: [{ type: "text", text: `<system-reminder>${LANE_TOKEN_MARKER}${token}</system-reminder>` }, { type: "text", text: String(first.content) }] }, ...base.slice(1)];
 }
 
+/** Claude Code 2.1.330 shape: opening role:"system" message at messages[1] carries
+ *  SubagentStart additionalContext alongside tool_addition blocks.
+ *  Pass 1 = [user, system]; pass >= 2 = [user, system, assistant, user, ...] (ends with user). */
+function systemCarrierHistory(prefix: string, pass: number, token: string): Msg[] {
+    const opening: Msg[] = [
+        { role: "user", content: [{ type: "text", text: "<system-reminder>shared CLAUDE.md</system-reminder>" }, { type: "text", text: `${prefix}-user-1` }] },
+        {
+            role: "system",
+            content: [
+                { type: "text", text: `SubagentStart hook additional context: ${LANE_TOKEN_MARKER}${token}\n\nThe following tools just became available:` },
+                { type: "tool_addition", tool: { type: "tool_reference", name: "Read" } },
+            ],
+        },
+    ];
+    for (let i = 2; i <= pass; i++) {
+        opening.push({ role: "assistant", content: `${prefix}-assistant-${i - 1}` });
+        opening.push({ role: "user", content: `${prefix}-user-${i}` });
+    }
+    return opening;
+}
+
 test("#5095 end to end: parallel same-type dispatches ride distinct lanes; parent untouched; no-token control unchanged", async () => {
     freshState();
     const SESSION = randomUUID();
@@ -344,6 +514,106 @@ test("#5095 end to end fallback: un-upgraded clients (no token) ride the stamped
         const sub2 = await post(ccHeaders, mainBody(history("sub", 3), SUB_AGENT_SYSTEM));
         assert.equal(sub2.status, 200, `token-less pass 2: ${sub2.text}`);
         assert.equal(peekSession(SESSION)!.stats.requests, 5, "successive turns of the SAME id stay verbatim");
+    } finally {
+        await close(proxy);
+        await close(upstream);
+    }
+});
+
+test("#5095 end to end: Claude Code 2.1.330 role:system SubagentStart carrier isolates concurrent dispatches and protects main sessions", async () => {
+    freshState();
+    const SESSION = randomUUID();
+    const ccHeaders = ccHeadersFor(SESSION);
+    const tokA = mintClaudeLaneToken();
+    const tokB = mintClaudeLaneToken();
+    const sessionStartTok = mintClaudeLaneToken();
+    const explicitMainTok = mintClaudeLaneToken();
+    const lateTok = mintClaudeLaneToken();
+    const captured: Record<string, unknown>[] = [];
+    const upstream = startMockUpstream(captured);
+    await listen(upstream);
+    const { proxy, post } = await startHarness(upstream);
+    try {
+        // NEGATIVE 1: main turn 1 with SessionStart recalling a valid token must stay on raw parent session
+        const main1 = await post(ccHeaders, mainBody([
+            { role: "user", content: [{ type: "text", text: "<system-reminder>shared CLAUDE.md</system-reminder>" }, { type: "text", text: "main-user-1" }] },
+            { role: "system", content: [{ type: "text", text: `SessionStart hook additional context: [Memory] ${LANE_TOKEN_MARKER}${sessionStartTok}` }] },
+        ]));
+        assert.equal(main1.status, 200, `main turn 1: ${main1.text}`);
+        const parent = peekSession(SESSION);
+        assert.ok(parent, "parent session exists");
+        assert.equal(parent.stats.requests, 1);
+        assert.equal(peekSession(tokenLaneKey(SESSION, tag(MAIN_SYSTEM), sessionStartTok)), undefined, "SessionStart marker must never fork main");
+
+        // NEGATIVE 2: explicit x-claude-code-request-class: main must never enter token fork even with token in messages[0]
+        const mainClass = await post(
+            { ...ccHeaders, "x-claude-code-request-class": "main" },
+            mainBody([
+                { role: "user", content: `investigate ${LANE_TOKEN_MARKER}${explicitMainTok}` },
+                { role: "system", content: [{ type: "text", text: "SessionStart hook additional context: clean" }] },
+            ]),
+        );
+        assert.equal(mainClass.status, 200, `explicit main turn: ${mainClass.text}`);
+        assert.equal(peekSession(tokenLaneKey(SESSION, tag(MAIN_SYSTEM), explicitMainTok)), undefined, "explicit main class must never fork");
+        assert.equal(parent.stats.requests, 2);
+
+        const laneA = tokenLaneKey(SESSION, tag(SUB_AGENT_SYSTEM), tokA);
+        const laneB = tokenLaneKey(SESSION, tag(SUB_AGENT_SYSTEM), tokB);
+
+        // Concurrent pass 1 ([user, system]) for two same-type subagents
+        const [a1, b1] = await Promise.all([
+            post(ccHeaders, mainBody(systemCarrierHistory("subA", 1, tokA), SUB_AGENT_SYSTEM)),
+            post(ccHeaders, mainBody(systemCarrierHistory("subB", 1, tokB), SUB_AGENT_SYSTEM)),
+        ]);
+        assert.equal(a1.status, 200, `dispatch A pass 1: ${a1.text}`);
+        assert.equal(b1.status, 200, `dispatch B pass 1: ${b1.text}`);
+        assert.ok(peekSession(laneA), "dispatch A rides its own token lane from messages[1] role:system");
+        assert.ok(peekSession(laneB), "dispatch B rides its own distinct token lane");
+        assert.notEqual(peekSession(laneA), peekSession(laneB));
+        assert.equal(peekSession(laneA)!.stats.requests, 1);
+        assert.equal(peekSession(laneB)!.stats.requests, 1);
+
+        // Continuation pass 2 ([user, system, assistant, user]) keeps the same lane
+        const a2 = await post(ccHeaders, mainBody(systemCarrierHistory("subA", 2, tokA), SUB_AGENT_SYSTEM));
+        assert.equal(a2.status, 200, `dispatch A pass 2: ${a2.text}`);
+        assert.equal(peekSession(laneA)!.stats.requests, 2);
+        assert.equal(parent.stats.requests, 2, "parent untouched by both concurrent dispatches");
+
+        // Verify BOTH pass 1 and pass 2 forwarded payloads for dispatch A preserved
+        // messages[1] (role:"system") with its exact text carrier and tool_addition block
+        const subAForwards = captured.filter((body) =>
+            Array.isArray(body.messages) &&
+            body.messages.length >= 2 &&
+            typeof body.messages[1] === "object" && body.messages[1] !== null &&
+            (body.messages[1] as { role?: unknown }).role === "system" &&
+            Array.isArray((body.messages[1] as { content?: unknown }).content) &&
+            ((body.messages[1] as { content: unknown[] }).content).some((b) =>
+                b !== null && typeof b === "object" && (b as { type?: unknown }).type === "text" &&
+                typeof (b as { text?: unknown }).text === "string" &&
+                (b as { text: string }).text.includes(`${LANE_TOKEN_MARKER}${tokA}`),
+            ),
+        );
+        assert.equal(subAForwards.length, 2, "upstream received both pass 1 and pass 2 with messages[1] role:system intact");
+        for (const fwd of subAForwards) {
+            const sysMsg = (fwd.messages as Array<{ role?: string; content?: Array<Record<string, unknown>> }>)[1];
+            assert.equal(sysMsg.role, "system");
+            assert.equal(sysMsg.content?.[0]?.type, "text");
+            assert.ok(String(sysMsg.content?.[0]?.text ?? "").startsWith("SubagentStart hook additional context:"));
+            assert.equal(sysMsg.content?.[1]?.type, "tool_addition");
+            assert.deepEqual(sysMsg.content?.[1]?.tool, { type: "tool_reference", name: "Read" });
+        }
+
+        // NEGATIVE 3: a late role:"system" message after an assistant turn must not fork the main session
+        const mainLate = await post(ccHeaders, mainBody([
+            { role: "user", content: "main-user-1" },
+            { role: "system", content: "SessionStart hook additional context: clean" },
+            { role: "assistant", content: "main-assistant-1" },
+            { role: "system", content: `SubagentStart hook additional context: ${LANE_TOKEN_MARKER}${lateTok}` },
+            { role: "user", content: "main-user-2" },
+        ]));
+        assert.equal(mainLate.status, 200, `main late system turn: ${mainLate.text}`);
+        assert.equal(peekSession(tokenLaneKey(SESSION, tag(MAIN_SYSTEM), lateTok)), undefined, "late system marker must never fork main session");
+        assert.equal(parent.stats.requests, 3, "main turn stays on raw parent session");
     } finally {
         await close(proxy);
         await close(upstream);

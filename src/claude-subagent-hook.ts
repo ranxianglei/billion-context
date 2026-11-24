@@ -5,7 +5,8 @@ import { LANE_TOKEN_MARKER, mintClaudeLaneToken } from "./claude-lane-token.js";
  *  subagent launch — mint a random lane token and hand it back as
  *  `additionalContext`, which Claude Code injects into that dispatch's
  *  context. Every model request of the dispatch then carries the token in
- *  its first user message, and the bili proxy keys the dispatch onto its own
+ *  its opening turn (the first user message or an immediately following
+ *  `role:"system"` SubagentStart carrier), and the bili proxy keys the dispatch onto its own
  *  compression lane (`<id>|sub:...:t:<token>`) instead of the persona-text
  *  fingerprint that merges parallel same-type subagents under the parent's
  *  session id (#4352/#5095).
