@@ -2921,10 +2921,22 @@ export async function pipePluginChatWithStrip(
     // every count taken from bili.log.
     const who = session ? `[${session.id}] ` : "";
     const onTagDrop = (snippet: string, duringDrain?: boolean) => {
-        droppedTagInFrame = true;
         sawStrippedEcho = true;
         const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
         loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
+    // #6034 (option E): the answer ledger's markup flag is VERDICT-driven,
+    // not "any drop arms it". A complete refs-only echo unit dies whole — it
+    // leaves no interior behind, so the answer text around it must count as
+    // the answer; arming on every drop miscounted a 108-char real answer as
+    // markup after such an echo and killed a healthy turn twice (the sample
+    // in #6034). Only a session-start open (verdict pending until the span
+    // resolves) and a close that releases its prose body leave interior.
+    // Last-write-wins is safe: the filter delivers verdicts in release order
+    // within a frame (a unit's drop precedes its interior's resolution), and
+    // the frame's released text is counted only after push() returns.
+    const onTagDropVerdict = (leavesInterior: boolean) => {
+        droppedTagInFrame = leavesInterior;
     };
     // #2190: the filter released bytes that still carry echo-residue shape —
     // the leak is now observable instead of silent. Log-only; the bytes were
@@ -2961,7 +2973,7 @@ export async function pipePluginChatWithStrip(
             // openai reasoning fields — the thinking channel is NEVER
             // rewritten, only the visible text channel is.
             const signedThinking = field === "thinking" || (protocol === "openai" && (field === "reasoning_content" || field === "reasoning"));
-            s = { filter: signedThinking ? createIdentityStreamFilter() : composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
+            s = { filter: signedThinking ? createIdentityStreamFilter() : composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText, onTagDropVerdict), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
             streams.set(key, s);
         }
         return s;
@@ -3009,8 +3021,12 @@ export async function pipePluginChatWithStrip(
      *  unclosed-tag case): markup the filter declined to swallow. A turn whose
      *  only visible output is this is as dead to the host as an empty one. */
     let releasedMarkupChars = 0;
-    /** Set while a frame is being rewritten because a render tag was dropped:
-     *  the text that survives such a frame is the tag's own interior. */
+    /** VERDICT-driven (onTagDropVerdict, #6034 option E): true while the
+     *  filter has just dropped an artifact whose interior the stream still
+     *  releases — the text surviving such a frame is the tag's own interior
+     *  (markup), so the answer ledger must not count it as the answer. A
+     *  whole-dead unit (complete refs-only echo) or a content release keeps
+     *  it false and the released text stays answer. */
     let droppedTagInFrame = false;
     let finalFinishReason: string | undefined;
     // #2328 Q2/Q4: termination diagnostics — every truncation emit below

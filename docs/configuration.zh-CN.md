@@ -306,6 +306,7 @@
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
+| `compress.protectedUserPatterns` | string[] | none | — | 用户文本消息的字面子串：命中即永不折叠，即使它不是最后一条 user 消息。用于长会话里 host 标记的当前任务 prompt。 |
 | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。 |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
@@ -1563,6 +1564,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   - **独立内容** —— 每个实例携带独特信息，后续结果不会取代它（opencode/pi 的 `skill` 加载、一次性引用资料）：用 `protectedTools`。折叠旧的加载会永久丢失其内容，保护可让每次加载都留在上下文中（#1109）。用 `skill/<name>` 路径模式可只保护某个编排 skill 的全部装载、让轻量 skill 照常折叠（`protectedTools: ["skill/release-orchestrator"]`，#1947）。
   - **累积快照** —— 每条新结果取代旧结果（客户端的 todo/任务清单）：用 `protectedLatestTools`。对这类工具保护**全部**实例会让其历史无限膨胀 —— 正是 #639 通过只保护最新一条来规避的故障。
   - 经验法则：低频高价值工具 → `protectedTools`；高频刷屏工具 → 绝不做全历史保护（上下文无界增长）；累积快照型工具 → `protectedLatestTools`。
+
+#### `protectedUserPatterns`
+
+- **类型：** `string[]`（字面文本子串，如 `["【本轮消息】"]`）
+- **默认值：** `[]`（无 —— 按 host 自行开启）
+- **状态：** ACTIVE
+- **说明：** 用户角色文本消息只要包含列表中的任一**字面子串**就永不被压缩（映射到内核 `Config.isMessageProtected`）。为长生命周期 agent 会话而设：当前任务 prompt 往往**不是最后一条 user 消息**（后面还有 tool-result / 图片 user 消息），内核的 last-user 保护覆盖不到它；一旦它被折叠，wire 上可能只剩更早的旧 user 消息，模型会误把旧任务当成当前任务继续执行。host 用稳定标记（例如 `【本轮消息】`）标识当前任务并在这里登记。匹配为字面子串（不是 glob）；只检查 user 角色的文本消息；空数组会被拒绝；跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedUserPatterns": ["【本轮消息】"] } }`。
 
 #### `neverPreserveRecentTools`
 
