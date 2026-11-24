@@ -73,7 +73,7 @@ import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
 import { billOutputUsage } from "./billing.js";
-import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
+import { promptInputTotal, declaredInclusiveFromUsage, lastIterationContext, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 import { lookupToolUseIdSession, lookupToolWitness, recordToolUseId, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
@@ -2660,7 +2660,9 @@ export async function handlePluginTool(
 // part of the context size, but NOT a cache hit (#790).
 // declaredInclusive = #4128 upstream self-declaration (billing_usage.semantic)
 // that input_tokens already INCLUDES cache_read — set only on the anthropic lane.
-export type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number; declaredInclusive?: boolean };
+// contextTokens = the context an advisor reply's last executor call read (its
+// top-level usage sums several calls; see lastIterationContext).
+export type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number; declaredInclusive?: boolean; contextTokens?: number };
 
 function num(v: unknown): number | undefined {
     return typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -2723,6 +2725,8 @@ export function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | u
         if (creation !== undefined && creation > 0) sample.creationTokens = creation;
         const output = num(usage["output_tokens"]);
         if (output !== undefined) sample.outputTokens = output;
+        const context = lastIterationContext(usage);
+        if (context !== undefined) sample.contextTokens = context;
         // #4128: honour a billing_usage stamp carried on the delta frame too.
         const declared = declaredInclusiveFromUsage(usage);
         if (declared !== undefined) sample.declaredInclusive = declared;
@@ -2780,8 +2784,8 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const hit = reportedCached === null ? undefined : Math.round((100 * reportedCached) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
-        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
-        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, creation: typeof sample.creationTokens === "number" ? sample.creationTokens : undefined });
+        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${sample.contextTokens !== undefined ? ` context=${sample.contextTokens}` : ""}${foldNew ? " fold=new" : ""}`);
+        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, creation: typeof sample.creationTokens === "number" ? sample.creationTokens : undefined, context: sample.contextTokens });
     }
     if (sample.outputTokens !== undefined) {
         session.stats.outputTokens += sample.outputTokens;
@@ -2812,6 +2816,7 @@ export function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.creationTokens !== undefined) acc.creationTokens = sample.creationTokens;
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
     if (sample.declaredInclusive !== undefined) acc.declaredInclusive = sample.declaredInclusive;
+    if (sample.contextTokens !== undefined) acc.contextTokens = sample.contextTokens;
 }
 
 /** Terminal reasons after which the model genuinely finished its turn. A

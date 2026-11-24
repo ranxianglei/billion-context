@@ -2979,7 +2979,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // `total` is always the true context size (see util.ts).
                 const rawUsage = prepared.protocol === "google" ? json.usageMetadata ?? json.usage : json.usage;
                 const u = (rawUsage ?? {}) as Record<string, unknown>;
-                const { total, cached, creation } = usageTotals(prepared.protocol, u);
+                const { total, cached, creation, context } = usageTotals(prepared.protocol, u);
                 const out = usageOutputTotal(prepared.protocol, u);
                 // #1547: settle through the shared path — stats AND the cache
                 // ledger. Before this, this branch updated stats only, so
@@ -2997,7 +2997,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         : typeof prepared.google?.model === "string" && prepared.google.model !== "" ? prepared.google.model
                         : typeof requestModelFromBody(wireBody, req) === "string" && requestModelFromBody(wireBody, req) !== "" ? requestModelFromBody(wireBody, req)
                         : undefined;
-                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation, model: settleModel });
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation, model: settleModel, context });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);
