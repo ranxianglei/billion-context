@@ -333,3 +333,70 @@ test("#7658 T4: capped egress-on parent — snapshot and fork serve from the op 
         await h.close(h.store);
     }
 });
+
+test("#7658 T5: fork-then-compress — the child's client-side fold books correctly in its own flow", async () => {
+    // On the plugin lane the fold executes HOST-side (pi folds its own state
+    // and re-sends the folded history on the next turn; the proxy only
+    // salvages/forwards the tool call — src/plugin.ts:3714). The egress side
+    // of "fork 后能压缩吗" is therefore: the child's first turn AFTER the
+    // client-side fold must book a D-run over the covered cells plus a fresh
+    // summary I row numbered above the parent high water, compact, keep the
+    // parent isolated, and keep serving from its own flow.
+    const logs: string[] = [];
+    const T5_SUMMARY = "T5 folded summary: the child compressed its inherited prefix. " + "y".repeat(64);
+    const h = await harness(logs);
+    try {
+        await seedParent(h.base, "p5");
+        await settle(h.store, "p5");
+        const ustore = h.store.egressOpLogStore()!;
+        const parentView = ustore.egressStateView("p5");
+        const parentHighWater = Math.max(...parentView.map((r) => r.num));
+
+        const snap = await snapshot(h.origin, "p5");
+        const { status, body } = await postFork(h.origin, {
+            protocolVersion: 2, parentConversationId: "p5", childConversationId: "c5", parentRevision: snap.parentRevision,
+            branchPoint: { messageCount: snap.orderedMessages.length, orderHash: snap.orderHash }, orderedMessages: snap.orderedMessages, idempotencyKey: "fork:c5",
+        });
+        assert.equal(status, 201, JSON.stringify(body));
+
+        // The child's first turn is ALREADY folded: the host kept the head
+        // cell and the fresh tail, and replaced the middle with the summary
+        // carrier (what pi does after a local compress).
+        const childMsgs = [HISTORY[0]!, { role: "assistant" as const, content: T5_SUMMARY }, HISTORY[4]!, m("user", 6)];
+        const childIds = ["p5-id-0", "c5-fold-0", "p5-id-4", "c5-new-0"];
+        await turn(h.base, "c5", childMsgs, childIds);
+        await settle(h.store, "c5");
+
+        const childView = ustore.egressStateView("c5");
+        const liveIds = new Set(childView.map((r) => r.msgid));
+        assert.ok(liveIds.has("c5-new-0"), "the fresh cell is live");
+        assert.ok(liveIds.has("p5-id-0") && liveIds.has("p5-id-4"), "the uncovered head/tail cells survive the fold");
+        const summaryRow = childView.find((r) => r.bytes.includes(T5_SUMMARY));
+        assert(summaryRow, "the fold summary rides its own flow row");
+        assert(summaryRow!.num > parentHighWater, `summary number ${summaryRow!.num} continues above the parent high water ${parentHighWater}`);
+        for (const id of ["p5-id-1", "p5-id-2", "p5-id-3"]) assert(!liveIds.has(id), `covered cell ${id} must be retired from the child flow`);
+
+        // Compaction: a D-bearing batch wrote the B base row and physically
+        // pruned the log before it — the flow is not a raw append-only dump.
+        const { DatabaseSync } = await import("node:sqlite");
+        const raw = new DatabaseSync(`${h.dir}/sessions/index.db`, { readOnly: true });
+        const bCount = (raw.prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = 'c5' AND row_type = 'B'").get() as { n: number }).n;
+        assert.ok(bCount >= 1, `the D-run triggered compaction (B rows: ${bCount})`);
+        raw.close();
+
+        // The next turn still serves from the child's own flow (no legacy
+        // downgrade): it advances by exactly one numbered cell.
+        await turn(h.base, "c5", [...childMsgs, m("assistant", 7)], [...childIds, "c5-new-1"]);
+        await settle(h.store, "c5");
+        const childView2 = ustore.egressStateView("c5");
+        const row2 = childView2.find((r) => r.msgid === "c5-new-1");
+        assert(row2, "the second turn cell landed");
+        const preTurn2Max = Math.max(...childView.map((r) => r.num));
+        assert.equal(row2!.num, preTurn2Max + 1, `the second cell takes the next flow number (${row2!.num} after ${preTurn2Max})`);
+
+        // Parent isolation holds through the fold too.
+        assert.deepEqual(ustore.egressStateView("p5"), parentView, "parent flow untouched by the child fold");
+    } finally {
+        await h.close(h.store);
+    }
+});
