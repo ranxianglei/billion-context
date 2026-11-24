@@ -67,6 +67,9 @@ export function mergeCompress(
     // `tierNudgeTokens` is another nested-object field merged sub-field-wise
     // like `absorb`: a model-level t2 must not discard a provider-level t1.
     const tierNudgeLevels = [global?.tierNudgeTokens, provider?.tierNudgeTokens, model?.tierNudgeTokens].filter(Boolean) as NonNullable<CompressSettings["tierNudgeTokens"]>[];
+    // #7666: `degenerateRetry` is merged sub-field-wise like `absorb`: a
+    // model-level nudges list must not discard a provider-level maxAttempts.
+    const degenerateRetryLevels = [global?.degenerateRetry, provider?.degenerateRetry, model?.degenerateRetry].filter(Boolean) as NonNullable<CompressSettings["degenerateRetry"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
@@ -120,6 +123,7 @@ export function mergeCompress(
         // `externalSummary` object at a deeper level replaces the entire
         // chain above it — there is no per-target or per-budget sub-merge.
         externalSummary: pick("externalSummary"),
+        degenerateRetry: degenerateRetryLevels.length > 0 ? Object.assign({}, ...degenerateRetryLevels) : undefined,
     };
 }
 

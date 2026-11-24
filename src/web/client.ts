@@ -4603,6 +4603,10 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
+            // #7666: degenerate-retry budget + nudge sentences.
+            const dr = (cp && cp.degenerateRetry && typeof cp.degenerateRetry === "object" && !Array.isArray(cp.degenerateRetry)) ? cp.degenerateRetry : null;
+            degenMax.value = dr && typeof dr.maxAttempts === "number" ? String(dr.maxAttempts) : "";
+            degenNudges.value = dr && Array.isArray(dr.nudges) ? dr.nudges.join("\\n") : "";
             rnRow.inp.checked = cp ? cp.requireNudge === true : false;
             rrRow.inp.checked = cp ? cp.requireRecommendation === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
@@ -4806,6 +4810,66 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         rrHint.className = "dim small";
         rrHint.textContent = t("cfg.q_require_rec_hint");
         rrRow.ctl.appendChild(rrHint);
+        // #7666: degenerate-terminal retry — attempt count + custom nudge
+        // sentences (compress.degenerateRetry; resolved global→provider→model
+        // server-side). The nudge rides the retry request only, never context.
+        const degenMax = textRow("quick-degen-max", t("cfg.q_degen_retry_max"), t("cfg.q_degen_retry_max_ph"));
+        degenMax.type = "number";
+        degenMax.min = "0";
+        degenMax.max = "5";
+        degenMax.style.flex = "0 0 140px";
+        qCtrls.push(degenMax);
+        degenMax.addEventListener("change", () => commit((d) => {
+            const v = degenMax.value.trim();
+            const c = compressOf(d);
+            if (v === "" || v === "1") {
+                if (c) {
+                    const dr = (c.degenerateRetry && typeof c.degenerateRetry === "object" && !Array.isArray(c.degenerateRetry)) ? c.degenerateRetry : null;
+                    if (dr) { delete dr.maxAttempts; if (Object.keys(dr).length === 0) delete c.degenerateRetry; }
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+                return;
+            }
+            const n = Number(v);
+            if (!Number.isInteger(n) || n < 0 || n > 5) { degenMax.value = ""; return; }
+            if (!c) d.compress = {};
+            const dr = (d.compress.degenerateRetry && typeof d.compress.degenerateRetry === "object" && !Array.isArray(d.compress.degenerateRetry)) ? d.compress.degenerateRetry : {};
+            dr.maxAttempts = n;
+            d.compress.degenerateRetry = dr;
+        }));
+        const degenNudgesRow = document.createElement("div");
+        degenNudgesRow.style.cssText = "display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap";
+        const degenNudgesLab = document.createElement("label");
+        degenNudgesLab.htmlFor = "quick-degen-nudges";
+        degenNudgesLab.style.cssText = "flex:0 1 auto;max-width:520px;align-self:center";
+        degenNudgesLab.textContent = t("cfg.q_degen_retry_nudges");
+        const degenNudges = document.createElement("textarea");
+        degenNudges.id = "quick-degen-nudges";
+        degenNudges.className = "editor mono";
+        degenNudges.spellcheck = false;
+        degenNudges.rows = 3;
+        degenNudges.placeholder = t("cfg.q_degen_retry_nudges_ph");
+        degenNudges.style.cssText = "flex:1 1 480px;max-width:720px";
+        degenNudgesRow.appendChild(degenNudgesLab);
+        degenNudgesRow.appendChild(degenNudges);
+        box.appendChild(degenNudgesRow);
+        qCtrls.push(degenNudges);
+        degenNudges.addEventListener("change", () => commit((d) => {
+            const lines = degenNudges.value.split("\\n").map((s) => s.trim()).filter((s) => s.length > 0);
+            const c = compressOf(d);
+            if (lines.length === 0) {
+                if (c) {
+                    const dr = (c.degenerateRetry && typeof c.degenerateRetry === "object" && !Array.isArray(c.degenerateRetry)) ? c.degenerateRetry : null;
+                    if (dr) { delete dr.nudges; if (Object.keys(dr).length === 0) delete c.degenerateRetry; }
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+                return;
+            }
+            if (!c) d.compress = {};
+            const dr = (d.compress.degenerateRetry && typeof d.compress.degenerateRetry === "object" && !Array.isArray(d.compress.degenerateRetry)) ? d.compress.degenerateRetry : {};
+            dr.nudges = lines.slice(0, 8);
+            d.compress.degenerateRetry = dr;
+        }));
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
