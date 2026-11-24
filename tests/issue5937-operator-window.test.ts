@@ -172,7 +172,11 @@ test("#5937 main path: compress.modelContextLimit drives the judging chain end-t
     }
 });
 
-test("#5937 egress fuse both-ways: an explicit cap replaces the 1M anti-guess floor", async () => {
+test("#5937 egress fuse: an explicit cap names the operator wall in the fuse profile log", async (t) => {
+    const captured: Captured[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    t.after(() => setLogCapture(null));
+
     // Base kernel limit = CAP too: no-model bodies re-stamp effectiveContextLimit
     // from the UNRESOLVED base config (existing master semantics, load-bearing
     // for #4079's no-model isolation), so keeping base == cap makes that
@@ -192,24 +196,23 @@ test("#5937 egress fuse both-ways: an explicit cap replaces the 1M anti-guess fl
 
         // No `model` in the body → preflight's `!model` early return makes the
         // FUSE the only window comparison on this send (#4079 isolation trick).
-        // ~4.0MB core text: OVER the operator bar (3,375,000 B) — pre-fix this
-        // body forwarded under the 1M-floored 7.5MB bar even though the
-        // session's declared wall is 450K.
-        const doomed = await fetch(url, {
+        // ~4.0MB core text: OVER the operator bar (3,375,000 B). #7537: the
+        // fuse now logs the measurement and forwards (no local estimate-refusal);
+        // the log line must name the operator wall (450,000), not the 1M floor.
+        const over = await fetch(url, {
             method: "POST",
             headers,
             body: JSON.stringify({ stream: true, messages: bigMessages(900, 4_450) }),
         });
-        const body = await doomed.text();
-        const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: boolean; message?: string } };
-        assert.equal(doomed.status, 413, `over-cap body must be stopped locally (got ${doomed.status})`);
-        assert.equal(parsed.error?.type, "request_too_large");
-        assert.equal(parsed.error?.code, "egress_window_fuse");
-        assert.equal(parsed.error?.retryable, false);
-        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ tokens.*vs the operator-declared model window 450,000/, "the measured-body fuse names the operator wall");
-        assert.match(parsed.error?.message ?? "", /compress\.modelContextLimit, #5937/, "the refusal names the setting");
-        assert.match(parsed.error?.message ?? "", /raise\/remove compress\.modelContextLimit/, "the remedy names how to release it");
-        assert.equal(calls.length, 1, "only the warm-up reached the upstream");
+        assert.equal(over.status, 200, "over-cap body forwards per #7537 (no local estimate-refusal)");
+        await over.text();
+
+        // The fuse's profile log line names the operator-declared window.
+        const fuseLine = captured.find((e) => e.level === "warn" && e.msg.includes("egress window fuse profile") && e.msg.includes("op-fuse"));
+        assert.ok(fuseLine, "egress fuse profile log line present");
+        assert.match(fuseLine.msg, /operator-declared model window 450,000/, "the fuse names the operator wall");
+        assert.match(fuseLine.msg, /compress\.modelContextLimit, #5937/, "the fuse names the setting");
+        assert.match(fuseLine.msg, /forwarding per #7537/, "the fuse logs the forward decision");
 
         // Negative direction: ~341K measured tokens sits UNDER the operator
         // token cap (450K) — the measured-body fuse must let it forward even
@@ -221,7 +224,7 @@ test("#5937 egress fuse both-ways: an explicit cap replaces the 1M anti-guess fl
         });
         assert.equal(under.status, 200, "under-bar bodies forward");
         await under.text();
-        assert.equal(calls.length, 2, "the under-bar body reached the upstream");
+        assert.equal(calls.length, 3, "all three bodies reached the upstream");
     } finally {
         await close();
     }
