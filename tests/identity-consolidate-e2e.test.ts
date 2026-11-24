@@ -117,10 +117,17 @@ function openStore(dir: string): SessionStore {
     return s;
 }
 
-function closeStore(store: SessionStore, dir: string): void {
+function closeStore(store: SessionStore, dir: string, db: Db | null): void {
     _resetStoreForTest();
-    void store.closeQuietly();
-    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    store.closeQuietly();
+    db?.close(); // the test's own read-only handle — must close before rmSync
+    try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {
+        // Windows: a SQLite handle can still be releasing asynchronously after
+        // closeQuietly (EBUSY on unlink); the dir is in the OS tmpdir and is
+        // transient — a cleanup failure must not fail the test.
+    }
 }
 
 const bm = (id: string): BiliMessage => ({ id, role: "user", content: [{ type: "text", text: id }] } as unknown as BiliMessage);
@@ -158,7 +165,7 @@ test("A: a legacy (non-egress) session still runs the full l1 path — byte-iden
         assert.equal(d2.decision.replay, true);
         assert.ok(r2.pinned !== null && r2.pinned.length === 5, "the full-form pin re-stamps every turn (#6785: the pin runs on watermark-hit turns too) — the ECHO is the decision, not the pin");
     } finally {
-        closeStore(store, dir);
+        closeStore(store, dir, db);
     }
 });
 
@@ -231,7 +238,7 @@ test("B: an egress-on session runs a STATELESS stage-0 — no l1 row ever, acros
         assert.equal(L1_COUNT(vd(), sid), 1, "still just the dormant turn-1 row");
         assert.equal(store.egressOpLogStore()!.snapR3Latched(sid), false, "not latched");
     } finally {
-        closeStore(store, dir);
+        closeStore(store, dir, db);
     }
 });
 
@@ -292,7 +299,7 @@ test("C: after a REAL kernel fold the position frontier is MAX(log_seq), not the
         assert.equal(d.decision.window.maxPos, 82, "maxPos = 82 (the base highWater) — NOT 0 (raw MAX(log_seq) post-compaction) and NOT 50 (the live count)");
         runStage0({ sessionId: sid, msgs: tail.map(bm), incomingMsgIds: tail, pluginMode: true, convBound: true, ...STAGE0_BASE });
     } finally {
-        closeStore(store, dir);
+        closeStore(store, dir, db);
     }
 });
 
@@ -335,7 +342,7 @@ test("D: the R3 latch lands on the sessions row, survives a restart, and the cle
         assert.equal(store.snapR3LatchClear(sid), sid, "one clear reports the release (returns the sid — the sessions carrier was latched)");
         assert.equal(store.snapR3Latched(sid), false, "the session is fully unlatched");
     } finally {
-        closeStore(store, dir);
+        closeStore(store, dir, db);
     }
 });
 
@@ -363,7 +370,7 @@ test("F: double-latched migration state — one clear releases BOTH carriers (re
         assert.equal(store.snapR3Latched(sid), false, "the legacy READ-FALLBACK did not re-latch the session");
         assert.equal((vd().prepare("SELECT r3_latched_at FROM l1_world WHERE sess_raw = ?").get(sid) as { r3_latched_at: number | null }).r3_latched_at, null, "the l1 carrier was cleared too");
     } finally {
-        closeStore(store, dir);
+        closeStore(store, dir, db);
     }
 });
 
@@ -416,6 +423,6 @@ test("E: GC and manual archive — the idle egress-on session with a recent op l
         const ok = store.unifiedArchiveSession(mSid);
         assert.ok(ok?.ok, "manual archive proceeds for the legacy session");
     } finally {
-        closeStore(store, dir);
+        closeStore(store, dir, db);
     }
 });
