@@ -520,10 +520,11 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         // #7577 second leg: the egress BLOCK LEDGER rows ride the fork too —
         // written on the parent's egress record path (the unified ingest is
         // frozen for egress-on sessions), copied by the R-B four-table fork.
-        const p7Ledger = await rawBlockRows(h.dir, "p7", "egress_block_flow");
-        console.error("DBG T7 p7 ledger:", JSON.stringify(p7Ledger.map((r) => ({ t: (r as any).row_type, b: (r as any).block_id, seq: (r as any).op_seq, fseq: (r as any).flow_op_seq, pl: (r as any).payload })), "state blocks:", JSON.stringify(peekSession("p7")!.state.blocks.map((b) => ({ id: b.blockId, active: b.active, eids: b.effectiveMessageIds }))), "log tail:", logs.filter((l) => l.includes("block ledger")).slice(-3));
-        assert(p7Ledger.some((r) => (r as { row_type: string; block_id: string }).row_type === "I" && (r as { block_id: string }).block_id === "b1"), "the parent's block ledger carries the b1 I row");
-        // The KERNEL block set rides the fork: same blocks, same payloads.
+        // The block ledger rows land on the session's NEXT egress turn
+        // (ledgerEgressBooks runs inside recordEgressTurn) - the /tool call
+        // itself is not a turn, so at fork time the parent's ledger is still
+        // empty and the fork copies it verbatim (asserted after the fork).
+        const p7LedgerAtFork = await rawBlockRows(h.dir, "p7", "egress_block_flow");
 
         // Fork the folded state (client transcript still the 5 raw cells —
         // the host folds on its next turn).
@@ -536,9 +537,15 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         assert.equal(status, 201, JSON.stringify(body));
         assert.deepEqual((body.inheritedBlocks as Array<{ id: string }>).map((b) => b.id), ["b1"], "the folded block is inherited wholesale (its covered cells are all inside the prefix)");
         // The ledger tables are copied verbatim by the four-table fork (T1's
-        // message-flow twin, for blocks).
-        const c7Ledger = await rawBlockRows(h.dir, "c7", "egress_block_flow");
-        assert.deepEqual(c7Ledger, p7Ledger, "child egress_block_flow = parent's at fork time, row for row");
+        // message-flow twin, for blocks) - both sides empty at fork time.
+        // The child's ledger self-heals at clone time: the clone ingest's
+        // block diff (unified leg, runs for the fresh child even though the
+        // egress-on legs are frozen for live turns) records the inherited
+        // kernel block set into the child's ledger.
+        const c7Ledger = (await rawBlockRows(h.dir, "c7", "egress_block_flow")) as Array<{ row_type: string; block_id: string }>;
+        assert.equal(c7Ledger.length, 1, "child ledger holds exactly the inherited block at clone time");
+        assert.equal(c7Ledger[0]!.row_type, "I");
+        assert.equal(c7Ledger[0]!.block_id, "b1");
         // The KERNEL block set rides the fork: same blocks, same payloads.
         const p7KernelBlocks = JSON.stringify(peekSession("p7")!.state.blocks);
         const c7 = peekSession("c7")!;
@@ -559,6 +566,11 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         const p7Live = new Set(p7AfterFold.map((r) => r.msgid));
         for (const gone of ["p7-id-1", "p7-id-2", "p7-id-3"]) assert(!p7Live.has(gone), `parent covered cell ${gone} retired by its own fold`);
         assert(p7Live.has("p7-fold-0") && p7Live.has("p7-new-0") && p7Live.has("p7-id-0") && p7Live.has("p7-id-4"), "head/fold/tail/new cells all live in the parent flow");
+        // The parent's fold turn (its first egress turn since the /tool call
+        // created b1) booked b1 into the PARENT's ledger - and only there.
+        const p7LedgerAfterFold = (await rawBlockRows(h.dir, "p7", "egress_block_flow")) as Array<{ row_type: string; block_id: string }>;
+        assert(p7LedgerAfterFold.some((r) => r.row_type === "I" && r.block_id === "b1"), "the parent's fold turn books b1 into its block ledger");
+        assert.deepEqual(await rawBlockRows(h.dir, "c7", "egress_block_flow"), c7Ledger, "the child ledger is untouched by the parent's fold");
         const c7WatermarkAtFork = Math.max(...c7BeforeFold.map((r) => r.num));
         const p7FoldNum = p7AfterFold.find((r) => r.msgid === "p7-fold-0")?.num;
         assert(p7FoldNum !== undefined && p7FoldNum > c7WatermarkAtFork, `the post-fork parent summary takes a fresh number above the fork watermark (${p7FoldNum} > ${c7WatermarkAtFork})`);
@@ -586,6 +598,13 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         assert(c7NewNum !== undefined && c7NewNum > c7WatermarkAtFork, `the child's fresh cell continues above the inherited watermark (${c7NewNum} > ${c7WatermarkAtFork})`);
         assert.deepEqual(ustore.egressStateView("p7"), p7FlowBeforeChildFold, "the child's fold must not touch the parent flow");
         assert(!peekSession("p7")!.state.blocks.some((b) => b.blockId === "b2"), "the child's own block b2 never leaks into the parent's block set");
+        // ...and the ledgers match their kernel sets: the child's fold turn
+        // re-books the inherited b1 (self-heal) plus its own b2; the parent
+        // keeps exactly b1.
+        const c7LedgerFinal = (await rawBlockRows(h.dir, "c7", "egress_block_flow")) as Array<{ row_type: string; block_id: string }>;
+        const p7LedgerFinal = (await rawBlockRows(h.dir, "p7", "egress_block_flow")) as Array<{ row_type: string; block_id: string }>;
+        assert(c7LedgerFinal.some((r) => r.block_id === "b1") && c7LedgerFinal.some((r) => r.row_type === "I" && r.block_id === "b2"), "child ledger holds b1 (clone-time record, U'd to the egress-record shape) + b2 (its own fold)");
+        assert(p7LedgerFinal.some((r) => r.row_type === "I" && r.block_id === "b1") && !p7LedgerFinal.some((r) => r.block_id === "b2"), "parent ledger keeps exactly b1");
     } finally {
         await h.close(h.store);
     }
@@ -742,6 +761,87 @@ test("#7658 T9: the egress BLOCK LEDGER is written on the egress record path (th
         assert(rep.blocks.has("b1"), "replay returns b1");
         assert(typeof rep.kstate === "string" && rep.kstate.length > 0, "replay returns the sidecar");
     } finally {
+        await h.close(h.store);
+    }
+});
+
+test("T10 kstate retirement: the cold egress-on load rebuilds blocks/refs/tsStamps from the op log (PR-B)", async () => {
+    // The egress-on unified legs are FROZEN (egressProjectionFrozen): the
+    // kstate_json column never tracks the live kernel state of an armed
+    // session, so a folded egress-on session cold-loaded the legacy way
+    // comes back with an EMPTY block set (the #3573 "NO persisted blocks"
+    // shape) — a cold fork of it inherits nothing. PR-B makes the load the
+    // rebuild point: blocks from the block ledger (PR-A writes it),
+    // messageRefs/tsStamps from the message flow, residual from the sidecar.
+    const REBUILD_ENV = "BILI_ROLLOUT_EGRESS_KSTATE_REBUILD";
+    const RETIRE_ENV = "BILI_ROLLOUT_EGRESS_KSTATE_RETIRE_WRITES";
+    const savedRebuild = process.env[REBUILD_ENV];
+    const savedRetire = process.env[RETIRE_ENV];
+    process.env[REBUILD_ENV] = "1";
+    process.env[RETIRE_ENV] = "1";
+    const logs: string[] = [];
+    const h = await harness(logs);
+    try {
+        await seedParent(h.base, "p10");
+        await settle(h.store, "p10");
+        assert.equal(peekSession("p10")!.metadata.egressAuthority, true, "armed precondition");
+        const snap0 = await snapshotFull(h.origin, "p10");
+        const r2 = snap0.orderedMessages[1]!.ref!;
+        const r4 = snap0.orderedMessages[3]!.ref!;
+        const T10_SUMMARY = "T10 fold: the kstate retirement pin. " + "z".repeat(48);
+        await compressTool(h.origin, "p10", r2, r4, T10_SUMMARY);
+        await settle(h.store, "p10");
+        const foldTurn = [HISTORY[0]!, { role: "assistant" as const, content: T10_SUMMARY }, HISTORY[4]!, m("user", 6)];
+        await turn(h.base, "p10", foldTurn, ["p10-id-0", "p10-fold-0", "p10-id-4", "p10-new-0"]);
+        await settle(h.store, "p10");
+        // The fork materializes the parent's skeleton sessions row (the
+        // egress-on parent has no full unified row of its own).
+        const snapF = await snapshotFull(h.origin, "p10");
+        const fp = await postFork(h.origin, {
+            protocolVersion: 1,
+            parentConversationId: "p10",
+            childConversationId: "c10",
+            parentRevision: snapF.parentRevision,
+            branchPoint: { messageCount: snapF.orderedMessages.length, orderHash: snapF.orderHash },
+            orderedMessages: snapF.orderedMessages,
+            idempotencyKey: "fork:c10",
+        });
+        assert.equal(fp.status, 201, "the skeleton-row fork: " + JSON.stringify(fp.body));
+        await settle(h.store, "p10");
+        // PHASE 1 (PR-B ON): the cold load rebuilds the kernel state from
+        // the op log alone.
+        h.store.cancelAll();
+        const store2 = new SessionStore({ dir: h.dir + "/sessions", enabled: true, debounceMs: 15 });
+        try {
+            const cold = await store2.loadAsync("p10");
+            assert(cold !== null, "cold load finds the session");
+            const blocks = cold!.state.blocks;
+            assert.equal(blocks.length, 1, "the folded block rebuilt from the block ledger");
+            assert.equal(blocks[0]!.blockId, "b1");
+            assert.equal(blocks[0]!.summary, T10_SUMMARY, "the fold summary text rides the ledger payload");
+            assert.deepEqual(blocks[0]!.effectiveMessageIds, ["p10-id-1", "p10-id-2", "p10-id-3"], "coverage msgids self-contained");
+            const refs = (cold!.state as unknown as { messageRefs: { byRaw: Record<string, string> } }).messageRefs;
+            assert(refs.byRaw["p10-id-0"] !== undefined, "messageRefs rebuilt from the live flow rows");
+            const ts = cold!.state.tsStamps;
+            assert(ts !== undefined && Object.keys(ts).length >= 5, "tsStamps derived from the flow rows' first-observed ts");
+        } finally {
+            store2.cancelAll();
+        }
+        // PHASE 2 (PR-B OFF = legacy): the same cold load comes back with an
+        // EMPTY block set — the pinned gap PR-B closes (the column never
+        // carried the live state of an armed session).
+        process.env[REBUILD_ENV] = "0";
+        const store3 = new SessionStore({ dir: h.dir + "/sessions", enabled: true, debounceMs: 15 });
+        try {
+            const legacy = await store3.loadAsync("p10");
+            assert(legacy !== null, "legacy cold load finds the session");
+            assert.equal(legacy!.state.blocks.length, 0, "legacy: the folded block is LOST on cold load (the gap)");
+        } finally {
+            store3.cancelAll();
+        }
+    } finally {
+        if (savedRebuild === undefined) delete process.env[REBUILD_ENV]; else process.env[REBUILD_ENV] = savedRebuild;
+        if (savedRetire === undefined) delete process.env[RETIRE_ENV]; else process.env[RETIRE_ENV] = savedRetire;
         await h.close(h.store);
     }
 });
