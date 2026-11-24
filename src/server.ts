@@ -390,6 +390,10 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
         if (res.writableEnded || res.destroyed || !res.socket || res.socket.destroyed) return;
         const secs = Math.round((Date.now() - startedAt) / 1000);
         log("error", `[watchdog] ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} produced no output for ${secs}s (idle budget ${Math.round(budgetMs / 1000)}s) — closing the request so the client can fail fast instead of hanging forever`);
+        // #7661: this aborts the CLIENT's controller (requestAborts), so the
+        // dispatch catch mislabels it "client aborted mid-stream" without the tag.
+        // Bili-initiated (idle watchdog), not a client hangup.
+        setAbortOrigin(res, "bili-internal");
         requestAborts.get(res)?.abort();
         try {
             if (!res.headersSent) {
