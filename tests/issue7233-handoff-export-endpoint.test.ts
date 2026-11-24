@@ -6,10 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 
-// #7233: pin the route-level failure shapes that the unit tests cannot see.
-// Unknown ids must stay 404s (and malformed ids must not throw), so an empty
-// sessions dir is enough; 409/500 need a real handoff fixture and are covered
-// by the handler logic in admin.ts.
+// #7233: pin the route-level failure shapes that the unit tests cannot see:
+// unknown ids stay 404s (and malformed ids must not throw) with an empty
+// sessions dir, and a session whose handoff render fails is a 409. The 500
+// write-failure path needs a forced I/O error and is not covered here.
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-export-endpoint-"));
 process.env.BILI_SESSIONS_DIR = path.join(root, "sessions");
 fs.mkdirSync(process.env.BILI_SESSIONS_DIR, { recursive: true });
