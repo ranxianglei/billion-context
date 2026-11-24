@@ -115,6 +115,17 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
 - **看门狗与生命周期:** MCP 子进程每 30 s 探测一次代理。attach 模式下永远等待(绝不碰用户自己的代理);spawn 模式下代理死亡则重新拉起并把路由改写到新 origin。恢复失败时移除受管改写,让流量退回直连上游而不是打到死端口。会话结束时 ZCode 杀掉 MCP 子进程,父进程 pid 看门狗随之收掉拉起的代理;MCP 子进程退出前(SIGTERM/SIGINT/正常退出)在锁下交接:若共享 provider store 仍指向它自己的代理,优先改写到另一个存活兼容实例,没有则移除受管改写退回直连(#1623)——实例死后共享配置不留死端口。看门狗每个 tick 同时检查共享 store:若残留着其他实例的死端口(硬杀场景,上述交接没跑成——如 Windows TerminateProcess 跳过 JS handler),接管修复(优先改到存活实例,否则回退直连);只在 store 指向死端口时动手,绝不从存活实例手里抢路由。多个并发会话共享第一个拉起的代理;它消失后其余会话自动重新拉起并改路。边界:ZCode 按会话缓存 provider baseURL,上述修复只对「之后的新读取」(新会话/新查询)生效,在途会话仍会重试缓存的旧端口直到重读;要结构性规避,把 `BILLION_CONTEXT_PROXY` 钉到一个常驻代理(`bili start`)让所有会话 attach 上去(attach 模式绝不碰用户自己的代理)。
 - **已知局限:** ZCode 的反欺诈指纹(#661)作用于 `zcode.z.ai` 登录流量的 MITM 重建 body —— 原生模式不碰那个面(模型流量走 provider store,不走 GUI 代理);若你同时使用 GUI 代理/MITM 配置,请保留 `"mitm://zcode.z.ai": { "passthrough": true }` 路由。v3.14+ 构建上,coding-plan 账号的 ClientRequestSigningV4 在模型创建阶段拒绝非 HTTPS origin,且其握手路径只从 origin 派生(丢弃任何 /bili/ 前缀),因此 /bili/ 包装的 baseURL 会以 "Client signing handshake requires HTTPS." 失败(#1621)。该冲突硬编码在 ZCode 侧,原生模式把这些账号**逐条跳过** —— 记录原因、这些账号保持直连;在这些账号上请用 GUI 证书 MITM 配置获得压缩能力,直到 ZCode 发布签名修复,届时设 `BILI_ZCODE_SIGNING_FIXED=1` 即可恢复路由。默认 `route:"all"` 下只有这些账号被跳过 —— store 上其余 provider 继续路由;整体退场(路由全关)只在 `route:"plans"` 下发生,因为那里 plan 账号本身就是签名账号。pre-3.14 legacy-store 客户端不受影响。`BILLION_CONTEXT_PROXY` 已设置(attach 模式管着代理)或定义了 `BILI_PROVIDER_REWRITES` 时插件整体退场。退出开关:`BILI_NATIVE_ZCODE=0`。
 
+## WorkBuddy（腾讯桌面应用）
+
+WorkBuddy Desktop 是 Electron 应用（`@genie/workbuddy-desktop`），内嵌一个 CodeBuddy Code CLI 分支：所有 agent 会话 —— 桌面托管的 sidecar 与手动终端运行 —— 都是那个 CLI。应用用显式 env 白名单拉起 CLI，shell 里的 export 永远到不了它；但 CLI 会先从用户配置文件读 `env.CODEBUDDY_BASE_URL`（优先于 process.env）—— 这个文件就是接缝（#7456）：
+
+- **安装：** `bili plugin install workbuddy` 写 `~/.workbuddy/settings.json`（配置目录可被 `WORKBUDDY_CONFIG_DIR` / `CODEBUDDY_CONFIG_DIR` 覆盖）：把 `env.CODEBUDDY_BASE_URL` 包进常驻代理（`http://127.0.0.1:8787/bili/https://www.workbuddy.ai`），并置 `autoCompactEnabled: false`，关掉 WorkBuddy 自带自动压缩、让 bili 接管压缩（手动压缩仍可用）。外来的 `CODEBUDDY_BASE_URL` 只报告、不动；显式的 `autoCompactEnabled: true` 尊重；每次写入前把先前状态快照到 `.bili-bak`。钉死的 origin 上没有存活代理记录时，安装会响亮警告。
+- **卸载：** `bili plugin remove workbuddy` 精确移除安装写入的内容，用户自己的键不动。
+- **纯 wire 模式（无宿主工具面）。** 压缩由代理承载（`acp_summary`），与所有 OpenAI-wire 车道一致。宿主 MCP 工具面在应用自身会话里*不可能*：桌面拉起的 CLI sidecar 带 `--strict-mcp-config`，屏蔽 user/project/local MCP 作用域；而全局打 plugin-mode 头恰恰会让那些会话降级（zcode degraded 模式，#4344）。仅终端的 MCP 面可作为 v2 后续（双工具面的权衡）。
+- **保持常驻 bili 运行**（面板或 `bili start`）：配置块钉死常驻 origin —— 没有按会话引导。bili 跑在自定义端口：安装前设 `BILI_WORKBUDDY_PROXY=http://127.0.0.1:<端口>`；`BILI_WORKBUDDY_UPSTREAM=https://<relay>` 可改包自建中转而不是 `https://www.workbuddy.ai`。
+- **状态：** `bili plugin list` / `bili doctor` 的 `workbuddy` 行报告路由 origin 与自动压缩开关。
+- **已知局限：** 路由在 WorkBuddy 重启后生效（设置随 CLI 会话启动加载）。鉴权（SSO bearer + `X-User-Id`）由内嵌 CLI 添加，经 `/bili/` 转发原样透传；模型流量无 TLS 钉死或客户端签名，无需证书 MITM。应用登录/SSO 流量走浏览器，不碰 bili。
+
 ## Codex(OpenAI Codex CLI)
 
 **模型目录临时断网（#3993）。** 经 Bili 转发的带认证 `GET https://chatgpt.com/backend-api/codex/models` 请求，在网络故障或 HTTP 500/502/503/504 时可使用最近一次完整有效的目录，避免临时发现失败导致 Codex 丢失已知窗口和工具能力。私有缓存位于既有 XDG 缓存目录的 `codex-model-catalog-v1` 子目录，按完整 URL/客户端版本以及认证、账号、组织、项目的指纹隔离，不保存原始凭证；每份最多 1 MiB、最多 16 份、最长六小时。在线发现优先，离线命中不会延长有效期；有可用缓存时，网络及响应体等待上限为四秒。客户端取消、401/403、其他明确错误和无效/空目录不会转成缓存成功。冷缓存、过期或凭证变化仍需要在线发现成功。离线返回不清除上游熔断，也不代表模型推理端点可达。不修改推理载荷、压缩模式或已配置上下文上限。

@@ -20,15 +20,17 @@
 
 **写入侧。** ingest 路径批量写统一视图（稳定绝对 seq；内容哈希 id 走 `identityOfStoredContent`；边界帧 `boundaryMsgId` 随批落地）。`persist.ts` 管会话文件存盘/装载与 EPERM 告警层。内核经 StateStore 接口写压缩状态（blocks / refs / dead_refs / checkpoints）——接口由内核自带，宿主换实现。
 
-**kstate JSON 是平行的第二个真源（痛点 1）。** 存活 `CompressionState` 字段清单经 `mergeState()` 序列化（字段清单的单一事实源在 `src/state-hydration.ts`），与表并行读写——双通道。#5643 演进会把内核态序列化挪进 `snap_ckpt.meta_json`，让表成为唯一真源。
+**kstate JSON 是平行的第二个真源（痛点 1）。** 存活 `CompressionState` 字段清单经 `mergeState()` 序列化（字段清单的单一事实源在 `src/state-hydration.ts`），与表并行读写——双通道。把内核态收敛进表是后续工作（#6858 将其列为 #6785 范围外）；#5874 v2 基座（内容 CAS、messages × blocks × refs、l1_world 身份账本、egress_state/egress_flow op log——fold_journal/egress_snapshot 已在合入前退役，7439 裁定）就是那次收敛落地的目标。
 
 **读取侧。** 水合用 `mergeState()` 作为存活字段的单一事实源（表 + kstate 拼装）。出站跑折叠覆盖检查与服务端正史渲染（D-lane，#3756——任何失步回退 legacy 路径，**降级不猜**）。计费与缓存账本（`cache-ledger`、CCR 取回在 `store.ts`）、展示/导出面（`sessions-data`、`acp_status`、`export`——诚实输出 #155）读的都是同一批行。维护面是 `state-gc` / `storage-maintenance` / 孤儿 GC（`sessions.gc_*` 上的 storage GC，opt-in，dead-ref 回收）。
 
 **一致性。** 检查点帧签名 + S4 逐行校验和；判决只信链、不信内容相似。可选静态加密：AES-256-GCM（#708）+ zstd（#1080）。`src/storage/mysql.ts` 的 mysql 方言只是**测试镜像**（mysql-contract CI 车道）——生产存储永远是 SQLite。
 
+**egress 平面（KDD #23，#7398/#7439——出站会话 op log）。** `egress_state`/`egress_flow`（仅 SQLite 车道，gate `rollout.features.egressPlane`）存每个会话出站视图的稀疏 I/D/U op log；行自包含（字节随行走，不经内容 CAS）。两表均以 `(session_id, op_seq)` 为主键（append-only 行游标，恢复/截断键），I 行另带 `log_seq`——正史消息编号，永不重发。对 egress-on 会话，op log 是**唯一**正史消息权威：出站字节从它 serve，pin 通道解析它的 I 行而非 messages 账本，逐轮统一 ingest 停止（messages 降级为**惰性投影**，回滚/web 读/恢复时一次性重建），会话 JSON 信封在 bootstrap 冻结。恢复 = `recoverEgressBase`（有界 state 重放）；无健康点 ⇒ 整轮硬失败（裁定 7439-5），绝不降级到客户端字节。裁定 7439-2 把读写侧落到 blocks 表自身：`summary_bytes` 内联压缩块摘要（读端优先用它，内容 CAS 只对遗留行保留回落），`start_msgid`/`end_msgid` 在折叠时一次性对齐到流水的 msgid 坐标——只有被流水记录的会话有值，其余保持 NULL。完整梳理：[PR #6785 文档 §6](../pr-6785-unified-storage-and-flows.zh-CN.md)。
+
 ## 硬不变量（动手前先读 AGENTS.md）
 
-- 消息 id 永不复用（内核契约）；`messages.msgId` 是规范 id。
+- 消息 id 永不复用（内核契约）；`messages.msgId` 是规范 id——KDD #23 例外：egress-on 会话的正史消息权威是 op log 的 I 行（`egress_flow.msgid` + `log_seq`），messages 行是惰性投影。
 - 行序 = 身份载体；折叠 = inactive 标记，不是物理删除。
 - 升级纯加性；破坏性变化前先回滚演练。
 

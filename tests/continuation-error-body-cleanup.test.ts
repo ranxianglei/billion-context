@@ -85,6 +85,10 @@ test("a bodyless continuation response still returns null", async () => {
 });
 
 test("a 429 continuation keeps its body for model-scope classification", async () => {
+    // #6639: governor is OFF by default now — this pin verifies the ENABLED
+    // path, so opt in explicitly (restored in finally).
+    const previousToggle = process.env.BILI_THROTTLE_429;
+    process.env.BILI_THROTTLE_429 = "1";
     _resetUpstreamThrottleForTest();
     let canceled = 0;
     const response = new Response(new ReadableStream<Uint8Array>({
@@ -105,6 +109,8 @@ test("a 429 continuation keeps its body for model-scope classification", async (
         assert.equal(_liveUpstreamTimersForTest(), 0);
     } finally {
         _resetUpstreamThrottleForTest();
+        if (previousToggle === undefined) delete process.env.BILI_THROTTLE_429;
+        else process.env.BILI_THROTTLE_429 = previousToggle;
     }
 });
 
