@@ -19,6 +19,7 @@ import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { buildProxyFailureResponse, isExpectedFailFast, type SkippedProxyInfo } from "./upstream-fail.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
+import { subagentPromptTask } from "./session-title.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
 // (single source of truth shared with the omp/pi adapters): import from
 // "acp-kernel/wire" (kernel #215).
@@ -4584,7 +4585,15 @@ export async function preflightCompressIfNeeded(
             pendingRebuild = probe;
             const probeMsgs = probe.processedMessages.length > 0 ? probe.processedMessages : probe.originalMessages;
             const probeTextSize = estimateCoreMessages(probeMsgs) + overheadEstimate;
-            if (probeTextSize > session.stats.lastInputTokens) {
+            // #6865: never let the #5974 probe demote an active overflow-arm
+            // baseline — the arm is the evidence floor that keeps an armed
+            // session folding instead of trusting optimistic local estimates
+            // (same doctrine as the #5880 fix and relay.ts #2484
+            // armFailureShrink). Without this, the probe rewrites the armed
+            // tag to "estimate" before the #5880 guard reads it, re-opening
+            // the #5880 400-livelock on a different code path.
+            if (probeTextSize > session.stats.lastInputTokens
+                && session.stats.lastInputTokensSource !== "overflow-arm") {
                 session.stats.lastInputTokens = probeTextSize;
                 session.stats.lastInputTokensSource = "estimate";
             }
@@ -4669,7 +4678,15 @@ export async function preflightCompressIfNeeded(
         const rebuiltImageTokens = imageReserveFor(session, rebuilt.protocol, rebuilt.body, opts, upstreamUrl);
         remainingImageTokens = rebuiltImageTokens;
         reducedImageWire = result.compressedRanges > 0 && rebuiltImageTokens < imageTokens;
-        if (rebuiltTextSize > session.stats.lastInputTokens) {
+        // #6865: same guard as the #5974 probe above — the post-rebuild anchor
+        // must not demote an active overflow-arm either. The probe guard alone
+        // does not hold the arm through the turn: this anchor runs in the same
+        // preflight flow, on the same local estimate, and rewrites the armed
+        // tag to "estimate" before the #5880 guard reads it (same doctrine as
+        // relay.ts #2484 armFailureShrink — an upstream-proven ceiling must
+        // never be demoted by a local payload estimate).
+        if (rebuiltTextSize > session.stats.lastInputTokens
+            && session.stats.lastInputTokensSource !== "overflow-arm") {
             session.stats.lastInputTokens = rebuiltTextSize;
             session.stats.lastInputTokensSource = "estimate";
         }
@@ -5119,7 +5136,12 @@ export function isAutoInjectedNotification(text: string): boolean {
  *  Used so the web UI can show "Fix auth bug" instead of an opaque hash.
  *  Contextual fragments (#2118) and host-injected notifications (#2286) are
  *  skipped — if no real question has arrived yet, no title is set and
- *  derivation retries on later requests. */
+ *  derivation retries on later requests. Agent-spawned subagent sessions get
+ *  an identical machine-written dispatch prefix + the parent's task in ONE
+ *  first user message: the prefix is stripped and the task becomes the title
+ *  (a prefix-only prompt yields no title and derivation retries on later
+ *  requests); the web list additionally falls back to the first block topic
+ *  for old sessions that already persisted the boilerplate (#7590). */
 export function deriveTitle(messages: CoreMessage[]): string | undefined {
     for (const m of messages) {
         if (m.role !== "user" || m.contentType !== "text") continue;
@@ -5127,7 +5149,9 @@ export function deriveTitle(messages: CoreMessage[]): string | undefined {
         if (!raw.trim()) continue;
         if (isContextualUserFragment(raw)) continue;
         if (isAutoInjectedNotification(raw)) continue;
-        const clean = raw.replace(/\s+/g, " ").trim();
+        const task = subagentPromptTask(raw);
+        const clean = (task === undefined ? raw : task).replace(/\s+/g, " ").trim();
+        if (!clean) continue;
         return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
     }
     return undefined;

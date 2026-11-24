@@ -299,6 +299,40 @@ test("null billing prices: structured and whole-file saves reject without mutati
     }
 });
 
+test("#7263 unknown billing root field: load warns without rewriting config", (t) => {
+    resetState();
+    const raw = JSON.stringify({ port: 9876, billing: { prices: { "claude-bill": { input: 6 } }, cacheRead: 0.3 } });
+    const file = withRawConfig(t, raw);
+    setBillingOverrides({ "claude-bill": { input: 9 } });
+    const warnings: string[] = [];
+    setLogCapture((level, message) => { if (level === "warn") warnings.push(message); });
+    t.after(() => setLogCapture(null));
+
+    const options = loadOptions({});
+    assert.equal(options.port, 9876, "other config remains available");
+    assert.ok(warnings.some((message) => message.includes('ignoring invalid "billing" block')));
+    assert.equal(resolveBillingPrice("claude-bill")?.source, "registry", "invalid block cannot apply or retain overrides");
+    assert.equal(readFileSync(file, "utf8"), raw, "load preserves the complete invalid config file");
+});
+
+test("#7263 unknown billing root field: both save paths preserve config and active prices", async (t) => {
+    resetState();
+    const raw = JSON.stringify({ billing: { prices: { "claude-bill": { input: 9 } } } });
+    const file = withRawConfig(t, raw);
+    loadOptions({});
+
+    for (const prices of [{}, { "claude-bill": { input: 6 } }]) {
+        const billing = { prices, cacheRead: 0.3 };
+        for (const body of [{ billing }, { file: JSON.stringify({ billing }) }]) {
+            const result = await putConfig(body);
+            assert.equal(result.status, 400);
+            assert.match(String(result.payload.error), /invalid billing settings/);
+            assert.equal(readFileSync(file, "utf8"), raw, "rejection preserves the complete config file");
+            assert.equal(resolveBillingPrice("claude-bill")?.input, 9, "rejection preserves active overrides");
+        }
+    }
+});
+
 test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview totals aggregate USD", async () => {
     resetState();
     const priced = getSession("web-money-1", { protocol: "anthropic", upstreamOrigin: "http://api.somehost.com" });

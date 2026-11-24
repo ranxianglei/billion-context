@@ -44,7 +44,7 @@ const MODEL = "gpt-test";
 const MAIN_SYSTEM = "You are DeepSeek Harness, the main coding agent.";
 const CATALOG_V1 = `\x3csystem-reminder\x3e\nThe following skills are available in this workspace.\n\x3cavailable_skills\x3e\n- name: git-helper\n  description: commit conventions and rebase safety\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e`;
 const CATALOG_V2 = `\x3csystem-reminder\x3e\nThe following skills are available in this workspace.\n\x3cavailable_skills\x3e\n- name: doc-writer\n  description: draft documentation from merged PRs\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e`;
-const AGENTS_MD = "Instructions from: AGENTS.md\nrepo policy: always run tests before pushing (marker X7Q).";
+const AGENTS_MD = "\x3csystem-reminder\x3e\nInstructions from: AGENTS.md\nrepo policy: always run tests before pushing (marker X7Q).\n\x3c/system-reminder\x3e";
 
 function filler(tag: string): string {
     return `${tag}-` + "z".repeat(900);
