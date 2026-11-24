@@ -492,7 +492,10 @@ test("HTTP dsh-lane durable guards keep plain-text snapshots, forks and revision
     try {
         const history = [
             { role: "user", content: "Synthetic snapshot test" },
-            { role: "user", content: `Instructions from: /repo/AGENTS.md\n# repo rules\nbehave` },
+            // #7153: the carrier must look like what dsh-agent-instructions emits —
+            // the label inside the complete \x3csystem-reminder\x3e frame (a bare label is
+            // ordinary history now, so it would no longer be pinned).
+            { role: "user", content: `\x3csystem-reminder\x3e\nInstructions from: /repo/AGENTS.md\n# repo rules\nbehave\n\x3c/system-reminder\x3e` },
             { role: "assistant", content: "Starting" },
             ...Array.from({ length: 4 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `tail ${i}` })),
         ];

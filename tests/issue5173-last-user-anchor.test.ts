@@ -76,7 +76,7 @@ describe("#5173 registry wiring", () => {
     test("all twelve dsh families resolve in BOTH the slot-exclusion and drift-accounting registries", () => {
         const samples: Array<[string, string]> = [
             ["\x3csystem-reminder\x3e \x3cavailable_skills\x3e updated catalog \x3c/available_skills\x3e", "durable/skill-catalog"],
-            ["Instructions from: /home/x/.dsh/AGENTS.md", "durable/agents-md"],
+            ["\x3csystem-reminder\x3e\nInstructions from: /home/x/.dsh/AGENTS.md\n\x3c/system-reminder\x3e", "durable/agents-md"],
             ["Current runtime context. This snapshot supersedes earlier runtime-context snapshots.", "durable/runtime-context"],
             ["\x3cmcp_catalog\x3e registered servers \x3c/mcp_catalog\x3e", "durable/mcp-catalog"],
             ["Time sampled while preparing turn 9, step 1: 2026-11-01T00:00:00Z", "oneshot/time-context"],

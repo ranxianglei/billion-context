@@ -8,6 +8,7 @@ import { resolveAbsorbSettings } from "../compress-settings.js";
 import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
+import { isSubagentPrompt } from "../session-title.js";
 import { collectSeparatorManifest, repairResponsesAssistantOrdering, type SeparatorSlot } from "./responses-ordering.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
@@ -53,11 +54,11 @@ import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
 import { SessionStore, getStore } from "../persist.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
-import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
+import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudgeArmed, emergencyNudgeForConfig, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, egressTinyBudget, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -381,6 +382,13 @@ export async function prepareResponses(
             incomingMsgIds,
             incomingSeqs,
             pluginMode,
+            // Identity consolidation (discussions/7591): egress-on sessions
+            // carry no conversations row — the in-memory metadata field is
+            // the row's source of truth, use it instead of the store lookup.
+            // Predicate mirrors the row write verbatim (ingest.ts namespace =
+            // the pluginAgent when a non-empty string, else "proxy") so the
+            // two cannot drift apart.
+            convBound: session.metadata["egressAuthority"] === true ? (typeof session.metadata["pluginAgent"] === "string" && session.metadata["pluginAgent"] !== "") : undefined,
             log,
         });
         if (s0.pinned !== null) {
@@ -577,7 +585,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title) || isSubagentPrompt(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
@@ -595,7 +603,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
-        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange);
+        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudgeForConfig(turn.nudge, loopConfig);
         // #3482 Step 2.5: the ONE nudge gate (lane-decisions). The responses lane's
         // two DELIBERATE differences are explicit inputs: the compaction
         // trigger (#2155/#2432 — a trigger request never carries the nudge)
@@ -609,7 +617,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             breakerArmed: compressBreakerArmed(session),
             autoFoldEngaged: autoFoldEngaged(loopConfig, session),
             growthFoldingArmed: growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined, autoFoldFloor(session)),
-            modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
+            modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor, loopConfig.nudge.maxContextLimitPct)),
         });
         const caLine = recordNudgeObservation(sessionId, turn, tokenCount, config.modelContextLimit, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool));
         if (caLine) log("info", caLine);
@@ -638,7 +646,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // (trigger/prompt form) are transient, like title-gen, and are not
         // recorded nor served.
         let laneCore = processedMessages;
-        if (!isCompactionTrigger && featureEnabled("egressPlane")) {
+        // #7574: the swap (server authority) is armed by the ONE shared rule
+        // (egressAuthorityArmed — same as the OpenAI lane). Every other main
+        // turn is only recorded.
+        const egressSide = isCompactionTrigger || egressTinyBudget(parsed);
+        if (!egressSide && featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 // The single shared authority seam (egress-lane-io),
@@ -647,8 +659,9 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 // parts (the developer block is injected below and rebuilt
                 // live every turn — recording it would churn the system
                 // row). Unreadable flow → hard fail.
-                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCore, log });
-                const served = recordAuthorityTurn(st, sessionId, auth, laneCore, projection.systemParts.join("\n\n"), log);
+                const armed = egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: egressSide });
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCore, log, armed });
+                const served = recordAuthorityTurn(st, sessionId, auth, projection.systemParts.join("\n\n"), log);
                 if (served !== null) laneCore = served;
             }
         }

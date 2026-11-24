@@ -22,7 +22,7 @@ import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { historyGenerationsOf, markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
+import { blockContentSnapshot, historyGenerationsOf, markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
 import {
     archivedBlockHeader,
     archivedBlockView,
@@ -329,7 +329,7 @@ export function resolveDecompress(
     }
 
     const full = args.full === true || args.full === "true";
-    const cached = ctx.session.blockContents.get(blockId);
+    const cached = blockContentSnapshot(ctx.session.blockContents, block);
     let body: string;
     let count: number;
     if (cached) {
@@ -707,7 +707,7 @@ function resolveDerivedDecompress(
             return toolFail(`[decompress FAILED: range restore (startId/endId) of derived-parent blocks is not supported — decompress "${blockId}" without range args (#1333)]`);
         }
         const full = args.full === true || args.full === "true";
-        const cached = anc.blockContents.get(blockId);
+        const cached = blockContentSnapshot(anc.blockContents, block);
         const view = cached ? (full ? cached.full : (cached.one ?? cached.full)) : undefined;
         const body = view?.text || block.summary;
         const count = view?.count ?? 0;

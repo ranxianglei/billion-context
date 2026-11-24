@@ -1,4 +1,5 @@
 import { collectBlockContent } from "acp-kernel";
+import { blockContentSnapshot } from "./session.js";
 import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from "./compress-tool.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
@@ -6,7 +7,7 @@ import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, supersededRefRejection, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
-import { describeExternalSummaryFailure, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
+import { describeExternalSummaryFailure, externalSummaryFailureAdvice, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
 import { newExternalCallId } from "./external-summary-marker.js";
 
 // Re-exported for callers that historically imported it here; the canonical
@@ -84,7 +85,7 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
             const collected = collectBlockContent(state, block, source, { full: false }).text;
             if (collected.trim()) return collected;
             // An inline-restored block may no longer have originals in the wire view.
-            const cached = ctx.session.blockContents.get(block.blockId);
+            const cached = blockContentSnapshot(ctx.session.blockContents, block);
             return cached?.one?.text ?? cached?.full?.text ?? "";
         }).join("\n\n");
         if (!content.trim()) continue;
@@ -125,7 +126,10 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     ctx.log(`[external-summary] completed ${successful.length}/${parsed.ranges.length} range(s); ${describeExternalSummaryFailure(batch)}`);
     // #4833: the bounded attempt diagnostics (source + budgets + outcomes) ride
     // the tool result too — enums and numbers only, never payload bytes.
-    if (successful.length === 0) return compressResult(`[Compression FAILED: all configured external summary candidates failed or exceeded their budget. Nothing compressed; do not retry unchanged configuration — summaries longer than the configured cap are rejected whole, so raise compress.maxSummaryLength or request less via per-range summaryMaxChars.] [${describeExternalSummaryFailure(batch)}]`, "refused", 0);
+    // #6885: the advice follows the batch's own stop reason and attempt
+    // outcomes — the old text blamed maxSummaryLength for every failure,
+    // including budget and parse failures that knob cannot help.
+    if (successful.length === 0) return compressResult(`[Compression FAILED: all configured external summary candidates failed or exceeded their budget. Nothing compressed; do not retry unchanged configuration — ${externalSummaryFailureAdvice(batch)}] [${describeExternalSummaryFailure(batch)}]`, "refused", 0);
     const applied = applyRanges({ ...parsed, ranges: successful }, ctx);
     // Client call arguments carry only an optional hint, never the generated summary.
     // In-place refolds retain their old call id in the kernel; keep their anchor too.
