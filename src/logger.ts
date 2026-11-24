@@ -74,7 +74,7 @@ export type Logger = (level: string, msg: string) => void;
 // module boundaries without an import cycle (logger is the one leaf every
 // abort site already imports).
 export const ABORT_ORIGIN = Symbol.for("bili.abortOrigin");
-export type AbortOrigin = "client-disconnect" | "runaway-guard" | "upstream-watchdog" | "bili-internal";
+type AbortOrigin = "client-disconnect" | "runaway-guard" | "upstream-watchdog" | "bili-internal";
 
 export function setAbortOrigin(res: object, origin: AbortOrigin): void {
     Object.defineProperty(res, ABORT_ORIGIN, { value: origin, enumerable: false, writable: true });
