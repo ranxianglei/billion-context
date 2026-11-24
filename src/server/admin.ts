@@ -1816,7 +1816,7 @@ async function sendSessionReport(res: http.ServerResponse, url: string): Promise
         res.end(JSON.stringify({ error: `unknown session: ${id}` }));
         return;
     }
-    const opts = { mask: q.get("mask") !== "off", lang: q.get("lang") === "en" ? "en" : "zh-CN" };
+    const opts = { mask: q.get("mask") !== "off", lang: q.get("lang") === "en" || q.get("lang") === "ko" ? String(q.get("lang")) : "zh-CN" };
     if (q.get("format") === "svg") {
         const r = buildSessionReportSvg(detail, opts);
         res.writeHead(200, { "content-type": "application/json" });

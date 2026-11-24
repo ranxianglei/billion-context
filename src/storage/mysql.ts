@@ -138,7 +138,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     tail_json         LONGTEXT NOT NULL DEFAULT ('{}'),
     ccr_json          LONGTEXT NULL,
     last_ingested_seq BIGINT NULL,
-    orphans_json      LONGTEXT NULL
+    orphans_json      LONGTEXT NULL,
+    r3_latched_at     BIGINT NULL
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS content (
@@ -444,6 +445,21 @@ export class MysqlBackend implements StorageBackend {
                 }
                 if (!have.has("end_msgid")) {
                     await conn.query("ALTER TABLE blocks ADD COLUMN end_msgid VARCHAR(255) NULL");
+                }
+            }
+            // 身份表收拢 (discussions/7591): the R3 breaker latch moves onto
+            // the sessions row (NULL/0 = not latched, else epoch-ms). Same
+            // probe-first discipline as the blocks block above: every
+            // pre-existing table picks it up, fresh installs get it from
+            // the DDL; no version bump.
+            {
+                const [cols] = (await conn.query(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS " +
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sessions'",
+                )) as unknown as [Row[]];
+                const have = new Set(cols.map((r) => str(r.COLUMN_NAME)));
+                if (!have.has("r3_latched_at")) {
+                    await conn.query("ALTER TABLE sessions ADD COLUMN r3_latched_at BIGINT NULL");
                 }
             }
             // Stamp advances but never downgrades: a future library stamped

@@ -166,7 +166,8 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     tail_json           TEXT NOT NULL DEFAULT '{}',
     ccr_json            TEXT,
     last_ingested_seq   INTEGER,
-    orphans_json        TEXT
+    orphans_json        TEXT,
+    r3_latched_at       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS content (
@@ -480,9 +481,12 @@ CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msg
  *  block-set read replica (PK (session_id, block_id), one latest snapshot per
  *  block; compaction may physically trim it). SELF-CONTAINED BYTES (D2,
  *  ruling 7439-1): the one/full block content is inlined in the payload —
- *  zero content-CAS refs, zero hash columns. op_seq shares the SAME append
- *  clock as egress_flow (one transaction per turn writes both logs), so any
- *  op_seq aligns the message view and the block set. Probe-first, no version
+ *  zero content-CAS refs, zero hash columns. DUAL CLOCKS (owner ruling
+ *  2026-11-24): the block tables number THEMSELVES (op_seq dense within
+ *  egress_block_flow); flow_op_seq is the pointer to the flow clock (its
+ *  MAX at write time) used for cross-table alignment at point forks — the
+ *  original shared-clock design was rejected in review because it broke the
+ *  flow's density invariant on the first fold. Probe-first, no version
  *  bump (the tables never shipped, like the egress pair). */
 const EGRESS_BLOCK_DDL = `-- #7577: block lifecycle log (flow + state), self-contained bytes, kstate sidecar.
 -- Dual clocks (owner ruling 2026-11-24): the block tables number THEMSELVES
@@ -690,6 +694,18 @@ export function migrateSchema(db: {
             db.exec("ALTER TABLE ccr_entries ADD COLUMN orig_hash TEXT REFERENCES content(hash)");
         }
         db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_orig_hash ON ccr_entries(orig_hash)");
+    }
+    // 身份表收拢 (discussions/7591): the R3 breaker latch moves onto the
+    // sessions row — the l1_world row it used to latch is a dead carrier
+    // once egress-on stops writing that table. PROBE-FIRST, not version-
+    // gated (same discipline as the ccr/blocks probes above): a db whose
+    // user_version already sits at the current version still picks the
+    // column up here; a fresh db already carries it from the base DDL.
+    // NULL/0 = not latched, else the epoch-ms of the latch.
+    const sessionCols = (db.prepare("PRAGMA table_info(sessions)").all() as unknown as { name?: unknown }[])
+        .map((c) => (typeof c?.name === "string" ? c.name : ""));
+    if (sessionCols.length > 0 && !sessionCols.includes("r3_latched_at")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN r3_latched_at INTEGER");
     }
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;
