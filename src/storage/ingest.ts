@@ -499,8 +499,9 @@ function finishPlan(
     const seqById = new Map<string, number>();
     for (const e of log) if (!seqById.has(e.msgId)) seqById.set(e.msgId, e.seq);
 
+    const completedViews = completeBlockContents(session.blockContents, session.state.blocks);
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
-        const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
+        const views = completedViews.get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
         const summaryJson = JSON.stringify(full);
@@ -584,9 +585,18 @@ function finishPlan(
           })
         : [];
 
+    // #7577 D4: egress-on sessions do not persist tsStamps/tokenSnapshot/
+    // lastPassIds in the kstate column: tsStamps is derived on load from the
+    // egress view (the I rows carry the kernel raw msgid + first-observed
+    // wall-clock ts), tokenSnapshot is recomputed by the kernel's render
+    // pass, and lastPassIds self-heals after the first compress pass.
+    // Excluding them keeps the column bounded (<2KB residual sidecar).
+    const egressOn = session.metadata["egressAuthority"] === true;
+    const KSTATE_TRIM_FIELDS = new Set(["tsStamps", "tokenSnapshot", "lastPassIds"]);
     const kstateRaw: Record<string, unknown> = {};
     for (const field of MERGE_STATE_FIELDS) {
         if (TABLE_OWNED_FIELDS.has(field)) continue;
+        if (egressOn && KSTATE_TRIM_FIELDS.has(field)) continue;
         const v = (session.state as Record<string, unknown>)[field];
         if (v !== undefined) kstateRaw[field] = v;
     }

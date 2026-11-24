@@ -42,6 +42,7 @@ test("pinned watermark-HIT turns ledger the DECLARED tail ids (#7366)", async ()
     test.after(() => rmSync(dir, { recursive: true, force: true }));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = "full";
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     const savedWm = process.env.BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK;
     const savedInc = process.env.BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL;
     process.env.BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK = "1";

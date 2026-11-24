@@ -66,7 +66,7 @@ test("#6770: the argument-less default reads the live record the overlay writes"
                 { name: "@deepseek-ai/dsh-command-compact" },
             ],
         };
-        mw({ entry: { options: { name: "preset-dsh-go-companion" } } }, () => cfg);
+        mw.call(null, { entry: { options: { name: "preset-dsh-go-companion" } } }, () => cfg);  // #7112: fiber rides the first arg, not `this`
         assert.equal(compactionCoverageText(), "1 preset entry rewritten (preset-dsh-go-companion\u00d72)");
     } finally {
         _resetDshCompactionVerdictForTest();

@@ -6,6 +6,7 @@ process.env.NODE_ENV = "test";
 import { defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { settleUsageReport } from "../src/cache-ledger.ts";
+import { CALIBRATION_PROVENANCE_TEXT_ONLY } from "../src/util.ts";
 import { applyCompressSettings, resolveCompress } from "../src/compress-settings.ts";
 import { findRoute, parseCalibrationPolicy, parseCompressSettings, parseRouteEntry, type ProviderRoutes } from "../src/config.ts";
 
@@ -134,6 +135,11 @@ test("#3211 A: explicit max below the publication floor is honored (user intent 
 
 test("#3211 A: policy {disabled:true} suppresses publication but keeps the ring", () => {
     const s = makeSession();
+    // A previously published text-only factor must clear with the rest of
+    // its stamps when the route opts out (#5952).
+    s.stats.calibratedEstimate = 0.5;
+    s.stats.calibratedEstimateOrigin = ORIGIN;
+    s.stats.calibratedEstimateProvenance = CALIBRATION_PROVENANCE_TEXT_ONLY;
     stampPolicy(s, { disabled: true }, ORIGIN);
     pair(s, 10000, ORIGIN, 18600);
     stampPolicy(s, { disabled: true }, ORIGIN);
@@ -141,6 +147,7 @@ test("#3211 A: policy {disabled:true} suppresses publication but keeps the ring"
     assert.equal(s.stats.calibratedEstimate, undefined, "no factor may be applied on this route");
     assert.equal(s.stats.calibratedEstimateOrigin, undefined);
     assert.equal(s.stats.calibratedEstimateModel, undefined, "provenance stamp clears with the factor");
+    assert.equal(s.stats.calibratedEstimateProvenance, undefined, "text-only provenance clears with the factor");
     const ring = s.stats.calibrationRing;
     assert.ok(ring && ring.values.length === 2, "raw ring stays auditable");
 });

@@ -2,7 +2,7 @@ import { MESSAGES } from "./i18n.js";
 
 // Dependency-free, DOM-free builders so they run in both the proxy (/__bili/session-report)
 // and unit tests; title/label (user PII) masked by default, upstream host + metrics kept.
-type Locale = "zh-CN" | "en";
+type Locale = "zh-CN" | "en" | "ko";
 
 interface ReportOpts {
     /** Mask title/label (user PII). Defaults to true. */
@@ -65,7 +65,7 @@ interface SvgReport {
 }
 
 function tr(lang: string, key: string, args?: Record<string, string | number>): string {
-    const loc: Locale = lang === "en" ? "en" : "zh-CN";
+    const loc: Locale = lang === "en" || lang === "ko" ? lang : "zh-CN";
     let s = MESSAGES[loc][key] ?? key;
     if (args) for (const [k, v] of Object.entries(args)) s = s.split("{" + k + "}").join(String(v));
     return s;
@@ -146,7 +146,7 @@ function readLedger(d: ReportData) {
 
 export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): string {
     const mask = opts.mask !== false;
-    const lang = opts.lang === "en" ? "en" : "zh-CN";
+    const lang = opts.lang === "en" || opts.lang === "ko" ? opts.lang : "zh-CN";
     const t = (k: string, a?: Record<string, string | number>) => tr(lang, k, a);
     const f = makeFmt(lang);
     const { tot, seam, st, folds, lines, seamEvents, ctxBest, win, rec } = readLedger(d);
@@ -274,7 +274,7 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
 
 export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): SvgReport {
     const mask = opts.mask !== false;
-    const lang = opts.lang === "en" ? "en" : "zh-CN";
+    const lang = opts.lang === "en" || opts.lang === "ko" ? opts.lang : "zh-CN";
     const t = (k: string, a?: Record<string, string | number>) => tr(lang, k, a);
     const f = makeFmt(lang);
     const { tot, seam, st, folds, lines, seamEvents, ctxBest, win, rec } = readLedger(d);
