@@ -51,6 +51,7 @@ import type { CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { createSession } from "../src/session.ts";
 import { recordEgressTurn } from "../src/storage/egress-record.ts";
@@ -86,7 +87,7 @@ function makeCtx(sessionId: string): Ctx {
     };
     const ctx = {
         core: createCore(),
-        config: defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages: [...MESSAGES],
         session,
         log: (_m: string) => undefined,

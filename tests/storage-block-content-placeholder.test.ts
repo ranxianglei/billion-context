@@ -26,7 +26,7 @@ const pad = (n: number): string => String(n).padStart(5, "0");
 
 function fold() {
     const core = createCore();
-    const config = applyCompressSettings(defaultConfig(200_000), 200_000, { ccr: { enabled: true, minToolTokens: 50 } }) as Config;
+    const config = applyCompressSettings(defaultConfig(200_000), 200_000, { ccr: { enabled: true, minToolTokens: 50 }, minFoldBenefitTokens: 0 }) as Config;
     const session = getSession(`ph-repro-${Math.random().toString(36).slice(2)}`);
     session.meta.protocol = "anthropic";
     session.meta.upstreamOrigin = "http://127.0.0.1:8199";

@@ -51,6 +51,7 @@ import type { CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { SessionStore, _setStoreForTest, _resetStoreForTest } from "../src/persist.ts";
 import { runStage0 } from "../src/snapshot/stage0.ts";
 import { FoundationRejectError } from "../src/snapshot/plane.ts";
@@ -88,7 +89,7 @@ function makeCtx(sessionId: string, messages: CoreMessage[] = MESSAGES): Ctx {
     };
     const ctx = {
         core: createCore(),
-        config: defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages: [...messages],
         session,
         log: (_m: string) => undefined,

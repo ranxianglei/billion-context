@@ -22,7 +22,7 @@ const pad = (n: number): string => String(n).padStart(5, "0");
 
 function fold() {
     const core = createCore();
-    const config = applyCompressSettings(defaultConfig(200_000), 200_000, { ccr: { enabled: true, minToolTokens: 50 } }) as Config;
+    const config = applyCompressSettings(defaultConfig(200_000), 200_000, { ccr: { enabled: true, minToolTokens: 50 }, minFoldBenefitTokens: 0 }) as Config;
     const session = getSession(`mig-ph-${Math.random().toString(36).slice(2)}`);
     storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
     const raw: CoreMessage[] = [];
