@@ -6,6 +6,7 @@ import {
     detectBashTimeout,
     appendTimeoutNotice,
     isBashToolResult,
+    isHostBoundedResult,
     wireToolGuardrails,
     canonicalStringify,
     repetitionFingerprint,
@@ -234,6 +235,45 @@ test("wireToolGuardrails honors an explicit smaller cap", () => {
     assert.ok(ret && typeof ret === "object" && "content" in ret && Array.isArray(ret.content));
     const t = textOf(ret.content[0]);
     assert.ok(Buffer.byteLength(t, "utf8") < 2000, "payload must be truncated to the explicit cap");
+});
+
+// --- #7638: a host-bounded read (pi caps at 50 KiB + continuation notice)
+// must NOT be re-capped — the cap strips the "Use offset=N to continue"
+// notice and a codemode read→write then loses everything past the cap ---
+
+test("isHostBoundedResult is true only for a host truncation marker with truncated=true", () => {
+    const base = { toolCallId: "r1", content: text("x") };
+    assert.equal(isHostBoundedResult({ ...base, toolName: "read", details: { truncation: { truncated: true } } }), true);
+    assert.equal(isHostBoundedResult({ ...base, toolName: "read", details: { truncation: { truncated: false } } }), false);
+    assert.equal(isHostBoundedResult({ ...base, toolName: "read", details: { truncation: {} } }), false);
+    assert.equal(isHostBoundedResult({ ...base, toolName: "read", details: {} }), false);
+    assert.equal(isHostBoundedResult({ ...base, toolName: "read" }), false);
+    assert.equal(isHostBoundedResult({ ...base, toolName: "bash", details: { fullOutputPath: "/tmp/x" } }), false);
+});
+
+test("wireToolGuardrails does NOT re-cap a host-bounded read result (pi's continuation notice survives, #7638)", () => {
+    const onResult = wireFor();
+    const notice = "\n\n[Showing lines 1-1234 of 5000 (50.0KB limit). Use offset=1235 to continue.]";
+    const body = "line\n".repeat(10_000) + notice; // > 50KB: a pi-truncated read
+    const ret = onResult({ toolName: "read", content: text(body), isError: false, details: { truncation: { truncated: true } } });
+    assert.equal(ret, undefined, "host-bounded read passes through uncapped — the notice is the only 'file continues' signal");
+});
+
+test("wireToolGuardrails still caps a read result the host did NOT bound (no truncation marker)", () => {
+    const onResult = wireFor();
+    const ret = onResult({ toolName: "read", content: text("x".repeat(60_000)), isError: false });
+    assert.ok(ret && typeof ret === "object" && "content" in ret && Array.isArray(ret.content));
+    const t = textOf(ret.content[0]);
+    assert.match(t, /\[ACP guardrail/);
+});
+
+test("wireToolGuardrails still caps an oversized bash result (the cap's original purpose)", () => {
+    const onResult = wireFor();
+    const ret = onResult({ toolName: "bash", content: text("x".repeat(60_000)), isError: false, details: { fullOutputPath: "/tmp/full.log" } });
+    assert.ok(ret && typeof ret === "object" && "content" in ret && Array.isArray(ret.content));
+    const t = textOf(ret.content[0]);
+    assert.match(t, /\[ACP guardrail/);
+    assert.match(t, /\/tmp\/full\.log/);
 });
 
 // --- generic tool-call repetition guard (issue #308) ---
