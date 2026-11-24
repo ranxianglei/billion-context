@@ -2805,6 +2805,9 @@ export class SessionStore {
      *  backend queue. Fire-and-forget from the save paths. */
     private async maybeCutForkBaseAsync(session: Session): Promise<void> {
         if (!this.shadow || this.shadow.stats.disabled) return;
+        // #7577 D5: egress-on sessions fork via point copy (egressPointFork),
+        // not a fork_base checkpoint — skip the checkpoint cut entirely.
+        if (session.metadata["egressAuthority"] === true) return;
         const retained = session.metadata.publicForkReceipt !== undefined
             || session.metadata.publicSnapshotRetained === true;
         if (!retained || !Array.isArray(session.pluginSnapshot) || session.pluginSnapshot.length === 0) return;
@@ -2850,6 +2853,14 @@ export class SessionStore {
             if (!view) throw new Error(`[storage] session ${sessionId} is not in the unified index (unknown, or never persisted under this mode)`);
             record = viewToRecord(view);
         }
+        // #7577 D5: egress-on sessions do not use checkpoints — the admin
+        // API does a point copy (egressPointFork) instead. Guard on the
+        // PERSISTED record's metadata (resident build or unified view, both
+        // carry it) so a stray call cannot create a checkpoint for an
+        // egress-on session whether or not it is currently loaded.
+        if (record.metadata?.["egressAuthority"] === true) {
+            throw new Error(`[storage] createReplica: session ${sessionId} is egress-on — use the point-fork path instead`);
+        }
         // CCR originals must survive the rollback the replica exists for:
         // the live content-store sidecar (not just what the unified index
         // captured) is the authoritative envelope — stamp it into the frozen
@@ -2876,6 +2887,62 @@ export class SessionStore {
         const row = await shadow.getCheckpointAsync(cpId);
         if (!row) throw new Error(`[storage] checkpoint ${cpId} missing right after insert (index inconsistency)`);
         return row;
+    }
+
+    /** #7577 D5 / review (c): egress-on sessions have no checkpoint substrate
+     *  (checkpoints are retired for them), so the admin "create replica" path
+     *  FORKS THE SESSION TO NOW instead — a full copy as of the current
+     *  flow high water (the FLOW clock is the reference clock — dual clocks,
+     *  owner ruling 2026-11-24): the four egress op-log tables (the content
+     *  authority; block rows align via their flow_op_seq pointer) plus the
+     *  unified kernel-state rows. The child is a new, loadable session; the
+     *  parent is never mutated. Forking at an EARLIER op_seq is deliberately
+     *  NOT supported: the unified kernel-state rows only exist at *now*, so a
+     *  point below the high water would pair content-at-X with
+     *  kernel-state-at-now (inconsistent). That needs the point-reconstruction
+     *  materializer — a follow-up, not this PR. */
+    async forkEgressSnapshot(sessionId: string, childId?: string): Promise<{ childId: string; opSeq: number }> {
+        await this.ready();
+        // Resident if it is actively loaded; otherwise load the persisted
+        // (idle) session — a point-fork of an egress-on session does not need
+        // the parent to be in-flight, only present.
+        const parent = peekSession(sessionId) ?? (await this.loadAsync(sessionId));
+        if (!parent) throw new Error(`[storage] forkEgressSnapshot: session ${sessionId} does not exist`);
+        if (parent.metadata["egressAuthority"] !== true) throw new Error(`[storage] forkEgressSnapshot: session ${sessionId} is not an egress-on session`);
+        const cid = childId ?? `fork-${randomUUID()}`;
+        if (peekSession(cid) !== undefined || (await this.loadAsync(cid))) throw new Error(`[storage] forkEgressSnapshot: child ${cid} already exists`);
+        // Deep-copy the mutable fields: persistForkSession mutates the child
+        // (fork-base receipt, tail fold, resident drops), so the child must
+        // not alias the parent's state/metadata/lock chain. `transient` is
+        // in-flight request state — never carried into a fork child. The
+        // contentStore is shared by design: saveContentStore snapshots it to
+        // disk under the child's id, and dropResidentContentStore reassigns
+        // the CHILD's field only (the parent keeps its own handle).
+        const child: Session = {
+            ...parent,
+            id: cid,
+            meta: structuredClone(parent.meta),
+            stats: structuredClone(parent.stats),
+            metadata: { ...parent.metadata, derivedFromSessionId: sessionId },
+            state: structuredClone(parent.state),
+            blockContents: new Map([...(parent.blockContents ?? new Map()).entries()].map(([k, v]) => [k, structuredClone(v)])),
+            lastMessages: parent.lastMessages ? structuredClone(parent.lastMessages) : undefined,
+            pluginSnapshot: parent.pluginSnapshot ? structuredClone(parent.pluginSnapshot) : undefined,
+            decompositionLog: parent.decompositionLog ? structuredClone(parent.decompositionLog) : undefined,
+            transient: undefined,
+            lockChain: undefined,
+            persisted: false,
+            inFlight: 0,
+            pendingRetrievals: [],
+        };
+        await this.persistForkSession(sessionId, child);
+        // #7577 (dual clocks, owner ruling 2026-11-24): report the FLOW high
+        // water (egress_flow's MAX) — the reference clock for point forks.
+        // Block rows align to it via their flow_op_seq pointer; the block
+        // table's own op_seq space is self-contained and not part of the
+        // watermark.
+        const opSeq = this.egressOpLogStore()?.egressStateMaxSeq(cid) ?? 0;
+        return { childId: cid, opSeq };
     }
 
     async listReplicas(sessionId?: string): Promise<CheckpointRow[]> {

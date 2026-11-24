@@ -29,12 +29,25 @@ import {
     egressStateAt,
     egressStateBaseSeq,
     egressStateRead,
+    egressStateView,
     egressFork,
     EgressStateCorruptError,
     type EgressOp,
     type EgressViewRow,
 } from "./egress-state.js";
 import { featureEnabled } from "../rollout.js";
+import {
+    diffBlockSet,
+    egressBlockAppend,
+    egressBlockCompact,
+    egressBlockReplay,
+    egressBlockView,
+    egressPointFork,
+    serializeKstateResidual,
+    serializeKstateResidualFromKstateJson,
+    type EgressBlockOp,
+    type EgressBlockSnapshot,
+} from "./egress-block.js";
 import {
     snapL1Record,
     snapR3LatchedRead,
@@ -1724,6 +1737,10 @@ export class UnifiedStore {
                     start_msgid = COALESCE(excluded.start_msgid, blocks.start_msgid),
                     end_msgid = COALESCE(excluded.end_msgid, blocks.end_msgid)`,
             );
+            // #7577: collect the transcript-resolved coordinates per block so
+            // the egress block recorder (below) can build self-contained
+            // snapshots without re-reading the egress flow view.
+            const blockCoords = new Map<string, { startSeq: number; endSeq: number; startMsgid: string | null; endMsgid: string | null }>();
             for (const b of input.blocks) {
                 if (skipIncomingBlocks) continue;
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
@@ -1747,6 +1764,7 @@ export class UnifiedStore {
                 } else {
                     [bStartMsgid, bEndMsgid] = msgidBoundsForCovered(b.payloadJson);
                 }
+                blockCoords.set(b.blockId, { startSeq: bStartSeq, endSeq: bEndSeq, startMsgid: bStartMsgid, endMsgid: bEndMsgid });
                 const incomingSummaryBytes = b.summaryBytes ?? b.summary;
                 if (ex &&
                     ex.ord === b.ord &&
@@ -1813,6 +1831,48 @@ export class UnifiedStore {
                     if (ex.one_hash !== null) {
                         if (ex.one_hash === oneHash && oneHash !== null) this.releaseContent(oneHash);
                         else this.releaseContent(ex.one_hash);
+                    }
+                }
+            }
+
+            // #7577: EGRESS BLOCK LIFECYCLE LOG — record the block set for
+            // egress-on sessions (dual clocks: the block table numbers itself;
+            // each row carries the flow watermark pointer). Snapshots are
+            // built from the incoming blocks + the transcript-resolved
+            // coordinates collected above. Gated on the egress-on latch (set
+            // by resolveEgressAuthority) AND a non-envelope save (envelope
+            // imports preserve the stored lineage — the block flow is not
+            // updated for them). A live block leaving the set emits a terminal
+            // reaped U (D6), not a DELETE + orphan_blocks copy.
+            if (!skipIncomingBlocks) {
+                let egressOn = false;
+                try {
+                    const meta = JSON.parse(s.metadataJson) as Record<string, unknown>;
+                    egressOn = meta["egressAuthority"] === true;
+                } catch { /* metadataJson parse failure → not egress-on */ }
+                if (egressOn) {
+                    const currentBlocks = new Map<string, EgressBlockSnapshot>();
+                    for (const b of input.blocks) {
+                        const coords = blockCoords.get(b.blockId);
+                        if (!coords) continue;
+                        currentBlocks.set(b.blockId, {
+                            tier: b.tier,
+                            startMsgid: coords.startMsgid,
+                            startSeq: coords.startSeq,
+                            endMsgid: coords.endMsgid,
+                            endSeq: coords.endSeq,
+                            supersedesBlockId: b.supersedesBlockId,
+                            active: b.active,
+                            reaped: false,
+                            one: b.one,
+                            full: b.summary,
+                        });
+                    }
+                    const prevBlocks = this.egressBlockView(s.sessionId);
+                    const blockOps = diffBlockSet(prevBlocks, currentBlocks);
+                    if (blockOps.length > 0) {
+                        const kstateResidual = serializeKstateResidualFromKstateJson(s.kstateJson);
+                        this.egressBlockAppendOps(s.sessionId, blockOps, kstateResidual, Date.now());
                     }
                 }
             }
@@ -2248,7 +2308,76 @@ export class UnifiedStore {
         this.db.transaction(() => {
             this.db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(sessionId);
+            // #7577: the block lifecycle log rides the same session — delete it too.
+            this.deleteEgressBlockOps(sessionId);
         });
+    }
+
+
+    /** #7577: EGRESS BLOCK LIFECYCLE LOG — the store surface over
+     *  src/storage/egress-block.ts (dual table: bounded state replica + total
+     *  flow, sharing the egress_flow op_seq clock). Corruption throws
+     *  EgressBlockCorruptError — callers degrade per the degrade ladder. */
+    egressBlockAppendOps(sessionId: string, ops: EgressBlockOp[], kstateJson: string | null, nowMs: number): number[] {
+        return egressBlockAppend(this.db, sessionId, ops, kstateJson, nowMs);
+    }
+
+    egressBlockView(sessionId: string): Map<string, EgressBlockSnapshot> {
+        return egressBlockView(this.db, sessionId);
+    }
+
+    /** Fork/rollback reconstruction of the block set at the block's OWN
+     *  op_seq x (dual clocks — this is egress_block_flow's sequence, not the
+     *  flow watermark), plus the kstate sidecar from the last row at/before
+     *  x. */
+    egressBlockReplay(sessionId: string, x: number): { blocks: Map<string, EgressBlockSnapshot>; kstate: string | null } {
+        return egressBlockReplay(this.db, sessionId, x);
+    }
+
+    egressBlockCompact(sessionId: string, blocks: Map<string, EgressBlockSnapshot>, kstateJson: string | null, nowMs: number): number {
+        return egressBlockCompact(this.db, sessionId, blocks, kstateJson, nowMs);
+    }
+
+    /** The block table's own op_seq high-water (dual clocks — diagnostic
+     *  only; the point-fork watermark is the FLOW clock, egressStateMaxSeq,
+     *  because every block row's flow_op_seq pointer <= the flow MAX). */
+    egressBlockMaxSeq(sessionId: string): number {
+        const block = this.db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_block_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
+        return Number(block.mx) || 0;
+    }
+
+    /** #7577 D5: point fork — copy the parent's egress + block op logs up to
+     *  (and including) FLOW watermark wm to the child (one transaction; the
+     *  child inherits the parent's number space). Block rows are selected by
+     *  their flow_op_seq pointer. wm = egressStateMaxSeq is the whole-copy
+     *  special case. */
+    egressPointForkSession(parentId: string, childId: string, wm: number): boolean {
+        return egressPointFork(this.db, parentId, childId, wm) > 0;
+    }
+
+    /** #7577 (b): tsStamps for an egress-on session is NOT persisted (the
+     *  write path trims it — see ingest.ts KSTATE_TRIM_FIELDS); it is DERIVED
+     *  from the live egress view, where each row's msgid IS the kernel raw
+     *  message id and ts is the first-observed wall clock. Returns null when
+     *  the session has no egress rows (egress-off) or a corrupt log. */
+    egressTsStamps(sessionId: string): Record<string, number> | null {
+        try {
+            const view = egressStateView(this.db, sessionId);
+            const out: Record<string, number> = {};
+            for (const row of view) {
+                if (row.ts !== undefined) out[row.msgid] = row.ts;
+            }
+            return Object.keys(out).length > 0 ? out : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /** Delete the session's block op-log rows (state AND flow). Runs inside
+     *  the caller's sweep transaction. */
+    deleteEgressBlockOps(sessionId: string): void {
+        this.db.prepare("DELETE FROM egress_block_state WHERE session_id = ?").run(sessionId);
+        this.db.prepare("DELETE FROM egress_block_flow WHERE session_id = ?").run(sessionId);
     }
 
 
@@ -4059,7 +4188,13 @@ export class UnifiedStore {
             // space and retired marks, nothing is re-issued across the
             // fork, and no other logic changes. No-op when the parent has
             // no egress rows (proxy-mode / egress-off sessions).
-            this.egressForkSession(parentId, childId);
+            // #7577 (dual clocks, owner ruling 2026-11-24): the watermark is
+            // the FLOW clock (egressStateMaxSeq — the flow table keeps its
+            // exclusive number pool). The point fork copies ALL FOUR tables
+            // (egress_state, egress_flow, egress_block_state, egress_block_flow):
+            // block rows align on wm via their flow_op_seq pointer, so the
+            // child inherits the parent's block set as of that flow point.
+            this.egressPointForkSession(parentId, childId, this.egressStateMaxSeq(parentId));
             this.db
                 .prepare(
                     `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)
