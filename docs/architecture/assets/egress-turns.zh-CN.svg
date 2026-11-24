@@ -55,13 +55,13 @@
 <text x="1012" y="355" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_block_flow / _state</text>
 <text x="1012" y="370" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">每轮写 = 仅新增行</text>
 <line x1="280" y1="150" x2="340" y2="155" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
-<polygon points="340,155 331,151 331,159" fill="#3a5a8a"/>
+
 <text x="308" y="143" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">证据流</text><line x1="280" y1="345" x2="340" y2="345" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
-<polygon points="340,345 331,341 331,349" fill="#3a5a8a"/>
+
 <text x="308" y="338" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">校验</text><line x1="485" y1="260" x2="485" y2="300" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
-<polygon points="485,300 476,296 476,304" fill="#3a5a8a"/><line x1="630" y1="110" x2="686" y2="110" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
-<polygon points="686,110 677,106 677,114" fill="#3a5a8a"/><text x="658" y="104" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="10.5" fill="#7a3b0f" text-anchor="end" font-weight="bold">从日志提供·字节一致</text><line x1="815" y1="160" x2="815" y2="220" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
-<polygon points="815,220 806,216 806,224" fill="#3a5a8a"/><line x1="940" y1="340" x2="1000" y2="340" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
-<polygon points="1000,340 991,336 991,344" fill="#3a5a8a"/>
+<line x1="630" y1="110" x2="686" y2="110" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="658" y="104" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="10.5" fill="#7a3b0f" text-anchor="end" font-weight="bold">从日志提供·字节一致</text><line x1="815" y1="160" x2="815" y2="220" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<line x1="940" y1="340" x2="1000" y2="340" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+
 <text x="40" y="458" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#555">egress-on 条件：egressPlane 开 ∧ pluginMode ∧ pinned ∧ !sideRequest（egress-lane-io.ts）。任何不可重建点：整轮降级 legacy，绝不部分替换。</text>
 </svg>
