@@ -17,6 +17,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { markdownToHtml } from "../src/web/markdown.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, hiddenEmptyCount, _resetDiskCacheForTest, _diskScanStatsForTest } from "../src/web/sessions-data.ts";
+import { SUBAGENT_PROMPT_PREFIX } from "../src/session-title.ts";
 import vm from "node:vm";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -1159,6 +1160,7 @@ withSessionsDir("session filters compose before paging and drive the real client
         const session = makeSession(`filter-${i}`, meta, { requests: 2, inputTokens: 10, cachedTokens: 4, contextTokens: 5 });
         if (dsh) session.metadata = { pluginAgent: "dsh" };
         if (codex) session.metadata = { clientHint: "codex" };
+        if (i < 2) session.metadata = { ...(session.metadata ?? {}), derivedFromSessionId: "filter-root" };
         await store.writeNow(session);
     }
     _setStoreForTest(new SessionStore({ enabled: false }));
@@ -1235,6 +1237,14 @@ withSessionsDir("session filters compose before paging and drive the real client
         assert.equal(history.total, 60);
         const ignoredState = await j("/__bili/sessions?state=unknown&page=1&pageSize=50");
         assert.equal(ignoredState.total, 61, "unknown state is ignored rather than filtering everything out");
+        const childrenOnly = await j("/__bili/sessions?kind=child&page=1&pageSize=50");
+        assert.equal(childrenOnly.total, 2, "child keeps only sessions with a parent");
+        assert.ok(childrenOnly.sessions.every((s) => s.parentSessionId === "filter-root"));
+        const topOnly = await j("/__bili/sessions?kind=top&page=1&pageSize=50");
+        assert.equal(topOnly.total, 59, "top excludes derived sessions");
+        assert.ok(topOnly.sessions.every((s) => s.parentSessionId === undefined));
+        const ignoredKind = await j("/__bili/sessions?kind=unknown&page=1&pageSize=50");
+        assert.equal(ignoredKind.total, 61, "unknown kind is ignored");
 
         const requests: string[] = [];
         const els = await runWebClient(base, "#/sessions", requests);
@@ -1266,6 +1276,14 @@ withSessionsDir("session filters compose before paging and drive the real client
         assert.equal(filteredUrl.searchParams.get("client"), "dsh");
         assert.equal(filteredUrl.searchParams.get("state"), "history");
 
+        els.get("ses-kind")!.value = "child";
+        els.get("ses-kind")!.dispatch("change");
+        await waitFor(() => els.get("ses-count")?.textContent === "2 / 61 sessions", "kind filter did not compose with the other filters");
+        assert.equal(new URL(requests.at(-1)!).searchParams.get("kind"), "child");
+        els.get("ses-kind")!.value = "";
+        els.get("ses-kind")!.dispatch("change");
+        await waitFor(() => els.get("ses-count")?.textContent === "20 / 61 sessions", "clearing kind did not restore the filter set");
+
         els.get("ses-search")!.value = "Dsh 1";
         els.get("ses-search")!.dispatch("input");
         await waitFor(() => els.get("ses-count")?.textContent === "11 / 61 sessions", "debounced search did not compose with filters");
@@ -1274,11 +1292,12 @@ withSessionsDir("session filters compose before paging and drive the real client
         els.get("ses-reset-filters")!.dispatch("click");
         await waitFor(() => els.get("ses-count")?.textContent === "61 sessions", "reset did not restore the unfiltered list");
         const resetUrl = new URL(requests.at(-1)!);
-        for (const key of ["q", "protocol", "client", "state"]) assert.equal(resetUrl.searchParams.has(key), false, `${key} must be cleared`);
+        for (const key of ["q", "protocol", "client", "state", "kind"]) assert.equal(resetUrl.searchParams.has(key), false, `${key} must be cleared`);
         assert.equal(els.get("ses-search")?.value, "");
         assert.equal(els.get("ses-protocol")?.value, "");
         assert.equal(els.get("ses-client")?.value, "");
         assert.equal(els.get("ses-state")?.value, "");
+        assert.equal(els.get("ses-kind")?.value, "");
     } finally {
         await close(proxy);
     }
@@ -1480,6 +1499,82 @@ withFullMode("R2.2 file-less rows: web list and detail survive a vanished legacy
     assert.equal(detail.blockDetails[0].compressedTokens, 2500);
 });
 
+withSessionsDir("subagent dispatch titles fall back to the first block topic", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const s = makeSession(
+        "subagent-title",
+        { protocol: "openai", title: SUBAGENT_PROMPT_PREFIX },
+        { requests: 3, inputTokens: 900, cachedTokens: 300, contextTokens: 600 },
+    );
+    s.state.blocks.push(mkBlock("b1", 1200, true, "JS 字幕校对 151–153"));
+    await store.writeNow(s);
+    store.closeQuietly();
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const list = await buildSessionList();
+    const row = list.find((x) => x.id === "subagent-title");
+    assert.ok(row, "subagent session is listed");
+    assert.equal(row.firstBlockHint, "JS 字幕校对 151–153");
+    assert.equal(row.title, "JS 字幕校对 151–153", "boilerplate title is replaced by the task topic");
+});
+
+withSessionsDir("subagent dispatch title fallback: a normal title is not replaced", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const s = makeSession(
+        "normal-title",
+        { protocol: "openai", title: "Fix the login bug" },
+        { requests: 3, inputTokens: 900, cachedTokens: 300, contextTokens: 600 },
+    );
+    s.state.blocks.push(mkBlock("b1", 1200, true, "JS 字幕校对 151–153"));
+    await store.writeNow(s);
+    store.closeQuietly();
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const list = await buildSessionList();
+    const row = list.find((x) => x.id === "normal-title");
+    assert.ok(row, "session is listed");
+    assert.equal(row.title, "Fix the login bug", "a real title must not be replaced by the block topic");
+});
+
+withSessionsDir("subagent dispatch title fallback: a host-provided title wins", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const s = makeSession(
+        "host-title",
+        { protocol: "openai", title: SUBAGENT_PROMPT_PREFIX, hostTitle: "JS 字幕校对" },
+        { requests: 3, inputTokens: 900, cachedTokens: 300, contextTokens: 600 },
+    );
+    s.state.blocks.push(mkBlock("b1", 1200, true, "JS 字幕校对 151–153"));
+    await store.writeNow(s);
+    store.closeQuietly();
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const list = await buildSessionList();
+    const row = list.find((x) => x.id === "host-title");
+    assert.ok(row, "session is listed");
+    assert.equal(row.title, "JS 字幕校对", "hostTitle outranks the boilerplate fallback");
+});
+
+withSessionsDir("subagent dispatch title fallback: no block topic keeps the stored title", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const s = makeSession(
+        "no-block",
+        { protocol: "openai", title: SUBAGENT_PROMPT_PREFIX },
+        { requests: 3, inputTokens: 900, cachedTokens: 300, contextTokens: 600 },
+    );
+    await store.writeNow(s);
+    store.closeQuietly();
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const list = await buildSessionList();
+    const row = list.find((x) => x.id === "no-block");
+    assert.ok(row, "session is listed");
+    assert.equal(row.title, SUBAGENT_PROMPT_PREFIX, "no hint available: keep the stored title, never blank");
+});
+
 withSessionsDir("#5796: slow-session flag fires at/above threshold and stays off below", async (dir) => {
     // SLOW_SESSION_REQUESTS_WARN = 5000 in src/web/sessions-data.ts (>= semantics).
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
@@ -1505,4 +1600,31 @@ withSessionsDir("#5796: slow-session flag fires at/above threshold and stays off
     const fastRow = list.find((s) => s.id === "fast-5796");
     assert.ok(fastRow, "below-threshold session is listed");
     assert.equal(fastRow.slowSession, undefined, "below threshold carries no flag");
+});
+
+withSessionsDir("session pages split top-level and child sessions", async () => {
+    _resetSessionsForTest();
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const parent = getSession("tree-parent", { protocol: "openai", label: "Parent" });
+    parent.stats.requests = 4;
+    parent.stats.inputTokens = 100;
+    const child = getSession("tree-child", { protocol: "openai", label: "Child" });
+    child.metadata = { derivedFromSessionId: "tree-parent" };
+    child.stats.requests = 4;
+    child.stats.inputTokens = 80;
+    const legacy = getSession("tree-legacy", { protocol: "openai", label: "Legacy child" });
+    legacy.metadata = { derivedFrom: "tree-parent" };
+    legacy.stats.requests = 4;
+    legacy.stats.inputTokens = 60;
+
+    const all = await buildSessionPage({ pageSize: 20 });
+    assert.equal(all.total, 3);
+
+    const children = await buildSessionPage({ kind: "child", pageSize: 20 });
+    assert.deepEqual(children.sessions.map((s) => s.id).sort(), ["tree-child", "tree-legacy"]);
+    assert.ok(children.sessions.every((s) => s.parentSessionId === "tree-parent"));
+
+    const top = await buildSessionPage({ kind: "top", pageSize: 20 });
+    assert.deepEqual(top.sessions.map((s) => s.id), ["tree-parent"]);
 });

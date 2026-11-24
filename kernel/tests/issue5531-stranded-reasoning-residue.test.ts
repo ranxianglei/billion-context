@@ -259,7 +259,7 @@ describe("#5531 negative: a VISIBLE call still guards its reasoning", () => {
     assert.ok(!inRange("t"));
   });
 
-  it("applyCompression still refuses the split with the canonical error", () => {
+  it("applyCompression is a no-op (not an error) when the call stays visible (#7596)", () => {
     const { core, messages, state } = freshSeeded();
     const byRaw = state.messageRefs.byRaw;
     const protectedRefs = new Set([byRaw["c"]!, byRaw["res"]!]);
@@ -270,8 +270,14 @@ describe("#5531 negative: a VISIBLE call still guards its reasoning", () => {
       protectedMessageIds: protectedRefs,
       ranges: [{ startRef: "m00002", endRef: "m00003", summary: "s".repeat(400) }],
     });
+    // The guard still holds (nothing folded, r and t never enter a block), but
+    // the doomed range is now a no-op success with a warning — not the
+    // batch-rolling split error it used to be (#7596).
     assert.equal(res.result.blocksCreated, 0);
-    assert.equal(res.result.errors.length, 1);
-    assert.match(res.result.errors[0]!, /split 1 turn/);
+    assert.deepEqual(res.result.errors, []);
+    assert.equal(res.state.blocks.length, 0);
+    assert.equal(res.result.warnings.length, 1);
+    assert.match(res.result.warnings[0]!, /folded nothing/);
+    assert.match(res.result.warnings[0]!, /withdrawn in full instead of split/);
   });
 });

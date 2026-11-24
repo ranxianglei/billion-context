@@ -183,3 +183,18 @@ export function splitKstate(
     }
     return { column, rows };
 }
+
+/**
+ * #7574 (review of #6785) — "is this value the older build's default?".
+ * A build that predates the state_fields rows loads a session WITHOUT the
+ * nine row-backed fields and writes the column back with whatever its own
+ * code put there — nothing, or an empty container. Used by the view
+ * builder to tell "the older build had nothing" (empty) from "something
+ * was added while the older build ran" (non-empty = newer than the row).
+ */
+export function isEmptyStateValue(v: unknown): boolean {
+    if (v === null || v === undefined || v === "" || v === 0 || v === false) return true;
+    if (Array.isArray(v)) return v.length === 0;
+    if (typeof v === "object") return Object.keys(v as object).length === 0;
+    return false;
+}

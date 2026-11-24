@@ -93,6 +93,14 @@ export interface UnitProjectionInput {
 export interface UnitProjectionFatal {
   kind: "zone" | "split";
   error: Error;
+  /** #7596: set only by the fresh-fold path where the integrity withdrawal
+   *  left the range with NOTHING foldable (not a merge). applySingleRange
+   *  treats this as a no-op success with a warning instead of throwing —
+   *  killing the whole batch over one doomed range made the model re-pay
+   *  full-context reads on every retry until the breaker fired. The merge
+   *  split fatals (excluded-merge / actionable split) do NOT set it and stay
+   *  hard errors. */
+  degradable?: boolean;
 }
 
 export interface UnitProjection {
@@ -496,6 +504,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
           return finish({
             fatal: {
               kind: "split",
+              degradable: true,
               error: new Error(
                 `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
               ),

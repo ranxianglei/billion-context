@@ -73,7 +73,7 @@ import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
 import { billOutputUsage } from "./billing.js";
-import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
+import { promptInputTotal, declaredInclusiveFromUsage, lastIterationContext, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 import { lookupToolUseIdSession, lookupToolWitness, recordToolUseId, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
@@ -2660,7 +2660,9 @@ export async function handlePluginTool(
 // part of the context size, but NOT a cache hit (#790).
 // declaredInclusive = #4128 upstream self-declaration (billing_usage.semantic)
 // that input_tokens already INCLUDES cache_read — set only on the anthropic lane.
-export type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number; declaredInclusive?: boolean };
+// contextTokens = the context an advisor reply's last executor call read (its
+// top-level usage sums several calls; see lastIterationContext).
+export type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number; declaredInclusive?: boolean; contextTokens?: number };
 
 function num(v: unknown): number | undefined {
     return typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -2723,6 +2725,8 @@ export function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | u
         if (creation !== undefined && creation > 0) sample.creationTokens = creation;
         const output = num(usage["output_tokens"]);
         if (output !== undefined) sample.outputTokens = output;
+        const context = lastIterationContext(usage);
+        if (context !== undefined) sample.contextTokens = context;
         // #4128: honour a billing_usage stamp carried on the delta frame too.
         const declared = declaredInclusiveFromUsage(usage);
         if (declared !== undefined) sample.declaredInclusive = declared;
@@ -2780,8 +2784,8 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const hit = reportedCached === null ? undefined : Math.round((100 * reportedCached) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
-        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
-        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, creation: typeof sample.creationTokens === "number" ? sample.creationTokens : undefined });
+        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${sample.contextTokens !== undefined ? ` context=${sample.contextTokens}` : ""}${foldNew ? " fold=new" : ""}`);
+        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, creation: typeof sample.creationTokens === "number" ? sample.creationTokens : undefined, context: sample.contextTokens });
     }
     if (sample.outputTokens !== undefined) {
         session.stats.outputTokens += sample.outputTokens;
@@ -2812,6 +2816,7 @@ export function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.creationTokens !== undefined) acc.creationTokens = sample.creationTokens;
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
     if (sample.declaredInclusive !== undefined) acc.declaredInclusive = sample.declaredInclusive;
+    if (sample.contextTokens !== undefined) acc.contextTokens = sample.contextTokens;
 }
 
 /** Terminal reasons after which the model genuinely finished its turn. A
@@ -2916,10 +2921,22 @@ export async function pipePluginChatWithStrip(
     // every count taken from bili.log.
     const who = session ? `[${session.id}] ` : "";
     const onTagDrop = (snippet: string, duringDrain?: boolean) => {
-        droppedTagInFrame = true;
         sawStrippedEcho = true;
         const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
         loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
+    // #6034 (option E): the answer ledger's markup flag is VERDICT-driven,
+    // not "any drop arms it". A complete refs-only echo unit dies whole — it
+    // leaves no interior behind, so the answer text around it must count as
+    // the answer; arming on every drop miscounted a 108-char real answer as
+    // markup after such an echo and killed a healthy turn twice (the sample
+    // in #6034). Only a session-start open (verdict pending until the span
+    // resolves) and a close that releases its prose body leave interior.
+    // Last-write-wins is safe: the filter delivers verdicts in release order
+    // within a frame (a unit's drop precedes its interior's resolution), and
+    // the frame's released text is counted only after push() returns.
+    const onTagDropVerdict = (leavesInterior: boolean) => {
+        droppedTagInFrame = leavesInterior;
     };
     // #2190: the filter released bytes that still carry echo-residue shape —
     // the leak is now observable instead of silent. Log-only; the bytes were
@@ -2956,7 +2973,7 @@ export async function pipePluginChatWithStrip(
             // openai reasoning fields — the thinking channel is NEVER
             // rewritten, only the visible text channel is.
             const signedThinking = field === "thinking" || (protocol === "openai" && (field === "reasoning_content" || field === "reasoning"));
-            s = { filter: signedThinking ? createIdentityStreamFilter() : composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
+            s = { filter: signedThinking ? createIdentityStreamFilter() : composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText, onTagDropVerdict), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
             streams.set(key, s);
         }
         return s;
@@ -3004,8 +3021,12 @@ export async function pipePluginChatWithStrip(
      *  unclosed-tag case): markup the filter declined to swallow. A turn whose
      *  only visible output is this is as dead to the host as an empty one. */
     let releasedMarkupChars = 0;
-    /** Set while a frame is being rewritten because a render tag was dropped:
-     *  the text that survives such a frame is the tag's own interior. */
+    /** VERDICT-driven (onTagDropVerdict, #6034 option E): true while the
+     *  filter has just dropped an artifact whose interior the stream still
+     *  releases — the text surviving such a frame is the tag's own interior
+     *  (markup), so the answer ledger must not count it as the answer. A
+     *  whole-dead unit (complete refs-only echo) or a content release keeps
+     *  it false and the released text stays answer. */
     let droppedTagInFrame = false;
     let finalFinishReason: string | undefined;
     // #2328 Q2/Q4: termination diagnostics — every truncation emit below
