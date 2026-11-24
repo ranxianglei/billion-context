@@ -245,8 +245,9 @@ function presetRegistryOf(ctx: CompactionDisableHost): PresetRegistry | undefine
     // rows and surfaced as "Unknown agent preset: standard". The generic
     // accessor is the supported probe; the property read stays as a fallback
     // for host stubs that expose the service without one. Every read below
-    // goes through readOrUndefined: on a cordis proxy even `ctx.get` itself
-    // throws when the fiber does not inject it.
+    // goes through readOrUndefined: on a real cordis context `ctx.get`
+    // resolves through the reflect service's mixin accessor, but a host stub
+    // (or a future cordis revision) may still refuse the read.
     const accessor = readOrUndefined(() => ctx.get);
     if (typeof accessor === "function") {
         // strict=false: a provider whose fiber is still activating is exactly
@@ -321,8 +322,9 @@ export type CompactionDisableHost = {
     // profiles that ship it; optional like every other host surface here.
     agentPresets?: PresetRegistry | undefined;
     // #7190: cordis' generic service accessor (returns undefined for a
-    // non-provided service, per dsh's own tool-subagent usage). `strict=false`
-    // also reports a service whose provider fiber is still activating.
+    // non-provided service; cordis' ReflectService.get takes the optional
+    // strict flag). `strict=false` also reports a service whose provider
+    // fiber is still activating.
     get?: (name: string, strict?: boolean) => unknown;
 };
 type MiddlewareSelf = { entry?: { options?: { name?: unknown } } | undefined };
