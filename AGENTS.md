@@ -109,7 +109,7 @@ msgid 真身只有 `messages.msg_id` 一处，`l1_world`/`fold_journal`/`egress_
 
 ### #24 — egress 平面默认全量（egressPlane 0 → 100）+ 文档收口（owner 裁定 2026-11-24） (Tier B)
 
-egress 平面完成 #7581（块生命周期/双时钟）+ #7617（身份收拢）后默认全量：`egressPlane` 代码默认 0 → 100，按仓库 GA 先例（#5469）保留 opt-out（`rollout.features.egressPlane: false` / `BILI_ROLLOUT_EGRESS_PLANE=0`），**开关删除是后续清理不在本条**。文档收口（同 PR）：新增强文档 `docs/egress-plane.md`（+zh，唯一入口：设计脉络/双时钟/身份收拢/开关依赖图与 on/off 解析序/env→配置文件→代码默认）与 `docs/deprecations.md`（+zh，退役登记表：l1 占位行、conversations、D-lane 退役触发条件、物理 DROP 批次）；`docs/architecture/storage.md` 刷新。动 egress 平面任何开关或文档前读 docs/egress-plane.md 与 deprecations.md。Full text: design-decisions.md #24.
+egress 平面文档收口（#7581 块生命周期/双时钟 + #7617 身份收拢合入后）：`egressPlane` 代码默认**保持 0**（opt-in，owner 裁定 2026-11-24；翻 100 的 GA 曾被提议、未批）——开启 = `rollout.features.egressPlane: true` / `BILI_ROLLOUT_EGRESS_PLANE=1`。新增强文档 `docs/egress-plane.md`（+zh，唯一入口：设计脉络/双时钟/身份收拢/表结构/性能/fork 回退/开关依赖图与 on/off 解析序 env→配置文件→代码默认/操作手册/图×3）与 `docs/deprecations.md`（+zh，退役登记表：l1 占位行、conversations、D-lane 退役触发条件、物理 DROP 批次）；`docs/architecture/storage.{md,zh,ja}` 刷新 + identity/storage 架构图更新。动 egress 平面任何开关或文档前读 docs/egress-plane.md 与 deprecations.md。Full text: design-decisions.md #24.
 
 ### Install-Lane & Update-Ownership Contract (#1196)
 

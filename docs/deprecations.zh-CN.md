@@ -11,8 +11,8 @@
 | `compress-at-fold-point` kernel 模式 | **早已退役** | fold = op log 里 D×n + I(摘要);kernel 不再原地截断 | —(已移除) | #7439 系列 |
 | **l1_world 占位行**(R3 latch 载体、身份游标) | **已降级**:egress-on 会话不再用载体(改用 `sessions.r3_latched_at`),stage-0 无状态(无游标) | `sessions.r3_latched_at` + op log 前沿(`MAX(op_seq)` / `egressMessageHighWater`) | 全量到 egressPlane GA + 一个稳定版本期间双载体回读零触发 → 物理 DROP 批次(先列后表) | #7617(讨论 #7591) |
 | **conversations** 宿主身份认领表 | 对 egress-on **已降级**(身份无状态化,无需认领) | flow 的服务端身份 | 与 l1_world 同批(一次 DDL 迁移) | #7617 |
-| msgid 三件套:`pluginLaneServerHistory` / `pluginMsgIdIncremental` / `pluginFullResendWatermark` | **GA**(缺省 100);条目保留作退出 | 硬编码开的行为 | 本 PR 的 egressPlane GA + 至少一个版本期间这三个条目零事故回滚 → 删注册表条目(硬编码开) | #7064 §8、#5469;GA 翻转在本 PR |
-| D-lane `snapshotRender` | **尚未 GA**(缺省 0)。服务*未 arm* 的插件会话;egress-on 轮次按构造绕过它(`snapshot-render.ts:529`) | egress op log(等每个插件会话都能 arm) | 全部满足才算:D-lane 才会对插件轮次不可达、才可退役——egressPlane 全量稳定 · 所有盖章宿主默认 pin · side 请求例外关闭。**不属于本次 GA。** | #3756 vs 讨论 #7439 |
+| msgid 三件套:`pluginLaneServerHistory` / `pluginMsgIdIncremental` / `pluginFullResendWatermark` | **GA**(缺省 100);条目保留作退出 | 硬编码开的行为 | egressPlane GA（默认翻 100，待 owner 决定）+ 至少一个版本期间这三个条目零事故回滚 → 删注册表条目(硬编码开) | #7064 §8、#5469;默认翻 100 待 owner 决定 |
+| D-lane `snapshotRender` | **尚未 GA**(缺省 0)。服务*未 arm* 的插件会话;egress-on 轮次按构造绕过它(`snapshot-render.ts:529`) | egress op log(等每个插件会话都能 arm) | 全部满足才算:D-lane 才会对插件轮次不可达、才可退役——egressPlane 全量稳定 · 所有盖章宿主默认 pin · side 请求例外关闭。**不属于本 PR。** | #3756 vs 讨论 #7439 |
 | 注册表键 `egressOpLog` / `egressServeLog` | **已退役键**(设了只告警) | `egressPlane` | 无(条目已删;告警留到市面配置文件确认干净) | #7439 系列 |
 
 ## 为什么"保留条目"是 GA 的默认形态

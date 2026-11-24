@@ -28,7 +28,7 @@ So: **the client still sends everything (inbound), but bili no longer believes i
 
 **Why compression (fold) works on top of the flow.** A fold is just ops: `D` × covered originals + `I` (the summary message — it is context, so it lives in the flow) + a `B` base in the same transaction. The summary's **block object** (lifecycle: active/superseded/reaped, coverage, the covered originals' `one`/`full` text) lives in the **block tables** — the log records "what the context is", the block tables record "what the fold did to get there". On-demand full-text retrieval (`decompress`) reads the block row, not the flow. The fold's compaction **physically deletes** the subsumed flow rows below the base (retention floor: point forks below the newest base are refused until the point-reconstruction materializer lands).
 
-## 3. Tables (SQLite, `src/storage/schema.ts`; probe-first DDL, never shipped before GA)
+## 3. Tables (SQLite, `src/storage/schema.ts`; probe-first DDL, dev-era tables)
 
 | Table | PK | Role | Key columns |
 |---|---|---|---|
@@ -73,21 +73,21 @@ The invariant that pays for all of it: **every read the serving path needs is bo
 
 | Flag | Default | Role in the egress family |
 |---|---|---|
-| `rollout.features.egressPlane` | **100 (on, GA 2026-11-24)** | THE switch. Arms the plane for eligible sessions. Opt-out: `false`/percent / `BILI_ROLLOUT_EGRESS_PLANE=0`. |
+| `rollout.features.egressPlane` | **0 (off — opt-in per owner ruling 2026-11-24; a default-100 GA flip was proposed in this series and declined)** | THE switch. Arms the plane for eligible sessions. Force on: `true`/percent / `BILI_ROLLOUT_EGRESS_PLANE=1`. |
 | `storage.unified` (full/shadow) | — | **Prerequisite.** SQLite lane only; the op log lives in the unified store. No unified store ⇒ the plane has nowhere to write and stays inert. |
-| `pluginLaneServerHistory` | 100 (GA) | The **pin**: server history + msgid identity. Without a pin, `egressAuthority` never arms — the plane silently idles. |
-| `pluginMsgIdIncremental` | 100 (GA) | Steady-state tail form of the pin channel (requires `pluginLaneServerHistory`). |
-| `pluginFullResendWatermark` | 100 (GA) | Fastpath optimization of the same family (skip re-parsing the verified identical prefix). |
+| `pluginLaneServerHistory` | 100 | The **pin**: server history + msgid identity. Without a pin, `egressAuthority` never arms — the plane silently idles. |
+| `pluginMsgIdIncremental` | 100 | Steady-state tail form of the pin channel (requires `pluginLaneServerHistory`). |
+| `pluginFullResendWatermark` | 100 | Fastpath optimization of the same family (skip re-parsing the verified identical prefix). |
 | `snapshotRender` (D-lane) | 0 | **NOT egress.** Server-render for *unarmed* plugin sessions; egress-on turns bypass it by construction (`src/server/snapshot-render.ts`: `if (deps.pluginMode) return clientMsgs`). Retirement trigger conditions: [deprecations.md](./deprecations.md). |
 | `pluginIncrementalTurns` | 0 | Not egress at all — a client opt-in wire protocol (#3248). |
 
 **Arm rule** (`src/server/egress-lane-io.ts`): `featureEnabled("egressPlane") && pluginMode && pinned && !sideRequest` — one rule for all four wire lanes; side requests (title-gen, compaction calls, tiny budgets) never touch the log.
 
-**Silent half-states are documented, not hidden**: `egressPlane` on + `pluginLaneServerHistory` off ⇒ nothing arms, nothing happens. All four msgid-family flags default to 100, so this only happens via an explicit operator opt-out. Flag removal (hardcode-on) is on the retirement register, gated on GA stability.
+**Silent half-states are documented, not hidden**: `egressPlane` on + `pluginLaneServerHistory` off ⇒ nothing arms, nothing happens. The three msgid-family flags default to 100 (their GA predates this doc), so this only happens via an explicit operator opt-out. Flag removal (hardcode-on) is on the retirement register, gated on fleet-wide egressPlane stability.
 
 ## 8. Operator runbook
 
-- **Where on/off is read (resolution order):** env `BILI_ROLLOUT_EGRESS_PLANE` (`"0"`/`"false"` = off, anything else on) → config file `$XDG_CONFIG_HOME/billion-context/billion-context.json` (default `~/.config/billion-context/billion-context.json`), key `rollout.features.egressPlane` (`true`/`false`, or `{"percent": n}`) → code default (`src/rollout.ts`): **100 (GA)**. Turning it on needs nothing else (`storage.unified` is set by the standard install).
+- **Where on/off is read (resolution order):** env `BILI_ROLLOUT_EGRESS_PLANE` (`"0"`/`"false"` = off, anything else on) → config file `$XDG_CONFIG_HOME/billion-context/billion-context.json` (default `~/.config/billion-context/billion-context.json`), key `rollout.features.egressPlane` (`true`/`false`, or `{"percent": n}`) → code default (`src/rollout.ts`): **0 (off)**. Turning it on needs nothing else beyond the flag (`storage.unified` is set by the standard install).
 - **Opt out (whole plane):** `BILI_ROLLOUT_EGRESS_PLANE=0` (env wins over config) or `"rollout": {"features": {"egressPlane": false}}`. New turns go legacy; existing rows stay (projection rebuild still reads them).
 - **Degrade (no action needed):** any unrebuildable row / corrupt point / probe failure degrades **that turn** to legacy. No healthy point at all ⇒ loud hard fail.
 - **Point fork:** `POST /__bili/replicas` — 201 point-fork / 503 non-resident / 400 below newest base. Fork-to-now copies all four tables verbatim.
@@ -104,6 +104,6 @@ The invariant that pays for all of it: **every read the serving path needs is bo
 | #7574 | op-log integrity: in-transaction seq reads, `recoverEgressBase` walk-back, concurrent-writer refusal, density invariant. |
 | [#7577](https://github.com/ranxianglei/billion-context/discussions/7577) / **#7581** (merged) | `egress_block_flow`/`egress_block_state` (**dual clocks** — the shared-clock design was rejected in review because it broke flow density on the first fold), checkpoint retirement → point fork, kstate trim. |
 | [#7591](https://github.com/ranxianglei/billion-context/discussions/7591) / **#7617** (merged) | Identity consolidation: stateless stage-0, R3 latch → `sessions`, conversations retirement for egress-on, GC/manual-archive guards. |
-| **#7659 (this PR, GA 2026-11-24)** | `egressPlane` default 0 → 100; this doc; [deprecations.md](./deprecations.md); KDD #24. Every CI run now exercises the plane fleet-wide. |
+| **#7659 (this PR, 2026-11-24)** | Docs wrap-up: this doc; [deprecations.md](./deprecations.md); KDD #24; diagrams. The egressPlane default stays **0** per the owner ruling — a GA flip was proposed and declined. |
 
-**Open follow-ups** (tracked, not blocking GA): the point-reconstruction materializer (fork below the newest base); the archive format gaining the op log; a production caller for `egressBlockCompact`/`Replay`; the physical DROP batch for the retired identity carriers; flag removal (hardcode-on) per the retirement register.
+**Open follow-ups** (tracked): the egressPlane default-100 flip when the owner says so; the point-reconstruction materializer (fork below the newest base); the archive format gaining the op log; a production caller for `egressBlockCompact`/`Replay`; the physical DROP batch for the retired identity carriers; flag removal (hardcode-on) per the retirement register.
