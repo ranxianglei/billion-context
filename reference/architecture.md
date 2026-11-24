@@ -160,6 +160,7 @@ billion-context/
 │   │   ├── engine-bootstrap.ts   #   Self-downloads pinned better-sqlite3 prebuilt when no engine exists
 │   │   ├── identity.ts           #   messages-table identity hash: strips position metadata (#4390)
 │   │   ├── egress-state.ts         #   Egress op-log outbound view: dual-table state+flow, replay, compaction, any-seq rollback (#7398)
+│   │   ├── egress-block.ts         #   Egress block op-log: dual-table block state+flow, replay, compaction, point-fork, kstate sidecar (#7577, rollout egressPlane)
 │   │   ├── egress-record.ts        #   Egress op-log RECORDING: build the outbound view rows, diff vs prev, append sparse ops, fold-triggered compaction (#7398, rollout egressPlane)
 │   │   ├── egress-serve.ts         #   Egress op-log SERVE: rebuild the outbound elements from the self-contained op-log rows (byte-identity chain, ladder recovery, whole-turn degrade) + shadow byte comparison (#7398, rollout egressPlane)
 │   │   ├── ingest.ts             #   Legacy → unified row mapping + legacy view rebuild (#2671)
