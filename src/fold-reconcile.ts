@@ -993,13 +993,29 @@ export function planReconciliation(
     plan.nextCanon = canon;
     const missing: string[] = [];
     const missingSet = new Set<string>();
+    // #6916: a tool-result id hashes toolName + text only (#3642) and
+    // duplicates take positional `_N` ordinals, so when the client rewrites an
+    // earlier duplicate (Claude Code's media eviction) a later, unfolded
+    // result inherits the covered id. Its tool_use_id betrays it: the id is
+    // missing, and its holder may be claimed only by an exact toolCallId.
+    const displaced = new Set<string>();
     for (const id of covered) {
-        // #5142: expected-rebase ids are absent BY DESIGN (host retired them)
-        // — not missing, so their permanent absence keeps the early exit
-        // reachable (near-zero steady state).
-        if (!byId.has(id) && !expectedAbsent?.has(id)) {
+        const present = byId.get(id);
+        if (present === undefined) {
+            // #5142: expected-rebase ids are absent BY DESIGN (host retired them)
+            // — not missing, so their permanent absence keeps the early exit
+            // reachable (near-zero steady state).
+            if (!expectedAbsent?.has(id)) {
+                missing.push(id);
+                missingSet.add(id);
+            }
+            continue;
+        }
+        const t = anchors[id]?.t;
+        if (t !== undefined && present.toolCallId !== undefined && present.toolCallId !== "" && present.toolCallId !== t) {
             missing.push(id);
             missingSet.add(id);
+            displaced.add(id);
         }
     }
     if (missing.length === 0) return plan;
@@ -1039,6 +1055,9 @@ export function planReconciliation(
         const id = oldOrder[i];
         if (missingSet.has(id)) missingMiddle.push(id);
     }
+    const toolMissing = missingMiddle.concat([...displaced].filter((id) => !missingMiddle.includes(id)));
+    const toolCandidates = candidates.concat(msgs.flatMap((message, pos) =>
+        message.id !== undefined && displaced.has(message.id) ? [{ id: message.id, message, pos }] : []));
 
     // Pass 0 — positional identity (#2480), order-centric since #2915. A
     // codec switch mints new ids for unchanged content, but the array COUNT
@@ -1136,16 +1155,17 @@ export function planReconciliation(
     // unclaimed candidate with the same toolCallId and role is the same
     // message with rewritten bytes. No length guard: the protocol id is
     // authoritative (clients may legitimately re-encode tool_result content).
-    if (missingMiddle.length > 0 && candidates.length > 0) {
+    if (toolMissing.length > 0 && toolCandidates.length > 0) {
         const byToolCallId = new Map<string, typeof candidates>();
-        for (const cand of candidates) {
+        for (const cand of toolCandidates) {
             const t = cand.message.toolCallId;
             if (t === undefined || t === "") continue;
             const bucket = byToolCallId.get(t);
             if (bucket === undefined) byToolCallId.set(t, [cand]);
             else bucket.push(cand);
         }
-        for (const oldId of missingMiddle) {
+        for (const oldId of toolMissing) {
+            if (plan.claims.has(oldId)) continue;
             const anchor = anchors[oldId];
             if (anchor === undefined || anchor.t === undefined || anchor.r === undefined) continue;
             const bucket = byToolCallId.get(anchor.t);
@@ -1720,7 +1740,9 @@ function rewriteBlocks(blocks: BlockLike[], claims: Map<string, string[]>): bool
                 // N→1 collapse), the old id is removed, not kept: two covered
                 // ids collapsing onto one live id is exactly the model-switch
                 // pair→merged shape (#2636).
-                const keep = replacement.filter((target) => !present.has(target));
+                // A target that is itself a claimed id (#6916: displaced
+                // duplicates hand ids along) leaves its own slot this pass.
+                const keep = replacement.filter((target) => !present.has(target) || claims.has(target));
                 const remaining = present.get(id)! - 1;
                 if (remaining === 0) present.delete(id);
                 else present.set(id, remaining);
@@ -2513,6 +2535,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             // restore the old one. Either alignment event clears the latch
             // automatically (resetFoldDriftState on the first clean pass).
             session.metadata[METADATA_EPOCH_CONFIRM] = true;
+            // #7545 follow-up: a confirmed epoch replacement is a new
+            // compression lifecycle — re-arm the preflight one-shot gate so
+            // the new epoch gets its own single attempt (an aborted attempt
+            // on the REPLACED epoch must not starve the new one). Successful
+            // folds never set this latch, so the one-shot still holds within
+            // any single epoch.
+            if (session.stats) delete session.stats.preflightRuns;
             if (opts.log !== undefined) {
                 opts.log("error", `${tag}[fold-reconcile] fold epoch confirmation required: ${realUnmatched.length} covered id(s) missing with NO anchor match and NO word evidence for ${streak} consecutive passes${span}${expectedNote} — the resent history shares nothing with the fold substrate (wholesale replacement: host-native compaction outside bili's knowledge #1729/#2193, or a brand-new conversation on the same session id). Folding is paused for this session until the histories realign (old history resent or a fresh fold on the new one starts a new epoch); bili keeps the existing snapshot — nothing is deleted (#3641)${driftTok}`);
             }
