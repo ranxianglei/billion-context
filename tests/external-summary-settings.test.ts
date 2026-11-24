@@ -156,7 +156,6 @@ test("named provider recipes parse strictly and reject plaintext credentials", (
         { baseUrl: "https://example.com", api: "openai", models: { m: {} } },
         { baseUrl: "https://example.com", api: "openai", apiKeyEnv: "K", credentialRef: "c", models: { m: {} } },
         { baseUrl: "", api: "openai", apiKeyEnv: "K", models: { m: {} } },
-        { baseUrl: "https://example.com", api: "openai-completions", apiKeyEnv: "K", models: { m: {} } },
         { baseUrl: "https://example.com", api: "openai", apiKeyEnv: "1BAD", models: { m: {} } },
         { baseUrl: "https://example.com", api: "openai", apiKeyEnv: "K", models: {} },
         { baseUrl: "https://example.com", api: "openai", apiKeyEnv: "K", models: { m: { temperature: 1 } } },
@@ -164,6 +163,19 @@ test("named provider recipes parse strictly and reject plaintext credentials", (
     ]) {
         assert.throws(() => parseNamedProviderRecipe(invalid), /.*/, JSON.stringify(invalid));
     }
+});
+
+test("suffixed provider api values from DSH are accepted as canonical aliases", () => {
+    // DSH writes "openai-completions"/"anthropic-messages" into the providers
+    // table; before aliasing, the whole recipe was skipped (catch→warn) and
+    // the provider lost its routing ("no adapter registered").
+    const openai = parseNamedProviderRecipe({ baseUrl: "https://example.com/", api: "openai-completions", apiKeyEnv: "K", models: { m: {} } });
+    assert.equal(openai.api, "openai");
+    assert.deepEqual(openai, parseNamedProviderRecipe({ baseUrl: "https://example.com/", api: "openai", apiKeyEnv: "K", models: { m: {} } }));
+    const anthropic = parseNamedProviderRecipe({ baseUrl: "https://example.com/", api: "anthropic-messages", apiKeyEnv: "K", models: { m: {} } });
+    assert.equal(anthropic.api, "anthropic");
+    assert.deepEqual(anthropic, parseNamedProviderRecipe({ baseUrl: "https://example.com/", api: "anthropic", apiKeyEnv: "K", models: { m: {} } }));
+    assert.throws(() => parseNamedProviderRecipe({ baseUrl: "https://example.com", api: "gpt-4-turbo", apiKeyEnv: "K", models: { m: {} } }));
 });
 
 test("collectNamedProviders only sees recipe-shaped named entries", () => {

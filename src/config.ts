@@ -1460,6 +1460,15 @@ export interface NamedProviderRecipe {
 
 const NAMED_PROVIDER_RECIPE_FIELDS = ["baseUrl", "api", "apiKeyEnv", "credentialRef", "models"] as const;
 
+/** DSH (and its Magpie integration) writes suffixed api values on provider
+ *  recipes ("anthropic-messages" / "openai-completions"); accept them as
+ *  aliases for the canonical wire names so the recipe is not skipped whole
+ *  (a skipped recipe drops its provider routing → "no adapter registered"). */
+const NAMED_PROVIDER_API_ALIASES: Record<string, NamedProviderRecipe["api"]> = {
+    "anthropic-messages": "anthropic",
+    "openai-completions": "openai",
+};
+
 /** Parse one named-entry recipe. THROWS on an invalid shape — the web save
  *  path surfaces it as a 400; loadNamedProviders catches and warns instead
  *  (a broken recipe disables its chain references loudly, never the proxy). */
@@ -1469,7 +1478,9 @@ export function parseNamedProviderRecipe(value: unknown): NamedProviderRecipe {
     const unknownKeys = Object.keys(obj).filter((key) => ![...NAMED_PROVIDER_RECIPE_FIELDS, "bind", "compactionOptIn"].includes(key));
     if (unknownKeys.length > 0) throw new Error(`unknown recipe fields on named provider entry [${unknownKeys.join(", ")}] — routing fields need "bind"; credentials must use apiKeyEnv/credentialRef`);
     if (typeof obj.baseUrl !== "string" || !obj.baseUrl.trim() || obj.baseUrl.length > 2048) throw new Error("recipe baseUrl must be a non-empty string");
-    if (obj.api !== "anthropic" && obj.api !== "openai" && obj.api !== "responses" && obj.api !== "google") throw new Error(`recipe api must be one of: anthropic, openai, responses, google (got ${JSON.stringify(obj.api)})`);
+    if (typeof obj.api !== "string") throw new Error(`recipe api must be one of: anthropic, openai, responses, google (got ${JSON.stringify(obj.api)})`);
+    const api = NAMED_PROVIDER_API_ALIASES[obj.api] ?? obj.api;
+    if (api !== "anthropic" && api !== "openai" && api !== "responses" && api !== "google") throw new Error(`recipe api must be one of: anthropic, openai, responses, google (got ${JSON.stringify(obj.api)})`);
     if (obj.apiKeyEnv !== undefined && (typeof obj.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(obj.apiKeyEnv))) throw new Error("recipe apiKeyEnv must be an environment variable name");
     if (obj.credentialRef !== undefined && (typeof obj.credentialRef !== "string" || !validSummaryCredentialName(obj.credentialRef))) throw new Error("recipe credentialRef must be a secret-store credential name");
     if (obj.apiKeyEnv !== undefined && obj.credentialRef !== undefined) throw new Error("recipe carries both apiKeyEnv and credentialRef — pick one");
@@ -1485,7 +1496,7 @@ export function parseNamedProviderRecipe(value: unknown): NamedProviderRecipe {
         if (knobs.stream !== undefined && typeof knobs.stream !== "boolean") throw new Error(`recipe model "${id}" stream must be a boolean`);
         models[id] = { ...(knobs.contextWindow !== undefined ? { contextWindow: knobs.contextWindow } : {}), ...(knobs.outputTokens !== undefined ? { outputTokens: knobs.outputTokens } : {}), ...(knobs.stream !== undefined ? { stream: knobs.stream } : {}) };
     }
-    return { baseUrl: obj.baseUrl.trim().replace(/\/+$/, ""), api: obj.api, ...(obj.apiKeyEnv !== undefined ? { apiKeyEnv: obj.apiKeyEnv } : {}), ...(obj.credentialRef !== undefined ? { credentialRef: obj.credentialRef } : {}), models };
+    return { baseUrl: obj.baseUrl.trim().replace(/\/+$/, ""), api, ...(obj.apiKeyEnv !== undefined ? { apiKeyEnv: obj.apiKeyEnv } : {}), ...(obj.credentialRef !== undefined ? { credentialRef: obj.credentialRef } : {}), models };
 }
 
 /** True when the entry carries recipe fields (used to re-scope the inert
