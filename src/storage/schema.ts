@@ -159,6 +159,7 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
     parent_session_id   TEXT,
     fork_point_seq      INTEGER,
+    fork_egress_watermark INTEGER,
     protocol            TEXT,
     label               TEXT,
     title               TEXT,
@@ -717,6 +718,11 @@ export function migrateSchema(db: {
         .map((c) => (typeof c?.name === "string" ? c.name : ""));
     if (sessionCols.length > 0 && !sessionCols.includes("r3_latched_at")) {
         db.exec("ALTER TABLE sessions ADD COLUMN r3_latched_at INTEGER");
+    }
+    // #7658: the egress fork point (FLOW-clock watermark the four egress
+    // tables were copied at) — probe-first, same discipline as r3_latched_at.
+    if (sessionCols.length > 0 && !sessionCols.includes("fork_egress_watermark")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN fork_egress_watermark INTEGER");
     }
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;

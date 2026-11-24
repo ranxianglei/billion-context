@@ -161,6 +161,19 @@ test("#7658 T1: fork-to-now — egress-on parent, child flow is the verbatim who
         // re-played).
         assert.deepEqual(ustore.egressStateView("c1"), parentView, "child flow must equal the parent flow verbatim");
         assert.equal(ustore.egressStateMaxSeq("c1"), ustore.egressStateMaxSeq("p1"));
+        // #7658 wiring 3: the egress fork point rides its own column — the
+        // unified fork_point_seq is NULL for an egress-on parent whose
+        // unified leg is frozen (no sessions row before the skeleton fix),
+        // so the FLOW watermark the four tables were copied at needs a
+        // carrier of its own, next to the lineage pair.
+        {
+            const { DatabaseSync } = await import("node:sqlite");
+            const raw = new DatabaseSync(`${h.dir}/sessions/index.db`, { readOnly: true });
+            const childRow = raw.prepare("SELECT parent_session_id, fork_point_seq, fork_egress_watermark FROM sessions WHERE session_id = 'c1'").get() as { parent_session_id: string | null; fork_point_seq: number | null; fork_egress_watermark: number | null };
+            raw.close();
+            assert.equal(childRow.parent_session_id, "p1", "lineage pair written on the child row");
+            assert.equal(childRow.fork_egress_watermark, ustore.egressStateMaxSeq("p1"), "fork_egress_watermark = the FLOW watermark the tables were copied at");
+        }
 
         // The child's unified projection is exactly the branch-point prefix
         // (no tail rows survive: parent egress-on sessions never ingest beyond
@@ -196,6 +209,10 @@ test("#7658 T2: mid-history fork — child's first turn converges one D-run, log
             branchPoint: { messageCount: 3, orderHash: forkOrderHashOf(prefix) }, orderedMessages: prefix, idempotencyKey: "fork:c2",
         });
         assert.equal(status, 201, JSON.stringify(body));
+        // #7658 wiring 1: the egressAuthority latch rides the fork
+        // whitelist — without it the child re-boots from client bytes on
+        // its first turn instead of being served from its own copied flow.
+        assert.equal(peekSession("c2")!.metadata.egressAuthority, true, "child inherits the egressAuthority latch");
         // Copied verbatim at fork time — tail included (the drop is the
         // child's first diff, not the copy's).
         assert.deepEqual(ustore.egressStateView("c2"), parentView);
@@ -250,12 +267,6 @@ test("#7658 T3: cold parent — restart, snapshot via reconstruction, fork still
         _setStoreForTest(store2);
         const snap = await snapshot(h.origin, "p3");
         assert.equal(snap.orderedMessages.length, 5, "cold parent snapshot serves the full 5-cell history (envelope/raw-tail reconstruction)");
-        console.error("DBG cold parent view:", store2.egressOpLogStore()!.egressStateView("p3").map((r) => `${r.msgid}#${r.num}`).join(", "));
-        console.error("DBG warm parent view:", parentView.map((r) => `${r.msgid}#${r.num}`).join(", "));
-        console.error("DBG cold parent view:", store2.egressOpLogStore()!.egressStateView("p3").map((r) => `${r.msgid}#${r.num}`).join(", "));
-        console.error("DBG warm parent view:", parentView.map((r) => `${r.msgid}#${r.num}`).join(", "));
-        console.error("DBG cold parent view:", JSON.stringify(store2.egressOpLogStore()!.egressStateView("p3").map((r) => ({ n: r.num, m: r.msgid, t: r.type }))));
-        console.error("DBG warm parent view:", JSON.stringify(parentView.map((r) => ({ n: r.num, m: r.msgid, t: r.type }))));
         const { status, body } = await postFork(h.origin, {
             protocolVersion: 2, parentConversationId: "p3", childConversationId: "c3", parentRevision: snap.parentRevision,
             branchPoint: { messageCount: 5, orderHash: snap.orderHash }, orderedMessages: snap.orderedMessages, idempotencyKey: "fork:c3",

@@ -133,6 +133,13 @@ export interface SessionRow {
     sessionId: string;
     parentSessionId?: string | null;
     forkPointSeq?: number | null;
+    /** #7658: the FLOW-clock watermark (MAX op_seq of the parent's
+     *  egress_flow at fork time) the four egress tables were copied at.
+     *  fork_point_seq carries the unified-message through-seq — NULL for
+     *  egress-on parents whose unified leg is frozen, so the egress fork
+     *  point needs its own carrier. NULL = no egress copy (egress-off or
+     *  the MySQL lane, which has no egress tables). */
+    forkEgressWatermark?: number | null;
     protocol?: string | null;
     label?: string | null;
     title?: string | null;
@@ -4231,7 +4238,7 @@ export class UnifiedStore {
     getSessionRow(sessionId: string): SessionRow | null {
         const row = this.db
             .prepare(
-                `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin, status,
+                `SELECT session_id, parent_session_id, fork_point_seq, fork_egress_watermark, protocol, label, title, host_title, namespace, origin, status,
                         created_at, updated_at, next_block_id, next_run_id,
                         meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json
                  FROM sessions WHERE session_id = ?`,
@@ -4242,6 +4249,7 @@ export class UnifiedStore {
             sessionId: row.session_id as string,
             parentSessionId: (row.parent_session_id as string | null) ?? null,
             forkPointSeq: (row.fork_point_seq as number | null) ?? null,
+            forkEgressWatermark: (row.fork_egress_watermark as number | null) ?? null,
             protocol: (row.protocol as string | null) ?? null,
             label: (row.label as string | null) ?? null,
             title: (row.title as string | null) ?? null,
@@ -4406,13 +4414,18 @@ export class UnifiedStore {
             // block rows align on wm via their flow_op_seq pointer, so the
             // child inherits the parent's block set as of that flow point.
             this.egressPointForkSession(parentId, childId, this.egressStateMaxSeq(parentId));
+            // #7658: record the egress fork point next to the (often NULL)
+            // unified fork_point_seq — the FLOW watermark the four tables
+            // were copied at. NULL when the parent has no egress rows.
+            const egressWatermark = this.egressStateMaxSeq(parentId) > 0 ? this.egressStateMaxSeq(parentId) : null;
             this.db
                 .prepare(
-                    `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)
-                     VALUES (?, ?, ?, ?, ?)
+                    `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq, fork_egress_watermark)
+                     VALUES (?, ?, ?, ?, ?, ?)
                      ON CONFLICT(session_id) DO UPDATE SET
                        parent_session_id = excluded.parent_session_id,
-                       fork_point_seq = excluded.fork_point_seq`,
+                       fork_point_seq = excluded.fork_point_seq,
+                       fork_egress_watermark = excluded.fork_egress_watermark`,
                 )
                 .run(
                     childId,
@@ -4420,6 +4433,7 @@ export class UnifiedStore {
                     Date.now(),
                     parentId,
                     throughSeq,
+                    egressWatermark,
                 );
             if (initial && !this.ingestSession(initial, undefined, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
             return true;
