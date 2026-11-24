@@ -2648,18 +2648,25 @@ export function inspectLanePresence(agent: PluginAgent): LanePresence {
         } catch {
             return laneAbsent();
         }
+        // #7643: dsh resolves bare bundle names installation-anchor-first — the
+        // DSH_HOME launcher shim ($DSH_HOME/node_modules/billion-context) shadows
+        // the profile-local copy when present, so the copy whose dsh.bundle
+        // declaration decides the lane is the shim, not the profile copy.
+        const shimRoot = path.join(resolveDshHome(process.env), "node_modules", DSH_PACKAGE);
+        const shimPresent = fs.existsSync(shimRoot);
         const profiles = dirs.flatMap((dir) => {
             const spec = dshProfileDepSpec(dir);
             const bundled = dshBundleInstalled(dir);
             if (spec === undefined && !bundled) return [];
             const copyRoot = path.join(dir, "node_modules", DSH_PACKAGE);
+            const declRoot = shimPresent ? shimRoot : copyRoot;
             return [{
                 name: path.basename(dir),
                 spec,
                 pinned: spec !== undefined && !isRegistryDepSpec(spec),
                 bundleInstalled: bundled,
                 copyVersion: bundled ? pkgVersionAt(copyRoot) : undefined,
-                bundleDeclared: bundled ? dshCopyDeclaresBundle(copyRoot) : undefined,
+                bundleDeclared: bundled ? dshCopyDeclaresBundle(declRoot) : undefined,
             }];
         });
         if (profiles.length === 0) return laneAbsent();

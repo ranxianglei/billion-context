@@ -195,13 +195,15 @@ export function dshBundleInstalled(profileDir: string): boolean {
     }
 }
 
-/** #7644: true when the profile's billion-context copy declares `dsh.bundle`
+/** #7644: true when the billion-context copy at `copyRoot` declares `dsh.bundle`
  *  in its package.json — the field dsh's boot-time bundle loader requires. A
  *  copy without it is skipped by dsh at boot ("declares no dsh.bundle"), so the
  *  lane is broken even though the dep + `dsh.profile.bundles` entry are present.
- *  Read-only. Returns false when the copy exists (readable package.json) but
- *  does not declare `dsh.bundle`; undefined when there is no readable
- *  package.json to check. */
+ *  `copyRoot` is the copy dsh actually resolves: the DSH_HOME launcher shim
+ *  ($DSH_HOME/node_modules/billion-context) when present (installation-anchor-
+ *  first, #7643), else the profile-local copy. Read-only. Returns false when
+ *  the copy exists (readable package.json) but does not declare `dsh.bundle`;
+ *  undefined when there is no readable package.json to check. */
 export function dshCopyDeclaresBundle(copyRoot: string): boolean | undefined {
     try {
         const pkg = JSON.parse(fs.readFileSync(path.join(copyRoot, "package.json"), "utf8")) as { dsh?: unknown };

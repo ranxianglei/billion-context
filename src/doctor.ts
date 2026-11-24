@@ -267,7 +267,7 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
             };
             if (row.verdict === "frozen") row.reason = "local-pin dep spec — no live update path; point it at a registry version or rebuild manually (AGENTS.md install-lane contract)";
             else if (row.verdict === "broken") row.reason = noBundleDecl
-                ? "the profile's billion-context copy declares no dsh.bundle in its package.json — dsh skips the bundle at boot (\"declares no dsh.bundle\"); reinstall a copy that declares it: 'dsh plugin --profile <name> add billion-context'"
+                ? "the billion-context copy dsh resolves declares no dsh.bundle in its package.json — dsh skips the bundle at boot (\"declares no dsh.bundle\"); reinstall a copy that declares it: 'dsh plugin --profile <name> add billion-context'"
                 : "profile depends on billion-context but the bundle copy is missing — rerun 'bili plugin install dsh'";
             const shadow = dshBundleShadowWarning({ packageName: ctx.packageName, globalInstallDir: ctx.global.installDir, globalDiskVersion: ctx.global.diskVersion, profileName: p.name, bundleInstalled: p.bundleInstalled, profileCopyVersion: p.copyVersion });
             if (shadow !== undefined) row.warnings = [...(row.warnings ?? []), shadow];

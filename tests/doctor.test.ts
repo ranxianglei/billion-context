@@ -290,6 +290,59 @@ test("#7644: runDoctor reports a dsh lane broken when the resolved copy declares
     }
 });
 
+test("#7643: inspectLanePresence dsh — a DSH_HOME shim (client-only) shadows the profile copy's dsh.bundle declaration", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-dsh-shim-"));
+    try {
+        const dshHome = path.join(base, "dsh");
+        // The DSH_HOME launcher shim: client-only, NO dsh.bundle (the #7643 case).
+        const shimCopy = path.join(dshHome, "node_modules", "billion-context");
+        mkdirSync(shimCopy, { recursive: true });
+        writeFileSync(path.join(shimCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.216", dsh: { client: { platform: "web" } } }));
+        // Profile "web": the profile copy DECLARES dsh.bundle (valid) — but the shim shadows it.
+        const webDir = path.join(dshHome, "profiles", "web");
+        const webCopy = path.join(webDir, "node_modules", "billion-context");
+        mkdirSync(webCopy, { recursive: true });
+        writeFileSync(path.join(webDir, "package.json"), JSON.stringify({ dependencies: { "billion-context": "^0.1.216" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+        writeFileSync(path.join(webCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.216", dsh: { bundle: { patch: "./dsh.bundle.patch.yml" } } }));
+        withEnv({ DSH_HOME: dshHome }, () => {
+            const p = inspectLanePresence("dsh");
+            const web = p.profiles?.find((x) => x.name === "web");
+            assert.equal(web?.bundleDeclared, false, "the DSH_HOME shim (client-only) shadows the profile copy's dsh.bundle declaration");
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
+test("#7643: runDoctor — a DSH_HOME shim (client-only) makes the dsh lane broken even when the profile copy declares dsh.bundle", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-dsh-shim-run-"));
+    const runWithFetch = mockFetch(() => new Response(JSON.stringify({ name: "billion-context", version: "999.0.0" }), { status: 200, headers: { "content-type": "application/json" } }));
+    try {
+        const dshHome = path.join(base, "dsh");
+        // The DSH_HOME launcher shim: client-only, NO dsh.bundle (the #7643 case).
+        const shimCopy = path.join(dshHome, "node_modules", "billion-context");
+        mkdirSync(shimCopy, { recursive: true });
+        writeFileSync(path.join(shimCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.216", dsh: { client: { platform: "web" } } }));
+        // Profile "web": the profile copy DECLARES dsh.bundle (valid) — but the shim shadows it.
+        const webDir = path.join(dshHome, "profiles", "web");
+        const webCopy = path.join(webDir, "node_modules", "billion-context");
+        mkdirSync(webCopy, { recursive: true });
+        writeFileSync(path.join(webDir, "package.json"), JSON.stringify({ dependencies: { "billion-context": "^0.1.216" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+        writeFileSync(path.join(webCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.216", dsh: { bundle: { patch: "./dsh.bundle.patch.yml" } } }));
+        await runWithFetch(async () => {
+            await withEnv({ ...doctorSandboxEnv(base), DSH_HOME: dshHome }, async () => {
+                const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.216" });
+                const web = report.lanes.find((l) => l.agent === "dsh:web");
+                assert.ok(web, "dsh:web lane present");
+                assert.equal(web?.verdict, "broken", "the DSH_HOME shim (client-only) makes the lane broken even when the profile copy declares dsh.bundle");
+                assert.match(web?.reason ?? "", /dsh\.bundle/, "reason must name the missing dsh.bundle declaration");
+            });
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
 test("#2850: inspectLanePresence pi: npm lane resolves the real copy root for every spec form", () => {
     const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-pi-npm-"));
     try {
