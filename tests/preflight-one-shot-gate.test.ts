@@ -10,6 +10,7 @@ import { startServer } from "../src/server.ts";
 import { type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { getSession, resetSessionCompression } from "../src/session.ts";
+import { epochConfirmPending } from "../src/fold-reconcile.ts";
 import { normalizeUpstreamOrigin } from "../src/util.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -40,6 +41,17 @@ function overWindowPayload(): Array<{ role: string; content: string }> {
         { role: "assistant", content: "A".repeat(24_000) },
         { role: "user", content: "B".repeat(24_000) },
     ];
+}
+
+// Distinct-word history of `count` messages, each ~`repeat` copies of a
+// per-message marker — the #6069 e2e shape (enough covered ids for the
+// fold-reconcile escalation, verbatim tails that stay identifiable).
+function wireHistory(tag: string, count: number, repeat: number): Array<{ role: string; content: string }> {
+    const messages: Array<{ role: string; content: string }> = [];
+    for (let i = 0; i < count; i++) {
+        messages.push({ role: i % 2 === 0 ? "user" : "assistant", content: `${tag} message ${i}. ` + `${tag}_${i}_content_`.repeat(repeat) });
+    }
+    return messages;
 }
 
 type Call = { stream: boolean; body: string };
@@ -258,6 +270,58 @@ test("one-shot gate: compression reset re-arms the one-shot fold", async () => {
         assert.equal(r.status, 200, r.body.slice(0, 300));
         assert.ok(env.calls.filter((c) => !c.stream).length >= 1, "after reset the fresh lifecycle folds again");
         assert.ok(getSession("oneshot-reset").state.blocks.length >= 1, "the re-armed attempt committed a block");
+    } finally {
+        await env.close();
+    }
+});
+
+// E (POSITIVE, the #6069 epoch exception): a session whose fold substrate was
+// wholesale replaced under the same session id gets the NEW epoch's own
+// one-shot — the old epoch's committed folds must not starve the new
+// history's first over-window turn (the merged gate regressed exactly this:
+// tests/issue6069-epoch-pause-over-window.test.ts). The paired negative proof
+// is case B2: a managed session whose substrate was NOT replaced stays
+// blocked. The final shot proves the exception is scoped to the latch window
+// — once the new fold commits and the latch clears, the one-shot holds again.
+test("one-shot gate: epoch replacement (latched) → the new epoch's over-window turn folds again", async () => {
+    const env = await startPair();
+    try {
+        // Old epoch: a large history folds (the session is now compression-managed).
+        const r1 = await post(env.proxyPort, env.upstreamPort, "oneshot-epoch", wireHistory("OLD", 24, 250));
+        assert.equal(r1.status, 200, r1.body.slice(0, 300));
+        const s = getSession("oneshot-epoch");
+        assert.ok(s.state.blocks.some((b) => b.active), "the old history is folded");
+        assert.ok((s.state.stats?.compressionCount ?? 0) > 0, "precondition: the session is compression-managed");
+
+        // Replacement: an unrelated history that fits the window, resent three
+        // times — fold-reconcile latches the epoch confirmation.
+        const replaced = wireHistory("NEW", 12, 100);
+        for (let pass = 0; pass < 3; pass++) {
+            const r = await post(env.proxyPort, env.upstreamPort, "oneshot-epoch", replaced);
+            assert.equal(r.status, 200, "a fitting history passes through while folding is paused (r.status=" + r.status + " " + r.body.slice(0, 300) + ")");
+        }
+        assert.equal(epochConfirmPending(s), true, "precondition: the epoch-confirm latch is pending");
+
+        // Grown: the new history grows past the window — the epoch exception
+        // must let the new epoch's one-shot fire. Without it, the gate blocks
+        // on the old epoch's committed count and the turn goes out unfolded.
+        const summaryCallsBefore = env.calls.filter((c) => !c.stream).length;
+        const grown = [...replaced, ...wireHistory("GROWN", 16, 250)];
+        const r2 = await post(env.proxyPort, env.upstreamPort, "oneshot-epoch", grown);
+        assert.equal(r2.status, 200, "the over-window turn is folded and forwarded, not withheld (r.status=" + r2.status + " " + r2.body.slice(0, 300) + ")");
+        assert.ok(env.calls.filter((c) => !c.stream).length > summaryCallsBefore, "the new epoch's one-shot fired: a new summarization call");
+        const forwarded = env.calls.filter((c) => c.stream).at(-1);
+        assert.ok(forwarded, "a forward happened");
+        assert.ok(forwarded.body.includes("SUMMARY: the large recent messages"), "the new summary is in the forwarded payload");
+        assert.ok(forwarded.body.includes("GROWN_15_content_"), "the newest turn stays verbatim");
+        assert.equal(epochConfirmPending(s), false, "the fresh fold starts the new epoch: the latch clears");
+
+        // The new epoch's one-shot is still ONE shot: the next over-window
+        // turn on the now-managed session is forwarded as-is.
+        const summaryCallsAfterNewEpoch = env.calls.filter((c) => !c.stream).length;
+        const r3 = await post(env.proxyPort, env.upstreamPort, "oneshot-epoch", [...grown, { role: "user", content: "Z".repeat(24_000) }]);
+        assert.equal(r3.status, 200, "the regrown payload is forwarded as-is, not withheld (r.status=" + r3.status + " " + r3.body.slice(0, 300) + ")");
+        assert.equal(env.calls.filter((c) => !c.stream).length, summaryCallsAfterNewEpoch, "the new epoch's one-shot is spent: no further proxy-side fold");
     } finally {
         await env.close();
     }

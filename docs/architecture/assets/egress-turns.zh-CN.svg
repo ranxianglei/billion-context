@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="470" viewBox="0 0 1240 470"><defs><marker id="ah" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L10,3 L0,6 z" fill="#3a5a8a"/></marker></defs>
+<rect width="1240" height="470" fill="#ffffff"/>
+<text x="40" y="36" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="16" font-weight="bold" fill="#1a2b4a">egress 平面：一轮的生命周期（入站 = 证据，出站 = op log 权威）</text>
+<rect x="40" y="70" width="240" height="170" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="52" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">① 入站（客户端 → bili）</text>
+<text x="52" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">宿主每轮全量重发对话（#2092 契约）</text>
+<text x="52" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">逐元素 msgid 信封</text>
+<text x="52" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">转发上游前全部剥除（永不上模型线）</text>
+<text x="52" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress-on：入站降级为「证据」</text>
+<text x="52" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">与日志不一致 ⇒ 整轮降级，永不写日志</text>
+<rect x="40" y="280" width="240" height="130" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="52" y="300" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">② Pin + stage-0（无状态）</text>
+<text x="52" y="320" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">pin 通道校验 msgid 信封</text>
+<text x="52" y="335" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">对 op log 存活视图（有界读）</text>
+<text x="52" y="350" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">stage-0 前沿 = MAX(op_seq)</text>
+<text x="52" y="365" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">＋最新 base 的 highWater</text>
+<text x="52" y="380" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">失配 ⇒ full 信号，下轮重锚</text>
+<rect x="340" y="70" width="290" height="190" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="352" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">③ recordEgressTurn（准备阶段）</text>
+<text x="352" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">diff 本轮视图 vs 上一轮</text>
+<text x="352" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">立即追加 I/D/U 行（不是保存时）</text>
+<text x="352" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">单事务：事务内 nextSeqs（#7574）</text>
+<text x="352" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">＋并发写守卫</text>
+<text x="352" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">折叠 ⇒ 同事务 B base</text>
+<text x="352" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">＋物理删除被覆盖行（保留底线）</text>
+<text x="352" y="200" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">摘要消息 = I 行（它是上下文）</text>
+<rect x="340" y="300" width="290" height="90" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="352" y="320" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">④ kernel（服务端权威）</text>
+<text x="352" y="340" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">kernel 输入从 flow 重放（7439-3）</text>
+<text x="352" y="355" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">折叠决策 = 下一轮 flow 操作</text>
+<text x="352" y="370" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">＋块表 I/U（生命周期 + one/full）</text>
+<rect x="690" y="70" width="250" height="90" rx="8" fill="#e8f6ec" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="702" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">⑤ 上游</text>
+<text x="702" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">回复中继，pf 头盖章</text>
+<text x="702" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">入站字节此时才转发</text>
+<rect x="690" y="220" width="250" height="170" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="702" y="240" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">⑥ 保存（每轮磁盘写只剩两块）</text>
+<text x="702" y="260" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">信封冻结（bootstrap 起仅索引）</text>
+<text x="702" y="275" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">块记录器 diff state.blocks</text>
+<text x="702" y="290" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">→ 追加块 I/U 行</text>
+<text x="702" y="305" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">每行盖 flow_op_seq</text>
+<text x="702" y="320" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">= flow.MAX(op_seq)（双时钟指针）</text>
+<text x="702" y="335" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">无逐轮统一 ingest（KDD #23）</text>
+<rect x="1000" y="70" width="200" height="190" rx="8" fill="#e8f6ec" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="1012" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">⑦ 重启 / 恢复</text>
+<text x="1012" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">重放 flow → egress_state（有界）</text>
+<text x="1012" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">tsStamps/token 统计从重放推导</text>
+<text x="1012" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">kstate 只留残差清单</text>
+<text x="1012" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">尾部损坏：recoverEgressBase</text>
+<text x="1012" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">逐 base 回退截断</text>
+<text x="1012" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">无健康点 ⇒ 响亮硬失败（7439-5）</text>
+<rect x="1000" y="300" width="200" height="110" rx="8" fill="#fff6e6" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="1012" y="320" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">表（见 egress-tables 图）</text>
+<text x="1012" y="340" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_flow / egress_state</text>
+<text x="1012" y="355" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_block_flow / _state</text>
+<text x="1012" y="370" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">每轮写 = 仅新增行</text>
+<line x1="280" y1="150" x2="340" y2="155" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+
+<text x="308" y="143" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">证据流</text><line x1="280" y1="345" x2="340" y2="345" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+
+<text x="308" y="338" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">校验</text><line x1="485" y1="260" x2="485" y2="300" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<line x1="630" y1="110" x2="686" y2="110" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="658" y="104" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="10.5" fill="#7a3b0f" text-anchor="end" font-weight="bold">从日志提供·字节一致</text><line x1="815" y1="160" x2="815" y2="220" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<line x1="940" y1="340" x2="1000" y2="340" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+
+<text x="40" y="458" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#555">egress-on 条件：egressPlane 开 ∧ pluginMode ∧ pinned ∧ !sideRequest（egress-lane-io.ts）。任何不可重建点：整轮降级 legacy，绝不部分替换。</text>
+</svg>

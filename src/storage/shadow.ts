@@ -31,7 +31,9 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import { featureEnabled } from "../rollout.js";
+import { planIngest, planIngestDelta, planIngestReanchor, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import type { CcrLedgerRow } from "./slim.ts";
 import { splitMediaContent } from "./identity.js";
 import type { BlockView } from "../session.js";
 import { effectiveJsonWriterOff, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.ts";
@@ -415,7 +417,9 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             try {
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, {
+                    walJournalSizeLimitBytes: walLimit,
+                });
             } catch (err) {
                 // #4175: anything else throwing StorageIntegrityError means quick_check
                 // proved the file set corrupt — handled below WITHOUT moving any file
@@ -707,14 +711,39 @@ export class UnifiedShadow {
             // parity oracle, so it runs on the first ingest of a session and
             // then every VERIFY_EVERY_INGESTS-th (drift stays observable via
             // stats.verifyDrift on the sampled saves).
+            // #7439 R-C step 1: a session latched before egress recording
+            // started is re-admitted here once — the flow table is the single
+            // byte generation (ruling 5: server canonical, never client
+            // bytes), so the drift it was latched for can no longer recur;
+            // the skipLastMessages gate in BatchedViewVerification (wired
+            // from egressAuthority) prevents re-latching on subsequent
+            // samples. Clearing the stale latch restores the delta fast path
+            // for sessions that were already on the O(rows) full-ingest path.
             phase = "verify-sample";
             const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
             this.ingestCounts.set(legacy.id, count);
-            if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
+            // #7574: only while the plane is switched ON. The marker is saved
+            // with the session, so after an install turns the plane off it
+            // would otherwise keep the sampled verification off and keep the
+            // delta fast path latched forever for that session.
+            if (legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane") && this.driftedSessions.delete(legacy.id)) {
+                this.driftStreaks.delete(legacy.id);
+                if (this.frozenEnvelopeIds.delete(legacy.id)) {
+                    this.frozenEnvelopeSince.delete(legacy.id);
+                    loggerLog("info", `[storage] egress-active ${legacy.id}: stale drift latch cleared — flow table is the single byte generation, delta fast path restored (#7439 R-C)`);
+                }
+            }
+            // #7439 item 1: BatchedViewVerification is disabled for egress-on
+            // sessions — its two legs are messages-reconciliation, and keeping
+            // it re-latches the known canonical≠client divergence (the #5677
+            // chronic loop source). The egress probe (client bytes vs flow
+            // sampled rows) is the sole verification for egress-on sessions.
+            const egressOn = legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane");
+            if (!egressOn && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
                 if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id));
+                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getCcrEntries(legacy.id), this.sync.getStateFields(legacy.id), this.sync.getOrphanViews(legacy.id) ?? {});
                 for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                     const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                     verifier.addBlocks(rows);
@@ -844,15 +873,31 @@ export class UnifiedShadow {
                 head = { msgId: headMsgId };
             }
             const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail, head);
-            if (!plan) return false;
-            const applied = this.sync.ingestSession(plan, {
-                trustedSeq: mark.seq,
-                boundaryMsgId: boundary.msgId,
-                boundaryHash: boundary.contentHash,
-                trustedTailSeqs: mark.tailSeqs,
-            });
-            if (applied) this.stats.deltaIngests++;
-            return applied;
+            if (plan) {
+                const applied = this.sync.ingestSession(plan, {
+                    trustedSeq: mark.seq,
+                    boundaryMsgId: boundary.msgId,
+                    boundaryHash: boundary.contentHash,
+                    trustedTailSeqs: mark.tailSeqs,
+                });
+                if (applied) this.stats.deltaIngests++;
+                return applied;
+            }
+            // #7474 window re-anchor: envelope (folded-render) shapes that
+            // violate strict-append — the pf-window lane's sliding tail
+            // window — resolve per-row by indexed identity instead of the
+            // O(all rows) full remap. Raw lineage never enters (its delta
+            // gates stay authoritative there); any in-txn doubt returns the
+            // caller to the exact full path.
+            if (!hasRawTail) {
+                const rp = planIngestReanchor(legacy);
+                if (rp) {
+                    const applied = this.sync.ingestSession(rp, undefined, undefined, { trustedTailSeqs: mark.tailSeqs });
+                    if (applied) this.stats.deltaIngests++;
+                    return applied;
+                }
+            }
+            return false;
         } catch {
             return false;
         }
@@ -876,9 +921,27 @@ export class UnifiedShadow {
                 for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
                     builder.addMessages(store.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                 }
+                // #6785 step 6: slim ccr envelopes hydrate from the CAS-backed
+                // ledger; full legacy envelopes ignore these rows.
+                builder.addCcrEntries(store.getCcrEntries(id));
+                // #6785 step 7: the orphan journal now lives in orphan_blocks;
+                // getOrphanViews also unions any legacy column entries.
+                builder.addOrphanViews(store.getOrphanViews(id) ?? {});
+                builder.addStateFields(store.getStateFields(id) ?? {});
                 // The builder preserves every MERGE_STATE_FIELDS key; its
                 // generic state declaration only needs widening here.
-                return builder.finish() as LegacySessionLike;
+                const view = builder.finish();
+                // #7577 (b): egress-on sessions do not persist tsStamps (it is
+                // trimmed on write — see ingest.ts KSTATE_TRIM_FIELDS); re-derive
+                // it from the live egress view (row.msgid IS the kernel raw id,
+                // row.ts the first-observed wall clock) so the kernel's <acp
+                // time=> stamps survive restarts. The async (MySQL) leg has no
+                // egress tables — the egress plane is the SQLite lane only.
+                if (view.metadata["egressAuthority"] === true && view.state.tsStamps === undefined) {
+                    const derived = store.egressTsStamps(id);
+                    if (derived !== null) view.state.tsStamps = derived;
+                }
+                return view as LegacySessionLike;
             });
             if (!unified) return null;
             warnTailGaps(id, unified as unknown as { tailGaps?: number });
@@ -911,7 +974,7 @@ export class UnifiedShadow {
                         appendBlockContents(contents, blocks);
                         if (blocks.length < VIEW_READ_BATCH_SIZE) break;
                     }
-                    mergeOrphanBlockContents(contents, store.getOrphansJson(id));
+                    mergeOrphanBlockContents(contents, JSON.stringify(store.getOrphanViews(id) ?? {}));
                     result.blockContents = contents;
                 }
                 return result;
@@ -1141,6 +1204,82 @@ export class UnifiedShadow {
         return this.sync.sessionStorageStats(sessionId);
     }
 
+    // #5874 2×2 stage 0 (brief 19544722): the element world-match accessors.
+    // Errors propagate (the lane maps the R3 reject to a hard 400 and every
+    // other fault to the legacy full path).
+
+    /** Stage 0 for one turn (see UnifiedStore.snapStage0). null when there
+     *  is no sync store. */
+    snapStage0(sessionId: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): import("../snapshot/plane.js").Stage0Result | null {
+        if (this.sync === null) return null;
+        return this.sync.snapStage0(sessionId, incoming, opts);
+    }
+
+    /** The stage-0 resync (diverge / re-baseline): clear the l1 envelope so
+     *  the next turn re-issues from the client's current array. */
+    snapStage0Reset(sessionId: string): void {
+        if (this.sync === null) return;
+        this.sync.snapStage0Reset(sessionId);
+    }
+
+    /** #7064 D2: conversation-bound check (see UnifiedStore.snapConvBound). */
+    snapConvBound(sessionId: string): boolean {
+        if (this.sync === null) return false;
+        return this.sync.snapConvBound(sessionId);
+    }
+
+    /** #7064 §8: live stamped msg_ids in seq order (see UnifiedStore.snapMsgIdLiveIds). */
+    snapMsgIdLiveIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.snapMsgIdLiveIds(sessionId);
+    }
+
+    /** #7474 P2 (ruling 7439): pin ledger entry — egress op log when the
+     *  session has one, messages rows otherwise (see UnifiedStore.snapPinLiveIds). */
+    snapPinLiveIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.snapPinLiveIds(sessionId);
+    }
+
+    /** #7398 seg 3: the sqlite UnifiedStore behind this shadow — the egress
+     *  op-log recorder's narrow seam. Null on network backends (mysql): the
+     *  shadow tables are sqlite-lane only, and the recorder skips the turn
+     *  exactly as it does when no sidecar opened. */
+    egressOpLogSync(): UnifiedStore | null {
+        return this.sync;
+    }
+
+    /** #6181 M3: persisted R3 breaker latch (see UnifiedStore.snapR3Latched). */
+    snapR3Latched(sessionId: string): boolean {
+        if (this.sync === null) return false;
+        return this.sync.snapR3Latched(sessionId);
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort). */
+    snapR3Latch(sessionId: string): void {
+        if (this.sync === null) return;
+        this.sync.snapR3Latch(sessionId);
+    }
+
+    /** #6785 review: operator escape hatch (see UnifiedStore.snapR3LatchClear). */
+    snapR3LatchClear(sessRaw: string): string | null {
+        if (this.sync === null) return null;
+        return this.sync.snapR3LatchClear(sessRaw);
+    }
+
+    /** #6785 review: the persisted-latch roster (see UnifiedStore.snapR3LatchedList). */
+    snapR3LatchedList(): Array<{ sessRaw: string; ledgerId: string; latchedAt: number }> {
+        if (this.sync === null) return [];
+        return this.sync.snapR3LatchedList();
+    }
+
+    /** #6785 review: conversation-binding sid of a raw id (see UnifiedStore.snapSidOfRaw). */
+    snapSidOfRaw(sessRaw: string): string | null {
+        if (this.sync === null) return null;
+        return this.sync.snapSidOfRaw(sessRaw);
+    }
+
+
     vacuum(mode: "full" | "incremental"): void {
         if (this.sync === null) throw new Error("[storage] sync vacuum unavailable on a network backend");
         return this.sync.vacuum(mode);
@@ -1342,7 +1481,6 @@ export class UnifiedShadow {
                     legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
                 }
                 if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-                // #3818/#3841: same orphan-guard + reap-journal semantics.
                 // #4216/#4242: orphan shape rides the plan journal — normal
                 // ingest (the async twin of the sync fix); no freeze.
                 // #3133 watermark delta.
@@ -1365,6 +1503,15 @@ export class UnifiedShadow {
                                 if (plan) {
                                     applied = await backend.ingestSession(plan, { trustedSeq: mark.seq, boundaryMsgId: boundary.msgId, boundaryHash: boundary.contentHash, trustedTailSeqs: mark.tailSeqs });
                                     if (applied) this.stats.deltaIngests++;
+                                } else if (!hasRawTail) {
+                                    // #7474 window re-anchor (async twin): sliding
+                                    // tail windows resolve per-row by indexed
+                                    // identity instead of the O(all rows) remap.
+                                    const rp = planIngestReanchor(legacy);
+                                    if (rp) {
+                                        applied = this.sync?.ingestSession(rp, undefined, undefined, { trustedTailSeqs: mark.tailSeqs }) ?? false;
+                                        if (applied) this.stats.deltaIngests++;
+                                    }
                                 }
                             }
                         }
@@ -1391,11 +1538,14 @@ export class UnifiedShadow {
                 phase = "verify-sample";
                 const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
                 this.ingestCounts.set(legacy.id, count);
-                if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
+                // #7439 item 1: BatchedViewVerification disabled for egress-on
+                // sessions (same rationale as the sync path above).
+                const egressOnAsync = legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane");
+                if (!egressOnAsync && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
                     this.stats.verifySamples++;
                     const sessionRow = await backend.getSessionRow(legacy.id);
                     if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id));
+                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id), await backend.getCcrEntries(legacy.id), await backend.getStateFields(legacy.id), (await backend.getOrphanViews(legacy.id)) ?? {});
                     for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                         const rows = await backend.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                         verifier.addBlocks(rows);
@@ -1444,6 +1594,12 @@ export class UnifiedShadow {
                     for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
                         builder.addMessages(await reader.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                     }
+                    // #6785 step 6: same slim-envelope hydration on the async
+                    // (MySQL seam) leg — one source, both legs.
+                    builder.addCcrEntries(await reader.getCcrEntries(id));
+                    // #6785 step 7: same orphan-journal union on the async leg.
+                    builder.addOrphanViews(await reader.getOrphanViews(id) ?? {});
+                    builder.addStateFields(await reader.getStateFields(id) ?? {});
                     return builder.finish() as LegacySessionLike;
                 });
                 if (!loaded) return null;
@@ -1711,8 +1867,8 @@ class BatchedViewVerification {
     private tailGaps = 0;
     private tailSlot: DriftDiagnostics["tailSlot"];
 
-    constructor(private readonly legacy: LegacySessionLike, session: SessionRow, refs: RefRow[], deadRefs: { ord: number; ref: string }[]) {
-        const header = loadLegacyView({ session, refs, deadRefs, messages: [], blocks: [] });
+    constructor(private readonly legacy: LegacySessionLike, session: SessionRow, refs: RefRow[], deadRefs: { ord: number; ref: string }[], ccrRows: readonly CcrLedgerRow[] = [], stateFieldsRows: Record<string, string> | null = null, orphanViews: Record<string, { one: unknown; full: unknown }> | null = null, private readonly skipLastMessages = false) {
+        const header = loadLegacyView({ session, refs, deadRefs, messages: [], blocks: [] }, ccrRows, stateFieldsRows, orphanViews ?? undefined);
         this.orphans = header.blockContents;
         this.remainingContents = new Map(completeBlockContents(legacy.blockContents, legacy.state.blocks));
         this.tail = JSON.parse(session.tailJson);
@@ -1832,7 +1988,16 @@ class BatchedViewVerification {
         if (this.blockCount !== this.legacy.state.blocks.length) this.changed("state");
         for (const [id, view] of this.orphans) this.compareContents(id, view);
         if (this.remainingContents.size > 0) this.changed("blockContents");
-        this.compareMessages("lastMessages", this.tail.tailSeqs);
+        // Ruling 7439 (egress-authority sessions): the message BYTES are
+        // authoritative in the egress op log, not in the messages table —
+        // there the rows are the identity/cursor ledger (watermark, pin
+        // tail-overlap) and the client legitimately resends its OWN bytes
+        // while the server serves the canonical ones, so this comparison
+        // diverges by design on those sessions and would latch the session
+        // onto the O(rows) full-ingest path (observed: 'diverged:
+        // lastMessages' → chronic slow full ingests). Marked sessions skip
+        // ONLY this dimension; every other check still runs.
+        if (!this.skipLastMessages) this.compareMessages("lastMessages", this.tail.tailSeqs);
         this.compareMessages("pluginSnapshot", this.tail.pluginSnapshotSeqs);
         const diagnostics: DriftDiagnostics = { keys: [...this.keys].sort() };
         if (this.headerDiag?.stateKeys) diagnostics.stateKeys = this.headerDiag.stateKeys;
