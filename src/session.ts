@@ -459,6 +459,21 @@ export type Session = {
          *  usage report (one-shot, per the #554 contract) and on compression
          *  reset. Absent on legacy session files → treated as no arm. */
         overflowArmTokens?: number;
+        /** One-shot preflight fold gate — 1 when the session's preflight
+         *  fold attempt was ABORTED by a client disconnect (the livelock
+         *  shape: a 3.5-4 min self-summary cut at the client's ~300s stream
+         *  watchdog, payload never shrinking — 2026-11-22 log-32 incident:
+         *  nine runs, each aborted at exactly +300.0s). The preflight
+         *  trigger (server.ts preflightCompressIfNeeded) forwards as-is once
+         *  this is set or the session carries committed compression
+         *  (state.stats.compressionCount). A fast summary failure (429/400/
+         *  empty) does NOT set it — the #726/#4079 retry contract keeps
+         *  re-running the walk on transient outages. Overflow recovery after
+         *  the shot is spent lives in #1195 in-request refold + the egress
+         *  fuse; steady growth is the model's job via the compress tool
+         *  (nudge path). Persisted; cleared on compression reset.
+         *  Absent on legacy session files → treated as fresh. */
+        preflightRuns?: number;
         /** #3450: completion-channel reservation PROVEN by an upstream-stated
          *  overflow ("N in the completion" billed against the same wall) —
          *  preflight folds against window − reserve because the foldable
@@ -1811,6 +1826,10 @@ export function resetSessionCompression(session: Session): void {
     // longer bounds this session; drop it so the guard falls back to the
     // declared window instead of clamping to a stale ceiling.
     delete session.stats.overflowArmTokens;
+    // One-shot fold gate: the rebuilt conversation is a fresh lifecycle —
+    // it gets its own first preflight attempt (matches the reset semantics
+    // of the arm and baseline it rides alongside).
+    delete session.stats.preflightRuns;
     // #3450: same boundary — the proven completion reservation described the
     // pre-compaction payload lineage, and the rebuilt conversation re-arms the
     // one-time mismatch warning.

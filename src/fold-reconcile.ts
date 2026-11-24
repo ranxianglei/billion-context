@@ -2512,6 +2512,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             // restore the old one. Either alignment event clears the latch
             // automatically (resetFoldDriftState on the first clean pass).
             session.metadata[METADATA_EPOCH_CONFIRM] = true;
+            // #7545 follow-up: a confirmed epoch replacement is a new
+            // compression lifecycle — re-arm the preflight one-shot gate so
+            // the new epoch gets its own single attempt (an aborted attempt
+            // on the REPLACED epoch must not starve the new one). Successful
+            // folds never set this latch, so the one-shot still holds within
+            // any single epoch.
+            if (session.stats) delete session.stats.preflightRuns;
             if (opts.log !== undefined) {
                 opts.log("error", `${tag}[fold-reconcile] fold epoch confirmation required: ${realUnmatched.length} covered id(s) missing with NO anchor match and NO word evidence for ${streak} consecutive passes${span}${expectedNote} — the resent history shares nothing with the fold substrate (wholesale replacement: host-native compaction outside bili's knowledge #1729/#2193, or a brand-new conversation on the same session id). Folding is paused for this session until the histories realign (old history resent or a fresh fold on the new one starts a new epoch); bili keeps the existing snapshot — nothing is deleted (#3641)${driftTok}`);
             }
