@@ -39,6 +39,7 @@ import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
+import { featureEnabled } from "./rollout.js";
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
@@ -2479,6 +2480,90 @@ export class SessionStore {
         }
     }
 
+    // #5874 2×2 stage 0 (brief 19544722): errors PROPAGATE (the lane maps the
+    // R3 reject to a hard 400 and any other fault to the legacy full path).
+
+    /** Stage 0 (element world match) for one turn. null when the unified
+     *  store is unavailable — the lane keeps the legacy path. */
+    snapStage0(sessionId: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): import("./snapshot/plane.js").Stage0Result | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapStage0(sessionId, incoming, opts);
+    }
+
+    /** The stage-0 resync (diverge / re-baseline): clear the l1 envelope so
+     *  the next turn re-issues from the client's current array. */
+    snapStage0Reset(sessionId: string): void {
+        if (!this.replicasAvailable()) return;
+        this.liveShadow().snapStage0Reset(sessionId);
+    }
+
+    /** #7064 D2: whether this sid is CONVERSATION-BOUND — the host already
+     *  declared a conversation identity (a conversations row for this sid),
+     *  so the per-turn R3 identity-fault policy never fires for it: the
+     *  session IS the identity, the stage-0 cursor is bookkeeping. */
+    snapConvBound(sessionId: string): boolean {
+        if (!this.replicasAvailable()) return false;
+        return this.liveShadow().snapConvBound(sessionId);
+    }
+
+    /** #7064 §8: live stamped msg_ids in seq order (see UnifiedStore.snapMsgIdLiveIds).
+     *  [] when the unified store is unavailable — the caller treats that as an
+     *  empty ledger (C=0) and degrades to the full-list signal. */
+    snapMsgIdLiveIds(sessionId: string): string[] {
+        if (!this.replicasAvailable()) return [];
+        return this.liveShadow().snapMsgIdLiveIds(sessionId);
+    }
+
+    /** #7474 P2 (ruling 7439): pin ledger entry for both storage authorities —
+     *  the egress op log when the session has one, the messages rows otherwise.
+     *  [] when the unified store is unavailable (same degradation as
+     *  snapMsgIdLiveIds — the caller degrades to the full-list signal). */
+    snapPinLiveIds(sessionId: string): string[] {
+        if (!this.replicasAvailable()) return [];
+        return this.liveShadow().snapPinLiveIds(sessionId);
+    }
+
+    /** #7398 seg 3: egress op-log surface (dual tables egress_state/
+     *  egress_flow). Null when the sqlite lane is unavailable (legacy mode,
+     *  network backends) — callers skip recording for the turn (shadow lane,
+     *  zero impact). */
+    egressOpLogStore(): import("./storage/store.js").UnifiedStore | null {
+        return this.replicasAvailable() ? this.liveShadow().egressOpLogSync() : null;
+    }
+
+    /** #6181 M3: whether this sid's R3 breaker latch persisted from a
+     *  previous process (a restart must not re-arm a misbehaving host). */
+    snapR3Latched(sessionId: string): boolean {
+        if (!this.replicasAvailable()) return false;
+        return this.liveShadow().snapR3Latched(sessionId);
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort). */
+    snapR3Latch(sessionId: string): void {
+        if (!this.replicasAvailable()) return;
+        this.liveShadow().snapR3Latch(sessionId);
+    }
+
+    /** #6785 review: operator escape hatch — clear the persisted R3 latch
+     *  (see UnifiedStore.snapR3LatchClear; /__bili/snapshot/r3-unlatch). */
+    snapR3LatchClear(sessRaw: string): string | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapR3LatchClear(sessRaw);
+    }
+
+    /** #6785 review: the persisted-latch roster (see UnifiedStore.snapR3LatchedList). */
+    snapR3LatchedList(): Array<{ sessRaw: string; ledgerId: string; latchedAt: number }> {
+        if (!this.replicasAvailable()) return [];
+        return this.liveShadow().snapR3LatchedList();
+    }
+
+    /** #6785 review: conversation-binding sid of a raw id (see UnifiedStore.snapSidOfRaw). */
+    snapSidOfRaw(sessRaw: string): string | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapSidOfRaw(sessRaw);
+    }
+
+
     /** #3928: physical index.db shrink after deletions (`bili sessions rm`).
      *  Throws on failure — the deletion itself is already committed, callers
      *  report the shrink as partial. Throws in legacy-only lanes — check
@@ -2720,6 +2805,9 @@ export class SessionStore {
      *  backend queue. Fire-and-forget from the save paths. */
     private async maybeCutForkBaseAsync(session: Session): Promise<void> {
         if (!this.shadow || this.shadow.stats.disabled) return;
+        // #7577 D5: egress-on sessions fork via point copy (egressPointFork),
+        // not a fork_base checkpoint — skip the checkpoint cut entirely.
+        if (session.metadata["egressAuthority"] === true) return;
         const retained = session.metadata.publicForkReceipt !== undefined
             || session.metadata.publicSnapshotRetained === true;
         if (!retained || !Array.isArray(session.pluginSnapshot) || session.pluginSnapshot.length === 0) return;
@@ -2751,20 +2839,37 @@ export class SessionStore {
         }
     }
 
-    async createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): Promise<CheckpointRow> {
+    async createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base"; resident?: Session } = {}): Promise<CheckpointRow> {
         const shadow = this.liveShadow();
-        const view = await shadow.viewForAsync(sessionId);
-        if (!view) throw new Error(`[storage] session ${sessionId} is not in the unified index (unknown, or never persisted under this mode)`);
-        const record = viewToRecord(view);
+        // #7439 P2: egress-on sessions have a frozen messages projection —
+        // viewForAsync returns the arm-time snapshot, not the live content.
+        // When the caller passes the resident session, use it directly
+        // (same pattern as maybeCutForkBaseAsync).
+        let record: PersistedSession;
+        if (opts.resident) {
+            record = this.buildRecordForSave(opts.resident);
+        } else {
+            const view = await shadow.viewForAsync(sessionId);
+            if (!view) throw new Error(`[storage] session ${sessionId} is not in the unified index (unknown, or never persisted under this mode)`);
+            record = viewToRecord(view);
+        }
+        // #7577 D5: egress-on sessions do not use checkpoints — the admin
+        // API does a point copy (egressPointFork) instead. Guard on the
+        // PERSISTED record's metadata (resident build or unified view, both
+        // carry it) so a stray call cannot create a checkpoint for an
+        // egress-on session whether or not it is currently loaded.
+        if (record.metadata?.["egressAuthority"] === true) {
+            throw new Error(`[storage] createReplica: session ${sessionId} is egress-on — use the point-fork path instead`);
+        }
         // CCR originals must survive the rollback the replica exists for:
         // the live content-store sidecar (not just what the unified index
         // captured) is the authoritative envelope — stamp it into the frozen
         // record (#2690 review blocking 6: "restore without the content-store
         // envelope → CCR cannot fetch originals").
-        const ccr = this.contentStoreById(sessionId, view.meta as { protocol?: string; upstreamOrigin?: string } | undefined);
+        const ccr = this.contentStoreById(sessionId, record.meta as { protocol?: string; upstreamOrigin?: string } | undefined);
         if (ccr) record.forkContentStore = ccr;
         const cpId = `cp-${randomUUID()}`;
-        const activeBlockIds = view.state.blocks
+        const activeBlockIds = record.state.blocks
             .filter((b) => (b as { active?: boolean }).active !== false)
             .map((b) => b.blockId)
             .sort();
@@ -2782,6 +2887,62 @@ export class SessionStore {
         const row = await shadow.getCheckpointAsync(cpId);
         if (!row) throw new Error(`[storage] checkpoint ${cpId} missing right after insert (index inconsistency)`);
         return row;
+    }
+
+    /** #7577 D5 / review (c): egress-on sessions have no checkpoint substrate
+     *  (checkpoints are retired for them), so the admin "create replica" path
+     *  FORKS THE SESSION TO NOW instead — a full copy as of the current
+     *  flow high water (the FLOW clock is the reference clock — dual clocks,
+     *  owner ruling 2026-11-24): the four egress op-log tables (the content
+     *  authority; block rows align via their flow_op_seq pointer) plus the
+     *  unified kernel-state rows. The child is a new, loadable session; the
+     *  parent is never mutated. Forking at an EARLIER op_seq is deliberately
+     *  NOT supported: the unified kernel-state rows only exist at *now*, so a
+     *  point below the high water would pair content-at-X with
+     *  kernel-state-at-now (inconsistent). That needs the point-reconstruction
+     *  materializer — a follow-up, not this PR. */
+    async forkEgressSnapshot(sessionId: string, childId?: string): Promise<{ childId: string; opSeq: number }> {
+        await this.ready();
+        // Resident if it is actively loaded; otherwise load the persisted
+        // (idle) session — a point-fork of an egress-on session does not need
+        // the parent to be in-flight, only present.
+        const parent = peekSession(sessionId) ?? (await this.loadAsync(sessionId));
+        if (!parent) throw new Error(`[storage] forkEgressSnapshot: session ${sessionId} does not exist`);
+        if (parent.metadata["egressAuthority"] !== true) throw new Error(`[storage] forkEgressSnapshot: session ${sessionId} is not an egress-on session`);
+        const cid = childId ?? `fork-${randomUUID()}`;
+        if (peekSession(cid) !== undefined || (await this.loadAsync(cid))) throw new Error(`[storage] forkEgressSnapshot: child ${cid} already exists`);
+        // Deep-copy the mutable fields: persistForkSession mutates the child
+        // (fork-base receipt, tail fold, resident drops), so the child must
+        // not alias the parent's state/metadata/lock chain. `transient` is
+        // in-flight request state — never carried into a fork child. The
+        // contentStore is shared by design: saveContentStore snapshots it to
+        // disk under the child's id, and dropResidentContentStore reassigns
+        // the CHILD's field only (the parent keeps its own handle).
+        const child: Session = {
+            ...parent,
+            id: cid,
+            meta: structuredClone(parent.meta),
+            stats: structuredClone(parent.stats),
+            metadata: { ...parent.metadata, derivedFromSessionId: sessionId },
+            state: structuredClone(parent.state),
+            blockContents: new Map([...(parent.blockContents ?? new Map()).entries()].map(([k, v]) => [k, structuredClone(v)])),
+            lastMessages: parent.lastMessages ? structuredClone(parent.lastMessages) : undefined,
+            pluginSnapshot: parent.pluginSnapshot ? structuredClone(parent.pluginSnapshot) : undefined,
+            decompositionLog: parent.decompositionLog ? structuredClone(parent.decompositionLog) : undefined,
+            transient: undefined,
+            lockChain: undefined,
+            persisted: false,
+            inFlight: 0,
+            pendingRetrievals: [],
+        };
+        await this.persistForkSession(sessionId, child);
+        // #7577 (dual clocks, owner ruling 2026-11-24): report the FLOW high
+        // water (egress_flow's MAX) — the reference clock for point forks.
+        // Block rows align to it via their flow_op_seq pointer; the block
+        // table's own op_seq space is self-contained and not part of the
+        // watermark.
+        const opSeq = this.egressOpLogStore()?.egressStateMaxSeq(cid) ?? 0;
+        return { childId: cid, opSeq };
     }
 
     async listReplicas(sessionId?: string): Promise<CheckpointRow[]> {
@@ -3085,10 +3246,12 @@ export class SessionStore {
                 // folded saves present the envelope render (no override),
                 // which the delta path already routes to the full ingest.
                 const tail = session.lastMessagesFolded !== true ? session.lastMessages : undefined;
-                this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
-                    tail && tail.length > 0
-                        ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                        : undefined, session.contentStore ?? undefined);
+                if (!this.egressProjectionFrozen(session)) {
+                    this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
+                        tail && tail.length > 0
+                            ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
+                            : undefined, session.contentStore ?? undefined);
+                }
                 this.noteOwnCommit(session.id, record);
                 return record;
             }
@@ -3108,7 +3271,7 @@ export class SessionStore {
             // to the live session so serving converges on the same newest-wins
             // arbitration the write side just used.
             this.convergeToDisk(session, disk);
-            this.shadow?.record(disk);
+            if (!this.egressProjectionFrozen(session)) this.shadow?.record(disk);
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
             this.noteOwnCommit(session.id, disk);
@@ -3228,6 +3391,20 @@ export class SessionStore {
         loggerLog("error", `[persist] ${sessionId}: skipping ${route} envelope save — JSON envelope writes FROZEN since ${since} (digest-drift escalation #4323); the unified store keeps receiving the save and compression continues from the in-memory view, but the two copies are NOT converging — see the [storage] DIGEST DRIFT lines for the divergence diagnosis (#5408)`);
     }
 
+    /** #7474 P2 (ruling 7439, proposal comment-19805485): the egress-on
+     *  session's transcript authority lives in the op log
+     *  (egress_state/egress_flow), so the per-turn unified-index ingest — the
+     *  O(ledger) double bookkeeping behind the 2s→5.7s @10w-row steady RT
+     *  (#7474) — stops: the messages projection is FROZEN and rebuilt lazily
+     *  by the first legacy FULL ingest after the plane rolls back (the rollback
+     *  turn resends full client history, the delta probe misses, the full path
+     *  re-interns everything). Gated on the LIVE plane flag so a mid-process
+     *  rollback resumes normal ingest at once. The JSON envelope (where
+     *  active) keeps flowing — only the unified legs are skipped. */
+    private egressProjectionFrozen(session: Session): boolean {
+        return session.metadata?.["egressAuthority"] === true && featureEnabled("egressPlane");
+    }
+
     /** #3397 (PR #6326): durability-before-render — make a session's unified-index
      *  rows durable SYNCHRONOUSLY (the small SQLite ingest) WITHOUT writing the
      *  JSON envelope. The incremental lane calls this the instant a turn's
@@ -3241,6 +3418,7 @@ export class SessionStore {
      *  envelope write and its landing stamp. */
     ingestRowsNow(session: Session): void {
         if (!this.shadow) return; // legacy-only (no unified index) — nothing to back
+        if (this.egressProjectionFrozen(session)) return; // #7474 P2: op log is the authority
         try {
             const stamp = this.liveStorageStamp;
             const record = this.buildRecordForSave(session, stamp);
@@ -3312,8 +3490,9 @@ export class SessionStore {
             this.durabilityArms.delete(session.id);
             return;
         }
-        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
-            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "scheduled");
+        const frozen = this.envelopeFrozen(session.id);
+        if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
+            if (frozen) this.noteFrozenSkip(session.id, "scheduled");
             // Phase 3 (#2960): index-only persistence — the builder closure
             // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
             // guard; no envelope write is armed, so no debounce is needed.
@@ -3371,9 +3550,19 @@ export class SessionStore {
                     // removed together with the 3-strike breaker itself
                     // (2026-10-30 owner policy: index writes are never
                     // abandoned, jsonWriter=off accepts index-only persistence).
-                    this.noteDurable(session.id, proofRevision);
-                    this.lastSaveLanded.set(session.id, true);
-                    this.runIdleSpillIfIdle(session.id);
+                    if (this.egressProjectionFrozen(session)) {
+                        // #7474 P2 (ruling 7439): the build above did NOT land
+                        // in the unified store (op-log authority) — do not
+                        // stamp it as durable: the durableRevision gate is what
+                        // authorizes the droppable-field discharge to
+                        // reconstruct thinned fields FROM that store, and for
+                        // this session that store holds nothing to read back.
+                        this.lastSaveLanded.set(session.id, true);
+                    } else {
+                        this.noteDurable(session.id, proofRevision);
+                        this.lastSaveLanded.set(session.id, true);
+                        this.runIdleSpillIfIdle(session.id);
+                    }
                     settledOk = true;
                     // #3818 writerOff safety valve REMOVED (#4216/#4242):
                     // the orphan/reap shape is now representable — its
@@ -3604,8 +3793,9 @@ export class SessionStore {
             this.durabilityArms.delete(session.id);
             throw new Error(`Originals were not saved for ${session.id}`);
         }
-        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
-            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "writeNow");
+        const frozen = this.envelopeFrozen(session.id);
+        if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
+            if (frozen) this.noteFrozenSkip(session.id, "writeNow");
             // #3133: drop the armed microtask (token mismatch below) — this
             // sync build subsumes it; later mutations re-arm on their own.
             this.writerOffPending.delete(session.id);
@@ -3613,12 +3803,24 @@ export class SessionStore {
             const rec = this.guardedBuild(session)();
             this.maybeCutForkBase(session);
             this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only build landed
-            this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
-            this.lastSaveLanded.set(session.id, true);
-            this.foldResidentTail(session);
-            this.dropResidentBlockContents(session);
-            this.dropResidentMetadata(session);
-            this.dropResidentContentStore(session);
+            if (!this.egressProjectionFrozen(session)) {
+                this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
+                this.lastSaveLanded.set(session.id, true);
+                this.foldResidentTail(session);
+                this.dropResidentBlockContents(session);
+                this.dropResidentMetadata(session);
+                this.dropResidentContentStore(session);
+            } else {
+                // #7474 P2 (ruling 7439): the build above deliberately did NOT
+                // land in the unified store (the op log is the transcript
+                // authority), so the droppable-field discharge — which
+                // reconstructs thinned fields FROM that store — must not run:
+                // a thinned resident metadata/block-content would 502 on the
+                // next turn's re-materialization (#4788 D2). The session keeps
+                // its full residency for its lifetime; the flow table already
+                // holds the same bytes on disk.
+                this.lastSaveLanded.set(session.id, true);
+            }
             return;
         }
         // #6793-review: full-build path (store.writeNow) never consults the
@@ -3643,6 +3845,61 @@ export class SessionStore {
         this.dropResidentMetadata(session);
         this.dropResidentContentStore(session);
         this.drainFlushWaiters(session.id, true);
+    }
+
+    /** #5874 P2-final: the IN-REQUEST snapshot application — persist the
+     *  session's current canonical state right now (single store transaction
+     *  through writeNow: legacy tables AND the snapshot plane via
+     *  snapShadowSync), so the egress stage of the SAME request reads a plane
+     *  that already contains this turn (chain: raw → wire→core → kernel
+     *  rewrite → snapshot write → egress rewrite → egress). Before this the
+     *  plane write waited for the post-response debounce, so egress always
+     *  saw the plane one tick behind and re-stitched the live tail from the
+     *  client resend at the seam.
+     *
+     *  Never throws — a failed flush leaves the round on the legacy egress
+     *  path (the seam walk carries it) and the debounced retry is untouched.
+     *  On success the armed debounce is settled: our live build already
+     *  covers every mutation up to the epoch it captured, so the pending
+     *  timer is dropped (its build would be a byte-identical no-op); a
+     *  mutation that landed DURING the write's chain-run window re-arms via
+     *  the caller's end-of-prepare markDirty (the returned epoch lets it
+     *  distinguish "already saved" from "new state since").
+     *  @returns { ok: write landed, epoch: revisionEpoch captured BEFORE the
+     *  write (compare against session.revisionEpoch afterwards). */
+    async flushSessionNow(session: Session): Promise<{ ok: boolean; epoch: number | undefined }> {
+        const epoch = session.revisionEpoch;
+        try {
+            await this.writeNow(session);
+        } catch (err) {
+            this.log("warn", `[persist] ${session.id}: in-request snapshot flush failed (round stays on the legacy egress path): ${String(err).slice(0, 200)}`);
+            return { ok: false, epoch };
+        }
+        if ((session.revisionEpoch ?? 0) !== (epoch ?? 0)) {
+            // Newer mutation landed during the chain-run window — keep the
+            // debounce alive for it (re-arm; the pending timer already covers
+            // it when the timer still exists).
+            this.scheduleSave(session);
+        } else {
+            const t = this.saveTimers.get(session.id);
+            if (t) {
+                clearTimeout(t);
+                this.saveTimers.delete(session.id);
+            }
+            this.saveBuilders.delete(session.id);
+            this.writerOffPending.delete(session.id);
+            this.runIdleSpillIfIdle(session.id);
+        }
+        return { ok: true, epoch };
+    }
+
+    /** #5874 P2-final: lane-facing wrapper — a missing or PARTIAL store (test
+     *  stubs that answer only the accessors under test) degrades to "not
+     *  flushed" instead of throwing into the lane's kernel-fail catch. */
+    static async flushOrSkip(session: Session): Promise<{ ok: boolean; epoch: number | undefined }> {
+        const st = getStore();
+        if (!st || typeof st.flushSessionNow !== "function") return { ok: false, epoch: session.revisionEpoch };
+        return st.flushSessionNow(session);
     }
 
     /** #3050 R3 ②a: once a save has captured the raw tail (envelope + the
@@ -3857,8 +4114,9 @@ export class SessionStore {
         this.consumePendingLedgerAlign(session); // #5608-D: before any serialization
         if (!this.saveContentStore(session)) return false;
         this.tryRecoverSidecar(); // #5188: eviction-time flushes are also a recovery opportunity
-        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
-            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "flushSync");
+        const frozen = this.envelopeFrozen(session.id);
+        if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
+            if (frozen) this.noteFrozenSkip(session.id, "flushSync");
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
             const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
@@ -3875,12 +4133,21 @@ export class SessionStore {
             }
             this.maybeCutForkBase(session);
             if (rec) this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only flush landed
-            this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
-            this.lastSaveLanded.set(session.id, true);
-            this.foldResidentTail(session);
-            this.dropResidentBlockContents(session);
-            this.dropResidentMetadata(session);
-            this.dropResidentContentStore(session);
+            if (!this.egressProjectionFrozen(session)) {
+                this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
+                this.lastSaveLanded.set(session.id, true);
+                this.foldResidentTail(session);
+                this.dropResidentBlockContents(session);
+                this.dropResidentMetadata(session);
+                this.dropResidentContentStore(session);
+            } else {
+                // #7474 P2 (ruling 7439): build did not land in the unified
+                // store — do not stamp it durable and do not thin resident
+                // fields that can only be re-materialized from that store
+                // (#4788 D2). Full residency stays; the flow table holds the
+                // same bytes on disk.
+                this.lastSaveLanded.set(session.id, true);
+            }
             return true;
         }
         // Mirror the kernel flushSync contract: a sync commit supersedes any

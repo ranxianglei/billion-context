@@ -24,7 +24,6 @@ import { dshWorkspaceInstructionsPath, durableMessageToolPaths } from "../src/du
 // #2989: rig hygiene resets the LIVE session-order registry (the persona-
 // anchor ladder is off the production path on every lane since #3134 —
 // v2 order resolution everywhere, google included).
-import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -69,7 +68,6 @@ async function startRig(): Promise<Rig> {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetSessionOrderForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
@@ -136,11 +134,11 @@ test("dshWorkspaceInstructionsPath: projects the baseline label to durable/agent
     assert.equal(dshWorkspaceInstructionsPath(msg("text", INSTR_MSG)), "durable/agents-md", "the merged global+project baseline projects");
     assert.equal(dshWorkspaceInstructionsPath(msg("text", "plain prose about workspace setup")), undefined);
     assert.equal(dshWorkspaceInstructionsPath(msg("text", CHANGE_MSG)), undefined, "lowercase reconciliation variants stay consumable history");
-    assert.equal(dshWorkspaceInstructionsPath(msg("tool-call", "Instructions from: AGENTS.md")), undefined, "non-text content types never match");
+    assert.equal(dshWorkspaceInstructionsPath(msg("tool-call", "\x3csystem-reminder\x3e\nInstructions from: AGENTS.md\n\x3c/system-reminder\x3e")), undefined, "non-text content types never match");
     assert.equal(dshWorkspaceInstructionsPath(msg("text", undefined)), undefined, "missing text is safe");
     const dshClassifier = durableMessageToolPaths["dsh"];
     assert.ok(dshClassifier, "dsh lane is registered");
-    assert.equal(dshClassifier!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
+    assert.equal(dshClassifier!(msg("text", "\x3csystem-reminder\x3e\n\x3cavailable_skills\x3e\n- name: x\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
     assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
 });
 

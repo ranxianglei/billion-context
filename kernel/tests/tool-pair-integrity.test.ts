@@ -187,7 +187,7 @@ describe("tool-pair integrity", () => {
     assert.deepEqual(unansweredToolCalls(view.messages), []);
   });
 
-  it("refuses a range whose only foldable half of a pair is the call", () => {
+  it("no-ops (not an error) a range whose only foldable half of a pair is the call (#7596)", () => {
     const core = createCore();
     const messages: CoreMessage[] = [
       user("m1"),
@@ -212,9 +212,15 @@ describe("tool-pair integrity", () => {
         { startRef: "m00002", endRef: "m00003", summary: "S".repeat(400) },
       ],
     });
+    // #7596: the pair is still never split — the guard withdraws the whole
+    // range instead — but the outcome is now a no-op success with a warning,
+    // not a batch-rolling error.
     assert.equal(res.result.blocksCreated, 0);
-    assert.equal(res.result.errors.length, 1);
-    assert.match(res.result.errors[0]!, /split 1 tool call\/result pair/);
+    assert.deepEqual(res.result.errors, []);
+    assert.equal(res.state.blocks.length, 0);
+    assert.equal(res.result.warnings.length, 1);
+    assert.match(res.result.warnings[0]!, /folded nothing/);
+    assert.match(res.result.warnings[0]!, /split 1 tool call\/result pair|withdrawn in full/);
   });
 
   it("withdraws the call and warns when the range also carries other messages", () => {
