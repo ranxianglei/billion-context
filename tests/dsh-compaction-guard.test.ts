@@ -215,3 +215,29 @@ test("refusal status is neither auth-class nor transient-class on any lane", () 
 test("the versioned marker prefix matches the live dsh template", () => {
     assert.ok(INSTRUCTION.startsWith(DSH_COMPACTION_INSTRUCTION_PREFIX));
 });
+
+// #7271 Form 3: dsh's Command Code provider classifies 422 responses as
+// context-overflow when the error message matches its CLI_CONTEXT_OVERFLOW_PATTERN.
+// The old REFUSAL_MESSAGE contained "billion-context" (→ "context") and
+// "over its window" (→ "window"), which matched the greedy pattern
+// `context.*(length|window)`, causing dsh to misclassify the terminal refusal
+// as a retryable context-overflow error and storm retries (each retry creating
+// an orphan session). The fix rephrases "over its window" to "over its limit"
+// to remove the "window" trigger. This regression test asserts the refusal
+// message does NOT match any of dsh's context-overflow patterns.
+test("#7271 Form 3 regression: refusal message does not match dsh context-overflow patterns", () => {
+    const overflowPatterns = [
+        /prompt is too long/i,
+        /context.*(length|window)/i,
+        /max_tokens/i,
+        /maximum.*tokens/i,
+    ];
+    for (const protocol of ["openai", "anthropic", "responses"] as const) {
+        const refusal = dshCompactionRefusal(protocol) as { status: number; body: { error?: { message?: string }; message?: string } };
+        const msg = refusal.body.error?.message ?? refusal.body.message ?? "";
+        assert.ok(msg.length > 0, `${protocol}: refusal message is empty`);
+        for (const pattern of overflowPatterns) {
+            assert.ok(!pattern.test(msg), `${protocol}: refusal message matches ${pattern} — dsh would misclassify as context overflow`);
+        }
+    }
+});
