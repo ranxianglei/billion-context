@@ -113,8 +113,8 @@ export function restoredBodyText(body: string | Uint8Array, encoding: BodyConten
 /** Re-encode `bytes` with `encoding` so a rewritten body rides the SAME
  *  content-encoding the request already declared (the header stays valid).
  *  `undefined` encoding returns the bytes unchanged. Returns undefined when the
- *  coding is unsupported on this runtime (the caller then sends the decoded
- *  bytes and drops the content-encoding header). */
+ *  coding is unsupported on this runtime (the caller then fails open and sends
+ *  the original encoded body unchanged — the #4912/#2496 discipline). */
 export function encodeBodyBytes(bytes: Uint8Array, encoding: BodyContentEncoding | undefined): Uint8Array | undefined {
     if (encoding === undefined) return bytes;
     try {

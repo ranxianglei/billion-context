@@ -1105,6 +1105,10 @@ export function createOmpDirectSendGuard(): (url: string, input: string | URL | 
         if (encodedWire !== undefined && encoding !== undefined) {
             const reencoded = encodeBodyBytes(new TextEncoder().encode(cleaned), encoding);
             if (reencoded !== undefined) return { outcome: "restored", body: reencoded };
+            // Re-encode unsupported on this runtime — sending the decoded body
+            // under the declared content-encoding would be garbage upstream, so
+            // fail open: send the original encoded body unchanged (#4912/#2496).
+            return prep;
         }
         return { outcome: "restored", body: cleaned };
     };
