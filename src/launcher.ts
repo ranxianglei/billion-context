@@ -5359,7 +5359,7 @@ async function resolveWedgedSameLaneHolder(
 }
 
 /** #7156: the last gate before the spawn ladder — never open a second
- *  SAME-LANE writer behind a live predecessor.
+ *  writer over the shared session store behind a live predecessor.
  *
  *  Background: SQLite's multi-process mode is turn-taking — healthy peers
  *  coordinate through the WAL index and never corrupt each other (270/270
@@ -5371,21 +5371,38 @@ async function resolveWedgedSameLaneHolder(
  *  in the incident. Spawning behind either one re-creates the corruption; the
  *  child then dies on "database disk image is malformed" and the lane wedges.
  *
- *  Predecessor = the LIVE same-lane (non-user-zone) instance on the port this
- *  launch is about to bind. The zone resolver is stateful (#1660), so the
- *  cheap probe-time prefilter runs before it is ever touched. Per survivor:
- *    listener up + health answers  → healthy peer: #3544 rotation above already
+ *  Predecessor = the LIVE instance (any lane identity — including a no-lane
+ *  manual `bili start`, which registers tokenless and would otherwise be
+ *  invisible as a "user-zone" instance) on the port this launch is about to
+ *  bind. Same-lane predecessors keep their historical cell table;
+ *  #7675 extends the gate to NO-LANE predecessors (a manual `bili start` on
+ *  the zone base): before, the `c.inst.lane === lane` filter made them
+ *  invisible, so every lane launch laddered to base+1 and silently drifted a
+ *  second proxy writing the same shared sessions dir (field: three manual
+ *  daemons + two drifted pi-lane daemons on one host). A manual daemon holds
+ *  no lane identity to attach to, and it is the user's own process — the
+ *  wedge-takeover ladder is deliberately NOT extended to it, so the only
+ *  honest outcome is an actionable refusal. A HEALTHY no-lane daemon is
+ *  reached here only when the attach tiers above already vetoed it; the
+ *  classic 8787 global daemon does not collide (different port base). The
+ *  zone resolver is stateful (#1660), so the cheap probe-time prefilter runs
+ *  before it is ever touched.
+ *  Per survivor:
+ *    same-lane, listener up + health answers  → healthy peer: #3544 rotation above
  *        handled the strictly-older case; normal dual-writer topology (#5082),
  *        allow the spawn — behavior unchanged.
- *    listener up + health silent   → WEDGED: throw. The #5955 wedge cell owns
+ *    same-lane, listener up + health silent   → WEDGED: throw. The #5955 wedge cell owns
  *        this holder; its forced takeover fires after the patience window.
  *        Until then the lane fails with an actionable error instead of
  *        drifting a second writer over the same index.db.
- *    listener down + process alive → DRAINING: its final flush still writes
+ *    no-lane, listener up (healthy or not)    → throw (#7675): an actionable
+ *        error naming the pid, its origin, and the remedies (dedicated port
+ *        zone for the manual daemon, or stop it).
+ *    (either) listener down + process alive   → DRAINING: its final flush still writes
  *        index.db, so the PORT being free is not the safety condition — the
  *        process actually exiting is (#5167: a drain can outlive its
  *        listener). Wait, bounded, for real death; then spawn.
- *    process dead (listener either way) → gone: spawn.
+ *    process dead (listener either way)       → gone: spawn.
  */
 async function quiesceSameLanePredecessor(
     probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>,
@@ -5399,13 +5416,14 @@ async function quiesceSameLanePredecessor(
 ): Promise<void> {
     if (lane === undefined) return;
     // Cheap prefilter — #1660: never touch the sticky zone resolver on a
-    // bring-up where nothing same-lane is alive at all.
-    if (!probed.some((c) => c.inst.lane === lane && !isUserZoneInstance(c.inst))) return;
+    // bring-up where nothing gate-relevant is alive at all. #7675: no-lane
+    // instances (manual `bili start`) are gate-relevant too — they hold the
+    // shared sessions dir just like any same-lane writer.
+    if (!probed.some((c) => c.inst.lane === lane || c.inst.lane === undefined)) return;
     const targetPort = resolveTargetPort();
     if (targetPort === undefined) return;
     const survivors = probed.filter(
-        (c) => c.inst.lane === lane
-            && !isUserZoneInstance(c.inst)
+        (c) => (c.inst.lane === lane || c.inst.lane === undefined)
             && c.inst.port === targetPort
             && isPidAlive(c.inst.pid),
     );
@@ -5414,10 +5432,21 @@ async function quiesceSameLanePredecessor(
         if (!isPidAlive(s.inst.pid)) continue; // raced to death between the filter and now
         const listening = await isConnectable(s.inst.origin);
         if (listening) {
+            // #7675: a manual `bili start` daemon (no lane) on this launch's
+            // target port was previously invisible to the gate — the lane
+            // laddered to +1 and silently spawned a second writer over the
+            // shared sessions dir. A no-lane holder is not attachable and not
+            // wedge-takeover-eligible (it is the user's own process), so the
+            // only honest outcome is an actionable refusal.
+            if (s.inst.lane !== lane) {
+                throw new Error(
+                    `bili: refusing to spawn a second writer — the target port ${targetPort} is held by a running bili proxy (pid ${s.inst.pid}, ${s.inst.origin}, no lane declared). A lane daemon spawning over the same shared sessions dir doubles the WAL writers and has corrupted indexes before (#7156); laddering to +1 would do that silently. Give the daemon its own port zone (start it with -p / a different BILI_PORT_ZONE) or stop it: kill ${s.inst.pid}`,
+                );
+            }
             const healthy = await fetchHealthInfoNoReuse(s.inst.origin);
             if (healthy !== undefined) continue; // healthy peer — allow (see above)
             throw new Error(
-                `bili: refusing to spawn a second same-lane writer — predecessor pid ${s.inst.pid} on port ${targetPort} is still serving but answers no health probe (wedged). Opening the shared session store behind it corrupts the index (#7156): its stale WAL view keeps writing into offsets our startup checkpoint reclaims. It is on the wedge-takeover watch — the forced takeover (shutdown → SIGTERM → SIGKILL) fires automatically after the patience window, and the lane comes up then. Stop it now to unblock immediately: kill ${s.inst.pid}`,
+                `bili: refusing to spawn a second same-lane writer — predecessor pid ${s.inst.pid} on port ${targetPort} is still serving but answers no health probe (wedged). Opening a second writer over the shared session store behind a stale-view peer is the #7156 corruption shape: its frames can land where a concurrent checkpoint reclaimed them. It is on the wedge-takeover watch — the forced takeover (shutdown → SIGTERM → SIGKILL) fires automatically after the patience window, and the lane comes up then. Stop it now to unblock immediately: kill ${s.inst.pid}`,
             );
         }
         // Listener closed: a graceful drain (final session flush) may still be
@@ -5429,7 +5458,7 @@ async function quiesceSameLanePredecessor(
         }
         if (isPidAlive(s.inst.pid)) {
             throw new Error(
-                `bili: refusing to spawn a second same-lane writer — predecessor pid ${s.inst.pid} (port ${targetPort}) closed its listener but is still draining after ${PREDECESSOR_DRAIN_GRACE_MS}ms; its final flush still writes the shared session store, so a new writer would corrupt the index (#7156). It exits on its own — retry the launch in a moment, or stop it now: kill ${s.inst.pid}`,
+                `bili: refusing to spawn a second writer — predecessor pid ${s.inst.pid} (port ${targetPort})${s.inst.lane === lane ? "" : ", no lane declared"} closed its listener but is still draining after ${PREDECESSOR_DRAIN_GRACE_MS}ms; its final flush still writes the shared session store, so a new writer would corrupt the index (#7156). It exits on its own — retry the launch in a moment, or stop it now: kill ${s.inst.pid}`,
             );
         }
     }

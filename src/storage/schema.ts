@@ -103,23 +103,31 @@ import { parseLegacyEnvelopeToWindow } from "../snapshot/identity.js";
 //        the DDL shapes are independent).
 export const STORAGE_SCHEMA_VERSION = 12;
 
-/** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
- *  auto checkpoints move frames into the main db and reset the write offset
- *  but NEVER shrink the WAL file — without this limit a long-lived process's
- *  index.db-wal stays at its historical high-water mark forever (field:
- *  55 MiB flat). With it, every completed checkpoint truncates the file back
- *  to the cap. 8 MiB sits well above any single-save burst while keeping
- *  disk use and crash-recovery replay bounded. Per-connection setting: each
- *  process that opens the shared index applies its own copy (#2671 topology).
- *  Tunable since #3250 via storage.walJournalSizeLimitBytes /
- *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (resolved by src/knobs.ts). */
-export const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
+/** #3250 → #7674: default for `journal_size_limit` is now UNLIMITED (0).
+ *  The old 8 MiB default made the engine truncate the WAL file internally
+ *  after every completed checkpoint — a reclaim that bypasses every
+ *  JS-side guard and comes back to fetch frames out from under live peer
+ *  connections sharing the directory (#2671 topology: five daemons, kill-9
+ *  handovers). That floor-reclaim is the #7156 damage shape (pages
+ *  double-allocated in the tail, "2nd reference to page", index pages
+ *  corrupting before table pages): three field events on this host
+ *  (2026-11-19, 2026-11-21, 2026-11-23) plus the #7156 incident itself,
+ *  all on a growing multi-GB index with peers. The engine never shrinks a
+ *  WAL it did not truncate, so without the limit the file sits at its
+ *  historical high-water mark (field: 55 MiB flat — bounded, harmless,
+ *  what opencode runs: 13 concurrent writers, 9.55 GB db, 4.7 MB WAL,
+ *  zero corruption). Explicit reclamation stays available: operators set
+ *  a positive cap via storage.walJournalSizeLimitBytes /
+ *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (resolved by src/knobs.ts) or
+ *  shrink on demand with ?vacuum=full. */
+export const WAL_JOURNAL_SIZE_LIMIT = 0;
 
 /** Connection pragmas for every index.db opener. The journal cap is
- *  per-opener (see WAL_JOURNAL_SIZE_LIMIT); the default list below is what
- *  short-lived openers (export fast path) and tests apply. */
+ *  per-opener and only issued when positive (0 = unlimited, the SQLite
+ *  default); the default list below is what short-lived openers (export
+ *  fast path) and tests apply. */
 export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
-    return [
+    const pragmas = [
         // #3901/#3463: with auto_vacuum=INCREMENTAL, freed pages can be handed
         // back to the filesystem by `PRAGMA incremental_vacuum`
         // (gc({vacuum:"incremental"})) without the offline full rewrite.
@@ -135,8 +143,11 @@ export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
         "PRAGMA synchronous = NORMAL",
         "PRAGMA busy_timeout = 5000",
         "PRAGMA foreign_keys = ON",
-        `PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`,
     ];
+    if (walJournalSizeLimitBytes > 0) {
+        pragmas.push(`PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`);
+    }
+    return pragmas;
 }
 
 export const STORAGE_PRAGMAS = storagePragmas(WAL_JOURNAL_SIZE_LIMIT);
@@ -148,6 +159,7 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
     parent_session_id   TEXT,
     fork_point_seq      INTEGER,
+    fork_egress_watermark INTEGER,
     protocol            TEXT,
     label               TEXT,
     title               TEXT,
@@ -706,6 +718,11 @@ export function migrateSchema(db: {
         .map((c) => (typeof c?.name === "string" ? c.name : ""));
     if (sessionCols.length > 0 && !sessionCols.includes("r3_latched_at")) {
         db.exec("ALTER TABLE sessions ADD COLUMN r3_latched_at INTEGER");
+    }
+    // #7658: the egress fork point (FLOW-clock watermark the four egress
+    // tables were copied at) — probe-first, same discipline as r3_latched_at.
+    if (sessionCols.length > 0 && !sessionCols.includes("fork_egress_watermark")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN fork_egress_watermark INTEGER");
     }
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;
