@@ -51,7 +51,7 @@ export type SymVal =
   // with null/undefined on the other arm — the value is the obj/arr only
   // when nullUnder is FALSE (JS truthiness/field-access must respect it).
   | { kind: "arr"; elems: SymVal[]; len: Num; nullUnder?: Bool<"main">; aliasEntries?: { entry: { fields: Map<string, SymVal> }; match: Bool<"main"> }[] }
-  | { kind: "obj"; fields: Map<string, SymVal>; symFields?: Map<Term, { g: Bool<"main">; v: SymVal }>; nullUnder?: Bool<"main"> }
+  | { kind: "obj"; fields: Map<string, SymVal>; symFields?: Map<Term, { g: Bool<"main">; v: SymVal }>; nullUnder?: Bool<"main">; presence?: Map<string, Bool<"main">> }
   | { kind: "fn"; node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration; env: Frame }
   | { kind: "null" }
   | { kind: "undef" }
@@ -513,6 +513,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
   const portMemo = new Map<string, SymVal>();
 
   let numStrCounter = 0;
+  let lastIdxCounter = 0;
   /** String(number): an uninterpreted decimal string; only its length matters
    * for stability properties (1..19 digits) and the replay lock validates the
    * witness against the real code. */
@@ -639,7 +640,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       const prev = (objSide as { nullUnder?: Bool<"main"> }).nullUnder;
       const tag = prev ? orFold(prev, side) : side;
       return objSide.kind === "obj"
-        ? { kind: "obj", fields: objSide.fields, nullUnder: tag }
+        ? { kind: "obj", fields: objSide.fields, presence: objSide.presence, nullUnder: tag }
         : { kind: "arr", elems: objSide.elems, len: objSide.len, nullUnder: tag };
     }
     // SCALAR-vs-undef/null: TAG instead of drop. `rec[k]` fan reads are
@@ -767,12 +768,30 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       case "obj": {
         const bb = b as Extract<SymVal, { kind: "obj" }>;
         const fields = new Map<string, SymVal>();
+        // presence: per-field `in`-operator guard — the field is present in
+        // the merged object exactly when the LIVE arm had it. No entry ≡
+        // definitely present (const-true guards are omitted).
+        const presence = new Map<string, Bool<"main">>();
         for (const key of new Set([...a.fields.keys(), ...bb.fields.keys()])) {
           const va = a.fields.get(key);
           const vb = bb.fields.get(key);
           if (va && vb) fields.set(key, mergeVal(cond, va, vb));
           else if (va) fields.set(key, guardedNeutral(cond, va));
           else if (vb) fields.set(key, guardedNeutral(cond.not(), vb));
+          const pa = a.presence?.get(key);
+          const pb = bb.presence?.get(key);
+          // pa/pb undefined ≡ "definitely present in that arm" — a key in
+          // only ONE arm is present exactly under that arm's liveness guard.
+          let g: Bool<"main"> | undefined;
+          if (va && vb) {
+            if (pa === undefined && pb === undefined) g = undefined; // present in both arms: tautology
+            else g = orFold(andFold(cond, pa), andFold(cond.not(), pb));
+          } else if (va) {
+            g = andFold(cond, pa);
+          } else {
+            g = andFold(cond.not(), pb);
+          }
+          if (g !== undefined && constBool(g) !== true) presence.set(key, g);
         }
         // merge symbolic-key bindings: present on one arm only means the
         // other arm never wrote it → undefined there (guard survives)
@@ -830,7 +849,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           const buT = bu ? andFold(cond.not(), bu) : undefined;
           nullUnder = orFold(auT ?? null, buT ?? null) ?? undefined;
         }
-        return { kind: "obj", fields, ...(symFields ? { symFields } : {}), ...(nullUnder ? { nullUnder } : {}) };
+        return { kind: "obj", fields, ...(presence.size ? { presence } : {}), ...(symFields ? { symFields } : {}), ...(nullUnder ? { nullUnder } : {}) };
       }
       default: {
         return { kind: "any" };
@@ -1684,25 +1703,31 @@ const mergeBranch = (
     if (ts.isObjectLiteralExpression(expr)) {
       let symFields: Map<Term, { g: Bool<"main">; v: SymVal }> | undefined;
       const fields = new Map<string, SymVal>();
+      // literal props are definitely present; spread keys inherit the
+      // source's presence guards (a later literal prop overrides them).
+      const presence = new Map<string, Bool<"main">>();
       for (const prop of expr.properties) {
         if (ts.isSpreadAssignment(prop)) {
           const v = evalExpr(prop.expression, frame, st, depth);
           if (isObj(v)) {
             for (const [k2, v2] of v.fields) fields.set(k2, v2);
             if (v.symFields) symFields = new Map(v.symFields);
+            if (v.presence) for (const [k2, g2] of v.presence) presence.set(k2, g2);
           }
         } else if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name)) {
           const pv = evalExpr(prop.initializer, frame, st, depth);
           fields.set(prop.name.text, pv);
+          presence.delete(prop.name.text);
         } else if (ts.isShorthandPropertyAssignment(prop)) {
           const sv0 = evalExpr(prop.name, frame, st, depth);
           const sv = sv0 === undefined || sv0.kind === undefined ? (() => { console.log(`[AT-UNDEF] shorthand ${prop.name.text}:`, JSON.stringify(frame.vars.get(prop.name.text), (k, v) => (k === "kids" ? "…" : v))?.slice(0, 220)); return { kind: "any" as const }; })() : sv0;
           fields.set(prop.name.text, sv);
+          presence.delete(prop.name.text);
         } else {
           degrade(st, prop, "object literal member");
         }
       }
-      return { kind: "obj", fields, ...(symFields ? { symFields } : {}) };
+      return { kind: "obj", fields, ...(presence.size ? { presence } : {}), ...(symFields ? { symFields } : {}) };
     }
       if (ts.isPropertyAccessExpression(expr)) {
       const obj = evalExpr(expr.expression, frame, st, depth);
@@ -1745,8 +1770,13 @@ const mergeBranch = (
         const idx = evalExpr(t.argumentExpression, frame, st, depth);
         if (isObj(base) && isStr(idx)) {
           const fields = new Map(base.fields);
+          // presence: a symbolic-key delete makes each key absent exactly
+          // when the index equals it — `in` must not report a deleted key.
+          const presence = base.presence ? new Map(base.presence) : new Map<string, Bool<"main">>();
           for (const key of [...fields.keys()]) {
             fields.set(key, iteVal(idx.t.eq(ctx.String.val(key)), { kind: "undef" }, fields.get(key)!));
+            const g = andFold(presence.get(key), notFold(idx.t.eq(ctx.String.val(key))));
+            if (g !== undefined) presence.set(key, g);
           }
           // symbolic-key delete: drop symFields entries whose key matches the
           // index term (structural identity) — the merge machinery then folds
@@ -1760,7 +1790,7 @@ const mergeBranch = (
               }
             }
           }
-          const newObj: SymVal = { kind: "obj", fields, ...(symFields ? { symFields } : {}) };
+          const newObj: SymVal = { kind: "obj", fields, presence, ...(symFields ? { symFields } : {}) };
           writeLValue(t.expression, newObj, frame, st, depth);
           return { kind: "bool", t: bool(ctx, true) };
         }
@@ -1769,13 +1799,16 @@ const mergeBranch = (
         if (isObj(base)) {
           const fields = new Map(base.fields);
           fields.set(t.name.text, { kind: "undef" });
+          // `delete obj.k` removes the property: `in` must report false.
+          const presence = base.presence ? new Map(base.presence) : new Map<string, Bool<"main">>();
+          presence.set(t.name.text, bool(ctx, false));
           // JS reference semantics — mirror the member-write path
           // (`rec.id = v`): delete MUTATES the object in place; every
           // container still holding `base` must see the field vanish.
           // Rebinding only the local alias left the mutation invisible to
           // the caller's array slots once loop-iteration merges rebuilt
           // them (identity-based pair replay missed the fresh slot objs).
-          const newObj: SymVal = { kind: "obj", fields, ...(base.symFields ? { symFields: new Map(base.symFields) } : {}) };
+          const newObj: SymVal = { kind: "obj", fields, presence, ...(base.symFields ? { symFields: new Map(base.symFields) } : {}) };
           if (pathIsUnconditional(st.pathCond)) st.mutations!.push({ old: base, next: newObj });
           replaceAliasInFrame(frame, base, newObj);
           writeLValue(t.expression, newObj, frame, st, depth);
@@ -1917,7 +1950,7 @@ const mergeBranch = (
         let hit = false;
         const nf: Map<string, SymVal> = new Map(vv.fields);
         for (const [fk, fv] of nf) if (fv === base) { nf.set(fk, newObj); hit = true; }
-        if (hit) frame.vars.set(vn, { kind: "obj", fields: nf, ...(vv.symFields ? { symFields: new Map(vv.symFields) } : {}) } as SymVal);
+        if (hit) frame.vars.set(vn, { kind: "obj", fields: nf, presence: vv.presence, ...(vv.symFields ? { symFields: new Map(vv.symFields) } : {}) } as SymVal);
       }
     }
   };
@@ -1952,9 +1985,12 @@ const mergeBranch = (
         if (isArr(rootArr) && isNum(idxV) && !isNumConstV(idxV)) {
           const fname = target.name.text;
           const elems = rootArr.elems.map((e, k) => {
-            const withField: SymVal = isObj(e)
-              ? { kind: "obj", fields: new Map([...e.fields, [fname, value]]), ...(e.symFields ? { symFields: new Map(e.symFields) } : {}) } as SymVal
-              : e;
+            let withField: SymVal = e;
+            if (isObj(e)) {
+              const p = e.presence ? new Map(e.presence) : undefined;
+              p?.delete(fname);
+              withField = { kind: "obj", fields: new Map([...e.fields, [fname, value]]), ...(p ? { presence: p } : {}), ...(e.symFields ? { symFields: new Map(e.symFields) } : {}) } as SymVal;
+            }
             return iteVal(numEq(ctx, idxV.t, num(ctx, k)), withField, e);
           });
           const newRoot: SymVal = { kind: "arr", elems, len: rootArr.len } as SymVal;
@@ -1965,7 +2001,9 @@ const mergeBranch = (
       if (isObj(base)) {
         const fields = new Map(base.fields);
         fields.set(target.name.text, value);
-        const newObj = { kind: "obj", fields, ...(base.symFields ? { symFields: new Map(base.symFields) } : {}) } as SymVal;
+        const p = base.presence ? new Map(base.presence) : undefined;
+        p?.delete(target.name.text);
+        const newObj = { kind: "obj", fields, ...(p ? { presence: p } : {}), ...(base.symFields ? { symFields: new Map(base.symFields) } : {}) } as SymVal;
         // JS reference semantics: the same object is reachable from its
         // containers (`const host = msgs[k]` / find()) — a field write must
         // be visible through every array (and one level of object field)
@@ -1998,10 +2036,12 @@ const mergeBranch = (
         // write is observable when the key matches nothing present (the
         // solver decides equality).
         const fields = new Map(base.fields);
+        const p = base.presence ? new Map(base.presence) : undefined;
         let symFields: Map<Term, { g: Bool<"main">; v: SymVal }> | undefined;
         const idxC = idx.t.c;
         if (typeof idxC === "string" && idx.t.sort === "String" && (idx.t.kids?.length ?? 0) === 0) {
           fields.set(idxC, value);
+          p?.delete(idxC);
         } else {
           for (const key of [...fields.keys()]) {
             fields.set(key, iteVal(strEqF(ctx, idx.t, ctx.String.val(key)), value, fields.get(key)!));
@@ -2013,7 +2053,7 @@ const mergeBranch = (
           symFields.delete(idx.t);
           symFields.set(idx.t, { g: bool(ctx, true), v: value });
         }
-        const newObj: SymVal = { kind: "obj", fields, ...(symFields ? { symFields } : {}) };
+        const newObj: SymVal = { kind: "obj", fields, ...(p ? { presence: p } : {}), ...(symFields ? { symFields } : {}) };
         if (pathIsUnconditional(st.pathCond)) st.mutations!.push({ old: base, next: newObj });
         // JS reference semantics: rec[k] = v must be visible through every
         // container still holding base (same rule as the member-write path).
@@ -2154,6 +2194,19 @@ const mergeBranch = (
             return { kind: "bool", t: kindMatch ? uu : bool(ctx, false) };
           }
           return { kind: "bool", t: kindMatch ? notFold(uu) : bool(ctx, true) };
+        }
+      }
+    }
+    // `K in obj` (const key): a plain fields entry means the key was written
+    // (present); a merged object carries a per-field presence guard; a key
+    // known absent (deleted) is const-false. Symbolic keys / dynamic
+    // fields (symFields) degrade as before.
+    if (op === ts.SyntaxKind.InKeyword) {
+      if (isStr(l) && isObj(r)) {
+        const k = strConst.get(l.t);
+        if (k !== undefined) {
+          if (r.fields.has(k)) return { kind: "bool", t: r.presence?.get(k) ?? bool(ctx, true) };
+          if (!r.symFields) return { kind: "bool", t: bool(ctx, false) };
         }
       }
     }
@@ -3012,6 +3065,20 @@ const mergeBranch = (
           if (rc !== undefined && ac !== undefined) return { kind: "num", t: num(ctx, rc.indexOf(ac)) };
           return { kind: "num", t: recv.t.indexOf(a0) };
         }
+        case "lastIndexOf": {
+          const a0 = isStr(args[0]) ? args[0].t : null;
+          if (!a0) return { kind: "any" };
+          const rc = strConst.get(recv.t), ac = strConst.get(a0);
+          if (rc !== undefined && ac !== undefined) return { kind: "num", t: num(ctx, rc.lastIndexOf(ac)) };
+          // Symbolic: over-approximate as an integer in [-1, len(recv) - len(a0)]
+          // (the JS result range) — consumers compare or slice, both sound
+          // under the bound.
+          const t = ctx.Real.const(`__lastidx_${lastIdxCounter++}`);
+          pushAsum(st, ctx.IsInt(t));
+          pushAsum(st, t.ge(num(ctx, -1)));
+          pushAsum(st, t.le(lenR(recv.t).sub(lenR(a0))));
+          return { kind: "num", t: t };
+        }
         case "slice":
         case "substring": {
           // known string + full-range slice is the identity (keeps JSON.parse
@@ -3239,7 +3306,9 @@ const mergeBranch = (
         const fields = new Map(parentVal.fields);
         if (!ts.isPropertyAccessExpression(hop)) return newArr; // element-middle chains: root rebind only
         fields.set(hop.name.text, rebuilt);
-        rebuilt = { kind: "obj", fields, symFields: parentVal.symFields ? new Map(parentVal.symFields) : undefined } as Extract<SymVal, { kind: "obj" }>;
+        const p = parentVal.presence ? new Map(parentVal.presence) : undefined;
+        p?.delete(hop.name.text);
+        rebuilt = { kind: "obj", fields, presence: p, symFields: parentVal.symFields ? new Map(parentVal.symFields) : undefined } as Extract<SymVal, { kind: "obj" }>;
       }
       frame.vars.set(root, rebuilt);
       return rebuilt;
@@ -3395,7 +3464,7 @@ const mergeBranch = (
             acc = isArr(mergedV) && isArr(got)
               ? { kind: "arr", elems: (mergedV as { elems: SymVal[] }).elems, len: (mergedV as { len: Term }).len, nullUnder: chainNull }
               : isObj(mergedV) && isObj(got)
-                ? { kind: "obj", fields: (mergedV as { fields: Map<string, SymVal> }).fields, nullUnder: chainNull, ...((mergedV as { symFields?: unknown }).symFields ? { symFields: (mergedV as { symFields: Map<Term, { g: Bool<"main">; v: SymVal }> }).symFields } : {}) }
+                ? { kind: "obj", fields: (mergedV as { fields: Map<string, SymVal> }).fields, presence: (mergedV as { presence?: Map<string, Bool<"main">> }).presence, nullUnder: chainNull, ...((mergedV as { symFields?: unknown }).symFields ? { symFields: (mergedV as { symFields: Map<Term, { g: Bool<"main">; v: SymVal }> }).symFields } : {}) }
                 : (mergedV.kind === "num" || mergedV.kind === "str" || mergedV.kind === "bool")
                   ? { ...(mergedV as Extract<SymVal, { kind: "num" | "str" | "bool" }>), undefUnder: chainNull }
                   : mergedV;

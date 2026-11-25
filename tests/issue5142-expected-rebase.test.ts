@@ -469,7 +469,7 @@ describe("#5142 carrier classifier units", () => {
     test("dshCarrierRawMarkers stay in lockstep with the dsh lane classifiers", () => {
         const cls = oneShotCarrierPaths.dsh;
         assert.ok(cls !== undefined, "dsh lane must have a classifier registry entry");
-        assert.ok(dshCarrierRawMarkers.length >= 15, "fifteen raw markers for the twelve known dsh carrier families (runtime-context, mnemon, image-offload each contribute two)");
+        assert.ok(dshCarrierRawMarkers.length >= 18, "eighteen raw markers for the twelve known dsh carrier families");
         // Markers that only occur mid-template need their fixed left context to
         // be a standalone classifiable shape (the relay wrapper's sender-id slot
         // varies, so the joint alone cannot classify).
@@ -479,13 +479,19 @@ describe("#5142 carrier classifier units", () => {
             // frame, so the marker alone is no longer a classifiable shape.
             "\x3cavailable_skills\x3e": "\x3csystem-reminder\x3e\n",
             "Instructions from:": "\x3csystem-reminder\x3e\n",
+            // #4922: the workspace-instructions classifiers are anchored AND
+            // require a non-empty path after the colon, so those markers also
+            // need a sample path appended (their real rows always carry one).
+            "Updated instructions from:": "\x3csystem-reminder\x3e ",
+            "Additional instructions from:": "\x3csystem-reminder\x3e ",
+            "Instructions removed:": "\x3csystem-reminder\x3e ",
         };
-        // #7153: the two notice families also need their right context — the
-        // emitter puts a job id / a settlement ending after the marker, and a
-        // bare "background job"/"Background subagent " prefix is ordinary prose.
         const MARKER_SUFFIX: Record<string, string> = {
             "background job": ' bash-1 (bash: "true") finished [status: completed]',
             "Background subagent ": "session-1 finished.",
+            "Updated instructions from:": "/x/AGENTS.md",
+            "Additional instructions from:": "/x/AGENTS.md",
+            "Instructions removed:": "/x/AGENTS.md",
         };
         for (const marker of dshCarrierRawMarkers) {
             const text = `${MARKER_CONTEXT[marker] ?? ""}${marker}${MARKER_SUFFIX[marker] ?? ""}`;
