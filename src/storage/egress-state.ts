@@ -27,8 +27,16 @@
  *             wholesale to the new session_id (egressFork) — the child
  *             inherits the parent's full number space and its retired marks,
  *             so the child's next number continues where the parent stopped.
- *             The model-facing mNNNNN (kernel-space) stays a display id; the
- *             join between the two spaces is the I row itself.
+ *             **Renumber (2026-11-25, egress-plane.md §10): log_seq IS the
+ *             kernel citation number** — the model-facing mNNNNN (kernel
+ *             space) is m + log_seq, one number, not two. I ops may carry an
+ *             explicit `num` (the kernel's ledger number for that msgid, read
+ *             at record time); the dense high-water+1 counter survives only
+ *             as the fallback for a row whose id has no ledger entry. The
+ *             constant system row is number 0 — OUTSIDE the citation space
+ *             (which starts at 1), so "the system prompt does not take a
+ *             message ref" is true by construction; 0 is valid only on the
+ *             egress-system msgid, every other row must carry >= 1.
  *
  * Two tables (dual-table, owner ruling):
  *   egress_state  — what serving reads; compaction PHYSICALLY deletes rows
@@ -90,15 +98,26 @@ export class EgressConcurrentWriteError extends Error {
     }
 }
 
+/** Constant msgid of the system row (no hash — identity is the role, not
+ * the content; a system change is a +U carrying the new bytes). Renumber
+ * (2026-11-25): the system row is canonical number 0 — outside the citation
+ * space, so it can never claim m00001. Defined HERE (the low layer) so the
+ * replay validation can name it without importing egress-record (which
+ * imports this module). */
+export const EGRESS_SYSTEM_MSGID = "egress-system";
+
 /** One row of the current view. The ref (mNNNNN) is the kernel-space
  * display identity, never hash and never re-issued (kernel contract).
  * `num` is the canonical session-scoped message number (ruling 7439): real
- * rows always carry num >= 1; an in-process row built before its I row is
- * appended carries 0 (unnumbered) and is stamped by the replay at record
- * time — 0 must never reach a stored row. `bytes` is the message's FINAL
- * core JSON (post reasoning-drop / image-rescale, pre outbound convert);
- * for the system row it is the system text itself. The row is
- * self-contained: replay + serve need nothing beyond this pair of tables. */
+ * rows always carry num >= 1 — EXCEPT the system row, which carries 0 by
+ * construction (renumber 2026-11-25: the citation space starts at 1; the
+ * system row is bookkeeping, not a message). An in-process row built before
+ * its I row is appended may carry 0 (unnumbered) for a REAL message and is
+ * stamped by the replay at record time — a real message must never STORE a
+ * 0. `bytes` is the message's FINAL core JSON (post reasoning-drop /
+ * image-rescale, pre outbound convert); for the system row it is the
+ * system text itself. The row is self-contained: replay + serve need
+ * nothing beyond this pair of tables. */
 export interface EgressViewRow {
     /** Canonical session-scoped message number (0 = not numbered yet). */
     num: number;
@@ -204,6 +223,18 @@ interface InsertOp {
     /** First-observed wall clock (epoch ms) — stamped by recordEgressTurn
      *  (#7577 D3); the I row is the message's birth, so this is its ts. */
     ts?: number;
+    /** Renumber (2026-11-25): the kernel's citation number for this msgid
+     *  (mNNNNN minus the prefix) — the op's log_seq when present and > 0.
+     *  Absent (or 0) = the dense high-water+1 fallback. Never smaller than
+     *  the current high water (kernel numbers are one-shot and the log's
+     *  high water includes every retired number, so a cited number for a
+     *  genuinely new id IS high-water+1 — the two agree by construction). */
+    num?: number;
+    /** System row only: the CLIENT RAW system text (input form A) — the
+     *  flow row's bytes are the assembled outbound (A + server blocks);
+     *  A gains its home inside the egress tables here (renumber 2026-11-25,
+     *  egress-plane.md §10; retires the session_ext inc:system copy). */
+    sysIn?: string;
 }
 interface DeleteOp {
     type: "D";
@@ -215,6 +246,8 @@ interface UpdateOp {
     msgid: string;
     bytes: string;
     role?: string;
+    /** System row only: the new client raw system text (see InsertOp). */
+    sysIn?: string;
 }
 export type EgressOp = InsertOp | DeleteOp | UpdateOp;
 
@@ -229,8 +262,10 @@ function egressViewHighWater(view: EgressViewRow[]): number {
 
 /** Pure replay: apply ops (in op order) on top of an existing view.
  * Shared by the db-backed replays and the diff engine's own verification.
- * Insert ops receive the next canonical numbers in op order
- * (high-water(prev) + 1, + 2, …) — the SAME rule the append uses, so the
+ * Insert ops take their canonical number from the op when the op carries an
+ * explicit `num` (the kernel citation number, renumber 2026-11-25) — the
+ * cursor tracks past it — otherwise the next dense number in op order
+ * (high-water(prev) + 1, + 2, …): the SAME rule the append uses, so the
  * replayed view is exactly the stamped view the tables would produce.
  * `startHigh` overrides high-water(prev): the append passes the cursor it
  * read from the flow, which includes numbers of rows a compaction retired
@@ -239,6 +274,21 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
     const view: EgressViewRow[] = prev.map((r) => ({ ...r }));
     const idxOf = (msgid: string): number => view.findIndex((r) => r.msgid === msgid);
     let num = startHigh ?? egressViewHighWater(view);
+    // Renumber (2026-11-25) — citation rules:
+    //  - the live set's numbers must stay UNIQUE; a cited number is
+    //    authoritative (kernel ledger), even below the high water — a fold
+    //    summary may legitimately take a slot a D retired in the same batch,
+    //    or one retired earlier. Only a collision with a row that is LIVE
+    //    at the op's position (or with a sibling op in this batch) is
+    //    corrupt.
+    //  - an UNCITED row takes the dense fallback ABOVE every number the
+    //    batch cites, so it can never squat a citation that arrives later
+    //    in the same batch (a kernel-generated summary has no refs entry
+    //    while the host's fold cell does — both land in one turn).
+    const liveNums = new Set<number>();
+    for (const r of view) if (r.num > 0) liveNums.add(r.num);
+    let maxCited = 0;
+    for (const op of ops) if (op.type === "I" && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
     for (const op of ops) {
         if (op.type === "I") {
             if (idxOf(op.msgid) >= 0) throw new EgressStateCorruptError(sessionId, `duplicate msgid ${op.msgid}`);
@@ -248,8 +298,25 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
             // the row at index 0 in silence.
             const at = op.after === null ? -1 : idxOf(op.after);
             if (at === -1 && op.after !== null) throw new EgressStateCorruptError(sessionId, `insert anchor ${op.after} missing`);
-            num += 1;
-            const entry: EgressViewRow = { num, msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, bytes: op.bytes };
+            const isSystem = op.msgid === EGRESS_SYSTEM_MSGID;
+            let assign = 0;
+            if (isSystem) {
+                num = Math.max(num, 0);
+                assign = 0;
+            } else {
+                const cited = typeof op.num === "number" && op.num > 0 ? op.num : 0;
+                if (cited > 0) {
+                    if (liveNums.has(cited)) throw new EgressStateCorruptError(sessionId, `cited number ${cited} is already live (msgid ${op.msgid})`);
+                    liveNums.add(cited);
+                    assign = cited;
+                    num = Math.max(num, cited);
+                } else {
+                    num = Math.max(num, maxCited) + 1;
+                    liveNums.add(num);
+                    assign = num;
+                }
+            }
+            const entry: EgressViewRow = { num: assign, msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, bytes: op.bytes };
             if (op.role !== undefined) entry.role = op.role;
             if (op.ts !== undefined) entry.ts = op.ts;
             view.splice(at + 1, 0, entry);
@@ -259,6 +326,10 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
             if (s < 0) throw new EgressStateCorruptError(sessionId, `delete start ${op.start} missing`);
             if (e < 0) throw new EgressStateCorruptError(sessionId, `delete end ${op.end} missing`);
             if (s > e) throw new EgressStateCorruptError(sessionId, "delete range inverted");
+            for (let i = s; i <= e; i++) {
+                const r = view[i];
+                if (r !== undefined && r.num > 0) liveNums.delete(r.num);
+            }
             view.splice(s, e - s + 1);
         } else {
             const i = idxOf(op.msgid);
@@ -328,6 +399,10 @@ export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[]): Eg
         if (!spine.has(r.msgid)) {
             const ins: InsertOp = { type: "I", msgid: r.msgid, after: last, ref: r.ref, tokens: r.tokens, typeTag: r.type, bytes: r.bytes };
             if (r.role !== undefined) ins.role = r.role;
+            // Renumber (2026-11-25): a next-view row may already carry its
+            // kernel citation number (recordEgressTurn stamps it from the
+            // refs ledger); the I op preserves it.
+            if (typeof r.num === "number" && r.num > 0) ins.num = r.num;
             ops.push(ins);
         }
         last = r.msgid;
@@ -342,22 +417,51 @@ function writeOp(db: SqliteDatabase, sessionId: string, opSeq: number, logSeq: n
 }
 
 /** Write a batch of ops as twin pairs. Every op gets the next op_seq; each I
- * op ALSO gets the next canonical number (dense; the cursor starts past
- * every number ever issued, retired ones included) — D/U ops occupy op_seq
- * slots but no numbers. The caller has already validated the batch against
- * the log as it is. */
+ * op ALSO gets its canonical number — the kernel citation number when the op
+ * carries an explicit `num` (renumber 2026-11-25), the dense high-water+1
+ * fallback otherwise (the cursor starts past every number ever issued,
+ * retired ones included) — D/U ops occupy op_seq slots but no numbers.
+ * The system row (no citation) stores log_seq 0. The caller has already
+ * validated the batch against the log as it is. */
 function writeOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], firstOpSeq: number, firstNum: number, nowMs: number): void {
     let num = firstNum - 1;
+    // Mirror egressReplay exactly (it already validated the batch): the
+    // dense fallback for an uncited row lands ABOVE every number the batch
+    // cites, and a cited row below the cursor is legal when its slot is
+    // retired (fold re-homing).
+    let maxCited = 0;
+    for (const op of ops) if (op.type === "I" && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
     for (let i = 0; i < ops.length; i++) {
         const op = ops[i];
         const opSeq = firstOpSeq + i;
         if (op.type === "I") {
-            num += 1;
-            writeOp(db, sessionId, opSeq, num, "I", op.msgid, JSON.stringify({ after: op.after, ref: op.ref, tokens: op.tokens, type: op.typeTag, role: op.role, ts: op.ts }), op.bytes, nowMs);
+            const isSystem = op.msgid === EGRESS_SYSTEM_MSGID;
+            // The system row stores 0 WITHOUT advancing the cursor — the
+            // replay's system branch (egressReplay) does not advance either;
+            // advancing here would retire number 1 on every session and
+            // store/replay would disagree by one.
+            if (!isSystem) {
+                const cited = typeof op.num === "number" && op.num > 0 ? op.num : 0;
+                if (cited > 0) {
+                    // A cited row stores ITS citation even when it sits below
+                    // the cursor (retired-slot re-homing); the cursor still
+                    // tracks the max.
+                    num = Math.max(num, cited);
+                } else {
+                    num = Math.max(num, maxCited) + 1;
+                }
+            }
+            const payload: Record<string, unknown> = { after: op.after, ref: op.ref, tokens: op.tokens, type: op.typeTag, role: op.role, ts: op.ts };
+            if (op.sysIn !== undefined) payload["sysIn"] = op.sysIn;
+            const citedLog = !isSystem && typeof op.num === "number" && op.num > 0 ? op.num : 0;
+            const logSeq = isSystem ? 0 : (citedLog > 0 ? citedLog : num);
+            writeOp(db, sessionId, opSeq, logSeq, "I", op.msgid, JSON.stringify(payload), op.bytes, nowMs);
         } else if (op.type === "D") {
             writeOp(db, sessionId, opSeq, null, "D", null, JSON.stringify({ start: op.start, end: op.end }), null, nowMs);
         } else {
-            writeOp(db, sessionId, opSeq, null, "U", op.msgid, JSON.stringify({ role: op.role }), op.bytes, nowMs);
+            const payload: Record<string, unknown> = { role: op.role };
+            if (op.sysIn !== undefined) payload["sysIn"] = op.sysIn;
+            writeOp(db, sessionId, opSeq, null, "U", op.msgid, JSON.stringify(payload), op.bytes, nowMs);
         }
     }
 }
@@ -372,7 +476,8 @@ function writeOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], firstO
  * base form has). Runs inside the caller's transaction. */
 function writeBase(db: SqliteDatabase, sessionId: string, view: EgressViewRow[], highWater: number, nowMs: number): number {
     for (const e of view) {
-        if (typeof e.num !== "number" || e.num < 1) {
+        // Renumber (2026-11-25): the system row carries 0; every real row >= 1.
+        if (typeof e.num !== "number" || (e.msgid === EGRESS_SYSTEM_MSGID ? e.num !== 0 : e.num < 1)) {
             throw new EgressStateCorruptError(sessionId, `compact base entry ${e.msgid} has no canonical number`);
         }
     }
@@ -632,15 +737,20 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
                 if (seen.has(e.msgid)) throw new EgressStateCorruptError(sessionId, `duplicate msgid ${e.msgid} in base at op_seq=${row.op_seq}`);
                 seen.add(e.msgid);
             }
-            if (view.some((e) => typeof e.num !== "number" || e.num < 1 || typeof e.msgid !== "string" || typeof e.ref !== "string" || typeof e.bytes !== "string")) {
-                throw new EgressStateCorruptError(sessionId, `base at op_seq=${row.op_seq} has malformed entries`);
+            for (const e of view) {
+                const shapeOk = typeof e.msgid === "string" && typeof e.ref === "string" && typeof e.bytes === "string" && typeof e.num === "number";
+                const numOk = e.msgid === EGRESS_SYSTEM_MSGID ? e.num === 0 : e.num >= 1;
+                if (!shapeOk || !numOk) throw new EgressStateCorruptError(sessionId, `base at op_seq=${row.op_seq} has malformed entries`);
             }
             continue;
         }
         const idxOf = (msgid: string): number => view.findIndex((e) => e.msgid === msgid);
         if (row.row_type === "I") {
             if (typeof row.msgid !== "string") throw new EgressStateCorruptError(sessionId, `insert at op_seq=${row.op_seq} has no msgid`);
-            if (typeof row.log_seq !== "number" || row.log_seq < 1) throw new EgressStateCorruptError(sessionId, `insert at op_seq=${row.op_seq} has no canonical number`);
+            // Renumber (2026-11-25): 0 is the system row's number (outside
+            // the citation space); every real message stores >= 1.
+            const isSystem = row.msgid === EGRESS_SYSTEM_MSGID;
+            if (typeof row.log_seq !== "number" || (row.log_seq < (isSystem ? 0 : 1) || (isSystem && row.log_seq !== 0))) throw new EgressStateCorruptError(sessionId, `insert at op_seq=${row.op_seq} has no canonical number`);
             if (idxOf(row.msgid) >= 0) throw new EgressStateCorruptError(sessionId, `duplicate msgid ${row.msgid} at op_seq=${row.op_seq}`);
             if (typeof p.ref !== "string" || typeof p.tokens !== "number" || typeof p.type !== "string" || typeof row.bytes !== "string") {
                 throw new EgressStateCorruptError(sessionId, `insert at op_seq=${row.op_seq} has a malformed payload or missing bytes`);
