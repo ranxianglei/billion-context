@@ -25,6 +25,8 @@ This module answers three questions per request: who carried it in (which host, 
 
 **The resolver.** `lane-decisions.ts` matches request shape × session sticky binding (+ one planned row for the #5643 foundation lane, negative+positive pair) and picks: incremental plugin-turn lane / v5 watermark / D-lane snapshot render / legacy full-resend.
 
+**Egress plane (KDD #23, [egress-plane.md](../egress-plane.md)).** Armed plugin sessions — `egressPlane` on + a pin has landed + not a side request — do NOT run on the four lanes above: the op log (`egress_flow`) is their outbound authority, the pin channel resolves its I rows, and stage-0 identity is stateless (no ledger, no resync, #7617). Everything that is not armed runs on the lanes.
+
 **Processing lanes.** See the [fastpaths module](./fastpaths.md) for the three fast lanes; legacy full-resend is the default for every shape and the fallback safety net for all of them.
 
 ## Key entries

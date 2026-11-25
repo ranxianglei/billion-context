@@ -25,6 +25,8 @@
 
 **裁决器。** `lane-decisions.ts` 匹配请求形状 × 会话粘滞绑定（外加 #5643 底座车道的一行，正负成对），逐请求选出：增量 plugin-turn / v5 水位 / D-lane 快照渲染 / legacy 全量重发。
 
+**egress 平面（KDD #23，[egress-plane.md](../egress-plane.zh-CN.md)）。** 已 armed 的插件会话（`egressPlane` 开 + pin 已落 + 非 side 请求）**不走**上面四条车道：op log（`egress_flow`）就是它的出站正史、pin 通道解析它的 I 行、stage-0 身份无状态（无账本、无 resync，#7617）。未 armed 的会话照常走车道。
+
 **处理车道。** 三条快车道见 [fastpaths 模块](./fastpaths.zh-CN.md)；legacy 全量重发是所有形状的默认、也是所有快车道的兜底安全网。
 
 ## 关键入口

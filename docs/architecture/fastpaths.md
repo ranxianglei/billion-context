@@ -37,4 +37,4 @@ Skips: whole-body `JSON.parse` + `openaiToCore` (v5); `snapshotMessages` prefix 
 
 ## Related
 
-[lanes](./lanes.md) · [pipeline](./pipeline.md) · [identity](./identity.md) · [#5643 evolution: all four converge onto the snapshot-table foundation](https://github.com/ranxianglei/billion-context/issues/5643) · `tests/issue5403-watermark-fastpath.test.ts`
+[lanes](./lanes.md) · [pipeline](./pipeline.md) · [identity](./identity.md) · [#5643 evolution: all four converge onto the snapshot-table foundation](https://github.com/ranxianglei/billion-context/issues/5643) · [deprecations register](../deprecations.md) (retirement gates for D-lane / `l1_world` / `conversations`) · `tests/issue5403-watermark-fastpath.test.ts`

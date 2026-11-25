@@ -37,4 +37,4 @@
 
 ## 関連
 
-[lanes](./lanes.md) · [pipeline](./pipeline.md) · [identity](./identity.md) · [#5643 進化: 4つすべてがスナップショットテーブル基盤に収束](https://github.com/ranxianglei/billion-context/issues/5643) · `tests/issue5403-watermark-fastpath.test.ts`
+[lanes](./lanes.md) · [pipeline](./pipeline.md) · [identity](./identity.md) · [#5643 進化: 4つすべてがスナップショットテーブル基盤に収束](https://github.com/ranxianglei/billion-context/issues/5643) · [非推奨台帳](../deprecations.md)（D レーン / `l1_world` / `conversations` の退役ゲート） · `tests/issue5403-watermark-fastpath.test.ts`
