@@ -73,9 +73,12 @@ const snapOn = (() => {
   return !!s && s !== "0" && s !== "off";
 })();
 const rolloutCfg = snapOn ? { rollout: { features: { egressPlane: true } } } : {};
+// Hermetic driver (tests/wire-lane-e2e.test.ts): GATE_WIRE_CAND_DIR points at
+// an already-built candidate, skipping the npm install of a packed tarball.
+const CAND_DIR = env("GATE_WIRE_CAND_DIR", "");
 
-if (!TGZ || !fs.existsSync(TGZ) || !MODEL_BASE) {
-  console.error("wire-lanes: TGZ and MODEL1_BASE_URL are required");
+if (!CAND_DIR && (!TGZ || !fs.existsSync(TGZ) || !MODEL_BASE)) {
+  console.error("wire-lanes: TGZ and MODEL1_BASE_URL are required (or GATE_WIRE_CAND_DIR)");
   process.exit(2);
 }
 if (env("GATE_SKIP", "").toLowerCase().split(",").filter(Boolean).includes("w")) {
@@ -159,9 +162,13 @@ function buildChat(text) {
 }
 function buildAnthropic(text) {
   const newId = nid();
+  // DIRECT /v1/messages wire elements ({role, content:[...]}) — the wrapped
+  // {type, message} shape is the RESPONSES-API item format and makes the
+  // anthropic parser throw ("blocks is not iterable"), which silently
+  // degraded the lane to a raw passthrough (same vacuous-pass trap as C7).
   const msgs = [...transcript, { id: newId, text, role: "user" }].map((t) => ({
-    type: t.role,
-    message: { role: t.role, content: [{ type: "text", text: t.text }] },
+    role: t.role,
+    content: [{ type: "text", text: t.text }],
   }));
   return { body: { model: MODEL, stream: false, max_tokens: 1024, messages: msgs, biliMsgIds: [...transcript.map((t) => t.id), newId] }, newId };
 }
@@ -191,10 +198,15 @@ const DOOR_MISSING = (status, body) =>
 async function main() {
   log(`-- lane W: mid-session wire switch (plane ${snapOn ? "ON" : "OFF"})`);
 
-  // candidate install
-  const prefix = path.join(LANE_DIR, "npm-prefix");
-  must("npm", ["install", "--prefix", prefix, "--no-audit", "--no-fund", TGZ]);
-  const cand = path.join(prefix, "node_modules", "billion-context");
+  // candidate install (or the hermetic prebuilt dir)
+  let cand;
+  if (CAND_DIR) {
+    cand = CAND_DIR;
+  } else {
+    const prefix = path.join(LANE_DIR, "npm-prefix");
+    must("npm", ["install", "--prefix", prefix, "--no-audit", "--no-fund", TGZ]);
+    cand = path.join(prefix, "node_modules", "billion-context");
+  }
   const candPkg = JSON.parse(fs.readFileSync(path.join(cand, "package.json"), "utf8"));
   log(`  candidate ${candPkg.version}`);
 
@@ -261,6 +273,12 @@ async function main() {
   };
 
   try {
+    // Anti-vacuous guard: if a turn's wire shape was wrong, the kernel catch
+    // forwards the client bytes unchanged and bili.log says so — a 200 alone
+    // proves nothing then (the C7 vacuous-green trap).
+    const noKernelBypass = (label, sinceLogLen) =>
+      record(`${label} no kernel-transform bypass in bili.log`, !/kernel transform failed/.test(readLog().slice(sinceLogLen)), readLog().slice(sinceLogLen).match(/kernel transform failed[^(\n]*)/)?.[0]?.slice(0, 120) ?? "");
+
     const corpus = buildCorpus(CORPUS_TOKENS);
     const t1q = `A long document follows. Which GATE-MARK-Sxx markers does it contain? List every marker you find, nothing else.\n\n${corpus}`;
 
@@ -268,6 +286,7 @@ async function main() {
     const t1 = await turn("chat", (t) => buildChat(t), BIG_WINDOW);
     t1.q = t1q;
     record("t1 chat-wire turn completes", t1.status === 200, `status ${t1.status} ${t1.body.slice(0, 120)}`);
+    noKernelBypass("t1", 0);
     const t1marks = MARKERS.filter((m) => t1.out.includes(m));
     record("t1 echoes >= 8 of 12 markers", t1marks.length >= 8, `saw ${t1marks.length}: ${t1marks.slice(0, 4).join(",")}${t1marks.length > 4 ? "…" : ""}`);
     if (t1.status !== 200 || t1marks.length < 8) { log("lane W aborted after t1"); finish(); return; }
@@ -275,6 +294,7 @@ async function main() {
     // ---- t2: chat wire, SMALL window — fold pressure ----------------------
     const t2 = await turn("chat", () => buildChat("Recap: how many markers were in the document? Answer with the count and the word DONE."), SMALL_WINDOW);
     record("t2 fold-pressure turn completes (no 500/422)", t2.status === 200, `status ${t2.status} ${t2.body.slice(0, 160)}`);
+    noKernelBypass("t2", 0);
     if (t2.status !== 200) { finish(); return; }
 
     const logBefore3 = readLog();
@@ -297,6 +317,7 @@ async function main() {
     const log3 = readLog();
     record("t3 [lane-switch] line fired (openai -> anthropic)", /\[lane-switch\][^\n]*openai\s*->\s*anthropic/.test(log3.slice(logBefore3.length)), log3.slice(logBefore3.length).match(/\[lane-switch\][^\n]*/)?.[0]?.slice(0, 160) ?? "no lane-switch line");
     record("t3 no pin rejection / unreadable", !/pin rejected|unreadable/.test(log3), "");
+    noKernelBypass("t3", logBefore3.length);
 
     // ---- t4: SWITCH to responses wire (switch #2) -------------------------
     const recBefore4 = fs.existsSync(recOut) ? fs.readFileSync(recOut, "utf8").split("\n").length : 0;
@@ -315,6 +336,7 @@ async function main() {
     const log4 = readLog();
     record("t4 [lane-switch] line fired (anthropic -> responses, switch #2)", /\[lane-switch\][^\n]*anthropic\s*->\s*responses/.test(log4.slice(logBefore4.length)), log4.slice(logBefore4.length).match(/\[lane-switch\][^\n]*/)?.[0]?.slice(0, 160) ?? "no lane-switch line");
     record("t4 no pin rejection / unreadable", !/pin rejected|unreadable/.test(log4), "");
+    noKernelBypass("t4", logBefore4.length);
 
     finish();
   } finally {
