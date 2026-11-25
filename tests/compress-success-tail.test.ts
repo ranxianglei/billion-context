@@ -4,6 +4,7 @@ import type { CoreMessage, CompressibleRange, NudgeDecision } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
 
 // #1387: post-compress success tail — remaining-ranges snapshot (pi #420) and
 // explicit stop signal (pi #521). Cross-host wording must stay verbatim.
@@ -14,7 +15,7 @@ type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] 
 
 function makeCtx(messages: CoreMessage[], overrides?: Record<string, unknown>): Ctx {
     const logs: string[] = [];
-    return {
+    const ctx: Ctx = {
         core: createCore(),
         config: defaultConfig(200000, overrides as never),
         messages,
@@ -34,6 +35,10 @@ function makeCtx(messages: CoreMessage[], overrides?: Record<string, unknown>): 
         log: (m: string) => { logs.push(m); },
         logs,
     };
+    // #7318: these tests assert the legacy recommendation tail — opt into
+    // compress.postComPressTail (default is now OFF).
+    storeUnpromptedGate(ctx.session, { nudgeInjected: false, requireNudge: false, requireRecommendation: false, postComPressTail: true });
+    return ctx;
 }
 
 function withRefs(ctx: Ctx): Ctx {

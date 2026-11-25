@@ -34,10 +34,14 @@ function withHermeticConfig(fn: () => void): void {
 
 test("storage mode label: env matrix matches the store's effective resolution", () => {
     withHermeticConfig(() => {
-    withEnv({ BILI_STORAGE_UNIFIED: undefined, BILI_ENCRYPTION_KEY: undefined }, () => {
-        // absent everywhere now resolves to the FULL default (#3818 flip of
-        // the #2815 rollout) — the label must say so; explicit shadow stays
-        // reachable in the rows below
+    withEnv({ BILI_STORAGE_UNIFIED: undefined, BILI_ENCRYPTION_KEY: undefined, BILI_STORAGE_JSON_WRITER: undefined }, () => {
+        // absent everywhere now resolves to the PURE-SQLITE default (#3818 dual-write
+        // fleet retired): the JSON envelope writer is off by default, index.db is
+        // the sole persistent copy — the label must say so
+        assert.equal(storageStatusLabel(), "storage: sqlite (unified-only, json envelope off)");
+    });
+    // explicit jsonWriter=on on the default selection restores the dual-write label
+    withEnv({ BILI_STORAGE_UNIFIED: undefined, BILI_ENCRYPTION_KEY: undefined, BILI_STORAGE_JSON_WRITER: "1" }, () => {
         assert.equal(storageStatusLabel(), "storage: full (unified-first reads, dual-write)");
     });
     for (const v of ["1", "true", "shadow"]) {
@@ -45,8 +49,19 @@ test("storage mode label: env matrix matches the store's effective resolution", 
             assert.equal(storageStatusLabel(), "storage: shadow (dual-write dry-run → index.db)", `BILI_STORAGE_UNIFIED=${v}`);
         });
     }
-    withEnv({ BILI_STORAGE_UNIFIED: "full", BILI_ENCRYPTION_KEY: undefined }, () => {
+    withEnv({ BILI_STORAGE_UNIFIED: "full", BILI_ENCRYPTION_KEY: undefined, BILI_STORAGE_JSON_WRITER: undefined }, () => {
+        // explicit full keeps the historical #3818 dual-write default (zero change
+        // for users who opt in by spelling)
         assert.equal(storageStatusLabel(), "storage: full (unified-first reads, dual-write)");
+    });
+    // explicit full + explicit off: envelopes stop even under spelled full
+    withEnv({ BILI_STORAGE_UNIFIED: "full", BILI_ENCRYPTION_KEY: undefined, BILI_STORAGE_JSON_WRITER: "0" }, () => {
+        assert.equal(storageStatusLabel(), "storage: sqlite (unified-only, json envelope off)");
+    });
+    // "sqlite" is the pure-SQLite spelling (same store machinery as full, envelope
+    // writer off by default)
+    withEnv({ BILI_STORAGE_UNIFIED: "sqlite", BILI_ENCRYPTION_KEY: undefined, BILI_STORAGE_JSON_WRITER: undefined }, () => {
+        assert.equal(storageStatusLabel(), "storage: sqlite (unified-only, json envelope off)");
     });
     for (const v of ["full", "unified"]) {
         withEnv({ BILI_STORAGE_UNIFIED: v, BILI_ENCRYPTION_KEY: undefined }, () => {

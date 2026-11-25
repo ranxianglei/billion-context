@@ -227,7 +227,7 @@ os.environ.pop("BILI_CONFIG_FILE", None)
 for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES",
           "BILLION_CONTEXT_PLUGIN", "BILI_PROVIDER_REWRITES",
           "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
-          "ALL_PROXY", "all_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE"):
+          "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE"):
     os.environ.pop(k, None)
 
 RECORDED = {"tool": [], "runtime_info": [], "watcher": [], "health": [], "status": []}
@@ -368,6 +368,34 @@ def install_sidecar(bad):
     with open(os.path.join(PLUGIN_DIR, "bili.json"), "w") as f:
         json.dump({"proxyScript": script, "nodePath": os.environ["BC_NODE"]}, f)
 
+def write_dist(base_dir):
+    d = os.path.join(base_dir, "billion-context", "dist")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "index.js")
+    with open(p, "w") as f:
+        f.write("// dummy bili dist entry point\n")
+    os.chmod(p, 0o755)  # npm chmods the bin it links onto; \`bili\` must be executable on PATH
+    return p
+
+def stub_bili(bin_dir, target):
+    p = os.path.join(bin_dir, "bili")
+    if os.path.exists(p):
+        os.remove(p)
+    os.symlink(target, p)
+    return p
+
+def clean_node_bin():
+    # A bin dir holding ONLY a node shim. The "no bili anywhere" assertions must hold against a
+    # PATH that has node but no bili; the node's own bin dir is NOT safe for that, because a real
+    # global install puts its \`bili\` symlink next to \`node\` on the standard npm layout.
+    d = os.path.join(BASE, "cleanbin")
+    os.makedirs(d, exist_ok=True)
+    node = os.path.join(d, "node")
+    if os.path.lexists(node):
+        os.remove(node)
+    os.symlink(os.environ["BC_NODE"], node)
+    return d
+
 # --- #2905 instance-record fixtures (identity fields discovery now checks) ---
 
 def fp_of(bad):
@@ -499,7 +527,45 @@ elif SCENARIO.startswith("gate-"):
     os.environ[envvar] = "http://127.0.0.1:1" if envvar == "BILLION_CONTEXT_PROXY" else "0"
     mod.register(ctx)
 elif SCENARIO == "no-sidecar":
+    # Hermetic: a \`bili\` on the machine's own PATH must not turn "no dist anywhere" into a
+    # resolution — the ladder's last rung is asserted against a PATH that holds node only.
+    # clean_node_bin(), not the node's own dir: a real global install sits next to node there.
+    os.environ["PATH"] = clean_node_bin()
     mod.register(ctx)
+elif SCENARIO == "load-sidecar":
+    # #6672: the sidecar resolution ladder, first hit wins and nothing is ever written.
+    before = sorted(os.listdir(PLUGIN_DIR))
+    res = {}
+    install_sidecar(False)
+    res["sidecar"] = mod.load_sidecar()
+    os.remove(os.path.join(PLUGIN_DIR, "bili.json"))
+    global_dist = write_dist(os.path.join(BASE, "global"))
+    write_dist(os.path.join(PLUGIN_DIR, "node_modules"))
+    res["bundled"] = mod.load_sidecar()
+    shutil.rmtree(os.path.join(PLUGIN_DIR, "node_modules"))
+    if os.name == "nt":
+        res["path"] = res["path_wrapper"] = res["none"] = "skip"
+    else:
+        bin_dir = os.path.join(BASE, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        # node_dir must hold node but NO bili: clean_node_bin(), not the node's own bin dir,
+        # which on a standard install also carries the real global \`bili\` symlink.
+        node_dir = clean_node_bin()
+        wrapper = os.path.join(BASE, "wrapper.sh")
+        with open(wrapper, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(wrapper, 0o755)
+        stub_bili(bin_dir, global_dist)
+        os.environ["PATH"] = bin_dir + os.pathsep + node_dir
+        res["path"] = mod.load_sidecar()
+        # A shell wrapper is not the dist: the realpath+.js guard falls through to inert.
+        stub_bili(bin_dir, wrapper)
+        res["path_wrapper"] = mod.load_sidecar()
+        os.remove(os.path.join(bin_dir, "bili"))
+        os.environ["PATH"] = node_dir
+        res["none"] = mod.load_sidecar()
+    out["sidecar_resolution"] = res
+    out["plugin_dir_unchanged"] = sorted(os.listdir(PLUGIN_DIR)) == before
 elif SCENARIO == "spawn-fail":
     install_sidecar(True)
     mod.register(ctx)
@@ -710,6 +776,12 @@ elif SCENARIO == "output-limits":
 elif SCENARIO.startswith("attach"):
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    # #6862: an operator-provided NO_PROXY present when apply_env runs must be merged in,
+    # never replaced — BC_TEST_NO_PROXY simulates it (the preamble pops the real keys).
+    operator_no_proxy = os.environ.get("BC_TEST_NO_PROXY", "").strip()
+    if operator_no_proxy:
+        os.environ["NO_PROXY"] = operator_no_proxy
+        os.environ["no_proxy"] = operator_no_proxy
     ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
     os.makedirs(ca_dir, exist_ok=True)
     ca_file = os.path.join(ca_dir, "root-ca.pem")
@@ -745,6 +817,16 @@ elif SCENARIO.startswith("attach"):
         no_session_result = ctx.tools.get("compress", {}).get("handler")({}, task_id="t1")
         # #2072 negative leg: the model-transcribed conversation_id channel stays UNFLAGGED
         transcribed_result = ctx.tools.get("compress", {}).get("handler")({"conversation_id": "transcribed-9"}, task_id="t2")
+        # #7514: the pre_tool_call hook smuggles the host's tool_call_id into the dispatch args for
+        # our tools only; the handler strips it into the top-level toolCallId slot.
+        pre_hook = ctx.hooks.get("pre_tool_call")
+        hook_ours = pre_hook(tool_name="compress", args={"startId": "m00001", "endId": "m00010"}, tool_call_id="call-abc-123")
+        hook_foreign = pre_hook(tool_name="terminal", args={"command": "ls"}, tool_call_id="call-abc-123")
+        hook_noid = pre_hook(tool_name="compress", args={}, tool_call_id="")
+        # the host shallow-merges the hook's args into the dispatch args (hermes_cli/plugins.py)
+        merged = {"startId": "m00001", "endId": "m00010"}
+        merged.update((hook_ours or {}).get("args") or {})
+        id_result = ctx.tools.get("compress", {}).get("handler")(merged, session_id="sess-1", task_id="t3")
         out.update({
             "round1_none": round1 is None,
             "req_unmutated": req == frozen,
@@ -758,6 +840,10 @@ elif SCENARIO.startswith("attach"):
             "tool_result": tool_result,
             "no_session_result": no_session_result,
             "transcribed_result": transcribed_result,
+            "pre_hook_ours": hook_ours,
+            "pre_hook_foreign": hook_foreign,
+            "pre_hook_noid": hook_noid,
+            "id_result": id_result,
         })
 elif SCENARIO == "defer-fallback":
     # Hermes registers the ACP tools natively but its tool_search layer DEFERS the toolset, so the
@@ -939,17 +1025,21 @@ elif SCENARIO == "origin-death":
         ready.wait(10)
     out["death_initial_ready"] = (mod._state.get("bootstrap") or {}).get("state")
     out["death_env_routed"] = os.environ.get("HTTPS_PROXY")
+    out["death_http_routed"] = os.environ.get("HTTP_PROXY")
     SLOW["enabled"] = True
     def release_later():
         __import__("time").sleep(1.5)
         SLOW["release"].set()
     threading.Thread(target=release_later, daemon=True).start()
     gap_values = []
+    http_gap = []
     saw_gap = False
     end = __import__("time").monotonic() + 20
     while __import__("time").monotonic() < end:
         v = os.environ.get("HTTPS_PROXY")
         gap_values.append(v)
+        if v != ORIGIN:
+            http_gap.append(os.environ.get("HTTP_PROXY"))
         if v != ORIGIN:
             saw_gap = True
         rec = mod._state.get("bootstrap") or {}
@@ -960,6 +1050,8 @@ elif SCENARIO == "origin-death":
     rec = mod._state.get("bootstrap") or {}
     out["death_final_state"] = rec.get("state")
     out["death_final_env"] = os.environ.get("HTTPS_PROXY")
+    out["death_http_gap"] = list(dict.fromkeys(http_gap))
+    out["death_final_http"] = os.environ.get("HTTP_PROXY")
     out["death_tools"] = sorted(ctx.tools.keys())
     out["death_register_calls"] = sum(ctx.reg_counts.values())
     out["death_warnings"] = [w for w in WARNINGS if "is gone" in w]
@@ -1105,9 +1197,12 @@ elif SCENARIO == "ready-unload":
     user_proxy = "http://user-proxy.example:9999"   # pre-existing host routing — must survive unload
     os.environ["HTTPS_PROXY"] = user_proxy
     os.environ["https_proxy"] = user_proxy
+    os.environ["NO_PROXY"] = "corp.example"   # #6862: operator NO_PROXY must survive unload too
+    os.environ["no_proxy"] = "corp.example"
     mod.register(ctx)
     out["env_routed"] = os.environ.get("HTTPS_PROXY") == ORIGIN
     ctx.run_unload()
+    out["env_after_unload_no_proxy"] = os.environ.get("NO_PROXY")
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -1119,6 +1214,9 @@ out.update({
     "pid": os.getpid(),
     "env_https_proxy": os.environ.get("HTTPS_PROXY"),
     "env_https_proxy_lc": os.environ.get("https_proxy"),
+    "env_http_proxy": os.environ.get("HTTP_PROXY"),
+    "env_http_proxy_lc": os.environ.get("http_proxy"),
+    "env_no_proxy": os.environ.get("NO_PROXY"),
     "env_ca_bundle": os.environ.get("HERMES_CA_BUNDLE"),
     "env_ssl_cert_file": os.environ.get("SSL_CERT_FILE"),
     "marker_left": os.path.exists(os.path.join(os.environ["XDG_STATE_HOME"], "billion-context", "proxy-starting")),
@@ -1147,6 +1245,9 @@ interface DriverOut {
     hooks: string[];
     env_https_proxy?: string | null;
     env_https_proxy_lc?: string | null;
+    env_http_proxy?: string | null;
+    env_http_proxy_lc?: string | null;
+    env_no_proxy?: string | null;
     env_ca_bundle?: string | null;
     env_ssl_cert_file?: string | null;
     marker_left?: boolean;
@@ -1169,6 +1270,10 @@ interface DriverOut {
     tool_result?: string;
     no_session_result?: string;
     transcribed_result?: string;
+    pre_hook_ours?: { action?: string; args?: Record<string, unknown> } | null;
+    pre_hook_foreign?: unknown;
+    pre_hook_noid?: unknown;
+    id_result?: string;
     mitm_kind?: string;
     mitm_domains?: string[];
     mitm_warnings?: string[];
@@ -1219,6 +1324,7 @@ interface DriverOut {
     unload_thread_alive?: boolean;
     state_after_unload?: string;
     env_after_unload?: string | null;
+    env_after_unload_no_proxy?: string | null;
     mw_after_unload_none?: boolean;
     acp_after_unload?: string | null;
     env_routed?: boolean;
@@ -1239,6 +1345,9 @@ interface DriverOut {
     death_gap_values?: Array<string | null>;
     death_final_state?: string;
     death_final_env?: string | null;
+    death_http_routed?: string | null;
+    death_http_gap?: Array<string | null>;
+    death_final_http?: string | null;
     death_tools?: string[];
     death_register_calls?: number;
     death_warnings?: string[];
@@ -1257,6 +1366,8 @@ interface DriverOut {
     rf_dead?: unknown;
     rf_dup_pid?: string | null;
     rf_none?: unknown;
+    sidecar_resolution?: Record<string, { script: string; node: string } | null | string>;
+    plugin_dir_unchanged?: boolean;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -1288,7 +1399,7 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
         assert.deepEqual(out!.toolsets, ["billion-context"]);
         assert.deepEqual(out!.middlewares, ["llm_request"]);
-        assert.deepEqual(out!.hooks, ["pre_api_request"]);
+        assert.deepEqual(out!.hooks, ["pre_api_request", "pre_tool_call"]);
         assert.deepEqual(out!.commands, {
             acp: "Show bili context-compression status for this session",
             "acp-cache": "Prompt-cache reconciliation (same report as the acp_cache tool)",
@@ -1297,6 +1408,15 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.req_unmutated, true);
         assert.equal(out!.env_https_proxy, out!.origin);
         assert.equal(out!.env_https_proxy_lc, out!.origin);
+        assert.equal(out!.env_http_proxy, out!.origin, "a plain-http provider base_url is routed too");
+        assert.equal(out!.env_http_proxy_lc, out!.origin);
+        // #6862: loopback stays direct AND the code/dependency hosts the lane cannot serve
+        // bypass it by default, so a hermes update / shell task's git/uv/npm does not route
+        // through the MITM lane and fail. Model routing above is untouched.
+        assert.equal(out!.env_no_proxy,
+            "127.0.0.1,localhost,::1,github.com,api.github.com,objects.githubusercontent.com,"
+            + "codeload.github.com,pypi.org,files.pythonhosted.org,registry.npmjs.org",
+            "loopback + non-model bypass hosts stay direct");
         assert.match(out!.env_ca_bundle!, /root-ca\.pem$/);
         assert.match(out!.env_ssl_cert_file!, /combined-ca\.pem$/, "#1375: ambient trust rides the combined bundle");
         const h1 = out!.first_headers!;
@@ -1330,12 +1450,38 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tool_calls, [
             { conversationId: "sess-1", tool: "compress", args: {}, nativeCaller: true },
             { conversationId: "transcribed-9", tool: "compress", args: { conversation_id: "transcribed-9" } },
+            // #7514: the smuggled key never rides the model-visible args; the real id lands in
+            // the top-level toolCallId slot (the first two calls stay UNFLAGGED — no id, no key).
+            { conversationId: "sess-1", tool: "compress", args: { startId: "m00001", endId: "m00010" }, nativeCaller: true, toolCallId: "call-abc-123" },
         ]);
         assert.equal(out!.transcribed_result, "compressed 3 blocks");
+        // #7514: the pre_tool_call hook smuggles the host's tool_call_id into the dispatch args
+        // for our tools only — a foreign tool and an empty id get nothing (fail closed).
+        assert.deepEqual(out!.pre_hook_ours, { action: "modify", args: { _tool_call_id: "call-abc-123" } },
+            "our tool + a call id -> modify directive carrying the smuggle key");
+        assert.equal(out!.pre_hook_foreign, null, "a foreign tool never gets the smuggle key");
+        assert.equal(out!.pre_hook_noid, null, "no call id -> no smuggle");
+        assert.equal(out!.id_result, "compressed 3 blocks");
         assert.deepEqual(out!.runtime_info, [{ agent: "hermes", model: "test-model", maxOutput: 4096, source: "hermes-native" }]);
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.
         assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }], "attached session registers its host pid as a watchdog owner");
+    });
+
+    test("attach with an operator NO_PROXY: the operator's entries are merged in, never replaced (#6862)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("attach", { BC_TEST_NO_PROXY: "corp.example" });
+        assert.ok(out, err);
+        assert.equal(out!.env_https_proxy, out!.origin, "model traffic is still routed");
+        const bypassed = (out!.env_no_proxy ?? "").split(",");
+        assert.ok(bypassed.includes("corp.example"), "operator entry survives");
+        assert.ok(bypassed.includes("127.0.0.1") && bypassed.includes("localhost"), "loopback stays direct");
+        assert.ok(bypassed.includes("github.com") && bypassed.includes("pypi.org")
+            && bypassed.includes("registry.npmjs.org"), "non-model bypass hosts still apply");
+        assert.equal(bypassed.filter((h) => h === "corp.example").length, 1, "no duplicate entries");
     });
 
     // A toolset the host DEFERS (Hermes tool_search) is invisible in the outgoing snapshot even
@@ -1649,6 +1795,38 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.env_https_proxy, null);
     });
 
+    test("no sidecar: resolves the dist from a host-managed copy, then from `bili` on PATH (#6672)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("load-sidecar");
+        assert.ok(out, err);
+        const res = out!.sidecar_resolution!;
+        const scriptOf = (v: unknown): string | null => (v && typeof v === "object" ? (v as { script: string }).script : null);
+        // 1. the installer's sidecar still wins untouched
+        assert.match(scriptOf(res.sidecar)!, /[/\\]proxy\.js$/, "bili.json stays the first hit");
+        // 2. a host-managed copy in the plugin's own node_modules
+        assert.match(
+            scriptOf(res.bundled)!,
+            /[/\\]node_modules[/\\]billion-context[/\\]dist[/\\]index\.js$/,
+            "no sidecar: the plugin resolves the dist its own npm install put there",
+        );
+        if (process.platform !== "win32") {
+            // 3. the global install, reached through `bili` on PATH (realpath onto dist/index.js)
+            assert.match(
+                scriptOf(res.path)!,
+                /[/\\]global[/\\]billion-context[/\\]dist[/\\]index\.js$/,
+                "no sidecar, no local copy: the reference lane's global dist is resolved off PATH",
+            );
+            // 3b. a shell wrapper named bili is not the dist — the realpath+.js guard keeps it inert
+            assert.equal(res.path_wrapper, null, "a non-.js entry point falls through instead of spawning it");
+            // 4. nothing anywhere is still inert
+            assert.equal(res.none, null);
+        }
+        assert.equal(out!.plugin_dir_unchanged, true, "resolution is read-only: no sidecar is ever written");
+    });
+
     test("spawn failure: child dies -> inert, env untouched, starting marker cleaned up", () => {
         if (!PY) {
             console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
@@ -1740,6 +1918,10 @@ describe("python plugin runtime (subprocess)", () => {
         assert.ok(out, err);
         assert.equal(out!.death_initial_ready, "ready");
         assert.equal(out!.death_env_routed, out!.origin);
+        assert.equal(out!.death_http_routed, out!.origin);
+        assert.ok(out!.death_http_gap!.length > 0 && !out!.death_http_gap!.includes(out!.origin),
+            "HTTP_PROXY is unrouted with the HTTPS pair, not left pointing at the dead origin");
+        assert.equal(out!.death_final_http, out!.origin);
         assert.ok(out!.death_gap_values!.includes("http://user-proxy.example:9999"),
             "the unroute RESTORED the pre-existing user proxy instead of deleting the key");
         assert.equal(out!.death_final_state, "ready", "the watchdog re-bootstrapped a healthy origin");
@@ -1803,6 +1985,8 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.env_https_proxy, "http://user-proxy.example:9999",
             "the host's own proxy is restored verbatim, not left at the plugin's origin port");
         assert.equal(out!.env_https_proxy_lc, "http://user-proxy.example:9999");
+        assert.equal(out!.env_after_unload_no_proxy, "corp.example",
+            "the operator's NO_PROXY is restored verbatim, not left at the merged bypass value");
         assert.equal(out!.env_ca_bundle, null, "a key we added is dropped, not left pointing into our CA dir");
         assert.equal(out!.env_ssl_cert_file, null);
     });

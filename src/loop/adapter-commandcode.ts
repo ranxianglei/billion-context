@@ -19,6 +19,8 @@ import type {
 
 const PROXY_TOOL_SET = new Set([
     "compress", "decompress", "search_context", "acp_status",
+    // Keep function-only proxy calls inside the loop, as on the OpenAI wire.
+    "acp_retire", "acp_restore", "acp_rewrite", "acp_cache",
     "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
 ]);
 
@@ -79,8 +81,9 @@ export function createCommandcodeAdapter(
 
         async *parseStream(upstream: ReadableStream<Uint8Array>, round: number): AsyncGenerator<ParsedStreamEvent> {
             void round;
-            const tagFilter = composeStreamFilters(createTagEchoFilter((snippet) => {
-                loggerLog("warn", `[tag-echo] stripped model-emitted render tag (commandcode proxy mode): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+            const tagFilter = composeStreamFilters(createTagEchoFilter((snippet, duringDrain) => {
+                const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (commandcode proxy mode)";
+                loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
             }), createMarkerLineFilter());
             let sawReasoning = false;
             let sawRealToolCall = false;

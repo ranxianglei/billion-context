@@ -25,6 +25,14 @@ process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
 test.after(() => rmSync(testRoot, { recursive: true, force: true }));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
+// #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+// off) — this suite's cold-disk-restore tests read the legacy JSON
+// content-store files off disk, so pin the dual-write writer explicitly.
+process.env.BILI_STORAGE_JSON_WRITER = "on";
+// ci:full branch: this suite pins the LEGACY fork/orphan contract; the egress
+// plane default (100 here) serves raw sessions from the op log and legitimately
+// changes outbound bytes — out of this suite's scope.
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
 
 interface SnapshotResponse {
@@ -414,6 +422,40 @@ function forkRequest(snapshot: { parentRevision: string; orderedMessages: unknow
     return { protocolVersion: 1, parentConversationId: "parent", childConversationId: child, parentRevision: snapshot.parentRevision, branchPoint: { messageCount: count, orderHash: hash(orderedMessages) }, orderedMessages, idempotencyKey: `fork-${child}` };
 }
 
+test("HTTP fork retains ref state in source order and removes only the excluded side", { timeout: 60_000 }, async () => {
+    const h = await harness(false, false);
+    try {
+        const count = 256;
+        const history = Array.from({ length: count }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `fork source ${i}` }));
+        await sendIntentModel(h, "parent", history, [], "main");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const refs = snapshot.body.orderedMessages.map((message) => message.ref);
+        const parent = resolveConversation("parent").session!;
+        parent.state.hiddenOrphanRefs = [refs[127]!, refs[128]!, refs[0]!, refs[127]!];
+        parent.state.emergencyTruncateLatch = [
+            { ref: refs[1]!, text: "first clipped text" },
+            { ref: refs[200]!, text: "outside clipped text" },
+            { ref: refs[126]!, text: "last clipped text" },
+        ];
+        parent.state.renderDeferredRefs = [refs[255]!, refs[2]!, refs[2]!];
+        parent.state.deadRefs = [refs[3]!, refs[254]!, refs[255]!, refs[254]!];
+        parent.state.viewLatches = { [refs[4]!]: { text: "inside" }, [refs[129]!]: { text: "outside" } };
+        const before = structuredClone(parent.state);
+
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", 128));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const child = resolveConversation("child").session!;
+        assert.deepEqual(child.state.hiddenOrphanRefs, [refs[127], refs[0], refs[127]]);
+        assert.deepEqual(child.state.emergencyTruncateLatch, [before.emergencyTruncateLatch![0], before.emergencyTruncateLatch![2]]);
+        assert.deepEqual(child.state.renderDeferredRefs, [refs[2], refs[2]]);
+        assert.deepEqual(child.state.deadRefs, [refs[254], refs[255], refs[254]]);
+        assert.deepEqual(child.state.viewLatches, { [refs[4]!]: { text: "inside" } });
+        assert.deepEqual(child.pluginSnapshot, parent.pluginSnapshot!.slice(0, 128));
+        assert.deepEqual(parent.state, before, "fork filtering does not mutate the parent's state");
+    } finally { await h.close(); }
+});
+
 test("HTTP protected tools keep plain-text snapshots, forks and revisions usable (#2620)", { timeout: 60_000 }, async () => {
     const h = await harness(false, false, { protectedTools: ["ask_user_question"] });
     try {
@@ -454,7 +496,10 @@ test("HTTP dsh-lane durable guards keep plain-text snapshots, forks and revision
     try {
         const history = [
             { role: "user", content: "Synthetic snapshot test" },
-            { role: "user", content: `Instructions from: /repo/AGENTS.md\n# repo rules\nbehave` },
+            // #7153: the carrier must look like what dsh-agent-instructions emits —
+            // the label inside the complete \x3csystem-reminder\x3e frame (a bare label is
+            // ordinary history now, so it would no longer be pinned).
+            { role: "user", content: `\x3csystem-reminder\x3e\nInstructions from: /repo/AGENTS.md\n# repo rules\nbehave\n\x3c/system-reminder\x3e` },
             { role: "assistant", content: "Starting" },
             ...Array.from({ length: 4 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `tail ${i}` })),
         ];
@@ -909,6 +954,15 @@ test("HTTP CCR shared payload deletion fails closed before persistence", { timeo
 
 for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "wrong-raw-alias", "changed-payload"] as const) {
     test(`HTTP CCR ${corruption} fails closed after cold disk restore`, async () => {
+        // Pure-SQLite is the default storage writer now (2026-11-13): these
+        // corruption tests corrupt and re-read a .content-store.json envelope,
+        // which never exists on disk under the default writer (ENOENT on
+        // sessions/<protocol> — red in the e2e-dsh-plugin-lane). Pin dual-write
+        // like the other e2e lanes (d252543a/74a925db); the test still removes
+        // index.db below, so the fail-closed 409 contract is unchanged, and
+        // pure-sqlite-only semantics stay covered by the storage unit tests.
+        const previousWriter = process.env.BILI_STORAGE_JSON_WRITER;
+        process.env.BILI_STORAGE_JSON_WRITER = "1";
         const h = await harness(true);
         try {
             const parent = resolveConversation("parent").session!;
@@ -966,7 +1020,11 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
             assert.equal(parentState(), before);
             assert.equal(readFileSync(path, "utf8"), JSON.stringify(disk));
             store2.closeQuietly();
-        } finally { await h.close(); }
+        } finally {
+            if (previousWriter === undefined) delete process.env.BILI_STORAGE_JSON_WRITER;
+            else process.env.BILI_STORAGE_JSON_WRITER = previousWriter;
+            await h.close();
+        }
     });
 }
 

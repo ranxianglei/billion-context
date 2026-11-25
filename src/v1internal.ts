@@ -139,20 +139,26 @@ export function wrapV1ResponseJson(json: string): string {
     return json;
 }
 
-// Rewrite a single SSE frame's data payload. Only `data:` lines carrying a JSON
-// object are touched; [DONE]/empty/non-JSON payloads and event:/comment lines
-// pass through unchanged.
+// Rewrite a single SSE frame's complete data payload: SSE joins multiple
+// `data:` fields with newlines before dispatch. Only JSON objects needing an
+// envelope change are touched; other payloads and non-data fields stay intact.
 function mapDataPayload(frame: string, fn: (payload: string) => string): string {
     const lines = frame.split("\n");
+    const data: string[] = [];
+    let firstData = -1;
     for (let i = 0; i < lines.length; i++) {
         if (lines[i].startsWith("data:")) {
-            const payload = lines[i].slice(5).trim();
-            if (payload === "" || payload === "[DONE]") return frame;
-            lines[i] = "data: " + fn(payload);
-            return lines.join("\n");
+            if (firstData < 0) firstData = i;
+            data.push(lines[i].charAt(5) === " " ? lines[i].slice(6) : lines[i].slice(5));
         }
     }
-    return frame;
+    if (firstData < 0) return frame;
+    const payload = data.join("\n").trim();
+    if (payload === "" || payload === "[DONE]") return frame;
+    const mapped = fn(payload);
+    if (mapped === payload) return frame;
+    lines[firstData] = "data: " + mapped;
+    return lines.filter((line, index) => index === firstData || !line.startsWith("data:")).join("\n");
 }
 
 export function unwrapV1SseFrame(frame: string): string {

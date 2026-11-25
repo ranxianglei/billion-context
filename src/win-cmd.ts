@@ -18,7 +18,8 @@
 /** Returns a human-readable reason why this token cannot cross the cmd.exe
  *  line parser verbatim, or undefined when it can (the safe set): plain text,
  *  whitespace-bearing text quoted whole, Unicode, semicolons/commas/equals,
- *  backslashes in even runs or outside quoted positions, and `!` (delayed
+ *  backslashes anywhere (quoteWinToken doubles a trailing run inside quotes, so
+ *  the receiving program reads it back verbatim), and `!` (delayed
  *  expansion is opt-in via ^setlocal enabledelayedexpansion^ and standard npm
  *  shims never enable it). The offending CONTENT is deliberately not part of
  *  the return value — callers may log the reason but must not echo the token
@@ -29,13 +30,6 @@ export function winCmdUnsafeToken(token: string): string | undefined {
     if (token.includes("%")) return "% (cmd.exe expands %VAR%)";
     if (/[&|<>^()]/.test(token)) return "cmd metacharacters (& | < > ^ ( ))";
     if (/[\r\n]/.test(token)) return "a line break";
-    // Odd trailing-backslash run matters only when quoteWinToken will wrap the
-    // token in quotes (whitespace-bearing, quote-free): the final `\` then
-    // escapes the closing quote in MSVCRT parsing and swallows it.
-    if (/\s/.test(token)) {
-        const trail = /\\+$/.exec(token)?.[0].length ?? 0;
-        if (trail % 2 === 1) return "an odd number of trailing backslashes";
-    }
     return undefined;
 }
 

@@ -34,16 +34,17 @@ type Item = Record<string, unknown>;
 
 const SUMMARY_MARKER = "[Compressed conversation section]";
 const NUDGE_MARKER = "Compressible ranges (";
-// Indices verified against the kernel's nudge gate with nudgeGrowthTokens=2000
-// and ~9KiB filler turns. Pre-#4521 (master) the injections landed on
-// requests {7,8,9}; since #4521 the armed-but-silent status line rides an
-// ephemeral carrier on the gated turns and its shown-marker feeds the nudge
-// gate back, so the schedule shifts to {4,6,8,9} — the fold/proxy-tool-round
-// mechanics under test are unchanged, only this probe's anchor re-calibrates
-// to the next nudge-carrying request pair (6 → tool round, 7 → fold round).
-const PROXY_TOOL_AT = 6; // upstream request index whose response = acp_status call (round 1)
-const FOLD_AT = 7;       // upstream request index whose response = compress call (round 2)
-// FOLD_AT+1 = post-fold refreshed re-request (round 3); FOLD_AT+2 = next steady client turn.
+// The fold turn is materialized SCHEDULE-INDEPENDENTLY: the fake upstream
+// arms on the first request carrying the ephemeral nudge (with >=11 tagged
+// refs to fold) and folds on the re-request that follows the acp_status
+// round. A hardcoded request-index anchor broke every time the nudge gate's
+// token schedule shifted — #4521's status-line feedback ({7,8,9} → {4,6,8,9}),
+// #6928's status-line removal, and #4313's timestamp-rendering default flip
+// (the suite preload pin BILI_MESSAGE_TIMESTAMPS="0" changes the wire shape
+// and hence the schedule: OFF {4,13} vs ON {3,5,11,14} — direct local runs
+// without the preload diverge from CI). The probe also pins
+// compress.messageTimestamps:false so its wire shape is hermetic regardless
+// of how the suite is launched.
 const TOTAL_TURNS = 13;
 
 const FILLER = (seed: number, kb: number): string => {
@@ -120,6 +121,13 @@ test("#2929: nudge + proxy-tool-round fold keeps re-request/next-turn byte-stabl
 
     try {
         const captured: Array<{ url: string; body: string }> = [];
+        // Object (not bare lets) so the outer-scope reads aren't narrowed to
+        // the initial "idle" — the mutations happen inside the request callback.
+        const fold = {
+            state: "idle" as "idle" | "armed" | "folded",
+            armIdx: -1,  // upstream request index that carried the nudge (acp_status round)
+            foldIdx: -1, // upstream request index that carried the compress call
+        };
         upstream = http.createServer((req, res) => {
             const chunks: Buffer[] = [];
             req.on("data", (c: Buffer) => chunks.push(c));
@@ -127,15 +135,21 @@ test("#2929: nudge + proxy-tool-round fold keeps re-request/next-turn byte-stabl
                 const idx = captured.length;
                 const body = Buffer.concat(chunks).toString("utf8");
                 captured.push({ url: req.url ?? "", body });
-                if (idx === PROXY_TOOL_AT) {
-                    // Round 1 of the fold turn: model asks for proxy status — the
-                    // loop executes it locally and re-requests (round 2).
+                const input = (JSON.parse(body) as { input?: Item[] }).input ?? [];
+                if (fold.state === "idle" && hasNudge(input) && refsOf(input).length >= 11) {
+                    // Round 1 of the fold turn: the first nudge-carrying request
+                    // with enough refs — model asks for proxy status, the loop
+                    // executes it locally and re-requests (round 2).
+                    fold.state = "armed";
+                    fold.armIdx = idx;
                     functionCallSse(res, `resp_${idx}`, "acp_status", "{}", `call_st_${idx}`);
                     return;
                 }
-                if (idx === FOLD_AT) {
-                    const prev = (JSON.parse(captured[idx - 1]!.body) as { input?: Item[] }).input ?? [];
-                    const uniq = refsOf(prev);
+                if (fold.state === "armed") {
+                    // Round 2: the re-request after the acp_status round — fold.
+                    fold.state = "folded";
+                    fold.foldIdx = idx;
+                    const uniq = refsOf(input);
                     assert.ok(uniq.length >= 11, `fold round: expected >=11 tagged refs, saw ${uniq.length}`);
                     const args = JSON.stringify({ content: [
                         { startId: uniq[3]!, endId: uniq[5]!, topic: "F1A", summary: `F1A summary: ${FILLER(1, 1)}` },
@@ -144,10 +158,9 @@ test("#2929: nudge + proxy-tool-round fold keeps re-request/next-turn byte-stabl
                     functionCallSse(res, `resp_${idx}`, "compress", args, `call_cmp_${idx}`);
                     return;
                 }
-                const parsed = JSON.parse(body) as { input?: Item[] };
                 let label = "0";
-                for (let i = (parsed.input ?? []).length - 1; i >= 0; i--) {
-                    const it = parsed.input![i]!;
+                for (let i = input.length - 1; i >= 0; i--) {
+                    const it = input[i]!;
                     if (it.type === "message" && it.role === "user" && typeof it.content === "string") {
                         const m = (it.content as string).match(/Turn (\d+):/);
                         if (m) { label = m[1]!; break; }
@@ -169,7 +182,7 @@ test("#2929: nudge + proxy-tool-round fold keeps re-request/next-turn byte-stabl
             routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 200_000 } } } },
             modelContextLimit: 200_000,
             kernelConfig: defaultConfig(200_000),
-            compress: { injectTool: true, injectNudge: true, nudgeGrowthTokens: 2000 },
+            compress: { injectTool: true, injectNudge: true, nudgeGrowthTokens: 2000, messageTimestamps: false },
             promptCache: { routing: "auto" },
             sessionHeader: "x-acp-session",
             log: true,
@@ -223,17 +236,18 @@ test("#2929: nudge + proxy-tool-round fold keeps re-request/next-turn byte-stabl
         }
 
         const inputs = captured.map((c) => (JSON.parse(c.body) as { input?: Item[] }).input ?? []);
-        assert.ok(inputs.length >= FOLD_AT + 3, `expected >= ${FOLD_AT + 3} upstream requests, got ${inputs.length}`);
+        assert.ok(fold.state === "folded", `scenario miss: the nudge never fired on a request with >=11 refs — probe cannot materialize the #2929 trigger; adjust nudgeGrowthTokens/filler`);
+        assert.ok(inputs.length >= fold.foldIdx + 3, `expected >= ${fold.foldIdx + 3} upstream requests, got ${inputs.length}`);
 
         // (0) Scenario materialization: the nudge must have been injected into
-        // the PRE-FOLD original request (production shape: nudge armed -> model
+        // the arming (pre-fold) request (production shape: nudge armed -> model
         // calls proxy tool -> compress). Without it this probe does not cover
         // the #2929 trigger.
-        assert.ok(hasNudge(inputs[PROXY_TOOL_AT]!), `scenario miss: no ephemeral nudge in the pre-fold request (inputs[${PROXY_TOOL_AT}]) — probe does not cover the production trigger; adjust nudgeGrowthTokens/filler`);
-        console.log(`probe: nudge confirmed in pre-fold request; total upstream requests=${inputs.length}`);
+        assert.ok(hasNudge(inputs[fold.armIdx]!), `scenario miss: no ephemeral nudge in the arming request (inputs[${fold.armIdx}]) — probe does not cover the production trigger`);
+        console.log(`probe: nudge at inputs[${fold.armIdx}], fold at inputs[${fold.foldIdx}]; total upstream requests=${inputs.length}`);
 
         // (1) The post-fold re-request carries the in-place summary(s).
-        const rPost = inputs[FOLD_AT + 1]!;
+        const rPost = inputs[fold.foldIdx + 1]!;
         const postSums = summaryIndices(rPost);
         assert.ok(postSums.length >= 1, "post-fold re-request must carry the in-place summary");
 
@@ -241,7 +255,7 @@ test("#2929: nudge + proxy-tool-round fold keeps re-request/next-turn byte-stabl
         // the post-fold re-request up to and including the summary anchor. In
         // production this is where the chain breaks (next turn hits only the
         // instructions baseline).
-        const next = inputs[FOLD_AT + 2]!;
+        const next = inputs[fold.foldIdx + 2]!;
         const nextSums = summaryIndices(next);
         assert.ok(nextSums.length >= 1, `next steady turn lost the summary entirely (summaries: ${nextSums.length}) — fold did not survive to the client turn`);
         assert.equal(nextSums[0], postSums[0], `summary anchor drifted: re-request item[${postSums[0]}] vs next turn item[${nextSums[0]}]`);

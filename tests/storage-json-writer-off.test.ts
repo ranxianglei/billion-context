@@ -72,7 +72,7 @@ test("jsonWriter=off (full): no envelope written, index-only session survives re
     process.env.BILI_STORAGE_UNIFIED = "full";
     process.env.BILI_STORAGE_JSON_WRITER = "off";
     try {
-        assert.equal(storageStatusLabel(), "storage: full (unified-only, json envelope off)");
+        assert.equal(storageStatusLabel(), "storage: sqlite (unified-only, json envelope off)");
         const seed = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jw-seed-"));
         const session = loadCorpusCase(seed, "folded", "corpus-folded", "anthropic");
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jw-full-"));
@@ -252,7 +252,7 @@ test("storage.jsonWriter file tier works via the config file (#2960)", async () 
     delete process.env.BILI_STORAGE_UNIFIED; // let the file tier decide
     fs.writeFileSync(process.env.BILI_CONFIG_FILE!, JSON.stringify({ storage: { unified: "full", jsonWriter: "off" } }));
     try {
-        assert.equal(storageStatusLabel(), "storage: full (unified-only, json envelope off)");
+        assert.equal(storageStatusLabel(), "storage: sqlite (unified-only, json envelope off)");
         const seed = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jw-seed-"));
         const session = loadCorpusCase(seed, "tier2", "corpus-tier2", "chat");
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jw-tier-"));
@@ -269,5 +269,34 @@ test("storage.jsonWriter file tier works via the config file (#2960)", async () 
     } finally {
         fs.writeFileSync(process.env.BILI_CONFIG_FILE!, "{}");
         process.env.BILI_STORAGE_UNIFIED = prevMode;
+    }
+});
+
+test("pure-sqlite DEFAULT: no envelope written when neither tier says otherwise (this release's flip)", async () => {
+    const prevWriter = process.env.BILI_STORAGE_JSON_WRITER;
+    delete process.env.BILI_STORAGE_UNIFIED;
+    delete process.env.BILI_STORAGE_JSON_WRITER;
+    try {
+        assert.equal(storageStatusLabel(), "storage: sqlite (unified-only, json envelope off)");
+        const seed = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jw-seed-"));
+        const session = loadCorpusCase(seed, "tier2", "corpus-tier2", "chat");
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jw-default-"));
+        try {
+            const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
+            await store.writeNow(session);
+            store.cancelAll();
+            store.closeQuietly();
+
+            // The DEFAULT now matches an explicit off: index.db is the only
+            // persistent copy, no session envelope on disk.
+            assert.equal(envelopeFiles(dir).length, 0, "default (pure sqlite) must not write a session envelope");
+            assert.ok(fs.existsSync(path.join(dir, "index.db")), "index.db must exist");
+        } finally {
+            rmBestEffort(dir);
+            rmBestEffort(seed);
+        }
+    } finally {
+        process.env.BILI_STORAGE_JSON_WRITER = prevWriter;
+        process.env.BILI_STORAGE_UNIFIED = "legacy"; // restore the module-level pin
     }
 });

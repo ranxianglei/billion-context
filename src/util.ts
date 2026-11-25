@@ -17,6 +17,11 @@ export const BILI_PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 // mirroring what a direct send without the overlay would have been.
 export const BILI_PASSTHROUGH_HEADER = "x-bili-passthrough";
 
+// Internal request marker: OMP owns stream truncation recovery for its native
+// fetch calls; the proxy consumes this header and strips it before upstream egress.
+export const BILI_HOST_RECOVERY_OWNER_HEADER = "x-bili-host-recovery-owner";
+export const BILI_HOST_RECOVERY_OWNER_OMP = "omp";
+
 // #4079: the MINIMUM window both egress oversize guards size against. A
 // configured or declared window can be wrong SMALL — a stale
 // modelContextLimit, a registry miss, a model-catalog fallback (#3993:
@@ -124,6 +129,12 @@ export function applyEstimateCalibration(raw: number, k: number | undefined, kOr
     return raw * k;
 }
 
+/** #5952: the provenance stamp a published k̂ carries when every sample in
+ *  its ring came from a text-only final wire estimate (per-request capture
+ *  pair, #4430 discipline). Only this value ever decides: a factor whose
+ *  evidence may include image-billed usage must not scale a text estimate. */
+export const CALIBRATION_PROVENANCE_TEXT_ONLY = "text-only-v1";
+
 /** #2117: read-side gate for the learned estimator scale — the model dimension
  *  of k̂ provenance. A factor published against model X must not decide on
  *  model Y: tokenizers bill differently, and a stale cross-model factor can be
@@ -133,10 +144,19 @@ export function applyEstimateCalibration(raw: number, k: number | undefined, kOr
  *  string → factor kept as-is, so factors published before this field existed
  *  (or requests without a model stamp) are never invalidated by missing
  *  information — they retire through the normal ring rollover when new samples
- *  land. Invalid factors degrade to absent. */
-export function currentCalibrationFactor(stats: { calibratedEstimate?: number; calibratedEstimateModel?: string }, lastModel?: unknown): number | undefined {
+ *  land. Invalid factors degrade to absent.
+ *  #5952: the provenance dimension is STRICT where the model dimension is
+ *  lenient — a factor with no text-only stamp is absent, however well it
+ *  matches on route+model. The incident proved a legacy multiplier can be
+ *  image-contaminated (the shared prepare slot records text + image reserve
+ *  under a "TextEstimate" name), and no amount of route/model matching can
+ *  vouch for its evidence. Sessions re-train within two fresh text-only
+ *  settles; a ring that still holds a legacy sample stays inert until the
+ *  window flushes it out. */
+export function currentCalibrationFactor(stats: { calibratedEstimate?: number; calibratedEstimateModel?: string; calibratedEstimateProvenance?: string }, lastModel?: unknown): number | undefined {
     const k = stats.calibratedEstimate;
     if (k === undefined || !Number.isFinite(k) || k <= 0) return undefined;
+    if (stats.calibratedEstimateProvenance !== CALIBRATION_PROVENANCE_TEXT_ONLY) return undefined;
     if (stats.calibratedEstimateModel !== undefined && typeof lastModel === "string" && lastModel !== "" && stats.calibratedEstimateModel !== lastModel) return undefined;
     return k;
 }
@@ -166,10 +186,26 @@ export type WireProtocol = "anthropic" | "openai" | "responses" | "google";
  * portion, inflating the reported context size (→ premature compression) and
  * deflating the reported cache-hit rate.
  */
+// An advisor reply bundles several model calls and its top-level usage sums
+// them; `iterations` lists each call, and the last executor call read the
+// context the next request will carry. Undefined for a one-call reply.
+export function lastIterationContext(usage: Record<string, unknown>): number | undefined {
+    const its = usage["iterations"];
+    if (!Array.isArray(its) || its.length < 2) return undefined;
+    for (let i = its.length - 1; i >= 0; i--) {
+        const it = its[i] as Record<string, unknown> | null;
+        if (!it || it["type"] !== "message") continue;
+        const n = (k: string): number => (typeof it[k] === "number" && Number.isFinite(it[k]) ? (it[k] as number) : 0);
+        const sum = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+        return sum > 0 ? sum : undefined;
+    }
+    return undefined;
+}
+
 export function usageTotals(
     protocol: WireProtocol,
     usage: Record<string, unknown>,
-): { total: number | undefined; cached: number | undefined; creation?: number | undefined } {
+): { total: number | undefined; cached: number | undefined; creation?: number | undefined; context?: number | undefined } {
     const num = (v: unknown): number | undefined =>
         typeof v === "number" && Number.isFinite(v) ? v : undefined;
     if (protocol === "anthropic") {
@@ -185,6 +221,7 @@ export function usageTotals(
             // #4899: anthropic is the only wire with a cache-WRITE premium —
             // surface creation tokens for the USD ledger (billing.ts).
             creation,
+            context: lastIterationContext(usage),
         };
     }
     if (protocol === "openai") {
@@ -398,6 +435,10 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /输入[^。；;！!\n]{0,12}(?:超出|超过|超限)/,
     // (f) #3240/#3246 consolidation: mixed-language gateways write "prompt 过长".
     /prompt[^。；;！!\n]{0,6}(?:过长|太长|超长)/i,
+    // DashScope compatible-mode states the ceiling as an input-length RANGE
+    // ("Range of input length should be [1, 1000000]"), with no token or length
+    // subject phrase: unlisted here, the 400 is not an overflow and nothing arms.
+    /range of input length should be \[/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
@@ -462,6 +503,10 @@ function parseOverflowWindow(text: string): number | undefined {
     // tokens allowed (1048576)." — the number after "allowed" is the window; the
     // first parenthesized number is the rejected payload and must not be used.
     m = text.match(/maximum number of tokens allowed\s*\((\d[\d,]*)\)/i);
+    if (m) return toTokenNumber(m[1]);
+    // DashScope: "Range of input length should be [1, 1000000]" — the upper
+    // bound is the input ceiling; the lower bound is not a window.
+    m = text.match(/range of input length should be \[\s*\d[\d,]*\s*,\s*(\d[\d,]*)\s*\]/i);
     if (m) return toTokenNumber(m[1]);
     m =
         text.match(/maximum context length is (\d[\d,]*)/i) ??
@@ -556,18 +601,30 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     };
 }
 
-// #4452: an intermediate gateway that rewrites EVERY rejection into one generic
-// body (Cherry Studio et al. strip the token counts / window from each overflow
-// 400) makes inspectContextOverflow return isOverflow:false even when the payload
-// really overflows — so bili's whole overflow self-heal (#1195 same-request
-// refold, armOverflowShrink, window learn) keys off a marker that is never there
-// and silently never engages, starving the route of calibration. This predicate
-// names exactly that shape — a 4xx overflow-SHAPED reject whose body matches no
-// pattern — so the relay can log it loudly instead of the opaque `← upstream 400`
-// line. Deliberately EXCLUDES 5xx (those already self-heal via the local estimate,
+// #4452: an intermediate gateway that rewrites a payload-size rejection into one
+// generic body (Cherry Studio et al. strip the token counts / window) makes
+// inspectContextOverflow return isOverflow:false even when the payload really
+// was too large — so bili's whole overflow self-heal (#1195 same-request refold,
+// armOverflowShrink, window learn) keys off a marker that is never there and
+// silently never engages, starving the route of calibration. This predicate
+// names exactly that shape — an unmarked size-wall reject whose body matches no
+// pattern — so the relay can log it loudly instead of the opaque
+// `← upstream 413` line.
+//
+// ONLY 413 carries that meaning on its own. A 400 is the generic "malformed /
+// schema-invalid / role-rejected / auth-shaped" bucket across relays: the SAME
+// opaque body (`{"error":{"message":"Internal server error",
+// "code":"bad_request"}}`) is emitted for a truncated JSON body, an unsupported
+// field and a genuinely oversized payload alike, so treating every unmarked 400
+// as evidence of overflow manufactured a false overflow diagnosis for ordinary
+// malformed requests (#4452 follow-up). 413 Request Entity Too Large is the
+// status whose SEMANTICS are already the payload-size verdict, which is why it
+// can be diagnosed without a body marker.
+//
+// Deliberately EXCLUDES 5xx (those already self-heal via the local estimate,
 // #604) and any body that DOES carry a marker (self-heal engages normally then).
 export function isMarkerlessOverflowReject(status: number, bodyText: string): boolean {
-    return (status === 400 || status === 413) && !CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
+    return status === 413 && !CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
 }
 
 /** Default cap on the output-headroom reservation, as a fraction of the
@@ -659,6 +716,21 @@ export function systemToUser<T extends { role: string }>(messages: T[], should?:
     );
 }
 
+// #5432: index of the first entry of the trailing run of role:"system" entries
+// (== length when nothing trails). Shared by every host path that mutates an
+// ALREADY assembled anthropic body: the kernel heal keeps a client's legal
+// trailing system run verbatim at array end, so any post-assembly user insert
+// must land BEFORE it or the request 400s ("role 'system' must precede an
+// 'assistant' message or end the array").
+export function trailingSystemRunStart(messages: readonly unknown[]): number {
+    let i = messages.length;
+    while (i > 0) {
+        const m = messages[i - 1];
+        if (!m || typeof m !== "object" || Array.isArray(m) || (m as Record<string, unknown>).role !== "system") break;
+        i--;
+    }
+    return i;
+}
 
 /** #719: Some OpenAI-compatible backends (DeepSeek) reject assistant messages
  * whose `content` is null — they require a string content (possibly "") or

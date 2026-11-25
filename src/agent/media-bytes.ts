@@ -9,7 +9,7 @@
 // wire shapes that carry inline media (anthropic {type:"base64",data} source
 // blocks and redacted_thinking payloads, openai input_audio parts and data:
 // URLs incl. file file_data, responses input_image whose image_url is a bare
-// data-URL string (singular form), google inlineData), returning their byte
+// data-URL string (singular form), google inlineData / inline_data), returning their byte
 // mass so native refusal gates bill core text only. Keyed structurally (field
 // names/types), never by content: a base64 blob pasted as TEXT (a
 // {type:"text"} block or plain string content) is NOT media on any wire and
@@ -41,6 +41,7 @@ export function mediaBytesOfWireBody(raw: string): number {
         if (typeof v.image_url === "string") mediaBytes += dataUrlBytes(v.image_url);
         if (isObj(v.input_audio) && typeof v.input_audio.data === "string") mediaBytes += bytesOf(v.input_audio.data);
         if (isObj(v.inlineData) && typeof v.inlineData.data === "string") mediaBytes += bytesOf(v.inlineData.data);
+        if (isObj(v.inline_data) && typeof v.inline_data.data === "string") mediaBytes += bytesOf(v.inline_data.data);
         for (const child of Object.values(v)) pending.push(child);
     }
     return mediaBytes;

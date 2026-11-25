@@ -175,7 +175,7 @@ function runCase(engine: SqliteEngineName, name: string): void {
                 deadRefs: store.getDeadRefs(loaded.id),
                 refs: store.getRefs(loaded.id),
             };
-            const view = loadLegacyView(rows);
+            const view = loadLegacyView(rows, store.getCcrEntries(loaded.id), store.getStateFields(loaded.id));
             assert.equal(sessionDigest(view), manifest[name]!.digest, `${engine}/${name}: unified round-trip digest drift`);
         } finally {
             store.close();
@@ -239,7 +239,7 @@ test("storage unified: re-ingest is idempotent across the whole corpus (digest s
                     deadRefs: store.getDeadRefs(loaded.id),
                     refs: store.getRefs(loaded.id),
                 };
-                assert.equal(sessionDigest(loadLegacyView(rows)), manifest[name]!.digest, `${name}: digest drift after re-ingest`);
+                assert.equal(sessionDigest(loadLegacyView(rows, store.getCcrEntries(loaded.id), store.getStateFields(loaded.id))), manifest[name]!.digest, `${name}: digest drift after re-ingest`);
             } finally {
                 store.close();
             }
@@ -306,7 +306,7 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                     // what the override received, whichever that is.
                     const overridePresent = !!liveTail && liveTail.length > 0 && liveFolded !== true;
                     assert.equal(
-                        sessionDigest(loadLegacyView(rows)),
+                        sessionDigest(loadLegacyView(rows, unified.getCcrEntries(loaded.id), unified.getStateFields(loaded.id))),
                         overridePresent
                             ? recordDigest({ ...written, messages: liveTail, messagesFolded: liveFolded })
                             : recordDigest(written),
@@ -390,8 +390,8 @@ test("resolveStorageMode file tier: storage.unified applies when the env is abse
     assert.equal(resolveStorageMode({ BILI_STORAGE_UNIFIED: "legacy" }, "full"), "legacy");
 });
 
-test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file tier, default (#3250)", () => {
-    const DEFAULT = 8 * 1024 * 1024; // contract literal, mirrors tests/issue3250-wal-checkpoint.test.ts
+test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file tier, default (#3250 → #7674)", () => {
+    const DEFAULT = 0; // #7674: unlimited is the default — the engine-internal truncate is the #7156 vector
     assert.equal(resolveStorageWalJournalSizeLimit({}), DEFAULT, "absent everywhere must give the default cap");
     assert.equal(
         resolveStorageWalJournalSizeLimit({ BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: "67108864" }, DEFAULT),
@@ -815,7 +815,7 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
             assert.equal(row!.origin, null, "origin backfills NULL");
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 11, "schema version stamped to 11 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column + v6 orphans journal + v7 media map + v8 identity/tombstones + v9 zero-ref collection index + v10 immutable message ts column + v11 FK child indexes)");
+            assert.equal(ver.user_version, 12, "schema version stamped to 12 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column + v6 orphans journal + v7 media map + v8 identity/tombstones + v9 zero-ref collection index + v10 immutable message ts column + v11 FK child indexes + v12 snapshot-table foundation)");
             // v3 backfill: every pre-existing sessions row claims its
             // (namespace, conversation_id) identity binding.
             const binding = (store as unknown as { lookupConversation(ns: string, id: string): string | null }).lookupConversation("proxy", "dev-window-1");
@@ -877,7 +877,7 @@ test("schema v10: v9→v10 migration adds messages.ts without backfill; idempote
         try {
             const ver = (reopened as unknown as { db: { prepare(q: string): { get(): unknown } } }).db
                 .prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 11, "v9 library migrates to v11");
+            assert.equal(ver.user_version, 12, "v9 library migrates to v12");
             const rows = reopened.getMessages("v10-mig-1") as { seq: number; ts?: number | null }[];
             assert.equal(rows.length, 1, "row survives the migration");
             assert.ok(rows[0].ts === null || rows[0].ts === undefined, "pre-existing row keeps NULL (never backfilled)");
@@ -958,5 +958,38 @@ test("#4313: fork clone copies ts verbatim (inherited ledger rows keep their sta
     } finally {
         store.close();
         fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("#6325: unchanged large session columns are not rewritten on delta ingest", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-6325-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        const now = Date.now();
+        const makeSession = (id: string, text: string): LegacySessionLike => ({
+            id,
+            createdAt: now,
+            lastSeen: now,
+            meta: { protocol: "openai" },
+            stats: {},
+            metadata: { cacheLedger: { keep: "x".repeat(4096) } },
+            state: { blocks: [], nextBlockId: 1, nextRunId: 1, messageRefs: { byRaw: {}, byRef: {} } },
+            blockContents: new Map(),
+            lastMessages: [{ id: "m1", role: "user", contentType: "text", text } as unknown as CoreMessage],
+            lastMessagesFolded: false,
+            pluginSnapshot: undefined,
+            contentStore: undefined,
+        } as unknown as LegacySessionLike);
+        const session = makeSession("sess-6325", "hello");
+        const before = store.ingestSession(planIngest(session));
+        assert.ok(before);
+        const first = store.getSessionRow("sess-6325");
+        assert.ok(first?.metadataJson?.includes("cacheLedger"));
+        store.ingestSession(planIngest({ ...session, lastMessages: [{ id: "m2", role: "assistant", contentType: "text", text: "world" } as unknown as CoreMessage] }));
+        const second = store.getSessionRow("sess-6325");
+        assert.equal(second?.metadataJson, first?.metadataJson, "unchanged metadata_json should reuse the stored value");
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
     }
 });

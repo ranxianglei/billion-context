@@ -1,11 +1,12 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { indexToRef, matchSession as matchSessionKernel, parseStoredPlaceholder, refForRaw, renderHandoff as renderHandoffKernel, renderMessage, type CompressionBlock, type MessageContentStore, type CoreMessage } from "acp-kernel";
-import type { Session } from "./session.js";
+import { blockContentSnapshot, type Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 import { SqliteBackend, backendSelectionNotice, listBackendNames, openBackend, resolveBackendName, resolveMysqlDsn, selectedBackendRaw, type StorageBackend } from "./storage/backend.js";
 import { fileStorageBackend, fileStorageMysqlDsn } from "./knobs.js";
 import { UnifiedStore } from "./storage/store.js";
+import { displaySessionTitle, firstBlockTopicLead, topicLeadFrom } from "./session-title.js";
 
 interface ExportOptions {
     dir?: string;
@@ -64,7 +65,7 @@ function blockLedgerLine(s: Session, b: CompressionBlock): string {
             }
         }
     }
-    const orig = s.blockContents.get(b.blockId)?.full.text.length;
+    const orig = blockContentSnapshot(s.blockContents, b)?.full.text.length;
     const status = !b.active ? "consumed" : b.retired ? "retired" : "active";
     return `messages ${range} · original ${orig !== undefined ? `${orig} chars` : "not cached"} · summary ${b.summary.length} chars · ${status}`;
 }
@@ -86,7 +87,9 @@ export async function listSessions(opts: ExportOptions = {}): Promise<SessionSum
         return fast
             .map((r) => ({
                 id: r.sessionId,
-                title: r.title,
+                // #7595: display fallback — a stored subagent dispatch boilerplate
+                // title falls back to the first block topic (host name wins).
+                title: displaySessionTitle(r.hostTitle, r.title, topicLeadFrom(r.firstTopic, r.firstSummary)),
                 label: r.label,
                 protocol: r.protocol,
                 upstreamOrigin: r.origin,
@@ -100,7 +103,9 @@ export async function listSessions(opts: ExportOptions = {}): Promise<SessionSum
     sessions.sort((a, b) => latestBlockTime(b) - latestBlockTime(a));
     return sessions.map((s) => ({
         id: s.id,
-        title: s.meta.hostTitle ?? s.meta.title,
+        // #7595: display fallback — a stored subagent dispatch boilerplate
+        // title falls back to the first block topic (host name wins).
+        title: displaySessionTitle(s.meta.hostTitle, s.meta.title, firstBlockTopicLead(s.state.blocks)),
         label: s.meta.label,
         protocol: s.meta.protocol,
         upstreamOrigin: s.meta.upstreamOrigin,
@@ -151,7 +156,9 @@ export function renderHandoff(s: Session, full: boolean): string {
             full,
             folded,
             meta: {
-                title: s.meta.hostTitle ?? s.meta.title,
+                // #7595: display fallback — a stored subagent dispatch boilerplate
+                // title falls back to the first block topic (host name wins).
+                title: displaySessionTitle(s.meta.hostTitle, s.meta.title, firstBlockTopicLead(s.state.blocks)),
                 label: s.meta.label,
                 sessionId: s.id,
                 contextTokens: s.stats.contextTokens,
@@ -170,7 +177,9 @@ export function renderHandoff(s: Session, full: boolean): string {
     const lines: string[] = [];
     lines.push(`# billion-context session handoff`);
     lines.push("");
-    lines.push(`- title: ${s.meta.hostTitle ?? s.meta.title ?? "(untitled)"}`);
+    // #7595: display fallback — a stored subagent dispatch boilerplate title
+    // falls back to the first block topic (host name wins).
+    lines.push(`- title: ${displaySessionTitle(s.meta.hostTitle, s.meta.title, firstBlockTopicLead(s.state.blocks)) ?? "(untitled)"}`);
     if (s.meta.label) lines.push(`- label: ${s.meta.label}`);
     lines.push(`- session id: ${s.id}`);
     if (s.meta.protocol) lines.push(`- protocol: ${s.meta.protocol}`);
@@ -196,7 +205,7 @@ export function renderHandoff(s: Session, full: boolean): string {
         lines.push("");
         lines.push(b.summary.trim());
         lines.push("");
-        const content = s.blockContents.get(b.blockId);
+        const content = blockContentSnapshot(s.blockContents, b);
         if (full && content) {
             lines.push(`### Original messages (${content.full.count})`);
             lines.push("");
@@ -242,7 +251,7 @@ function blockSummariesSection(s: Session, includeOriginals: boolean, priorDoc: 
             lines.push(summary);
         }
         lines.push("");
-        const content = includeOriginals ? s.blockContents.get(b.blockId) : undefined;
+        const content = includeOriginals ? blockContentSnapshot(s.blockContents, b) : undefined;
         if (content) {
             lines.push(`#### Original messages (${content.full.count})`);
             lines.push("");
@@ -264,6 +273,15 @@ function safeJson(raw: string | null | undefined): unknown {
     } catch {
         return raw;
     }
+}
+
+function ccrOriginals(store: MessageContentStore | null): Map<string, string> {
+    const originals = new Map<string, string>();
+    if (store) for (const [ref, entry] of Object.entries(store.byRef)) {
+        const payload = typeof entry?.hash === "string" ? store.byHash[entry.hash] : undefined;
+        if (typeof payload === "string") originals.set(ref, payload);
+    }
+    return originals;
 }
 
 /** JSONL dump rendered from the unified tables (#2671 Phase 2c). One JSON
@@ -298,21 +316,20 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
             tail: safeJson(row.tailJson),
         }),
     );
-    // Index entries first (fork receipts carry them); the on-disk content
-    // store fills the gaps for normal sessions — the record itself omits the
-    // store by design (multi-MB rewrite cost, see session.ts contentStore).
-    const ccr = new Map((await backend.getCcrEntries(sessionId)).map((e) => [e.key, e.content] as const));
+    // CCR entries contain reference metadata; originals live in byHash.
+    // The on-disk store fills gaps in the indexed mirror.
+    const ccr = ccrOriginals(full ? await backend.getCcr(sessionId) : null);
     if (extraCcr) for (const [k, v] of extraCcr) if (!ccr.has(k)) ccr.set(k, v);
     // #4664: historian read — include retired (tombstoned) rows so a rewound
     // session exports its full history; live rows omit `retiredAt`.
     for (const m of await backend.getMessages(sessionId, { includeRetired: true })) {
-        let message: Record<string, unknown>;
+        let message: unknown;
         try {
-            message = JSON.parse(m.content) as Record<string, unknown>;
+            message = JSON.parse(m.content);
         } catch {
             message = { raw: m.content };
         }
-        if (full && typeof message.text === "string") {
+        if (full && message !== null && typeof message === "object" && "text" in message && typeof message.text === "string") {
             const ph = parseStoredPlaceholder(message.text);
             const payload = ph ? ccr.get(ph.ref) : undefined;
             if (payload !== undefined) message = { ...message, text: payload, dereferencedFrom: ph!.ref };
@@ -384,7 +401,7 @@ export function renderSessionJsonlFromSession(s: Session, full: boolean, content
         lines.push(JSON.stringify({ type: "message", seq: i, rawId: m.id, role: m.role, message: out }));
     }
     for (const [i, b] of s.state.blocks.entries()) {
-        const orig = s.blockContents.get(b.blockId)?.full.text.length;
+        const orig = blockContentSnapshot(s.blockContents, b)?.full.text.length;
         lines.push(
             JSON.stringify({
                 type: "block",
@@ -406,6 +423,81 @@ export function renderSessionJsonlFromSession(s: Session, full: boolean, content
     const dead = s.state.deadRefs ?? [];
     if (dead.length > 0) lines.push(JSON.stringify({ type: "deadRefs", refs: dead }));
     return `${lines.join("\n")}\n`;
+}
+
+async function renderSelectedSessionJsonl(store: SessionStore, session: Session, full: boolean): Promise<string> {
+    // Backend-aware open (#3388 step 2): storage.backend="mysql" + a DSN
+    // exports straight from MySQL; everything else (and every fallback)
+    // stays on the local sqlite index. A mysql failure degrades to the
+    // legacy-tail renderer exactly like a corrupt index does.
+    const backendName = resolveBackendName(process.env, fileStorageBackend());
+    if (backendName === "mysql") {
+        const dsn = resolveMysqlDsn(process.env, fileStorageMysqlDsn());
+        if (dsn.length > 0) {
+            try {
+                const backend = await openBackend("mysql", dsn);
+                try {
+                    await backend.init?.();
+                    if (await backend.getSessionRow(session.id)) {
+                        return await renderSessionJsonlFromTables(backend, session.id, full);
+                    }
+                } finally {
+                    await backend.close();
+                }
+            } catch (err) {
+                process.stderr.write(`[export] mysql backend unreadable (${String(err)}) — falling back to the local index
+`);
+            }
+        }
+    }
+    const index = path.join(store.dir, "index.db");
+    const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
+    if (existsSync(index) && !encrypted) {
+        // #3931: the selection is enforced at open time, mirroring the lane-boot
+        // split — a registered-but-unshipped choice (mysql, step 2) fails here
+        // with its documented backend error before any file access, so a deliberate
+        // selection never silently reads sqlite; a typo'd name warns once and reads sqlite.
+        const selected = selectedBackendRaw(process.env, fileStorageBackend());
+        if (selected && selected !== "sqlite") {
+            if (listBackendNames().includes(selected)) {
+                // #3931 step 2: open is async now. The contract from the
+                // #3932 review holds — a deliberate selection never
+                // silently reads sqlite: without a DSN the open rejects
+                // with the documented error (bubbles out of the export);
+                // with a DSN the probe opens + closes cleanly (the real
+                // mysql export above already ran; if it degraded, its
+                // stderr notice announced the sqlite fallback).
+                const probe = await openBackend(selected, selected === "mysql" ? resolveMysqlDsn(process.env, fileStorageMysqlDsn()) : index);
+                await probe.close();
+            } else {
+                const notice = backendSelectionNotice(selected);
+                if (notice) process.stderr.write(`[export] ${notice}\n`);
+            }
+        }
+        // Guarded open: a corrupt/foreign index.db must degrade to the
+        // legacy-tail renderer, not fail the export (#2690 review notes).
+        // Encryption gates the read for the same reason the ingest side
+        // does — index.db holds cleartext payloads, so an encrypted lane
+        // must never read from it.
+        try {
+            // #3931 step 2: openBackend is async (network backends
+            // open a pool + DDL init); the sqlite path resolves
+            // immediately.
+            const backend = await openBackend("sqlite", index);
+            try {
+                if (await backend.getSessionRow(session.id)) {
+                    const disk = store.loadContentStore(session);
+                    const extra = disk ? ccrOriginals(disk) : undefined;
+                    return await renderSessionJsonlFromTables(backend, session.id, full, extra);
+                }
+            } finally {
+                await backend.close();
+            }
+        } catch (err) {
+            process.stderr.write(`[export] unified index unreadable (${String(err)}) — falling back to the legacy-tail renderer\n`);
+        }
+    }
+    return renderSessionJsonlFromSession(session, full, store.loadContentStore(session));
 }
 
 export async function exportSession(selector: string | undefined, opts: ExportOptions = {}): Promise<string> {
@@ -430,87 +522,15 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
         const ids = matches.map((s) => s.id).join(", ");
         throw new Error(`selector "${selector}" matches ${matches.length} sessions (${ids}); use the full session id`);
     }
-    if (opts.jsonl) {
-        // Backend-aware open (#3388 step 2): storage.backend="mysql" + a DSN
-        // exports straight from MySQL; everything else (and every fallback)
-        // stays on the local sqlite index. A mysql failure degrades to the
-        // legacy-tail renderer exactly like a corrupt index does.
-        const backendName = resolveBackendName(process.env, fileStorageBackend());
-        if (backendName === "mysql") {
-            const dsn = resolveMysqlDsn(process.env, fileStorageMysqlDsn());
-            if (dsn.length > 0) {
-                try {
-                    const backend = await openBackend("mysql", dsn);
-                    try {
-                        await backend.init?.();
-                        if (await backend.getSessionRow(matches[0]!.id)) {
-                            return await renderSessionJsonlFromTables(backend, matches[0]!.id, opts.full ?? false);
-                        }
-                    } finally {
-                        await backend.close();
-                    }
-                } catch (err) {
-                    process.stderr.write(`[export] mysql backend unreadable (${String(err)}) — falling back to the local index
-`);
-                }
-            }
-        }
-        const index = path.join(store.dir, "index.db");
-        const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
-        if (existsSync(index) && !encrypted) {
-            // #3931: the selection is enforced at open time, mirroring the lane-boot
-            // split — a registered-but-unshipped choice (mysql, step 2) fails here
-            // with its documented backend error before any file access, so a deliberate
-            // selection never silently reads sqlite; a typo'd name warns once and reads sqlite.
-            const selected = selectedBackendRaw(process.env, fileStorageBackend());
-            if (selected && selected !== "sqlite") {
-                if (listBackendNames().includes(selected)) {
-                    // #3931 step 2: open is async now. The contract from the
-                    // #3932 review holds — a deliberate selection never
-                    // silently reads sqlite: without a DSN the open rejects
-                    // with the documented error (bubbles out of the export);
-                    // with a DSN the probe opens + closes cleanly (the real
-                    // mysql export above already ran; if it degraded, its
-                    // stderr notice announced the sqlite fallback).
-                    const probe = await openBackend(selected, selected === "mysql" ? resolveMysqlDsn(process.env, fileStorageMysqlDsn()) : index);
-                    await probe.close();
-                } else {
-                    const notice = backendSelectionNotice(selected);
-                    if (notice) process.stderr.write(`[export] ${notice}\n`);
-                }
-            }
-            // Guarded open: a corrupt/foreign index.db must degrade to the
-            // legacy-tail renderer, not fail the export (#2690 review notes).
-            // Encryption gates the read for the same reason the ingest side
-            // does — index.db holds cleartext payloads, so an encrypted lane
-            // must never read from it.
-            try {
-                // #3931 step 2: openBackend is async (network backends
-                // open a pool + DDL init); the sqlite path resolves
-                // immediately.
-                const backend = await openBackend("sqlite", index);
-                try {
-                    if (await backend.getSessionRow(matches[0]!.id)) {
-                        const disk = store.loadContentStore(matches[0]!);
-                        const extra = disk ? new Map(Object.entries(disk.byRef).map(([ref, e]) => [ref, disk.byHash[e.hash] ?? ""] as const)) : undefined;
-                        return await renderSessionJsonlFromTables(backend, matches[0]!.id, opts.full ?? false, extra);
-                    }
-                } finally {
-                    await backend.close();
-                }
-            } catch (err) {
-                process.stderr.write(`[export] unified index unreadable (${String(err)}) — falling back to the legacy-tail renderer\n`);
-            }
-        }
-        return renderSessionJsonlFromSession(matches[0]!, opts.full ?? false, store.loadContentStore(matches[0]!));
-    }
-    const markdown = renderHandoff(matches[0]!, opts.full ?? false);
+    const content = opts.jsonl
+        ? await renderSelectedSessionJsonl(store, matches[0]!, opts.full ?? false)
+        : renderHandoff(matches[0]!, opts.full ?? false);
     if (opts.output) {
         mkdirSync(path.dirname(path.resolve(opts.output)), { recursive: true });
-        writeFileSync(opts.output, markdown, "utf8");
+        writeFileSync(opts.output, content, "utf8");
         return `written to ${opts.output}`;
     }
-    return markdown;
+    return content;
     } finally {
         // The one-shot store holds index.db open in unified modes; close it or
         // Windows callers cannot delete their temp dirs (EPERM).

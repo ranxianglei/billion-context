@@ -22,14 +22,15 @@
 // (BILLION_CONTEXT_PLUGIN=0 / BILI_NATIVE_OMP=0).
 
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
-import { createBiliPlugin } from "./pi.js";
-import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
+import { createBiliPlugin, createOmpDirectSendGuard } from "./pi.js";
+import { applyOmpFirstEventTimeout, applyOmpMessageThreadsOff, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
 import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
-import { clearIncrementalProbe, createPrepareDirectSend, hostMsgIdHintFor, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, hostMsgIdHintFor, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import * as pfChannel from "./pf-channel.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
+import { BILI_HOST_RECOVERY_OWNER_HEADER, BILI_HOST_RECOVERY_OWNER_OMP } from "../util.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOmp(env: NodeJS.ProcessEnv): boolean {
@@ -68,7 +69,11 @@ function errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
 
-const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+const state: NativeInterceptState = {
+    origin: undefined,
+    ready: Promise.resolve(undefined),
+    headersFor: () => ({ [BILI_HOST_RECOVERY_OWNER_HEADER]: BILI_HOST_RECOVERY_OWNER_OMP }),
+};
 
 // #3248 phase 2: incremental-turn divert for omp. omp never emits header
 // events, so the ONLY identity signal at the fetch layer is the
@@ -209,8 +214,10 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
 
 state.beforeSend = ompIncrementalBeforeSend;
 // #3304: the omp swap stamps the turn id atomically with the body, so the
-// strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
-state.prepareDirectSend = createPrepareDirectSend();
+// strict shared guard applies — mutated + unrestorable ⇒ refuse locally. A
+// direct send also drops the prompt_cache_key the plugin stamped (no proxy
+// strips it on that path).
+state.prepareDirectSend = createOmpDirectSendGuard();
 
 export function ompIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
     const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
@@ -411,8 +418,11 @@ if (plan.mode !== "off") armNativeOmp(plan);
 // preflight over a large context holds the response for minutes while OMP only
 // sees keep-alive comments, and its default 300s timer would abort mid-compression.
 // Sync at module eval so it lands before the first request; user-pinned values win.
+// #6088: same for OMP's message threads — OMP reads the switch per request, so
+// defaulting it off here makes every turn carry the full history bili compresses.
 if (process.env.NODE_TEST_CONTEXT === undefined && ompTrafficRidesBili(process.env)) {
     applyOmpFirstEventTimeout(process.env);
+    applyOmpMessageThreadsOff(process.env);
 }
 
 // node:test imports this module for shouldBootstrapNativeOmp — never
@@ -449,6 +459,11 @@ export function _setOmpOriginForTest(origin: string | undefined): void {
 /** Test hook: expose the armed runtime-recovery seam (mirrors pi/opencode/dsh). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook: inspect the owner marker installed by the native OMP host. */
+export function _headersForTest(url: string): Record<string, string> | undefined {
+    return state.headersFor?.(url);
 }
 
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */

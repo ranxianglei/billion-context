@@ -2,7 +2,7 @@
 // external summary rewrite (acp_rewrite). The kernel owns the state mutation
 // (kernel/src/block-ops.ts); this module parses tool args, formats receipts,
 // and marks the session dirty so the change persists.
-import { retireBlocks, restoreBlocks, rewriteBlockSummary, type Config } from "acp-kernel";
+import { defaultCountTokens, parseBlockIdArg, retireBlocks, restoreBlocks, rewriteBlockSummary, type Config } from "acp-kernel";
 import { markDirty, type Session } from "./session.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -81,17 +81,55 @@ export function executeAcpRestore(args: Record<string, unknown>, session: Sessio
     return opReceipt("acp_restore", outcome, "restored");
 }
 
-export function executeAcpRewrite(args: Record<string, unknown>, session: Session): ProxyToolResult {
+/** One block id in either spelling the block ops take: "b5" / "5" or the
+ *  number 5 (same bounds as collectBlockIds). undefined = not an id. */
+function blockIdArg(v: unknown): string | undefined {
+    if (typeof v === "string") return v.trim();
+    if (typeof v === "number" && Number.isInteger(v) && v >= 0) return String(v);
+    return undefined;
+}
+
+/** Hold a rewrite to the bounds compress puts on a summary for the same
+ *  block, so acp_rewrite cannot store what compress would have refused:
+ *  compress.minSummaryLength / maxSummaryLength of the resolved config (0 or
+ *  absent = unbounded, as in compress) and net shrink — a summary that is not
+ *  smaller than the content the block folded is refused, unless it at least
+ *  shrinks the summary it replaces. Only judges a rewrite the kernel would
+ *  apply: unknown/inactive ids and blank or identical text return undefined
+ *  and keep the kernel's own rejection reasons. */
+function rewriteRefusal(session: Session, rawId: string, summary: string, config: Config | undefined): { id: string; reason: string } | undefined {
+    const blockId = parseBlockIdArg(rawId);
+    const block = blockId === null ? undefined : session.state.blocks.find((b) => b.blockId === blockId);
+    const next = summary.trim();
+    if (!block || !block.active || next.length === 0 || next === block.summary.trim()) return undefined;
+    const minLen = config?.compress?.minSummaryLength ?? 0;
+    if (minLen > 0 && next.length < minLen) {
+        return { id: block.blockId, reason: `Summary too short (${next.length} chars, min ${minLen}). The summary must capture the block's key information — to take a block out of the resident view use acp_retire instead.` };
+    }
+    const maxLen = config?.compress?.maxSummaryLength ?? 0;
+    if (maxLen > 0 && next.length > maxLen) {
+        return { id: block.blockId, reason: `Summary too long (${next.length} chars, max ${maxLen}). Strip noise — keep critical paths, decisions, errors, and code references.` };
+    }
+    const nextTokens = defaultCountTokens(next);
+    if (block.compressedTokens > 0 && nextTokens >= block.compressedTokens && nextTokens >= defaultCountTokens(block.summary)) {
+        return { id: block.blockId, reason: `no net shrink — the new summary (~${nextTokens} tokens) is not smaller than the content this block folded (~${block.compressedTokens} tokens). Supply a shorter summary.` };
+    }
+    return undefined;
+}
+
+export function executeAcpRewrite(args: Record<string, unknown>, session: Session, config?: Config): ProxyToolResult {
     type Item = { blockId: string; summary: string };
     const items: Item[] = [];
-    if (typeof args.blockId === "string" && typeof args.summary === "string") {
-        items.push({ blockId: args.blockId.trim(), summary: args.summary });
+    const singleId = blockIdArg(args.blockId);
+    if (singleId !== undefined && typeof args.summary === "string") {
+        items.push({ blockId: singleId, summary: args.summary });
     }
     let skippedItems = 0;
     if (Array.isArray(args.items)) {
         for (const raw of args.items) {
-            if (raw && typeof raw === "object" && typeof (raw as Item).blockId === "string" && typeof (raw as Item).summary === "string") {
-                items.push({ blockId: (raw as Item).blockId.trim(), summary: (raw as Item).summary });
+            const id = raw && typeof raw === "object" ? blockIdArg((raw as { blockId?: unknown }).blockId) : undefined;
+            if (id !== undefined && typeof (raw as Item).summary === "string") {
+                items.push({ blockId: id, summary: (raw as Item).summary });
             } else {
                 skippedItems += 1;
             }
@@ -101,6 +139,11 @@ export function executeAcpRewrite(args: Record<string, unknown>, session: Sessio
     const lines: string[] = [];
     let appliedCount = 0;
     for (const item of items) {
+        const refusal = rewriteRefusal(session, item.blockId, item.summary, config);
+        if (refusal !== undefined) {
+            lines.push(`${refusal.id}: ${refusal.reason}`);
+            continue;
+        }
         const res = rewriteBlockSummary(session.state, item.blockId, item.summary);
         if (res.ok) {
             appliedCount += 1;
@@ -109,7 +152,7 @@ export function executeAcpRewrite(args: Record<string, unknown>, session: Sessio
             lines.push(`${res.id}: ${res.reason}`);
         }
     }
-    if (skippedItems > 0) lines.push(`${skippedItems} item(s) skipped — each entry needs string blockId and summary`);
+    if (skippedItems > 0) lines.push(`${skippedItems} item(s) skipped — each entry needs a blockId and a string summary`);
     if (appliedCount > 0) markDirty(session);
     const note = "previous summary kept for rollback; decompress originals are unchanged";
     const text = `[acp_rewrite: ${lines.join("; ")}; ${note}]`;
