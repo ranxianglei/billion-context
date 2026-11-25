@@ -1,5 +1,5 @@
 import { defaultCountTokens, orderedRefPair, type CompressionBlock } from "acp-kernel";
-import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
+import { blockContentSnapshot, listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
 import { fileNameMatchesId, getStore, isValidRecord, _resetStoreForTest, relPathFor } from "../persist.js";
@@ -16,6 +16,7 @@ type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
+import { displaySessionTitle, firstBlockTopicLead } from "../session-title.js";
 import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
@@ -84,6 +85,9 @@ interface WebSessionSummary {
     hasLedger?: boolean;
     /** Display-name fallback: collapsed lead of the first compression block's topic/summary. */
     firstBlockHint?: string;
+    /** Parent session for a subagent/derived session, when the host stamped
+     *  metadata.derivedFromSessionId (or the legacy derivedFrom key). */
+    parentSessionId?: string;
     /** Which client produced this session: plugin agents stamp metadata.pluginAgent,
      *  non-plugin clients get a sniffed/UA-derived metadata.clientHint (server.ts #1426). */
     clientHint?: string;
@@ -961,14 +965,12 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             ? { w: livePrice.cacheWrite, r: livePrice.cacheRead, q: livePrice.output }
             : undefined;
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
-    let firstBlockHint = "";
-    const fb = s.state.blocks.find((b) => b.topic || b.summary);
-    if (fb && (fb.topic || fb.summary)) {
-        firstBlockHint = String(fb.topic || fb.summary).replace(/\s+/g, " ").trim();
-        if (firstBlockHint.length > 48) firstBlockHint = firstBlockHint.slice(0, 48) + "…";
-    }
+    const firstBlockHint = firstBlockTopicLead(s.state.blocks) ?? "";
     // #1426: which client this session came from (plugin stamp wins, then sniff/UA hint).
     const metaRec = s.metadata as Record<string, unknown>;
+    // Host-stamped parent for a subagent/derived session. New sessions
+    // stamp derivedFromSessionId; keep derivedFrom as the legacy fallback.
+    const parentSessionId = str(metaRec["derivedFromSessionId"]) ?? str(metaRec["derivedFrom"]);
     // #2155: active self-heal state (zombie plugin degrade / nudge
     // suppression) — surface it so the web list can badge the session.
     const shRaw = metaRec["selfHeal"];
@@ -995,12 +997,16 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // #3376: idle cache-keepalive state — memory-only, so live rows only.
     const keepalive = live ? keepaliveStatusFor(s.id) : undefined;
     const best = displayContextBest(s);
+    // Subagent dispatch prompts are identical across children, so an old
+    // set-once title may be pure boilerplate. displaySessionTitle falls back
+    // to the first block topic for display; a real host-provided title wins.
+    const displayTitle = displaySessionTitle(s.meta.hostTitle, s.meta.title, firstBlockHint);
     return {
         id: s.id,
         ...(best ? { contextBest: best } : {}),
         // #2322: a host-provided name (pi /name) outranks the derived
         // first-message title everywhere the row feeds (list, search, export).
-        ...((s.meta.hostTitle || s.meta.title) ? { title: s.meta.hostTitle || s.meta.title } : {}),
+        ...(displayTitle ? { title: displayTitle } : {}),
         // #1426: meta.label is auto-stamped with the session id on many clients —
         // treat label === id as "no title" so lists/details show 无标题 + block hint.
         ...(s.meta.label && s.meta.label !== s.id ? { label: s.meta.label } : {}),
@@ -1028,6 +1034,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),
         ...(firstBlockHint ? { firstBlockHint } : {}),
+        ...(parentSessionId ? { parentSessionId } : {}),
         ...(hasFolds ? { grossSaved, netSaved, repayCost, summaryCost, foldCount } : {}),
         ...(typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? { model: s.metadata.lastModel } : {}),
         ...(costUsd !== undefined ? { costUsd } : {}),
@@ -1114,6 +1121,9 @@ interface SessionPageQuery {
     protocol?: string;
     client?: string;
     state?: SessionPageState;
+    /** "top" excludes derived sessions; "child" keeps only sessions with a
+     *  parentSessionId. Unknown values are ignored, like the other facets. */
+    kind?: "top" | "child";
     page?: number;
     pageSize: number;
 }
@@ -1151,6 +1161,8 @@ export async function buildSessionPage(query: SessionPageQuery): Promise<Session
         }
         if (protocol && (s.protocol ?? "unknown").toLowerCase() !== protocol) return false;
         if (client && (s.clientHint ?? "").toLowerCase() !== client) return false;
+        if (query.kind === "top" && s.parentSessionId) return false;
+        if (query.kind === "child" && !s.parentSessionId) return false;
         if (query.state === "live" && (!s.live || s.restored)) return false;
         if (query.state === "history" && s.live && !s.restored) return false;
         return true;
@@ -1767,7 +1779,7 @@ function snapshotRefIndexFor(session: Session, block: CompressionBlock): Map<str
     if (direct.length === 0) return null;
     let content: BlockContent | undefined;
     try {
-        content = session.blockContents.get(block.blockId);
+        content = blockContentSnapshot(session.blockContents, block);
     } catch {
         return null;
     }
@@ -1921,7 +1933,7 @@ export async function buildBlockContent(id: string, blockId: string, view: Block
     if (!block) return { ok: false, reason: "unknown-block" };
     let content: BlockContent | undefined;
     try {
-        content = session.blockContents.get(blockId);
+        content = blockContentSnapshot(session.blockContents, block);
     } catch (error) {
         // #3917: a corrupt/unreadable content store must not 500 the panel —
         // report it as "no snapshot" and let the UI explain.
