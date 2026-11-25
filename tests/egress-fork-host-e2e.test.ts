@@ -860,7 +860,7 @@ test("T10 kstate retirement: the cold egress-on load rebuilds blocks/refs/tsStam
 test("#7658 T11: the fork route must not leak a raw corruption error as FORK_FAILED (review fix)", async () => {
     const logs: string[] = [];
     const h = await harness(logs);
-    let wdb: { db: import("node:sqlite").DatabaseSync } | null = null;
+    let wdb: ReturnType<typeof openSqliteDatabase> | null = null;
     try {
         await seedParent(h.base, "p11");
         await settle(h.store, "p11");
