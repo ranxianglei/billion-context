@@ -44,7 +44,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
-import { egressAuthorityArmed, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -401,7 +401,7 @@ export async function prepareGoogle(
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinned, sideRequest: isTitleGen });
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
-                const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log);
+                const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log, egressBlockLedgerFor(session));
                 if (served !== null) {
                     rebuiltContents = coreToGoogle(served, { model });
                 }
