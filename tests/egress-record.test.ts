@@ -21,10 +21,10 @@ import * as path from "node:path";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
 import {
+    egressAppendTurn,
     egressStateAt,
-    egressStateAppend,
-    egressStateCompact,
     egressStateView,
+    type EgressOp,
 } from "../src/storage/egress-state.ts";
 import { EGRESS_SYSTEM_MSGID, buildEgressViewRows, recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
 import { featureEnabled } from "../src/rollout.ts";
@@ -45,14 +45,13 @@ function open(): Harness {
     const { db } = openSqliteDatabase(path.join(dir, "index.db"));
     migrateSchema(db);
     const store: EgressOpLogStore = {
-        egressStateAppendOps: (sid, ops, nowMs) => egressStateAppend(db, sid, ops, nowMs),
+        egressAppendTurn: (sid, ops, baseSeq, nowMs) => egressAppendTurn(db, sid, ops, nowMs, { baseSeq }),
         egressStateView: (sid) => egressStateView(db, sid),
-        egressStateCompactView: (sid, view, nowMs) => egressStateCompact(db, sid, view, nowMs),
         egressStateViewAt: (sid, seq) => egressStateAt(db, sid, seq),
-        egressStateMaxSeq: (sid) => (db.prepare(`SELECT COALESCE(MAX(log_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
+        egressStateMaxSeq: (sid) => (db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
         egressStateTruncateAfter: (sid, seq) => {
-            const a = db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND log_seq > ?`).run(sid, seq);
-            const b = db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND log_seq > ?`).run(sid, seq);
+            const a = db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
+            const b = db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
             return Number(a.changes) + Number(b.changes);
         },
     };
@@ -97,7 +96,9 @@ test("recording: turn1 = full +I batch; turn2 tail append = exactly one +I", () 
 
         const t2 = [t1[0], t1[1], M("c", "three")];
         view = recordEgressTurn({ store: H.store, sessionId: S, prev: view, conversation: t2, systemText: "SYS", nowMs: 2000 });
-        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND log_seq > 3").get(S) as { c: number };
+        // Renumber (2026-11-25): turn1's rows are system=0, a=1, b=2 (the
+        // system row no longer consumes number 1) — the new tail row is 3.
+        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND log_seq > 2").get(S) as { c: number };
         assert.equal(added.c, 1, "tail append records exactly ONE new op row");
         const last = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? ORDER BY log_seq DESC LIMIT 1").get(S) as { row_type: string; msgid: string };
         assert.deepEqual({ row_type: last.row_type, msgid: last.msgid }, { row_type: "I", msgid: "c" });
@@ -115,16 +116,30 @@ test("recording: fold shape = -D range + +I summary, and the -D triggers compact
         let view = recordEgressTurn({ store, sessionId: S, prev: undefined, conversation: [M("a", "1"), M("b", "2"), M("c", "3"), M("d", "4"), M("e", "5")], systemText: "SYS", nowMs: 1000 });
         // fold: b..d replaced by one summary row
         const folded = [M("a", "1"), M("acp_summary_9", "…", "assistant"), M("e", "5")];
-        view = recordEgressTurn({ store, sessionId: S, prev: view, conversation: folded, systemText: "SYS", nowMs: 2000 });
-        const ops = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? AND op_seq > 5 ORDER BY op_seq").all(S) as { row_type: string; msgid: string | null }[];
-        const types = ops.map((o) => o.row_type);
+        // read the op list through the store: the compaction that the -D
+        // triggers replaces the flow's history with the base row (#7574), so
+        // egress_flow no longer shows the single ops afterwards
+        const batches: EgressOp[][] = [];
+        const spy: EgressOpLogStore = {
+            ...store,
+            egressAppendTurn: (sid, ops, baseSeq, nowMs) => {
+                batches.push(ops);
+                return store.egressAppendTurn(sid, ops, baseSeq, nowMs);
+            },
+        };
+        view = recordEgressTurn({ store: spy, sessionId: S, prev: view, conversation: folded, systemText: "SYS", nowMs: 2000 });
+        const ops = batches[0];
+        assert.ok(ops !== undefined && ops.length > 0, "the fold was recorded");
+        const types = ops.map((o) => o.type);
         assert.ok(types.includes("D"), "fold emits a -D");
         assert.ok(types.includes("I"), "fold emits a +I for the summary");
         assert.equal(view.length, 4);
-        // compaction fired: state table = base row + nothing else (the I was
-        // replayed INTO the base by the same compact call)
+        // compaction fired, in the same write as the ops: state table = base
+        // row + nothing else (the D and the I were replayed INTO the base)
         const stateRows = H.db.prepare("SELECT row_type FROM egress_state WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
-        assert.ok(stateRows.some((r) => r.row_type === "B"), "compaction wrote a base row");
+        assert.deepEqual(stateRows.map((r) => r.row_type), ["B"], "the state table holds only the base row");
+        const flowRows = H.db.prepare("SELECT row_type FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
+        assert.deepEqual(flowRows.map((r) => r.row_type), ["B"], "the flow dropped the rows the base replaced (#7574)");
         assert.equal(egressStateView(H.db, S).length, 4, "view has the system row + a + summary + e");
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), view.map((r) => r.msgid), "view survives compaction byte-identical");
     } finally {
@@ -168,10 +183,19 @@ test("recording: nudge-shaped churn is EXCLUDED (ephemeral rows never recorded)"
     }
 });
 
-test("#3617 negative direction: rollout key OFF by default → gate never opens", () => {
-    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
-    assert.equal(featureEnabled("egressPlane"), false, "egressPlane defaults to 0 — the prepare-openai gate (featureEnabled) sees nothing and records zero rows");
-    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
-    assert.equal(featureEnabled("egressPlane"), true);
-    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+test("#3617 negative direction: the plane can be forced OFF → gate never opens", () => {
+    const saved = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
+    try {
+        // this ci:full branch bakes egressPlane to 100 — the rollback path is
+        // the forced "0" (the env always wins over the baked-in percent):
+        // with the env at 0 the prepare-openai gate (featureEnabled) sees it OFF and
+        // records no rows. The documented force-on is env "1" or config true.
+        assert.equal(featureEnabled("egressPlane"), false, "forced 0 resolves OFF even against the branch default 100");
+        process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+        assert.equal(featureEnabled("egressPlane"), true, "explicit 1 (the documented force-on) opens the gate");
+    } finally {
+        if (saved === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+        else process.env.BILI_ROLLOUT_EGRESS_PLANE = saved;
+    }
 });

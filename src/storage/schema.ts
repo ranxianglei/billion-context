@@ -103,23 +103,31 @@ import { parseLegacyEnvelopeToWindow } from "../snapshot/identity.js";
 //        the DDL shapes are independent).
 export const STORAGE_SCHEMA_VERSION = 12;
 
-/** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
- *  auto checkpoints move frames into the main db and reset the write offset
- *  but NEVER shrink the WAL file — without this limit a long-lived process's
- *  index.db-wal stays at its historical high-water mark forever (field:
- *  55 MiB flat). With it, every completed checkpoint truncates the file back
- *  to the cap. 8 MiB sits well above any single-save burst while keeping
- *  disk use and crash-recovery replay bounded. Per-connection setting: each
- *  process that opens the shared index applies its own copy (#2671 topology).
- *  Tunable since #3250 via storage.walJournalSizeLimitBytes /
- *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (resolved by src/knobs.ts). */
-export const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
+/** #3250 → #7674: default for `journal_size_limit` is now UNLIMITED (0).
+ *  The old 8 MiB default made the engine truncate the WAL file internally
+ *  after every completed checkpoint — a reclaim that bypasses every
+ *  JS-side guard and comes back to fetch frames out from under live peer
+ *  connections sharing the directory (#2671 topology: five daemons, kill-9
+ *  handovers). That floor-reclaim is the #7156 damage shape (pages
+ *  double-allocated in the tail, "2nd reference to page", index pages
+ *  corrupting before table pages): three field events on this host
+ *  (2026-11-19, 2026-11-21, 2026-11-23) plus the #7156 incident itself,
+ *  all on a growing multi-GB index with peers. The engine never shrinks a
+ *  WAL it did not truncate, so without the limit the file sits at its
+ *  historical high-water mark (field: 55 MiB flat — bounded, harmless,
+ *  what opencode runs: 13 concurrent writers, 9.55 GB db, 4.7 MB WAL,
+ *  zero corruption). Explicit reclamation stays available: operators set
+ *  a positive cap via storage.walJournalSizeLimitBytes /
+ *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (resolved by src/knobs.ts) or
+ *  shrink on demand with ?vacuum=full. */
+export const WAL_JOURNAL_SIZE_LIMIT = 0;
 
 /** Connection pragmas for every index.db opener. The journal cap is
- *  per-opener (see WAL_JOURNAL_SIZE_LIMIT); the default list below is what
- *  short-lived openers (export fast path) and tests apply. */
+ *  per-opener and only issued when positive (0 = unlimited, the SQLite
+ *  default); the default list below is what short-lived openers (export
+ *  fast path) and tests apply. */
 export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
-    return [
+    const pragmas = [
         // #3901/#3463: with auto_vacuum=INCREMENTAL, freed pages can be handed
         // back to the filesystem by `PRAGMA incremental_vacuum`
         // (gc({vacuum:"incremental"})) without the offline full rewrite.
@@ -135,8 +143,11 @@ export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
         "PRAGMA synchronous = NORMAL",
         "PRAGMA busy_timeout = 5000",
         "PRAGMA foreign_keys = ON",
-        `PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`,
     ];
+    if (walJournalSizeLimitBytes > 0) {
+        pragmas.push(`PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`);
+    }
+    return pragmas;
 }
 
 export const STORAGE_PRAGMAS = storagePragmas(WAL_JOURNAL_SIZE_LIMIT);
@@ -148,6 +159,7 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
     parent_session_id   TEXT,
     fork_point_seq      INTEGER,
+    fork_egress_watermark INTEGER,
     protocol            TEXT,
     label               TEXT,
     title               TEXT,
@@ -166,7 +178,8 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     tail_json           TEXT NOT NULL DEFAULT '{}',
     ccr_json            TEXT,
     last_ingested_seq   INTEGER,
-    orphans_json        TEXT
+    orphans_json        TEXT,
+    r3_latched_at       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS content (
@@ -431,9 +444,11 @@ CREATE TABLE IF NOT EXISTS state_fields (
  *  outbound conversation (B base / I insert / D delete-range / U
  *  update-content; anchors are msgids, never positions). DUAL TABLES:
  *  egress_state is what serving reads and compaction physically trims below
- *  the watermark; egress_flow is append-only and never deleted (any op_seq
- *  stays reconstructible — rollback is based on this table, not on client
- *  resends). SELF-CONTAINED BYTES (ruling 7439-1): the `bytes` column holds
+ *  the watermark; egress_flow is the record — compaction trims it below the
+ *  watermark as well (#7574: it used to keep every row AND gain one full
+ *  snapshot per fold, so a long session grew without bound), so every op_seq
+ *  from the newest base on stays reconstructible — rollback is based on this
+ *  table, not on client resends. SELF-CONTAINED BYTES (ruling 7439-1): the `bytes` column holds
  *  the message's final core JSON for I/U rows — no hash refs, no content
  *  table; replay needs only this table pair. TWO SEQUENCES (ruling 7439,
  *  canonical message number): op_seq orders EVERY row (the primary key);
@@ -466,6 +481,51 @@ CREATE TABLE IF NOT EXISTS egress_flow (
     PRIMARY KEY (session_id, op_seq)
 );
 CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msgid);
+`;
+
+/** #7577 (follow-up to #7439, owner design 2026-11-23): the BLOCK LIFECYCLE
+ *  log — the op-log of the fold blocks, symmetric to the message egress log.
+ *  egress_block_flow is append-only (row types B base / I block-born / U
+ *  block-state-change; NEVER deleted) and carries the bounded kstate residual
+ *  snapshot in `kstate_json` on every row (D4: no fifth table — the sidecar
+ *  rides the block-change rows, whose count = fold count, 2-3 orders of
+ *  magnitude below the message count). egress_block_state is the current
+ *  block-set read replica (PK (session_id, block_id), one latest snapshot per
+ *  block; compaction may physically trim it). SELF-CONTAINED BYTES (D2,
+ *  ruling 7439-1): the one/full block content is inlined in the payload —
+ *  zero content-CAS refs, zero hash columns. DUAL CLOCKS (owner ruling
+ *  2026-11-24): the block tables number THEMSELVES (op_seq dense within
+ *  egress_block_flow); flow_op_seq is the pointer to the flow clock (its
+ *  MAX at write time) used for cross-table alignment at point forks — the
+ *  original shared-clock design was rejected in review because it broke the
+ *  flow's density invariant on the first fold. Probe-first, no version
+ *  bump (the tables never shipped, like the egress pair). */
+const EGRESS_BLOCK_DDL = `-- #7577: block lifecycle log (flow + state), self-contained bytes, kstate sidecar.
+-- Dual clocks (owner ruling 2026-11-24): the block tables number THEMSELVES
+-- (op_seq dense within egress_block_flow); flow_op_seq is the pointer to the
+-- egress_flow clock (its MAX at write time) used for cross-table alignment at
+-- point forks. egress_flow keeps its own exclusive number pool — untouched.
+CREATE TABLE IF NOT EXISTS egress_block_flow (
+    session_id TEXT NOT NULL,
+    op_seq INTEGER NOT NULL,
+    flow_op_seq INTEGER NOT NULL DEFAULT 0,
+    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','U')),
+    block_id TEXT,
+    payload TEXT NOT NULL,
+    kstate_json TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, op_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_egress_block_flow_block ON egress_block_flow (session_id, block_id);
+CREATE TABLE IF NOT EXISTS egress_block_state (
+    session_id TEXT NOT NULL,
+    block_id TEXT NOT NULL,
+    op_seq INTEGER NOT NULL,
+    flow_op_seq INTEGER NOT NULL DEFAULT 0,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, block_id)
+);
 `;
 
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
@@ -519,7 +579,17 @@ export function migrateSchema(db: {
     const hasEgressState = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_state'")
         .get();
-    if (!hasEgressState) db.exec(EGRESS_STATE_DDL);
+    // #7574 item 10: the group is TWO tables + TWO indexes, so it is applied
+    // inside ONE transaction. Executed bare (the driver autocommits each
+    // statement of the batch separately) a crash after the first CREATE left
+    // egress_state without egress_flow, and this table probe then said
+    // "already there" on every later open — the half-built pair stayed
+    // half-built forever. The probe now asks for BOTH tables, so a library
+    // interrupted by the old code converges on its next open.
+    const hasEgressFlow = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_flow'")
+        .get();
+    if (!hasEgressState || !hasEgressFlow) db.transaction(() => db.exec(EGRESS_STATE_DDL));
     // 7439 ruling (canonical message number): a dev DB created with the
     // pre-numbering row shape (log_seq primary key, no op_seq column) is
     // replaced in place — the two tables NEVER shipped in any release, so
@@ -528,9 +598,29 @@ export function migrateSchema(db: {
     const egressCols = (db.prepare("PRAGMA table_info(egress_state)").all() as unknown as { name?: unknown }[])
         .map((c) => c.name);
     if (egressCols.length > 0 && !egressCols.includes("op_seq")) {
-        db.exec("DROP TABLE IF EXISTS egress_flow");
-        db.exec("DROP TABLE IF EXISTS egress_state");
-        db.exec(EGRESS_STATE_DDL);
+        // #7574 item 10: drop + recreate is one step (same transaction rule).
+        db.transaction(() => {
+            db.exec("DROP TABLE IF EXISTS egress_flow");
+            db.exec("DROP TABLE IF EXISTS egress_state");
+            db.exec(EGRESS_STATE_DDL);
+        });
+    }
+    // #7577: the block lifecycle log — own probe (same discipline, no bump).
+    const hasEgressBlockFlow = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_block_flow'")
+        .get();
+    const blockCols = hasEgressBlockFlow
+        ? (db.prepare("PRAGMA table_info(egress_block_flow)").all() as unknown as { name?: unknown }[]).map((c) => c.name)
+        : [];
+    if (!hasEgressBlockFlow || !blockCols.includes("flow_op_seq")) {
+        // Never-shipped dev table; a dev DB that created the old-shape
+        // (shared-clock) layout is dropped and recreated (one step, same
+        // #7574 rule). Data loss is the accepted dev cost.
+        db.transaction(() => {
+            db.exec("DROP TABLE IF EXISTS egress_block_flow");
+            db.exec("DROP TABLE IF EXISTS egress_block_state");
+            db.exec(EGRESS_BLOCK_DDL);
+        });
     }
     // 2×2 (#5874 brief, element-level world): the L1 world carries the
     // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
@@ -616,6 +706,23 @@ export function migrateSchema(db: {
             db.exec("ALTER TABLE ccr_entries ADD COLUMN orig_hash TEXT REFERENCES content(hash)");
         }
         db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_orig_hash ON ccr_entries(orig_hash)");
+    }
+    // 身份表收拢 (discussions/7591): the R3 breaker latch moves onto the
+    // sessions row — the l1_world row it used to latch is a dead carrier
+    // once egress-on stops writing that table. PROBE-FIRST, not version-
+    // gated (same discipline as the ccr/blocks probes above): a db whose
+    // user_version already sits at the current version still picks the
+    // column up here; a fresh db already carries it from the base DDL.
+    // NULL/0 = not latched, else the epoch-ms of the latch.
+    const sessionCols = (db.prepare("PRAGMA table_info(sessions)").all() as unknown as { name?: unknown }[])
+        .map((c) => (typeof c?.name === "string" ? c.name : ""));
+    if (sessionCols.length > 0 && !sessionCols.includes("r3_latched_at")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN r3_latched_at INTEGER");
+    }
+    // #7658: the egress fork point (FLOW-clock watermark the four egress
+    // tables were copied at) — probe-first, same discipline as r3_latched_at.
+    if (sessionCols.length > 0 && !sessionCols.includes("fork_egress_watermark")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN fork_egress_watermark INTEGER");
     }
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;
@@ -753,6 +860,19 @@ export function migrateSchema(db: {
     });
     if (needV8Backfill) migrateV8Identities(db);
     db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
+    // #7574: idx_conversations_session ships inside STORAGE_DDL_V1, so only
+    // a database BORN on a current build ever had it — a library that
+    // climbed to its user_version from an earlier release took the versioned
+    // steps above and never the v1 DDL, so every conversations(session_id)
+    // lookup stayed a full scan. Probe the index itself and create it on the
+    // first open that misses it (the table exists on every path: v1 DDL on a
+    // fresh file, the `from < 3` step, or already).
+    const hasConversationsIndex = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_session'")
+        .get();
+    if (hasConversationsIndex === undefined) {
+        db.exec("CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id)");
+    }
     return { from, to: STORAGE_SCHEMA_VERSION };
 }
 

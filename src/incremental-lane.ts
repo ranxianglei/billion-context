@@ -530,6 +530,12 @@ function persistLaneState(sessionId: string, system: unknown, systemSet: boolean
 
 export function loadSystem(sessionId: string): unknown {
     try {
+        // Renumber (2026-11-25): egress-on sessions carry the client's raw
+        // system (A) in the op log's system row (sysIn) — the authoritative
+        // copy (survives kstate retirement, fork-verbatim). The inc:system
+        // ext row stays as the legacy read for everything else.
+        const viaOpLog = getStore().egressOpLogStore()?.egressSystemInput?.(sessionId);
+        if (viaOpLog !== null && viaOpLog !== undefined) return viaOpLog;
         return getStore().getSessionExt(sessionId, EXT_KEY_SYSTEM);
     } catch {
         return undefined;

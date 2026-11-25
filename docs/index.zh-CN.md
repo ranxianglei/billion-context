@@ -36,3 +36,6 @@
 | [auto-merge-guardrails](auto-merge-guardrails.md) | `AGENTS.md` §7 背后的证据附录（AI 自动开发评审史） |
 | [unified-loop-spec](unified-loop-spec.md) | 历史设计：统一压缩循环规格（已落地，以代码为准） |
 | [PR #6785 详尽梳理](pr-6785-unified-storage-and-flows.zh-CN.md) / [EN](pr-6785-unified-storage-and-flows.md) | PR #6785 审查级梳理：统一存储表结构（schema v12）/ 实现逻辑 / 逐轮数据流转 / 开关总账 + 实测验证（#5874/#7064/#7398/#4491）+ 第 2 轮：op log 正史编号、惰性投影、窗口 re-anchor、常驻性能门（KDD #23） |
+| [egress 块流/状态](egress-block-flow.zh-CN.md) / [EN](egress-block-flow.md) | 块正史 + checkpoint 退役（#7577）：`egress_block_flow`/`egress_block_state` 表、kstate 边车、点位 fork、kstate 裁剪 |
+| [egress 平面（一站式）](egress-plane.zh-CN.md) / [EN](egress-plane.md) | egress 平面唯一入口：设计脉络（#7439→#7581→#7617）、双时钟、身份收拢、开关依赖与 on/off 解析序、操作手册 |
+| [退役登记表](deprecations.zh-CN.md) / [EN](deprecations.md) | l1 占位行、conversations 表、D-lane 退役触发条件、msgid 开关删除、物理 DROP 批次 |

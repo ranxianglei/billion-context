@@ -24,10 +24,13 @@ export interface RawSpan { readonly start: number; readonly end: number }
  *  Every other top-level field is parsed from its own tiny span. Returns null
  *  when the body is outside the scannable shape or any field span fails to
  *  parse — the caller keeps the legacy full JSON.parse (fail-soft, never
- *  guess — same contract as the scan itself). */
-export function synthesizeTopLevel(bodyText: string): Record<string, unknown> | null {
+ *  guess — same contract as the scan itself). `counts.total`, when given,
+ *  receives the wire element count on success (the caller's inbound message
+ *  count, otherwise unknown until the array is decoded). */
+export function synthesizeTopLevel(bodyText: string, counts?: { total: number }): Record<string, unknown> | null {
     const scan = scanMessagesSpans(bodyText, "all");
     if (!scan) return null;
+    if (counts) counts.total = scan.total;
     const out: Record<string, unknown> = {};
     for (const [key, span] of scan.fieldSpans) {
         if (key === "messages") continue;

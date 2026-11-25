@@ -143,6 +143,7 @@ billion-context/
 │   ├── registry-snapshot.json    # Bundled full models.dev snapshot (offline floor)
 │   ├── session.ts                # Session model + in-memory store (bounded, MAX_SESSIONS)
 │   ├── session-id.ts             # Session identity: client value verbatim + persona fork fingerprint
+│   ├── session-title.ts          # Subagent dispatch prompt: prefix matcher + task strip for titles (#7590)
 │   ├── claude-lane-token.ts      # SubagentStart lane-token grammar (mint/extract, #5095)
 │   ├── session-resolve.ts        # #2944/#7525-GA order resolver: stamped id rides verbatim; #5095 lane-token fork
 │   ├── session-gc.ts             # Session-file GC, opt-in (sessions.gc.* / BILI_SESSION_GC*) (#1082)
@@ -160,6 +161,7 @@ billion-context/
 │   │   ├── engine-bootstrap.ts   #   Self-downloads pinned better-sqlite3 prebuilt when no engine exists
 │   │   ├── identity.ts           #   messages-table identity hash: strips position metadata (#4390)
 │   │   ├── egress-state.ts         #   Egress op-log outbound view: dual-table state+flow, replay, compaction, any-seq rollback (#7398)
+│   │   ├── egress-block.ts         #   Egress block op-log: dual-table block state+flow, replay, compaction, point-fork, kstate sidecar (#7577, rollout egressPlane)
 │   │   ├── egress-record.ts        #   Egress op-log RECORDING: build the outbound view rows, diff vs prev, append sparse ops, fold-triggered compaction (#7398, rollout egressPlane)
 │   │   ├── egress-serve.ts         #   Egress op-log SERVE: rebuild the outbound elements from the self-contained op-log rows (byte-identity chain, ladder recovery, whole-turn degrade) + shadow byte comparison (#7398, rollout egressPlane)
 │   │   ├── ingest.ts             #   Legacy → unified row mapping + legacy view rebuild (#2671)
@@ -221,6 +223,7 @@ billion-context/
 │   │   ├── media-bytes.ts        #   Shared inline-media byte accounting for native direct-send refusal gates
 │   │   ├── native-bootstrap.ts   #   dist/agent/<entry>.js → dist/index.js resolution
 │   │   ├── native-intercept.ts   #   Model-API fetch routing, attribution and proxy recovery
+│   │   ├── prompt-mass.ts   #   Protocol-shaped prompt-mass pricing for the client-local doom gate (#7106)
 │   │   ├── fetch-chain/
 │   │   │   └── index.ts          #   Fetch guard, re-entry cutoff and pi-web-access coexistence
 │   │   ├── native-ws-intercept.ts #  WebSocket-companion intercept: Codex Responses upgrades → /bili/ lane (#2111)
