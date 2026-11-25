@@ -3,8 +3,10 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 
 /**
- * Immutable-publication journal for the two machine-global state snapshots
- * (src/affinity-persist.ts, src/order-persist.ts). Replaces whole-file RMW
+ * Immutable-publication journal for the machine-global state snapshot
+ * (src/affinity-persist.ts — the second original consumer, src/order-persist.ts,
+ * was retired with the trust-stamped-id GA before this landed). Replaces
+ * whole-file RMW
  * against ONE shared `<name>.json.tmp` renamed over `<name>.json` guarded only
  * by a process-local flag: two instances on one state dir (#4125) raced and the
  * later rename clobbered the earlier writer's merged content (#1724/#3397).

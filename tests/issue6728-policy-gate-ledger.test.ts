@@ -198,26 +198,26 @@ test("#6728: requireNudge refusals charge the ledger — breaker arms by the 3rd
   );
 });
 
-test("#6728: requireRecommendation refusals charge the ledger — breaker arms by the 3rd identical refusal", () => {
+test("#7197: requireRecommendation refusals do NOT arm the breaker (range-correctness gate, not fold-feasibility)", () => {
   const ctx = scopeGateCtx();
   const first = runApply(ctx, SCOPE_CALL);
   assert.ok(
     first.startsWith("[Compression REFUSED"),
     `expected refusal, got: ${first.slice(0, 120)}`,
   );
-  assert.ok(
-    !compressBreakerArmed(ctx.session),
-    "breaker must not arm on the first refusal",
-  );
   runApply(ctx, SCOPE_CALL);
   const third = runApply(ctx, SCOPE_CALL);
   assert.ok(
-    compressBreakerArmed(ctx.session),
-    "breaker must be armed after 3 consecutive gate refusals",
+    !compressBreakerArmed(ctx.session),
+    "#7197: scope-gate refusals must NOT arm the breaker — the recovery (acp_status + in-recommendation retry) is always available, so the stop wording would forbid the only recovery the code allows",
   );
   assert.ok(
-    third.includes("COMPRESS CIRCUIT BREAKER"),
-    "3rd receipt must carry the breaker paragraph:\n" + third,
+    !third.includes("COMPRESS CIRCUIT BREAKER"),
+    "scope-gate refusal must not carry the breaker paragraph:\n" + third,
+  );
+  assert.ok(
+    third.includes("again"),
+    "the spec-repeat collapse must still fire on the 3rd identical call (#6728 protection preserved):\n" + third,
   );
 });
 

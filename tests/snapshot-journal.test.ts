@@ -36,8 +36,6 @@ const REPO = fileURLToPath(new URL("../", import.meta.url));
 const JOURNAL = pathToFileURL(path.join(REPO, "src/snapshot-journal.ts")).href;
 const AFFINITY = pathToFileURL(path.join(REPO, "src/affinity-persist.ts")).href;
 const AFFINITY_RESOLVER = pathToFileURL(path.join(REPO, "src/prefix-affinity.ts")).href;
-const ORDER = pathToFileURL(path.join(REPO, "src/order-persist.ts")).href;
-const ORDER_RESOLVER = pathToFileURL(path.join(REPO, "src/session-resolve.ts")).href;
 /** The repo's own runner flag: `node --import tsx`. Children load the same TS
  *  sources as this process, so a spawned writer runs the real journal code. */
 const TSX_IMPORT = "tsx";
@@ -711,36 +709,10 @@ console.log(JSON.stringify({ leaves: leaves.length, legacyUnchanged: legacyAfter
     assert.ok(out.hydrated.includes("new-chain"), "hydrate reads the journal output — a restart reattaches the chain");
 });
 
-test("order skeletons persist through the journal across a restart", { timeout: 30_000 }, async () => {
-    const state = freshDir("order-store");
-    const script = `
-process.env.XDG_STATE_HOME = ${JSON.stringify(state)};
-const fs = await import("node:fs");
-const path = await import("node:path");
-const { orderSnapshot, resetSessionOrderForTest, applyOrderSnapshot } = await import(${JSON.stringify(ORDER_RESOLVER)});
-const { flushOrderSkeletons, hydrateOrderSkeletons } = await import(${JSON.stringify(ORDER)});
-
-resetSessionOrderForTest();
-applyOrderSnapshot([{ id: "conv-a", kinds: ["user", "assistant"], frags: ["f1", "f2"], tagHash: "tag", lastSeen: Date.now() }]);
-flushOrderSkeletons();
-
-const dir = path.join(${JSON.stringify(state)}, "billion-context");
-const journalDir = path.join(dir, "session-order.json.journal");
-const leaves = fs.existsSync(journalDir) ? fs.readdirSync(journalDir).filter((n) => n.startsWith("pub-")) : [];
-
-resetSessionOrderForTest();
-const cold = orderSnapshot().length;
-hydrateOrderSkeletons();
-const after = orderSnapshot();
-console.log(JSON.stringify({ leaves: leaves.length, cold, after }));
-`;
-    const out = await runChild(script);
-    assert.ok(out.leaves >= 1, "the flush published an output");
-    assert.equal(out.cold, 0, "the registry was cold before hydration");
-    assert.equal(out.after.length, 1, "hydrate restored the skeleton");
-    assert.equal(out.after[0].id, "conv-a");
-    assert.deepEqual(out.after[0].kinds, ["user", "assistant"]);
-});
+// 2026-11-25: the order-skeleton writer (src/order-persist.ts) was retired with
+// the trust-stamped-id GA (#7525) before this PR merged — its restart-through-
+// the-journal case is gone with the module; the affinity case above covers the
+// same journal code path.
 
 // ─── policy controls ───
 
