@@ -435,6 +435,14 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /输入[^。；;！!\n]{0,12}(?:超出|超过|超限)/,
     // (f) #3240/#3246 consolidation: mixed-language gateways write "prompt 过长".
     /prompt[^。；;！!\n]{0,6}(?:过长|太长|超长)/i,
+    // #7709: OpenAI-compatible self-hosted / gateway upstreams (e.g. a MaaS
+    // relay) meter a per-CHANNEL ceiling and phrase the rejection as
+    // "prompt tokens (N) exceeds channel max limit (W)" — no context / model /
+    // length keyword at all, so none of the patterns above match and the
+    // overflow self-heal (#1195 refold, armOverflowShrink) never arms. Anchored
+    // on the token subject so a channel-level RATE / concurrency limit phrased
+    // in the same family stays dark (no spurious token-space shrink).
+    /tokens?[^.]{0,40}channel max(?:imum)? limit/i,
     // DashScope compatible-mode states the ceiling as an input-length RANGE
     // ("Range of input length should be [1, 1000000]"), with no token or length
     // subject phrase: unlisted here, the 400 is not an overflow and nothing arms.
@@ -529,6 +537,11 @@ function parseOverflowWindow(text: string): number | undefined {
         text.match(/(\d[\d,]*)\s*(?:个\s*)?tokens?\s*(?:的)?(?:上限|最大|限制)/i) ??
         text.match(/(?:上限|最大(?:值|限制)?|限制)[^。；;！!\n]{0,20}?(\d[\d,]*)\s*(?:个\s*)?tokens?/i);
     if (m) return toTokenNumber(m[1]);
+    // #7709: "…exceeds channel max limit (512000)" — the parenthesized number
+    // AFTER the limit phrase is the ceiling; the token-side count is the
+    // rejected payload (parseOverflowCounts), never the window.
+    m = text.match(/channel max(?:imum)? limit *[(]([0-9][0-9,]*)[)]/i);
+    if (m) return toTokenNumber(m[1]);
     return undefined;
 }
 
@@ -564,6 +577,10 @@ function parseOverflowCounts(text: string): { total?: number; messages?: number;
         const n = toTokenNumber(mm[2]);
         if (n !== undefined && !/(?:支持|最大|上限|限制|允许)/.test(mm[1])) return { total: n, messages: n };
     }
+    // #7709: "prompt tokens (611188) exceeds channel max limit (512000)" — the
+    // token-side count is the rejected payload's own size.
+    m = text.match(/prompt tokens? *[(]([0-9][0-9,]*) *[)] *exceeds/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[1]) };
     return {};
 }
 
