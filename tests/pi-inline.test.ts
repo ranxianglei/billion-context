@@ -7,6 +7,7 @@
 //     mock upstream, makes exactly ONE upstream round trip per request (loop
 //     safety), and tracks the session in-process.
 import { after, test } from "node:test";
+import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -112,6 +113,34 @@ async function freshChain() {
     return piInline;
 }
 
+// #6841 rework: a minimal stand-in for the pi-web-access 0.46.0 shared proxy
+// wrapper — the shape the real bundle installs when its proxy scope is on:
+// with a scope active, any http(s) URL that is NOT on its bypass list is
+// handled by the wrapper itself (it curls it) and never reaches the fetch
+// below; with no scope active it passes through untouched. It marks itself
+// with __piWebAccessSharedProxyFetch only (0.46+ behavior). `seenByWrapper`
+// records what the wrapper actually observed, and `proxyCalls` records what
+// its scope claimed — the assertions that prove inline traffic never reaches
+// either.
+function installScopeWrapper() {
+    const proxyScope = new AsyncLocalStorage<boolean>();
+    const proxyCalls: string[] = [];
+    const seenByWrapper: string[] = [];
+    const base = globalThis.fetch;
+    const wrapper = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        seenByWrapper.push(url);
+        if (proxyScope.getStore() === true && !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])([:/]|$)/.test(url)) {
+            proxyCalls.push(url);
+            return new Response("proxy-handled");
+        }
+        return base(input, init);
+    }) as typeof fetch;
+    Object.defineProperty(wrapper, "__piWebAccessSharedProxyFetch", { value: true, configurable: true });
+    globalThis.fetch = wrapper;
+    return { proxyScope, proxyCalls, seenByWrapper };
+}
+
 test("#3278 transport: pseudo-origin URLs are served in-process, foreign URLs pass through", async () => {
     const ie = await import("../src/inline-engine.ts");
     const calls: string[] = [];
@@ -199,6 +228,266 @@ test("#4527 composition: native intercept + inline link stacked like the real ar
         piInline2._resetInlineTransportForTest();
         fc2.resetFetchChainForTest();
         ni2._resetForTest();
+        ie._setEngineFactoryForTest(undefined);
+        ie._resetInlineEngineForTest();
+    }
+});
+
+test("#6829: pi-web-access 0.46+ wrapper (shared marker only) keeps model traffic on the inline engine", async () => {
+    // The production arm (pi-native.ts) installs the inline transport FIRST,
+    // then the native fetch intercept ON TOP. From pi-web-access 0.46.0 a web
+    // tool call wraps the intercept link with a wrapper that carries ONLY the
+    // new `__piWebAccessSharedProxyFetch` marker (the old
+    // `__piWebAccessProxyFetch` propagates only when the wrapped fetch already
+    // has it, which bili's chain never sets from native). Pre-fix the wrapper
+    // fell into the generic re-chain, then the #1662 escape handed the
+    // rewritten INLINE_ORIGIN request to the oldest live anchor — a real DNS
+    // lookup of billion-context.inline that dies ENOTFOUND, and only the first
+    // occurrence is logged, so every later model call failed silently.
+    const ie = await import("../src/inline-engine.ts");
+    const ni = await import("../src/agent/native-intercept.ts");
+    const fc = await import("../src/agent/fetch-chain/index.ts");
+    const piInline = await import("../src/agent/pi-inline.ts");
+    const calls: string[] = [];
+    ie._setEngineFactoryForTest(async () => ({
+        origin: ie.INLINE_ORIGIN,
+        dispatch: async (input: string | URL | Request): Promise<Response> => {
+            calls.push(String(input));
+            return new Response("inline-ok");
+        },
+        dispatchHttp: async () => {},
+        wsOrigin: Promise.resolve(undefined),
+        webOrigin: Promise.resolve(undefined),
+    }));
+    try {
+        ni._resetForTest();
+        fc.resetFetchChainForTest();
+        piInline._resetInlineTransportForTest();
+        piInline.installInlineTransport();
+        const state: import("../src/agent/native-intercept.ts").NativeInterceptState = { origin: ie.INLINE_ORIGIN, ready: Promise.resolve(ie.INLINE_ORIGIN) };
+        assert.equal(ni.installNativeFetchIntercept(state), true);
+        // 0.46+ installGlobalProxyFetch shape: wraps the current top and marks
+        // ONLY the shared flag; passes everything else through to its base.
+        const seenByWrapper: string[] = [];
+        const base = globalThis.fetch;
+        const wrapper = (async (input: string | URL | Request, init?: RequestInit) => {
+            seenByWrapper.push(typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url);
+            return base(input, init);
+        }) as typeof fetch;
+        Object.defineProperty(wrapper, "__piWebAccessSharedProxyFetch", { value: true });
+        globalThis.fetch = wrapper;
+        // The shared marker must be visible through bili's re-chained top, so
+        // pi-web-access's own install guard sees a proxy is already in place
+        // and does not re-install on every web tool call.
+        assert.equal(Reflect.get(globalThis.fetch, "__piWebAccessSharedProxyFetch"), true);
+        const before = hits.length;
+        // A PLAIN model URL — what the host SDK actually calls. The intercept
+        // rewrites it to the pseudo-origin; the inline link must serve it.
+        const r = await withTimeout(fetch(`${upstreamOrigin}/v1/messages`, { method: "POST", body: "{}" }), 10_000, "model via chain + 0.46 wrapper");
+        assert.equal(r.status, 200);
+        assert.equal(await r.text(), "inline-ok");
+        assert.deepEqual(calls, [`${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`]);
+        // The real upstream must stay untouched — a DNS-bound pseudo-origin
+        // leak would never reach it anyway (ENOTFOUND).
+        assert.equal(hits.length, before);
+        // The wrapper's hook still ran on the rewritten URL (coexistence, not bypass).
+        // #6841 rework: the wrapper NEVER sees pseudo-origin traffic now —
+        // the intercept serves it in-process before any downstream runs, so
+        // coexistence is the marker handshake, not the hook running on it.
+        assert.deepEqual(seenByWrapper, []);
+        // Management URLs take the intercept's control-passthrough branch and
+        // must land on the inline engine too.
+        const m = await withTimeout(fetch(`${ie.INLINE_ORIGIN}/__bili/health`), 10_000, "mgmt via chain + 0.46 wrapper");
+        assert.equal(m.status, 200);
+        assert.deepEqual(calls, [`${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`, `${ie.INLINE_ORIGIN}/__bili/health`]);
+    } finally {
+        const piInline2 = await import("../src/agent/pi-inline.ts");
+        const fc2 = await import("../src/agent/fetch-chain/index.ts");
+        const ni2 = await import("../src/agent/native-intercept.ts");
+        piInline2._resetInlineTransportForTest();
+        fc2.resetFetchChainForTest();
+        ni2._resetForTest();
+        ie._setEngineFactoryForTest(undefined);
+        ie._resetInlineEngineForTest();
+    }
+});
+
+test("#6841 rework: proxy-scope-ON pi-web-access wrapper cannot steal inline-origin traffic", async () => {
+    const ie = await import("../src/inline-engine.ts");
+    const ni = await import("../src/agent/native-intercept.ts");
+    const fc = await import("../src/agent/fetch-chain/index.ts");
+    const piInline = await import("../src/agent/pi-inline.ts");
+    ie._setEngineFactoryForTest(async () => ({
+        origin: ie.INLINE_ORIGIN,
+        dispatch: async (): Promise<Response> => new Response("inline-ok"),
+        dispatchHttp: async () => {},
+        wsOrigin: Promise.resolve(undefined),
+        webOrigin: Promise.resolve(undefined),
+    }));
+    try {
+        const model = `${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`;
+        const mgmt = `${ie.INLINE_ORIGIN}/__bili/health`;
+        const web = "http://example.test/web-search";
+        // Intercept installed first (real arm order), wrapper above it.
+        ni._resetForTest();
+        fc.resetFetchChainForTest();
+        piInline._resetInlineTransportForTest();
+        piInline.installInlineTransport();
+        const state: import("../src/agent/native-intercept.ts").NativeInterceptState = { origin: ie.INLINE_ORIGIN, ready: Promise.resolve(ie.INLINE_ORIGIN) };
+        assert.equal(ni.installNativeFetchIntercept(state), true);
+        const { proxyScope, proxyCalls, seenByWrapper } = installScopeWrapper();
+        try {
+            // Scope ON: model + management traffic must reach the engine;
+            // the wrapper must see nothing at all.
+            await proxyScope.run(true, async () => {
+                assert.equal(await (await withTimeout(fetch(model, { method: "POST", body: "{}" }), 10_000, "model scope-on")).text(), "inline-ok");
+                assert.equal(await (await withTimeout(fetch(mgmt), 10_000, "mgmt scope-on")).text(), "inline-ok");
+            });
+            assert.deepEqual(proxyCalls, []);
+            assert.deepEqual(seenByWrapper, []);
+            // Scope OFF: same outcome.
+            assert.equal(await (await withTimeout(fetch(model, { method: "POST", body: "{}" }), 10_000, "model scope-off")).text(), "inline-ok");
+            assert.equal(await (await withTimeout(fetch(mgmt), 10_000, "mgmt scope-off")).text(), "inline-ok");
+            assert.deepEqual(proxyCalls, []);
+            // Negative control: real web traffic with the scope ON still
+            // goes to the proxy stub, so the wrapper is genuinely active.
+            await proxyScope.run(true, async () => {
+                assert.equal(await (await withTimeout(fetch(web), 10_000, "web scope-on")).text(), "proxy-handled");
+            });
+            assert.deepEqual(proxyCalls, [web]);
+        } finally {
+            fc.resetFetchChainForTest();
+        }
+    } finally {
+        const piInline2 = await import("../src/agent/pi-inline.ts");
+        const fc2 = await import("../src/agent/fetch-chain/index.ts");
+        const ni2 = await import("../src/agent/native-intercept.ts");
+        piInline2._resetInlineTransportForTest();
+        fc2.resetFetchChainForTest();
+        ni2._resetForTest();
+        ie._setEngineFactoryForTest(undefined);
+        ie._resetInlineEngineForTest();
+    }
+});
+
+test("#6841 rework: inline-origin requests from a stale dispatchDepth context still reach the engine", async () => {
+    const ie = await import("../src/inline-engine.ts");
+    const ni = await import("../src/agent/native-intercept.ts");
+    const fc = await import("../src/agent/fetch-chain/index.ts");
+    const piInline = await import("../src/agent/pi-inline.ts");
+    // The dispatch mints an AsyncResource the #5614 way: created inside the
+    // fake engine dispatch, it keeps the dispatch's ALS (dispatchDepth 2)
+    // alive after the dispatch returns.
+    let stale: AsyncResource | undefined;
+    ie._setEngineFactoryForTest(async () => ({
+        origin: ie.INLINE_ORIGIN,
+        dispatch: async (): Promise<Response> => {
+            stale = new AsyncResource("stale-scope");
+            return new Response("inline-ok");
+        },
+        dispatchHttp: async () => {},
+        wsOrigin: Promise.resolve(undefined),
+        webOrigin: Promise.resolve(undefined),
+    }));
+    try {
+        const model = `${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`;
+        ni._resetForTest();
+        fc.resetFetchChainForTest();
+        piInline._resetInlineTransportForTest();
+        piInline.installInlineTransport();
+        const state: import("../src/agent/native-intercept.ts").NativeInterceptState = { origin: ie.INLINE_ORIGIN, ready: Promise.resolve(ie.INLINE_ORIGIN) };
+        assert.equal(ni.installNativeFetchIntercept(state), true);
+        const { proxyScope, proxyCalls, seenByWrapper } = installScopeWrapper();
+        try {
+            await withTimeout(fetch(model, { method: "POST", body: "{}" }), 10_000, "seed");
+            assert.notEqual(stale, undefined);
+            // Requests issued from that stale scope, with the proxy scope ON,
+            // must still reach the engine — not the wrapper, not the anchor.
+            await proxyScope.run(true, async () => {
+                await stale!.runInAsyncScope(async () => {
+                    assert.equal(await (await withTimeout(fetch(model, { method: "POST", body: "{}" }), 10_000, "stale model")).text(), "inline-ok");
+                    assert.equal(await (await withTimeout(fetch(`${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`, { method: "POST", body: "{}" }), 10_000, "stale routed")).text(), "inline-ok");
+                });
+            });
+            assert.deepEqual(proxyCalls, []);
+            assert.deepEqual(seenByWrapper, []);
+        } finally {
+            fc.resetFetchChainForTest();
+        }
+    } finally {
+        const piInline2 = await import("../src/agent/pi-inline.ts");
+        const fc2 = await import("../src/agent/fetch-chain/index.ts");
+        const ni2 = await import("../src/agent/native-intercept.ts");
+        piInline2._resetInlineTransportForTest();
+        fc2.resetFetchChainForTest();
+        ni2._resetForTest();
+        ie._setEngineFactoryForTest(undefined);
+        ie._resetInlineEngineForTest();
+    }
+});
+
+test("#6841 rework: inline-origin classification is the exact origin, not a prefix", async () => {
+    const ie = await import("../src/inline-engine.ts");
+    const fc = await import("../src/agent/fetch-chain/index.ts");
+    const piInline = await import("../src/agent/pi-inline.ts");
+    const calls: string[] = [];
+    ie._setEngineFactoryForTest(async () => ({
+        origin: ie.INLINE_ORIGIN,
+        dispatch: async (input: string | URL | Request): Promise<Response> => {
+            calls.push(String(input));
+            return new Response("inline-ok");
+        },
+        dispatchHttp: async () => {},
+        wsOrigin: Promise.resolve(undefined),
+        webOrigin: Promise.resolve(undefined),
+    }));
+    const originalFetch = globalThis.fetch;
+    try {
+        // Canned anchor: anything the link does NOT serve in-process lands
+        // here, so a misclassification is observable without real DNS.
+        const anchorCalls: string[] = [];
+        const canned = (async (input: string | URL | Request, _init?: RequestInit) => {
+            anchorCalls.push(typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url);
+            return new Response("anchor-ok");
+        }) as typeof fetch;
+        // Define the property DIRECTLY: a plain assignment would fire the
+        // stale guard accessor left by the previous test, re-chaining the
+        // canned sink as the downstream of the inherited top — every later
+        // test would then read "anchor-ok" instead of the real upstream.
+        // No { anchor } option: the canned sink is only the link's
+        // downstream (captured from globalThis.fetch at install); the
+        // module anchor stays the real fetch.
+        Object.defineProperty(globalThis, "fetch", { value: canned, writable: true, configurable: true, enumerable: true });
+        fc.resetFetchChainForTest();
+        piInline._resetInlineTransportForTest();
+        piInline.installInlineTransport();
+        const model = `${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`;
+        // Exact origin, case-insensitive host, :80 — served in-process.
+        assert.equal(await (await withTimeout(fetch(model), 10_000, "exact")).text(), "inline-ok");
+        assert.equal(await (await withTimeout(fetch("HTTP://BILLION-CONTEXT.INLINE/bili/x"), 10_000, "case")).text(), "inline-ok");
+        assert.equal(await (await withTimeout(fetch("http://billion-context.inline:80/bili/x"), 10_000, "port80")).text(), "inline-ok");
+        // Lookalike host, https, :81, credentials — NOT the pseudo-origin:
+        // they pass through to the anchor instead of reaching the engine.
+        assert.equal(await (await withTimeout(fetch("http://billion-context.inline.evil.com/bili/x"), 10_000, "lookalike")).text(), "anchor-ok");
+        assert.equal(await (await withTimeout(fetch("https://billion-context.inline/bili/x"), 10_000, "https")).text(), "anchor-ok");
+        assert.equal(await (await withTimeout(fetch("http://billion-context.inline:81/bili/x"), 10_000, "port81")).text(), "anchor-ok");
+        assert.equal(await (await withTimeout(fetch("http://user:pass@billion-context.inline/bili/x"), 10_000, "creds")).text(), "anchor-ok");
+        assert.deepEqual(calls, [model, "HTTP://BILLION-CONTEXT.INLINE/bili/x", "http://billion-context.inline:80/bili/x"]);
+        assert.deepEqual(anchorCalls, [
+            "http://billion-context.inline.evil.com/bili/x",
+            "https://billion-context.inline/bili/x",
+            "http://billion-context.inline:81/bili/x",
+            "http://user:pass@billion-context.inline/bili/x",
+        ]);
+    } finally {
+        const piInline2 = await import("../src/agent/pi-inline.ts");
+        const fc2 = await import("../src/agent/fetch-chain/index.ts");
+        piInline2._resetInlineTransportForTest();
+        fc2.resetFetchChainForTest();
+        // Reset restores the pre-install descriptor (the canned anchor);
+        // define the previous top back directly, so the guarded setter
+        // cannot swallow it as an own-chain write-back (see above).
+        Object.defineProperty(globalThis, "fetch", { value: originalFetch, writable: true, configurable: true, enumerable: true });
         ie._setEngineFactoryForTest(undefined);
         ie._resetInlineEngineForTest();
     }
