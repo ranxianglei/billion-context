@@ -34,6 +34,7 @@ test("wedge trips only when >=2 previously-green hosts fail every lookup for >=5
     const s = getResolverWedgeState();
     assert.ok(s, "exactly at the sustain boundary the alarm trips");
     assert.deepEqual(s!.hosts, ["api.deepseek.com", "api.openai.com"], "hosts sorted");
+    assert.deepEqual(s!.coldStartHosts, [], "both were green before — no cold-start hosts");
     assert.equal(s!.sinceMs, t0, "sinceMs anchors the earliest streak");
     assert.equal(s!.elapsedMs, 5 * MIN);
 });
@@ -46,12 +47,38 @@ test("one wedged host never alarms (#3617 negative row)", () => {
     assert.equal(getResolverWedgeState(), null);
 });
 
-test("hosts that NEVER resolved green in this process do not qualify", () => {
+test("born-wedged (never-green) hosts DO trip the cold-start wedge (#7747)", () => {
     setup();
+    const t0 = clock;
     resolverWedgeRecord("typo.upstream", false);
     resolverWedgeRecord("another.dead.name", false);
-    clock += 30 * MIN;
-    assert.equal(getResolverWedgeState(), null, "a dead name is configuration noise, not resolver corruption");
+    clock = t0 + 4 * MIN + 59_000;
+    assert.equal(getResolverWedgeState(), null, "the failure streak must SUSTAIN before alarming");
+    clock = t0 + 5 * MIN;
+    const s = getResolverWedgeState();
+    assert.ok(s, "two never-green hosts failing for >=5 min now trip (born-wedged case)");
+    assert.deepEqual(s!.hosts, ["another.dead.name", "typo.upstream"], "hosts sorted");
+    assert.deepEqual(s!.coldStartHosts, ["another.dead.name", "typo.upstream"], "both were never resolved green");
+    assert.equal(s!.sinceMs, t0, "sinceMs anchors the first failure");
+});
+
+test("one never-green host alone never alarms (two-host floor, #3617 negative row)", () => {
+    setup();
+    resolverWedgeRecord("typo.upstream", false);
+    clock += 60 * MIN;
+    assert.equal(getResolverWedgeState(), null, "a single dead name is configuration noise, not a wedge");
+});
+
+test("mixed wedge: coldStartHosts lists only the never-green hosts (#7747)", () => {
+    setup();
+    resolverWedgeRecord("green.host", true);
+    resolverWedgeRecord("born.wedged", false);
+    resolverWedgeRecord("green.host", false);
+    clock += 6 * MIN;
+    const s = getResolverWedgeState();
+    assert.ok(s, "one green-before + one never-green host failing trips");
+    assert.deepEqual(s!.hosts, ["born.wedged", "green.host"], "both wedged");
+    assert.deepEqual(s!.coldStartHosts, ["born.wedged"], "only the never-green host is cold-start");
 });
 
 test("recovery of one host drops the alarm below the two-host floor", () => {
@@ -116,6 +143,7 @@ test("checkTunnelDestination feeds the detector: throw-only failures count, an a
     const s = getResolverWedgeState();
     assert.ok(s, "both formerly-green hosts failing for >5 min must trip");
     assert.deepEqual(s!.hosts, ["green.one", "green.two"], "the empty-answer host never entered the evidence set");
+    assert.deepEqual(s!.coldStartHosts, [], "both were green before the wedge");
     assert.equal(s!.sinceMs, failClock, "streaks began at first throwing lookup");
 });
 

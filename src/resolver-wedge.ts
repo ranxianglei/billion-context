@@ -15,12 +15,18 @@
  *   1. only THROWING resolutions count as failures — an empty answer is an
  *      authoritative NO-DATA response, i.e. the resolver IS reachable; a dead
  *      name must never look like resolver corruption (#1686 boundary);
- *   2. a host qualifies only if this process saw it resolve OK at least once
- *      (a mistyped upstream that never resolved does not qualify);
+ *   2. a host qualifies on a sustained failure streak ALONE — whether or not
+ *      this process ever resolved it green. #7747: a process BORN wedged (DNS
+ *      takeover before first launch, or a machine where direct egress is
+ *      structurally impossible) never records a green, so the old "must have
+ *      resolved OK before" gate kept the alarm silent in exactly the case it
+ *      exists for. The never-green hosts are LABELLED (coldStartHosts) so the
+ *      advice never promises a restart that cannot help; the two-host floor
+ *      (gate 4) still keeps a single mistyped upstream from alarming.
  *   3. the failure streak must run continuously for >= WEDGE_SUSTAIN_MS;
  *   4. at least WEDGE_MIN_HOSTS distinct hosts must be wedged at once — one
- *      poisoned destination is configuration noise, two never-green-before
- *      hosts failing in lockstep after a network flip is the wedge signature.
+ *      poisoned destination is configuration noise; two hosts failing every
+ *      lookup in lockstep (green-before or born-wedged) is the wedge signature.
  *
  * Recovery is derived, not latched: any successful resolution clears that
  * host's streak; when fewer than two hosts remain wedged the alarm drops on
@@ -44,6 +50,13 @@ type ResolverWedgeWire = {
     elapsedMs: number;
     /** Sorted hostnames currently wedged (full list, no truncation — the status reader owns display). */
     hosts: string[];
+    /**
+     * Wedged hosts this process NEVER resolved green — a cold-start wedge
+     * (#7747). A restart is unlikely to help for these (a fresh process would
+     * hit the same resolver), so the advice must route egress through a proxy
+     * instead of promising a restart.
+     */
+    coldStartHosts: string[];
 };
 
 type HostRecord = { lastGoodAt: number | null; failSince: number | null };
@@ -59,23 +72,27 @@ function evictFirstSeen(): void {
 }
 
 function evalAndLog(now: number): ResolverWedgeWire | null {
-    const wedged: Array<[string, number]> = [];
+    const wedged: Array<[string, number, number | null]> = [];
     for (const [host, r] of hosts) {
-        if (r.failSince !== null && r.lastGoodAt !== null && now - r.failSince >= WEDGE_SUSTAIN_MS) {
-            wedged.push([host, r.failSince]);
+        if (r.failSince !== null && now - r.failSince >= WEDGE_SUSTAIN_MS) {
+            wedged.push([host, r.failSince, r.lastGoodAt]);
         }
     }
     if (wedged.length < WEDGE_MIN_HOSTS) return null;
     wedged.sort((a, b) => a[0].localeCompare(b[0]));
     const sinceMs = Math.min(...wedged.map(([, since]) => since));
+    const coldStartHosts = wedged.filter(([, , lastGoodAt]) => lastGoodAt === null).map(([h]) => h);
     if (now - episodeLoggedAt >= LOG_DEDUP_MS) {
         episodeLoggedAt = now;
+        const remedy = coldStartHosts.length > 0
+            ? `egress routes through an upstream proxy (-F/--forward-proxy) — ${coldStartHosts.length} of these were never resolved by this process, so restarting the proxy is unlikely to help (a fresh process would hit the same resolver)`
+            : `the proxy process restarts or egress routes through an upstream proxy (-F/--forward-proxy) — this process resolved these hosts before the wedge`;
         loggerLog(
             "warn",
-            `[resolver-wedge] suspected local-resolver wedge: ${wedged.length} host(s) this process resolved before now fail every lookup for >=${WEDGE_SUSTAIN_MS / 60000} min (${wedged.slice(0, 5).map(([h]) => h).join(", ")}${wedged.length > 5 ? ", …" : ""}) — model requests 502 until the proxy process restarts or egress routes through an upstream proxy (-F/--forward-proxy); see #5221`,
+            `[resolver-wedge] suspected local-resolver wedge: ${wedged.length} host(s) fail every lookup for >=${WEDGE_SUSTAIN_MS / 60000} min (${wedged.slice(0, 5).map(([h]) => h).join(", ")}${wedged.length > 5 ? ", …" : ""}) — model requests 502 until ${remedy}; see #5221`,
         );
     }
-    return { tripped: true, sinceMs, elapsedMs: now - sinceMs, hosts: wedged.map(([h]) => h) };
+    return { tripped: true, sinceMs, elapsedMs: now - sinceMs, hosts: wedged.map(([h]) => h), coldStartHosts };
 }
 
 /** Record ONE hostname-path resolution outcome from checkTunnelDestination.
@@ -99,6 +116,15 @@ export function resolverWedgeRecord(host: string, resolvedOk: boolean, nowMs?: n
  *  unresolvable admission AND from the 5s status poll — pure derived state. */
 export function getResolverWedgeState(nowMs?: number): ResolverWedgeWire | null {
     return evalAndLog(nowMs ?? nowFn());
+}
+
+/** Whether this process ever resolved this host green. Used by the per-request
+ *  unresolvable message: a never-green host means a restart is unlikely to
+ *  help, so the advice must not promise one (#7747). No record → treat as
+ *  possibly-green and keep the historical restart advice. */
+export function resolverWedgeHostEverResolved(host: string): boolean {
+    const rec = hosts.get(host.toLowerCase());
+    return rec ? rec.lastGoodAt !== null : true;
 }
 
 /** Test seams only. */
