@@ -1,3 +1,5 @@
+import { parseLegacyEnvelopeToWindow } from "../snapshot/identity.js";
+
 /**
  * Unified storage schema v1 (#2671, 6-OVERALL-DESIGN.md §schema).
  *
@@ -83,25 +85,49 @@
 //        discipline as v9 (#4796); building them once costs about what
 //        open-time quick_check pays on EVERY open (#4175). Additive-only: an
 //        older build opening a v11 file ignores the extra indexes.
-export const STORAGE_SCHEMA_VERSION = 11;
+//      - v12: snapshot foundation v2 (#5874 P0, pure-incremental redesign
+//        after the owner ruling) — ONE additive table (l1_world, the
+//        stage-0 identity ledger; the original four-table plane was retired
+//        before merge — superseded by docs/pr-6785-unified-storage-and-flows.md).
+//        No backfill. Additive-only: an older build opening a v12 file
+//        ignores the extra tables. (The fold-journal / egress-snapshot /
+//        scope-rev tables that once lived here were retired before merge —
+//        discussions/7439; the egress op-log below is self-contained.)
+//        Applied PROBE-FIRST (table-existence check), NOT version-gated:
+//        the unmerged fastpath re-land (#5855) numbers its two table groups
+//        v12/v13 and landed them into a SHARED database first (field,
+//        2026-11-08: user_version 13 + pf_* present, l1_world absent →
+//        stage-0 died with "no such table: l1_world"). The probe makes
+//        both merge orderings coexist; whichever branch lands second in
+//        master still renumbers its constant mechanically (hygiene only —
+//        the DDL shapes are independent).
+export const STORAGE_SCHEMA_VERSION = 12;
 
-/** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
- *  auto checkpoints move frames into the main db and reset the write offset
- *  but NEVER shrink the WAL file — without this limit a long-lived process's
- *  index.db-wal stays at its historical high-water mark forever (field:
- *  55 MiB flat). With it, every completed checkpoint truncates the file back
- *  to the cap. 8 MiB sits well above any single-save burst while keeping
- *  disk use and crash-recovery replay bounded. Per-connection setting: each
- *  process that opens the shared index applies its own copy (#2671 topology).
- *  Tunable since #3250 via storage.walJournalSizeLimitBytes /
- *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (resolved by src/knobs.ts). */
-export const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
+/** #3250 → #7674: default for `journal_size_limit` is now UNLIMITED (0).
+ *  The old 8 MiB default made the engine truncate the WAL file internally
+ *  after every completed checkpoint — a reclaim that bypasses every
+ *  JS-side guard and comes back to fetch frames out from under live peer
+ *  connections sharing the directory (#2671 topology: five daemons, kill-9
+ *  handovers). That floor-reclaim is the #7156 damage shape (pages
+ *  double-allocated in the tail, "2nd reference to page", index pages
+ *  corrupting before table pages): three field events on this host
+ *  (2026-11-19, 2026-11-21, 2026-11-23) plus the #7156 incident itself,
+ *  all on a growing multi-GB index with peers. The engine never shrinks a
+ *  WAL it did not truncate, so without the limit the file sits at its
+ *  historical high-water mark (field: 55 MiB flat — bounded, harmless,
+ *  what opencode runs: 13 concurrent writers, 9.55 GB db, 4.7 MB WAL,
+ *  zero corruption). Explicit reclamation stays available: operators set
+ *  a positive cap via storage.walJournalSizeLimitBytes /
+ *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (resolved by src/knobs.ts) or
+ *  shrink on demand with ?vacuum=full. */
+export const WAL_JOURNAL_SIZE_LIMIT = 0;
 
 /** Connection pragmas for every index.db opener. The journal cap is
- *  per-opener (see WAL_JOURNAL_SIZE_LIMIT); the default list below is what
- *  short-lived openers (export fast path) and tests apply. */
+ *  per-opener and only issued when positive (0 = unlimited, the SQLite
+ *  default); the default list below is what short-lived openers (export
+ *  fast path) and tests apply. */
 export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
-    return [
+    const pragmas = [
         // #3901/#3463: with auto_vacuum=INCREMENTAL, freed pages can be handed
         // back to the filesystem by `PRAGMA incremental_vacuum`
         // (gc({vacuum:"incremental"})) without the offline full rewrite.
@@ -117,8 +143,11 @@ export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
         "PRAGMA synchronous = NORMAL",
         "PRAGMA busy_timeout = 5000",
         "PRAGMA foreign_keys = ON",
-        `PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`,
     ];
+    if (walJournalSizeLimitBytes > 0) {
+        pragmas.push(`PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`);
+    }
+    return pragmas;
 }
 
 export const STORAGE_PRAGMAS = storagePragmas(WAL_JOURNAL_SIZE_LIMIT);
@@ -130,6 +159,7 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
     parent_session_id   TEXT,
     fork_point_seq      INTEGER,
+    fork_egress_watermark INTEGER,
     protocol            TEXT,
     label               TEXT,
     title               TEXT,
@@ -148,7 +178,8 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     tail_json           TEXT NOT NULL DEFAULT '{}',
     ccr_json            TEXT,
     last_ingested_seq   INTEGER,
-    orphans_json        TEXT
+    orphans_json        TEXT,
+    r3_latched_at       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS content (
@@ -191,6 +222,9 @@ CREATE TABLE IF NOT EXISTS blocks (
     created_at          INTEGER NOT NULL,
     covered_hash        TEXT NOT NULL,
     payload_json        TEXT NOT NULL,
+    summary_bytes       BLOB,
+    start_msgid         TEXT,
+    end_msgid           TEXT,
     PRIMARY KEY (session_id, block_id)
 );
 
@@ -237,6 +271,10 @@ CREATE TABLE IF NOT EXISTS ccr_entries (
     ord             INTEGER NOT NULL,
     ccr_key         TEXT NOT NULL,
     content_hash    TEXT NOT NULL REFERENCES content(hash),
+    -- #6785 step 6: the ORIGINAL text behind entry.hash (byHash half of the
+    -- content store). NULL only on pre-step-6 rows — their full ccr_json
+    -- envelope still carries the text. See src/storage/slim.ts.
+    orig_hash       TEXT REFERENCES content(hash),
     PRIMARY KEY (session_id, ord)
 );
 
@@ -254,6 +292,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     claimed_at       INTEGER NOT NULL,
     PRIMARY KEY (namespace, conversation_id)
 ) WITHOUT ROWID;
+
+-- #6785 review: the stage-0 plane resolves the conversation binding per turn
+-- (store.ts snapSessRawOf: WHERE session_id = ?) — the PK cannot serve it.
+CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
 
 -- Per-session arbitrary state (#3069 v4): the escape hatch for host /
 -- plugin / UI state that must survive restarts but is NOT kernel session
@@ -307,8 +349,183 @@ CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_one_hash ON blocks(one_hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_summary_hash ON blocks(summary_hash);
 CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash);
+-- #6785 step 6: orig_hash is the SECOND FK child column of content(hash) —
+-- #5539's discipline applies to it too, or every parent delete full-scans
+-- ccr_entries (MySQL twin: idx_ccr_entries_orig_hash).
+CREATE INDEX IF NOT EXISTS idx_ccr_entries_orig_hash ON ccr_entries(orig_hash);
 CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash);
+`;
+
+/** #5874 snapshot foundation v2 (pure-incremental, 2026-11-15 owner ruling) —
+ *  one additive table for the stage-0 identity ledger. The original four-table
+ *  plane (snap_rows/snap_log/snap_ckpt, #5874 v1) was RETIRED before merge in
+ *  favor of the pure-incremental skeleton: the per-position materialized state
+ *  is re-derived from the append-only substrate (messages × blocks × refs ×
+ *  fold journal) instead of being stored as its own updatable table. This DDL
+ *  stays ADDITIVE + probe-first exactly as the plane's did (T1): fresh
+ *  installs and in-place upgrades converge on the same shape, rollback is
+ *  DROP + user_version rewind, and a sibling branch that consumed a version
+ *  number after v11 (real-world 2026-11-08: #5855 landed the pf_* planes)
+ *  coexists without renumbering.
+ *
+ *  l1_world: stage-0 identity ledger — the raw host session id (sess_raw)
+ *  maps to the proxy's ledger identity (ledger_id = sessions.session_id).
+ *  witness_probe is the sampled id fingerprint the arm decision was based on
+ *  (composite-probe evidence). issued_at precedes armed_at until one full
+ *  echo round validates the mapping (the "one round of arming" the proposal
+ *  charges for a fresh identity). envelope_json/envelope_checksum carry the
+ *  per-element msgid ENVELOPE ({id, pos} canon, #6181 §4.0) — the committed
+ *  element-level world M2 delta inbound (src/snapshot/identity.ts matchWorld)
+ *  reads/writes; the R3 breaker latch (r3_latched_at, #6181 M3) persists so a
+ *  proxy restart does not re-arm a misbehaving host's envelope.
+ *
+ *  #7064 msgid-storage slimming (owner ruling 2026-11-17): the per-element
+ *  world is a BOOKKEEPING CURSOR, not a full canon — tail_json/head_json
+ *  hold the last/first id windows of the previous turn's host array
+ *  (WORLD_TAIL_K/WORLD_HEAD_K, src/snapshot/identity.ts), count its length,
+ *  max_pos the append-only pos frontier. The full {id,pos} envelope
+ *  (envelope_json/envelope_checksum) is GONE: D1 (an id verdict never
+ *  diverges) and D2 (conversation-bound sessions skip the verdict) made the
+ *  full canon unnecessary. Pre-slimming rows migrate on first open
+ *  (probe below). */
+const L1WORLD_DDL_V12 = `-- #5874 snapshot foundation v2 (P0 schema, l1_world identity ledger).
+CREATE TABLE IF NOT EXISTS l1_world (
+    sess_raw       TEXT PRIMARY KEY,
+    ledger_id      TEXT NOT NULL,
+    witness_probe  TEXT NOT NULL,
+    issued_at      INTEGER NOT NULL,
+    armed_at       INTEGER,
+    tail_json      TEXT,
+    head_json      TEXT,
+    count          INTEGER,
+    max_pos        INTEGER,
+    r3_latched_at  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id);
+`;
+
+/** #6785 step 7: the ORPHAN BLOCKS table. The orphan journal (#4216/#4242:
+ *  blockContents entries whose block was reaped out of state.blocks) used to
+ *  accumulate in sessions.orphans_json — an ever-growing JSON blob re-merged
+ *  and re-written on every save of the session. It is now ONE ROW PER BLOCK
+ *  (immutable content; a refreshed view for the same id is an UPDATE), the
+ *  same table-ization as #6325's kstate/ccr columns. The column becomes a
+ *  one-time migration source (legacy rows move onto the table on first
+ *  ingest, then the column is cleared). Probed separately (probe-first,
+ *  no version bump). */
+const ORPHAN_BLOCKS_DDL = `-- #6785 step 7: one row per reaped block's retained contents.
+CREATE TABLE IF NOT EXISTS orphan_blocks (
+    session_id TEXT NOT NULL,
+    block_id TEXT NOT NULL,
+    one_json TEXT,
+    full_json TEXT NOT NULL,
+    PRIMARY KEY (session_id, block_id)
+);
+`;
+
+/** #6785 step 8: one row per UNBOUNDED CompressionState field (the kstate
+ *  slim split). The sessions.kstate_json column keeps only the bounded
+ *  fields; these rows carry the rest (tokenSnapshot, tsStamps, viewLatches,
+ *  absorbed, rules, …). The field set is FROZEN in src/storage/slim.ts
+ *  (ROW_BACKED_KSTATE_FIELDS) and pinned by tests/issue5874-state-fields.
+ *  Probe-first, no version bump. */
+const STATE_FIELDS_DDL = `-- #6785 step 8: unbounded CompressionState fields off the sessions row.
+CREATE TABLE IF NOT EXISTS state_fields (
+    session_id TEXT NOT NULL,
+    field TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    PRIMARY KEY (session_id, field)
+);
+`;
+
+/** #6785 perf (proposal discussions/7398 + revised design discussions/7439,
+ *  owner design 2026-11-20/21): the EGRESS STATE LOG — the op-log view of the
+ *  outbound conversation (B base / I insert / D delete-range / U
+ *  update-content; anchors are msgids, never positions). DUAL TABLES:
+ *  egress_state is what serving reads and compaction physically trims below
+ *  the watermark; egress_flow is the record — compaction trims it below the
+ *  watermark as well (#7574: it used to keep every row AND gain one full
+ *  snapshot per fold, so a long session grew without bound), so every op_seq
+ *  from the newest base on stays reconstructible — rollback is based on this
+ *  table, not on client resends. SELF-CONTAINED BYTES (ruling 7439-1): the `bytes` column holds
+ *  the message's final core JSON for I/U rows — no hash refs, no content
+ *  table; replay needs only this table pair. TWO SEQUENCES (ruling 7439,
+ *  canonical message number): op_seq orders EVERY row (the primary key);
+ *  log_seq is the canonical message number set ONLY on I rows (one number
+ *  per message, session-scoped, never re-issued — U/D/B carry NULL). The
+ *  secondary index serves +U targeting and -D endpoint resolution.
+ *  Probe-first, no version bump. */
+const EGRESS_STATE_DDL = `-- #6785 perf (proposals discussions/7398 + 7439): op-log outbound view (state + flow), self-contained bytes, canonical per-message numbers.
+CREATE TABLE IF NOT EXISTS egress_state (
+    session_id TEXT NOT NULL,
+    op_seq INTEGER NOT NULL,
+    log_seq INTEGER,
+    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
+    msgid TEXT,
+    payload TEXT NOT NULL,
+    bytes TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, op_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_egress_state_msgid ON egress_state (session_id, msgid);
+CREATE TABLE IF NOT EXISTS egress_flow (
+    session_id TEXT NOT NULL,
+    op_seq INTEGER NOT NULL,
+    log_seq INTEGER,
+    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
+    msgid TEXT,
+    payload TEXT NOT NULL,
+    bytes TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, op_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msgid);
+`;
+
+/** #7577 (follow-up to #7439, owner design 2026-11-23): the BLOCK LIFECYCLE
+ *  log — the op-log of the fold blocks, symmetric to the message egress log.
+ *  egress_block_flow is append-only (row types B base / I block-born / U
+ *  block-state-change; NEVER deleted) and carries the bounded kstate residual
+ *  snapshot in `kstate_json` on every row (D4: no fifth table — the sidecar
+ *  rides the block-change rows, whose count = fold count, 2-3 orders of
+ *  magnitude below the message count). egress_block_state is the current
+ *  block-set read replica (PK (session_id, block_id), one latest snapshot per
+ *  block; compaction may physically trim it). SELF-CONTAINED BYTES (D2,
+ *  ruling 7439-1): the one/full block content is inlined in the payload —
+ *  zero content-CAS refs, zero hash columns. DUAL CLOCKS (owner ruling
+ *  2026-11-24): the block tables number THEMSELVES (op_seq dense within
+ *  egress_block_flow); flow_op_seq is the pointer to the flow clock (its
+ *  MAX at write time) used for cross-table alignment at point forks — the
+ *  original shared-clock design was rejected in review because it broke the
+ *  flow's density invariant on the first fold. Probe-first, no version
+ *  bump (the tables never shipped, like the egress pair). */
+const EGRESS_BLOCK_DDL = `-- #7577: block lifecycle log (flow + state), self-contained bytes, kstate sidecar.
+-- Dual clocks (owner ruling 2026-11-24): the block tables number THEMSELVES
+-- (op_seq dense within egress_block_flow); flow_op_seq is the pointer to the
+-- egress_flow clock (its MAX at write time) used for cross-table alignment at
+-- point forks. egress_flow keeps its own exclusive number pool — untouched.
+CREATE TABLE IF NOT EXISTS egress_block_flow (
+    session_id TEXT NOT NULL,
+    op_seq INTEGER NOT NULL,
+    flow_op_seq INTEGER NOT NULL DEFAULT 0,
+    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','U')),
+    block_id TEXT,
+    payload TEXT NOT NULL,
+    kstate_json TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, op_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_egress_block_flow_block ON egress_block_flow (session_id, block_id);
+CREATE TABLE IF NOT EXISTS egress_block_state (
+    session_id TEXT NOT NULL,
+    block_id TEXT NOT NULL,
+    op_seq INTEGER NOT NULL,
+    flow_op_seq INTEGER NOT NULL DEFAULT 0,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, block_id)
+);
 `;
 
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
@@ -319,6 +536,194 @@ export function migrateSchema(db: {
 }): { from: number; to: number } {
     const row = db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
     const from = row?.user_version ?? 0;
+    // #6785 review fix (owner): DROP COLUMN needs SQLite ≥ 3.35. The host
+    // better-sqlite3 v7 in the engine ladder can carry SQLite 3.32 — there
+    // the redundant columns simply STAY (every reader probes table_info and
+    // every INSERT/UPDATE names its columns explicitly, so a kept column is
+    // inert). Never throw from a migration because the host engine is old.
+    let dropColumnOk = false;
+    try {
+        const v = (db.prepare("PRAGMA sqlite_version").get() as { sqlite_version: string } | undefined)?.sqlite_version ?? "";
+        const m = v.match(/^(\d+)\.(\d+)/);
+        if (m) dropColumnOk = Number(m[1]) > 3 || (Number(m[1]) === 3 && Number(m[2]) >= 35);
+    } catch { /* leave false — keep the columns */ }
+    // v12 (#5874) is PROBE-FIRST, not version-gated. A sibling branch may
+    // have consumed the version numbers after v11 for its own additive DDL
+    // while ours was still unmerged — real-world 2026-11-08: #5855 landed
+    // v12+v13 (the pf_* planes) into a SHARED database, and this branch's
+    // old `if (from < 12)` block was skipped by the early return below, so
+    // the plane died on first save with "no such table: l1_world". The DDL
+    // is pure CREATE ... IF NOT EXISTS (no backfill, no rewrite of existing
+    // rows), so it is safe to run at ANY from-version; probing for the
+    // table itself (the discipline v2/v5/v6/v8 already use) makes both
+    // merge orderings coexist without renumbering — the final master
+    // version number stays a mechanical merge-time hygiene step.
+    const hasL1World = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'l1_world'")
+        .get();
+    if (!hasL1World) db.transaction(() => db.exec(L1WORLD_DDL_V12));
+    // #6785 step 7: orphan blocks — own probe (a db written between the
+    // egress_snapshot and orphan_blocks landings picks it up here; fresh dbs
+    // pass through — same discipline, no version bump).
+    const hasOrphanBlocks = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'orphan_blocks'")
+        .get();
+    if (!hasOrphanBlocks) db.exec(ORPHAN_BLOCKS_DDL);
+    // #6785 step 8: kstate rows — own probe (same discipline, no bump).
+    const hasStateFields = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'state_fields'")
+        .get();
+    if (!hasStateFields) db.exec(STATE_FIELDS_DDL);
+    // #6785 perf (proposal discussions/7398): the egress state log — own
+    // probe (same discipline, no version bump).
+    const hasEgressState = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_state'")
+        .get();
+    // #7574 item 10: the group is TWO tables + TWO indexes, so it is applied
+    // inside ONE transaction. Executed bare (the driver autocommits each
+    // statement of the batch separately) a crash after the first CREATE left
+    // egress_state without egress_flow, and this table probe then said
+    // "already there" on every later open — the half-built pair stayed
+    // half-built forever. The probe now asks for BOTH tables, so a library
+    // interrupted by the old code converges on its next open.
+    const hasEgressFlow = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_flow'")
+        .get();
+    if (!hasEgressState || !hasEgressFlow) db.transaction(() => db.exec(EGRESS_STATE_DDL));
+    // 7439 ruling (canonical message number): a dev DB created with the
+    // pre-numbering row shape (log_seq primary key, no op_seq column) is
+    // replaced in place — the two tables NEVER shipped in any release, so
+    // there is no user data and no migration path; a fresh recreate is the
+    // whole migration.
+    const egressCols = (db.prepare("PRAGMA table_info(egress_state)").all() as unknown as { name?: unknown }[])
+        .map((c) => c.name);
+    if (egressCols.length > 0 && !egressCols.includes("op_seq")) {
+        // #7574 item 10: drop + recreate is one step (same transaction rule).
+        db.transaction(() => {
+            db.exec("DROP TABLE IF EXISTS egress_flow");
+            db.exec("DROP TABLE IF EXISTS egress_state");
+            db.exec(EGRESS_STATE_DDL);
+        });
+    }
+    // #7577: the block lifecycle log — own probe (same discipline, no bump).
+    const hasEgressBlockFlow = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_block_flow'")
+        .get();
+    const blockCols = hasEgressBlockFlow
+        ? (db.prepare("PRAGMA table_info(egress_block_flow)").all() as unknown as { name?: unknown }[]).map((c) => c.name)
+        : [];
+    if (!hasEgressBlockFlow || !blockCols.includes("flow_op_seq")) {
+        // Never-shipped dev table; a dev DB that created the old-shape
+        // (shared-clock) layout is dropped and recreated (one step, same
+        // #7574 rule). Data loss is the accepted dev cost.
+        db.transaction(() => {
+            db.exec("DROP TABLE IF EXISTS egress_block_flow");
+            db.exec("DROP TABLE IF EXISTS egress_block_state");
+            db.exec(EGRESS_BLOCK_DDL);
+        });
+    }
+    // 2×2 (#5874 brief, element-level world): the L1 world carries the
+    // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
+    // session-level witness_probe. Pure additive probe-first ALTER (a dev
+    // window that created l1_world before this column exists upgrades with
+    // one ALTER; a fresh DB already has it from the DDL above). The 2×2
+    // stage-0 (src/snapshot/identity.ts matchWorld) reads/writes these; the
+    // session-level v1 path (#5901) leaves them NULL and is unaffected.
+    const l1Cols = (db.prepare("PRAGMA table_info(l1_world)").all() as unknown as { name?: unknown }[])
+        .map((c) => c.name);
+    if (l1Cols.length > 0) {
+        if (!l1Cols.includes("tail_json")) db.exec("ALTER TABLE l1_world ADD COLUMN tail_json TEXT");
+        if (!l1Cols.includes("head_json")) db.exec("ALTER TABLE l1_world ADD COLUMN head_json TEXT");
+        if (!l1Cols.includes("count")) db.exec("ALTER TABLE l1_world ADD COLUMN count INTEGER");
+        if (!l1Cols.includes("max_pos")) db.exec("ALTER TABLE l1_world ADD COLUMN max_pos INTEGER");
+        // #7064 slimming migration: a pre-slimming row's full envelope
+        // (envelope_json) reshapes onto the window columns once — the
+        // checksum column is dropped with it (D1: no verdict reads it).
+        // Rows whose JSON does not parse degrade to a BLANK cursor (the
+        // next turn re-issues the world; D1: bookkeeping, never a reject).
+        if (l1Cols.includes("envelope_json")) {
+            const legacy = (db.prepare(
+                "SELECT sess_raw, envelope_json FROM l1_world WHERE envelope_json IS NOT NULL AND (tail_json IS NULL OR count IS NULL)"
+            ).all() as unknown as { sess_raw: string, envelope_json: string | null }[]);
+            for (const row of legacy) {
+                let tail = "[]";
+                let head = "[]";
+                let count = 0;
+                let maxPos = 0;
+                try {
+                    const win = parseLegacyEnvelopeToWindow(row.envelope_json ?? "[]");
+                    tail = JSON.stringify(win.tailIds);
+                    head = JSON.stringify(win.headIds);
+                    count = win.count;
+                    maxPos = win.maxPos;
+                } catch {
+                    // blank cursor — world re-issues on the next turn
+                }
+                db.prepare(
+                    "UPDATE l1_world SET tail_json = ?, head_json = ?, count = ?, max_pos = ? WHERE sess_raw = ?"
+                ).run(tail, head, count, maxPos, row.sess_raw);
+            }
+            // #6785 review fix (owner): on a < 3.35 host the reshaped data
+            // stays in the NEW columns and the legacy columns are kept
+            // (inert — readers probe table_info; the legacy SELECT above is
+            // re-run only while rows still lack tail_json, which it now has).
+            if (dropColumnOk) {
+                db.exec("ALTER TABLE l1_world DROP COLUMN envelope_json");
+                if (l1Cols.includes("envelope_checksum")) db.exec("ALTER TABLE l1_world DROP COLUMN envelope_checksum");
+            }
+        }
+        // #6181 M3: the R3 breaker latch PERSISTS (a proxy restart must not
+        // re-arm a misbehaving host's sid and re-400 the same broken
+        // envelope); NULL/0 = not latched, else the epoch-ms of the latch.
+        if (!l1Cols.includes("r3_latched_at")) db.exec("ALTER TABLE l1_world ADD COLUMN r3_latched_at INTEGER");
+    }
+    // #7439 step 6: blocks self-contained — the summary bytes and msgid
+    // coordinates move INTO the blocks table (zero cross-table pointers).
+    // PROBE-FIRST, not version-gated: the blocks table is a master table
+    // (pre-existing), so a probe-first ALTER is the safe pattern.
+    const blocksCols = (db.prepare("PRAGMA table_info(blocks)").all() as unknown as { name?: unknown }[])
+        .map((c) => (typeof c?.name === "string" ? c.name : ""));
+    if (blocksCols.length > 0) {
+        if (!blocksCols.includes("summary_bytes")) db.exec("ALTER TABLE blocks ADD COLUMN summary_bytes BLOB");
+        if (!blocksCols.includes("start_msgid")) db.exec("ALTER TABLE blocks ADD COLUMN start_msgid TEXT");
+        if (!blocksCols.includes("end_msgid")) db.exec("ALTER TABLE blocks ADD COLUMN end_msgid TEXT");
+    }
+    // #6785 step 6: ccr_entries.orig_hash — PROBE-FIRST, not version-gated:
+    // a db whose user_version is already at the current version (the #5855
+    // field build wrote v12/v13 into shared databases) takes the early
+    // return below and would never pick the column up if the probe sat
+    // inside the transaction. Every pre-existing db must get it, so probe
+    // unconditionally; a fresh db's table does not exist yet at this point
+    // (PRAGMA table_info → empty) and the base DDL above already carries
+    // the column. Pre-step-6 rows keep NULL; their full ccr_json envelope
+    // remains the read authority (slim.ts). The index rides the same probe
+    // (#5539 FK-child discipline; a lib that already carried the column but
+    // not the key converges on the idempotent CREATE).
+    const ccrCols = (db.prepare("PRAGMA table_info(ccr_entries)").all() as unknown as { name?: unknown }[])
+        .map((c) => (typeof c?.name === "string" ? c.name : ""));
+    if (ccrCols.length > 0) {
+        if (!ccrCols.includes("orig_hash")) {
+            db.exec("ALTER TABLE ccr_entries ADD COLUMN orig_hash TEXT REFERENCES content(hash)");
+        }
+        db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_orig_hash ON ccr_entries(orig_hash)");
+    }
+    // 身份表收拢 (discussions/7591): the R3 breaker latch moves onto the
+    // sessions row — the l1_world row it used to latch is a dead carrier
+    // once egress-on stops writing that table. PROBE-FIRST, not version-
+    // gated (same discipline as the ccr/blocks probes above): a db whose
+    // user_version already sits at the current version still picks the
+    // column up here; a fresh db already carries it from the base DDL.
+    // NULL/0 = not latched, else the epoch-ms of the latch.
+    const sessionCols = (db.prepare("PRAGMA table_info(sessions)").all() as unknown as { name?: unknown }[])
+        .map((c) => (typeof c?.name === "string" ? c.name : ""));
+    if (sessionCols.length > 0 && !sessionCols.includes("r3_latched_at")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN r3_latched_at INTEGER");
+    }
+    // #7658: the egress fork point (FLOW-clock watermark the four egress
+    // tables were copied at) — probe-first, same discipline as r3_latched_at.
+    if (sessionCols.length > 0 && !sessionCols.includes("fork_egress_watermark")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN fork_egress_watermark INTEGER");
+    }
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;
     db.transaction(() => {
@@ -430,6 +835,10 @@ export function migrateSchema(db: {
                 db.exec("ALTER TABLE messages ADD COLUMN ts INTEGER");
             }
         }
+        // #6785 step 6: ccr_entries.orig_hash — probe-first, moved ABOVE the
+        // version early return (a #5855-era db already at user_version 12
+        // must pick the column up; the in-transaction probe it was at never
+        // ran there). See the probe-first note before the early return.
         if (from < 11) {
             // v11 (#5539): FK child indexes on content.hash — see the header
             // note and the DDL comment above for the mechanism and field
@@ -442,9 +851,28 @@ export function migrateSchema(db: {
             db.exec("CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash)");
             db.exec("CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)");
         }
+        // v12 (#5874 P0): snapshot-table compression foundation — ensured
+        // PROBE-FIRST above (coexists with sibling-branch DDL that consumed
+        // the v12/v13 numbers, see the note before the early return).
+        // Pure additivity: no backfill, no rewrite of existing rows.
+        // Rollback = DROP the tables and set user_version back
+        // (T1 pins the byte-identical behavior in both directions).
     });
     if (needV8Backfill) migrateV8Identities(db);
     db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
+    // #7574: idx_conversations_session ships inside STORAGE_DDL_V1, so only
+    // a database BORN on a current build ever had it — a library that
+    // climbed to its user_version from an earlier release took the versioned
+    // steps above and never the v1 DDL, so every conversations(session_id)
+    // lookup stayed a full scan. Probe the index itself and create it on the
+    // first open that misses it (the table exists on every path: v1 DDL on a
+    // fresh file, the `from < 3` step, or already).
+    const hasConversationsIndex = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_session'")
+        .get();
+    if (hasConversationsIndex === undefined) {
+        db.exec("CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id)");
+    }
     return { from, to: STORAGE_SCHEMA_VERSION };
 }
 

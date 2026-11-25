@@ -26,9 +26,21 @@ export interface CompressReasoningConfig {
      *  `compress` call must total STRICTLY more than this to be dropped.
      *  Default: 2048. `0` drops any non-empty run. */
     threshold?: number;
+    /** (#7144 follow-up) Extend the drop from compress turns to ANY closed round in
+     *  the protected tail: a tool call whose result arrived with at least
+     *  one message after it, or an assistant text turn that is no longer
+     *  the view's last message. Those rounds leave the protected window
+     *  (and their reasoning with it) at the next fold anyway — dropping
+     *  early reclaims the tokens now. The in-flight round (result pending
+     *  or still the last message) is NEVER touched, exactly like the base
+     *  pass. Default: false. Requires `drop !== false`. On strict-echo
+     *  upstreams the whole pass is disabled upstream of this gate
+     *  (planReasoningDrop) and the #762/#2169 blank-echo normalization
+     *  already covers any residual missing echo. */
+    tail?: boolean;
 }
 
-export const DEFAULT_COMPRESS_REASONING: Required<CompressReasoningConfig> = { drop: true, threshold: 2048 };
+export const DEFAULT_COMPRESS_REASONING: Required<CompressReasoningConfig> = { drop: true, threshold: 2048, tail: false };
 
 export function resolveReasoningDrop(cfg?: CompressReasoningConfig): Required<CompressReasoningConfig> {
     let threshold = DEFAULT_COMPRESS_REASONING.threshold;
@@ -38,11 +50,12 @@ export function resolveReasoningDrop(cfg?: CompressReasoningConfig): Required<Co
             threshold = Math.floor(t);
         }
     }
-    return { drop: cfg?.drop !== false, threshold };
+    return { drop: cfg?.drop !== false, threshold, tail: cfg?.tail === true };
 }
 
 /** Request-time pass: remove reasoning messages attached to a `compress`
- *  tool call only when ALL gates hold —
+ *  tool call (base) — and, with `tail`, to ANY closed round — only when ALL
+ *  gates hold —
  *  1. closed round [#348 twin]: the compress call has its tool-result
  *     message (`contentType: "tool-result"`, matching `toolCallId`) at a
  *     LATER index, and at least one message exists after that result (the
@@ -60,7 +73,7 @@ export function resolveReasoningDrop(cfg?: CompressReasoningConfig): Required<Co
  *  Pure: never mutates the input; idempotent; fail-safe (any error returns
  *  an empty set / the input unchanged). */
 export function dropCompressReasoningIds(messages: BiliMessage[], cfg?: CompressReasoningConfig): Set<string> {
-    const { drop, threshold } = resolveReasoningDrop(cfg);
+    const { drop, threshold, tail } = resolveReasoningDrop(cfg);
     const ids = new Set<string>();
     if (!drop || messages.length === 0) return ids;
     try {
@@ -72,19 +85,45 @@ export function dropCompressReasoningIds(messages: BiliMessage[], cfg?: Compress
                 resultAt.set(m.toolCallId, i);
             }
         }
+        // Contiguous reasoning run ending at i-1 (message i is the first
+        // non-reasoning after it); null when there is no such run.
+        const runBefore = (i: number): number[] | null => {
+            if (i === 0 || messages[i - 1]!.contentType !== "reasoning") return null;
+            const idx: number[] = [];
+            let j = i - 1;
+            while (j >= 0 && messages[j]!.contentType === "reasoning") { idx.push(j); j--; }
+            return idx;
+        };
+        const harvest = (i: number): void => {
+            const idx = runBefore(i);
+            if (idx === null) return;
+            let total = 0;
+            for (const k of idx) total += (messages[k]!.text ?? "").length;
+            if (total > threshold) for (const k of idx) ids.add(messages[k]!.id);
+        };
         for (let i = 0; i <= last; i++) {
             const m = messages[i]!;
             if (m.contentType !== "tool-call" || typeof m.toolName !== "string" || !isMcpBiliCompress(m.toolName)) continue;
             const ri = typeof m.toolCallId === "string" ? resultAt.get(m.toolCallId) : undefined;
             if (ri === undefined || ri <= i || ri >= last) continue;
-            let total = 0;
-            let j = i - 1;
-            while (j >= 0 && messages[j]!.contentType === "reasoning") {
-                total += (messages[j]!.text ?? "").length;
-                j--;
-            }
-            if (total > threshold) {
-                for (let k = j + 1; k < i; k++) ids.add(messages[k]!.id);
+            harvest(i);
+        }
+        // (#7144 follow-up) tail scope: any closed round, not only compress turns.
+        // A tool call closes when its result arrived with at least one
+        // message after it; an assistant text turn (a run's successor is
+        // always model output) closes when it is no longer the last message.
+        if (tail) {
+            for (let i = 0; i <= last; i++) {
+                const m = messages[i]!;
+                if (m.contentType === "tool-call") {
+                    const ri = typeof m.toolCallId === "string" ? resultAt.get(m.toolCallId) : undefined;
+                    if (ri === undefined || ri <= i || ri >= last) continue;
+                } else if (m.contentType === "text") {
+                    if (i >= last) continue;
+                } else {
+                    continue;
+                }
+                harvest(i);
             }
         }
     } catch {
