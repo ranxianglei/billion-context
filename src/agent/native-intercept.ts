@@ -1960,7 +1960,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     // log say whether any folding could ever bring this body
                     // under the cap.
                     const silentRaw = prep.outcome === "restored"
-                        ? prep.body
+                        ? (typeof prep.body === "string"
+                          ? prep.body
+                          : restoredBodyText(prep.body, bodyContentEncodingOf(outgoingHeadersOf(defaultInput, init))))
                         : measured?.raw ?? (typeof init?.body === "string" ? init.body : undefined);
                     const silentMediaBytes = silentRaw !== undefined ? mediaBytesOfWireBody(silentRaw) : undefined;
                     logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B${silentMediaBytes !== undefined && silentMediaBytes > 0 ? `; ${silentMediaBytes.toLocaleString("en-US")} B inline media, incompressible` : ""}); would be sent uncompressed (#5405/#5408)`);
