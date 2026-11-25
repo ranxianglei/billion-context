@@ -141,7 +141,7 @@ test("chat pipe: non-plugin lane (session=undefined) ring-records via witnessSes
     ];
     // session omitted (non-plugin lane, usage accounting stays off); the
     // witnessSessionId is the trailing param — the ring must record under it.
-    await pipePluginChatWithStrip(streamOf(events), makeRes([]), "openai", undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "w-np");
+    await pipePluginChatWithStrip(streamOf(events), makeRes([]), "openai", undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "w-np");
     assert.deepEqual([...lookupToolWitness("compress", COMPRESS_ARGS)], ["w-np"]);
 });
 
