@@ -173,10 +173,13 @@ export function snapR3LatchedRead(db: DbLike, sessRaw: string): boolean {
     return !!r && !!r.r3_latched_at;
 }
 
-/** #6181 M3: persist the R3 breaker latch. UPSERT (not UPDATE-only) — the
- *  first fault of a fresh session happens BEFORE its stage-0 snapL1Record
- *  call (the R3 check runs at pin validation), so an UPDATE-only latch
- *  would silently no-op for sessions with no l1 row yet. */
+/** #6181 M3: persist the R3 breaker latch onto the l1_world row.
+ *  Legacy carrier — used by `UnifiedStore.snapR3Latch` when egressPlane is
+ *  OFF (discussions/7591 owner ruling 2026-11-24): with the switch off the
+ *  latch lands here exactly as pre-migration; with it on, new latches land
+ *  on the SESSIONS row ({@link snapR3LatchWriteOnSession}) instead. Also the
+ *  row shape the egress-off "red" rebind branch of `snapStage0` repairs
+ *  (pre-migration rows). Drop with the l1 table in the later release. */
 export function snapR3LatchWrite(db: DbLike, sessRaw: string, nowMs: number): void {
     // Upsert — the first fault of a fresh session happens BEFORE its stage-0
     // snapL1Record call (the R3 check runs at pin validation), so an
@@ -210,6 +213,52 @@ export function snapR3LatchedList(db: DbLike): Array<{ sessRaw: string; ledgerId
         .prepare("SELECT sess_raw, ledger_id, r3_latched_at FROM l1_world WHERE r3_latched_at IS NOT NULL ORDER BY r3_latched_at DESC")
         .all() as Array<{ sess_raw: string; ledger_id: string; r3_latched_at: number }>)
         .map((r) => ({ sessRaw: r.sess_raw, ledgerId: r.ledger_id, latchedAt: r.r3_latched_at }));
+}
+
+// --- identity consolidation (discussions/7591, #7439 follow-up) ------------
+// The R3 breaker latch's Durable home is now the SESSIONS row itself (the
+// session table is the single identity table; the l1_world row is a legacy
+// fallback READ carrier until that table is dropped in a later release).
+// The sessions column is INTEGER, NULL/0 = not latched, else epoch-ms — the
+// "not latched" sentinel is 0, never NULL semantics games (fresh installs
+// probe the column in, pre-existing rows read NULL which is falsy like 0).
+
+/** Read the persisted R3 latch from the sessions row. Missing row or
+ *  NULL/0 → false. (The column exists on every store — schema.ts probes it
+ *  in first.) */
+export function snapR3LatchedReadOnSession(db: DbLike, sessionId: string): boolean {
+    const r = db
+        .prepare("SELECT r3_latched_at FROM sessions WHERE session_id = ?")
+        .get(sessionId) as { r3_latched_at: number | null } | undefined;
+    return !!r && !!r.r3_latched_at;
+}
+
+/** Persist the R3 latch onto the sessions row. UPSERT of a MINIMAL row when
+ *  the session is not recorded yet (the first fault of a fresh session
+ *  happens before its first ingest upsert) — the minimal row carries only
+ *  the NOT-NULL-without-default columns plus the latch; every later ingest
+ *  upsert fills the rest via ON CONFLICT DO UPDATE without touching it.
+ *  (The legacy l1 placeholder-row ceremony is gone with this: v1 identity is
+ *  the identity map, the row's PK IS the ledger id.) */
+export function snapR3LatchWriteOnSession(db: DbLike, sessionId: string, nowMs: number): void {
+    db.prepare("INSERT INTO sessions (session_id, created_at, updated_at, r3_latched_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET r3_latched_at = excluded.r3_latched_at").run(sessionId, nowMs, nowMs, nowMs);
+}
+
+/** Clear the persisted R3 latch on the sessions row. Returns the session id
+ *  when the row WAS latched (callers use the return to clear the in-memory
+ *  breaker for the resolvable sid), null when it was not. */
+export function snapR3LatchClearOnSession(db: DbLike, sessionId: string): string | null {
+    const was = snapR3LatchedReadOnSession(db, sessionId);
+    db.prepare("UPDATE sessions SET r3_latched_at = NULL WHERE session_id = ?").run(sessionId);
+    return was ? sessionId : null;
+}
+
+/** The persisted-latch roster from the sessions row (empty when none). */
+export function snapR3LatchedListOnSessions(db: DbLike): Array<{ sessRaw: string; ledgerId: string; latchedAt: number }> {
+    return (db
+        .prepare("SELECT session_id, r3_latched_at FROM sessions WHERE r3_latched_at IS NOT NULL AND r3_latched_at <> 0 ORDER BY r3_latched_at DESC")
+        .all() as Array<{ session_id: string; r3_latched_at: number }>)
+        .map((r) => ({ sessRaw: r.session_id, ledgerId: r.session_id, latchedAt: r.r3_latched_at }));
 }
 
 // ---------------------------------------------------------------------------
