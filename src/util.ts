@@ -439,6 +439,14 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     // ("Range of input length should be [1, 1000000]"), with no token or length
     // subject phrase: unlisted here, the 400 is not an overflow and nothing arms.
     /range of input length should be \[/i,
+    // #7709: self-hosted OpenAI-compatible gateways (new-api/one-api family)
+    // reject an over-limit request with a "channel max limit" phrasing — the
+    // per-channel INPUT ceiling configured on the gateway. "max" must sit
+    // between the channel subject and the limit word inside one clause, so
+    // throttle phrasings ("channel rate limit", "channel frequency limit")
+    // stay dark. A body number is optional: when absent, the emergency shrink
+    // arms at the rejected payload's own estimate (the #3787 path).
+    /channel['’]?s?['’]?\s*max(?:imum)?\b[^。；;！!\n]{0,16}(?:limit|tokens?)/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
@@ -508,6 +516,12 @@ function parseOverflowWindow(text: string): number | undefined {
     // bound is the input ceiling; the lower bound is not a window.
     m = text.match(/range of input length should be \[\s*\d[\d,]*\s*,\s*(\d[\d,]*)\s*\]/i);
     if (m) return toTokenNumber(m[1]);
+    // #7709: "exceeds the channel max limit of 1000000" / "channel max input
+    // tokens (100000)" — the number ATTACHED TO the channel ceiling word is the
+    // limit; a payload size quoted elsewhere in the sentence must not be used
+    // (a wrong guess arms the shrink at the wrong wall).
+    m = text.match(/channel['’]?s?['’]?\s*max(?:imum)?\b[^。；;！!\n]{0,16}(?:limit|tokens?)\s*(?:of|is|:|：)?\s*\(?(\d[\d,]*)/i);
+    if (m) return toTokenNumber(m[1]);
     m =
         text.match(/maximum context length is (\d[\d,]*)/i) ??
         text.match(/maximum context length of (\d[\d,]*)/i) ??
@@ -563,6 +577,18 @@ function parseOverflowCounts(text: string): { total?: number; messages?: number;
     for (const mm of text.matchAll(/(?:请求|输入)([^。；;！!\n]{0,12}?)(\d[\d,]*)\s*(?:个\s*)?tokens?\s*[，,]?\s*(?:超过|超出|超限)/gi)) {
         const n = toTokenNumber(mm[2]);
         if (n !== undefined && !/(?:支持|最大|上限|限制|允许)/.test(mm[1])) return { total: n, messages: n };
+    }
+    // #7709: the rejected payload's own count, adjacent to the overflow
+    // predicate: "the input tokens (123456) exceeds the channel max limit",
+    // "prompt tokens 123456 exceeds channel max input tokens". The number sits
+    // right after an input-side unit word (tokens/length/count) and before the
+    // exceed verb — the span between subject and number is a fixed unit word,
+    // so no limit-vocabulary guard is needed (a number attached to limit
+    // vocabulary is a CEILING: parseOverflowWindow's half). A rejection bills
+    // input only, so total and messages carry the same number (#3450).
+    for (const mm of text.matchAll(/(?:input|prompt|request|total)\s+(?:tokens?|length|count)\s*\(?(\d[\d,]*)\s*\)?\s*(?:个\s*)?(?:tokens?\s*)?[，,]?\s*exceeds/gi)) {
+        const n = toTokenNumber(mm[1]);
+        if (n !== undefined) return { total: n, messages: n };
     }
     return {};
 }

@@ -288,6 +288,81 @@ test("CJK overflow phrasings in both word orders → overflow (#3787)", () => {
     assert.equal(inspectContextOverflow(400, '{"error":{"message":"输入 token 数超出最大上下文限制"}}').isOverflow, true);
 });
 
+test("#7709: 'channel max limit' 400 (self-hosted OpenAI-compatible gateway) → overflow, window undefined", () => {
+    // The reported shape (new-api/one-api family): the per-channel INPUT ceiling
+    // rejection, no window number in the body — the emergency shrink must arm
+    // at the rejected payload's own estimate (the #3787 path).
+    const info = inspectContextOverflow(
+        400,
+        '{"error":{"message":"The input length exceeds the channel max limit, please reduce the input","type":"invalid_request_error","code":"channel_max_limit"}}',
+    );
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, undefined);
+    assert.equal(info.requestedTotal, undefined);
+    assert.equal(info.requestedMessages, undefined);
+});
+
+test("#7709: 'channel max limit (N)' states the ceiling → window N + payload counts", () => {
+    const info = inspectContextOverflow(
+        400,
+        '{"error":{"message":"The input tokens (123456) exceeds the channel max limit (1000000). Please reduce the input.","type":"invalid_request_error"}}',
+    );
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 1000000);
+    assert.equal(info.requestedTotal, 123456);
+    assert.equal(info.requestedMessages, 123456);
+    assert.equal(info.requestedCompletion, undefined);
+});
+
+test("#7709: channel-max variants (bare number / channel's / maximum / of N)", () => {
+    // "prompt tokens 123456 exceeds channel max input tokens 1000000" — the
+    // number attached to the ceiling word is the window, the payload count sits
+    // before the exceed verb.
+    const a = inspectContextOverflow(400, '{"error":{"message":"prompt tokens 123456 exceeds channel max input tokens 1000000"}}');
+    assert.equal(a.isOverflow, true);
+    assert.equal(a.window, 1000000);
+    assert.equal(a.requestedTotal, 123456);
+    assert.equal(a.requestedMessages, 123456);
+    const b = inspectContextOverflow(400, '{"error":{"message":"input exceeds the channel\'s max limit of 200000"}}');
+    assert.equal(b.isOverflow, true);
+    assert.equal(b.window, 200000);
+    const c = inspectContextOverflow(400, '{"error":{"message":"the request length is above the channel maximum input limit 500000"}}');
+    assert.equal(c.isOverflow, true);
+    assert.equal(c.window, 500000);
+});
+
+test("#7709: a request id after the ceiling word is NOT captured as the window", () => {
+    const info = inspectContextOverflow(
+        400,
+        '{"error":{"message":"input exceeds the channel max limit, request id 123456","code":"channel_max_limit"}}',
+    );
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, undefined);
+    assert.equal(info.requestedTotal, undefined);
+});
+
+test("#7709: channel throttle phrasings stay dark (not an overflow)", () => {
+    // "max" must sit between the channel subject and the limit word: rate /
+    // frequency throttle phrasings name no input size and must not arm the
+    // token-space shrink.
+    assert.equal(
+        inspectContextOverflow(400, '{"error":{"message":"This channel rate limit exceeded, please try again later"}}').isOverflow,
+        false,
+    );
+    assert.equal(inspectContextOverflow(400, '{"error":{"message":"channel frequency limit reached"}}').isOverflow, false);
+    assert.equal(
+        inspectContextOverflow(429, '{"error":{"message":"channel max limit exceeded, please retry after 60s"}}').isOverflow,
+        false,
+    );
+});
+
+test("#7709: 5xx-relayed channel overflow still counts (#2484 parity)", () => {
+    const info = inspectContextOverflow(502, '{"error":{"message":"upstream: input tokens (234567) exceeds the channel max limit (200000)"}}');
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 200000);
+    assert.equal(info.requestedTotal, 234567);
+});
+
 test("CJK text mentioning 上下文 without an overflow verb is NOT an overflow", () => {
     assert.equal(inspectContextOverflow(400, '{"error":{"message":"无效的请求体：messages 字段格式错误（上下文历史解析失败）"}}').isOverflow, false);
 });
