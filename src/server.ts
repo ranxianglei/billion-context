@@ -771,7 +771,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const engine = await createEngineContext(opts);
     const { core, config, log, instanceId, instanceStartedAt, proxyWatchers, watcherLastSeen, initialWatcherPid, adminCtx } = engine;
 
-    const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
+    const dispatchRequest = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         armRequestWatchdog(req, res, log);
         const connRec = connRecords.get(req.socket);
         if (connRec) {
@@ -854,6 +854,25 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 res.end(body);
             } else {
                 res.end();
+            }
+        }
+    };
+    let liveRequests = 0;
+    const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
+        liveRequests++;
+        let released = false;
+        const release = (): void => {
+            if (released) return;
+            released = true;
+            liveRequests--;
+        };
+        try {
+            await dispatchRequest(req, res);
+        } finally {
+            if (res.writableEnded || res.destroyed) release();
+            else {
+                res.once("finish", release);
+                res.once("close", release);
             }
         }
     };
@@ -1833,6 +1852,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // the release by minutes (keep-alive pins), and a stale claim let a
         // same-lane newcomer misclassify us as its twin and die (#4982).
         markPortReleased(instanceId);
+        let idleSince: number | null = null;
+        const idleCut = setInterval(() => {
+            if (liveRequests > 0 || totalInFlight() > 0) {
+                idleSince = null;
+                return;
+            }
+            idleSince ??= Date.now();
+            if (Date.now() - idleSince < SHUTDOWN_FLUSH_GRACE_MS) {
+                for (const socket of connRecords.keys()) if (socket.writableLength > 0) return;
+            }
+            clearInterval(idleCut);
+            const closed = forceCloseLingeringSockets();
+            if (closed > 0) log("info", `shutdown: no request in flight — closed ${closed} idle connection(s) (tunnels, keep-alives) instead of waiting out the drain`);
+        }, SHUTDOWN_IDLE_POLL_MS);
+        idleCut.unref?.();
         // Hard fallback: if connections hang (client never closes), don't
         // block shutdown forever — force-exit after a grace window. #3890:
         // while connections are still ALIVE the window re-arms (bounded by
@@ -2383,6 +2417,8 @@ export function effectiveHeartbeatGrace(heartbeatGraceMs: number, loopLagMs: num
 // drain ≈ (1 + SHUTDOWN_DRAIN_MAX_PASSES) windows.
 const SHUTDOWN_DRAIN_GRACE_MS = 10_000;
 const SHUTDOWN_DRAIN_MAX_PASSES = 10;
+const SHUTDOWN_IDLE_POLL_MS = 200;
+const SHUTDOWN_FLUSH_GRACE_MS = 1_000;
 
 // #3890: how many CONSECUTIVE failed kill-0 probes must agree before the
 // watchdog believes a watched pid has died. Pre-fix, ONE failed probe removed
