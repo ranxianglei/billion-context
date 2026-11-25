@@ -41,7 +41,6 @@ const MODEL_A = "gpt-test";
 const MODEL_B = "gpt-test2";
 const CLAUDE = "claude-test";
 const GEMINI = "gemini-test";
-const FOLD_MODEL = "gpt-fold";
 
 type Kind = "model" | "wire" | "both";
 type Phase = "bootstrap" | "steady" | "fold" | "fork";
@@ -80,20 +79,26 @@ test("C7 switch matrix: {model, wire, both} × {bootstrap, steady, fold, fork} a
                 const url = req.url ?? "";
                 const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
                 seen.push({ url, model: String(body.model ?? "") });
+                // honest usage: bill what actually arrived (the /4 estimator —
+                // the usage-driven fold controller judges on billed input)
+                const billed = Math.max(10, Math.round(JSON.stringify(body).length / 4));
+                // the preflight summarizer also lands here (no biliMsgIds, big
+                // content): answer it with a real ≥50-char summary, not "ok"
+                const isSummaryCall = !("biliMsgIds" in body) && JSON.stringify(body).length > 4000;
                 res.writeHead(200, { "content-type": "application/json" });
                 if (url.includes("/v1/messages")) {
-                    res.end(JSON.stringify({ id: "msg-test", type: "message", role: "assistant", model: CLAUDE, content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 5 } }));
+                    res.end(JSON.stringify({ id: "msg-test", type: "message", role: "assistant", model: CLAUDE, content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: billed, output_tokens: 5 } }));
                 } else if (url.includes("/v1/responses")) {
-                    res.end(JSON.stringify({ id: "resp-test", object: "response", status: "completed", model: GEMINI, output: [{ type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: "ok" }] }], usage: { input_tokens: 10, output_tokens: 5 } }));
+                    res.end(JSON.stringify({ id: "resp-test", object: "response", status: "completed", model: GEMINI, output: [{ type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: "ok" }] }], usage: { input_tokens: billed, output_tokens: 5 } }));
                 } else {
-                    res.end(JSON.stringify({ id: "chatcmpl-test", object: "chat.completion", model: String(body.model ?? MODEL_A), choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }));
+                    res.end(JSON.stringify({ id: "chatcmpl-test", object: "chat.completion", model: String(body.model ?? MODEL_A), choices: [{ index: 0, message: { role: "assistant", content: isSummaryCall ? `folded history ${"z".repeat(240)}` : "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: billed, completion_tokens: 5, total_tokens: billed + 5 } }));
                 }
             });
         });
         upstream.listen(0, "127.0.0.1");
         await listen(upstream);
         const llmUrl = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
-        const allModels = { [MODEL_A]: { context: 400_000 }, [MODEL_B]: { context: 400_000 }, [CLAUDE]: { context: 400_000 }, [GEMINI]: { context: 400_000 }, [FOLD_MODEL]: { context: 8_000 } };
+        const allModels = { [MODEL_A]: { context: 400_000 }, [MODEL_B]: { context: 400_000 }, [CLAUDE]: { context: 400_000 }, [GEMINI]: { context: 400_000 } };
         const opts: ProxyOptions = {
             port: 0, host: "127.0.0.1", upstream: llmUrl,
             routes: { [llmUrl]: { models: allModels } },
@@ -146,9 +151,9 @@ test("C7 switch matrix: {model, wire, both} × {bootstrap, steady, fold, fork} a
             const body: Record<string, unknown> = { model: t.model, stream: false, max_tokens: 1024, biliMsgIds: ids };
             if (t.path === "/v1/messages") {
                 body.messages = [
-                    { type: "user", message: { role: "user", content: [{ type: "text", text: `q${ids.length}` }] } },
-                    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "talking" }, { type: "tool_use", id: `call_${ids.length}`, name: "t", input: {} }] } },
-                    { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: `call_${ids.length}`, content: "result" }] } },
+                    { role: "user", content: [{ type: "text", text: `q${ids.length}` }] },
+                    { role: "assistant", content: [{ type: "text", text: "talking" }, { type: "tool_use", id: `call_${ids.length}`, name: "t", input: {} }] },
+                    { role: "user", content: [{ type: "tool_result", tool_use_id: `call_${ids.length}`, content: "result" }] },
                 ];
             } else if (t.path === "/v1/responses") {
                 body.input = [
@@ -170,11 +175,12 @@ test("C7 switch matrix: {model, wire, both} × {bootstrap, steady, fold, fork} a
         };
 
         const cell = async (kind: Kind, phase: Phase): Promise<void> => {
-            const sid = `c7-${kind}-${phase}`;
+            let sid = `c7-${kind}-${phase}`;
             const logMark = logs.length;
             const seenMark = seen.length;
             const ids = ["h0", "h1", "h2"];
-            let switched;
+            let switched: string[] = [];
+            let switchOnFold = false;
             switch (phase) {
                 case "bootstrap":
                     await openaiTurn(sid, 1, MODEL_A, ["b0", "b1", "b2"]);
@@ -186,16 +192,37 @@ test("C7 switch matrix: {model, wire, both} × {bootstrap, steady, fold, fork} a
                     switched = ids;
                     break;
                 case "fold": {
-                    // a REAL kernel fold: tiny window + long history
+                    // A pinned host manages its own context: turn 1 sends the long
+                    // history, turn 2 (the SWITCH turn) re-sends the folded view —
+                    // compact summary + fresh tail. The op-log diff emits D-ops and
+                    // the flow shrinks — exactly how #7577's e2e drives a real fold.
                     const long: Array<{ role: string; content: string }> = [];
-                    for (let i = 0; i < 300; i++) long.push({ role: i % 2 === 0 ? "user" : "assistant", content: `message ${i}: ${"x".repeat(90)}` });
-                    const r = await post("/v1/chat/completions", sid, { model: FOLD_MODEL, stream: false, max_tokens: 1024, messages: long, biliMsgIds: long.map((_, i) => `f${i}`) });
-                    assert.equal(r.status, 200, `fold turn -> ${r.status}: ${r.body.slice(0, 200)}`);
+                    for (let i = 0; i < 100; i++) long.push({ role: i % 2 === 0 ? "user" : "assistant", content: `message ${i}: ${"x".repeat(2000)}` });
+                    const r1 = await post("/v1/chat/completions", sid, { model: MODEL_A, stream: false, max_tokens: 1024, messages: long, biliMsgIds: long.map((_, i) => `f${i}`) });
+                    assert.equal(r1.status, 200, `fold-prime turn -> ${r1.status}: ${r1.body.slice(0, 200)}`);
                     await settle(sid);
-                    const view = store!.egressStateRead(sid) ?? [];
+                    // the switch turn carries the folded view on the target wire
+                    const t = TARGETS[kind];
+                    const folded: Record<string, unknown> = { model: t.model, stream: false, max_tokens: 1024, biliMsgIds: ["fs0", "fs1", "fs2"] };
+                    if (t.path === "/v1/messages") {
+                        folded.messages = [
+                            { role: "user", content: [{ type: "text", text: "summary: a hundred long messages about x" }] },
+                            { role: "user", content: [{ type: "text", text: "still there?" }] },
+                            { role: "user", content: [{ type: "text", text: "after the fold" }] },
+                        ];
+                    } else if (t.path === "/v1/responses") {
+                        folded.input = [{ role: "user", content: "summary: a hundred long messages about x" }, { role: "user", content: "still there?" }, { role: "user", content: "after the fold" }];
+                    } else {
+                        folded.messages = [{ role: "user", content: "summary: a hundred long messages about x" }, { role: "user", content: "still there?" }, { role: "user", content: "after the fold" }];
+                    }
+                    const r2 = await post(t.path, sid, folded);
+                    assert.equal(r2.status, 200, `fold+switch turn -> ${r2.status}: ${r2.body.slice(0, 200)}`);
+                    await settle(sid);
+                    const view = store!.egressOpLogStore()?.egressStateView(sid) ?? [];
                     const liveMsgs = view.filter((v) => v.msgid !== "egress-system").length;
-                    assert.ok(liveMsgs < 300, `fold actually compacted the flow (${liveMsgs} live rows < 300 sent)`);
-                    switched = ids;
+                    if (liveMsgs >= 20) console.log("FOLD2-DEBUG", logs.filter((l) => /iterable|error|warn|egress|fold|record|blocks/.test(l)).slice(-40).join("\n").slice(-4000));
+                    assert.ok(liveMsgs < 20, `the fold shrank the flow via D-ops (${liveMsgs} live rows vs 100 sent; tail: ${view.slice(-5).map((v) => v.msgid).join(",")})`);
+                    switchOnFold = true;
                     break;
                 }
                 case "fork": {
@@ -210,10 +237,10 @@ test("C7 switch matrix: {model, wire, both} × {bootstrap, steady, fold, fork} a
                         biliMsgIds: ["p0", "p1", "p2", "p3"],
                         ...(TARGETS[kind].path === "/v1/messages"
                             ? { messages: [
-                                { type: "user", message: { role: "user", content: [{ type: "text", text: "q1" }] } },
-                                { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "talking" }, { type: "tool_use", id: "call_1", name: "t", input: {} }] } },
-                                { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "result" }] } },
-                                { type: "user", message: { role: "user", content: [{ type: "text", text: "after fork" }] } },
+                                { role: "user", content: [{ type: "text", text: "q1" }] },
+                                { role: "assistant", content: [{ type: "text", text: "talking" }, { type: "tool_use", id: "call_1", name: "t", input: {} }] },
+                                { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "result" }] },
+                                { role: "user", content: [{ type: "text", text: "after fork" }] },
                             ] }
                             : TARGETS[kind].path === "/v1/responses"
                                 ? { input: [
@@ -236,18 +263,20 @@ test("C7 switch matrix: {model, wire, both} × {bootstrap, steady, fold, fork} a
                     break;
                 }
             }
-            if (phase !== "fork") await switchTurn(kind, sid, switched);
+            if (phase !== "fork" && !switchOnFold) await switchTurn(kind, sid, switched);
 
             // ---- the contract assertions ---------------------------------
             const tailLogs = logs.slice(logMark);
             assert.ok(!tailLogs.some((l) => l.includes("pin rejected")), `${kind}/${phase}: no pin rejection (drift class never rejects, but the pin must have hit): ${tailLogs.filter((l) => l.includes("pin")).join(" | ").slice(0, 400)}`);
             assert.ok(!tailLogs.some((l) => l.includes("unreadable")), `${kind}/${phase}: no egress-unreadable degradation`);
+            assert.ok(!tailLogs.some((l) => l.includes("kernel transform failed")), `${kind}/${phase}: the kernel transform must not crash (a crash means the turn was forwarded raw, unrecorded): ${tailLogs.filter((l) => l.includes("kernel transform")).join(" | ").slice(0, 300)}`);
             const t = TARGETS[kind];
             const last = seen.slice(seenMark).at(-1);
-            assert.ok(last && last.url.includes(t.path.split("/").slice(-2, -1)[0] === "messages" ? "/v1/messages" : t.path === "/v1/responses" ? "/v1/responses" : "/v1/chat"), `${kind}/${phase}: the upstream saw the target wire (${last?.url})`);
+            const wantUrl = t.path === "/v1/messages" ? "/v1/messages" : t.path === "/v1/responses" ? "/v1/responses" : "/v1/chat";
+            assert.ok(last && last.url.includes(wantUrl), `${kind}/${phase}: the upstream saw the target wire (${last?.url}); seen tail: ${JSON.stringify(seen.slice(seenMark).map((e) => e.url))}`);
             const live = store!.snapPinLiveIds(sid);
             assert.ok(live.length > 0, `${kind}/${phase}: the op log stayed alive (${live.length} ids)`);
-            const view = store!.egressStateRead(sid) ?? [];
+            const view = store!.egressOpLogStore()?.egressStateView(sid) ?? [];
             assert.ok(view.length > 0, `${kind}/${phase}: the live view exists`);
             console.log(`  ✓ ${kind}/${phase} — ${t.label}: ${live.length} pinned ids, ${view.length} live rows`);
         };
