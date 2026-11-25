@@ -61,7 +61,7 @@ import {
     snapR3LatchedListOnSessions,
 } from "./snap.js";
 import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
-import { EGRESS_SYSTEM_MSGID } from "./egress-record.js";
+import { EGRESS_SYSTEM_MSGID, type EgressIdentityColumns } from "./egress-record.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
@@ -430,6 +430,19 @@ export interface IngestSessionInput {
 const EXT_KEY_MAX = 256;
 const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
 
+// #7735 R7: the kv_store is a small-key substrate — a serialized value over
+// this many characters is a payload that belongs in the content CAS / egress
+// op log, not a kv row. The cap is enforced at the write chokepoints (setKv in
+// this file + the MySQL twin) and THROWS loud (no silent truncation). The two
+// frozen legacy blobs that pre-date the cap (the 1.88 MB prefix-affinity chain
+// and the plugin-conversations table) are exempt so existing instances keep
+// working; both are RETIRED in eg mode (R4/R5) so they never grow there.
+export const KV_LARGE_VALUE_MAX_CHARS = 256;
+export const KV_LARGE_VALUE_WHITELIST: ReadonlySet<string> = new Set([
+    "prefix-affinity|v1",
+    "plugin-conversations|table",
+]);
+
 export function validateExtKey(value: string, what: string): void {
     if (typeof value !== "string" || value.length === 0 || value.length > EXT_KEY_MAX) {
         throw new Error(`[storage] extension ${what} must be a non-empty string of at most ${EXT_KEY_MAX} characters`);
@@ -796,7 +809,12 @@ export class UnifiedStore {
                 }
                 db.exec(pragma);
             }
-            migrateSchema(db);
+            // #7735 R2: an eg-mode instance (egressPlane on) materializes only
+            // the CORE table family on a fresh DB; the legacy family is created
+            // by the convergence path on a later open that flips the flag off.
+            // A non-eg instance (the default) passes nothing (= legacyTables
+            // true) and behaves byte-identically to before.
+            migrateSchema(db, { legacyTables: !featureEnabled("egressPlane") });
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
             // to be corrupt: the #2771 fallback tells operators to MOVE the
@@ -2472,6 +2490,70 @@ export class UnifiedStore {
         });
     }
 
+    /** #7735 R1: upsert the session's identity row (sessions table) for an
+     *  egress-on session whose unified ingest is frozen, plus the arm-turn l1
+     *  dead-row cleanup — in ONE transaction. Without this the rowless
+     *  egress-on session is restart-unloadable, GC-invisible, and a point-fork
+     *  cannot open a rowless parent. Conflict semantics mirror the full
+     *  ingest byte-for-byte (first parent wins, descriptive cols
+     *  blind-overwrite, payload cols NEVER touched) so the identity row and a
+     *  later flag=0 full ingest land on the SAME row without drift. The l1
+     *  cleanup removes the dead row snapL1Record writes on the arm turn
+     *  (witness recorded but not yet armed / R3-latched); the R3 breaker row
+     *  (witness '' + r3_latched_at set) and armed rows are protected by the
+     *  predicate, and an absent l1_world (eg fresh DB) skips it. */
+    ensureEgressIdentity(sessionId: string, cols: EgressIdentityColumns): void {
+        this.db.transaction(() => {
+            this.db
+                .prepare(
+                    `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
+                       status, created_at, updated_at, meta_json, metadata_json)
+                      VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle, @namespace, @origin,
+                       @status, @createdAt, @updatedAt, @metaJson, @metadataJson)
+                      ON CONFLICT(session_id) DO UPDATE SET
+                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                        fork_point_seq = CASE WHEN sessions.parent_session_id IS NULL THEN excluded.fork_point_seq ELSE sessions.fork_point_seq END,
+                        protocol = excluded.protocol,
+                        label = excluded.label,
+                        title = excluded.title,
+                        host_title = excluded.host_title,
+                        namespace = excluded.namespace,
+                        origin = excluded.origin,
+                        status = excluded.status,
+                        updated_at = excluded.updated_at,
+                        meta_json = excluded.meta_json,
+                        metadata_json = CASE WHEN metadata_json IS excluded.metadata_json THEN sessions.metadata_json ELSE excluded.metadata_json END`,
+                )
+                .run({
+                    sessionId,
+                    parentSessionId: cols.parentSessionId,
+                    forkPointSeq: cols.forkPointSeq,
+                    protocol: cols.protocol,
+                    label: cols.label,
+                    title: cols.title,
+                    hostTitle: cols.hostTitle,
+                    namespace: cols.namespace,
+                    origin: cols.origin,
+                    status: cols.status,
+                    createdAt: cols.createdAt,
+                    updatedAt: cols.updatedAt,
+                    metaJson: cols.metaJson,
+                    metadataJson: cols.metadataJson,
+                });
+            const hasL1 = this.db
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'l1_world'")
+                .get();
+            if (hasL1) {
+                this.db
+                    .prepare(
+                        `DELETE FROM l1_world
+                         WHERE ledger_id = ? AND sess_raw = ? AND armed_at IS NULL AND r3_latched_at IS NULL AND witness_probe <> ''`,
+                    )
+                    .run(sessionId, this.snapSessRawOf(sessionId));
+            }
+        });
+    }
+
     /** Ruling 7439 (fork = whole-table copy): copy the parent's entire egress
      *  op log (BOTH tables, every row) to the child session_id inside the
      *  CALLER's transaction — the child inherits the parent's full canonical
@@ -3828,6 +3910,14 @@ export class UnifiedStore {
         validateExtKey(namespace, "namespace");
         validateExtKey(key, "key");
         const valueJson = serializeExtValue(value);
+        // #7735 R7: hard cap on the serialized value. The whitelist exempts the
+        // two frozen legacy blobs (see KV_LARGE_VALUE_WHITELIST); everything
+        // else over the cap throws loud — kv rows are small keys, not payloads.
+        if (valueJson.length > KV_LARGE_VALUE_MAX_CHARS && !KV_LARGE_VALUE_WHITELIST.has(`${namespace}|${key}`)) {
+            throw new Error(
+                `[storage] kv value for ${namespace}|${key} is ${valueJson.length} chars — over the ${KV_LARGE_VALUE_MAX_CHARS}-char cap; store large payloads in the content CAS / egress op log instead`,
+            );
+        }
         this.db
             .prepare(
                 "INSERT INTO kv_store (namespace, key, value_json, updated_at) VALUES (?, ?, ?, ?) " +

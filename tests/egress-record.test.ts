@@ -187,11 +187,10 @@ test("#3617 negative direction: the plane can be forced OFF → gate never opens
     const saved = process.env.BILI_ROLLOUT_EGRESS_PLANE;
     process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     try {
-        // this ci:full branch bakes egressPlane to 100 — the rollback path is
-        // the forced "0" (the env always wins over the baked-in percent):
-        // with the env at 0 the prepare-openai gate (featureEnabled) sees it OFF and
-        // records no rows. The documented force-on is env "1" or config true.
-        assert.equal(featureEnabled("egressPlane"), false, "forced 0 resolves OFF even against the branch default 100");
+        // the env always wins over the baked-in percent: with the env at 0
+        // the prepare-openai gate (featureEnabled) sees it OFF and records no
+        // rows. The documented force-on is env "1" or config true.
+        assert.equal(featureEnabled("egressPlane"), false, "forced 0 resolves OFF");
         process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
         assert.equal(featureEnabled("egressPlane"), true, "explicit 1 (the documented force-on) opens the gate");
     } finally {

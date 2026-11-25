@@ -132,6 +132,28 @@ export function buildEgressViewRows(
     return rows;
 }
 
+/** The `sessions` identity columns for an egress-on session — the subset of
+ *  a SessionRow that carries WHO/WHEN the session is, never the payload
+ *  (stats/kstate/tail/ccr/orphans/next_*). Mapped once by
+ *  egressIdentityColumnsOf (ingest.ts) so the identity row and the full
+ *  ingest can never drift. #7735 R1: egress-on sessions freeze the unified
+ *  ingest, so without this seam their sessions row never lands. */
+export interface EgressIdentityColumns {
+    parentSessionId: string | null;
+    forkPointSeq: number | null;
+    protocol: string | null;
+    label: string | null;
+    title: string | null;
+    hostTitle: string | null;
+    namespace: string;
+    origin: string | null;
+    status: string;
+    createdAt: number;
+    updatedAt: number;
+    metaJson: string;
+    metadataJson: string;
+}
+
 /** The storage seam (UnifiedStore today; keeps the recorder testable). */
 export interface EgressOpLogStore {
     /** Record one turn: guarded, validated, appended, compacted — in ONE
@@ -140,6 +162,13 @@ export interface EgressOpLogStore {
      *  EgressStateCorruptError when the log or the batch does not replay.
      *  Returns the stamped view the tables now hold. */
     egressAppendTurn(sessionId: string, ops: EgressOp[], baseSeq: number, nowMs: number): EgressViewRow[];
+    /** #7735 R1: upsert the session's identity row (sessions table) for an
+     *  egress-on session whose unified ingest is frozen — same conflict
+     *  semantics as the full ingest (first parent wins, descriptive cols
+     *  blind-overwrite, payload cols untouched), plus the arm-turn l1 dead-row
+     *  cleanup, in ONE transaction. Optional: test shims without a sessions
+     *  table skip it; the production UnifiedStore implements it. */
+    ensureEgressIdentity?(sessionId: string, cols: EgressIdentityColumns): void;
     egressStateView(sessionId: string): EgressViewRow[];
     /** Rollback reconstruction at any op_seq at or above the newest base. */
     egressStateViewAt(sessionId: string, opSeq: number): EgressViewRow[];

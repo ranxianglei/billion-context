@@ -39,7 +39,7 @@ import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
 import { mkdirSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
-import { sha256Hex, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
+import { sha256Hex, rewriteArchiveLog, validateExtKey, serializeExtValue, KV_LARGE_VALUE_MAX_CHARS, KV_LARGE_VALUE_WHITELIST } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
@@ -2476,6 +2476,14 @@ export class MysqlBackend implements StorageBackend {
         validateExtKey(namespace, "namespace");
         validateExtKey(key, "key");
         const valueJson = serializeExtValue(value);
+        // #7735 R7: same hard cap + whitelist as the SQLite twin (store.ts) —
+        // the MySQL backend is the opt-in network storage path and must not
+        // accept large kv blobs either.
+        if (valueJson.length > KV_LARGE_VALUE_MAX_CHARS && !KV_LARGE_VALUE_WHITELIST.has(`${namespace}|${key}`)) {
+            throw new Error(
+                `[storage] kv value for ${namespace}|${key} is ${valueJson.length} chars — over the ${KV_LARGE_VALUE_MAX_CHARS}-char cap; store large payloads in the content CAS / egress op log instead`,
+            );
+        }
         await this.pool.query(
             "INSERT INTO kv_store (namespace, kv_key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
                 "ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)",

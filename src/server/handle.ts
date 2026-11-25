@@ -2077,7 +2077,7 @@ async function handleRequest(
                 ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
                 ...(existingProducer ? { producer: existingProducer } : anonProvenance ? { producer: anonProvenance } : {}),
             };
-        } else if (clientProvided && zcodeMemory === undefined) {
+        } else if (clientProvided && zcodeMemory === undefined && !featureEnabled("egressPlane")) {
             // #1486: track identified clients' chains too, so a resume that
             // forks a NEW client id (cc --resume) can be matched back to its
             // parent across requests and proxy restarts (the #499 snapshot
@@ -2088,6 +2088,11 @@ async function handleRequest(
             // /compact echo) intentionally does NOT update the chain: that
             // resume degrades to today's fresh-start behavior rather than
             // risking a side-request clobber.
+            // #7735 R5: an eg-mode instance does NOT write the explicit-client
+            // chain (the 1.88 MB prefix-affinity|v1 blob in the field) — the
+            // anonymous branch above (K3) keeps writing, and the egress op log
+            // is the durable record for identified clients. A non-eg instance
+            // writes exactly as before.
             const fp = prefixAffinity.chainFingerprint(affinityMessageList());
             if (fp) {
                 const tracked = prefixAffinity.peekChain(sessionId);

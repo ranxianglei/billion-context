@@ -23,6 +23,7 @@
 | 7439-2 | **块的读/写侧落 blocks 表**——`summary_bytes` 内联块摘要；`start_msgid`/`end_msgid` 在折叠时一次性对齐到 flow 的 msgid 坐标。 | 折叠产物写在 kernel 读取的地方；每轮不做跨表身份对账。 |
 | 7439-3/5 | **服务端权威 + 硬失败**——kernel 输入从 flow 重放；日志**没有任何健康点**时响亮地硬失败，而不是静默地拿客户端字节应答。 | 「答错但没声音」正是本平面要消灭的失败模式；响亮的 500 + 恢复日志可接受。 |
 | KDD #23 | **`messages` 降级为惰性投影**——egress-on 会话停止逐轮统一 ingest；messages 表只在平面回滚 / web 读 / 恢复时一次性 O(n) 重建。 | 存储开销曾正比于 messages 账本**总行数**（~20µs/行，10w 行 2× 双账本放大）。op log 每轮写入 = O(新增消息)，serving 读被压实有界。 |
+| #7735 R1 | **`sessions` 身份行由权威接缝每轮 upsert**——冻结的 ingest（KDD #23）永远不会写它，所以接缝（`ensureEgressIdentity`）每轮 upsert 14 个身份列：首父优先（血缘）、描述列盲覆盖（title/protocol/namespace/origin）、payload 列（stats/kstate/tail/ccr/last_ingested_seq/orphans/next_*）不动。 | 缺了它 egress-on 会话就是**无行**——重启不可载、list/GC 不可见、metadata 只在内存、point-fork 打不开无行父会话。该行不是一次性状态：flag=0 实例之后由正常 ingest 接管同一行（upsert 冲突语义一致，payload 列照常补齐）。 |
 | 双时钟（#7581） | **块表自己编号**；每个块行用 `flow_op_seq` 指向 flow 时钟（单调不减 ⇒ `<= X` 是前缀）。 | 共用一个时钟时，折叠的块行（**保存时**写）落在该轮最后一条 flow 行（**准备时**写）之后两个 op_seq 处，下一轮第一次读就击穿 flow 的密度不变量。两时钟 + 单向指针让两张表各自稠密、互不阻塞。 |
 | 无状态身份（#7617） | egress-on 的 stage-0 直接从 op log 前沿计算（`MAX(op_seq)` + 最新 base 的 high water），无 `l1_world` 游标、无 resync。 | 日志本身已经是身份账本——第二个游标就是第三个时钟。R3 故障 latch 迁到 `sessions.r3_latched_at`（与旧列双载体读/清）。 |
 
@@ -40,6 +41,15 @@
 | `conversations` | — | 宿主身份认领表。egress-on 会话不再需要认领行（身份无状态）；物理 DROP 在退役登记。 | |
 
 保留规则：flow/state 被压实**剪到最新 B base 为止**（保留底线）；block_flow 追加式（压实路径 `egressBlockCompact` 存在但尚无生产调用方，见遗留）。
+
+### 3.1 表创建门（7 CORE / 12 legacy——#7735 R2）
+
+**全新** eg 模式实例只物化 **7 张 CORE 表**——`sessions`、`kv_store`、`session_ext`、`egress_state`、`egress_flow`、`egress_block_flow`、`egress_block_state`——**不建任何 12 张 legacy 表**（`content`、`messages`、`blocks`、`dead_refs`、`refs`、`checkpoints`、`ccr_entries`、`conversations`、`message_media`、`l1_world`、`orphan_blocks`、`state_fields`）。门是 `migrateSchema(db, { legacyTables })`（`src/storage/schema.ts`），由 open 时的 `!featureEnabled("egressPlane")` 驱动（`src/storage/store.ts`）。
+
+- **收敛**：全新 eg 库之后把 flag 关掉，下次 open 自动补齐 12 张 legacy 表（probe-first、幂等——`STORAGE_DDL_V1` 全是 `IF NOT EXISTS`，3 张共享 CORE 表 no-op）。已有 legacy 库以 eg 模式打开**保留**其 12 张表（K5：门只控创建，永不删）。
+- **代价说明**：eg 模式实例 = **插件车道实例**。其上的 proxy 模式客户端失去 12 张 legacy 表 → stage-0 降级到 legacy 全量路径，unified 保存经 3-strike sidecar 响亮失败。平面为插件车道设计；混合实例应把平面关掉。
+
+**l1 死行自动清理（#7735 R3）。** arm 轮仍走 legacy stage-0 路径（平面尚未 latch），所以 `snapL1Record` 为 egress-on 会话写一行 `l1_world`——一行**死行**（witness 非空、`armed_at`/`r3_latched_at` NULL），平面永不读它。身份行接缝（R1）在**同一事务、同一轮** DELETE 它：`DELETE FROM l1_world WHERE ledger_id = ? AND sess_raw = ? AND armed_at IS NULL AND r3_latched_at IS NULL AND witness_probe <> ''`。R3 断路器行（witness `''` + `r3_latched_at` 已设）与 armed 行（`armed_at` 已设）受保护。全新 eg 库（无 `l1_world`）静默跳过清理。
 
 ## 4. 一轮的生命周期
 
@@ -94,6 +104,7 @@
 - **R3 latch 卡住**：`SELECT r3_latched_at FROM sessions WHERE session_id = ?`（旧二进制另查 `l1_world`）；清除**两个载体都清**。
 - **GC / 归档**：egress-on 会话**完全排除在按龄 GC 之外**，手动归档（`bili sessions archive`）**被拒绝**——归档格式尚未承载 op log（遗留项）。
 - **诊断**：`/__bili/status`；恢复事件（回退截断、降级轮）在代理日志里响。
+- **kv 大值上限（#7735 R7）**：`kv_store` 值序列化超过 **256 字符**即响亮抛错（不截断），除非 `namespace|key` 在冻结白名单 `{prefix-affinity|v1, plugin-conversations|table}`（两个仍在服役的 legacy 大 blob）内。大 payload 应放 content CAS / egress op log，不放 `kv_store`。两个白名单键在 eg 模式退役（R4/R5），所以 eg 模式实例永不写白名单 blob。
 
 ## 9. PR / 提案时间线
 
@@ -104,7 +115,8 @@
 | #7574 | op log 完整性：事务内 seq 读、`recoverEgressBase` 回退、并发写拒绝、密度不变量。 |
 | [#7577](https://github.com/ranxianglei/billion-context/discussions/7577) / **#7581**（已合并） | `egress_block_flow`/`egress_block_state`（**双时钟**——共用时钟方案在 review 中被否：它会在第一次折叠时击穿 flow 密度）、checkpoint 退役 → 点位 fork、kstate 裁剪。 |
 | [#7591](https://github.com/ranxianglei/billion-context/discussions/7591) / **#7617**（已合并） | 身份收拢：无状态 stage-0、R3 latch → `sessions`、conversations 对 egress-on 退役、GC/手动归档守卫。 |
-| **#7659（本 PR，2026-11-24）** | 文档收尾：本文档；[deprecations.zh-CN.md](./deprecations.zh-CN.md)；KDD #24；图。egressPlane 默认按 owner 裁定保持 **0**——GA 翻转被提议后否决。 |
+| **#7659（2026-11-24）** | 文档收尾：本文档；[deprecations.zh-CN.md](./deprecations.zh-CN.md)；KDD #24；图。egressPlane 默认按 owner 裁定保持 **0**——GA 翻转被提议后否决。 |
+| **#7735（2026-11-26）** | eg 系列扫尾：`sessions` 身份行由权威接缝每轮 upsert（R1）；7 CORE / 12 legacy 表创建门 + 收敛（R2）；l1 arm 轮死行同事务自动清理（R3）；eg 模式退役 plugin-conversations 持久化（R4）与显式客户端 affinity 链（R5）；kv 256 字符上限（R7）；三个 egress 标志的默认 100（ci:full 验证分支）回 **0**（R8）。KDD #25。 |
 
 **遗留**（已跟踪）：egressPlane 默认翻 100（等 owner 点头）；point-reconstruction materializer（低于最新 base 的 fork 点）；归档格式承载 op log；`egressBlockCompact` 的生产**压缩**调用方（replay 已在 #7664 落地）；退役身份载体的物理 DROP 批次；按退役登记表删开关（硬编码开）。
 

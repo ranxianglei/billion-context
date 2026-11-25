@@ -45,6 +45,7 @@
 // are owned by the caller.
 
 import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
+import { egressIdentityColumnsOf } from "../storage/ingest.js";
 import type { EgressBlockLedgerInput } from "../storage/egress-block.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { featureEnabled } from "../rollout.js";
@@ -225,6 +226,16 @@ export function resolveEgressAuthority(args: {
     // session metadata (meta_json) so it survives restarts and covers
     // every later turn, not just this one.
     session.metadata["egressAuthority"] = true;
+    // #7735 R1: an egress-on session's unified ingest is frozen, so its
+    // sessions row never lands through the normal path — upsert the identity
+    // row here (idempotent, self-healing, updated_at advances for the GC
+    // watermark). Best-effort: a storage failure must never fail the request
+    // (the op log is the authority; the identity row is descriptive).
+    try {
+        st.ensureEgressIdentity?.(sessionId, egressIdentityColumnsOf(session));
+    } catch (err) {
+        log("warn", `[${sessionId}] egress-authority: identity row upsert failed (request continues; the op log is the authority): ${err instanceof Error ? err.message : String(err)}`);
+    }
     if (base0.view.length === 0) {
         // Turn-1 cold start (ruling 7439-5): the client bytes are the
         // content source EXACTLY ONCE — recordAuthorityTurn puts them in

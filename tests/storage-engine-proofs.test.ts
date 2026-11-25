@@ -88,8 +88,8 @@ process.env.BILI_CONFIG_FILE = path.join(
 // Absent everywhere now resolves to the shadow DEFAULT (#2815 rollout flip);
 // this suite needs the explicit legacy baseline — per-test legs override it.
 process.env.BILI_STORAGE_UNIFIED = "legacy";
-// ci:full branch (egress family default 100): scope this suite off the egress
-// PLANE — but note what the plane ON actually breaks here (measured 2026-11-25
+// Scope this suite off the egress PLANE defensively — but note what the plane
+// ON actually breaks here (measured 2026-11-25
 // after the renumber): with the plane on, BOTH legs record to the op log, and
 // the FULL leg serves the outbound conversation from the log verbatim
 // (egress-serve.ts seg 4b) — so a folded summary carrier KEEPS the <acp> tag

@@ -222,10 +222,11 @@ function cleanEnv(): NodeJS.ProcessEnv {
   // off) — this suite asserts the legacy JSON persistence surface, so pin
   // the dual-write writer explicitly.
   env.BILI_STORAGE_JSON_WRITER = "on";
-  // ci:full branch: the egress plane (default 100) arms these REAL plugin lanes —
-  // egress-on sessions freeze the legacy JSON persistence surface (op log +
-  // index.db are the authority), which this legacy-persistence e2e asserts.
-  // Scope the plane off; the armed behavior is pinned by the egress suites.
+  // The egress plane arms these REAL plugin lanes — egress-on sessions freeze
+  // the legacy JSON persistence surface (op log + index.db are the authority),
+  // which this legacy-persistence e2e asserts. Scope the plane off defensively
+  // (regardless of the rollout default); the armed behavior is pinned by the
+  // egress suites.
   env.BILI_ROLLOUT_EGRESS_PLANE = "0";
   // NODE_TEST_CONTEXT: set by the node:test runner and inherited by the
   // spawned dsh — dsh-native.ts deliberately stands down inside node:test

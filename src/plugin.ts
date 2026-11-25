@@ -1,5 +1,6 @@
 import { ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME, BLOCKED_REF, BLOCK_OP_TOOL_NAMES, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
+import { featureEnabled } from "./rollout.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
@@ -387,6 +388,11 @@ let conversationsDirty = false;
 
 function writeConversationsFile(): void {
     if (!conversationsDirty) return;
+    // #7735 R4: an eg-mode instance does NOT persist the conversation table to
+    // kv_store or the legacy file — the in-memory map (K4) stays authoritative
+    // for the process lifetime, and the identity row R1 + the egress op log are
+    // the durable record. A non-eg instance persists exactly as before.
+    if (featureEnabled("egressPlane")) return;
     try {
         const obj: Record<string, ConversationEntry> = {};
         for (const [k, v] of conversations) obj[k] = v;

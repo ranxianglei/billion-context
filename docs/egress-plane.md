@@ -23,6 +23,7 @@ So: **the client still sends everything (inbound), but bili no longer believes i
 | 7439-2 | **Blocks read/write side on the blocks table** — `summary_bytes` inlines the block summary; `start_msgid`/`end_msgid` align a block to the flow's msgid coordinates once at fold time. | Fold output is written where the kernel reads it; no cross-table identity dance per turn. |
 | 7439-3/5 | **Server authority + hard fail** — kernel input replays from flow; a log with **no healthy point at all** hard-fails loudly instead of silently serving client bytes. | A wrong-but-silent answer is the failure mode the plane exists to kill; a loud 500 with the recovery log is acceptable. |
 | KDD #23 | **`messages` demoted to a lazy projection** — for egress-on sessions the per-turn unified ingest stops; the messages table is rebuilt one-time, O(n), only on plane rollback / web read / restore. | Storage cost was proportional to the messages ledger's **total** rows per turn (~20µs/row; 2× double-ledger at 100k). The op log's per-turn write is O(new messages) and the serving reads are bounded by compaction. |
+| #7735 R1 | **The `sessions` identity row is upserted every turn through the authority seam** — the frozen ingest (KDD #23) would never write it, so the seam (`ensureEgressIdentity`) upserts the 14 identity columns each turn: first-parent-wins (lineage), descriptive cols blind-overwrite (title/protocol/namespace/origin), payload cols (stats/kstate/tail/ccr/last_ingested_seq/orphans/next_*) untouched. | Without it an egress-on session is **rowless** — restart-unloadable, list/GC invisible, metadata memory-only, and a point-fork cannot open a rowless parent. The row is not one-time state: a flag=0 instance later takes over the same row via the normal ingest (identical upsert conflict semantics, payload cols filled as usual). |
 | Dual clocks (#7581) | The **block** tables number themselves; each block row points at the flow clock via `flow_op_seq` (non-decreasing ⇒ `<= X` is a prefix). | One shared clock made the fold's block rows (written at **save**) land two op_seqs past the turn's last flow row (written at **prepare**) and broke the flow's density invariant on the next turn's first read. Two clocks + a one-way pointer keeps both tables dense and independent. |
 | Stateless identity (#7617) | stage-0 for egress-on sessions computes from op-log frontiers (`MAX(op_seq)` + newest-base high water); no `l1_world` cursor, no resync. | The log already IS the identity ledger — a second cursor would be a third clock. The R3 fault latch moves to `sessions.r3_latched_at` (dual-carrier read/clear with the legacy column). |
 
@@ -40,6 +41,15 @@ So: **the client still sends everything (inbound), but bili no longer believes i
 | `conversations` | — | Host-identity claim table. egress-on sessions no longer need a claim row (identity is stateless); physical DROP on the retirement register. | |
 
 Retention rules: flow/state are pruned **down to the newest B base** (the retention floor); block_flow is append-only (its compaction path exists — `egressBlockCompact` — but has no production caller yet, see follow-ups).
+
+### 3.1 Table creation gate (7 CORE / 12 legacy — #7735 R2)
+
+A **fresh** eg-mode instance materializes **exactly the 7 CORE tables** — `sessions`, `kv_store`, `session_ext`, `egress_state`, `egress_flow`, `egress_block_flow`, `egress_block_state` — and **none of the 12 legacy tables** (`content`, `messages`, `blocks`, `dead_refs`, `refs`, `checkpoints`, `ccr_entries`, `conversations`, `message_media`, `l1_world`, `orphan_blocks`, `state_fields`). The gate is `migrateSchema(db, { legacyTables })` (`src/storage/schema.ts`), driven by `!featureEnabled("egressPlane")` at open (`src/storage/store.ts`).
+
+- **Convergence:** a fresh eg DB that later flips the flag off re-creates the 12 legacy tables on the next open (probe-first, idempotent — `STORAGE_DDL_V1` is all `IF NOT EXISTS`, so the 3 shared CORE tables no-op). An existing legacy DB opened in eg mode **keeps** its 12 tables (K5: the gate controls creation only, never drops).
+- **Cost note:** an eg-mode instance is a **plugin-lane instance**. Proxy-mode clients on it lose the 12 legacy tables → their stage-0 degrades to the legacy full path and their unified save fails loud via the 3-strike sidecar. The plane is designed for the plugin lane; a mixed instance should run the plane off.
+
+**l1 dead-row auto-cleanup (#7735 R3).** The arm turn still runs the legacy stage-0 path (the plane is not latched yet), so `snapL1Record` writes one `l1_world` row for the egress-on session — a **dead row** (witness non-empty, `armed_at`/`r3_latched_at` NULL) that the plane never reads. The identity-row seam (R1) DELETEs it in the **same transaction, the same turn**: `DELETE FROM l1_world WHERE ledger_id = ? AND sess_raw = ? AND armed_at IS NULL AND r3_latched_at IS NULL AND witness_probe <> ''`. The R3 breaker row (witness `''` + `r3_latched_at` set) and armed rows (`armed_at` set) are protected. A fresh eg DB (no `l1_world`) skips the cleanup silently.
 
 ## 4. One turn, step by step
 
@@ -94,6 +104,7 @@ The invariant that pays for all of it: **every read the serving path needs is bo
 - **R3 latch stuck:** `SELECT r3_latched_at FROM sessions WHERE session_id = ?` (old binaries: also check `l1_world`); clearing resets **both** carriers.
 - **GC / archive:** egress-on sessions are **excluded from age GC entirely** and **refused** on manual archive (`bili sessions archive`) — the archive format doesn't carry the op log yet (follow-up).
 - **Diagnosis:** `/__bili/status`; recovery events (walk-back truncations, degraded turns) are loud in the proxy log.
+- **kv large-value cap (#7735 R7):** a `kv_store` value serialized over **256 chars** throws loud (no truncation) unless the `namespace|key` is in the frozen whitelist `{prefix-affinity|v1, plugin-conversations|table}` (the two legacy blobs still in service). Large payloads belong in the content CAS / egress op log, not `kv_store`. Both whitelist entries retire in eg mode (R4/R5), so an eg-mode instance never writes a whitelisted blob.
 
 ## 9. PR / proposal timeline
 
@@ -104,7 +115,8 @@ The invariant that pays for all of it: **every read the serving path needs is bo
 | #7574 | op-log integrity: in-transaction seq reads, `recoverEgressBase` walk-back, concurrent-writer refusal, density invariant. |
 | [#7577](https://github.com/ranxianglei/billion-context/discussions/7577) / **#7581** (merged) | `egress_block_flow`/`egress_block_state` (**dual clocks** — the shared-clock design was rejected in review because it broke flow density on the first fold), checkpoint retirement → point fork, kstate trim. |
 | [#7591](https://github.com/ranxianglei/billion-context/discussions/7591) / **#7617** (merged) | Identity consolidation: stateless stage-0, R3 latch → `sessions`, conversations retirement for egress-on, GC/manual-archive guards. |
-| **#7659 (this PR, 2026-11-24)** | Docs wrap-up: this doc; [deprecations.md](./deprecations.md); KDD #24; diagrams. The egressPlane default stays **0** per the owner ruling — a GA flip was proposed and declined. |
+| **#7659 (2026-11-24)** | Docs wrap-up: this doc; [deprecations.md](./deprecations.md); KDD #24; diagrams. The egressPlane default stays **0** per the owner ruling — a GA flip was proposed and declined. |
+| **#7735 (2026-11-26)** | eg-series cleanup: the `sessions` identity row upserted every turn through the authority seam (R1); the 7 CORE / 12 legacy table gate + convergence (R2); the l1 arm-turn dead row auto-cleaned in the same tx (R3); the plugin-conversations persistence (R4) and the explicit-client affinity chain (R5) retired in eg mode; the kv 256-char cap (R7); the three egress flags' default-100 (a ci:full verification branch) reverted to **0** (R8). KDD #25. |
 
 **Open follow-ups** (tracked): the egressPlane default-100 flip when the owner says so; the point-reconstruction materializer (fork below the newest base); the archive format gaining the op log; a production **compaction caller** for `egressBlockCompact` (replay is live in #7664); the physical DROP batch for the retired identity carriers; flag removal (hardcode-on) per the retirement register.
 

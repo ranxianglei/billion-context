@@ -29,9 +29,9 @@ for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CON
 // off) — this suite's cold-disk-restore tests read the legacy JSON
 // content-store files off disk, so pin the dual-write writer explicitly.
 process.env.BILI_STORAGE_JSON_WRITER = "on";
-// ci:full branch: this suite pins the LEGACY fork/orphan contract; the egress
-// plane default (100 here) serves raw sessions from the op log and legitimately
-// changes outbound bytes — out of this suite's scope.
+// This suite pins the LEGACY fork/orphan contract; the egress plane serves
+// raw sessions from the op log and legitimately changes outbound bytes —
+// out of this suite's scope. Scope the plane off defensively.
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
 

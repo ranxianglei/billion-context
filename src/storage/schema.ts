@@ -357,6 +357,61 @@ CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_h
 CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash);
 `;
 
+/** #7735 R2: the CORE tables — the only tables an egress-mode instance needs
+ *  on a FRESH database. The egress plane is self-contained (KDD #23: the op
+ *  log is the正史, messages is a lazy projection), so a fresh eg-mode DB
+ *  never materializes the legacy projection/CAS family (content/messages/
+ *  blocks/…). What it DOES need: `sessions` (the identity row R1 lands + the
+ *  R3 latch + point-fork children), `session_ext` (pf:state, K1) and
+ *  `kv_store` (small config rows, K2). The egress tables (egress_state /
+ *  egress_flow / egress_block_flow / egress_block_state) are probe-first
+ *  CORE and live in their own DDL constants below. Column set is byte-identical
+ *  to the matching tables in STORAGE_DDL_V1 — the fresh-eg-DB invariant test
+ *  pins exactly these seven tables. */
+const STORAGE_DDL_CORE = `CREATE TABLE IF NOT EXISTS sessions (
+    session_id          TEXT PRIMARY KEY,
+    parent_session_id   TEXT,
+    fork_point_seq      INTEGER,
+    fork_egress_watermark INTEGER,
+    protocol            TEXT,
+    label               TEXT,
+    title               TEXT,
+    host_title          TEXT,
+    namespace           TEXT NOT NULL DEFAULT 'proxy',
+    origin              TEXT,
+    status              TEXT NOT NULL DEFAULT 'active',
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    next_block_id       INTEGER NOT NULL DEFAULT 1,
+    next_run_id         INTEGER NOT NULL DEFAULT 1,
+    meta_json           TEXT NOT NULL DEFAULT '{}',
+    stats_json          TEXT NOT NULL DEFAULT '{}',
+    metadata_json       TEXT NOT NULL DEFAULT '{}',
+    kstate_json         TEXT NOT NULL DEFAULT '{}',
+    tail_json           TEXT NOT NULL DEFAULT '{}',
+    ccr_json            TEXT,
+    last_ingested_seq   INTEGER,
+    orphans_json        TEXT,
+    r3_latched_at       INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS session_ext (
+    session_id      TEXT NOT NULL,
+    key             TEXT NOT NULL,
+    value_json      TEXT NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (session_id, key)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS kv_store (
+    namespace       TEXT NOT NULL,
+    key             TEXT NOT NULL,
+    value_json      TEXT NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (namespace, key)
+) WITHOUT ROWID;
+`;
+
 /** #5874 snapshot foundation v2 (pure-incremental, 2026-11-15 owner ruling) —
  *  one additive table for the stage-0 identity ledger. The original four-table
  *  plane (snap_rows/snap_log/snap_ckpt, #5874 v1) was RETIRED before merge in
@@ -533,9 +588,27 @@ export function migrateSchema(db: {
     exec(sql: string): void;
     prepare(sql: string): { get(...a: unknown[]): unknown; all(...a: unknown[]): unknown[]; run(...a: unknown[]): unknown };
     transaction<T>(fn: () => T): T;
-}): { from: number; to: number } {
+}, opts?: { legacyTables?: boolean }): { from: number; to: number } {
+    // #7735 R2: egress-mode instances (egressPlane on) skip the legacy
+    // projection/CAS family on a FRESH database — the egress op log is the
+    //正史 and the legacy tables are a lazy projection they never write. The
+    // default (true) preserves the historical behavior for every non-eg caller
+    // (including the backup-repair path, which must see the full schema).
+    // `runLegacy` ORs in "the DB already has the legacy tables": an instance
+    // that flips the flag off later (or an existing DB opened in eg mode) must
+    // keep migrating a legacy schema it already owns — never leave a half-
+    // migrated table behind. K5: this only gates CREATION; no existing table
+    // or row is ever dropped.
+    const legacyTables = opts?.legacyTables ?? true;
     const row = db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
     const from = row?.user_version ?? 0;
+    // #7735 R2: probe the legacy family's anchor table up front — it decides
+    // both `runLegacy` and the convergence block below (a fresh eg DB that
+    // later flips the flag off re-creates the 12 legacy tables here).
+    const hasMessages = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'messages'")
+        .get();
+    const runLegacy = legacyTables || hasMessages !== undefined;
     // #6785 review fix (owner): DROP COLUMN needs SQLite ≥ 3.35. The host
     // better-sqlite3 v7 in the engine ladder can carry SQLite 3.32 — there
     // the redundant columns simply STAY (every reader probes table_info and
@@ -558,22 +631,27 @@ export function migrateSchema(db: {
     // table itself (the discipline v2/v5/v6/v8 already use) makes both
     // merge orderings coexist without renumbering — the final master
     // version number stays a mechanical merge-time hygiene step.
+    // #7735 R2: l1_world / orphan_blocks / state_fields are LEGACY tables —
+    // the stage-0 identity ledger and the kstate/orphan projections the
+    // egress plane does not use. A fresh eg-mode DB skips them (the identity
+    // row R1 lands on `sessions` instead); a non-eg DB or a converging one
+    // creates them as before. K5: an existing table is never dropped.
     const hasL1World = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'l1_world'")
         .get();
-    if (!hasL1World) db.transaction(() => db.exec(L1WORLD_DDL_V12));
+    if (legacyTables && !hasL1World) db.transaction(() => db.exec(L1WORLD_DDL_V12));
     // #6785 step 7: orphan blocks — own probe (a db written between the
     // egress_snapshot and orphan_blocks landings picks it up here; fresh dbs
     // pass through — same discipline, no version bump).
     const hasOrphanBlocks = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'orphan_blocks'")
         .get();
-    if (!hasOrphanBlocks) db.exec(ORPHAN_BLOCKS_DDL);
+    if (legacyTables && !hasOrphanBlocks) db.exec(ORPHAN_BLOCKS_DDL);
     // #6785 step 8: kstate rows — own probe (same discipline, no bump).
     const hasStateFields = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'state_fields'")
         .get();
-    if (!hasStateFields) db.exec(STATE_FIELDS_DDL);
+    if (legacyTables && !hasStateFields) db.exec(STATE_FIELDS_DDL);
     // #6785 perf (proposal discussions/7398): the egress state log — own
     // probe (same discipline, no version bump).
     const hasEgressState = db
@@ -724,10 +802,24 @@ export function migrateSchema(db: {
     if (sessionCols.length > 0 && !sessionCols.includes("fork_egress_watermark")) {
         db.exec("ALTER TABLE sessions ADD COLUMN fork_egress_watermark INTEGER");
     }
+    // #7735 R2 convergence: a database BORN as a fresh eg-mode DB (user_version
+    // already at the current version, no legacy tables) that later flips the
+    // flag off must materialize the legacy family on this open — the versioned
+    // tx below is skipped by the early return, so the CREATEs happen here.
+    // STORAGE_DDL_V1 is all IF NOT EXISTS, so the three CORE tables it also
+    // carries are no-ops. Idempotent: a DB that already has messages (runLegacy
+    // via hasMessages) never re-enters this branch.
+    if (legacyTables && hasMessages === undefined) {
+        db.transaction(() => db.exec(STORAGE_DDL_V1));
+    }
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;
     db.transaction(() => {
-        if (from < 1) db.exec(STORAGE_DDL_V1);
+        // #7735 R2: a fresh eg-mode DB (runLegacy false) materializes only the
+        // CORE tables; the legacy family is created by the convergence block
+        // above when the flag flips off. Non-eg / converging / existing-legacy
+        // DBs take the full V1 blob exactly as before.
+        if (from < 1) db.exec(runLegacy ? STORAGE_DDL_V1 : STORAGE_DDL_CORE);
         if (from < 2) {
             // v2 identity columns — probe first: dev-window builds whose V1
             // DDL already carried them must not fail on duplicate columns.
@@ -740,7 +832,11 @@ export function migrateSchema(db: {
                 db.exec("ALTER TABLE sessions ADD COLUMN origin TEXT");
             }
         }
-        if (from < 3) {
+        // #7735 R2: `conversations` is a LEGACY table — a fresh eg-mode DB
+        // skips it (the identity row R1 lands on `sessions`, not the
+        // conversations index). runLegacy keeps it for non-eg / converging /
+        // existing-legacy DBs exactly as before.
+        if (runLegacy && from < 3) {
             // v3 identity index (#2960 R2.1): create + backfill from the
             // sessions rows themselves. Both statements are idempotent
             // (IF NOT EXISTS / OR IGNORE) so any dev-window lib that already
@@ -756,7 +852,9 @@ export function migrateSchema(db: {
             db.exec("CREATE TABLE IF NOT EXISTS session_ext (\n                session_id      TEXT NOT NULL,\n                key             TEXT NOT NULL,\n                value_json      TEXT NOT NULL,\n                updated_at      INTEGER NOT NULL,\n                PRIMARY KEY (session_id, key)\n            ) WITHOUT ROWID");
             db.exec("CREATE TABLE IF NOT EXISTS kv_store (\n                namespace       TEXT NOT NULL,\n                key             TEXT NOT NULL,\n                value_json      TEXT NOT NULL,\n                updated_at      INTEGER NOT NULL,\n                PRIMARY KEY (namespace, key)\n            ) WITHOUT ROWID");
         }
-        if (from < 7) {
+        // #7735 R2: `message_media` is a LEGACY table (FK child of content) —
+        // a fresh eg-mode DB skips it with the rest of the legacy family.
+        if (runLegacy && from < 7) {
             // v7 media CAS (#3762): message→media mapping table. Idempotent
             // CREATE — pre-v7 rows keep their inline bytes and read back
             // verbatim (lazy: no backfill rehash).
@@ -785,7 +883,12 @@ export function migrateSchema(db: {
                 db.exec("ALTER TABLE sessions ADD COLUMN orphans_json TEXT");
             }
         }
-        if (from < 8) {
+        // #7735 R2: `messages` is a LEGACY table — a fresh eg-mode DB never
+        // materializes it, so the v8 identity/retired_at ALTERs and the
+        // streaming backfill are skipped (runLegacy false). The backfill flag
+        // is set only inside the gated block, so migrateV8Identities never runs
+        // for a legacy-less store.
+        if (runLegacy && from < 8) {
             // v8 position-independent identity + historian tombstones
             // (#4390). identity: the cross-save JOIN key (stored-bytes
             // serialization minus id/wireIndex) — content_hash stays the
@@ -812,7 +915,9 @@ export function migrateSchema(db: {
             // migration and re-OMM'd: permanently unopenable stores (#4677).
             needV8Backfill = true;
         }
-        if (from < 9) {
+        // #7735 R2: `content` is a LEGACY table (the CAS) — a fresh eg-mode DB
+        // skips the refcount index with the rest of the legacy family.
+        if (runLegacy && from < 9) {
             // v9 zero-ref collection index (#4796): gc()'s sweep and the
             // dry-run count address content BY refcount — without this index
             // every run full-scans the CAS table. Field report: 766K rows /
@@ -825,7 +930,9 @@ export function migrateSchema(db: {
             // dev-window lib that already carried it re-lands cleanly.
             db.exec("CREATE INDEX IF NOT EXISTS idx_content_refcount ON content(refcount)");
         }
-        if (from < 10) {
+        // #7735 R2: `messages` is a LEGACY table — a fresh eg-mode DB skips the
+        // v10 ts column with the rest of the legacy family.
+        if (runLegacy && from < 10) {
             // v10 (#4313): immutable message wall-clock stamp. Nullable, no
             // backfill — pre-feature rows read NULL and render without the
             // time attribute (legacy bytes unchanged). Probe-first like v8.
@@ -839,7 +946,10 @@ export function migrateSchema(db: {
         // version early return (a #5855-era db already at user_version 12
         // must pick the column up; the in-transaction probe it was at never
         // ran there). See the probe-first note before the early return.
-        if (from < 11) {
+        // #7735 R2: every index here is on a LEGACY table (messages/blocks/
+        // ccr_entries/message_media/checkpoints) — a fresh eg-mode DB skips
+        // them with the rest of the legacy family.
+        if (runLegacy && from < 11) {
             // v11 (#5539): FK child indexes on content.hash — see the header
             // note and the DDL comment above for the mechanism and field
             // evidence. Idempotent CREATEs, same discipline as v9; a
@@ -867,11 +977,17 @@ export function migrateSchema(db: {
     // lookup stayed a full scan. Probe the index itself and create it on the
     // first open that misses it (the table exists on every path: v1 DDL on a
     // fresh file, the `from < 3` step, or already).
-    const hasConversationsIndex = db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_session'")
-        .get();
-    if (hasConversationsIndex === undefined) {
-        db.exec("CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id)");
+    // #7735 R2: the index is on the LEGACY `conversations` table — a fresh
+    // eg-mode DB has no such table, so the CREATE would throw "no such
+    // table". Gate on runLegacy (the table exists for non-eg / converging /
+    // existing-legacy DBs; a fresh eg DB has runLegacy false and skips it).
+    if (runLegacy) {
+        const hasConversationsIndex = db
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_session'")
+            .get();
+        if (hasConversationsIndex === undefined) {
+            db.exec("CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id)");
+        }
     }
     return { from, to: STORAGE_SCHEMA_VERSION };
 }

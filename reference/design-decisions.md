@@ -97,3 +97,19 @@ Full text: discussion #7064 §8；实现：本 PR（#6785）。
 **默认值**：`egressPlane` 代码默认保持 **0**（opt-in，src/rollout.ts）。本系列曾按 #5469 watermark GA 先例提议「GA = 调到 100、保留退出口、不删开关」，owner 最终裁定：**现在不需要开，保持 0**。开启方式不变：`rollout.features.egressPlane: true`（或百分比）/ `BILI_ROLLOUT_EGRESS_PLANE=1`。三个 msgid 开关（`pluginMsgIdIncremental`/`pluginFullResendWatermark`/`pluginLaneServerHistory`）本已默认 100，未动。**翻 100 是后续独立决定**，触发时机由 owner 定，本文档已把「GA 后做什么」（退役闸门、flag 删除）写进 docs/deprecations.md 登记，随时可执行。
 
 **文档收口（#7659）**：(1) 新增强文档 `docs/egress-plane.md`（+zh，唯一入口）——设计脉络（#7439 系列）、入站 vs 出站、设计决策表、四表结构、一轮 7 步生命周期、性能前后对照、fork/回退、开关家族与 on/off 解析序（env → 配置文件 `~/.config/billion-context/billion-context.json` 的 `rollout.features.egressPlane` → 代码默认）、操作手册、PR 时间线，配三张图（一轮生命周期 / 表关系 / fork 与回退）；(2) `docs/deprecations.md`（+zh）——退役登记表（l1 占位行、conversations 表、D-lane、msgid 开关删除、物理 DROP 批次），每项标触发条件与去向；(3) `docs/architecture/storage.{md,zh-CN,ja}` 刷新（l1_world 定位改为「退化占位」、egress 段补齐三语）；identity/storage 两张架构图更新；pr-6785 详述文档加退役注；(4) AGENTS.md 本条 + 概览行常驻指引。**为什么必须现在做**：此前 eg 的全部设计知识只存在于 issue/讨论区/PR 正文里，AI 与新协作者「还在老的上面行走」（owner 原话）；本条之后单一入口 = docs/egress-plane.md + deprecations.md。**后续（不在本条）**：egressPlane 翻 100（owner 点头时）；snapshotRender（D-lane）退役触发条件 = 全部宿主 pinned + egressPlane 全量满一个发布周期，登记表已列；物理 DROP l1_world/conversations 随同一批次（deprecations.md）。
+
+### KDD #25 — eg 系列扫尾：身份行落地 + 遗留表/大字段退役 + 标志默认值修复（#7735，owner 提案 2026-11-25）
+
+**问题（实测四点）**：(1) `egressPlane`/`egressKstateRetireWrites`/`egressKstateRebuild` 三个标志代码默认被一个 ci:full 验证分支调到 **100**（注释自注「不作合并」）——合并后等于未批 GA；(2) egress-on 会话的 `sessions` 行**永不落地**（统一 ingest 被 KDD #23 冻结）→ 重启不可载、metadata 只在内存、血缘列不落、list/GC 不可见、point-fork 打不开无行父会话（5 个实测后果）；(3) arm 轮 `snapL1Record` 写一行 `l1_world` 死行（平面永不读）；(4) kv 大 blob：`prefix-affinity|v1` 1.88 MB 活跃、`session-order|v1` 640 KB 孤儿（写入器已退）、`plugin-conversations|table` 56 KB 活跃。
+
+**裁定与修复（R1–R8，全复用 `egressPlane` 现有开关，无新配置项）**：
+- **R1 身份行**：权威接缝（`resolveEgressAuthority` latch 后）每轮 upsert `sessions` 的 14 个身份列（`ensureEgressIdentity`，可选方法 on `EgressOpLogStore`；UnifiedStore 实现 = 一个事务：身份 upsert + R3 l1 清理）。冲突语义镜像全量 ingest（首父优先 COALESCE + CASE；描述列盲覆盖；payload 列 stats/kstate/tail/ccr/last_ingested_seq/orphans/next_* 永不触碰）。调用方 try/catch best-effort（warn、永不 fail 请求）。
+- **R2 表创建门**：`migrateSchema(db, { legacyTables })`——CORE 7（sessions/kv_store/session_ext/egress_state/egress_flow/egress_block_flow/egress_block_state）恒建；LEGACY 12 仅 `legacyTables=true` 时 probe-first 建。eg 模式 = `!featureEnabled("egressPlane")` 于 open。**收敛**：eg 新库关 flag 后下次 open 自动补齐 12 表（probe-first 幂等）。**K5**：永不删已建表/行。
+- **R3 l1 死行清理**：身份行同事务 `DELETE FROM l1_world WHERE ledger_id=? AND sess_raw=? AND armed_at IS NULL AND r3_latched_at IS NULL AND witness_probe <> ''`——保护 R3 断路器行（witness '' + r3_latched_at）与 armed 行；全新 eg 库（无 l1_world）静默跳过。
+- **R4**：eg 模式跳过 plugin-conversations 持久化（kv + legacy 文件）；进程内表（K4）保留。
+- **R5**：eg 模式不写显式客户端 affinity 链（`prefix-affinity|v1`，#1486）；匿名分支（K3）照写。
+- **R6**：`session-order|v1` 写入器已从 master 退（src/order-persist.ts 不存在）——仅退役登记 + 新库断言。
+- **R7 kv 256 上限**：`setKv` 序列化值 > 256 字符响亮抛错（不截断），白名单 `{prefix-affinity|v1, plugin-conversations|table}` 豁免（两个冻结 legacy blob；两者在 eg 模式经 R4/R5 退役）。SQLite（store.ts）+ MySQL（mysql.ts）双端。
+- **R8 默认值**：三标志 `{ percent: 100 }` → `{ percent: 0 }`；6 处文档（configuration 三语 × 2）回「0 (off)」。
+
+**保留（K1–K6）**：session_ext/pf:state 保留；小配置 kv 行保留；匿名 affinity 照写；plugin-conversations 进程内表保留；永不删已建表/行；flag=0 实例零行为变化（唯一例外：kv 256 上限对假想超限 legacy 写入器响亮失败，现存写入器无一超限）。**代价**：eg 模式实例 = 插件车道实例（其上 proxy 模式客户端失去 12 legacy 表 → stage-0 降级 legacy 全量、unified 保存经 3-strike sidecar 响亮失败）。**回滚** = revert 本 PR；已落身份行的库在 flag=0 下由正常 ingest 接管同一行（upsert 冲突语义一致）。

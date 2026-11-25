@@ -81,15 +81,15 @@ function cleanEnv(): NodeJS.ProcessEnv {
     // off) — this suite asserts the legacy JSON persistence surface (raw
     // conversation keys persisting sessions), so pin the dual-write writer.
     env.BILI_STORAGE_JSON_WRITER = "on";
-    // The egress plane (default ON on this ci:full evidence branch) arms
-    // these real dsh lanes and freezes the legacy JSON persistence surface
-    // (index-only), and egress-serve replays the recorded transcript across
-    // the mid-session model/protocol switches this suite exercises — both
-    // effects are pinned by the egress suites (egress-fork-host-e2e,
-    // storage-engine-proofs). This suite's contract is the LEGACY
-    // persistence + no-fork-on-switch behavior, so run it off the plane,
-    // the same discipline as e2e-native-dsh / e2e-native-pi /
-    // e2e-delegate-notify (commit 5c73de3).
+    // The egress plane arms these real dsh lanes and freezes the legacy JSON
+    // persistence surface (index-only), and egress-serve replays the recorded
+    // transcript across the mid-session model/protocol switches this suite
+    // exercises — both effects are pinned by the egress suites
+    // (egress-fork-host-e2e, storage-engine-proofs). This suite's contract is
+    // the LEGACY persistence + no-fork-on-switch behavior, so run it off the
+    // plane defensively (regardless of the rollout default), the same
+    // discipline as e2e-native-dsh / e2e-native-pi / e2e-delegate-notify
+    // (commit 5c73de3).
     env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     return env;
 }

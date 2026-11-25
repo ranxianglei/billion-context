@@ -27,6 +27,7 @@
 
 import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
+import type { EgressIdentityColumns } from "./egress-record.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
 import { CcrLedgerRow, hydrateSlimCcrStore, isEmptyStateValue, slimCcrEnvelope, splitKstate } from "./slim.js";
@@ -457,6 +458,50 @@ export function planIngestReanchor(session: LegacySessionLike): IngestPlan | nul
     return plan;
 }
 
+/** #7735 R1: the `sessions` identity columns for a session — the subset of a
+ *  SessionRow that carries WHO/WHEN the session is (lineage, protocol,
+ *  namespace, origin, timestamps, descriptive meta/metadata). The full ingest
+ *  (finishPlan) and the egress-on identity row (UnifiedStore.
+ *  ensureEgressIdentity) both map through this so the two can never drift.
+ *  The payload columns (orphans, next_block_id, next_run_id, stats, kstate,
+ *  tail, ccr) are NOT here — they stay in the full ingest only and are never
+ *  touched by the identity upsert. The input is the minimal structural shape
+ *  the mapping reads (no `state` — the live Session's CompressionState carries
+ *  no index signature and the identity columns never touch it), so both the
+ *  persist-side LegacySessionLike and the server-side Session satisfy it. */
+export function egressIdentityColumnsOf(session: {
+    meta: Record<string, unknown>;
+    metadata: Record<string, unknown>;
+    createdAt: number;
+    lastSeen: number;
+}): EgressIdentityColumns {
+    return {
+        // #4390: fork lineage into the unified row — the envelope's
+        // metadata.derivedFromSessionId (written by handle.ts at fork time)
+        // used to be the ONLY carrier; envelope loss orphaned the family.
+        parentSessionId: typeof session.metadata.derivedFromSessionId === "string" && session.metadata.derivedFromSessionId.length > 0
+            ? session.metadata.derivedFromSessionId
+            : null,
+        forkPointSeq: null,
+        protocol: typeof session.meta.protocol === "string" ? session.meta.protocol : null,
+        label: typeof session.meta.label === "string" ? session.meta.label : null,
+        title: typeof session.meta.title === "string" ? session.meta.title : null,
+        hostTitle: typeof session.meta.hostTitle === "string" ? session.meta.hostTitle : null,
+        // #2960: identity columns — the agent namespace that owns the
+        // conversation and the upstream origin the JSON shard was written
+        // under. Descriptive here; R2.1 promotes them into the row key.
+        namespace: typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent
+            ? session.metadata.pluginAgent
+            : "proxy",
+        origin: typeof session.meta.upstreamOrigin === "string" ? session.meta.upstreamOrigin : null,
+        status: "active",
+        createdAt: session.createdAt,
+        updatedAt: session.lastSeen,
+        metaJson: JSON.stringify(session.meta),
+        metadataJson: JSON.stringify(session.metadata),
+    };
+}
+
 /** Shared plan tail (everything except the messages log): given the same
  *  log + session, byte-identical output for both planners — the watermark
  *  fast path must not change what a full ingest would write. (#4182: the
@@ -623,33 +668,11 @@ function finishPlan(
 
     const sessionRow: SessionRow = {
         sessionId: session.id,
-        // #4390: fork lineage into the unified row — the envelope's
-        // metadata.derivedFromSessionId (written by handle.ts at fork time)
-        // used to be the ONLY carrier; envelope loss orphaned the family.
-        parentSessionId: typeof session.metadata.derivedFromSessionId === "string" && session.metadata.derivedFromSessionId.length > 0
-            ? session.metadata.derivedFromSessionId
-            : null,
-        forkPointSeq: null,
-        protocol: typeof session.meta.protocol === "string" ? session.meta.protocol : null,
-        label: typeof session.meta.label === "string" ? session.meta.label : null,
-        title: typeof session.meta.title === "string" ? session.meta.title : null,
-        hostTitle: typeof session.meta.hostTitle === "string" ? session.meta.hostTitle : null,
-        // #2960: identity columns — the agent namespace that owns the
-        // conversation and the upstream origin the JSON shard was written
-        // under. Descriptive here; R2.1 promotes them into the row key.
-        namespace: typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent
-            ? session.metadata.pluginAgent
-            : "proxy",
-        origin: typeof session.meta.upstreamOrigin === "string" ? session.meta.upstreamOrigin : null,
-        status: "active",
-        createdAt: session.createdAt,
-        updatedAt: session.lastSeen,
+        ...egressIdentityColumnsOf(session),
         orphansJson,
         nextBlockId: session.state.nextBlockId,
         nextRunId: session.state.nextRunId,
-        metaJson: JSON.stringify(session.meta),
         statsJson: JSON.stringify(session.stats),
-        metadataJson: JSON.stringify(session.metadata),
         kstateJson: JSON.stringify(kstateColumn),
         tailJson: JSON.stringify({ pluginSnapshotSeqs, tailSeqs, tailFolded: session.lastMessagesFolded === true }),
         // #6785 step 6: slim envelope — the column keeps key→hash only; the

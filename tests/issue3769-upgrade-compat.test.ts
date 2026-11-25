@@ -19,9 +19,9 @@ process.env.BILI_PERSIST_ZSTD = "0";
 // the index-row load path into an un-probeable namespaced file (same
 // discipline as the storage family; explicit env beats the preload's ??=).
 process.env.BILI_STORAGE_UNIFIED = "full";
-// ci:full branch: this suite pins the LEGACY fork/orphan contract; the egress
-// plane default (100 here) serves raw sessions from the op log and legitimately
-// changes outbound bytes — out of this suite's scope.
+// This suite pins the LEGACY fork/orphan contract; the egress plane serves
+// raw sessions from the op log and legitimately changes outbound bytes —
+// out of this suite's scope. Scope the plane off defensively.
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-upg-hermetic-")), "no-config.json");
 
