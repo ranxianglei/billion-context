@@ -68,7 +68,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeSubagentHelper, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -1413,6 +1413,9 @@ async function handleRequest(
         // resolver — never opened globally.
         const ccTitleSidecar = sideAgent !== "main" && claudeAnthropicPersonaOrderApplies(req.headers)
             && isClaudeCodeTitleRequest(protocol, parsed);
+        const ccSubagentHelper = sideAgent !== "main" && claudeSub !== undefined && opts.subagentSplit !== false
+            && claudeAnthropicPersonaOrderApplies(req.headers)
+            && isClaudeCodeSubagentHelper(protocol, parsed);
         // #6880: normalize the declared purpose for the SIDE classification
         // (and the lane log below) — one parse, marker-gated. The
         // "conversation" sentinel the post-#6883 plugin stamps on MAIN turns
@@ -1530,6 +1533,7 @@ async function handleRequest(
                  || gooseSingleShotSidecar
                  || codebuddyCompactionSidecar
                  || opencodeTitleSidecar
+                 || ccSubagentHelper
                  || (pluginAgentHeader(req.headers) !== undefined && sideAgent !== "main"
                      && req.headers["x-bili-ws-lane"] === undefined
                      && hasLeakedBiliToolsOnly(parsed)
@@ -2713,7 +2717,7 @@ async function handleRequest(
         // outputBudgetHighWater from it would poison the first starved restore
         // (title requests arrive FIRST, at session start). Starved all-bili requests
         // never reach here demoted: stripLeakedBiliTools vetoes them per #546.
-        if (!demotedSide && !serverToolUtility && !structuredOutputUtility && !audioOutputUtility) {
+        if (!demotedSide && !serverToolUtility && !structuredOutputUtility && !audioOutputUtility && !ccSubagentHelper) {
             // #3438: the dsh host contract (pi-ai buildBaseOptions) stamps the model-declared
             // maxTokens on every main turn, so on this lane a below-ceiling tool-carrying
             // budget is a raw-history collapse, not intent — arm the mid-band rescue.
@@ -2908,7 +2912,7 @@ async function handleRequest(
         // #5135: ccTitleSidecar joins the intent set so the title call rides
         // the #388 passthrough (kernel state untouched) like every other
         // recognized side request.
-        const sideIntent = isSideRequest(parsed, declaredPiMainTurn ? "main" : requestAgent, declaredPurpose) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar
+        const sideIntent = isSideRequest(parsed, declaredPiMainTurn ? "main" : requestAgent, declaredPurpose) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar || ccSubagentHelper
             || grokAuxSidecar || mcodeTitleSidecar || mcodeOneShotSidecar || gooseSingleShotSidecar || codebuddyCompactionSidecar || opencodeTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request check above
@@ -2933,7 +2937,7 @@ async function handleRequest(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: declaredPurpose !== undefined ? `declared purpose=${declaredPurpose} (#6880)` : serverToolUtility ? "server-tool utility call (#2500)" : structuredOutputUtility ? "structured-output utility call (#5073)" : audioOutputUtility ? "audio-output utility call (#6636)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : dshSingleShotSidecar ? "dsh single-shot sidecar (#5656)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : grokAuxSidecar ? "grok auxiliary sidecar (#6884)" : mcodeTitleSidecar ? "mcode title sidecar (#6884)" : mcodeOneShotSidecar ? "mcode one-shot aux sidecar (#6884)" : gooseSingleShotSidecar ? "goose single-shot sidecar (#6884)" : codebuddyCompactionSidecar ? "codebuddy compaction sidecar (#6884)" : opencodeTitleSidecar ? "opencode title-gen sidecar (#6884)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: declaredPurpose !== undefined ? `declared purpose=${declaredPurpose} (#6880)` : serverToolUtility ? "server-tool utility call (#2500)" : structuredOutputUtility ? "structured-output utility call (#5073)" : audioOutputUtility ? "audio-output utility call (#6636)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : dshSingleShotSidecar ? "dsh single-shot sidecar (#5656)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : ccSubagentHelper ? "claude-code subagent one-shot helper" : grokAuxSidecar ? "grok auxiliary sidecar (#6884)" : mcodeTitleSidecar ? "mcode title sidecar (#6884)" : mcodeOneShotSidecar ? "mcode one-shot aux sidecar (#6884)" : gooseSingleShotSidecar ? "goose single-shot sidecar (#6884)" : codebuddyCompactionSidecar ? "codebuddy compaction sidecar (#6884)" : opencodeTitleSidecar ? "opencode title-gen sidecar (#6884)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
