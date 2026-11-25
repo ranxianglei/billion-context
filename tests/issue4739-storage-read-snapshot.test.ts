@@ -68,7 +68,9 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
                 db.prepare("UPDATE sessions SET stats_json = ? WHERE session_id = ?").run('{"requests":"2"}', "snapshot");
                 assert.equal(store.getLoadHeader("snapshot")!.requests, 2, "old numeric-string counter matches full-load arbitration");
                 assert.equal(store.getMetadataJson("snapshot"), '{"requests":1}');
-                assert.deepEqual(JSON.parse(store.getOrphansJson("snapshot")!), JSON.parse(fixture().orphansJson!));
+                // #6785 step 7: orphans_json migrates into orphan_blocks on ingest; the
+                // lazy read path is the union view (table rows + any legacy column keys).
+                assert.deepEqual(store.getOrphanViews("snapshot"), JSON.parse(fixture().orphansJson!));
                 const contents = store.getBlockContents("snapshot", { limit: 2, offset: 1 });
                 assert.deepEqual(contents.map((row) => row.blockId), ["b1", "b2"]);
                 assert.deepEqual(JSON.parse(contents[0]!.summary), { text: "full1", count: 1 });

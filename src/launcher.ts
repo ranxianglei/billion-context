@@ -61,6 +61,7 @@ import { stateDir } from "./paths.js";
 import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
 import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
+import { dshProfileFromArgs } from "./dsh-channel.js";
 import { applyOmpFirstEventTimeout, applyOmpMessageThreadsOff, envMillis } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
@@ -1053,6 +1054,15 @@ interface EnvClientPreset {
 }
 
 const LAUNCHER_LOOPBACK_NO_PROXY = "localhost,127.0.0.1,::1";
+
+// #6862: hermes' own toolchain children (git/uv/npm update runners, shell tasks) inherit the
+// routed env and would ride the lane for code/dependency hosts the MITM whitelist does not cover —
+// a flaky lane egress or a dead port then takes the host's whole toolchain down. Keep those hosts
+// direct (mirrors the hermes-plugin default; same host list). Model hosts are NOT in this list, so
+// model traffic still rides the lane.
+const HERMES_NONMODEL_NO_PROXY = ("github.com,api.github.com,objects.githubusercontent.com,"
+    + "codeload.github.com,pypi.org,files.pythonhosted.org,registry.npmjs.org");
+const HERMES_DEFAULT_NO_PROXY = LAUNCHER_LOOPBACK_NO_PROXY + "," + HERMES_NONMODEL_NO_PROXY;
 
 const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
     codex: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
@@ -3633,7 +3643,7 @@ export function writeDshAcpPatch(dshHome: string, entryName?: string): string | 
     writeOverlayFileAtomic(
         dir,
         ".bili-acp.patch.yml",
-        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n    - id: bili-compaction-gate\n      name: ${gateUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #3354/#3662: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the always-on bili-compaction-gate entry registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
+        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n    - id: bili-compaction-gate\n      name: ${gateUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #7154: keep in sync with dsh.bundle.patch.yml — /compact drives the host compaction call the #1729 wire guard refuses unconditionally, so on a bili-owned lane it can only fail (and dsh blames the model for it)\n- id: command-compact\n  disabled: true\n# #3354/#3662: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the always-on bili-compaction-gate entry registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
     );
     const file = path.join(dir, ".bili-acp.patch.yml");
     try {
@@ -5150,7 +5160,8 @@ function runCommandCapture(command: string, args: readonly string[], timeoutMs: 
  *  reused pid would inherit the dead occupant's observation history and get
  *  force-taken-over on first sight. Sources (all best-effort, zero new deps):
  *   linux: /proc/<pid>/stat field 22 (starttime, ticks since boot)
- *   win32: powershell Get-Process StartTime (~1-3s cold start, rare path only)
+ *   win32: powershell Get-Process StartTime (1-3s warm; 30s budget — a loaded
+ *          CI runner's cold start can exceed 10s, #6785)
  *   other POSIX: `ps -o lstart=`
  *  Failure → undefined → the key degrades to origin#pid (previous behavior); a
  *  stamp that appears or disappears across observations restarts the window
@@ -5169,7 +5180,7 @@ export async function processBirthStamp(pid: number): Promise<string | undefined
             return undefined;
         }
         if (process.platform === "win32") {
-            const out = await runCommandCapture("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToString('o')`], 10_000);
+            const out = await runCommandCapture("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToString('o')`], 30_000);
             const trimmed = out.trim();
             return trimmed === "" ? undefined : `ps-${trimmed}`;
         }
@@ -5348,7 +5359,7 @@ async function resolveWedgedSameLaneHolder(
 }
 
 /** #7156: the last gate before the spawn ladder — never open a second
- *  SAME-LANE writer behind a live predecessor.
+ *  writer over the shared session store behind a live predecessor.
  *
  *  Background: SQLite's multi-process mode is turn-taking — healthy peers
  *  coordinate through the WAL index and never corrupt each other (270/270
@@ -5360,21 +5371,38 @@ async function resolveWedgedSameLaneHolder(
  *  in the incident. Spawning behind either one re-creates the corruption; the
  *  child then dies on "database disk image is malformed" and the lane wedges.
  *
- *  Predecessor = the LIVE same-lane (non-user-zone) instance on the port this
- *  launch is about to bind. The zone resolver is stateful (#1660), so the
- *  cheap probe-time prefilter runs before it is ever touched. Per survivor:
- *    listener up + health answers  → healthy peer: #3544 rotation above already
+ *  Predecessor = the LIVE instance (any lane identity — including a no-lane
+ *  manual `bili start`, which registers tokenless and would otherwise be
+ *  invisible as a "user-zone" instance) on the port this launch is about to
+ *  bind. Same-lane predecessors keep their historical cell table;
+ *  #7675 extends the gate to NO-LANE predecessors (a manual `bili start` on
+ *  the zone base): before, the `c.inst.lane === lane` filter made them
+ *  invisible, so every lane launch laddered to base+1 and silently drifted a
+ *  second proxy writing the same shared sessions dir (field: three manual
+ *  daemons + two drifted pi-lane daemons on one host). A manual daemon holds
+ *  no lane identity to attach to, and it is the user's own process — the
+ *  wedge-takeover ladder is deliberately NOT extended to it, so the only
+ *  honest outcome is an actionable refusal. A HEALTHY no-lane daemon is
+ *  reached here only when the attach tiers above already vetoed it; the
+ *  classic 8787 global daemon does not collide (different port base). The
+ *  zone resolver is stateful (#1660), so the cheap probe-time prefilter runs
+ *  before it is ever touched.
+ *  Per survivor:
+ *    same-lane, listener up + health answers  → healthy peer: #3544 rotation above
  *        handled the strictly-older case; normal dual-writer topology (#5082),
  *        allow the spawn — behavior unchanged.
- *    listener up + health silent   → WEDGED: throw. The #5955 wedge cell owns
+ *    same-lane, listener up + health silent   → WEDGED: throw. The #5955 wedge cell owns
  *        this holder; its forced takeover fires after the patience window.
  *        Until then the lane fails with an actionable error instead of
  *        drifting a second writer over the same index.db.
- *    listener down + process alive → DRAINING: its final flush still writes
+ *    no-lane, listener up (healthy or not)    → throw (#7675): an actionable
+ *        error naming the pid, its origin, and the remedies (dedicated port
+ *        zone for the manual daemon, or stop it).
+ *    (either) listener down + process alive   → DRAINING: its final flush still writes
  *        index.db, so the PORT being free is not the safety condition — the
  *        process actually exiting is (#5167: a drain can outlive its
  *        listener). Wait, bounded, for real death; then spawn.
- *    process dead (listener either way) → gone: spawn.
+ *    process dead (listener either way)       → gone: spawn.
  */
 async function quiesceSameLanePredecessor(
     probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>,
@@ -5388,13 +5416,14 @@ async function quiesceSameLanePredecessor(
 ): Promise<void> {
     if (lane === undefined) return;
     // Cheap prefilter — #1660: never touch the sticky zone resolver on a
-    // bring-up where nothing same-lane is alive at all.
-    if (!probed.some((c) => c.inst.lane === lane && !isUserZoneInstance(c.inst))) return;
+    // bring-up where nothing gate-relevant is alive at all. #7675: no-lane
+    // instances (manual `bili start`) are gate-relevant too — they hold the
+    // shared sessions dir just like any same-lane writer.
+    if (!probed.some((c) => c.inst.lane === lane || c.inst.lane === undefined)) return;
     const targetPort = resolveTargetPort();
     if (targetPort === undefined) return;
     const survivors = probed.filter(
-        (c) => c.inst.lane === lane
-            && !isUserZoneInstance(c.inst)
+        (c) => (c.inst.lane === lane || c.inst.lane === undefined)
             && c.inst.port === targetPort
             && isPidAlive(c.inst.pid),
     );
@@ -5403,10 +5432,21 @@ async function quiesceSameLanePredecessor(
         if (!isPidAlive(s.inst.pid)) continue; // raced to death between the filter and now
         const listening = await isConnectable(s.inst.origin);
         if (listening) {
+            // #7675: a manual `bili start` daemon (no lane) on this launch's
+            // target port was previously invisible to the gate — the lane
+            // laddered to +1 and silently spawned a second writer over the
+            // shared sessions dir. A no-lane holder is not attachable and not
+            // wedge-takeover-eligible (it is the user's own process), so the
+            // only honest outcome is an actionable refusal.
+            if (s.inst.lane !== lane) {
+                throw new Error(
+                    `bili: refusing to spawn a second writer — the target port ${targetPort} is held by a running bili proxy (pid ${s.inst.pid}, ${s.inst.origin}, no lane declared). A lane daemon spawning over the same shared sessions dir doubles the WAL writers and has corrupted indexes before (#7156); laddering to +1 would do that silently. Give the daemon its own port zone (start it with -p / a different BILI_PORT_ZONE) or stop it: kill ${s.inst.pid}`,
+                );
+            }
             const healthy = await fetchHealthInfoNoReuse(s.inst.origin);
             if (healthy !== undefined) continue; // healthy peer — allow (see above)
             throw new Error(
-                `bili: refusing to spawn a second same-lane writer — predecessor pid ${s.inst.pid} on port ${targetPort} is still serving but answers no health probe (wedged). Opening the shared session store behind it corrupts the index (#7156): its stale WAL view keeps writing into offsets our startup checkpoint reclaims. It is on the wedge-takeover watch — the forced takeover (shutdown → SIGTERM → SIGKILL) fires automatically after the patience window, and the lane comes up then. Stop it now to unblock immediately: kill ${s.inst.pid}`,
+                `bili: refusing to spawn a second same-lane writer — predecessor pid ${s.inst.pid} on port ${targetPort} is still serving but answers no health probe (wedged). Opening a second writer over the shared session store behind a stale-view peer is the #7156 corruption shape: its frames can land where a concurrent checkpoint reclaimed them. It is on the wedge-takeover watch — the forced takeover (shutdown → SIGTERM → SIGKILL) fires automatically after the patience window, and the lane comes up then. Stop it now to unblock immediately: kill ${s.inst.pid}`,
             );
         }
         // Listener closed: a graceful drain (final session flush) may still be
@@ -5418,7 +5458,7 @@ async function quiesceSameLanePredecessor(
         }
         if (isPidAlive(s.inst.pid)) {
             throw new Error(
-                `bili: refusing to spawn a second same-lane writer — predecessor pid ${s.inst.pid} (port ${targetPort}) closed its listener but is still draining after ${PREDECESSOR_DRAIN_GRACE_MS}ms; its final flush still writes the shared session store, so a new writer would corrupt the index (#7156). It exits on its own — retry the launch in a moment, or stop it now: kill ${s.inst.pid}`,
+                `bili: refusing to spawn a second writer — predecessor pid ${s.inst.pid} (port ${targetPort})${s.inst.lane === lane ? "" : ", no lane declared"} closed its listener but is still draining after ${PREDECESSOR_DRAIN_GRACE_MS}ms; its final flush still writes the shared session store, so a new writer would corrupt the index (#7156). It exits on its own — retry the launch in a moment, or stop it now: kill ${s.inst.pid}`,
             );
         }
     }
@@ -7315,6 +7355,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // carrier is present (anonymous requests are accepted, #286).
         env = stripInheritedProxy(process.env);
         env.HTTPS_PROXY = origin;
+        // #6862: keep hermes' own toolchain children (git/uv/npm update runners, shell tasks) off
+        // the lane for code/dependency hosts — they inherit HTTPS_PROXY and a flaky lane egress or
+        // dead port then takes the host's whole toolchain down. Model hosts are not listed, so
+        // model traffic still rides the lane.
+        env.NO_PROXY = HERMES_DEFAULT_NO_PROXY;
+        env.no_proxy = HERMES_DEFAULT_NO_PROXY;
         env.HERMES_CA_BUNDLE = ca;
         env.SSL_CERT_FILE = resolveCombinedCaPath(process.env);
         if (routes.httpRewrites.length === 0 && routes.httpsDomains.length === 0) {
@@ -7399,8 +7445,20 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const prevNodePath = env.NODE_PATH;
         env.NODE_PATH = prevNodePath !== undefined && prevNodePath.length > 0 ? `${dshNm}${path.delimiter}${prevNodePath}` : dshNm;
         let dshAcpPatch: string | undefined;
-        if (!dshNativeInstalled()) {
+        // #7155: ask about the profile this run is about to boot, not the
+        // machine. The machine-wide form made a bundle-less profile look
+        // installed whenever a sibling profile had the bundle: the overlay was
+        // skipped and the session ran with ZERO bili entries (no compression
+        // tools, no takeover, native compaction armed) while the note below
+        // described the other profile.
+        const targetProfile = dshProfileFromArgs(params.clientArgs);
+        if (!dshNativeInstalled(process.env, targetProfile)) {
             dshAcpPatch = writeDshAcpPatch(dshHomeDir, dshPluginEntry(dshOverlayHome ?? dshHomeDir));
+            if (targetProfile !== undefined && dshNativeInstalled()) {
+                console.error(
+                    `bili: profile "${targetProfile}" does not install billion-context (another profile on this machine does) — this run mounts the launcher overlay, so compression works for this session only. Install it permanently with: dsh plugin --profile ${targetProfile} add billion-context`,
+                );
+            }
         } else {
             // Unconditional (#3666): the #2028 allowDshCompaction opt-out was
             // removed, so a native install always leaves dsh compaction armed

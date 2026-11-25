@@ -41,7 +41,7 @@
   <text x="46" y="414" class="warnb">dual-channel read/write with the tables — the fork point the evolution would remove</text>
 
   <!-- DB band -->
-  <rect x="430" y="112" width="480" height="310" rx="8" fill="#eef2ff" stroke="#4f46e5"/>
+  <rect x="430" y="112" width="480" height="378" rx="8" fill="#eef2ff" stroke="#4f46e5"/>
   <text x="450" y="140" class="h">Unified SQLite · schema v11 (#5539 FK sub-index)</text>
   <g>
     <rect x="450" y="156" width="130" height="28" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="515" y="175" class="chip" text-anchor="middle">sessions</text>
@@ -57,11 +57,13 @@
     <rect x="590" y="264" width="130" height="28" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="655" y="283" class="chip" text-anchor="middle">conversations</text>
     <rect x="730" y="264" width="160" height="28" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="810" y="283" class="chip" text-anchor="middle">session_ext</text>
   </g>
-  <rect x="450" y="308" width="340" height="30" rx="5" fill="#fff" stroke="#6366f1" stroke-dasharray="5 4"/>
-  <text x="620" y="328" class="chip" text-anchor="middle">PF four tables (#5855 open, layers on after merge): pf_rows / pf_log / pf_ckpt / render face</text>
-  <text x="450" y="364" class="s">single file, single WAL writer · migrations = versioned DDL (CREATE IF NOT EXISTS, additive)</text>
-  <text x="450" y="382" class="s">optional at-rest encoding: AES-256-GCM (#708) + zstd (#1080); the mysql dialect is a test mirror (src/storage/mysql.ts)</text>
-  <text x="450" y="400" class="s">integrity: checkpoint frame signatures + S4 per-row checksums (verdicts trust the chain, never content similarity)</text>
+  <rect x="450" y="308" width="210" height="28" rx="5" fill="#dcfce7" stroke="#16a34a"/><text x="555" y="327" class="chip" text-anchor="middle">egress_flow (canonical op log, dual clocks)</text><rect x="670" y="308" width="180" height="28" rx="5" fill="#dcfce7" stroke="#16a34a"/><text x="760" y="327" class="chip" text-anchor="middle">egress_state (bounded read replica)</text><rect x="450" y="344" width="180" height="28" rx="5" fill="#dcfce7" stroke="#16a34a"/><text x="540" y="363" class="chip" text-anchor="middle">egress_block_flow (#7581)</text><rect x="640" y="344" width="180" height="28" rx="5" fill="#dcfce7" stroke="#16a34a"/><text x="730" y="363" class="chip" text-anchor="middle">egress_block_state (#7581)</text><rect x="830" y="344" width="160" height="28" rx="5" fill="#f3f4f6" stroke="#9ca3af" stroke-dasharray="4 3"/><text x="910" y="363" class="chip" text-anchor="middle">l1_world (placeholder, retiring)</text>
+  <text x="450" y="464" class="s">egress-on sessions: identity + authority live in the op log (l1_world / conversations retired for them, KDD #24)</text>
+  <rect x="450" y="364" width="340" height="30" rx="5" fill="#fff" stroke="#6366f1" stroke-dasharray="5 4"/>
+  <text x="620" y="384" class="chip" text-anchor="middle">PF four tables (#5855 open, layers on after merge): pf_rows / pf_log / pf_ckpt / render face</text>
+  <text x="450" y="408" class="s">single file, single WAL writer · migrations = versioned DDL (CREATE IF NOT EXISTS, additive)</text>
+  <text x="450" y="426" class="s">optional at-rest encoding: AES-256-GCM (#708) + zstd (#1080); the mysql dialect is a test mirror (src/storage/mysql.ts)</text>
+  <text x="450" y="444" class="s">integrity: checkpoint frame signatures + S4 per-row checksums (verdicts trust the chain, never content similarity)</text>
 
   <!-- readers -->
   <text x="1030" y="100" class="h">Read side (who reads)</text>
@@ -86,18 +88,18 @@
   <text x="1046" y="442" class="s">orphan-block GC · storage GC (sessions.gc.*, opt-in) · dead-ref reclaim</text>
 
   <!-- bottom invariants -->
-  <rect x="30" y="492" width="1340" height="118" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
-  <text x="50" y="520" class="h">Hard invariants (read AGENTS.md before touching this)</text>
-  <text x="50" y="546" class="b">· message ids are never reused (kernel contract): messages.msgId is the bili/kernel canonical id — the host msgid still has no landing spot (pain point 2; #5842 only covers in-flight)</text>
-  <text x="50" y="570" class="b">· stable absolute seq (#421 fix): row order is the primary identity carrier; folding = an inactive mark, never a physical delete (GC purges by cover-block lifecycle)</text>
-  <text x="50" y="594" class="b">· upgrades are purely additive: schema version only moves forward, old DBs land via CREATE IF NOT EXISTS — any breaking migration needs a rollback drill first (T1 discipline)</text>
+  <rect x="30" y="510" width="1340" height="118" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="50" y="538" class="h">Hard invariants (read AGENTS.md before touching this)</text>
+  <text x="50" y="564" class="b">· message ids are never reused (kernel contract): messages.msgId is the bili/kernel canonical id — the host msgid still has no landing spot (pain point 2; #5842 only covers in-flight)</text>
+  <text x="50" y="588" class="b">· stable absolute seq (#421 fix): row order is the primary identity carrier; folding = an inactive mark, never a physical delete (GC purges by cover-block lifecycle)</text>
+  <text x="50" y="612" class="b">· upgrades are purely additive: schema version only moves forward, old DBs land via CREATE IF NOT EXISTS — any breaking migration needs a rollback drill first (T1 discipline)</text>
 
   <!-- arrows -->
   <g stroke="#334155" fill="none" stroke-width="1.6">
     <path d="M330,150 H430" marker-end="url(#ar)"/>
     <path d="M330,233 H430" marker-end="url(#ar)"/>
     <path d="M330,311 H430" marker-end="url(#ar)"/>
-    <path d="M430,505 H1030"/>
+    <path d="M430,569 H1030"/>
     <path d="M1030,142 H1000"/>
     <path d="M1000,142 V430"/>
     <path d="M1000,142 H1030" marker-end="url(#ar)"/>
@@ -111,5 +113,5 @@
   </g>
   <text x="352" y="380" class="warnb">dual channel</text>
 
-  <text x="30" y="660" class="s">Key entries: src/storage/schema.ts (the single DDL source of truth) · src/storage/store.ts (row read/write) · src/storage/ingest.ts (batch entry) · src/persist.ts (StateStore wrapper) · src/state-hydration.ts (field list)</text>
+  <text x="30" y="678" class="s">Key entries: src/storage/schema.ts (the single DDL source of truth) · src/storage/store.ts (row read/write) · src/storage/ingest.ts (batch entry) · src/persist.ts (StateStore wrapper) · src/state-hydration.ts (field list)</text>
 </svg>

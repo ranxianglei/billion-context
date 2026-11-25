@@ -406,8 +406,13 @@ export type CompressSettings = {
      *  mcp catalog, agents-md baseline, runtime-context snapshot), so the
      *  same pattern machinery governs them: `"durable/*"` keeps the LATEST
      *  instance of every carrier (all four are cumulative snapshots — the
-     *  older catalogs/baselines fold away). Default when nothing is
-     *  configured: `durable/*` latest-per-identity in
+     *  older catalogs/baselines fold away). The agents-md carrier is the one
+     *  exception to "one identity per carrier": its mid-session REVISIONS
+     *  (`Updated|Additional instructions from:` / `Instructions removed:`)
+     *  project to `durable/agents-md-update/<path>` so a revision can never
+     *  demote the multi-file baseline it does not fully carry — latest-per-
+     *  path there means "the newest revision of EACH touched file" (#2447).
+     *  Default when nothing is configured: `durable/*` latest-per-identity in
      *  `protectedLatestTools` (pi-reference single-live-copy semantics —
      *  skill/MCP visibility can never be lost, superseded snapshots
      *  fold). */
@@ -432,12 +437,26 @@ export type CompressSettings = {
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedTools?: string[];
+    /** User-message text substrings that are NEVER compressed (kernel
+     *  `Config.isMessageProtected` hook). Built for long-lived agent sessions:
+     *  the current task prompt is often NOT the last user message (tool-result
+     *  / image user messages follow it), so the kernel's last-user protection
+     *  does not cover it. Once folded, a stale earlier user message can remain
+     *  as the only raw user turn and the model may resume that old task.
+     *  Hosts mark the current task with a stable literal (e.g. "【本轮消息】")
+     *  and list it here. Matching is literal substring on user-role text
+     *  messages; empty array is rejected; deepest level wins, whole-array
+     *  replace. */
+    protectedUserPatterns?: string[];
     /* (durable virtual paths) any pattern whose first path segment is
      *  `durable` takes over the whole durable policy for that lane
      *  (whole-identity takeover): bili attaches only the identity
      *  classifier and injects NO default — e.g. `"durable/agents-md"`
      *  protects just the workspace baseline while skill/mcp catalogs fold
-     *  normally. Unregistered lanes get no projection at all. */
+     *  normally. Note the agents-md revisions carry their own identity, so
+     *  that exact pattern leaves them foldable; add
+     *  `"durable/agents-md-update/*"` (or use `"durable/*"`) to keep the
+     *  whole family. Unregistered lanes get no projection at all. */
     /** Tool-name patterns EXCLUDED from the soft-protected recent zone —
      *  matching tool results inside the recent zone become compressible
      *  immediately instead of aging out first (kernel
@@ -691,6 +710,33 @@ export type CompressSettings = {
      *  Real edits never match (normalized text differs) and honestly
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
+    /** #7666: degenerate-terminal-turn retry budget and nudge wording. When a
+     *  turn reaches its terminal with nothing usable (tag-echo emptying, bare
+     *  announcement, draft tail), the pipe re-issues the same request with a
+     *  TRANSIENT continuation nudge appended as a trailing user turn — the nudge
+     *  never touches session state, so it is neither persisted nor replayed on
+     *  the client's next request. Merged sub-field-wise across the three levels
+     *  like `absorb` (per-model wording differences are the point).
+     *  - `maxAttempts` (default 1, integer 0..5): how many nudge re-issues one
+     *    turn may spend. 0 = OFF — a degenerate terminal passes through as an
+     *    empty completed turn with no retry and no in-band error (the #5897
+     *    opt-out without an env var). 1 = pre-#7666 behavior byte-for-byte.
+     *    The degenerate budget is INDEPENDENT of the zero-byte-cut re-issue
+     *    (#2171): each keeps its own one-shot, so a turn may now spend one of
+     *    each. On exhaustion the chat lane emits the #870 in-band error naming
+     *    the attempts spent; the responses lane passes the turn through.
+     *  - `nudges` (optional, 1..8 non-empty strings): nudge sentence list —
+     *    attempt i sends nudges[i], cycling when the list is shorter than
+     *    maxAttempts. Absent = built-in list (src/degenerate-retry.ts).
+     *    Cost note: the nudge is appended at the tail, so the prefix cache still
+     *    hits — each extra attempt costs roughly one generation, not one
+     *    full-context read. */
+    degenerateRetry?: {
+        /** Max nudge re-issues per turn. Integer 0..5; absent = 1. */
+        maxAttempts?: number;
+        /** Nudge sentence list; the i-th attempt uses the i-th sentence. */
+        nudges?: string[];
+    };
 };
 /** #5079: governs every prompt_cache_key BILI ITSELF writes to an egress body
  *  (chat-wire conversation-id stamping, Responses-wire identity injection).
@@ -2268,6 +2314,11 @@ type FileConfig = {
      *  edits apply on the next restart, not mid-session. */
     storage?: {
         unified?: string;
+        /** NOTE: `storage.snapBase` (enabled/cohorts/cutEveryKUserTurns, the
+         *  #5874 v2 snapshot-base plane) was RETIRED before merge (bc51c9445,
+         *  ruling 7439) — replaced wholesale by the egress op-log plane,
+         *  switched by `rollout.features.egressPlane`. A leftover `snapBase`
+         *  key in your config is dead and ignored. */
         /** SQLite engine self-download (#2833): when unified storage is
          *  requested but neither builtin node:sqlite nor a host-installed
          *  better-sqlite3 exists, bili downloads a pinned N-API prebuilt at
@@ -2297,16 +2348,20 @@ type FileConfig = {
          *  unset (JSON writing resumes; index-only sessions keep loading via
          *  the boot union, and replicas/restore re-materialize envelopes). */
         jsonWriter?: string;
-        /** WAL reclamation cap for index.db-wal (#3250), in bytes: every
-         *  completed checkpoint truncates the WAL file back to this size.
-         *  NOT a per-session data quota — data lands in index.db as it is
-         *  written and the WAL only stages frames between checkpoints, so
-         *  session count/size does not scale this. Higher = rarer truncate
-         *  IO but more steady disk use and a longer crash-replay tail.
-         *  Env BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES wins; default
-         *  8388608 (8 MiB); a non-positive/non-integer value falls back to
-         *  the file/default tier. Applied when the store opens (lane boot) —
-         *  hot edits apply on the next restart. */
+        /** WAL reclamation cap for index.db-wal (#3250), in bytes. 0 (default,
+         *  #7674) = unlimited: the engine does NOT truncate the WAL file after
+         *  a checkpoint (it sits at its historical high-water mark; frames
+         *  still converge via the periodic/flush PASSIVE checkpoints) — the
+         *  pre-#7674 8 MiB default made the engine truncate the WAL internally
+         *  after every completed checkpoint, an implicit floor-reclaim that no
+         *  JS-side guard covers and that pulls the WAL out from under live peer
+         *  connections sharing the sessions dir (#2671) — the #7156 damage
+         *  shape. A POSITIVE value N: every completed checkpoint truncates the
+         *  WAL back to N. NOT a per-session data quota — data lands in index.db
+         *  as it is written. Env BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES wins;
+         *  a non-positive/non-integer value falls back to the file/default tier.
+         *  Applied when the store opens (lane boot) — hot edits apply on the
+         *  next restart. */
         walJournalSizeLimitBytes?: number;
         /** #3901/#3463: session retention window in days for the GC age
          *  sweep (archive + tombstone + CAS release). 0 disables; env
@@ -2338,6 +2393,15 @@ type FileConfig = {
         streamKeepAliveMs?: number;
         /** Preflight hold grace (was BILI_PREFLIGHT_HOLD_MS; default 30000). */
         preflightHoldMs?: number;
+        /** #2383 emergency digest fold — when the payload's foldable mass exceeds the LLM fold
+         *  path's coverage bound (16 rounds x 2 x 0.6 = 19.2x the window), every fold switches
+         *  from an LLM summary call to a CPU-only structural digest (per-message ref/role/size
+         *  plus a head fragment). DEFAULT OFF (owner decision 2026-11-22): to the downstream
+         *  model the digest is a hard truncation — originals stay restorable via decompress, but
+         *  the content is gone unless the client asks for it back. With the regime off, those
+         *  payloads run the LLM fold ladder instead and may exhaust its budget into a fail-fast
+         *  413. Env BILI_PREFLIGHT_EMERGENCY_DIGEST wins ("1"/"true" restores the #2383 regime). */
+        emergencyDigest?: boolean;
         /** Max replay attempts on transient upstream errors (was BILI_REPLAY_RETRY_MAX; default 3). */
         replayRetryMax?: number;
         /** Replay backoff base delay (was BILI_REPLAY_RETRY_BASE_MS; default 1500). */
@@ -2597,6 +2661,8 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "reconcile", "streamSummary", "externalSummary",
     // #3635: summary-length caps — previously accepted nowhere, silently dropped.
     "maxSummaryLength", "minSummaryLength",
+    // #7666: degenerate-terminal retry budget + nudge wording.
+    "degenerateRetry",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -3394,6 +3460,11 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
         else (out as Record<string, unknown>)[key] = (v as string[]).map((x) => x.trim());
     }
+    if ("protectedUserPatterns" in obj && obj.protectedUserPatterns !== undefined) {
+        const v = obj.protectedUserPatterns;
+        if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
+        else out.protectedUserPatterns = (v as string[]).map((x) => x.trim());
+    }
     // neverPreserveRecentTools keeps the kernel semantics that an explicit
     // empty array is meaningful (excludes nothing — the #1198/#1277 escape
     // hatch), so unlike the two protectedTools knobs an empty array passes.
@@ -3469,6 +3540,29 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 }
             }
             if (ok) out.absorb = cleaned;
+        }
+    }
+    if ("degenerateRetry" in obj && obj.degenerateRetry !== undefined) {
+        const d = obj.degenerateRetry;
+        if (!d || typeof d !== "object" || Array.isArray(d)) {
+            ok = false;
+        } else {
+            const dobj = d as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["degenerateRetry"]> = {};
+            if ("maxAttempts" in dobj) {
+                const v = dobj.maxAttempts;
+                // #7666: 0 = off is meaningful, so stricter than takeNumber;
+                // 5 caps the UI/UX contract (each failed attempt still costs a
+                // full generation + ~15-30s of wall time before #870).
+                if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v > 5) ok = false;
+                else cleaned.maxAttempts = v;
+            }
+            if ("nudges" in dobj) {
+                const v = dobj.nudges;
+                if (!Array.isArray(v) || v.length < 1 || v.length > 8 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
+                else cleaned.nudges = (v as string[]).map((s) => s.trim());
+            }
+            if (ok) out.degenerateRetry = Object.keys(cleaned).length > 0 ? cleaned : undefined;
         }
     }
     if ("blockOps" in obj && obj.blockOps !== undefined) {
