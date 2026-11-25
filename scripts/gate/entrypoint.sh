@@ -155,7 +155,7 @@ P_PID=""; R_PID=""
 # Fresh per-run rc files: a stale copy left in a persistent outDir by an
 # earlier run must never be read back if the subshell dies before its final
 # echo (that failure direction HIDES a red in release verification).
-rm -f "$WORK/.rc-plugins" "$WORK/.rc-restart"
+rm -f "$WORK/.rc-plugins" "$WORK/.rc-restart" "$WORK/.rc-wire"
 if echo ",${SKIP}," | grep -q ",p,"; then
   sub "GATE_SKIP contains p — plugin lanes skipped"
   RC_PLUGINS=0
@@ -207,6 +207,27 @@ else
   fi
 fi
 
+
+# ---- 5.8 wire-switch (W) lane: mid-session wire change, real model --------
+if echo ",${SKIP}," | grep -q ",w,"; then
+  sub "GATE_SKIP contains w — wire-switch lane skipped"
+  RC_WIRE=0
+else
+  WL_ENV=(TGZ="$TGZ" WORKDIR="$WORK"
+    MODEL1_BASE_URL="$MODEL1_BASE_URL" MODEL1_MODEL="$MODEL1_MODEL" MODEL1_API_KEY="$MODEL1_API_KEY"
+    GATE_TURN_TIMEOUT_MS="${GATE_TURN_TIMEOUT_MS:-300000}"
+    GATE_W_CORPUS_TOKENS="${GATE_W_CORPUS_TOKENS:-10000}"
+    GATE_W_SMALL_WINDOW="${GATE_W_SMALL_WINDOW:-12000}")
+  if [ "$CONCURRENT" = "1" ]; then
+    ( env "${WL_ENV[@]}" node /gate-tools/wire-lanes.mjs 2>&1 | tee "$WORK/wire-lanes.log"
+      echo "${PIPESTATUS[0]}" > "$WORK/.rc-wire" ) &
+    W_PID=$!
+  else
+    env "${WL_ENV[@]}" node /gate-tools/wire-lanes.mjs 2>&1 | tee "$WORK/wire-lanes.log"
+    RC_WIRE=${PIPESTATUS[0]}
+  fi
+fi
+
 # Wait for whichever lane group(s) were launched in the background and pick up
 # their exit codes from the rc files (the subshell itself always exits 0).
 if [ -n "$P_PID" ]; then
@@ -216,6 +237,10 @@ fi
 if [ -n "$R_PID" ]; then
   wait "$R_PID"
   if [ -f "$WORK/.rc-restart" ]; then RC_RESTART=$(cat "$WORK/.rc-restart"); else RC_RESTART=2; fi
+fi
+if [ -n "$W_PID" ]; then
+  wait "$W_PID"
+  if [ -f "$WORK/.rc-wire" ]; then RC_WIRE=$(cat "$WORK/.rc-wire"); else RC_WIRE=2; fi
 fi
 
 # ---- 6. container-only lanes ---------------------------------------------------
@@ -241,9 +266,9 @@ fi
 # ---- summary --------------------------------------------------------------------
 log "SUMMARY"
 echo "repo $GATE_REPO_URL @ $GATE_REV ($REV_SHA) — candidate $V"
-echo "gate-local exit=$RC_GATE | plugin-lanes exit=$RC_PLUGINS | restart-lanes exit=$RC_RESTART | docker-lanes exit=$RC_LANES"
-echo "evidence: $WORK (gate-local.log, plugin-lanes.log, restart-lanes.log, docker-lanes.log, verdaccio.log, gate-scratch/, plugin-lanes/, restart-lanes/)"
-if [ "$RC_GATE" = "0" ] && [ "$RC_LANES" = "0" ] && [ "$RC_PLUGINS" = "0" ] && [ "$RC_RESTART" = "0" ]; then
+echo "gate-local exit=$RC_GATE | plugin-lanes exit=$RC_PLUGINS | restart-lanes exit=$RC_RESTART | wire-lanes exit=$RC_WIRE | docker-lanes exit=$RC_LANES"
+echo "evidence: $WORK (gate-local.log, plugin-lanes.log, restart-lanes.log, wire-lanes.log, docker-lanes.log, verdaccio.log, gate-scratch/, plugin-lanes/, restart-lanes/, wire-lanes/)"
+if [ "$RC_GATE" = "0" ] && [ "$RC_LANES" = "0" ] && [ "$RC_PLUGINS" = "0" ] && [ "$RC_RESTART" = "0" ] && [ "$RC_WIRE" = "0" ]; then
   echo "OVERALL: GREEN"
   exit 0
 else
