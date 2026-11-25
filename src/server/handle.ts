@@ -35,20 +35,16 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
+import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, preferZedThreadIdIdentity, qoderSideTaskConversation, zcodeMemoryConversation } from "../session-id.js";
 import { preferKiroConversationIdentity } from "../kiro.js";
 import { personaConversationOrder, type SessionOrderResolution } from "../session-resolve.js";
 
-/** #5686: fork/migration visibility on the server side. personaConversation
- *  used to throw away every outcome but the key, so a production fork
- *  (derived-*) or migration (reanchor) left NO durable line — the entire
- *  dsh |sub:-drift cluster had to be reconstructed from user screenshots.
- *  Log the state-changing outcomes; claim/continue stay silent (they are the
- *  steady state and would flood the log). derived lanes are the incident
+/** #5686: fork visibility on the server side. The raw stamped id is the
+ *  steady state (silent); a #5095 lane-token derived lane is the incident
  *  class → warn level. */
 function onSessionResolveEvent(rawId: string, r: SessionOrderResolution): void {
-    if (r.action !== "reanchor" && !r.action.startsWith("derived-")) return;
-    loggerLog(r.action.startsWith("derived-") ? "warn" : "info", `[session-resolve] ${r.action}: ${rawId} -> ${r.key}${r.reason !== undefined ? ` (${r.reason})` : ""}`);
+    if (!r.action.startsWith("derived-")) return;
+    loggerLog("warn", `[session-resolve] ${r.action}: ${rawId} -> ${r.key}${r.reason !== undefined ? ` (${r.reason})` : ""}`);
 }
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
@@ -64,6 +60,7 @@ import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, 
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
+import { ZED_PROVIDER_PROTOCOL, ZED_PROVIDERS, unwrapZedEnvelope, type ZedEnvelopeMeta, type ZedProvider } from "../zed-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
@@ -78,7 +75,9 @@ import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
-import { MSG_IDS_BODY_FIELD, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSGID_MODE_HEADER, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { DeltaReanchorError } from "./fastpath.js";
+import { synthesizeTopLevel } from "./fastpath-scan.js";
 import { harvestIdentity } from "../identity-harvest.js";
 import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
@@ -93,7 +92,7 @@ import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { featureEnabled } from "../rollout.js";
-import { BodyTooLargeError, buildForwardTarget, declPinConflictWarned, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, buildForwardTarget, declPinConflictWarned, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, scrubMsgIdFields, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { logRequestCost } from "./request-cost.js";
 import { normalizeVertexModelId } from "../vertex.js";
 import { CREDENTIAL_HEADER_NAMES } from "../cache-ledger.js";
@@ -109,6 +108,25 @@ function earlyHoldCredHeaders(req: http.IncomingMessage): Record<string, string>
         const v = headerValue(req, n);
         if (v !== undefined && v !== "") out[n] = v;
     }
+    return out;
+}
+
+// #7168/#7439: DSH rides top-level `dsh_*` client extensions on every request —
+// `dsh_session_log` (the 8 MiB lossless session-log upload for the official
+// DeepSeek API; the model never reads it) plus the sibling `dsh_plugin_packages`.
+// During the transition bili INTERCEPTS them: this drops every TOP-LEVEL `dsh_*`
+// key so the 8 MiB is never forwarded upstream (no bandwidth waste, no unknown-
+// field risk on a non-DeepSeek upstream). Nested `dsh_*` (inside messages, etc.)
+// is untouched — only top-level keys go. Returns the same reference when there is
+// nothing to drop (fast path). Gated by the `passDshExtensions` rollout flag
+// (default OFF = strip). RELEASE the intercept by flipping the flag to 100% once
+// the client-extension sideband ships (#6785 / discussion #7439). Exported for tests.
+export function withoutDshClientExtensions(parsed: unknown): unknown {
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return parsed;
+    const rec = parsed as Record<string, unknown>;
+    if (!Object.keys(rec).some((k) => k.startsWith("dsh_"))) return parsed;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(rec)) if (!k.startsWith("dsh_")) out[k] = v;
     return out;
 }
 
@@ -380,9 +398,10 @@ async function handleRequest(
     let providerDestUrl: string;
     let protocol: WireProtocol | null;
     /** #1295: wire family of a declared custom endpoint (currently only
-     *  "commandcode"). Undefined for built-in families; drives the envelope
+     *  "commandcode"); plus the zed cloud envelope wire (POST /completions,
+     *  body-classified). Undefined for built-in families; drives the envelope
      *  unwrap/rewrap + JSONL codec selection further down the pipeline. */
-    let wireFamily: "commandcode" | null = null;
+    let wireFamily: "commandcode" | "zed" | null = null;
     /** Gemini's model, resolved from the request path (its body never carries
      *  one). Undefined for every other protocol. */
     let googleModel: string | undefined;
@@ -484,15 +503,58 @@ async function handleRequest(
                 protocol = declared.wire;
             }
         } else {
-            protocol = urlPath.endsWith("/chat/completions") || urlPath.endsWith("/llm_raw_chat")
-                ? "openai"
-                : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
-                  ? "anthropic"
-                  : urlPath.endsWith("/responses") || responsesCompact
-                    ? "responses"
-                    : googlePathKind(urlPath) !== null
-                      ? "google"
-                      : null;
+            // zed cloud wire: cloud.zed.dev POSTs the provider request nested in a
+            // `{thread_id, prompt_id, provider, model, provider_request}` envelope
+            // to /completions. The ENVELOPE is the classifier (commandcode
+            // precedent) — but it must be PROBED BEFORE the suffix chain claims
+            // the path, because urlPath.endsWith("/completions") lands "/completions"
+            // on "anthropic". The probe is classification ONLY on the raw
+            // pre-decode bytes; the strict codec re-validates after the decode
+            // below and anything it rejects relays verbatim. The marker header
+            // lets the prepare* layers suppress the model-side compress surface
+            // (the response is NDJSON byte-passthrough — an in-stream acp loop is
+            // structurally unreachable, #3177 reasoning).
+            // The probe keys off the DESTINATION path: /bili/ tunnel URLs keep
+            // req.url wrapper-shaped, so urlPath is the embedded path only via
+            // route.rewrittenUrl.
+            let zedPath = urlPath;
+            if (route?.rewrittenUrl !== undefined) {
+                try {
+                    zedPath = new URL(route.rewrittenUrl).pathname;
+                } catch {
+                    zedPath = "";
+                }
+            }
+            let zedProtocol: WireProtocol | null = null;
+            if ((zedPath === "/completions" || (route?.rewrittenUrl !== undefined && urlPath === "/completions")) && zedPath !== "/completions/compact") {
+                let probe: Record<string, unknown> | undefined;
+                try {
+                    const raw: unknown = JSON.parse(bodyBuffer.toString("utf8"));
+                    if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+                        const r = raw as Record<string, unknown>;
+                        if (typeof r.provider === "string" && (ZED_PROVIDERS as readonly string[]).includes(r.provider)
+                            && r.provider_request !== null && typeof r.provider_request === "object" && !Array.isArray(r.provider_request)) {
+                            probe = r;
+                        }
+                    }
+                } catch {
+                    probe = undefined;
+                }
+                if (probe !== undefined) {
+                    wireFamily = "zed";
+                    zedProtocol = ZED_PROVIDER_PROTOCOL[probe.provider as ZedProvider];
+                    req.headers["x-bili-zed-lane"] = "1";
+                }
+            }
+            protocol = zedProtocol ?? (zedPath.endsWith("/chat/completions") || zedPath.endsWith("/llm_raw_chat")
+                    ? "openai"
+                    : zedPath.endsWith("/v1/messages") || zedPath.endsWith("/messages")
+                      ? "anthropic"
+                      : zedPath.endsWith("/responses") || responsesCompact
+                        ? "responses"
+                        : googlePathKind(zedPath) !== null
+                          ? "google"
+                          : null);
         }
         // Gemini carries the model in the PATH, not the body — resolve it here so
         // the window/config block below and every later model-keyed decision see
@@ -616,7 +678,7 @@ async function handleRequest(
             return;
         }
         log("debug", `passthrough: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — unattributed in-process caller (#1117), relaying verbatim`);
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
     // #5795: pre-ingest 429-hold fast path — while the egress governor holds
@@ -686,7 +748,7 @@ async function handleRequest(
     if (bypass) {
         const reason = bypassOverride === "on" ? "forced by BILI_PLUGIN_BYPASS=on" : "legacy in-process compression";
         log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (${reason})`);
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
@@ -697,14 +759,43 @@ async function handleRequest(
     // Parse body once and reuse everywhere (fixes duplicate JSON.parse).
     let parsed: unknown = null;
     let bodyText: string | undefined;
+    let bodyParseDeferred = false;
+    let deferredMsgCount = 0;
     if (protocol && bodyBuffer.length > 0) {
         bodyText = bodyBuffer.toString("utf8");
-        try {
-            parsed = JSON.parse(bodyText);
-        } catch {
-            parsed = null;
+        // #7398 perf: a multi-MiB OpenAI body on the pf handshake is a
+        // plugin-lane resend whose conversation array the fastpath/delta lane
+        // never needs whole (byte span scan + window-only parse). The full
+        // JSON.parse costs 150-600ms here for nothing on a hit, so synthesize
+        // `parsed` from the span scan (top-level fields only; messages stays
+        // the null marker). prepareOpenai re-parses the full body exactly once
+        // if — and only if — the lanes miss. No pf header / small body /
+        // unscannable shape / any field-span parse failure = legacy parse,
+        // byte-for-byte the old behavior. materializeDeferredBody
+        // (prepare-openai) puts the array back with every OTHER field exactly
+        // as handle.ts left it. The rollout flag is part of the condition:
+        // with it off the fastpath gate in prepareOpenai can never open, so
+        // deferring would only move the same parse later.
+        const pfProto = req.headers["x-bili-pf-count"] !== undefined || req.headers["x-bili-pf-delta"] !== undefined || req.headers["x-bili-pf-tail-ids"] !== undefined;
+        if (protocol === "openai" && wireFamily === null && pfProto && bodyBuffer.length >= 1048576 && featureEnabled("pluginFullResendWatermark")) {
+            const scanCounts = { total: 0 };
+            const synth = synthesizeTopLevel(bodyText, scanCounts);
+            if (synth !== null) { parsed = synth; bodyParseDeferred = true; deferredMsgCount = scanCounts.total; }
+        }
+        if (!bodyParseDeferred) {
+            try {
+                parsed = JSON.parse(bodyText);
+            } catch {
+                parsed = null;
+            }
         }
     }
+    // #7168/#7439: intercept DSH client extensions (default) — strip top-level
+    // `dsh_*` so the 8 MiB `dsh_session_log` is never forwarded upstream. Gated by
+    // the `passDshExtensions` rollout flag (default OFF = strip); release it once
+    // the client-extension sideband ships (#6785 / #7439). See
+    // withoutDshClientExtensions + src/rollout.ts.
+    if (!featureEnabled("passDshExtensions")) parsed = withoutDshClientExtensions(parsed);
     // Capture the raw-wire verdict before unwrapping or preparing can mutate
     // parsed. Only these scalars are needed for the post-forward bookkeeping.
     const rawWireMetadata = protocol ? preparePluginWireMetadata(bodyBuffer, parsed) : undefined;
@@ -735,7 +826,7 @@ async function handleRequest(
         v1ConvId = extractConversationId(unwrapped.inner) ?? undefined;
         if (isV1BackgroundSideRequest(unwrapped.meta, unwrapped.inner)) {
             log("info", `v1internal background utility call (requestType=${typeof unwrapped.meta.requestType === "string" ? unwrapped.meta.requestType : "micro"}) — verbatim passthrough, ACP state machine bypassed (#3129)`);
-            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, v1Model ?? googleModel ?? vertexModel);
+            await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, v1Model ?? googleModel ?? vertexModel);
             return;
         }
         log("debug", `v1internal envelope unwrapped (model=${v1Model ?? "?"} convId=${v1ConvId ?? "none"})`);
@@ -762,11 +853,43 @@ async function handleRequest(
                 }
                 log("warn", `[commandcode] declared endpoint body is not a convertible streaming CLI conversation — relaying verbatim to ${maskUrlsInText(upstreamOrigin)} (#1295) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
             }
-            await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+            await forward(req, res, opts, scrubMsgIdFields(bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
             return;
         }
         parsed = unwrapped.body;
         ccMeta = unwrapped.meta;
+    }
+    // zed cloud envelope: unwrap the `{thread_id, prompt_id, provider, model,
+    // provider_request}` wrapper so everything below — #1284 disambiguation,
+    // model/window resolution, session binding, kernel prepare — sees the
+    // standard provider wire. rewrapZedEnvelope restores the envelope at the
+    // final forward boundary. Strict fidelity (#1284 precedent): a body the
+    // classifier promised but the codec cannot convert relays verbatim with a
+    // one-time loud warning — never a partial conversion.
+    let zedMeta: ZedEnvelopeMeta | undefined;
+    let zedThreadId: string | undefined;
+    if (wireFamily === "zed" && protocol !== null) {
+        const unwrapped = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+            ? unwrapZedEnvelope(parsed as Record<string, unknown>)
+            : undefined;
+        if (!unwrapped) {
+            const relayKey = `zed:${upstreamOrigin}${urlPath}`;
+            if (!nonConversationRelayWarned.has(relayKey)) {
+                nonConversationRelayWarned.add(relayKey);
+                if (nonConversationRelayWarned.size > NON_CONVERSATION_RELAY_WARN_CAP) {
+                    nonConversationRelayWarned.delete(nonConversationRelayWarned.values().next().value as string);
+                }
+                log("warn", `[zed] /completions envelope body is not a convertible zed cloud request — relaying verbatim to ${maskUrlsInText(upstreamOrigin)} — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
+            }
+            await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+            return;
+        }
+        parsed = unwrapped.innerBody;
+        zedMeta = unwrapped.meta;
+        zedThreadId = unwrapped.threadId;
+        // The google arm's inner body carries no model (Gemini's is path-based);
+        // the ENVELOPE's `model` is the only source on this wire.
+        if (protocol === "google" && googleModel === undefined) googleModel = zedMeta.model;
     }
     // #2824: one cheap raw-text pass decides whether the incoming-image index
     //  (#1995/#2607) can find anything — a provably image-free body skips BOTH
@@ -777,11 +900,15 @@ async function handleRequest(
     // the raw body text. #4753 released it unconditionally, which silently disabled
     // the fastpath (its bodyText !== undefined gate could never fire). Keep the text
     // only on the wire+flag slice where the fastpath can fire; the strict gate in
-    // prepare-openai (pluginMode + !titleGen) remains authoritative.
-    if (!(protocol === "openai" && featureEnabled("pluginFullResendWatermark"))) bodyText = undefined;
+    // prepare-openai (pluginMode + !titleGen) remains authoritative. A deferred
+    // parse keeps the text regardless: the conversation array exists nowhere
+    // else, and the gate in prepare-openai may still be closed for this request.
+    if (!(protocol === "openai" && featureEnabled("pluginFullResendWatermark")) && !bodyParseDeferred) bodyText = undefined;
     // #903: inbound message count for the per-request cost line — messages
     // (anthropic/openai) or input (responses); null when the body has neither.
+    // A deferred body carries the count the span scan measured.
     const inboundMsgs: number | null = (() => {
+        if (bodyParseDeferred) return deferredMsgCount;
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
         const p = parsed as Record<string, unknown>;
         if (Array.isArray(p.messages)) return p.messages.length;
@@ -853,7 +980,7 @@ async function handleRequest(
     const throttleModel = v1Model ?? googleModel ?? vertexModel ?? bodyModel;
     if ((protocol === "anthropic" || protocol === "openai") && parsed !== null) {
         const p = typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
-        if (!p || !Array.isArray(p.messages)) {
+        if (!p || (p.messages !== null && !Array.isArray(p.messages))) {
             const relayKey = `${upstreamOrigin}${urlPath}`;
             if (!nonConversationRelayWarned.has(relayKey)) {
                 nonConversationRelayWarned.add(relayKey);
@@ -862,7 +989,7 @@ async function handleRequest(
                 }
                 log("warn", `[${protocol}] body has no "messages" array — not a model conversation; relaying verbatim to ${maskUrlsInText(upstreamOrigin)} instead of rejecting (#1284) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
             }
-            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, throttleModel);
+            await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, throttleModel);
             return;
         }
     }
@@ -1067,7 +1194,7 @@ async function handleRequest(
             // low-confidence fallback flag.
             const aligned = operatorWindowTuned
                 ? { limit: reqConfig.modelContextLimit, clamped: false }
-                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers, pluginWindow ?? runtimeWindow ?? launcherWindow);
+                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers, pluginWindow ?? runtimeWindow ?? launcherWindow, nativeFromFallback);
             if (!operatorWindowTuned && aligned.source === "codex-config-window" && !codexConfigWindowWarned.has(model)) {
                 codexConfigWindowWarned.add(model);
                 log("warn", `[codex] model=${model}: no live model table readable under ${process.env.CODEX_HOME || "~/.codex"} (model_catalog_json / models_cache.json missing or invalid) — aligning against config.toml model_context_window; copy your catalog into $CODEX_HOME/models_cache.json for exact sizing`);
@@ -1079,6 +1206,15 @@ async function handleRequest(
                 windowShrinkReason = "codex";
                 codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
                 log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
+            } else if (aligned.raised === true) {
+                // #7205: bili's own codex model knowledge sizes the session
+                // LARGER than the anonymous fallback did — adopt it. No shrink
+                // reason: the nudge band widens with the window.
+                const before = reqConfig.modelContextLimit;
+                reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
+                nativeFromFallback = false;
+                codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
+                log("info", `[codex] effective window raised ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}; bili's anonymous fallback undersized the session — #7205) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
                 windowShrinkReason = "operator";
             }
@@ -1165,16 +1301,19 @@ async function handleRequest(
                   : [];
         const claudeSub = protocol === "anthropic" ? claudeSubagentAgentId(req.headers, systemTextsForSplit) : undefined;
         const responsesIdentity = protocol === "responses"
-            ? (codexTurn
-                ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
-                : preferKiroConversationIdentity(
-                      preferPromptCacheKeyIdentity(
-                          conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
-                          parsed as ResponsesRequestBody,
-                      ),
-                      parsed,
-                      req.headers,
-                  ))
+            ? preferZedThreadIdIdentity(
+                  codexTurn
+                      ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
+                      : preferKiroConversationIdentity(
+                            preferPromptCacheKeyIdentity(
+                                conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
+                                parsed as ResponsesRequestBody,
+                            ),
+                            parsed,
+                            req.headers,
+                        ),
+                  zedThreadId,
+              )
             : undefined;
         // OpenAI chat mirrors the responses pck promotion: clients that replay
         // full history statelessly (omp chat-completions via a relay) send NO
@@ -1188,11 +1327,14 @@ async function handleRequest(
             ? conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader)
             : "";
         const openaiIdentity = protocol === "openai"
-            ? preferPromptCacheKeyIdentity(
-                  convHeader
-                    ? { value: openaiSignal, source: "header" as const, clientProvided: true }
-                    : { value: openaiSignal, source: "content-fingerprint" as const, clientProvided: false },
-                  parsed as { prompt_cache_key?: unknown },
+            ? preferZedThreadIdIdentity(
+                  preferPromptCacheKeyIdentity(
+                      convHeader
+                          ? { value: openaiSignal, source: "header" as const, clientProvided: true }
+                          : { value: openaiSignal, source: "content-fingerprint" as const, clientProvided: false },
+                      parsed as { prompt_cache_key?: unknown },
+                  ),
+                  zedThreadId,
               )
             : undefined;
         // Anthropic mirrors the openai pck promotion (#268): the omp plugin
@@ -1204,11 +1346,14 @@ async function handleRequest(
             ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
             : "";
         const anthropicIdentity = protocol === "anthropic"
-            ? preferPromptCacheKeyIdentity(
-                  convHeader
-                    ? { value: anthropicSignal, source: "header" as const, clientProvided: true }
-                    : { value: anthropicSignal, source: "content-fingerprint" as const, clientProvided: false },
-                  parsed as { prompt_cache_key?: unknown },
+            ? preferZedThreadIdIdentity(
+                  preferPromptCacheKeyIdentity(
+                      convHeader
+                          ? { value: anthropicSignal, source: "header" as const, clientProvided: true }
+                          : { value: anthropicSignal, source: "content-fingerprint" as const, clientProvided: false },
+                      parsed as { prompt_cache_key?: unknown },
+                  ),
+                  zedThreadId,
               )
             : undefined;
         // Gemini native wire: no conversation-header convention, and no
@@ -1224,11 +1369,14 @@ async function handleRequest(
         // Without this, every Antigravity window shares the anonymous branch and
         // collides on the constant FNV-1a sessionId / empty-prefix affinity.
         const googleIdentity = protocol === "google"
-            ? {
-                  value: v1ConvId ?? googleSignal,
-                  source: v1ConvId || convHeader ? ("header" as const) : ("content-fingerprint" as const),
-                  clientProvided: !!v1ConvId || !!convHeader,
-              }
+            ? preferZedThreadIdIdentity(
+                  {
+                      value: v1ConvId ?? googleSignal,
+                      source: v1ConvId || convHeader ? ("header" as const) : ("content-fingerprint" as const),
+                      clientProvided: !!v1ConvId || !!convHeader,
+                  },
+                  zedThreadId,
+              )
             : undefined;
         // #2156: a request that will ride the #388 side passthrough further
         // down must NEVER participate in persona namespace resolution.
@@ -1424,13 +1572,13 @@ async function handleRequest(
                 ? googleSystemText(parsed as GoogleRequestBody)
                 : "";
         const zcodeParentIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
-        // #5719: host-stamped message ids riding this request (`biliMsgIds`,
-        // #4491 pipeline). Fed to every persona-order lane as the LAST-RESORT
-        // identity rung: when byte-level evidence was destroyed in the same
-        // turn the system text changed (full compaction ∩ volatile-field
-        // drift), an id overlap proves same-conversation and re-anchors the
-        // raw lane instead of forking a zero-state |sub: child.
-        // undefined = absent → exactly the pre-change path.
+        // Host-stamped message ids riding this request (`biliMsgIds`,
+        // #4491 pipeline) — the PIN side of the #4491/#5719 identity channel:
+        // prepare-anthropic/prepare-openai pin them onto canonical message
+        // rows (messages.msg_id) behind the rollout gate, and foreign-block
+        // sweep reads them back. (The resolver's msgid-rescue RUNG retired
+        // with the #7525 GA fork ladder — the stamped id rides verbatim now,
+        // nothing to rescue onto.) undefined = absent → nothing to pin.
         const stampedInboundMsgIds = incomingMsgIdsOf(parsed);
         // #5825 identity-channel sources fill only the absent case. Precedence:
         // (1) body-field stamps (dsh/opencode/pi host rewrites) — always win;
@@ -1462,54 +1610,51 @@ async function handleRequest(
                 }
             }
         }
-        // The pin-consumers are prepare-anthropic AND prepare-openai (#5825
-        // parity): both read + strip MSG_IDS_BODY_FIELD unconditionally before
-        // it can reach the real upstream, then pin behind the rollout gate.
-        // So a non-body source (header / harvest) stamps the parsed body on
-        // BOTH wires now — nothing extra is ever forwarded either way;
-        // response-ish protocols keep feeding the resolve rung below via this
-        // local alone.
-        if (stampedInboundMsgIds === undefined && inboundMsgIds !== undefined &&
-            (protocol === "openai" || protocol === "anthropic")) {
+        // The pin-consumers are prepare-openai, prepare-anthropic AND
+        // prepare-google/prepare-responses (#6525): all four read + strip
+        // MSG_IDS_BODY_FIELD unconditionally before it can reach the real
+        // upstream, then pin behind the rollout gate. So a non-body source
+        // (header / harvest) stamps the parsed body on EVERY wire now —
+        // nothing extra is ever forwarded either way, and a length/shape
+        // mismatch is rejected (bail) at the pin, never leaked or mis-pinned.
+        if (stampedInboundMsgIds === undefined && inboundMsgIds !== undefined) {
             (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD] = [...inboundMsgIds];
         }
-        // #5719: the RECORDED side of the msgid identity rung lives in the
-        // UNIFIED STORE — stamped requests pin these very ids onto canonical
-        // message rows (messages.msg_id, #4491), so no parallel JSON ledger
-        // is kept. #5312's view returns the FULL historical id set (live AND
-        // retired rows — retire-don't-delete, #4390), identity-only, no
-        // content hydration. Lazy by contract: resolveSessionOrder invokes
-        // it at most once, and only at a fork exit with non-empty inbound
-        // ids; null = store unavailable → byte-evidence-only path.
-        const storedMsgIdsOf = (rawKey: string): readonly string[] | null =>
-            getStore().unifiedAllMessageIds(rawKey);
         const zcodeMemory = zcodeParentIdentity?.clientProvided
             ? zcodeMemoryConversation(zcodeParentIdentity.value, req.headers)
             : undefined;
-        const conversation = zcodeMemory !== undefined ? zcodeMemory : protocol === "google"
+        // #7439 worklist — Qoder side tasks (agent/webfetch/hook summary) reuse
+        // the parent x-session-id and are tagged only in body
+        // metadata.business_type; give each its own |aux: lane (zcode-memory
+        // pattern) so they don't merge into the parent conversation. Responses
+        // wire only; plain Task subagents carry no wire marker.
+        const qoderSideTask = protocol === "responses"
+            ? qoderSideTaskConversation(
+                (responsesIdentity?.value
+                    ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)) ?? "",
+                parsed,
+            )
+            : undefined;
+        const auxSidecar = zcodeMemory ?? qoderSideTask;
+        const conversation = auxSidecar !== undefined ? auxSidecar : protocol === "google"
             // #2730: the google lane is persona-aware too — dsh stamps its one
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
             // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google
             // paths), so a review persona would otherwise merge into the main
-            // session exactly like #1916/#2203 did on the other wires. #3134:
-            // the same v2 order resolver as the other lanes since #3060 (fork
-            // keys are byte-compatible, so persisted fork lanes survive). An
-            // empty systemInstruction is non-anchoring (kernel anchor
-            // semantics): ride the verbatim id — never route empty-tag
-            // traffic through the order resolver.
+            // session exactly like #1916/#2203 did on the other wires. The
+            // same order resolver as the other lanes; #7525 GA: the stamped
+            // id rides verbatim (no fork lanes left to route into). An empty
+            // systemInstruction is non-anchoring (kernel anchor semantics):
+            // ride the verbatim id — never route empty-tag traffic through
+            // the order resolver.
             ? (!dshDeclaredPersona && dshPersona && !sideRequestLike
                 ? (personaSystemText === ""
                       ? (googleIdentity?.value ?? googleSignal)
                       : personaConversationOrder(
                           googleIdentity?.value ?? googleSignal,
-                          (parsed as GoogleRequestBody).contents,
                           personaSystemText,
-                          pluginReportedModel(req.headers),
-                          undefined,
                           undefined,
                           onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
                       ))
                   : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
@@ -1523,11 +1668,10 @@ async function handleRequest(
               (claudeSub !== undefined && opts.subagentSplit !== false
                   ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
                   : !dshDeclaredPersona && dshPersona && !sideRequestLike
-                    // #2241: continuity-aware anchor — a system change whose
-                    // history continues the raw key's prefix-affinity chain
-                    // (model switch) MIGRATES the anchor instead of forking
-                    // the main lane off the raw key; only history-discontinuous
-                    // requests (review blobs) still fork onto `|sub:<fp>`.
+                    // #2241: continuity-aware anchor (pre-GA name) — #7525 GA:
+                    // the stamped id rides verbatim; the resolver is consulted
+                    // only so a lane token could carve its own lane (none on
+                    // this wire).
                     ? (personaSystemText === ""
                           // An empty system is non-anchoring (kernel anchor
                           // semantics): ride the verbatim id — never route
@@ -1536,61 +1680,37 @@ async function handleRequest(
                            ? (anthropicIdentity?.value ?? anthropicSignal)
                            : personaConversationOrder(
                                anthropicIdentity?.value ?? anthropicSignal,
-                               (parsed as AnthropicRequestBody).messages,
                                personaSystemText,
-                               pluginReportedModel(req.headers),
-                               undefined,
                                undefined,
                                onSessionResolveEvent,
-                               inboundMsgIds,
-                               storedMsgIdsOf,
                            ))
                      : claudeAnthropicPersonaOrderApplies(req.headers) && opts.subagentSplit !== false
                        && !sideRequestLike && personaSystemText !== ""
                        // #4352: header-less claude code subagents (VS Code
-                       // build) ride the raw parent id; route them through the
-                       // continuity-aware order resolver so a history-disjoint
-                       // ride forks onto its own |sub:<fp> lane while a
-                       // continuing main conversation keeps the raw key on
-                       // order+content evidence (#2944).
+                       // build) ride the raw parent id; the resolver is
+                       // consulted only so a #5095 lane token can carve the
+                       // dispatch onto its own lane (#2944; the |sub:<fp>
+                       // fork retired with the #7525 GA content ladder).
                        // #5095 D1-C: when the bili SubagentStart hook's token
                        // rides the first user message, the resolver keys the
                        // dispatch per-TOKEN — parallel same-type dispatches
                        // stop merging on the persona fingerprint (token wins:
                        // uniqueness by construction, no prompt-collision bet).
-                       // #5095 D1-B fallback: when NO valid token rides the
-                       // wire (un-upgraded installs, disabled hook, post-fold
-                       // head loss), fall back to the dispatch task prompt
-                       // (first user message fragment) as the per-run
-                       // discriminator so the fork key widens to
-                       // |sub:<fp>:<userFp> — a self-lane isolation strictly
-                       // better than the two-segment shared key; empty
-                       // fragment degrades to it. NO other call site passes
-                       // either.
+                       // Without a token the stamped id rides verbatim.
                        ? personaConversationOrder(
                            anthropicIdentity?.value ?? anthropicSignal,
-                           (parsed as AnthropicRequestBody).messages,
                            personaSystemText,
-                           pluginReportedModel(req.headers),
                            claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
-                           anthropicFirstUserFrag((parsed as AnthropicRequestBody).messages),
                            onSessionResolveEvent,
-                           inboundMsgIds,
-                           storedMsgIdsOf,
                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
               ? (!dshDeclaredPersona && dshPersona && !sideRequestLike && personaSystemText !== ""
                     ? personaConversationOrder(
                           openaiIdentity?.value ?? openaiSignal,
-                          (parsed as OpenAIRequestBody).messages,
                           personaSystemText,
-                          pluginReportedModel(req.headers),
-                          undefined,
                           undefined,
                           onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -1600,24 +1720,18 @@ async function handleRequest(
                 // untouched for metadata-less clients).
                 ? codexTurn.value
                  : !dshDeclaredPersona && dshPersona && !sideRequestLike && ((parsed as ResponsesRequestBody).instructions ?? "") !== ""
-                   // #2203/#2241: parity with the anthropic/openai lanes —
-                   // dsh-over-Responses rides the same continuity-aware persona
-                   // anchor: a model switch (history continues the raw key's
-                   // chain) migrates the anchor on the raw key; a history-
-                   // discontinuous auto-review blob forks onto `|sub:<fp>`.
-                   // Must sit BEFORE the stableSystemAnchor branch below so a
-                   // plugin request never takes the plain-proxy verbatim anchor.
+                   // #2203: parity with the anthropic/openai lanes —
+                   // dsh-over-Responses consults the same resolver; #7525 GA:
+                   // the stamped id rides verbatim (the |sub:<fp> auto-review
+                   // fork retired with the content ladder). Must sit BEFORE the
+                   // stableSystemAnchor branch below so a plugin request never
+                   // takes the plain-proxy verbatim anchor.
                    // Empty instructions = non-anchoring (verbatim id).
                     ? personaConversationOrder(
                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                          (parsed as ResponsesRequestBody).input,
                           (parsed as ResponsesRequestBody).instructions ?? "",
-                          pluginReportedModel(req.headers),
-                          undefined,
                           undefined,
                           onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
@@ -1642,27 +1756,19 @@ async function handleRequest(
                      // not a new persona. See instructionsFingerprintApplies
                      // in src/session-id.ts.
                       ? (!sideRequestLike
-                          ? // #2250: same continuity resolver as the dsh lanes
-                            // — an instructions drift whose history continues
-                            // the raw key's chain (model switch / AGENTS.md
-                            // edit / -c override / upgrade reassembly) MIGRATES
-                            // the anchor instead of forking the main lane off
-                            // its compression state; a genuinely fresh task
-                            // reusing the id (#150) still forks `|sub:<fp>`.
-                            // Empty instructions = non-anchoring: ride the
-                            // verbatim id (codex turn-1 / metadata-less roots).
+                          ? // #2250: same resolver as the dsh lanes — #7525 GA:
+                            // the stamped id rides verbatim regardless of
+                            // instructions drift (the |sub:<fp> fork retired
+                            // with the content ladder). Empty instructions =
+                            // non-anchoring: ride the verbatim id (codex
+                            // turn-1 / metadata-less roots).
                             ((parsed as ResponsesRequestBody).instructions ?? "") === ""
                               ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
                               : personaConversationOrder(
                                 responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                                (parsed as ResponsesRequestBody).input,
                                 (parsed as ResponsesRequestBody).instructions ?? "",
-                                pluginReportedModel(req.headers),
-                                undefined,
                                 undefined,
                                 onSessionResolveEvent,
-                                inboundMsgIds,
-                                storedMsgIdsOf,
                           )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
@@ -1762,7 +1868,7 @@ async function handleRequest(
                 // the search backend keeps working instead of hard-400ing.
                 if (protocol === "responses" && isResponsesServerToolSingleShot(parsed)) {
                     log("info", `single-shot server-tool Responses call — no conversation identity possible; forwarding verbatim (#6548): ${maskUrlForLog(req.url ?? "")}`);
-                    await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+                    await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
                     return;
                 }
                 log("warn", `400: no stable conversation identity on ${protocol} request → ${maskUrlsInText(upstreamOrigin)}; refusing to create a content-fingerprint session (#286)`);
@@ -2769,7 +2875,7 @@ async function handleRequest(
                     autoModeForge: { variant, body: forgeBody, contentType },
                 };
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
-                await forward(req, res, opts, bodyBuffer, amPrepared, core, reqConfig, log, route, instanceId, affinity);
+                await forward(req, res, opts, scrubMsgIdFields(bodyBuffer, log), amPrepared, core, reqConfig, log, route, instanceId, affinity);
                 return;
             }
         }
@@ -2873,6 +2979,7 @@ async function handleRequest(
                 }
             }
             sideBody = scrubCompatDrop(sideBody, compatDropPaths, log);
+            sideBody = scrubMsgIdFields(sideBody, log);
             // Gemini and Vertex encode stream mode in the path rather than the body.
             const requestStream = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
                 && "stream" in parsed && parsed.stream === true;
@@ -3263,11 +3370,39 @@ async function handleRequest(
                         // a real model (the loop's synthetic frames read it back).
                         return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
                     }
+                    // #6181 B3: a PLUGIN-lane chained round whose input
+                    // carries no ARRAY content (absent or empty — a
+                    // bare-string input is admitted too: the provider
+                    // concatenates it to its retained chain, the same
+                    // outcome the kernel path would produce, with none of
+                    // its side effects) is a pure chain continuation — the
+                    // provider
+                    // already has the full world via its retained chain. The
+                    // kernel path for such a round is HARMFUL: it injects the
+                    // standing dev message into an otherwise-empty input and
+                    // (on the no-delta egress path) strips the chain id, so
+                    // the provider answers from nothing and the host then
+                    // chains from that BLIND response → permanent context
+                    // loss. Forward the client's bytes verbatim instead (the
+                    // same passthrough the /responses/compact endpoint
+                    // already owns: no kernel, no dev injection, no plane
+                    // side effects — the response-side ingest still updates
+                    // the session from the answer).
+                    const pureChainContinuation =
+                        protocol === "responses" &&
+                        !responsesCompact &&
+                        !wsLaneEnvelope &&
+                        pluginMode &&
+                        typeof (work as ResponsesRequestBody).previous_response_id === "string" &&
+                        (work as ResponsesRequestBody).previous_response_id!.length > 0 &&
+                        (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0);
                     const preparedOut = protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
-                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText)
-                          : responsesCompact
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText, bodyParseDeferred)
+                          : pureChainContinuation
+                            ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
+                            : responsesCompact
                             // #618: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer —
                             // forward it unchanged (byte-identical passthrough).
@@ -3277,6 +3412,17 @@ async function handleRequest(
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
                     preparedOut.model = requestModel;
+                    // #6181 B3: the compact-passthrough base hard-codes
+                    // resetAfterSuccess — which schedules a native-compaction
+                    // REBASE for the next Responses turn (reconcileNative-
+                    // CompactionBoundary → resetSessionCompression). A pure
+                    // chain-continuation round compacts nothing: honoring the
+                    // marker would wipe this session's compression state on
+                    // the next turn with no compaction ever having happened.
+                    // Drop it for the B3 route (the next turn's stage-0
+                    // resync already converges the plane when the host
+                    // resends a genuinely-compact world).
+                    if (pureChainContinuation) preparedOut.resetAfterSuccess = false;
                     return preparedOut;
                 };
                 // #1295: stamp the envelope meta onto every Prepared for this
@@ -3284,6 +3430,7 @@ async function handleRequest(
                 const runPrepare = async (): Promise<Prepared> => {
                     const p = await runPrepareInner();
                     if (ccMeta !== undefined) p.commandcode = { meta: ccMeta };
+                    if (wireFamily === "zed" && zedMeta !== undefined) p.zed = { meta: zedMeta };
                     return p;
                 };
                 // #332: codex's native remote-compaction request (trigger form)
@@ -3467,6 +3614,7 @@ async function handleRequest(
                         anonAffinity !== null,
                         log,
                         instanceId,
+                        v1Meta,
                     );
                     if (isPreflightFailFast(outcome)) {
                         // #301: the payload still overflows the window and
@@ -3601,6 +3749,13 @@ async function handleRequest(
                     clearSignedRefusal(guardScheme);
                     log("warn", `[signed-passthrough] built-in-scheme request without a working re-sign arm forwarded byte-untouched, no compression (#1884 escape hatch via resign["sdk-hmac-sha256"].passthrough / BILI_RESIGN_PASSTHROUGH — the user has acknowledged this link runs uncompressed)`);
                     forwarded = true;
+                    // #6539: no msgid-field scrub here on purpose — this is the #1884
+                    // signed-passthrough escape hatch with a body-covering signature
+                    // (sdk-hmac-sha256); mutating the body would break the signature
+                    // the client already shipped. The byte-untouched contract wins;
+                    // a stamped body on this lane rides as-is (bounded: the lane is an
+                    // explicit user opt-in, and the kernel is bypassed on this lane,
+                    // so no bili pin ever consumes the field).
                     await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
                     return;
                 }
@@ -3615,7 +3770,23 @@ async function handleRequest(
             if (guardScheme !== undefined && !resignArmable && !guardResign.enabled) {
                 clearSignedRefusal(guardScheme);
             }
-            const pendingForward = await withSessionLock(session, () => runPreparedPipeline!(true));
+            // #5403 family delta arm: a prefix-less tail-slice body cannot be
+            // processed by the legacy path — the re-anchor is a 400 the client
+            // answers by resending THIS turn in full form (one-round
+            // convergence, the same contract as every pf miss). No pf-seq
+            // stamp; mode relearned as "full" via the header.
+            let pendingForward;
+            try {
+                pendingForward = await withSessionLock(session, () => runPreparedPipeline!(true));
+            } catch (err) {
+                if (err instanceof DeltaReanchorError && !res.destroyed && !res.writableEnded) {
+                    log("warn", `[${session.id}] watermark delta re-anchor 400 (${err.reason}) — client resends in full form`);
+                    res.writeHead(400, { "content-type": "application/json", [MSGID_MODE_HEADER]: "full" });
+                    res.end(JSON.stringify({ error: { type: "pf_delta_reanchor", message: err.reason } }));
+                    return;
+                }
+                throw err;
+            }
             if (pendingForward) {
                 forwarded = true;
                 // #1195: wire clients (omp/pi on the plain proxy path) treat an
@@ -3689,6 +3860,6 @@ async function handleRequest(
                 logUnrecognizedPath(log, req.url ?? "");
             }
         }
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
     }
 }

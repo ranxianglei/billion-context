@@ -179,22 +179,38 @@ export function codexWindowNetsOutputHeadroom(source: string | undefined): boole
     return source === "codex-catalog" || source === "codex-models-cache";
 }
 
-function alignedResult(limit: number, w: number, source: CodexWindowSource): { limit: number; clamped: boolean; source: CodexWindowSource } {
-    return limit > w ? { limit: w, clamped: true, source } : { limit, clamped: false, source };
+/** #7205: `raised: true` appears ONLY when the window was raised, so the
+ *  untouched/clamped shapes stay byte-identical for existing call sites/tests. */
+function alignedResult(limit: number, w: number, source: CodexWindowSource, canRaise = false): { limit: number; clamped: boolean; raised?: boolean; source: CodexWindowSource } {
+    if (limit > w) return { limit: w, clamped: true, source };
+    if (canRaise && w > limit) return { limit: w, clamped: false, raised: true, source };
+    return { limit, clamped: false, source };
 }
 
+/** #7205: `canRaise` lets bili raise an undersized fallback-sized session to
+ *  its OWN codex model knowledge (bundled snapshot / live table / flat 272K
+ *  fallback). The incident: an anonymous alias (`codex-auto-review`) matched
+ *  no window source at all, so bili kept its generic 200K anonymous default
+ *  while bili's own codex-fallback path knew the real window was 272K — every
+ *  payload between the two died on bili's LOCAL 413 wall below the point the
+ *  model actually accepts. Raise is offered only when bili's number came from
+ *  a generic fallback (handle.ts passes `nativeFromFallback`); a client
+ *  declaration, registry hit, or operator tuning stays authoritative. */
 export function codexAlignedWindow(
     limit: number,
     model: string,
     headers: Record<string, string | string[] | undefined>,
     clientWindow?: number,
-): { limit: number; clamped: boolean; source?: CodexWindowSource } {
+    canRaise = false,
+): { limit: number; clamped: boolean; raised?: boolean; source?: CodexWindowSource } {
     if (!isCodexClient(headers)) return { limit, clamped: false };
     const cw = positiveWindow(clientWindow);
+    // Client-declared window stays NO-RAISE: the client's own declaration is
+    // authoritative for itself (it may deliberately cap below the model max).
     if (cw !== undefined) return alignedResult(limit, cw, "client-metadata");
     const live = readCodexLiveModelWindow(model, resolveCodexHome(process.env));
-    if (live !== undefined) return alignedResult(limit, live.window, live.source);
-    return alignedResult(limit, codexWindowForModel(model), lookupModel(model, TABLE) ? "bundled-snapshot" : "codex-fallback");
+    if (live !== undefined) return alignedResult(limit, live.window, live.source, canRaise);
+    return alignedResult(limit, codexWindowForModel(model), lookupModel(model, TABLE) ? "bundled-snapshot" : "codex-fallback", canRaise);
 }
 
 /** Test hook: replace the bundled table (mirrors registry._setForTest). */
