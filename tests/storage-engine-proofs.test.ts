@@ -89,13 +89,18 @@ process.env.BILI_CONFIG_FILE = path.join(
 // this suite needs the explicit legacy baseline — per-test legs override it.
 process.env.BILI_STORAGE_UNIFIED = "legacy";
 // ci:full branch (egress family default 100): scope this suite off the egress
-// PLANE. With the plane on, the openai lane SERVES the outbound conversation
-// from the op log for every session (egress-serve.ts, seg 4b) — recorded bytes
-// are replayed verbatim, so a folded summary carrier keeps its <acp> tag while
-// the legacy restart re-renders it without one (measured: turn 13 diverges on
-// all four wires; kstate pair and storage tier alone stay byte-equal). That is
-// egress-serve behavior — pinned by the egress suites — not storage-tier
-// invisibility, which is this suite's contract (goldens pre-date the plane).
+// PLANE — but note what the plane ON actually breaks here (measured 2026-11-25
+// after the renumber): with the plane on, BOTH legs record to the op log, and
+// the FULL leg serves the outbound conversation from the log verbatim
+// (egress-serve.ts seg 4b) — so a folded summary carrier KEEPS the <acp> tag
+// it was served under, while the legacy leg re-renders the same carrier
+// untagged. The tags themselves now AGREE (renumber, docs/egress-plane.md §10:
+// the op log's number IS the kernel citation number, system = 0 — the earlier
+// "op log mints m00001 = egress-system, shifts every citation" corruption is
+// fixed and pinned by tests/egress-load-refs-overlay.test.ts); the remaining
+// turn-13 delta is the tag carrier, i.e. egress-serve's "logged bytes are the
+// transcript" semantics — pinned by the egress suites, not by this one, whose
+// contract is storage-TIER invisibility (its goldens pre-date the plane).
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 
 const CORPUS_ROOT = path.resolve(import.meta.dirname, "golden/storage-corpus");

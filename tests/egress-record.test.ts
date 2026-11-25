@@ -96,7 +96,9 @@ test("recording: turn1 = full +I batch; turn2 tail append = exactly one +I", () 
 
         const t2 = [t1[0], t1[1], M("c", "three")];
         view = recordEgressTurn({ store: H.store, sessionId: S, prev: view, conversation: t2, systemText: "SYS", nowMs: 2000 });
-        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND log_seq > 3").get(S) as { c: number };
+        // Renumber (2026-11-25): turn1's rows are system=0, a=1, b=2 (the
+        // system row no longer consumes number 1) — the new tail row is 3.
+        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND log_seq > 2").get(S) as { c: number };
         assert.equal(added.c, 1, "tail append records exactly ONE new op row");
         const last = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? ORDER BY log_seq DESC LIMIT 1").get(S) as { row_type: string; msgid: string };
         assert.deepEqual({ row_type: last.row_type, msgid: last.msgid }, { row_type: "I", msgid: "c" });

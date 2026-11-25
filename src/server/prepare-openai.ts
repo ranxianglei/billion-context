@@ -715,6 +715,7 @@ export async function prepareOpenai(
                         systemText: openaiOutboundSystem,
                         nowMs: Date.now(),
                         blockLedger: egressBlockLedgerFor(session),
+                        refMap: session.state.messageRefs,
                     });
                     const reb = rebuildOutboundFromLog(view);
                     if (reb !== null) {
@@ -974,6 +975,7 @@ export async function prepareOpenai(
                     systemText: openaiOutboundSystem ?? openaiSystemText,
                     nowMs: Date.now(),
                     blockLedger: egressBlockLedgerFor(session),
+                    refMap: session.state.messageRefs,
                 });
             }
         } catch (err) {

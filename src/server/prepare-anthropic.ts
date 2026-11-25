@@ -602,7 +602,7 @@ export async function prepareAnthropic(
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinMode === "incremental", sideRequest: anthropicTitleGen });
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
-                const served = recordAuthorityTurn(st, sessionId, auth, extractSystem(systemOut) ?? "", log, egressBlockLedgerFor(session));
+                const served = recordAuthorityTurn(st, sessionId, auth, extractSystem(systemOut) ?? "", log, egressBlockLedgerFor(session), session.state.messageRefs);
                 if (served !== null) {
                     rebuiltMessages = coreToAnthropic(served, anthropicCacheMarks ?? clientCacheControls);
                 }
