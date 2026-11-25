@@ -166,11 +166,12 @@ export const WEB_CLIENT = `(function () {
         const pinMatch = /[?&]lang=([^&]*)/i.exec(search);
         const pinned = pinMatch && pinMatch[1] ? pinMatch[1] : null;
         if (pinned === "zh" || pinned === "zh-CN") locale = "zh-CN";
-        else if (pinned === "en") locale = "en";
+        else if (pinned === "en" || pinned === "ko") locale = pinned;
         else {
             const saved = localStorage.getItem("bili-language");
-            if (saved === "en" || saved === "zh-CN") locale = saved;
+            if (saved === "en" || saved === "zh-CN" || saved === "ko") locale = saved;
             else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
+            else if (/^ko([-_]|$)/i.test(navigator.language || "")) locale = "ko";
         }
     } catch (e) {}
     // #3373: when the panel is served through a host relay under a path
@@ -212,8 +213,14 @@ export const WEB_CLIENT = `(function () {
         if (packSelEl && prev && packNames.includes(prev)) packSelEl.value = prev;
         if (rerenderQuick) rerenderQuick();
     }
+    const LOCALE_CYCLE = ["zh-CN", "en", "ko"];
+    const LOCALE_NAMES = { "zh-CN": "中文", en: "English", ko: "한국어" };
+    function nextLocale() {
+        return LOCALE_CYCLE[(LOCALE_CYCLE.indexOf(locale) + 1) % LOCALE_CYCLE.length];
+    }
     function t(key, vars) {
         let text = MESSAGES[locale][key];
+        if (text === undefined && locale === "ko") text = MESSAGES.en[key];
         if (text === undefined) text = MESSAGES["zh-CN"][key];
         if (text === undefined) text = key;
         if (vars) for (const name of Object.keys(vars)) text = text.split("{" + name + "}").join(String(vars[name]));
@@ -441,6 +448,7 @@ export const WEB_CLIENT = `(function () {
         if (typeof v === "string") return v;
         if (v && typeof v === "object") {
             if (v[locale] !== undefined && typeof v[locale] === "string") return v[locale];
+            if (locale === "ko" && typeof v.en === "string") return v.en;
             if (v["zh-CN"] !== undefined && typeof v["zh-CN"] === "string") return v["zh-CN"];
             if (v.en !== undefined && typeof v.en === "string") return v.en;
             const vals = Object.values(v);
@@ -636,7 +644,7 @@ export const WEB_CLIENT = `(function () {
         document.querySelectorAll("[data-i18n-ph]").forEach((el) => { el.setAttribute("placeholder", t(el.getAttribute("data-i18n-ph"))); });
         document.querySelectorAll("[data-i18n-title]").forEach((el) => { el.setAttribute("title", t(el.getAttribute("data-i18n-title"))); });
         const tog = $("language-toggle");
-        if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
+        if (tog) tog.textContent = LOCALE_NAMES[nextLocale()];
         bindSessionColumns();
     }
 
@@ -730,6 +738,7 @@ export const WEB_CLIENT = `(function () {
         const href = "#/session/" + encodeURIComponent(s.id);
         return '<a class="slink" href="' + href + '"><span class="row-title clip w-title' + (named ? "" : " faint") + '">' + escapeHtml(name) + "</span>"
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
+            + (s.parentSessionId ? ' <span class="badge proto" title="' + escapeHtml(t("ses.badge_child_tip")) + '">' + t("ses.badge_child") + "</span>" : "")
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
 + (s.keepalive ? ' <span class="badge live" style="background:#3b6d8a" title="' + escapeHtml(t("det.keepalive_tip") + " · " + s.keepalive.tierLabel + " · " + (s.keepalive.cadenceMs >= 60_000 ? Math.round(s.keepalive.cadenceMs / 60_000) + "min" : Math.round(s.keepalive.cadenceMs / 1000) + "s") + (s.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(s.keepalive.lastHitAt).toISOString()) : "")) + '">' + t("det.keepalive_short") + "×" + s.keepalive.pingCount + "</span>" : "")
@@ -1847,11 +1856,13 @@ function changelogCatOf(rawLine) {
         const protocol = filterValue("ses-protocol");
         const client = filterValue("ses-client");
         const state = filterValue("ses-state");
+        const kind = filterValue("ses-kind");
         return API_ROOT + "/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE +
             (q ? "&q=" + encodeURIComponent(q) : "") +
             (protocol ? "&protocol=" + encodeURIComponent(protocol) : "") +
             (client ? "&client=" + encodeURIComponent(client) : "") +
-            (state ? "&state=" + encodeURIComponent(state) : "");
+            (state ? "&state=" + encodeURIComponent(state) : "") +
+            (kind ? "&kind=" + encodeURIComponent(kind) : "");
     }
     function filterValue(id) {
         const el = $(id);
@@ -1893,7 +1904,7 @@ function changelogCatOf(rawLine) {
     }
     function hasActiveFilters() {
         const q = (($("ses-search") && $("ses-search").value) || "").trim();
-        return Boolean(q || filterValue("ses-protocol") || filterValue("ses-client") || filterValue("ses-state"));
+        return Boolean(q || filterValue("ses-protocol") || filterValue("ses-client") || filterValue("ses-state") || filterValue("ses-kind"));
     }
     function updatePager() {
         const prev = $("ses-prev");
@@ -1921,7 +1932,7 @@ function changelogCatOf(rawLine) {
     function resetSessionFilters() {
         const search = $("ses-search");
         if (search) search.value = "";
-        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
+        ["ses-protocol", "ses-client", "ses-state", "ses-kind"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
         return refreshSessions(false, 1);
     }
     function renderSessionTable() {
@@ -3904,7 +3915,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (!mdBtn && !pngBtn) return;
         var safeId = String(d.id).replace(/[^A-Za-z0-9._-]/g, "_");
         var base = "billion-context-report-" + safeId;
-        var q = "session=" + encodeURIComponent(d.id) + "&mask=on&lang=" + (locale === "en" ? "en" : "zh-CN");
+        var q = "session=" + encodeURIComponent(d.id) + "&mask=on&lang=" + locale;
         if (mdBtn) mdBtn.addEventListener("click", async function () {
             busy(mdBtn, true);
             try {
@@ -4595,6 +4606,10 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
+            // #7666: degenerate-retry budget + nudge sentences.
+            const dr = (cp && cp.degenerateRetry && typeof cp.degenerateRetry === "object" && !Array.isArray(cp.degenerateRetry)) ? cp.degenerateRetry : null;
+            degenMax.value = dr && typeof dr.maxAttempts === "number" ? String(dr.maxAttempts) : "";
+            degenNudges.value = dr && Array.isArray(dr.nudges) ? dr.nudges.join("\\n") : "";
             rnRow.inp.checked = cp ? cp.requireNudge === true : false;
             rrRow.inp.checked = cp ? cp.requireRecommendation === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
@@ -4798,6 +4813,66 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         rrHint.className = "dim small";
         rrHint.textContent = t("cfg.q_require_rec_hint");
         rrRow.ctl.appendChild(rrHint);
+        // #7666: degenerate-terminal retry — attempt count + custom nudge
+        // sentences (compress.degenerateRetry; resolved global→provider→model
+        // server-side). The nudge rides the retry request only, never context.
+        const degenMax = textRow("quick-degen-max", t("cfg.q_degen_retry_max"), t("cfg.q_degen_retry_max_ph"));
+        degenMax.type = "number";
+        degenMax.min = "0";
+        degenMax.max = "5";
+        degenMax.style.flex = "0 0 140px";
+        qCtrls.push(degenMax);
+        degenMax.addEventListener("change", () => commit((d) => {
+            const v = degenMax.value.trim();
+            const c = compressOf(d);
+            if (v === "" || v === "1") {
+                if (c) {
+                    const dr = (c.degenerateRetry && typeof c.degenerateRetry === "object" && !Array.isArray(c.degenerateRetry)) ? c.degenerateRetry : null;
+                    if (dr) { delete dr.maxAttempts; if (Object.keys(dr).length === 0) delete c.degenerateRetry; }
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+                return;
+            }
+            const n = Number(v);
+            if (!Number.isInteger(n) || n < 0 || n > 5) { degenMax.value = ""; return; }
+            if (!c) d.compress = {};
+            const dr = (d.compress.degenerateRetry && typeof d.compress.degenerateRetry === "object" && !Array.isArray(d.compress.degenerateRetry)) ? d.compress.degenerateRetry : {};
+            dr.maxAttempts = n;
+            d.compress.degenerateRetry = dr;
+        }));
+        const degenNudgesRow = document.createElement("div");
+        degenNudgesRow.style.cssText = "display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap";
+        const degenNudgesLab = document.createElement("label");
+        degenNudgesLab.htmlFor = "quick-degen-nudges";
+        degenNudgesLab.style.cssText = "flex:0 1 auto;max-width:520px;align-self:center";
+        degenNudgesLab.textContent = t("cfg.q_degen_retry_nudges");
+        const degenNudges = document.createElement("textarea");
+        degenNudges.id = "quick-degen-nudges";
+        degenNudges.className = "editor mono";
+        degenNudges.spellcheck = false;
+        degenNudges.rows = 3;
+        degenNudges.placeholder = t("cfg.q_degen_retry_nudges_ph");
+        degenNudges.style.cssText = "flex:1 1 480px;max-width:720px";
+        degenNudgesRow.appendChild(degenNudgesLab);
+        degenNudgesRow.appendChild(degenNudges);
+        box.appendChild(degenNudgesRow);
+        qCtrls.push(degenNudges);
+        degenNudges.addEventListener("change", () => commit((d) => {
+            const lines = degenNudges.value.split("\\n").map((s) => s.trim()).filter((s) => s.length > 0);
+            const c = compressOf(d);
+            if (lines.length === 0) {
+                if (c) {
+                    const dr = (c.degenerateRetry && typeof c.degenerateRetry === "object" && !Array.isArray(c.degenerateRetry)) ? c.degenerateRetry : null;
+                    if (dr) { delete dr.nudges; if (Object.keys(dr).length === 0) delete c.degenerateRetry; }
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+                return;
+            }
+            if (!c) d.compress = {};
+            const dr = (d.compress.degenerateRetry && typeof d.compress.degenerateRetry === "object" && !Array.isArray(d.compress.degenerateRetry)) ? d.compress.degenerateRetry : {};
+            dr.nudges = lines.slice(0, 8);
+            d.compress.degenerateRetry = dr;
+        }));
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
@@ -5723,7 +5798,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     function initStaticHandlers() {
         const tog = $("language-toggle");
         if (tog) tog.addEventListener("click", () => {
-            locale = locale === "zh-CN" ? "en" : "zh-CN";
+            locale = nextLocale();
             try { localStorage.setItem("bili-language", locale); } catch (e) {}
             // #2321: a ?lang= pin would silently re-force the old language on a
             // plain reload — drop it so the manual choice sticks.
@@ -5742,7 +5817,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         }
         const sref = $("ses-refresh");
         if (sref) sref.addEventListener("click", () => refreshSessions(true, sesPage));
-        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => {
+        ["ses-protocol", "ses-client", "ses-state", "ses-kind"].forEach((id) => {
             const el = $(id);
             if (el) el.addEventListener("change", () => refreshSessions(false, 1));
         });
