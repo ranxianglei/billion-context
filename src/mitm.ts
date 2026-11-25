@@ -8,6 +8,7 @@ import { isLoopbackAddress } from "./util.js";
 import { maskHostForLog, maskHostInText, maskHostPortForLog } from "./log-mask.js";
 import { mitmHandshakeTimeoutMs as knobMitmHandshakeTimeoutMs } from "./knobs.js";
 import { DEFAULT_MITM_DOMAINS, matchesAnyMitmDomain } from "./mitm-domains.js";
+import { noteMitmTunnel } from "./quiet-traffic.js";
 
 // Re-exported so existing importers (launcher.ts) keep their path; the const
 // itself lives in the leaf module so config.ts can use it without importing
@@ -300,7 +301,8 @@ function doMitm(
     // the cleartext bytes — exactly the same path as a direct (non-proxy)
     // request, so handle()/forward() work unmodified.
     server.emit("connection", tlsSocket);
-    log(`mitm ${maskHostForLog(host)}:${port} tunnel established (TLS terminated locally)`);
+    const tunnelLine = noteMitmTunnel(`${host}:${port}`, `${maskHostForLog(host)}:${port}`);
+    if (tunnelLine !== null) log(tunnelLine);
 }
 
 /** Read the MITM upstream marker from a request's underlying socket.

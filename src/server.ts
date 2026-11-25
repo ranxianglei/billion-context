@@ -137,6 +137,7 @@ import { dropCompatFieldsJson } from "./compat-drop.js";
 import { handleAdminRoute } from "./server/admin.js";
 import { handle } from "./server/handle.js";
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
+import { isQuietPollPath } from "./quiet-traffic.js";
 import {
     clientErrorBackstopMs as knobClientErrorBackstopMs,
     countTokensPassthrough as knobCountTokensPassthrough,
@@ -776,6 +777,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         const connRec = connRecords.get(req.socket);
         if (connRec) {
             connRec.requests++;
+            const quiet = isQuietPollPath(req.url ?? "");
+            connRec.quiet = connRec.requests === 1 ? quiet : connRec.quiet && quiet;
             res.on("finish", () => { connRec.lastResponseEndAt = Date.now(); });
         }
         try {
@@ -933,8 +936,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         lingerBackstopAt: number | null;
         /** #2895: the self-restart force-close owns this socket — classify as intentional (never ABORTIVE) and bypass the post-response linger arm. */
         restartForced: boolean;
+        /** Every request on this connection was a Remote Control work poll: its info/debug lifecycle lines are skipped (warnings still log). */
+        quiet: boolean;
     }
     const connRecords = new Map<net.Socket, ConnRecord>();
+    const isQuietConn = (rec: ConnRecord): boolean => rec.quiet || rec.paired?.quiet === true;
     let connSeq = 0;
     // #1982: turn the proxy-initiated post-response close from abortive into
     // graceful. Node's destroySoon() — the Connection: close disposition in
@@ -980,7 +986,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             if (why === "backstop") {
                 rec.lingerBackstopAt = performance.now();
                 log("warn", `[conn#${rec.id}] ${rec.kind} linger backstop: no peer close signal ${knobPostResponseLingerMs()}ms after post-response close — destroying (peer may see RST/ECONNRESET)`);
-            } else if (why === "peer-fin") {
+            } else if (why === "peer-fin" && !isQuietConn(rec)) {
                 log("debug", `[conn#${rec.id}] ${rec.kind} linger complete: peer close signal received — closing cleanly`);
             }
             origDestroy();
@@ -1009,7 +1015,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 return origDestroy();
             }
             armed = true;
-            log("info", `[conn#${rec.id}] ${rec.kind} post-response close: lingering for peer close signal (budget ${knobPostResponseLingerMs()}ms)`);
+            if (!isQuietConn(rec)) log("info", `[conn#${rec.id}] ${rec.kind} post-response close: lingering for peer close signal (budget ${knobPostResponseLingerMs()}ms)`);
             // http leaves the socket paused between requests; without resume()
             // the peer's EOF would never reach us and every linger would run
             // out on the backstop. Draining also removes unread recv residual
@@ -1040,6 +1046,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             paired: null,
             lingerBackstopAt: null,
             restartForced: false,
+            quiet: false,
         };
         connRecords.set(socket, rec);
         if (socket instanceof tls.TLSSocket) {
@@ -1111,7 +1118,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // intentional path carries its own dedicated marker above.
             if (reason === "destroyed") {
                 log("warn", `[conn#${rec.id}] ${rec.kind} closed reason=destroyed age=${now - rec.openedAt}ms reqs=${rec.requests} [ABORTIVE — peer may see RST/ECONNRESET]`);
-            } else {
+            } else if (!isQuietConn(rec) || rec.errored) {
                 log("debug", `[conn#${rec.id}] ${rec.kind} closed reason=${reason} age=${now - rec.openedAt}ms reqs=${rec.requests}`);
             }
         });

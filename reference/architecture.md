@@ -131,6 +131,7 @@ billion-context/
 │   ├── tool-ring.ts              # Zero-injection session identity witness ring (#1685)
 │   ├── tunnel-guard.ts           # Tunnel admission for /bili/<url> zero-config branch (#409)
 │   ├── mitm.ts                   # CONNECT MITM proxying (handshake timeout knob-resolved)
+│   ├── quiet-traffic.ts          # Rate-limited logging for Remote Control work polls and MITM tunnel setup
 │   ├── ca.ts                     # Lazy root CA generation + OS trust-bundle discovery
 │   ├── apig-resign.ts            # APIG SDK-HMAC-SHA256 re-signing after body rewrite (#1884)
 │   ├── compat-roles.ts           # Wire-compat role rewrite resolution (learn-on-failure)

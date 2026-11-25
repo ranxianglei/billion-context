@@ -75,6 +75,7 @@ import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering
 import { estimateWireOverhead, outputBudgetField, readOutputBudget, writeOutputBudget } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
+import { isQuietPollPath, noteQuietPoll } from "../quiet-traffic.js";
 import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferStreamIfFits, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
@@ -803,9 +804,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
     // proxied URL is the only useful signal in the log.
-    log("info", currentFetchTransport()
-        ? `forward WS → ${maskUrlForLog(upstreamUrl.replace(/^http/, "ws"))}`
-        : `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`);
+    if (isQuietPollPath(req.url ?? "")) {
+        const summary = noteQuietPoll();
+        if (summary !== null) log("info", summary);
+    } else {
+        log("info", currentFetchTransport()
+            ? `forward WS → ${maskUrlForLog(upstreamUrl.replace(/^http/, "ws"))}`
+            : `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`);
+    }
     if (opts.debug && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);
@@ -2186,7 +2192,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // this line byte-identical to before). Read-only: no recovery decision
         // here depends on it.
         const terminalCause = rejectionDiagnosticSuffix(bodyText);
-        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}${terminalCause}`);
+        const quietPath = isQuietPollPath(req.url ?? "") ? ` (${req.method} ${maskUrlForLog(upstreamUrl)})` : "";
+        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${quietPath}${reqIdText}: ${snippet}${terminalCause}`);
         // #7537 (owner ruling 2026-11-22): local estimate-refusals are gone —
         // when the UPSTREAM itself rejects the body as too large, its verdict
         // is authoritative. bili logs its own measurement as evidence and marks
