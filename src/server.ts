@@ -16,7 +16,7 @@ import { withExitDeadline } from "./exit-deadline.js";
 import { effectivePromptCacheRouting, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
-import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
+import { egressSummary, getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { buildProxyFailureResponse, isExpectedFailFast, type SkippedProxyInfo } from "./upstream-fail.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 import { subagentPromptTask } from "./session-title.js";
@@ -1455,6 +1455,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : "")
                 + (opts.passthrough ? " — PASSTHROUGH (compression OFF)" : ""),
         );
+        // #7750: make the effective egress path (direct vs upstream proxy)
+        // answerable at a glance — the SAME decision the request path makes.
+        {
+            const egress = egressSummary(opts.routes, opts.proxy, opts.upstream, opts.proxyFallback);
+            log(
+                "info",
+                `[egress] model upstream ${egress.upstream} → ${egress.mode === "proxied" ? `proxied via ${egress.proxy} (source: ${egress.source})` : `direct (source: ${egress.source})`}`,
+            );
+        }
         // #4994 rung 2: the spawner's timeout adoption parses THIS child's
         // pid-tagged listen line out of the per-port log when it laddered off
         // the preferred port — but post-#2864 the muted stderr leg means the

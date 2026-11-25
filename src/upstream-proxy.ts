@@ -356,6 +356,42 @@ export function resolveProxy(
     return resolveProxyDecision(routes, globalProxy, upstreamUrl, fallback).proxy;
 }
 
+export type EgressSummary = {
+    /** "proxied" when the request path would route through an upstream proxy, "direct" otherwise. */
+    mode: "direct" | "proxied";
+    /** The proxy address with credentials masked (redactProxyUrl) when proxied; null when direct. */
+    proxy: string | null;
+    /** Where the decision came from (global source name / "provider" / env var name / "windows-system" / "direct" / …). */
+    source: string;
+    /** The upstream this decision applies to. */
+    upstream: string;
+};
+
+/** #7750: the effective egress path for a model upstream — the SAME decision
+ *  the request path makes (resolveProxyDecision), summarized for the display
+ *  surfaces (/__bili/status + the startup log) so "am I already on the
+ *  upstream proxy?" is answerable at a glance. Purely diagnostic: never read
+ *  by egress decisions. Proxy credentials are masked. A decision error
+ *  degrades to a direct/null summary rather than failing the surface. */
+export function egressSummary(
+    routes: ProviderRoutes,
+    globalProxy: string | undefined,
+    upstream: string | undefined,
+    fallback: ProxyFallbackOptions = {},
+): EgressSummary {
+    try {
+        const decision = resolveProxyDecision(routes, globalProxy, upstream, fallback);
+        return {
+            mode: decision.proxy !== undefined ? "proxied" : "direct",
+            proxy: decision.proxy !== undefined ? (redactProxyUrl(decision.proxy) ?? null) : null,
+            source: decision.source,
+            upstream: upstream ?? "",
+        };
+    } catch {
+        return { mode: "direct", proxy: null, source: "error", upstream: upstream ?? "" };
+    }
+}
+
 /** Keep-alive reuse ceiling for PROXIED dispatchers (#1263): common proxies
  *  recycle idle tunnels on a 60s-ish cadence; undici honors server
  *  Keep-Alive hints up to its 600s max, so a reused-just-recycled socket is
