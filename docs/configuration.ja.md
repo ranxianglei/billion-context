@@ -103,8 +103,12 @@
 | `rollout.features.salt` | string | the feature name | — | バケット分割用のハッシュソルト。変更するとコホート全体が再ランダム化される（シャッフルする唯一の方法；パーセンテージを上げるだけではシャッフルされない）。 |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | ネストされたロールアウト：指定された機能の有効化コホート内でのみこの機能を評価し、パーセンテージがその母集団に対する相対値となる（Aのユーザーに対してBをロールアウト；チェーンは許可、サイクルはクローズドに失敗する）。 |
 | `rollout.features.identityChannelHarvest` | boolean \| number | 0 (off) | BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST | IDチャネル収穫コホートゲート (#5825)：インストールごとの環境スイッチなしで、ループバック専用のトランスクリプト/sqlite収穫（`src/identity-harvest.ts`: claude-code / codebuddy / mcode / goose / qwen レーン）を許可する。インストールごとのスイッチ（`BILI_IDENTITY_HARVEST`）もこのキーも設定されていない場合、クライアントストレージは一切読み取られない。オーナー裁定 2026-11-07：このコホートキーは `rollout.features.pluginLaneServerHistory`（承認済みIDの行固定を管理）とは意図的に分離されている — いずれかのイネーブラーが収穫を有効化できる。デフォルト 0%；小規模コホートでの degrade warn-once レートの観察後に引き上げる。`identity-channels.md` を参照。 |
-| `rollout.features.pluginLaneServerHistory` | boolean \| number | 0 (off) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | プラグインレーンのサーバー所有履歴 (#4491)：有効化されたインストールにおいて、(a) プラグインレーンのリクエストは `messages` と並行して内部 `biliMsgIds` 配列を持ち、メッセージIDをクライアント提供のIDに固定できる（上流転送前に常に除去；不正な配列は警告付きで無視、ID汚染形状は増分レーンでハードフェイル）；(b) ループバック専用の `POST /__bili/plugin/render` エンドポイントは、統合トランスクリプトからレンダリングされた送信プレフィックスを提供する（折り畳み領域はサマリアンカーに縮小；デシンクは非2xxにデグレードし、シムはローカル履歴にフォールバック）；(c) 増分レーンのプローブは `serverHistory` をアドバタイズする。デフォルト 0% — ロールアウトされるまで挙動は変わらない。 |
-| `rollout.features.pluginFullResendWatermark` | boolean \| number | 5 (experimental grey) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | フルリセンドウォーターマークファストパス (#5403/#5418)：前回のレスポンスに `x-bili-pf-seq` ス tamp を持っていたプラグインレーンのチャットコンプリートターンでは、エコーされたカウントにより再送信プレフィックスをアサートする（構造スキャン、フルパースなし）；ヒット時にパイプラインはスタッシュされた正規プレフィックスコアと新しいテールウィンドウのみを消費する（バイト同一の送信プロベナンス；疑義がある場合はターンごとに未変更のフルパースパスにフォールバックし再スタンプ、5回のクレジットミスでレーンを1時間保持）。クライアントがスタンプを `x-bili-pf-count` としてエコーバックすることを要求（dsh/pi/opencode/omp は対応；未適応レーンはヒットしない）。実験的グレースケールロールアウト — インストールの約5%でデフォルトON（オーナー裁定 2026-11-02：GA前に小規模コホート；Web UIで全インストールに一度限りの導入通知、クイック設定に3状態スイッチ）。`true` で強制、`false`（またはパーセンテージ）/ 環境変数 = 0 でオフ。`technical-notes.md` の「Full-resend watermark fastpath」を参照。 |
+| `rollout.features.pluginLaneServerHistory` | boolean \| number | 100 (on, GA) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | プラグインレーンのサーバー所有履歴 (#4491)：有効化されたインストールにおいて、(a) プラグインレーンのリクエストは `messages` と並行して内部 `biliMsgIds` 配列を持ち、メッセージIDをクライアント提供のIDに固定できる（上流転送前に常に除去；不正な配列は警告付きで無視、ID汚染形状は増分レーンでハードフェイル）；(b) ループバック専用の `POST /__bili/plugin/render` エンドポイントは、統合トランスクリプトからレンダリングされた送信プレフィックスを提供する（折り畳み領域はサマリアンカーに縮小；デシンクは非2xxにデグレードし、シムはローカル履歴にフォールバック）；(c) 増分レーンのプローブは `serverHistory` をアドバタイズする。デフォルト 100%（GA、オーナー裁定 2026-11-13）；0 に設定するとインストールは GA 前の状態に戻る。 |
+| `rollout.features.pluginMsgIdIncremental` | boolean \| number | 100 (on, GA) | BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL | 増分 msgid pin チャネル(#7064 §8、オーナー裁定 2026-11-18/19)：定常プラグインターンはメッセージ ID を**テール形態**で申告する — 有界な `x-bili-pf-tail-ids` ヘッダー（アンカー+新規 ID、≤ 2048 個、`?` プレースホルダ）または短い body ID 配列 — 全リストを置き換える。サーバーは自前の台帳 live 行からプレフィックス ID を再スタンプする（ingest は INSERT OR IGNORE on (session_id,seq) — 位置の msg_id は一度だけ書き込まれ、決して上書きされない）。受理規則（2026-11-19 定石）：申告されたテール [T-L, T-1] と台帳の重複区間が逐行一致すること（1行でもずれれば `full` にデグレード、400 はしない）；超長セッション（> 2048）も切り詰められたテールで同じく pin できる — 重複区間が長いほど証拠は強い。スナップショットラウンド（台帳空/折り畳み後の再アンカー）のみ全形態を送る；両方到着時は全形態が優先。レスポンスは `x-bili-msgid-mode: incremental\|full` を載せる（4xx でクリア、x-bili-pf-seq と同じ学習ポイント）。不一致は 1 ラウンドで自己修復。デフォルト 100%；0 で全リスト pin にロールバック（機能前とバイト一致）。pluginLaneServerHistory が必要。session-identity-resolution.md 参照。 |
+| `rollout.features.egressPlane` | boolean \| number | 100 (on — ci:full verification branch) | BILI_ROLLOUT_EGRESS_PLANE | egress プレーン — 新しい経路全体の**単一スイッチ**(#7398/#7439；退役した egressOpLog/egressServeLog の二キーを置き換え)。ON：全 wire レーン（OpenAI/Anthropic/Responses/Google）が毎ターン送信会話ビューをスパース op（I/D/U）として egress_state/egress_flow デュアルテーブルに記録 — 行は**自己完結**（メッセージバイトが同行する；コンテンツ CAS を経由しない、裁定 7439-1）— 送信コアメッセージ部分を op ログから復元し再構築、構造によりバイト一致（行内バイトはパイプライン自身の最終 core JSON）；ピン留め済みプラグインレーンは加えてサーバー権威を取得 — カーネル入力をフローからリプレイ（裁定 7439-3/5）。有界の遡行ラダーで最新の健全ログ点に回復；再構築不能行（バイト欠落/空、未知 role）、ログ破損、プローブ失敗のいずれかで**そのターン全体**をレガシーチェーンにデグレード — 部分的な swap は絶対にしない、クライアントを権威にしない。system ブロックは両経路でライブ構築のまま（プレフィックスキャッシュアンカー規律）。SQLite レーンのみ；タイトル生成/圧縮のサイドリクエストは除外。デフォルト 0 = オフ：レガシー経路、0 行、機能前とバイト一致。第 2 回（KDD #23）：egress-on セッションでは `messages` テーブルは**遅延投影**——ターンごとの ingest なし、pin チャネルは op ログの I 行を解決、セッション JSON エンベロープはブートストラップで凍結——ターンごとのコストは台帳サイズに関係なく O（ライブウィンドウ）のまま（10w 累計実測 638 ms p50；常駐ガード：`tests/egress-bench.test.ts`、PR #6785 ドキュメント §6）。 |
+| `rollout.features.pluginDeltaResend` | boolean \| number | 0 (off) | BILI_ROLLOUT_PLUGIN_DELTA_RESEND | Delta 再送 — フルリセンドウォーターマークレーンのテールスライス形態：定常プラグインレーンのターンは `x-bili-pf-delta: 1` + body.messages = 新要素のみ（L = T − stampT、プレフィックスなし）を送る；サーバーはスタッシュ済みプレフィックスコアとパース済みテールからビューを再構築する（フルレーンと同一のヒット由来）。満たせない主張（count/body/tail-ids 幅の不一致、既知リスト後のアンカーチェーン破断、ロールアウトオフ）は 400 `pf_delta_reanchor` + `x-bili-msgid-mode: full` を返し、クライアントはそのターンをフルフォームで再送する — 1ラウンドで収束、静かな誤パースは絶対にしない。デフォルトオフ：delta body はこのアームを持たないサーバーでは処理できないため、クライアント送信側が実装されるまでキーは 0 のまま。`technical-notes.md` の「Delta resend」を参照。 |
+| `rollout.features.pluginFullResendWatermark` | boolean \| number | 100 (GA — on by default) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | フルリセンドウォーターマークファストパス (#5403/#5418)：前回のレスポンスに `x-bili-pf-seq` ス tamp を持っていたプラグインレーンのチャットコンプリートターンでは、エコーされたカウントにより再送信プレフィックスをアサートする（構造スキャン、フルパースなし）；ヒット時にパイプラインはスタッシュされた正規プレフィックスコアと新しいテールウィンドウのみを消費する（バイト同一の送信プロベナンス；疑義がある場合はターンごとに未変更のフルパースパスにフォールバックし再スタンプ、5回のクレジットミスでレーンを1時間保持）。クライアントがスタンプを `x-bili-pf-count` としてエコーバックすることを要求（dsh/pi/opencode/omp は対応；未適応レーンはヒットしない）。GA — デフォルトON（オーナー裁定 2026-11-22、PR #6785：5%グレースケールは2026-11-02以降問題なく運用）；Web UIで全インストールに一度限りの導入通知、クイック設定に3状態スイッチ。`false`（またはパーセンテージ）/ 環境変数 = 0 でオフ。`technical-notes.md` の「Full-resend watermark fastpath」を参照。 |
+| `rollout.features.passDshExtensions` | boolean \| number | 0 (off = intercept) | BILI_ROLLOUT_PASS_DSH_EXTENSIONS | DSHクライアント拡張インターセプト (#7168/#7439)：DSH（deepseek-harness）は全リクエストにトップレベルの `dsh_*` フィールドを載せる — `dsh_session_log`（公式 DeepSeek API 向けの 8 MiB 無損セッションログアップロード；モデルは読まない）と姉妹フィールド `dsh_plugin_packages`；フォーク/シードされたセッションはウォーターマークが追いつくまで毎ターンログ全体を再送する。デフォルト 0% = インターセプト：bili は受信ボディの解析後、プロトコルパスが送信を構築する前に、すべてのトップレベル `dsh_*` キーを削除する（`src/server/handle.ts`）ため、8 MiB は決して上流に転送されない — バンド幅の無駄がなく、非 DeepSeek 上流での未知フィールドリスクもない。DSH には影響なし：アップロードウォーターマークは 2xx のみで前進し、bili は依然 2xx を返すため、再送は自己修復する。ウィンドウメーターは #7168 の dsh_* スキップ（`src/preflight.ts`）で別途免除。サーバー権威エグレス作業（#6785 / ディスカッション #7439）がクライアント拡張サイドバンドを搭載したら 100% に切り替える（またはストリップを削除する）ことでリリース；当面は `true` / 環境変数 = 1 でパストスルーを強制。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | ログ内の非公開ターゲットホストを <private-host> としてマスクする。認証情報ヘッダーは常にマスクされる。 |
 | `security.adminRelay` | boolean | false | — | エンベディングホスト（現在は dsh web）が、リモートブラウザからパネルを開けるように（#3373）、その自身のエントリーオリジンを通じて /__bili/ 管理サーフェス全体をリレーすることを許可する。フェイルクローズ、ファイルのみ。リレーされたホップはローカル非ブラウザクライアントとしてプロキシに到達する（ループバックソース + ループバック Host、Origin なし）ため、管理ゲートは変更されない。これを有効にすると、ホスト Web エントリーに到達できる者に設定編集と認証情報の書き込みが露出する — まずそのエントリー（認証 / リバースプロキシ）を保護すること。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude Code サブエージェントは、メインセッションのキューに並ぶ代わりに、独自のセッション名前空間（<session>\|sub:<agent-id>）を取得します。Anthropic-wire 専用 — Responses wire ではこのスイッチは no-op です（`subagentSplit` / BOTH-mechanisms スコープ注記を参照）。 |
@@ -120,6 +124,7 @@
 | `compat.roles` | record role → role | {} | — | メッセージロールを上流が受け入れる名前にマッピングします（例：developer→system）；完全一致ロールのみ、プロバイダーごとのエントリがキーごとに優先されます。 |
 | `compat.dropFields` | string[] (dot paths) | [] | — | 未知のフィールドで 400 を返す厳格スキーマゲートウェイ向けに、転送されるすべてのボディからドットパスフィールドを削除します；グローバル + プロバイダーごとのリストは加算的に統合されます。 |
 | `compat.streamErrorShape` | "protocol" \| "completion" | protocol | BILI_STREAM_ERROR_SHAPE | 200 がコミットされた後、上流ストリーム失敗がどのように提示されるか：プロトコルネイティブのエラーフレーム（デフォルト）またはレガシーの合成完了形状。 |
+| `compat.degenerateTurn` | "error" \| "passthrough" | error | BILI_DEGENERATE_TURN | プラグインチャットパイプで退化ターンのリトライ後も利用可能な出力がゼロだった場合の終了処理（#4913）：インバンドストリームエラー（デフォルト、#870）または空ターンを通常の完了として通過させる（#870 以前）。 |
 | `compat.noCacheControl` | boolean | false | BILI_NO_CACHE_CONTROL | Anthropic レーンの cache_control ブレークポイントを完全にスタンプしないようにします（独自のブレークポイントポリシーを持つ上流/リレー用のエスケープハッチ）。 |
 | `compat.keepResponseId` | boolean | false | ACP_KEEP_RESPONSE_ID | カーネル再構築された Responses リクエストで previous_response_id を保持します（デフォルトでは削除するため、再構築されたボディは上流が発行したことのない ID を参照しません）。 |
 | `dsh` | object | {} | BILI_ALLOW_DSH_COMPACTION | セクションは認識されるが、従来のエスケープハッチは削除された（#3666、#2028 を代替）：`allowDshCompaction` キーおよび `BILI_ALLOW_DSH_COMPACTION` 環境変数はもはや存在しない — dsh ネイティブコンパクションは、すべてのレーンにおいてワイヤガードによって無条件に拒否される。残存する `dsh.allowDshCompaction` の値は、一度限りの非推奨警告とともに無視される；代わりにホスト側の抑制を適用すること（#3354/#2474）。ライブキー — `dsh.authoredCompaction`、`dsh.contextTab`、`dsh.contextTabLabel` — は以下のエントリに文書化されている。 |
@@ -144,6 +149,8 @@
 | `pi.inline` | boolean | true (unset env+file runs inline) | BILI_PI_INLINE | Pi インラインレーン（#3278; #5428 以降デフォルトで有効、#4687 のオプトインルールを置き換え）: pi 拡張機能の圧縮はインプロセスで実行されます — スポンされたプロキシなし、エフェメラルポートなし；モデルトラフィックと /__bili//__acp ツールサーフェスは擬似オリジンを通じてインプロセスエンジンによって提供され、codex Responses WebSocket レーンはループバック専用 WS ブリッジによって、Web UI はエンジンと同時に起動されるループバック専用 Web リスナーによって提供されます。現在、env+file が未設定の場合にはインラインで実行されます；ANNOUNCED アタッチターゲット（ランチャー設定の BILLION_CONTEXT_PROXY/ATTACH）はデフォルトよりも優先されるため、`bili pi` はランチャープロキシを維持します。BILI_PI_INLINE=0/false/no/off またはこのキーを false に設定することでオプトアウトできます — 従来のアタッチ/スポン姿勢を復元します。解決順序は env > file > default；明示的なインライン選択は常に ANNOUNCED アタッチターゲットよりも優先されます。人間向けサーフェス：`bili -i/--inline pi`（≡ ワンコマンドレーン）と `bili -s/--server pi`（プロキシ姿勢をピン留め、継承されたインライン env よりも優先）。 |
 | `pi.commands` | string[] \| boolean | ["acp", "acp-cache"] |  | 登録される bili pi-plugin スラッシュコマンド："acp", "acp-cache", "acp-rule", "acp-fleet"。デフォルトでは、ステータス（/acp）とキャッシュ調整（/acp-cache）のエントリポイントを維持しつつ、より稀に使用される /acp-rule と /acp-fleet をスラッシュ補完リストから除外します；true は 4 つすべてを登録し、[] または false は何も登録しません。不明な名前は一度警告が表示され、無視されます。セッション開始時に読み取られるため、設定の編集は次のセッションに適用されます（プロキシの再起動は不要）。純粋な UI サーフェス：コマンドの無効化は、基盤となるツール（acp_cache / acp_rule はモデルに対して利用可能のまま）を削除したり、プロキシに影響を与えたりしません。 |
 | `opencode.inline` | boolean | false | BILI_OPENCODE_INLINE | OpenCode インラインレーン（#3278 ポート；オプトイン — #4687 におけるオーナーの決定に従い、デフォルトはスポンされたプロキシのまま）: opencode プラグインの圧縮はインプロセスで実行されます — スポンされたプロキシなし、エフェメラルポートなし、MITM 証明書なし；モデルトラフィックと /__bili/ ツールサーフェスは擬似オリジンを通じてインプロセスエンジンによって提供されます（Bun ホストで検証済み）。有効にするには true（または BILI_OPENCODE_INLINE=1）を設定します。解決順序は env > file；明示的なインライン選択は常に ANNOUNCED アタッチターゲットよりも優先され、選択が欠如している場合は従来どおりアタッチ/スポンにフォールバックします。`bili opencode-inline` はワンコマンドレーンです。 |
+| `plugin.snapshotCapBytes` | number | 104857600 (100 MiB) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | 公開 fork API 用にプラグインセッションごとに保持する生ワイヤー履歴スナップショットの上限（#2017 D-B）。超過すると無界の生コピーを保持する代わりにセッションはクローズドに失敗（409）します。デフォルトは 16 MiB から引き上げられました（#2394 G3）。0 で保持を完全に無効化します。 |
+| `snapshot.shadow` | boolean | true | BILI_SNAPSHOT_SHADOW | スナップショットレンダリングのシャドウ観測スイッチ（#3756 フォローアップ）。アームされたプロキシターンごとにスナップショットビューを計算しますが使用はしません（送信バイトはレガシーパスのまま）、実際に送信した内容との差分を分類し、Web パネルと snapshot-shadow 診断トピックで表示されるセッションごとのカウンターを記録します。デフォルト ON（レンダリングレーン自体はロールアウトゲート 0% のままで、シャドウレーンは純粋な観測です）。 |
 
 **MITM レーン**
 
@@ -167,6 +174,7 @@
 | `network.exposureLogIntervalMs` | number | 3600000 (0 disables the log) | BILI_EXPOSURE_LOG_INTERVAL_MS | バインドアドレス公開の警告がログに繰り返し表示される間隔；0 で完全に無効化。 |
 | `network.streamKeepAliveMs` | number | 15000 (0 disables) | BILI_STREAM_KEEPALIVE_MS | モデルチャンク間の下流ストリームキープアライブピン間隔；0 でピンを無効化。 |
 | `network.preflightHoldMs` | number | 30000 | BILI_PREFLIGHT_HOLD_MS | 失敗したプリフライトが、リクエストが未調整のまま許可されるまで保持される時間。 |
+| `network.emergencyDigest` | boolean | false (env BILI_PREFLIGHT_EMERGENCY_DIGEST=1 overrides) | BILI_PREFLIGHT_EMERGENCY_DIGEST | #2383 の緊急ダイジェスト regime（ペイロードがウィンドウの19.2倍超えで決定的ダイジェスト折畳み）を復帰させる。PR #7549 以降デフォルト OFF：収束しない極端なオーバーフローは、履歴をモデル可視のダイジェストブロックに置き換える代わりにリクエストを失敗させる。true で旧動作を復帰。 |
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 行き止まりのプリフライト後、同じセッションの調整を再試行するまでのクールダウン。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | エラーを表面化させる前に、同一リクエストの最大トランスポート失敗リプレイ回数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | リプレイ間のベースバックオフ遅延（指数関数的）。 |
@@ -204,27 +212,24 @@
 | `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | エクスポートの忠実性のために生テキストとして保持される最近のメッセージのトークンサイズ末尾。 |
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | ログにアラートを出すまでの連続 EPERM 書き込み失敗回数。 |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM アラートの繰り返し間隔。0 の場合は 1 回のみログ出力する。 |
+| `sessions` | object | {} (all defaults) | — | セッションプールと GC のノブ（#2030）— 以前は BILI_MAX_SESSIONS / BILI_SESSION_GC* が環境変数のみ。 |
+| `sessions.max` | number | 256 | BILI_MAX_SESSIONS | セッションプールの上限：メモリに保持するセッション数の最大値。超過すると最も冷たいセッションが LRU で退避されます（ファイルはディスクに残ります）。 |
+| `sessions.warmMax` | number | 0 (warms none) | BILI_SESSION_WARM_MAX | 有界起動（#2803/#3050）：リッスン前に最近保存されたセッションのうち何個をウォームするか。0 = ウォームしない（未ウォームのセッションは初回アクセス時にオンデマンドで 1 回読み込み）。8 にすると #2803 のイージートウォームセットが復元されます。 |
+| `sessions.warmMaxBytes` | number | 67108864 (64 MiB) | BILI_SESSION_WARM_MAX_BYTES | 起動ウォームセットのデコードバイト予算（#2803）。予算を超える単一ファイルはウォームされません。 |
+| `sessions.residentMaxBytes` | number | 4294967296 (4 GiB) | BILI_SESSION_RESIDENT_MAX_BYTES | 推定レジデントセッションバイト数のソフト目標（#2803）。アクティブ/実行中の状態はピン留めされます。デフォルトは #5779 で 512 MiB から引き上げられました。 |
+| `sessions.hardMaxBytes` | number | = sessions.residentMaxBytes (0 disables) | BILI_SESSION_RESIDENT_HARD_MAX_BYTES | セッション単位のレジデント重みのハードバイト上限（#4788 D1-A）。1 つのセッションを拘束し、免除/唯一アクティブのセッションでもターン間のフィールド破棄をトリガーします。0 で上限チェックを完全に無効化します。 |
+| `sessions.gc.enabled` | boolean | false (off) | BILI_SESSION_GC | セッションファイルのガベージコレクション（#1082、オプトイン）。定期的なディスクスウィープは 2 つのゲートが両方成立する時のみセッションファイルを削除します — 最終アクティビティが gc.maxAgeDays より古く、かつセッションが未圧縮で再送サイズが gc.maxTokens 以下。すべての削除は監査ログに記録されます。 |
+| `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC の年齢ゲート（#1082）。セッションファイルは最終アクティビティがこの日数より古い時のみスウィープ対象になります — id は再利用されないため（再開したセッションは m00001 から番号をやり直す）、あらゆる現実的な再開ウィンドウを大きく超える値に保たれます。 |
+| `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC のサイズゲート（#1082）。セッションファイルは再送サイズ（rawInputTokens、旧ファイルは contextTokens）がこのトークン数以下の場合のみスウィープ対象になります — フォールドのあるセッションはコンテキスト上は小さく読めても巨大な生履歴を保持し得るため、そうしたファイルは常に保持されます。 |
+| `sessions.gc.intervalMs` | number | 3600000 (1 h) | BILI_SESSION_GC_INTERVAL_MS | GC スウィープの間隔（ミリ秒、#1082）。 |
 | `storage` | object | {} (all defaults) | — | 統合 SQLite ストレージサイドカーの設定 (#2671)。 |
 | `storage.unified` | legacy\|shadow\|full\|sqlite | unset (sqlite) | BILI_STORAGE_UNIFIED | 階層型ストレージ移行スイッチ (#2671): shadow = ダイジェスト照合付き統合 SQLite ダブルライトのドライラン; full = ドロップイン読み取りパス (オーガニックインポート付きの統合優先読み込み、レガシーフォールバック); sqlite = ピュア SQLite モード - full と同じストレージ機構だが JSON エンベロープ書き込みはデフォルト OFF (SQLite インデックスが唯一の永続コピー; JSON エンベロープは書き込まれない)。デフォルト (どこでも未設定) は現在ピュア SQLite: ダブルライト fleet は #3818 以降ダイジェスト照合が安定して稼働しているため、JSON エンベロープはデフォルトでは書き込まれなくなった - 明示的な full は #3818 由来のダブルライトデフォルトを維持し、legacy は 1 行のエスケープハッチとして残る (将来の表記は同じ形: mysql = ネットワークバックエンド、json = エンベロープのみ)。ファイル階層は厳密に legacy/shadow/full/sqlite; 環境変数階層は 1/true (=shadow) と unified (=full) も受け入れ、ファイルより優先される。レーン起動ごとに 1 回のみ解決される - ホット編集には再起動が必要。暗号化 (BILI_ENCRYPTION_KEY) はサイドカーをハードブロックする。 |
 | `storage.backend` | sqlite\|mysql | unset (sqlite) | BILI_STORAGE_BACKEND | ストレージバックエンドの選択 (#3388 / #3931): 統合ストアは操作レベルの非同期 StorageBackend 契約を消費する。sqlite がデフォルト (Promise ラップされたアダプター背後の既存の UnifiedStore)。mysql は完全に配線済み (ステップ 2+3): openBackend("mysql", dsn) は MySQL 8.0 に対して実際の MysqlBackend を開く - 完全な契約サーフェス (CAS リファレンスカウント付きのインジェスト、読み取り、session_ext、リープジャーナル、アーカイブ/リストア/GC、チェックポイント、会話)、mysql2 は通常の依存関係としてバンドルされ、遅延ロードされる (mysql を選択しない起動では決してロードされない)。プロキシのホットパスは非同期シャドウファサードを通じて配線されている: セーブはシリアルバックエンドキューにエンキューされる (ウォーターマークデルタ、孤立/リープジャーナル、ダイジェストサンプリング - sqlite はゼロ await の同期高速パスを不変のまま維持)、同期読み取りは JSON エンベロープに乗る (サイドカーは ready() 経由で非同期にアタッチされる; viewFor/importRecord の同期ファサードは意図的にミスする)、レプリカ/ext/GC/エクスポート/フォークは非同期ツインを話す (#4911: フォークレーンはそれらを通じて lastLiveSeq + 行クローンに await する; フォールドアンカーバックフィル / スナップショットレンダリングのための同期ウィンドウ読み取りは意図的にエンベロープ提供される)。writerOff は sqlite のみ (エンベロープは mysql の同期読み取りパスである)。不明な名前は通知付きで sqlite にフォールバックする。レーン起動ごとに 1 回のみ解決される。 |
 | `storage.mysql.dsn` | string | unset | BILI_MYSQL_DSN | storage.backend="mysql" 用の MySQL DSN (#3388 ステップ 2, #3931): mysql://user:pass@host:3306/db。StorageBackend 契約パスによって消費される (ホットパスを含む - 非同期シャドウキュー)。環境変数 BILI_MYSQL_DSN がファイルキーより優先される。空/未設定 = mysql バックエンドが開けない - 文書化されたエラーは両方のノブと動作するデフォルトを名指しする。 |
 | `storage.sqliteAutoDownload` | boolean | true | BILI_SQLITE_AUTO_DOWNLOAD | 1 回限りの SQLite エンジンの自己ダウンロードのゲート (#2833): プロセス内でエンジンが利用可能でない場合 (組み込みの node:sqlite なし、ホストインストールの better-sqlite3 なし) かつこのプラットフォームで統合サイドカーが望まれる場合、bili は npm レジストリからピン留めされた better-sqlite3 プリビルトタールボールを 1 回ダウンロードし (~11 MB、sha512 検証済み)、キャッシュディレクトリに保存し、その後のすべての起動で再利用する。エンジン解決順序: 組み込み node:sqlite (Node >= 22.5) -> ホスト提供の better-sqlite3 -> キャッシュされた自己ダウンロード -> 自己ダウンロード (このスイッチでゲート) -> なし (レガシーのみ、#2825 のデグレード契約)。このスイッチはネットワークフェッチのみをゲートする - キャッシュされたコピーは false でも使用される; 非サポートプラットフォームでは決してダウンロードしない。タールボールのダウンロードは組み込みミラーリストを辿る (#3338): 設定されたレジストリ (BILI_UPDATE_REGISTRY / update.registry) が最初に試され、次に https://registry.npmjs.org、次に https://registry.npmmirror.com - sha512 検証済みのタールボールを返す最初のミラーが勝つ; エンジンなしの Node < 22.5 はデグレード理由に明示的な Node アップグレードヒントが付く (#3385)。エンジン成果物はランタイムごとにピン留めされる。なぜなら、バインディングはそのパッケージが宣言する範囲外ではロードできないため: N-API >= 10 を持つ Node >= 22 は better-sqlite3 v13 を使用 (独自のプリビルドを保持する 1 つのタールボール)、一方 v13 のメジャーフロアは通るが N-API 9 のみ搭載する Node 20 と Node 22.0-22.12 バンドは v12.9.0 を使用 (JS のみのタールボールとその ABI キー付きプリビルド、バイナリミラーから取得され nativeBinding を通じてバインドされる)。これにより、低バージョンの Node でも統合レーンに留まり、レガシーへのデグレードを避ける。ピン留めされた成果物が提供できないランタイム (すべてのフロア未満、またはプリビルドがターゲットとしない ABI) は、ロード前に拒否される。ダウンロードもキャッシュされたコピーも登録されない。そのようなバインディングのロードは優雅に失敗するのではなくプロセスをクラッシュさせるため (#3341, #3894)。ダウンロード失敗は、キャッシュディレクトリ配下にマーカーファイルとして永続化される 6 時間のリトライクールダウンをアームする (billion-context/sqlite/.bootstrap-failed.json); ストレージ診断ブロブはマーカーの絶対期限時間とパスを表示する - そのファイルを削除して bili を再起動すると、ウィンドウ全体を待たずに即座のリトライを強制できる (#3788)。 |
 | `storage.jsonWriter` | on\|off | unset (off for the pure-sqlite selection — absent/unified=sqlite — and on for explicit full) | BILI_STORAGE_JSON_WRITER | フェーズ 3 エンベロープスイッチ (#2960) — 今回のリリースでデフォルト反転: 未設定 (UNSET) はピュア SQLite 選択 (storage.unified 未設定または "sqlite") ではデフォルト OFF — SQLite インデックスが唯一の永続コピーとなる (読み取りはすでに統合優先; 起動時にインデックスの和集合を列挙するため、インデックスのみのセッションは正常にロードされる)。明示的な full は #3818 由来のダブルライトデフォルトを維持 (このキーが指定しない限りエンベロープは書き込まれ続ける)。有効な full モードではいずれの階層でも明示的な on/off が常に優先: shadow/legacy (または暗号化が有効な場合) で要求された off は、JSON ファイルが唯一の真実のソースであるため 1 回限りの警告付きで無視される。環境変数階層 0/false/off = off、1/true/on = on が厳密なファイル表記 ("off"/"on") より優先される。フェイルセーフ: サイドカーが実行中に自身を無効化した場合、次のセーブでエンベロープ書き込みが再開される。ダブルライトの復元: storage.jsonWriter=on (または BILI_STORAGE_JSON_WRITER=1) — インデックスのみのセッションは起動和集合経由で引き続きロードされ、レプリカ/リストアはポータブルな JSON エンベロープを再物質化する。バイナリのダウングレード (または SQLite エンジンの喪失) は、>=v0.1.197 バイナリが再び実行されるまで、インデックスのみのセッションを v0.1.196 以前のバージョンから不可視にする - データは index.db に無傷のまま残るが、古いコードによって読み取られないだけである。セッションごとの CCR コンテンツストアサイドカーも書き込みが停止する - full モードでは、すべての読み取りで最初にインデックスの ccr ミラーが参照されるため、ミラーが永続コピーとなる。jsonWriter=off レーンは、そのセッションディレクトリの唯一のライターでなければならない: off レーンは統合優先で読み取り、決してファイルにフォールバックしないため、同じディレクトリに対して legacy/shadow で実行されるピアインスタンスは静かに分岐する (その JSON コピーは更新を受け取らなくなり、off レーンはピアの書き込みを決して見ない)。 |
-| `storage.walJournalSizeLimitBytes` | number | 8388608 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | index.db-wal の WAL 回収上限 (#3250)、バイト単位: 完了したチェックポイントごとに WAL ファイルがこのサイズまで切り詰められ、長寿命プロセスにおけるディスク使用量とクラッシュ復旧リプレイを制限する。セッションごとのデータクォータではない - データは書き込まれた時点で index.db に着地し、WAL はチェックポイント間のフレームをステージングするだけなので、セッション数/サイズはこれをスケーリングしない; 大きなバーストは、次の完了チェックポイントが切り詰めるまで一時的に超過しうる。高い = 切り詰め IO が稀になるが、定常時のディスク使用量が増え、クラッシュリプレイのテールが長くなる。環境変数階層 (正の整数) がファイル階層より優先される; ゴミまたは非正の環境変数値は、起動を失敗させるのではなくファイル/デフォルト階層にフォールスルーする。レーン起動時にストアが開かれる時点で適用される - ホット編集には再起動が必要。有効な値は統合有効ログ行とストレージ診断ブロブに表示される。 |
+| `storage.walJournalSizeLimitBytes` | number | 0 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | index.db-wal の WAL 回収上限 (#3250)、バイト単位。0 (デフォルト、#7674) = 無制限 — エンジンはチェックポイント後に WAL ファイルを切り詰めない。ファイルは過去の高水位 (現場: 安定して ~55 MiB) に留まり、フレームは毎回定期/終了時のチェックポイント (PASSIVE — リプレイテールゼロ) で index.db に収斂する。opencode がこの運用 (13 並行ライター、9.55 GB db、破損ゼロ)。#7674 前の 8 MiB デフォルトはすべての完了したチェックポイント後にエンジンが WAL を内部で切り詰める暗黙の床回収を生んでいた — JS 側のガードがどこからもカバーせず、共有セッションディレクトリの生きたピア接続 (#2671: 5 daemon、kill-9 交代) の真下から WAL を引き抜く — #7156 の損傷形。正数 N: 完了したチェックポイントごとに WAL を N に切り詰め。セッションごとのデータクォータではない - データは書き込まれた時点で index.db に着地。環境変数階層 (正の整数) がファイル階層より優先される; ゴミまたは非正の環境変数値はファイル/デフォルト階層にフォールスルーし起動は失敗しない。レーン起動時のストアオープン時点で適用 - ホット編集には再起動が必要。 |
 | `storage.archiveAfterDays` | integer | 365 | BILI_STORAGE_ARCHIVE_AFTER_DAYS | 日単位の GC 年齢スイープウィンドウ (#3463, #3901): これより長くアイドル状態のセッションはアーカイブされる - 単一のアーカイブログ (セッションディレクトリ配下の archive/archive.jsonl — セッションごとのファイルスプレーなし) に 1 行の JSON が追記され、トombストーン行がラベルとアイデンティティを保持し、コンテンツ/メディア参照が解放され、リストアは 1 つの POST のみで可能。0 は年齢スイープを無効にする; POST /__bili/storage/gc は常に実行され、既存の index.db を縮小するには ?vacuum=full を取る (新規書き込みには常に auto_vacuum=INCREMENTAL が有効)。同じ操作に CLI レイヤーがある (#3928): bili storage gc [--days N] [--vacuum full\|incremental] [--dry-run]、および bili sessions ls/rm/archive/restore <id> (README の 'Storage maintenance CLI' セクション)。環境変数がファイル階層より優先される。 |
-| `sessions` | object | {} (all defaults) | — | セッションテーブルサイズ上限とオプトインによるゴミ収集。 |
-| `sessions.max` | number | 256 | BILI_MAX_SESSIONS | メモリ内セッションテーブル上限 (アイドルセッションの LRU 退避)。 |
-| `sessions.warmMax` | number | 0 | BILI_SESSION_WARM_MAX | 有界な起動 (#2803/#3050): リスニング前に起動時に水合される最大最近保存セッション数; 古い状態はオンデマンドで再ロードされる。デフォルト 0 (急激なウォームセットなし — 最初のタッチが 1 回のオンデマンドロードを支払う; 急激な動作を復元するには 8 を設定)。sessions.max で上限が設定される。 |
-| `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | 起動ウォームセットのデコード済みバイト予算 (#2803)。ディスク上の圧縮バイトではなくデコード済みサイズをカウントするため、zstd アーカイブが RAM 境界をすり抜けることはない。予算を超える単一のファイルは決してウォームされない。 |
-| `sessions.residentMaxBytes` | number | 4294967296 | BILI_SESSION_RESIDENT_MAX_BYTES | 推定リザident セッションバイトのソフトターゲット (#2803; #5779 で 512 MiB から 4 GiB に引き上げ — 単一のセッションは通常 512 MiB を超え、より小さい予算に対して永遠にピンポンしていた)。アクティブ/進行中の状態はそれより上にピン留めされる; ターゲット超過時、アイドル状態はリクエスト完了時にディスクへ排出される。メモリが少ないマシンではこれを下げる。 |
-| `sessions.hardMaxBytes` | number | (same as `sessions.residentMaxBytes`) | BILI_SESSION_RESIDENT_HARD_MAX_BYTES | セッションごとの推定リザident バイトのハード上限 (#4788, 決定 #4792 D1-A)。プールソフト上限とは異なり — それは他のコールドセッションのみを退避でき、単独アクティブセッションには決して触れない — これは 1 つのセッションを制限する: リクエスト終了境界で上限超過時、そのドロップ可能なフィールド (フォールドブロックのオリジナル、メタデータ台帳、有界ビューを超える生テール) はプール免除セッションであっても強制的にディスクへ戻され、次のターンは狭いディスク読み取りを通じて必要なものを透明に再読み取りする。最後の保存が確実に着地したことが証明される限り、安全なドロップはすべてのリクエスト境界で実行される; 上限はセッションごとのコールアウト (警告、60 秒にスロットリング) を追加する。`0` は上限チェックを無効にする。 |
-| `sessions.contentStorePin` | boolean | false | BILI_SESSION_CONTENT_STORE_PIN | #4788 フェーズ2の常駐ドロップのエスケープハッチ: 各セッションのコンテンツストアをメモリに固定する（折りたたみは行われない）。デフォルトはオフ: 検証済みの保存が完了するたびに、アイドル状態のセッションのコンテンツストアはリクエスト間でドロップされ、統合インデックスミラーまたはサイドカーファイルからオンデマンドで再読み込みされる。検証済みのコピーがないストアを持つセッション（例: 新しいフォーク子プロセス）は自動的に常駐する。RAMを犠牲にしてゼロの再読み込みレイテンシが必要な場合にこれを設定する。 |
-| `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | 古い永続化セッションのオプトインによるガベージコレクション（このフラグなしでユーザーデータを静かに削除することはない）。 |
-| `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GCの年齢しきい値（日）。 |
-| `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | セッションレコードごとのGCトークンサイズしきい値。 |
-| `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GCスイープ間隔。 |
-| `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | ネイティブプラグインに配信されるフォークAPIパブリックスナップショットのサイズ上限。 |
-| `snapshot.shadow` | boolean | true (on) | — | スナップショットレンダリングのシャドウ観測可能性（#3756のフォローアップ）: レンダリングレーンがまだロールアウトゲートされている間、すべてのアームされたターンがスナップショットビューを計算し、レガシーアウトバウンドとの差分を分類し、セッションごとのカウンターを記録する（Webパネル行 + /__bili/status の snapshotShadow 集計 + snapshot-shadow 診断トピック）。デフォルトはオン - これはロールアウト切り替えをゲートするエラー率を持つフリートワイドのドライランである。環境変数 BILI_SNAPSHOT_SHADOW が優先される。追加のターンごとの計算を望まない場合は false/0/off でオフにする。 |
 
 **更新 & アドバイズリー**
 
@@ -299,6 +304,7 @@
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | クライアントがターン間で履歴を巻き戻しまたは書き換えた場合、フォールド状態を調整する。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 圧縮プロンプトパック。解決順序はプロジェクトパック → ユーザーパック → ビルトイン。`acknowledgePromptsRisk` によるゲートはされない。 |
 | `compress.tiers` | boolean | true | — | T1→T3 の階層型蒸留により、フォールドコストを世代間で分散する。 |
+| `compress.protectedUserPatterns` | string[] | none | — | ユーザー本文のリテラル部分文字列：一致したプロンプトは最新のユーザーメッセージでなくてもフォールドされない。長寿命セッションでホストが現在のタスクを示す用途。 |
 | `compress.protectedTools` | string[] | none | — | 全履歴に対するハード除外：リストされたツールの結果は決してフォールドされない。パスパターン（`skill/<name>`）は名前でスキルを選択する（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 最新の結果が古いものを上書きする累積スナップショット型ツールの最新インスタンスのみを保護する（例：todo リスト）。パスパターンはスキルごとに最新インスタンスを保持する（`skill/*`, #1947）。 |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 最近保護ゾーンから除外（即時圧縮可能）。空の配列は何も除外しない（最大保護）。 |
@@ -310,6 +316,7 @@
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | ウィンドウが埋まるにつれて成長の通知を送信する（グローバルレベルのみ）。 |
 | `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | 2048文字を超える完了ラウンドの推論実行を破棄する（デフォルトで drop: true）；厳格な推論を要求するアップストリームでは drop: false が必要。 |
 | `compress.absorb` | object | opt-in (disabled) | — | ツール結果を短い要約に即時蒸留するオプトイン機能；元データはコンテンツストアに保存される。デフォルトでは画像を含む結果のみが対象となる。 |
+| `compress.degenerateRetry` | object | 1 attempt (built-in nudge) | — | クライアントに見える出力がゼロで終わるターンのリトライ予算と nudge 文の設定。継続 nudge はリトライ本文にのみ付加され、永続化も次のリクエストでの再生もされない。 |
 | `compress.blockOps` | object | off | — | 圧縮ブロック管理用のブロックライフサイクルツール（acp_retire / acp_restore / acp_rewrite）のオプトイン；デフォルト無効により、#5765 以前のワイヤーとバイト単位で同一を維持する。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | コンテンツキャッシュと取得：大きな出力はセッションの隣接にロスカレスで保存され、先頭抜粋とポインタに置き換えられ、acp_retrieve 経由で取得される；上限や退避は行われない。 |
 | `compress.search` | object | off | — | search_context の検索動作設定；現在、planAware リランキングを保持している。 |
@@ -326,6 +333,8 @@
 | `compress.absorb.excludeTools` | string[] | [] | — | 吸収から除外されるツール名。 |
 | `compress.absorb.toolName` | string | "absorb" | — | 吸収ツールの登録名。 |
 | `compress.absorb.mediaOnly` | boolean | true | — | メディア（画像）を伴うツール結果に吸収を制限する。画像バイトはテキストにカウントされないため、minToolTokens の対象外となる。false に設定すると、従来の大規模結果の全文吸収が有効になる。 |
+| `compress.degenerateRetry.maxAttempts` | integer | 1 | — | 退化ターンのリトライ予算（#7666）：クライアントに見える出力が何もないターン終了時に、agent の元のリクエストに末尾ユーザー nudge を追加して再発行する。0 = 無効（そのターンは素通し）、1 = 1 回（#7666 以前の動作）、最大 5；i 回目の試行で nudges[i] を送信（リストが短ければ循環）。ゼロバイト切断の再発行（#2171）とは予算が独立——1 ターンでそれぞれ 1 回まで。 |
+| `compress.degenerateRetry.nudges` | string[] | 3 built-in | — | 退化ターンリトライ用のカスタム nudge 文（#7666）；i 回目のリトライで i 番目の文を送信（短ければ循環）。未設定 = 組み込みローテーション（先頭はデフォルトの継続 nudge）。 |
 | `compress.blockOps.enabled` | boolean | false | — | 3 つのブロックライフサイクルツール（インジェクション + プロンプト + マニフェスト）を有効にする。Off = ツールなし、プロンプトセクションなし、リクエストごとのコストゼロ。 |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | コンテンツキャッシュおよび取得ブロックを有効にする。 |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | CCR ストレージの対象となるツール結果の最小推定トークンサイズ。 |
@@ -457,6 +466,7 @@
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | スポンチャネル: プラグインエージェントプロセスを示す。 |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | エグレス画像のダウンスケールパスのトリガー閾値（px）（#3400）; 数値でない場合または 128 未満の場合は無視される（デフォルトが適用される）。設計上、環境変数のみ。 |
 | `BILI_PLUGIN_BYPASS` | string | auto (unset = the inbound header decides) | — | x-bili-plugin-bypass パススルー判定のオペレーターオーバーライド（#6220）、リクエストごとに読み取り（再起動不要）。3 状態：未設定（または auto）= 現状 — 受信ヘッダーがリクエストごとに判定（legacy opencode-acp セッションはバイパス、その他はフルパイプライン）；1/on/true = 強制バイパス — すべての受信リクエストをそのまま転送（ツール注入なし、nudge なし、セッションバインドなし）；0/off/false = 常にバイパスしない — 受信 x-bili-plugin-bypass ヘッダーをすべて無視し、legacy opencode-acp セッションもフルパイプラインを通過。識別できない値は auto（= 現状）として扱われます。#6220 の owner 承認デザインにより環境変数のみ（ヘッダーはホストがスタンプするワイヤー契約であり、オーバーライドはプロセス単位のオペレーター姿勢であり、ルート単位の設定フィールドではない）。 |
+| `BILI_SESSION_CONTENT_STORE_PIN` | 1/true | unset (fold after save) | — | 各セッションの CCR コンテンツストア（{byRef}/{byHash} の原文）を、保存完了後に折りたたむ代わりにメモリにレジデントのまま保持します（#4788 フェーズ 2、ディスカッション #3916-E）。ストアは初回アクセス時に統一 ccr ミラーまたは .content-store.json サイドカーから再マテリアライズされます。未設定、0/false、その他の値 = 折りたたみ（デフォルト）。設計上、環境変数のみ。 |
 
 <!-- /bili:gen -->
 
@@ -543,13 +553,14 @@
   ```
 ### `compat`
 
-- **Type:** `{ roles?: Record<string, string>; dropFields?: string[]; streamErrorShape?: "protocol" | "completion"; noCacheControl?: boolean; keepResponseId?: boolean }`
+- **Type:** `{ roles?: Record<string, string>; dropFields?: string[]; streamErrorShape?: "protocol" | "completion"; degenerateTurn?: "error" | "passthrough"; noCacheControl?: boolean; keepResponseId?: boolean }`
 - **Default:** `{}` (無効)
 - **Status:** ACTIVE
 - **Description:** グローバルなワイヤー互換ロールマップ。`roles` はメッセージのロールを、アップストリームが受け入れるロール名にマッピングします。例: `{"compat":{"roles":{"developer":"system"}}}` は、`developer` ロールを拒否するアップストリーム（#552、新しい codex クライアント）に対して、最終転送ボディ内で `developer` → `system` に書き換えます。`openai` の chat-completions と `responses` リクエストに適用されます。完全一致するロールのみ対象であり、ボディ内の他の部分は変更されません。再送信される compress-retry ボディにも同じ書き換えが適用されます。プロバイダーごとの `compat.roles` エントリ（[Providers](#providers) 参照）はキーごとに優先されます。デフォルトの `{}` では、ボディはバイト単位で変更なしに転送されます。
 - **Learn-on-failure:** compat が設定されていない場合、アップストリームからの `400 Invalid role: …` は自動修正されます — bili は問題のあるロールを `system` に書き換え、1回リトライし、そのマッピングを**セッションスコープ**（セッション内のメモリ上；設定ファイルには書き込まれない）で記憶します。そのセッション内の後続のリクエストでは、400 の往復がスキップされます。修正が発火した際に出力される情報ログには、恒久的なプロバイダーごとのスニペットが含まれます。
 - **dropFields:** 最終転送ボディから削除するフィールドのドットパスリスト — クライアントが常に送信するがアップストリームが受け付けないフィールドを拒否する厳格スキーマのアップストリーム向け（#1757）。パスはプレーンオブジェクトのセグメントのみ使用可能（`reasoning.summary`）；ワイルドカードと配列インデックスはサポートされていません；存在しないパスや非オブジェクトの中間要素はサイレントにスキップされます；文字列値は決して検査・変更されません — 構造キーのみ対象であり、ツール引数やメッセージコンテンツはバイト単位で正確に保たれます。`roles` と異なり、すべてのワイヤープロトコル（任意の JSON リクエストボディ）に適用されます。グローバルとプロバイダーごとのリストは**加算的に**（和集合）マージされます — プロバイダーエントリはパスを追加できますが、グローバルのものを撤回することはできません。最終送信ボディのロールマッピング / 出力ステアリングの後（プロンプトキャッシュスタンプの前）に適用され、compress-retry ループが再送信するすべてのボディおよび逐語パススルー転送にも適用されます。一致するフィールドのないボディはバイト単位で変更なしに転送されます；1つ以上のフィールドが実際に削除された場合、削除されたパスを記録する情報行がログ出力されます。オプトインのみ — v1 では learn-on-failure はありません: `"compat":{"dropFields":["reasoning.summary"]}`。
 - **streamErrorShape:** アップストリームストリーム失敗が、200 レスポンスがすでにコミットされた後に anthropic/openai ワイヤー上でどのように提示されるか（`"protocol"`（デフォルト）または `"completion"`）。`protocol` はプロトコルネイティブの失敗チャネルに乗ります — anthropic/responses は `event: error` フレームを受け取り、openai はトップレベルの `error` フレームに続けて `[DONE]` を受け取ります — これによりクライアントは「このターンが失敗した」と「このターンが完了した」を区別し、独自のリトライロジックを維持できます（#1455: 従来の合成された `end_turn`/`finish_reason` は、死んだターンを通常の完了として装い、クライアントのリトライ予算をサイレントに消費していました）。`completion` は、インバンドエラーイベントを表面化できない SDK を持つホストのために、そのレガシー形状（合成された正常な完了内の失敗テキスト）を復元します。設定ファイル: `"compat":{"streamErrorShape":"completion"}`；環境変数 `BILI_STREAM_ERROR_SHAPE` が優先されます。google ワイヤーのみ影響を受けません（すでにネイティブエラーフレームを使用）；responses ワイヤーでは、このノブはサーバーサイドの終了を合成されたアイテムライフサイクル完了から `event: error` フレームに変更します（ループ内での終了はすでに `response.failed` 経由でネイティブでした）。
+- **degenerateTurn:** プラグインチャットパイプで、退化ターミナルターン（#2756 ゲート）がその一度の継続リトライ再発行（#732/#821）後も依然として利用可能な出力がゼロだった場合（＝リトライも空で終了した場合）の終了処理（`"error"`（デフォルト）または `"passthrough"`）。`error` は #870 のインバンドストリームエラーを送出する：空ターンはそれ以外では「モデルが何も生成しなかった」と区別がつかず、セッションは死んでいるのにアイドルと読み取られ、ホストがそれを自発的に表には出さない — 提示形状は `streamErrorShape` に従う。`passthrough` は #870 以前の終了に戻すオプトイン：空ターンを通常の完了として通過させる — プロキシレーンと responses ワイヤーがこの条件に対してすでに取っている同じ終了（両者に致命的な分岐は元々ない）。設定ファイル：`"compat":{"degenerateTurn":"passthrough"}`；環境変数 `BILI_DEGENERATE_TURN` が優先。影響するのはプラグインチャットレーンのみ；不明な値は `"error"` にフォールバック。（#4913：致命的な終了には以前は出口がなかった — thinking のみで応答するローカルモデルに固定されたホストはパススルーの復元を必要としていた。）
 - **noCacheControl:** (`#2030`) `true` にすると、bili の Anthropic レーンでの `cache_control` ブレークポイントスタンプが無効になります — フィールドを拒否するアップストリームや、独自のブレークポイントポリシーを持つリレーのためのエスケープハッチです。環境変数 `BILI_NO_CACHE_CONTROL` が優先されます；完全なメカニクスはその[環境変数エントリ](#environment-variables)を参照してください。
 - **keepResponseId:** (`#2030`) `true` にすると、カーネル再構築された Responses リクエストで `previous_response_id` を保持し、ストリップしません（デフォルトではストリップするため、再構築されたボディは、書き換えられた入力に対してアップストリームが発行しなかったレスポンス ID を参照することはありません）。環境変数 `ACP_KEEP_RESPONSE_ID=1` が優先されます。
 
@@ -1640,6 +1651,19 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
   - `toolName: string` — 注入されたツールの名前を変更（デフォルト `"absorb"`）；宣伝/注入スキーマ、システムプロンプトセクション、セッションごとの裁定は両方のレーンで名前に従います。**レーンガバナンス (#1359):** プラグインモードは**ベース**設定によって `absorb` ブロック全体を支配するため、名前変更されたツールはその名前で宣伝され、その名前で実行されます（決して乖離しません）；プロバイダー/モデルレベルの `absorb.*` 上書きは**プロキシレーンのみ**です（プロキシはマージされた名前で注入し裁定します）。読み込み時の警告は、ベースから乖離するプロバイダー/モデル `absorb.*` フィールドを列挙します。
   注入はワイヤーのネイティブツールサーフェスに従います：プロキシモードは anthropic/openai/responses ネイティブツールワイヤーでツール（リクエストごとに解決された名前で）+ システムプロンプトセクションを注入し、プラグインモードは**有効な間のみ**プラグインマニフェストで宣伝します（ホストはマニフェストのツールを逐語に登録します — 無効なツールの宣伝はそれらを壊します、#1192；MCP シェルは無料で拾います）。Responses **マーカー/テキストプロトコル**ルートはサポートされていません（ネイティブツールサーフェスなし — REQUIRED absorb 指示は満たせません）、タイトル生成リクエスト（`max_tokens ≤ 200`）は compress プロンプトと同様に注入をスキップします。Absorb されたペアは再起動後も隠されたままです（セッション状態に永続化）。
 
+#### `degenerateRetry`
+
+- **型:** `object` (`{ maxAttempts?, nudges? }`) — サブフィールドは最も深い優先でマージ（グローバル → プロバイダー → モデル）
+- **既定:** 未設定 = `{ maxAttempts: 1 }` + 組み込み nudge ローテーション（#7666 以前のスレの動作）
+- **状態:** ACTIVE
+
+**説明:** 空ターンのリトライ予算。空ターン = クライアントに見える出力ゼロで完了イベントに達するターン（tag-echo が唯一のテキストを全剥、圧縮ドラフトの閉じタグ、または宣言のみの末尾）。各試行は、agent 自身の転送済み本体に尾部 user nudge を追加して再送出する（`src/degenerate-retry.ts`）；本体の変異はセッション状態に一切触れないため、nudge は一時物的 — クライアントの次リクエストは本来あるはずのものとバイト同一。サブフィールド：
+
+- `maxAttempts`（integer 0–5、既定 1）— 1 ターンあたりの nudge 再送出上限。0 = 空ターンリトライ全体を無効化（ターンは裸で通過）。予算枯渇時：chat レーンはインバンドの #870 エラー（"…after the continuation nudge" / "…after N continuation nudges"）を送出、responses レーンは空ターンを通過させる。
+- `nudges`（string[]、1–8、既定は組み込み 3 文）— i 回目に使う文（短いと循環）。組み込みローテーションの先頭は既定の継続 nudge（"Your previous response ended without a tool call. Continue now: …"）。
+
+ゼロバイト切断の再送出（#2171）とは独立し、そちらは独自の一発予算を保持する。失敗ファミリーとローカル 7 日間データ（空ターン arm 85 回、単発リトライで 93% 救出）は #7666 / #6034 を参照。
+
 #### `blockOps`
 
 - **型:** `object` (`{ enabled? }`)
@@ -1963,6 +1987,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
+| `BILI_DEGENERATE_TURN` | `compat.degenerateTurn` | error |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |
 | `BILI_DSH_CONTEXT_TAB` | `dsh.contextTab` | true |
 | `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
@@ -2014,9 +2039,10 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_PI_INLINE` | `pi.inline` | true (unset env+file runs inline) |
 | `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
+| `BILI_PREFLIGHT_EMERGENCY_DIGEST` | `network.emergencyDigest` | false (env BILI_PREFLIGHT_EMERGENCY_DIGEST=1 overrides) |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
 | `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | 55000 (0 = one-shot connections) |
-| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 104857600 (0 disables snapshots) |
+| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 104857600 (100 MiB) |
 | `BILI_RECEIVE_BODY_BYTES` | `network.receiveBodyBytes` | 5368709120 |
 | `BILI_RELEASE_NOTES_CHECK` | `releaseNotesCheck` | true |
 | `BILI_RELEASE_NOTES_URL` | `releaseNotesUrl` | unset (built-in feed) |
@@ -2028,25 +2054,29 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_RESIGN_PASSTHROUGH` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
+| `BILI_ROLLOUT_EGRESS_PLANE` | `rollout.features.egressPlane` | 100 (on — ci:full verification branch) |
 | `BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST` | `rollout.features.identityChannelHarvest` | 0 (off) |
-| `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
-| `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
-| `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
-| `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
-| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
+| `BILI_ROLLOUT_PASS_DSH_EXTENSIONS` | `rollout.features.passDshExtensions` | 0 (off = intercept) |
+| `BILI_ROLLOUT_PLUGIN_DELTA_RESEND` | `rollout.features.pluginDeltaResend` | 0 (off) |
+| `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 100 (GA — on by default) |
+| `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 100 (on, GA) |
+| `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL` | `rollout.features.pluginMsgIdIncremental` | 100 (on, GA) |
+| `BILI_SESSION_GC` | `sessions.gc.enabled` | false (off) |
+| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 (1 h) |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
 | `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
-| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | `sessions.hardMaxBytes` | (same as `sessions.residentMaxBytes`) |
-| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 4294967296 |
-| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 0 |
-| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 |
+| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | `sessions.hardMaxBytes` | = sessions.residentMaxBytes (0 disables) |
+| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 4294967296 (4 GiB) |
+| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 0 (warms none) |
+| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 (64 MiB) |
+| `BILI_SNAPSHOT_SHADOW` | `snapshot.shadow` | true |
 | `BILI_SQLITE_AUTO_DOWNLOAD` | `storage.sqliteAutoDownload` | true |
 | `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | `storage.archiveAfterDays` | 365 |
 | `BILI_STORAGE_BACKEND` | `storage.backend` | unset (sqlite) |
 | `BILI_STORAGE_JSON_WRITER` | `storage.jsonWriter` | unset (off for the pure-sqlite selection — absent/unified=sqlite — and on for explicit full) |
 | `BILI_STORAGE_UNIFIED` | `storage.unified` | unset (sqlite) |
-| `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | `storage.walJournalSizeLimitBytes` | 8388608 |
+| `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | `storage.walJournalSizeLimitBytes` | 0 |
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |

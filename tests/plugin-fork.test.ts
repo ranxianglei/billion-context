@@ -25,6 +25,14 @@ process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
 test.after(() => rmSync(testRoot, { recursive: true, force: true }));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
+// #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+// off) — this suite's cold-disk-restore tests read the legacy JSON
+// content-store files off disk, so pin the dual-write writer explicitly.
+process.env.BILI_STORAGE_JSON_WRITER = "on";
+// ci:full branch: this suite pins the LEGACY fork/orphan contract; the egress
+// plane default (100 here) serves raw sessions from the op log and legitimately
+// changes outbound bytes — out of this suite's scope.
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
 
 interface SnapshotResponse {
@@ -488,7 +496,10 @@ test("HTTP dsh-lane durable guards keep plain-text snapshots, forks and revision
     try {
         const history = [
             { role: "user", content: "Synthetic snapshot test" },
-            { role: "user", content: `Instructions from: /repo/AGENTS.md\n# repo rules\nbehave` },
+            // #7153: the carrier must look like what dsh-agent-instructions emits —
+            // the label inside the complete \x3csystem-reminder\x3e frame (a bare label is
+            // ordinary history now, so it would no longer be pinned).
+            { role: "user", content: `\x3csystem-reminder\x3e\nInstructions from: /repo/AGENTS.md\n# repo rules\nbehave\n\x3c/system-reminder\x3e` },
             { role: "assistant", content: "Starting" },
             ...Array.from({ length: 4 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `tail ${i}` })),
         ];
