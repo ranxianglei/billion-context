@@ -145,14 +145,14 @@ test("dshMcpCatalogPath: projects the catalog marker to durable/mcp-catalog on t
     assert.equal(dshMcpCatalogPath(msg("text", "bare \x3cmcp_catalog\x3e without wrapper")), "durable/mcp-catalog", "the bare block projects too — a wrapper rewording cannot disarm the classifier");
     // Deliberately foldable neighbors stay consumable:
     assert.equal(dshMcpCatalogPath(msg("text", "plain prose mentioning an mcp catalog in lowercase")), undefined, "plain prose without the exact XML marker stays foldable");
-    assert.equal(dshMcpCatalogPath(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), undefined, "the #2419 skill catalog is a DIFFERENT carrier (own identity)");
+    assert.equal(dshMcpCatalogPath(msg("text", "\x3csystem-reminder\x3e\n\x3cavailable_skills\x3e\n- name: x\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e")), undefined, "the #2419 skill catalog is a DIFFERENT carrier (own identity)");
     assert.equal(dshMcpCatalogPath(msg("tool-call", MCP_MSG)), undefined, "non-text content types never match");
     assert.equal(dshMcpCatalogPath(msg("text", undefined)), undefined, "missing text is safe");
     const dshClassifier = durableMessageToolPaths["dsh"];
     assert.ok(dshClassifier, "dsh lane is registered");
     assert.equal(dshClassifier!(msg("text", MCP_MSG)), "durable/mcp-catalog", "lane entry covers the #2446 catalog shape");
-    assert.equal(dshClassifier!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
-    assert.equal(dshClassifier!(msg("text", "Instructions from: AGENTS.md")), "durable/agents-md", "lane entry still covers the #2447 baseline shape");
+    assert.equal(dshClassifier!(msg("text", "\x3csystem-reminder\x3e\n\x3cavailable_skills\x3e\n- name: x\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
+    assert.equal(dshClassifier!(msg("text", "\x3csystem-reminder\x3e\nInstructions from: AGENTS.md\n\x3c/system-reminder\x3e")), "durable/agents-md", "lane entry still covers the #2447 baseline shape");
     assert.equal(dshClassifier!(msg("text", "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.")), "durable/runtime-context", "lane entry still covers the #2481 snapshot shape");
     assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
 });

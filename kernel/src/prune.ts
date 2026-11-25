@@ -270,6 +270,7 @@ export function prune(
         isCompressTool,
       ),
     ),
+    messages,
   );
 }
 
@@ -693,8 +694,46 @@ function stripOrphanedToolCalls(
  * ship a 400-triggering half-pair. Runs AFTER tool stripping, since removing
  * an orphaned tool-call can leave its preceding reasoning dangling too.
  */
-function stripOrphanedReasoning(messages: CoreMessage[]): CoreMessage[] {
+function hasPrePruneReasoningGap(
+  reasoning: CoreMessage,
+  companion: CoreMessage,
+  prePrune: CoreMessage[],
+  origIndex: Map<CoreMessage, number>,
+): boolean {
+  const ri = origIndex.get(reasoning);
+  const ci = origIndex.get(companion);
+  if (ri === undefined || ci === undefined || ci <= ri) return true;
+  const rWire = wireIndexOf(reasoning);
+  const cWire = wireIndexOf(companion);
+  const sameWire =
+    rWire !== undefined && cWire !== undefined && rWire === cWire;
+  for (let p = ri + 1; p < ci; p++) {
+    const mid = prePrune[p]!;
+    if (mid.contentType === "reasoning") {
+      const mWire = wireIndexOf(mid);
+      if (sameWire && mWire !== undefined && mWire !== rWire) return true;
+      continue;
+    }
+    if (sameWire && mid.role === "assistant" && wireIndexOf(mid) === rWire) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+function stripOrphanedReasoning(
+  messages: CoreMessage[],
+  prePrune?: CoreMessage[],
+): CoreMessage[] {
   const drop = new Set<number>();
+  let origIndex: Map<CoreMessage, number> | undefined;
+  if (prePrune) {
+    origIndex = new Map<CoreMessage, number>();
+    for (let idx = 0; idx < prePrune.length; idx++) {
+      origIndex.set(prePrune[idx]!, idx);
+    }
+  }
   for (let i = 0; i < messages.length; i++) {
     if (drop.has(i)) continue;
     if (messages[i]!.contentType !== "reasoning") continue;
@@ -713,7 +752,14 @@ function stripOrphanedReasoning(messages: CoreMessage[]): CoreMessage[] {
         companion.contentType === "tool-call");
     if (!hasCompanion) {
       for (let k = i; k <= j; k++) drop.add(k);
+    } else if (prePrune && origIndex) {
+      for (let k = i; k <= j; k++) {
+        if (hasPrePruneReasoningGap(messages[k]!, companion, prePrune, origIndex)) {
+          drop.add(k);
+        }
+      }
     }
+    i = j;
   }
   if (drop.size === 0) return messages;
   return messages.filter((_, i) => !drop.has(i));
