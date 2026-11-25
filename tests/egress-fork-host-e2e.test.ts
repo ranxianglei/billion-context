@@ -32,7 +32,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { openSqliteDatabase } from "../src/storage/driver.ts";
+import { openSqliteDatabase, type SqliteDatabase } from "../src/storage/driver.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest, peekSession } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
@@ -860,7 +860,7 @@ test("T10 kstate retirement: the cold egress-on load rebuilds blocks/refs/tsStam
 test("#7658 T11: the fork route must not leak a raw corruption error as FORK_FAILED (review fix)", async () => {
     const logs: string[] = [];
     const h = await harness(logs);
-    let wdb: { db: import("node:sqlite").DatabaseSync } | null = null;
+    let wdb: { db: SqliteDatabase } | null = null;
     try {
         await seedParent(h.base, "p11");
         await settle(h.store, "p11");
