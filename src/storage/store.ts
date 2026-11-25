@@ -2430,6 +2430,25 @@ export class UnifiedStore {
         return egressStateAt(this.db, sessionId, logSeq);
     }
 
+    /** Renumber (2026-11-25, egress-plane.md §10): the client's raw system
+     *  (A) — the latest system row's sysIn. The incremental lane's sticky
+     *  input stops living in the inc:system ext column for egress-on
+     *  sessions (reads consult this first; the ext write stays for legacy). */
+    egressSystemInput(sessionId: string): string | null {
+        const row = this.db
+            .prepare(
+                "SELECT payload FROM egress_state WHERE session_id = ? AND msgid = 'egress-system' ORDER BY op_seq DESC LIMIT 1",
+            )
+            .get(sessionId) as { payload?: string } | undefined;
+        if (!row?.payload) return null;
+        try {
+            const p = JSON.parse(row.payload) as { sysIn?: unknown };
+            return typeof p.sysIn === "string" ? p.sysIn : null;
+        } catch {
+            return null;
+        }
+    }
+
     egressStateMaxSeq(sessionId: string): number {
         // op_seq is the row-ordering high-water (log_seq is the per-message
         // number and only I rows carry it — it is not the row cursor).

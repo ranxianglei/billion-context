@@ -32,7 +32,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { openSqliteDatabase, type SqliteDatabase } from "../src/storage/driver.ts";
+import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest, peekSession } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
@@ -494,11 +494,17 @@ test("#7658 T6: real client adoption — tryForkAdoption (the #2399 client half)
         // (stamped) bytes — flow is the content authority, so that is exactly
         // what the host holds after an adopted fork — plus the fresh tail.
         const before = ustore.egressStateMaxSeq("c6");
+        const inheritedMax = Math.max(...ustore.egressStateView("c6").map((r) => r.num ?? 0));
         const childMsgs = [...snap.messages.map((row) => ({ role: row.role, content: row.text ?? "" })), m("user", 6)];
         await turn(h.base, "c6", childMsgs, [...snap.orderedMessages.map((o) => o.rawId), "c6-new-0"]);
         await settle(h.store, "c6");
         const v2 = ustore.egressStateView("c6");
-        assert.equal(v2.find((r) => r.msgid === "c6-new-0")?.num, before + 1, "served from its own flow: one new number, no downgrade");
+        // Renumber (2026-11-25): the new cell's number is one above the
+        // HIGHEST inherited canonical number — the kernel ledger and the
+        // egress numbers are the same space now, so the kernel mints
+        // highWater+1 (or the dense fallback does). The op_seq count
+        // (before) is a different sequence and no longer predicts it.
+        assert.equal(v2.find((r) => r.msgid === "c6-new-0")?.num, inheritedMax + 1, `served from its own flow: one new number above the inherited high water ${inheritedMax}, no downgrade (op_seq at fork was ${before})`);
     } finally {
         await h.close(h.store);
     }
@@ -834,7 +840,11 @@ test("T10 kstate retirement: the cold egress-on load rebuilds blocks/refs/tsStam
             const refs = (cold!.state as unknown as { messageRefs: { byRaw: Record<string, string> } }).messageRefs;
             assert(refs.byRaw["p10-id-0"] !== undefined, "messageRefs rebuilt from the live flow rows");
             const ts = cold!.state.tsStamps;
-            assert(ts !== undefined && Object.keys(ts).length >= 5, "tsStamps derived from the flow rows' first-observed ts");
+            // Renumber (2026-11-25): tsStamps derive from the LIVE view —
+            // after the fold the covered cells are retired, so the four
+            // live rows (id-0, fold-0, id-4, new-0) are the expected set.
+            assert(ts !== undefined && Object.keys(ts).length === 4, "tsStamps derived for exactly the live rows (retired rows are not in the view)");
+            assert(ts!["p10-id-0"] !== undefined && ts!["p10-fold-0"] !== undefined && ts!["p10-id-4"] !== undefined && ts!["p10-new-0"] !== undefined, "the four live rows carry their first-observed ts");
         } finally {
             store2.cancelAll();
         }
@@ -860,7 +870,7 @@ test("T10 kstate retirement: the cold egress-on load rebuilds blocks/refs/tsStam
 test("#7658 T11: the fork route must not leak a raw corruption error as FORK_FAILED (review fix)", async () => {
     const logs: string[] = [];
     const h = await harness(logs);
-    let wdb: { db: SqliteDatabase } | null = null;
+    let wdb: ReturnType<typeof openSqliteDatabase> | null = null;
     try {
         await seedParent(h.base, "p11");
         await settle(h.store, "p11");

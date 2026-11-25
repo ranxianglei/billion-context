@@ -401,7 +401,7 @@ export async function prepareGoogle(
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinned, sideRequest: isTitleGen });
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
-                const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log, egressBlockLedgerFor(session));
+                const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log, egressBlockLedgerFor(session), session.state.messageRefs);
                 if (served !== null) {
                     rebuiltContents = coreToGoogle(served, { model });
                 }

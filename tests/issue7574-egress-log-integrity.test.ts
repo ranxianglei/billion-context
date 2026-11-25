@@ -131,7 +131,7 @@ test("a turn that deletes compacts in the same write: both tables hold the base 
         assert.deepEqual(s.flow, ["B"], "flow: the base row replaced the rows below it (it used to keep all of them and add one snapshot per fold)");
         // the next message gets the next number, none is issued twice
         const high = Math.max(...view.map((r) => r.num));
-        assert.equal(high, 7, "system + five messages + the summary row = seven numbers issued so far");
+        assert.equal(high, 6, "five messages (numbers 1..5) + the summary row = six numbers issued (the system row is number 0, outside the citation space — renumber 2026-11-25)");
         const grown = recordEgressTurn({ store: H.ops, sessionId: S, prev: view, conversation: [M("a", "1"), M("sum", "…", "assistant"), M("e", "5"), M("f", "6")], systemText: "sys", nowMs: 3 });
         assert.equal(grown.find((r) => r.msgid === "f")!.num, high + 1, "numbering continues after the base — none is issued twice");
         assert.deepEqual(shape(H, S).flow, ["B", "I"]);
