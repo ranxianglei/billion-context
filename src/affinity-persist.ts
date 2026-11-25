@@ -76,7 +76,15 @@ function affinityFile(): string {
  *  alone is not the whole on-disk store; the census never throws or deletes, so
  *  the null-on-failure shape is gone). */
 function readDiskEntries(): AffinitySnapshotEntry[] {
-    return journal.census([]).records;
+    const census = journal.census([]);
+    for (const w of census.warnings) log("warn", `[prefix-affinity] read: ${w}`);
+    if (census.incomplete) {
+        const gap = census.retained.length > 0
+            ? `${census.retained.length} unreadable input(s) left in place`
+            : "some durable input was unreadable or churned";
+        log("warn", `[prefix-affinity] read: ${gap} and still missing from this view`);
+    }
+    return census.records;
 }
 
 /** #1724: union of ours + disk keyed by sessionId, deeper/fresher chain wins per
