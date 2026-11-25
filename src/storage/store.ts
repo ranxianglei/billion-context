@@ -72,9 +72,12 @@ import type { MessageContentStore } from "acp-kernel";
  *  built-in autocheckpoint alone cannot guarantee reclamation in a long-lived
  *  process: while a foreign connection holds a read snapshot (dashboard /
  *  export / second lane sharing the directory — #2671 topology) WAL backfill
- *  is blocked at that snapshot and the file grows until the reader lets go.
- *  PASSIVE never blocks the ingest path; a failed checkpoint is logged and
- *  forgotten — the next tick retries and journal_size_limit does the rest. */
+ *  is blocked at that snapshot and frames pile up. PASSIVE moves committed
+ *  frames into the main db WITHOUT touching the WAL file (no floor reclaim
+ *  under live peers — the #7156/#7674 discipline) and never blocks the
+ *  ingest path; a failed checkpoint is logged and forgotten — the next tick
+ *  retries. File-size reclamation is a separate concern: an explicit
+ *  journal_size_limit (when configured) or an operator's ?vacuum=full. */
 const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 
 /** PR #4725 N3: covered-seq span point queries chunk the msg_id IN (…) list
@@ -805,33 +808,26 @@ export class UnifiedStore {
         const store = new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
         if (foreignLockHolder !== null) store.noteForeignWriterSeen(foreignLockHolder.pid);
         if (bootVerdictFresh) store.noteIntegrityOk();
-        // #3250: converge the WAL an unclean exit left behind (SIGKILL / power
-        // loss never reaches close()). Moving committed frames into the main db
-        // now shortens the NEXT crash's recovery replay. Isolated from the open
-        // contract above on purpose: under a multi-process shared directory
-        // (#2671) a TRUNCATE can come back busy while a foreign connection is
-        // mid-transaction — that must log, not fail the open; the periodic and
-        // close-time passes retry the reclamation.
-        // #7156 fix 2 (owner 2026-11-20): a TRUNCATE checkpoint does not merely
-        // move frames — it RECLAIMS the WAL file and its -shm index state out
-        // from under every peer. A live peer holding a STALE view of that index
-        // (a wedged predecessor mid-fold, a predecessor still draining after
-        // accepting shutdown) then writes or checkpoints from the invalidated
-        // view, and its frames land in reclaimed offsets — the #7156 damage
-        // shape (child pointers beyond EOF, "2nd reference to page", ptrmap
-        // mismatches). So while a live foreign writer is proven present, skip
-        // the truncate: the WAL simply stays until the peer exits, and the
-        // periodic/close/next-open passes converge it then. With no live
-        // foreign writer the behavior is byte-identical to before.
-        const foreignAtOpen = store.activeForeignWriter();
-        if (foreignAtOpen === null) {
-            try {
-                db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
-            } catch (err) {
-                loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
-            }
-        } else {
-            loggerLog("info", `[storage] skipping the WAL checkpoint (TRUNCATE) on open for ${path}: live foreign writer pid ${foreignAtOpen} present — truncating the WAL index under a live peer risks the #7156 corruption shape; the periodic/close/next-open passes converge the WAL after it exits`);
+        // #3250: converge the frames an unclean exit left behind (SIGKILL /
+        // power loss never reaches close()). Moving committed frames into the
+        // main db now shortens the NEXT crash's recovery replay. Isolated from
+        // the open contract above on purpose: under a multi-process shared
+        // directory (#2671) a checkpoint can come back busy while a foreign
+        // connection is mid-transaction — that must log, not fail the open;
+        // the periodic and close-time passes retry. #7674: PASSIVE, not
+        // TRUNCATE — a TRUNCATE reclaim fetches the WAL file and its -shm
+        // index out from under live peers; a peer holding a stale view of
+        // that index then writes into reclaimed offsets, the #7156 damage
+        // shape (pages double-allocated, "2nd reference to page", index
+        // pages corrupting before table pages). PASSIVE moves every frame it
+        // can without touching the file: same replay shortening, no floor
+        // reclaim. The file stays at its historical high-water mark
+        // (bounded; shrink on demand with ?vacuum=full or an explicit
+        // storage.walJournalSizeLimitBytes).
+        try {
+            db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
         // #4609: a large store's cache-miss check runs post-open on a second
         // read-only connection — open() returns immediately; the verdict
@@ -893,21 +889,17 @@ export class UnifiedStore {
         // leaves nothing for the next boot's recovery to replay. Same isolation
         // as open(): a checkpoint hiccup logs and never throws — callers treat
         // close() as best-effort shutdown work.
-        // #7156 fix 2: the same live-foreign-writer guard as open(). The dying
-        // process's FINAL checkpoint is the proven vector — the incident's old
-        // sidecar ran its shutdown checkpoint while its replacement was already
-        // writing, and that truncate reclaimed the WAL under a live peer. A
-        // skip only delays reclamation: the WAL stays, the peer's next clean
-        // pass converges it, nothing is lost.
-        const foreignAtClose = this.activeForeignWriter();
-        if (foreignAtClose === null) {
-            try {
-                this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
-            } catch (err) {
-                loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
-            }
-        } else {
-            loggerLog("info", `[storage] skipping the WAL checkpoint (TRUNCATE) on close for ${this.dbPath}: live foreign writer pid ${foreignAtClose} present (#7156) — the WAL is left for the peer's next clean pass to converge`);
+        // #7674: PASSIVE, not TRUNCATE. The dying process's FINAL checkpoint
+        // was the proven #7156 vector — the incident's old sidecar ran its
+        // shutdown checkpoint while its replacement was already writing, and
+        // that truncate reclaimed the WAL under a live peer. PASSIVE moves
+        // every committable frame into the main db without touching the WAL
+        // file: the replay tail is converged, the floor is not reclaimed from
+        // under a live successor.
+        try {
+            this.db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
         }
         this.db.close();
         // #4609: a clean close of a VERIFIED store refreshes the PASS memo onto
@@ -3173,7 +3165,9 @@ export class UnifiedStore {
      *  (#2671/#394) may hold a read transaction; busy_timeout already
      *  absorbs most contention. Throws when all attempts fail: the deletion
      *  itself is already committed, the caller reports the shrink as
-     *  partial. */
+     *  partial. #7674 note: this stays TRUNCATE — vacuum is an explicit
+     *  operator request, so the reclaim is a requested shrink, not the
+     *  implicit engine-internal truncate that the corruption came from. */
     vacuum(mode: "full" | "incremental"): void {
         if (mode === "incremental") {
             this.db.exec("PRAGMA incremental_vacuum");
@@ -3667,8 +3661,11 @@ export class UnifiedStore {
             deleted += Number(r.changes);
             // Best-effort shrink between batches: committed frames move into
             // the main db and the WAL file truncates back to the cap
-            // (#3250 discipline). A busy checkpoint loses nothing — the next
-            // batch retries.
+            // (#3250 discipline). This stays TRUNCATE under #7674: gc is an
+            // explicit operator action (?gc=full / admin), so the reclaim is
+            // a requested shrink, not the implicit engine-internal truncate
+            // the corruption came from. A busy checkpoint loses nothing — the
+            // next batch retries.
             try {
                 this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
             } catch { /* best-effort; retried by the next batch */ }
