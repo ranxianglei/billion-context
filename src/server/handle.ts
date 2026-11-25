@@ -82,6 +82,7 @@ import { harvestIdentity } from "../identity-harvest.js";
 import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
+import { noteSessionLaneSwitch } from "./session-lane.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
@@ -3462,6 +3463,11 @@ async function handleRequest(
                 // request (initial AND preflight re-prepares both flow through).
                 const runPrepare = async (): Promise<Prepared> => {
                     const p = await runPrepareInner();
+                    // C5 (PR #7684): a wire-lane change for this session is an
+                    // EVENT — one loud line with the explicit cross-wire loss
+                    // list (the stored history re-renders on the new lane from
+                    // here on). Same-lane re-prepares (preflight) re-log nothing.
+                    noteSessionLaneSwitch(session, p.protocol, p.originalMessages ?? p.processedMessages, log);
                     if (ccMeta !== undefined) p.commandcode = { meta: ccMeta };
                     if (wireFamily === "zed" && zedMeta !== undefined) p.zed = { meta: zedMeta };
                     return p;
