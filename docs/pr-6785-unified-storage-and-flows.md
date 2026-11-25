@@ -2,6 +2,8 @@
 
 > Scope: `2026-11-15_msgid-snapshot-unified` @ `39941c816` (base `origin/master` `b10c1a0d4`).
 > 134 files, +13740/−367. This is the **review-grade** full walkthrough of this PR: four parts (table structure / implementation logic / data flow / switches) plus measured validation and this round's findings and fixes. All line numbers refer to source at head.
+>
+> **Retirement note (post-merge, read before relying on the table list):** as of the #7439 series end-state, `l1_world` is a **degraded placeholder** (R3 latch carrier moved to `sessions.r3_latched_at`; egress-on stage-0 is stateless — #7617), `conversations` is retired for egress-on, and the `fold_journal`/`egress_snapshot` tables were dropped before merge. The current tables — including the `egress_flow`/`egress_state` op log and the `egress_block_flow`/`egress_block_state` dual-clock block log — are documented in [architecture/storage.md](./architecture/storage.md) and the one-stop [egress-plane.md](./egress-plane.md); the retirement register is [deprecations.md](./deprecations.md).
 
 ---
 

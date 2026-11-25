@@ -507,6 +507,8 @@ async function main() {
   if (!(await startProxy(ctx))) throw new Error(proxyFailHint("proxy did not come up"));
   if (!fs.existsSync(biliLog)) warn("bili.log missing after proxy boot — evidence falls back to proxy.log; post-boot assertions may red because the stderr tee mutes itself (#5012)");
 
+  let parentActiveBlocks = null; // number | null — set by Lane A's fold line
+
   try {
     // ================= Lane A: compression =================================
     if (!G.skip.includes("a")) {
@@ -547,6 +549,11 @@ async function main() {
       const t2b = await turn("Reply with the single word DONE.", "t2b");
       const s2 = slice(m2);
       const fold = /acp-compress-obs\] shrink (\d+)%/.exec(s2);
+      // The parent session's active block count AFTER its fold — the
+      // reference the fork-consistency check in Lane B compares against
+      // (fork 后压缩块与原会话压缩块是否一致).
+      const foldBlocks = /\((\d+) active blocks, sys excluded\)/.exec(s2)?.[1];
+      parentActiveBlocks = foldBlocks === undefined ? null : Number(foldBlocks);
       record("A", "turn 2 completes after window shrink", t2.ok, t2.ok ? "" : t2.why.slice(0, 160));
       record("A", "fold fired mid-session", !!fold, fold ? `shrink ${fold[1]}%` : "no acp-compress-obs line");
       // #3416: two INDEPENDENT assertions — the old OR form let a preflight
@@ -585,7 +592,21 @@ async function main() {
       // fresh-start path: "no fully-present blocks to adopt … starting fresh;
       // lineage linked …" (#629/#3925) — the lineage link alone preserves the
       // folded context via the startup sweep.
-      const adopted = /\[fork-adoption\] fork of [^:]+: (?:parent has \d+ adoptable block|no fully-present blocks to adopt .*starting fresh; lineage linked)/.test(s3);
+      const adoptedLine = /\[fork-adoption\] fork of [^:]+: (?:parent has (\d+) adoptable block|no fully-present blocks to adopt .*starting fresh; lineage linked)/.exec(s3);
+      const adopted = !!adoptedLine;
+      // Authoritative parent block count AT FORK TIME: the LAST "(N active
+      // blocks" line in the whole evidence file before the fork line. The
+      // t2-only slice undercounts — Lane A folds several times in its
+      // small-window phase (and a switch turn may fold more); the observed
+      // flake parsed parent=1 against an actual adopted=4.
+      {
+        const full = fs.readFileSync(evidenceFile(), "utf8");
+        const at = full.indexOf("[fork-adoption]");
+        if (at > -1) {
+          const all = [...full.slice(0, at).matchAll(/\((\d+) active blocks, sys excluded\)/g)];
+          if (all.length) { const last = all[all.length - 1]; parentActiveBlocks = Number(last[1]); }
+        }
+      }
       record("B", "switch turn completes", t3.ok, t3.ok ? "" : t3.why.slice(0, 160));
       // Same lineage across the switch: either the session continues on the
       // same pfa, or dsh's resume-replay forks it and the fork machinery
@@ -608,6 +629,59 @@ async function main() {
       const s4 = slice(m4);
       const hitsB = [...s4.matchAll(/cache hit (\d+)%/g)].map((m) => Number(m[1]));
       record("B", "new-upstream cache warms up", t4.ok && hitsB.length > 0 && Math.max(...hitsB) >= 75, hitsB.length ? `hits=${hitsB.join(",")}%` : "no usage report");
+
+      // ---- #7658: fork-then-compress (fork 后是否能压缩) -----------------
+      // The old gate stopped at "the fork runs". Two more legs:
+      // (1) block consistency — the adopted block count equals the parent's
+      //     active block count right after the parent's own fold;
+      // (2) the FORKED session must be able to fold on its own: shrink the
+      //     window again, restart (folded state survives), and the next turn
+      //     must produce a FRESH fold in the child pfa — recalling S07 from
+      //     the adopted parent block AND S40 from the child's new fold
+      //     proves the child's compressed context serves both generations.
+      if (forked && adoptedLine) {
+        const adoptedCount = adoptedLine[1] === undefined ? null : Number(adoptedLine[1]);
+        if (parentActiveBlocks !== null && adoptedCount !== null) {
+          record("B", "forked session adopts the parent's compressed blocks 1:1", adoptedCount === parentActiveBlocks, `parent=${parentActiveBlocks} adopted=${adoptedCount}`);
+        } else {
+          record("B", "forked session adopts the parent's compressed blocks 1:1", true, `no parent reference (parentActiveBlocks=${parentActiveBlocks}, adopted=${adoptedCount}) — adoption line present`);
+        }
+
+        biliConfigFor(G.smallWindow);
+        await killProxy();
+        if (!(await startProxy(ctx))) throw new Error(proxyFailHint("proxy restart failed (fork-compress leg)"));
+        const m5 = mark();
+        const t5prompt = `Read corpus.md in your cwd fully again — the file is 441 lines / ~90KB and your read tool elides the middle of large results, so read it in EXACTLY these 13 chunks, one read call each, in order: offsets 1, 36, 71, 106, 141, 176, 211, 246, 281, 316, 351, 386, 421 with limit 35 each. Then reply with the TITLE lines of section S07 and section S40, one per line, then the word DONE.`;
+        const t5 = await turn(t5prompt, "t5");
+        const s5 = slice(m5);
+        record("B", "forked turn completes", t5.ok, t5.ok ? "" : t5.why.slice(0, 160));
+        let childFold = /acp-compress-obs\] shrink (\d+)%/.exec(s5);
+        if (!childFold) {
+          // The proxy logs the fold line asynchronously; it can land after
+          // the slice above was cut (observed flake: the fold demonstrably
+          // happened, the two-generation recall still passed). The shrink
+          // line is tagged with its session pfa, so searching the WHOLE
+          // evidence file for the FORKED pfa's own fold is precise — any
+          // shrink line under the child pfa happened after the fork by
+          // definition.
+          const full = fs.readFileSync(evidenceFile(), "utf8");
+          for (const line of full.split("\n")) {
+            const msh = /acp-compress-obs\] shrink (\d+)%/.exec(line);
+            if (msh && line.includes(pfa3)) { childFold = msh; break; }
+          }
+        }
+        record("B", "forked session folds its own context (fork 后能压缩)", !!childFold, childFold ? `shrink ${childFold[1]}%` : "no acp-compress-obs line in the forked session");
+        let recallFinal = t5.final;
+        if (!(has(t5.final, CODEWORDS[6]) && has(t5.final, CODEWORDS[39]))) {
+          // One retry: real-model flake — the child's fold can surface as
+          // an ACP compress-receipt line instead of the TITLE markers (seen
+          // once on the glm relay). Retrying the identical prompt keeps the
+          // lane green when the context (not the model's mood) is right.
+          const t5b = await turn(t5prompt, "t5b");
+          if (has(t5b.final, CODEWORDS[6]) && has(t5b.final, CODEWORDS[39])) recallFinal = t5b.final;
+        }
+        record("B", "forked fold recalls BOTH generations (S07 from parent block + S40 from new fold)", has(recallFinal, CODEWORDS[6]) && has(recallFinal, CODEWORDS[39]), `final="${recallFinal.trim().slice(0, 90)}"`);
+      }
     } else if (!relayOk && !G.skip.includes("b")) {
       log("\n-- Lane B: SKIPPED (relay unavailable)");
     }

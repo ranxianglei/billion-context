@@ -61,6 +61,15 @@ export interface Stage0Input {
      *  last measured T, openai wire). */
     incomingTailIds?: string[] | null;
     pluginMode: boolean;
+    /** Identity consolidation (discussions/7591): the lane's IN-MEMORY
+     *  conversation-bound verdict for an egress-on session
+     *  (metadata.pluginAgent set → bound). When provided it REPLACES the
+     *  store's conversations-row lookup — egress-on sessions never grow a
+     *  conversations row and the metadata field is the row's source of
+     *  truth anyway. Legacy sessions pass nothing: the store lookup keeps
+     *  running (its sticky-namespace semantics, #1426, can legitimately
+     *  differ from the in-memory value). */
+    convBound?: boolean;
     /** The openai fast-path watermark hit; the responses lane has none.
      *  (D3: a hit turn still refreshes the cursor — this field is now
      *  informational for logs only.) */
@@ -93,6 +102,18 @@ export interface Stage0Result {
 
 export function runStage0(opts: Stage0Input): Stage0Result {
     const { sessionId, lane, msgs, incomingMsgIds, incomingSeqs, incomingTailIds, pluginMode, wpHit, log } = opts;
+    // Identity consolidation (discussions/7591): the lane-supplied
+    // conversation-bound verdict (egress-on sessions — no conversations row
+    // exists or will ever exist for them) wins; otherwise the legacy store
+    // lookup runs (a store fault must not OPEN the fault path).
+    const convBound: () => boolean = () => {
+        if (opts.convBound !== undefined) return opts.convBound;
+        try {
+            return getStore()?.snapConvBound(sessionId) ?? false;
+        } catch {
+            return false;
+        }
+    };
     void wpHit; // D3: the arm no longer keys on the hit state (logs only)
     const rollout = featureEnabled("pluginLaneServerHistory");
     const declared = Array.isArray(incomingMsgIds) && incomingMsgIds.length > 0;
@@ -154,14 +175,7 @@ export function runStage0(opts: Stage0Input): Stage0Result {
                 // the cursor is bookkeeping; a short/missing msgid array
                 // degrades to content-derived ids (the log below) instead of
                 // 400/latch.
-                const convBound = (() => {
-                    try {
-                        return getStore()?.snapConvBound(sessionId) ?? false;
-                    } catch {
-                        return false; // a store fault must not OPEN the fault path
-                    }
-                })();
-                if (convBound) {
+                if (convBound()) {
                     log("warn", `[${sessionId}] [msgid] ${lane}-wire pin rejected (${v.reason}) — conversation-bound sid skips the R3 fault, content-derived ids this turn`);
                 } else if (!checkR3Identity(true, msgs.length, Array.isArray(incomingMsgIds) ? (incomingMsgIds as string[]) : null)) {
                     // R3: a cohort host that DECLARED the dual-channel but
@@ -230,14 +244,7 @@ export function runStage0(opts: Stage0Input): Stage0Result {
                     if (v.ok) {
                         log("warn", `[${sessionId}] [msgid] ${lane}-wire tail form on an empty ledger — nothing to anchor against: the turn runs without the pin, the response asks for the full list (#7574)`);
                     } else if (armed) {
-                        const convBound = (() => {
-                            try {
-                                return getStore()?.snapConvBound(sessionId) ?? false;
-                            } catch {
-                                return false;
-                            }
-                        })();
-                        if (convBound) {
+                        if (convBound()) {
                             log("warn", `[${sessionId}] [msgid] ${lane}-wire pin rejected (${v.reason}) — conversation-bound sid skips the R3 fault, content-derived ids this turn`);
                         } else if (!checkR3Identity(true, msgs.length, bodyTail)) {
                             const { latched } = r3FaultTracker.recordFault(sessionId);

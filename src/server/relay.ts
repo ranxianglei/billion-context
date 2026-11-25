@@ -13,7 +13,7 @@ import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, lastForwardedBody, noteCalibrationPair, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { rewrapCommandcodeBody } from "../commandcode-wire.js";
@@ -49,7 +49,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { describeCoreTextDuplication, formatForwardFieldSizes, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -972,6 +972,18 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         }
         applyResign(headers, wireBody);
     }
+    // #7587: make telemetry-bloat visible at the point where the final bytes
+    // are known. Parsing every request would be wasteful, so this runs only
+    // for debug sessions or oversized bodies — exactly the cases where the
+    // breakdown pays for itself.
+    const wireBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : wireBody.byteLength;
+    if (opts.debug || wireBytes >= 1024 * 1024) {
+        try {
+            const wireText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+            const sizes = formatForwardFieldSizes(JSON.parse(wireText));
+            if (sizes) log("info", `[${prepared?.session.id ?? "passthrough"}] [forward] field sizes: ${sizes}`);
+        } catch { /* non-JSON bodies keep the existing behavior */ }
+    }
     try {
         checkOutboundBody(wireBody);
     } catch (err) {
@@ -1184,6 +1196,17 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             scaledText,
             imageTokens: est.imageTokens,
             calibrated: scaledText !== est.textOverhead,
+        });
+        // #5952: the calibration pair for THIS send — the final wire text
+        // estimate (no image reserve) + the image reserve of the same body,
+        // so the settle that bills this body trains the text multiplier only
+        // from text-only evidence, even when a concurrent request overwrote
+        // the shared prepare slot in between.
+        noteCalibrationPair(prepared.session, {
+            estimate: est.textOverhead,
+            imageTokens: est.imageTokens,
+            origin: normalizeUpstreamOrigin(upstreamUrl),
+            model: typeof sentParsed?.model === "string" && sentParsed.model !== "" ? sentParsed.model : (prepared.model ?? prepared.google?.model),
         });
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").
@@ -2300,6 +2323,10 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     let targetOrigin: string | undefined;
     try { targetOrigin = new URL(upstreamUrl).origin; } catch { targetOrigin = undefined; }
     let dumpRaw: Promise<void> | undefined;
+    // #7666: three-level resolved degenerate-retry budget (global → provider →
+    // model), shared by every plugin strip pipe below (plugin-mode streamed,
+    // reset-after-success, title-gen).
+    const degenerateRetryCfg = resolveCompress(opts.routes, upstreamUrl, throttleModel, opts.compress).degenerateRetry;
     // Plugin mode: the agent's native loop owns the tool surface — pass the
     // response through VERBATIM (a model-emitted compress call must reach the
     // plugin untouched) while sniffing usage so lastInputTokens (the input to
@@ -2411,6 +2438,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                             signal: clientAbort.signal,
                             log,
                             label: prepared.session.id,
+                            nudges: degenerateRetryCfg?.nudges,
                         }),
                         targetOrigin,
                         absorbInstructed,
@@ -2418,6 +2446,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         upstreamMeta,
                         reply,
                         hostOwnsTruncationRecovery,
+                        degenerateRetryCfg?.maxAttempts,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -2441,6 +2470,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                             signal: clientAbort.signal,
                             log,
                             label: prepared.session.id,
+                            nudges: degenerateRetryCfg?.nudges,
                         }),
                         targetOrigin,
                         absorbInstructed,
@@ -2449,6 +2479,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         reply,
                         opts.streamErrorShape,
                         hostOwnsTruncationRecovery,
+                        degenerateRetryCfg?.maxAttempts,
+                        opts.degenerateTurn,
                     );
                 }
             } else {
@@ -2595,6 +2627,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: prepared.session.id,
+                        nudges: degenerateRetryCfg?.nudges,
                     }),
                     undefined,
                     undefined,
@@ -2602,6 +2635,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     upstreamMeta,
                     reply,
                     hostOwnsTruncationRecovery,
+                    degenerateRetryCfg?.maxAttempts,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -2648,6 +2682,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: p.session.id,
+                        nudges: degenerateRetryCfg?.nudges,
                     }),
                     undefined,
                     undefined,
@@ -2655,6 +2690,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     upstreamMeta,
                     reply,
                     hostOwnsTruncationRecovery,
+                    degenerateRetryCfg?.maxAttempts,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -2675,6 +2711,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: p.session.id,
+                        nudges: degenerateRetryCfg?.nudges,
                     }),
                     undefined,
                     undefined,
@@ -2683,6 +2720,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     reply,
                     opts.streamErrorShape,
                     hostOwnsTruncationRecovery,
+                    degenerateRetryCfg?.maxAttempts,
+                    opts.degenerateTurn,
                 );
             }
         } else if (
@@ -2967,7 +3006,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // `total` is always the true context size (see util.ts).
                 const rawUsage = prepared.protocol === "google" ? json.usageMetadata ?? json.usage : json.usage;
                 const u = (rawUsage ?? {}) as Record<string, unknown>;
-                const { total, cached, creation } = usageTotals(prepared.protocol, u);
+                const { total, cached, creation, context } = usageTotals(prepared.protocol, u);
                 const out = usageOutputTotal(prepared.protocol, u);
                 // #1547: settle through the shared path — stats AND the cache
                 // ledger. Before this, this branch updated stats only, so
@@ -2985,7 +3024,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         : typeof prepared.google?.model === "string" && prepared.google.model !== "" ? prepared.google.model
                         : typeof requestModelFromBody(wireBody, req) === "string" && requestModelFromBody(wireBody, req) !== "" ? requestModelFromBody(wireBody, req)
                         : undefined;
-                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation, model: settleModel });
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation, model: settleModel, context });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);
