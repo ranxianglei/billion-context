@@ -8,7 +8,7 @@ process.env.NODE_ENV = "test";
 
 import { createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { clearScanCache, conflictScanEnabled, isDesignBenign, isDisplayOnlyConflictDetail, isKnownDisplayOnlyPlugin, isDshLiveCompactEntry, isOpencodeAcpEntry, isSiblingConflictDetail, parsePluginConflictDetail, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
+import { clearScanCache, conflictScanEnabled, isDesignBenign, isDisplayOnlyConflictDetail, isKnownDisplayOnlyPlugin, isDshLiveCompactEntry, isDshMnemeEntry, isOpencodeAcpEntry, isSiblingConflictDetail, parsePluginConflictDetail, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
 import { CONFLICT_LEDGER_MAX, conflictEventsOf, formatConflictSection, recordConflict, summarizeConflicts } from "../src/conflict-watch.js";
 import { resolveHermesHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "../src/client-config.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
@@ -377,6 +377,75 @@ test("dsh scan: dsh-live-compact lookalike stays keyword-suspected, not known (#
     assert.equal(isDshLiveCompactEntry("dsh-live-compact-viewer"), false);
     assert.equal(isDshLiveCompactEntry("dsh-live-compact"), true);
     assert.equal(isDshLiveCompactEntry("/home/u/dsh/profiles/main/node_modules/dsh-live-compact"), true);
+});
+
+test("dsh scan: dsh-mneme is a KNOWN conflict (dream memory-consolidation compressor, #7379)", () => {
+    clearScanCache();
+    const root = tmp("bili-1206-dsh-dm-");
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
+    const file = path.join(root, "dsh", "profiles", "main", "package.json");
+    assertTestOwned(file, root);
+    writeFile(file, JSON.stringify({
+        dependencies: {
+            "dsh-mneme": "^0.16.1",
+            "billion-context": "^0.1.0",
+        },
+    }));
+    const res = scanClientPlugins("dsh", { env, cwd: root });
+    const f = res.findings.find((x) => x.entry === "dsh-mneme");
+    assert.ok(f, "dsh-mneme must be flagged");
+    // Build the recorded detail string (same shape as src/server/handle.ts:
+    // recordConflict) BEFORE the assert.equal below narrows f.match.
+    const detail = `${f.client}: ${f.entry} (${f.source})${f.match === "keyword" ? " [suspected]" : ""}`;
+    assert.equal(f.match, "known");
+    assert.equal(f.knownId, "dsh-mneme");
+    // A known finding is never design-benign — it is a live competing compressor
+    // (memory consolidation that shadows the raw history), like dsh-live-compact.
+    assert.equal(isDesignBenign(f, "dsh"), false);
+    const d = parsePluginConflictDetail(detail);
+    assert.ok(d, "the recorded detail must parse back");
+    assert.equal(d.entry, "dsh-mneme");
+    assert.equal(d.suspected, false, "a known finding must not carry the [suspected] tag");
+    assert.ok(!isSiblingConflictDetail(detail), "a dsh finding is not a sibling detail");
+    assert.ok(!isDisplayOnlyConflictDetail(detail), "dsh-mneme is a live compressor, never display-only");
+});
+
+test("dsh scan: versioned dsh-mneme npm spec is a KNOWN conflict too (#7379)", () => {
+    clearScanCache();
+    const root = tmp("bili-1206-dsh-dm-spec-");
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
+    const file = path.join(root, "dsh", "profiles", "main", "package.json");
+    assertTestOwned(file, root);
+    writeFile(file, JSON.stringify({ dependencies: { "dsh-mneme@0.16.1": "0.16.1" } }));
+    const res = scanClientPlugins("dsh", { env, cwd: root });
+    const f = res.findings.find((x) => x.entry === "dsh-mneme@0.16.1");
+    assert.ok(f, "the spec-form entry must be flagged");
+    assert.equal(f?.match, "known");
+    assert.equal(f?.knownId, "dsh-mneme");
+});
+
+test("dsh scan: dsh-mneme lookalike is not in the known tier (#7379)", () => {
+    clearScanCache();
+    // The bounded-segment identity must exclude lookalikes ("-viewer" has no
+    // compression keyword at all → unflagged; "-compactor" carries the
+    // "compact" token → keyword-suspected only, never known). isDshMnemeEntry
+    // is the load-bearing gate either way.
+    assert.equal(isDshMnemeEntry("dsh-mneme-viewer"), false);
+    assert.equal(isDshMnemeEntry("dsh-mneme-compactor"), false);
+    assert.equal(isDshMnemeEntry("dsh-mneme"), true);
+    assert.equal(isDshMnemeEntry("dsh-mneme@0.16.1"), true);
+    assert.equal(isDshMnemeEntry("/home/u/dsh/profiles/main/node_modules/dsh-mneme"), true);
+    // A keyword-bearing lookalike is still surfaced as [suspected] for user
+    // confirmation, but NOT promoted to the known tier.
+    const root = tmp("bili-1206-dsh-dm-lookalike-");
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
+    const file = path.join(root, "dsh", "profiles", "main", "package.json");
+    assertTestOwned(file, root);
+    writeFile(file, JSON.stringify({ dependencies: { "dsh-mneme-compactor": "^0.1.0" } }));
+    const res = scanClientPlugins("dsh", { env, cwd: root });
+    const f = res.findings.find((x) => x.entry === "dsh-mneme-compactor");
+    assert.equal(f?.match, "keyword");
+    assert.equal(f?.knownId, undefined);
 });
 
 test("claude scan: enabledPlugins keys + plugins dir scanned", () => {
