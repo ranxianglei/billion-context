@@ -2620,7 +2620,8 @@ export async function handlePluginTool(
             const mem = session.transient?.pluginMessages;
             const rawMessages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
             // #7439 follow-up (C6): egress-on sessions number their live
-            // messages in the op log (1-based, the system row holds 1). Stamp
+            // messages in the op log (the renumbered citation space — the
+            // system row holds 0). Stamp
             // that space onto the fold's cores BEFORE the kernel runs — the
             // same way the four wire lanes stamp their processTurn input.
             // The kernel attests a fold block's startSeq/endSeq only from

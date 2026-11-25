@@ -290,9 +290,9 @@ export function recordAuthorityTurn(
 /**
  * #7439 follow-up (C6): egress-on sequence authority. For a session the
  * op log records, the FLOW is the transcript: each core carries its
- * canonical message number (egress_flow.log_seq — 1-based, the system row
- * takes 1, the first real message 2) as `ledgerSeq`, the same 1-based
- * display space the kernel's refs/prune/sync/compress consume (CoreMessage
+ * canonical message number (egress_flow.log_seq — the renumbered citation
+ * space: the system row is 0, the first real message 1) as `ledgerSeq`, the
+ * same display space the kernel's refs/prune/sync/compress consume (CoreMessage
  * .ledgerSeq, refs #4316 L3). Block coordinates resolved from the same flow
  * (ingestSession) live in the identical space, so seq coverage, block
  * pruning and the ref ledger all line up without any conversion.

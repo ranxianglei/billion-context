@@ -13,8 +13,9 @@
  *
  *  Pinned here (harness pattern: tests/identity-consolidate-e2e.test.ts):
  *   A. live egress-on (plane ON): the kernel-input cores carry
- *      ledgerSeq = flow num (1-based; the system row holds 1), so a REAL
- *      kernel fold ATTESTS its interval [11,41] in flow number space; the
+ *      ledgerSeq = flow num (the renumbered citation space — the system
+ *      row holds 0, the first real message 1), so a REAL
+ *      kernel fold ATTESTS its interval [10,40] in flow number space; the
  *      stamped cores are per-turn views only — the bytes recorded into the
  *      flow carry no ledgerSeq (the identity hash already stripped it).
  *   B. rollback re-ingest (plane OFF, arm marker still saved): unified
@@ -61,8 +62,8 @@ const MESSAGES = Array.from({ length: 80 }, (_, i) => ({
     text: "lorem ipsum dolor sit amet conseq ".repeat(8) + i,
 })) as unknown as CoreMessage[];
 
-// fold m00010..m00040 (refs) = raw9..raw39 → flow nums 11..41 (the system
-// row holds 1; raw0 = 2).
+// fold m00010..m00040 (refs) = raw9..raw39 → flow nums 10..40 (the
+// renumbered citation space: system row = 0, raw0 = 1).
 const SPEC = () => parseCompressInput({ content: [{ startId: "m00010", endId: "m00040", summary: "the thirty-one folded messages agree to refactor the cache layer" }] });
 
 function makeCtx(sessionId: string, messages: CoreMessage[] = MESSAGES): Ctx {
@@ -139,7 +140,7 @@ const mkBlock = (blockId: string, startSeq: number, endSeq: number, eff: string[
 const bm = (id: string, extra: Record<string, unknown> = {}): BiliMessage =>
     ({ id, role: "user", content: [{ type: "text", text: id }], ...extra }) as unknown as BiliMessage;
 
-test("A: live egress-on — kernel input carries flow numbers and a REAL fold attests [11,41] in that space", async () => {
+test("A: live egress-on — kernel input carries flow numbers and a REAL fold attests [10,40] in that space", async () => {
     const dir = mkdtempSync(join(tmpdir(), "c6-seq-"));
     const store = openStore(dir);
     let db: Db | null = null;
@@ -154,11 +155,11 @@ test("A: live egress-on — kernel input carries flow numbers and a REAL fold at
         assert.equal(row1.length, 81, "system + 80");
         await store.writeNow(persistable(ctx, ctx.messages));
 
-        // --- (1) the stamp: ledgerSeq = flow num (1-based; system row = 1)
+        // --- (1) the stamp: ledgerSeq = flow num (system row = 0)
         const stamped = stampEgressSeqs(ustore()!, sid, ctx.messages) as BiliMessage[];
-        assert.equal(stamped[0]!.ledgerSeq, 2, "raw0 is flow num 2 (the system row is num 1)");
-        assert.equal(stamped[9]!.ledgerSeq, 11, "raw9 (ref m00010) is flow num 11");
-        assert.equal(stamped[39]!.ledgerSeq, 41);
+        assert.equal(stamped[0]!.ledgerSeq, 1, "raw0 is flow num 1 (the system row is num 0)");
+        assert.equal(stamped[9]!.ledgerSeq, 10, "raw9 (ref m00010) is flow num 10");
+        assert.equal(stamped[39]!.ledgerSeq, 40);
         assert.equal(ctx.messages[0]!.ledgerSeq, undefined, "source cores are never stamped in place");
         const twice = stampEgressSeqs(ustore()!, sid, stamped) as BiliMessage[];
         assert.equal(twice, stamped, "a no-op re-stamp returns the same array (reference contract)");
@@ -177,8 +178,8 @@ test("A: live egress-on — kernel input carries flow numbers and a REAL fold at
         assert.equal(folded.length, 50, "80 - 31 + 1 summary");
         const blk = (ctx.session.state.blocks as { active?: boolean; startSeq?: number; endSeq?: number }[]).filter((b) => b.active)[0];
         assert.ok(blk, "an active block exists after the fold");
-        assert.equal(blk.startSeq, 11, "block startSeq = flow num of raw9 (m00010)");
-        assert.equal(blk.endSeq, 41, "block endSeq = flow num of raw39 (m00040)");
+        assert.equal(blk.startSeq, 10, "block startSeq = flow num of raw9 (m00010)");
+        assert.equal(blk.endSeq, 40, "block endSeq = flow num of raw39 (m00040)");
 
         // --- (3) the flow bytes never carry a stamp
         const row2 = recordEgressTurn({ store: ustore()!, sessionId: sid, prev: row1, conversation: folded, systemText: "sys", nowMs: 1_005_000 });
@@ -215,14 +216,14 @@ test("B: rollback re-ingest (plane OFF) — block coordinates bind to the flow, 
         assert.deepEqual([pre.start_seq, pre.end_seq], [0, 1], "pre-arm: the frozen-table space (b1=seq 0, b2=seq 1)");
 
         // the plane arms (marker saved) + one more live turn (flow grows:
-        // system=1, b1..b5 = 2..6) → rollback re-ingest binds from the FLOW
+        // system=0, b1..b5 = 1..5) → rollback re-ingest binds from the FLOW
         ctx.session.metadata["egressAuthority"] = true;
         const c5 = bm("c6-b5");
         ctx.messages = [...ctx.messages, c5];
         recordEgressTurn({ store: ustore()!, sessionId: sid, prev: rowPre, conversation: ctx.messages, systemText: "sys", nowMs: 1_005_000 });
         await store.writeNow(persistable(ctx, ctx.messages));
         pre = vd().prepare("SELECT start_seq, end_seq FROM blocks WHERE session_id = ? AND block_id = ?").get(sid, "b-pre") as { start_seq: number; end_seq: number };
-        assert.deepEqual([pre.start_seq, pre.end_seq], [2, 3], "arm marker present: coordinates rebind to the FLOW numbers b1=2, b2=3 (pre-fix: frozen-table 0..1)");
+        assert.deepEqual([pre.start_seq, pre.end_seq], [1, 2], "arm marker present: coordinates rebind to the FLOW numbers b1=1, b2=2 (pre-fix: frozen-table 0..1)");
 
         // a kernel-attested block whose covered ids are GONE from the live
         // view and from the projection: only the attestation knows.
