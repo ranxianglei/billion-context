@@ -4271,7 +4271,7 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFi
 export function attachConfigDriftNote(residentEpoch: string | undefined, currentEpoch: string): string | undefined {
     if (residentEpoch === undefined || residentEpoch === "" || currentEpoch === "") return undefined;
     if (residentEpoch === currentEpoch) return undefined;
-    return "attached helper is serving STALE config — you edited billion-context.json after this helper started, so process-level settings (compress.*, providers table, subagentSplit, modelContextLimit, …) are NOT applied yet. Fix: stop this helper (POST /__bili/shutdown) and let the host respawn it, or save the config from the bili panel.";
+    return "attached helper is serving STALE config — you edited your config file (billion-context.json or your BILI_CONFIG_FILE / -c target) after this helper started, so process-level settings (compress.*, providers table, subagentSplit, modelContextLimit, …) are NOT applied yet. Fix: stop this helper (POST /__bili/shutdown) and let the host respawn it, or save the config from the bili panel.";
 }
 
 /** #1232: every healthy live instance — not just the last writer of the
