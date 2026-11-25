@@ -44,7 +44,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
-import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority, stampEgressSeqs } from "./egress-lane-io.js";
 import { EgressAuthorityRejectError } from "../storage/egress-record.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
@@ -196,7 +196,9 @@ export async function prepareGoogle(
         // (#651 keeps reasoning-drop off this wire — Gemini validates
         // thoughtSignature — so only tokenCount + processTurn consume the
         // render view, unlike the openai/responses lanes' third consumer.)
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        let renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #7439 follow-up (C6): egress-on sequence authority (see egress-lane-io).
+        renderMsgs = stampEgressSeqs(getStore()?.egressOpLogStore(), sessionId, renderMsgs);
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.

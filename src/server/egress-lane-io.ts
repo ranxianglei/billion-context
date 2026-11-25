@@ -44,7 +44,7 @@
 // Rollout gate (egressPlane, default 0 — opt-in per owner ruling 2026-11-24) and each lane's arming condition
 // are owned by the caller.
 
-import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
+import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, EGRESS_SYSTEM_MSGID, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
 import type { EgressBlockLedgerInput } from "../storage/egress-block.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { featureEnabled } from "../rollout.js";
@@ -285,4 +285,51 @@ export function recordAuthorityTurn(
     }
     if (outcome.bootstrapping) return outcome.recordCore;
     return outcome.swappedCore;
+}
+
+/**
+ * #7439 follow-up (C6): egress-on sequence authority. For a session the
+ * op log records, the FLOW is the transcript: each core carries its
+ * canonical message number (egress_flow.log_seq — 1-based, the system row
+ * takes 1, the first real message 2) as `ledgerSeq`, the same 1-based
+ * display space the kernel's refs/prune/sync/compress consume (CoreMessage
+ * .ledgerSeq, refs #4316 L3). Block coordinates resolved from the same flow
+ * (ingestSession) live in the identical space, so seq coverage, block
+ * pruning and the ref ledger all line up without any conversion.
+ *
+ * A core not yet in the flow (fresh this turn) is left un-stamped — its
+ * number exists only after recordEgressTurn assigns it, and the id path
+ * stays authoritative for it until then. Never fails: an absent store, the
+ * flag off, an empty/corrupt view returns the input untouched (the id path
+ * keeps working — a sequence stamp is an optimization, not an authority).
+ */
+export function stampEgressSeqs(
+    st: EgressOpLogStore | null | undefined,
+    sessionId: string,
+    msgs: readonly BiliMessage[],
+): BiliMessage[] {
+    if (st === null || st === undefined || !featureEnabled("egressPlane")) return msgs as BiliMessage[];
+    let view: EgressViewRow[];
+    try {
+        view = st.egressStateView(sessionId);
+    } catch {
+        return msgs as BiliMessage[];
+    }
+    if (view.length === 0) return msgs as BiliMessage[];
+    const byId = new Map<string, number>();
+    for (const row of view) {
+        if (row.msgid !== EGRESS_SYSTEM_MSGID && row.num > 0) byId.set(row.msgid, row.num);
+    }
+    if (byId.size === 0) return msgs as BiliMessage[];
+    let touched = false;
+    const out = msgs.map((m) => {
+        const n = byId.get(m.id);
+        if (n === undefined || m.ledgerSeq === n) return m;
+        touched = true;
+        return { ...m, ledgerSeq: n };
+    });
+    // The SAME reference is returned whenever nothing was stamped, so the
+    // lanes' reference-inequality discriminators (snapshot-view replacement)
+    // keep their exact meaning; a stamped view is a genuine replacement.
+    return touched ? out : (msgs as BiliMessage[]);
 }

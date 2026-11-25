@@ -37,7 +37,7 @@
 import type { BiliMessage } from "acp-kernel/wire";
 import { getStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
-import { applyMsgIdPin, applyWireMsgIdPin, validateMsgIds, validateWireMsgIds, wirePinGroups } from "../msgid-pin.js";
+import { applyMsgIdPin, applyWireMsgIdPin, validateMsgIds, validateWireMsgIds, wireElementIds, wirePinGroups } from "../msgid-pin.js";
 import { checkR3Identity, FoundationRejectError, r3FaultTracker } from "./plane.js";
 
 export interface Stage0Input {
@@ -392,8 +392,16 @@ export function tryIncrementalPin(
             return null; // a store fault degrades — never a 500 on the pin path
         }
     }
-    const C = liveIds.length;
-    const T = msgs.length;
+    // #7439 follow-up (Part 2): the ledger is CORE-granular (a multi-core
+    // wire element carries derived `#pN` ids on its siblings) while the host
+    // tail list is WIRE-ELEMENT-granular — the old per-core math drifted on
+    // every split turn and the pin degraded to the full signal. Both sides
+    // in element units now: the ledger filters to its element leaders, the
+    // client view counts its wire groups. A 1:1 session filters nothing and
+    // counts identically — the old math is recovered exactly.
+    const ledgerEl = wireElementIds(liveIds);
+    const C = ledgerEl.length;
+    const T = wirePinGroups(msgs)?.size ?? msgs.length;
     const L = tailIds.length;
     if (C === 0) {
         log("debug", `[${sessionId}] [2x2:${lane}] incremental form on an empty ledger — full signal (bootstrap)`);
@@ -421,8 +429,8 @@ export function tryIncrementalPin(
     // degrades to the full signal — D1: never a reject.
     const overlapEnd = L - n; // first slot that is a NEW core (>= C)
     for (let j = 0; j < overlapEnd; j++) {
-        if (tailIds[j] !== liveIds[T - L + j]) {
-            log("info", `[${sessionId}] [2x2:${lane}] incremental tail drift at overlap row ${T - L + j} (got=${tailIds[j]}, ledger=${liveIds[T - L + j]}) — full signal (reanchor next turn)`);
+        if (tailIds[j] !== ledgerEl[T - L + j]) {
+            log("info", `[${sessionId}] [2x2:${lane}] incremental tail drift at overlap row ${T - L + j} (got=${tailIds[j]}, ledger=${ledgerEl[T - L + j]}) — full signal (reanchor next turn)`);
             return null;
         }
     }
@@ -446,9 +454,53 @@ export function tryIncrementalPin(
     // sweeps the ledger to the authoritative set, #3285/#4390 — the overlap
     // check above is what keeps the two in step; a fold-edge transient
     // degrades one turn and re-converges with the full list).
-    return msgs.map((m, i) => {
-        if (i < C) return { ...m, id: liveIds[i] };
-        const id = tailIds[i - C + L - n]; // slot of view position i in the list (n = T - C)
-        return id === "?" ? m : { ...m, id };
-    });
+    // CORE-UNIT APPLICATION: the ledger's live cores (RAW — `#pN` siblings
+    // included) restamp the first C0 view cores positionally (the host
+    // resends its history in parse order — the pin's invariant); the NEW
+    // cores are element-granular — each new element's leader takes its tail
+    // id, its siblings the derived `#pN` (same scheme as applyWireMsgIdPin,
+    // so next turn's ledger filters back to elements cleanly).
+    const C0 = liveIds.length;
+    if (C0 > msgs.length) {
+        log("info", `[${sessionId}] [2x2:${lane}] incremental view shorter than the ledger cores (view cores=${msgs.length}, ledger cores=${C0}) — full signal (reanchor next turn)`);
+        return null;
+    }
+    // The split path needs the prefix to re-split into the ledger's element
+    // shape (same wire structure, same split) — otherwise the positional
+    // restamp would cross element boundaries.
+    if (C0 > C) {
+        const prefix = wirePinGroups(msgs.slice(0, C0));
+        if (prefix === null || prefix.size !== C) {
+            log("info", `[${sessionId}] [2x2:${lane}] incremental prefix does not re-split into the ledger's element shape (ledger elements=${C}) — full signal (reanchor next turn)`);
+            return null;
+        }
+    }
+    const out: BiliMessage[] = new Array(msgs.length);
+    for (let i = 0; i < C0; i++) out[i]! = { ...msgs[i]!, id: liveIds[i]! };
+    let slot = 0;
+    let sibling = 0;
+    let leaderId = "";
+    let prevWire: number | undefined;
+    let havePrev = false;
+    for (let i = C0; i < msgs.length; i++) {
+        const m = msgs[i]!;
+        const w = m.wireIndex;
+        if (havePrev && w !== undefined && w === prevWire) {
+            sibling += 1;
+            out[i]! = { ...m, id: `${leaderId}#p${sibling}` };
+        } else {
+            havePrev = true;
+            prevWire = w;
+            sibling = 0;
+            if (slot >= n) {
+                log("info", `[${sessionId}] [2x2:${lane}] incremental tail carried more new elements (${slot}) than the view/ledger math allows (${n}) — full signal (reanchor next turn)`);
+                return null;
+            }
+            const t = tailIds[overlapEnd + slot]!;
+            slot += 1;
+            leaderId = t === "?" ? m.id : t;
+            out[i]! = t === "?" ? { ...m } : { ...m, id: leaderId };
+        }
+    }
+    return out;
 }

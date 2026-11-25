@@ -55,7 +55,7 @@ import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, 
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { egressAuthorityArmed, egressBlockLedgerFor, egressTinyBudget, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, egressBlockLedgerFor, egressTinyBudget, recordAuthorityTurn, resolveEgressAuthority, stampEgressSeqs } from "./egress-lane-io.js";
 import { EgressAuthorityRejectError } from "../storage/egress-record.js";
 
 export async function prepareResponses(
@@ -348,6 +348,8 @@ export async function prepareResponses(
         } else {
             renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
         }
+        // #7439 follow-up (C6): egress-on sequence authority (see egress-lane-io).
+        renderMsgs = stampEgressSeqs(getStore()?.egressOpLogStore(), sessionId, renderMsgs);
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.

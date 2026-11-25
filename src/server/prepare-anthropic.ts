@@ -54,7 +54,7 @@ import { collectRequestIds, probeRequestMembership } from "../request-membership
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { currentCalibrationFactor } from "../util.js";
 import { yieldToEventLoop } from "../yield-loop.js";
-import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority, stampEgressSeqs } from "./egress-lane-io.js";
 import { EgressAuthorityRejectError } from "../storage/egress-record.js";
 
 export async function prepareAnthropic(
@@ -309,7 +309,9 @@ export async function prepareAnthropic(
         // (fold-time ids, immune to identity re-mints); live tail keeps the
         // client's bytes. No-op when the lane is inactive/degraded; the
         // reconcile call below still observes the CLIENT view.
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        let renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #7439 follow-up (C6): egress-on sequence authority (see egress-lane-io).
+        renderMsgs = stampEgressSeqs(getStore()?.egressOpLogStore(), sessionId, renderMsgs);
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.

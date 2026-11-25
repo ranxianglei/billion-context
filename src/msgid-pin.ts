@@ -105,6 +105,28 @@ export function wirePinGroups(msgs: BiliMessage[]): WirePinGroups | null {
     return { min, size: groups.size, split, groups };
 }
 
+const WIRE_SIBLING_RE = /^(\S+)#p\d+$/;
+
+/**
+ * #7439 follow-up (Part 2): the ledger view is CORE-granular — a multi-core
+ * wire element carries its host id on its FIRST core and derived `#pN` ids
+ * on its siblings. Wire-element-granular consumers (the incremental tail pin
+ * compares against the host's element list) need the ELEMENT list: drop
+ * every derived sibling, keep every leader.
+ *
+ * Documented limit: a host-minted id that genuinely ends in `#pN` while its
+ * base is ALSO in the ledger is indistinguishable from a derived sibling and
+ * is treated as one (host ids are a host-owned namespace; the collision
+ * would have to match both the exact suffix and a co-resident base id).
+ */
+export function wireElementIds(ledgerIds: readonly string[]): string[] {
+    const set = new Set(ledgerIds);
+    return ledgerIds.filter((id) => {
+        const m = WIRE_SIBLING_RE.exec(id);
+        return !(m !== null && set.has(m[1]));
+    });
+}
+
 /** Wire-form validation: same entry rules as the per-core path, length
  *  against the GROUP count (wire elements), not the core count. */
 export function validateWireMsgIds(raw: unknown, groups: WirePinGroups): MsgIdValidation {
