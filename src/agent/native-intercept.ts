@@ -1550,27 +1550,47 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
     }
 }
 
+/** #7698: a swapped-in body changes the wire size, so any declared
+ *  content-length is stale — an explicit one makes undici throw
+ *  UND_ERR_REQ_CONTENT_LENGTH_MISMATCH (fetch only recomputes when the header
+ *  is absent). Drop it and let fetch measure the new body; the content-encoding
+ *  header stays valid. */
+function withoutContentLength(headers: string[][] | Record<string, string | ReadonlyArray<string>> | Headers | undefined): Headers | undefined {
+    if (headers === undefined) return undefined;
+    try {
+        const h = new Headers(headers);
+        h.delete("content-length");
+        return h;
+    } catch {
+        return undefined; // unparseable headers — leave them as-is (fail open)
+    }
+}
+
 /** #3304: rebuild a fall-back dispatch carrying `body` INSTEAD of whatever
  *  `init`/the Request carried. The restored body rides INIT so fetch-spec
  *  precedence (init over Request fields) stays exactly what the original
  *  dispatch had; a string body needs no duplex. #7698: `body` may be a
  *  Uint8Array (a content-encoded body the guard re-encoded to its original
- *  coding) — fetch measures its content-length itself, so the hop's declared
- *  content-length is ignored and the content-encoding header stays valid. */
+ *  coding) — the re-encoded size differs from the original, so the stale
+ *  content-length is dropped (see withoutContentLength) and fetch measures the
+ *  new body itself; the content-encoding header stays valid. */
 export function withRestoredBody(input: string | URL | Request, init: RequestInit | undefined, body: string | Uint8Array): { input: string | URL | Request; init: RequestInit | undefined } {
+    const initHeaders = withoutContentLength(init?.headers);
+    const initOut: RequestInit = { ...(init ?? {}), body };
+    if (initHeaders !== undefined) initOut.headers = initHeaders;
     if (input instanceof Request) {
         try {
-            const plain = new Request(input.url, { method: input.method, headers: input.headers, signal: input.signal });
-            return { input: plain, init: { ...(init ?? {}), body } };
+            const plain = new Request(input.url, { method: input.method, headers: withoutContentLength(input.headers) ?? input.headers, signal: input.signal });
+            return { input: plain, init: initOut };
         } catch {
             const headers: Record<string, string> = {};
             try {
-                for (const [k, v] of input.headers) headers[k] = v;
+                for (const [k, v] of input.headers) if (k.toLowerCase() !== "content-length") headers[k] = v;
             } catch {}
-            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body, signal: init?.signal !== undefined ? init.signal : input.signal } };
+            return { input: input.url, init: { ...initOut, method: input.method, headers, signal: init?.signal !== undefined ? init.signal : input.signal } };
         }
     }
-    return { input, init: { ...(init ?? {}), body } };
+    return { input, init: initOut };
 }
 
 /** Re-point the process-level live-state slot at the activating instance and

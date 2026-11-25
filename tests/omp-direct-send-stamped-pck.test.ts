@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import * as zlib from "node:zlib";
+import * as http from "node:http";
 import { createOmpDirectSendGuard, stampPromptCacheKey } from "../src/agent/pi.ts";
+import { withRestoredBody } from "../src/agent/native-intercept.ts";
 
 // The omp plugin stamps the session id as a top-level prompt_cache_key while a
 // proxy is claimed (BILLION_CONTEXT_PROXY). The proxy strips it before it
@@ -142,4 +144,46 @@ test("gzip body via a Request object: the stamped key is stripped", async () => 
     const decoded = JSON.parse(zlib.gunzipSync(Buffer.from(prep.body)).toString("utf8")) as Record<string, unknown>;
     assert.equal("prompt_cache_key" in decoded, false);
     assert.deepEqual(decoded, { model: "m", max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
+});
+
+// #7698 review: the re-encoded body is a different size than the original, so a
+// content-length the CLIENT set is stale — undici throws
+// UND_ERR_REQ_CONTENT_LENGTH_MISMATCH on an explicit stale value and the
+// degraded send dies locally. withRestoredBody must drop it so fetch measures
+// the new body. Regression: the wire content-length must equal the re-encoded
+// size, and the key must be stripped.
+test("re-encoded body: a client-set content-length is dropped so the wire length matches", async () => {
+    const server = http.createServer((r, s) => {
+        const chunks: Buffer[] = [];
+        r.on("data", (c) => chunks.push(c));
+        r.on("end", () => {
+            const actual = Buffer.concat(chunks).length;
+            const decoded = JSON.parse(zlib.gunzipSync(Buffer.concat(chunks)).toString("utf8")) as Record<string, unknown>;
+            s.end(JSON.stringify({ declared: r.headers["content-length"], actual, hasKey: "prompt_cache_key" in decoded }));
+            server.close();
+        });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const port = (server.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${port}/v1/messages`;
+    try {
+        const body = stampedBody("sess-gzip-cl");
+        const json = Buffer.from(JSON.stringify(body), "utf8");
+        const gz = zlib.gzipSync(json);
+        const req = new Request(url, { method: "POST", headers: { "content-encoding": "gzip", "content-type": "application/json", "content-length": String(gz.length) }, body: gz });
+        const prep = await createOmpDirectSendGuard()(url, req, undefined);
+        assert.equal(prep.outcome, "restored");
+        assert.ok(prep.body instanceof Uint8Array);
+        const reencoded = prep.body;
+        assert.notEqual(reencoded.length, gz.length, "fixture: stripping the key changes the compressed size");
+        const dispatch = withRestoredBody(req, undefined, reencoded);
+        const resp = await fetch(dispatch.input, dispatch.init);
+        assert.equal(resp.status, 200);
+        const seen = JSON.parse(await resp.text()) as { declared?: string; actual: number; hasKey: boolean };
+        assert.equal(seen.hasKey, false, "the stamped key is stripped");
+        assert.equal(seen.actual, reencoded.length, "the wire body is the re-encoded body");
+        assert.equal(seen.declared, String(reencoded.length), "the wire content-length matches the re-encoded size (stale client value dropped)");
+    } finally {
+        server.close();
+    }
 });
