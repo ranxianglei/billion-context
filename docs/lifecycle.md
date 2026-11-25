@@ -39,6 +39,7 @@
 | `BILI_FAKE_COMPLETION_RETRIES` | fake-completion fallback | 假完成重试（opt-in，默认 0 = 禁用） | fallback 机制定型后转 §2 | opt-in |
 | `BILI_NO_CACHE_CONTROL` | compat | 历史 no-cache-control 怪癖保留（knobs.ts:458 明言 "Historical quirk preserved in the env"） | 兼容窗口结束后退役 | 默认 off |
 | `BILI_STREAM_ERROR_SHAPE` | compat | 给无法带内上报错误的 SDK 的流错误形状兼容 | 兼容保留（长期） | 常设兼容旋钮 |
+| `BILI_DEGENERATE_TURN` | #4913 compat | plugin chat 车道退化回合重试耗尽后的终局：`error` 默认（#870 带内报错）/ `passthrough`（pre-#870 放行空回合为正常完成） | 确认无人用 passthrough 后退役（与 BILI_STREAM_ERROR_SHAPE 同类） | 默认 error |
 | `BILI_SUBAGENT_SPLIT` | #970 | subagent 拆分（默认 on） | 成为既定行为后移 §2 | 默认 ON（`=0` 退出） |
 | `BILI_PERSONA_SPLIT` | Responses personaSplit | Responses 线路 instructions 指纹分叉（默认 on；`=0` / `personaSplit: false` 关闭，剥 `instructionsFingerprintKeyed`、保留 identity） | 成为既定行为后移 §2 | 默认 ON（`=0` 退出） |
 | `BILI_RESUME_INHERITANCE` | resume inheritance | resume 继承行为（默认 on） | 同上 | 默认 ON（`=0` 退出） |
@@ -55,6 +56,7 @@
 | `BILI_INLINE_DEBUG` | #4669 | 仅 inline 车道：引擎 stderr 日志腿默认静默（stderr 是 pi 的交互终端，日志会挤掉输入框；默认只写 bili.log），设 1 恢复 stderr 输出用于排查 | 随 inline 车道（#3278）走 | 排查逃生口 |
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
 | `BILI_PF_RENDER_WINDOW` / `BILI_PF_RENDER_AUDIT_EVERY` | #5664 v6 render-snapshot plane | 实验性渲染快照车道可调项（默认 OFF，嵌套于 watermarkV6MsgId cohort）：W = 稳态轮回放的冻结核数（默认 8）；N = 计划全量审计节奏（默认 8）；读点 src/server/fastpath-v6-render.ts:50-60 | render 平面转正（rollout 100% 且审计计数归稳）后移 §2 常设面，或随车道退役删除 | opt-in（默认 OFF；仅由显式 rollout 开启） |
+| `BILI_PREFLIGHT_EMERGENCY_DIGEST` | PR #7549 | #2383 emergency digest regime（超窗 >19.2× 的确定性摘要折叠 = 模型可见的硬截断）默认关（owner decision 2026-11-22）；`=1` 或 file `network.emergencyDigest: true` 恢复旧行为（读点 src/knobs.ts preflightEmergencyDigestEnabled） | default-off dogfood 站稳后随 regime 一起退役（或转 §2 常设） | 默认 off（opt-in 恢复） |
 | `BILI_IDENTITY_HARVEST` | #5825 / PR #5842 | 身份信道采集 kill/scope 开关（src/identity-harvest.ts）：缺省=OFF（接线以惰性状态出厂）；`1`/`all`=全部已登记来源；逗号列表=按 roster 名圈定；须与 rollout `pluginLaneServerHistory` 及仅回环来源同时放行才生效 | harvest 车道（claude-code/codebuddy/mcode）站稳后按 #2028 模式退役 env（转 file 键）或移 §2 | opt-in（默认 off；rollout 0% 起灰度） |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）
@@ -111,7 +113,7 @@
 | `BILI_OUTBOUND_BODY_BYTES` | network.outboundBodyBytes，5 GiB——重建后转发上游的硬上限（#3128） |
 | `BILI_WS_OUTBOUND_BYTES` | network.wsOutboundBytes，10 MiB——WS 车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3701：网关对大帧 close 1009；0 关闭预发送削减；HTTP 车道不受影响） |
 | `BILI_HTTP_OUTBOUND_BYTES` | network.httpOutboundBytes，10 MiB——普通/代理/pi 原生 HTTP 中继车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3909：图片密集会话按字节/像素解码 CPU 被上游拒收、token 折叠不触发；仅在无受管传输时生效，受管 HTTP/dsh-inline 从不裁减 #3701 Finding 1；0 关闭） |
-| `BILI_INGEST_BODY_BYTES` | network.ingestBodyBytes，32 MiB——解码后进入 JSON.parse+归一化清扫的成本带（#5794：51.2 MiB 体每轮吞 5.5–7.2s 事件循环 → 747s FATAL；超带的**文本为主**体即 413，因为任何可解析的 32 MiB+ 文本体 ≥ ~8M token、超过一切真实窗口；带图片的体豁免——像素按设计不进 token 计量，由槽位预算/收件上限/车道 shed 治理（#496/#3909/#3701）；0 关闭） |
+| `BILI_INGEST_BODY_BYTES` | network.ingestBodyBytes，0（#7426 起默认对所有车道关闭；重发车道原始入站字节≠上下文）——解码后进入 JSON.parse+归一化清扫的成本带（#5794：51.2 MiB 体每轮吞 5.5–7.2s 事件循环 → 747s FATAL；超带的**文本为主**体即 413，因为任何可解析的 32 MiB+ 文本体 ≥ ~8M token、超过一切真实窗口；带图片的体豁免——像素按设计不进 token 计量，由槽位预算/收件上限/车道 shed 治理（#496/#3909/#3701）；0 关闭） |
 | `BILI_MAX_MESSAGES` | network.maxMessages，默认 0（关闭）——单上游 messages[] 数组长度硬限（COUNT 维度，任何字节/token 估算都表达不了；#5000：26,903 条消息体清掉所有尺寸闸仍在上游死掉；超限 413 提示 restart/rewind，不做折叠；按上游各自设置） |
 | `BILI_CACHE_KEEPALIVE`（#3376） | unset（false；同 `cacheKeepalive.enabled` 层级 env 覆盖） |
 | `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | unset（从 body cache_control 断点探测） |
@@ -141,6 +143,7 @@
 | `BILI_SESSIONS_DIR` | 状态目录重定位 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | storage.archiveAfterDays，默认 365 天——超龄会话由 gc 归档（export + tombstone + CAS 释放；0 关闭年龄清扫，#3901/#3463） |
 | `BILI_STORAGE_QUICK_CHECK` | 默认开——index.db 开库在迁移前跑 PRAGMA quick_check 自检；失败=影子层隔离文件组（.corrupt-<ts>）+重建新库（JSON 信封为恢复源）；=0 跳过（超大库启动时间敏感场景，#4175） |
+| `BILI_STORAGE_ALLOW_LEGACY_DEGRADE` | 纯 SQLite 姿态下证实损坏拒启的逃生阀（#7156）：设 1/true/on 恢复旧契约（响亮告警后不挂索引启动、以 JSON 路径服务，尽管此时损坏索引是唯一持久副本）；缺省 off、不被任何配置值隐含 |
 | `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | storage.walJournalSizeLimitBytes——SQLite WAL 回收字节上限（#3250；垃圾/非正值落回文件/默认层，不让 typo 崩 boot） |
 | `BILI_MYSQL_DSN` | storage.mysql.dsn——mysql 引擎连接串（env > 文件 > ""；空 = mysql 不可用走 sqlite，#3388/#3931） |
 
@@ -175,6 +178,7 @@
 | `BILI_CLAUDE_NATIVE_PORT` / `BILI_ZCODE_PORT` | 显式 zone 端口覆盖（strict-port 语义，#1660） |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` / `BILI_ATTACH_HEALTH_DEADLINE_MS` | native attach 证据宽限窗 / 健康截止窗 |
 | `BILI_SPAWN_WAIT_MS` / `BILI_SLOW_START_GRACE_MS` | launcher spawn 初始健康等待窗 / LIVE 子进程慢启动宽限；总 spawn 预算 = 两者之和（#4947） |
+| `BILI_PREDECESSOR_DRAIN_GRACE_MS` | spawn 前第二写者闸（#7156）内的有界宽限：前任监听器消失后等待进程真正退出的时长（排空期最终 flush 仍写 index.db）；默认 10s，非法值回落默认（envMillis，#1365） |
 | `BILI_SILENT_DIRECT_MAX_MB` | silent-direct 超大请求守卫上限（MiB，默认 8；非法值回退默认，#5405/#5826） |
 | `BILI_DSH_BIN` / `BILI_PI_BIN` | dsh / pi 可执行文件覆盖 |
 | `BILI_PLUGIN_AGENT` | `--plugin` 目标 agent 选择（默认 claude） |
@@ -182,6 +186,8 @@
 | `BILI_ALLOW_PRIVATE_HTTP_PROVIDERS` | 私有 http provider 放行（CGNAT 100.64/10 恒拒） |
 | `BILI_MITM` | MITM 功能总开关（env > 文件 mitm.enabled > 默认开；`=0` 整体关闭；与内部通道 `BILI_MITM_HOSTS`/`BILI_MITM_DOMAINS` 不同） |
 | `BILI_CLAUDE_UPSTREAM` | direct-URL 模式下绕过预置 relay 的上游 URL（OAuth 订阅流量需 MITM 模式） |
+| `BILI_WORKBUDDY_PROXY` | workbuddy 车道（#7456）钉死的 proxy origin（缺省常驻 http://127.0.0.1:8787） |
+| `BILI_WORKBUDDY_UPSTREAM` | workbuddy 车道（#7456）钉死的上游 URL（缺省 https://www.workbuddy.ai；改包自建 relay 用） |
 | `BILI_PLUGIN_BYPASS` | x-bili-plugin-bypass 透传判定的运维覆盖（#6220，env-only）：三态 unset/auto=现状（入站头逐请求决定，legacy opencode-acp 会话透传）/ `1`·`on`·`true`=强制透传（所有请求原样转发，不进管线、不绑会话）/ `0`·`off`·`false`=永不透传（忽略入站头）；无法识别的取值按 auto（现状）处理；逐请求读取无需重启（src/server/handle.ts 单点判定） |
 
 ### 2.7 更新器 / 公告

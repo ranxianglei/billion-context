@@ -2,7 +2,7 @@ import { MESSAGES } from "./i18n.js";
 
 // Dependency-free, DOM-free builders so they run in both the proxy (/__bili/session-report)
 // and unit tests; title/label (user PII) masked by default, upstream host + metrics kept.
-type Locale = "zh-CN" | "en";
+type Locale = "zh-CN" | "en" | "ko";
 
 interface ReportOpts {
     /** Mask title/label (user PII). Defaults to true. */
@@ -65,7 +65,7 @@ interface SvgReport {
 }
 
 function tr(lang: string, key: string, args?: Record<string, string | number>): string {
-    const loc: Locale = lang === "en" ? "en" : "zh-CN";
+    const loc: Locale = lang === "en" || lang === "ko" ? lang : "zh-CN";
     let s = MESSAGES[loc][key] ?? key;
     if (args) for (const [k, v] of Object.entries(args)) s = s.split("{" + k + "}").join(String(v));
     return s;
@@ -146,7 +146,7 @@ function readLedger(d: ReportData) {
 
 export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): string {
     const mask = opts.mask !== false;
-    const lang = opts.lang === "en" ? "en" : "zh-CN";
+    const lang = opts.lang === "en" || opts.lang === "ko" ? opts.lang : "zh-CN";
     const t = (k: string, a?: Record<string, string | number>) => tr(lang, k, a);
     const f = makeFmt(lang);
     const { tot, seam, st, folds, lines, seamEvents, ctxBest, win, rec } = readLedger(d);
@@ -274,7 +274,7 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
 
 export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): SvgReport {
     const mask = opts.mask !== false;
-    const lang = opts.lang === "en" ? "en" : "zh-CN";
+    const lang = opts.lang === "en" || opts.lang === "ko" ? opts.lang : "zh-CN";
     const t = (k: string, a?: Record<string, string | number>) => tr(lang, k, a);
     const f = makeFmt(lang);
     const { tot, seam, st, folds, lines, seamEvents, ctxBest, win, rec } = readLedger(d);
@@ -355,8 +355,8 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
     else {
         const CH = 150, PL = 52, PR = 14, PT = 8, PB = 20;
         const top = y + PT, bot = y + CH - PB, left = PAD + PL, right = W - PAD - PR;
-        const vals = lines.map((l) => Number(l.input) || 0);
-        let maxV = Math.max.apply(null, vals.concat(win ? [win] : []).concat(Number(d.systemPromptTokens) ? [Number(d.systemPromptTokens)] : []));
+        let maxV = lines.reduce((max, l) => Math.max(max, Number(l.input) || 0), -Infinity);
+        maxV = Math.max(maxV, win || -Infinity, Number(d.systemPromptTokens) || -Infinity);
         if (!(maxV > 0)) maxV = 1;
         const Xp = (i: number) => left + (lines.length <= 1 ? (right - left) / 2 : (i / (lines.length - 1)) * (right - left));
         const Yp = (v: number) => bot - (v / maxV) * (bot - top);
@@ -511,9 +511,9 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
                 }
                 const wAll = uLines.filter((ln) => (ln.at || 0) >= gs && (ln.at || 0) <= geT + 120000).map((ln) => ln.input || 0);
                 if (!wAll.length) return;
-                const gPeakAll = Math.max(...wAll);
-                const gPeak = Math.max(...wAll.filter((v) => v >= 0.25 * gPeakAll));
-                const gBase = preMin !== null && preMin >= 0.25 * gPeak ? preMin : Math.min(...wAll.filter((v) => v >= 0.25 * gPeak));
+                const gPeakAll = wAll.reduce((max, v) => Math.max(max, v), -Infinity);
+                const gPeak = wAll.filter((v) => v >= 0.25 * gPeakAll).reduce((max, v) => Math.max(max, v), -Infinity);
+                const gBase = preMin !== null && preMin >= 0.25 * gPeak ? preMin : wAll.filter((v) => v >= 0.25 * gPeak).reduce((min, v) => Math.min(min, v), Infinity);
                 const gGrow = Math.max(0, gPeak - gBase);
                 gPts.push({ at: geT, s: folded, g: gGrow, pct: gGrow > 0 ? Math.round(folded / gGrow * 1000) / 10 : null });
                 gPrevEnd = geT;
@@ -603,12 +603,12 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
                 const x = TX(gp.at);
                 if (gp.pct === null) {
                     // no new growth → mark on the 0% axis (pure older-stock cleanup)
-                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + bot.toFixed(1) + '" r="4" fill="none" stroke="' + GROW + '"><title>' + t("det.rec_growth_flat", { s: f.W(gp.s) }) + "</title>");
+                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + bot.toFixed(1) + '" r="4" fill="none" stroke="' + GROW + '"><title>' + t("det.rec_growth_flat", { s: f.W(gp.s) }) + "</title></circle>");
                     return;
                 }
                 const over = gp.pct > 100;
                 if (over) body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="7" fill="none" stroke="' + GROW + '"/>');
-                body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="4.5" fill="#ffffff" stroke="' + GROW + '" stroke-width="1.8"/><title>' + t("det.rec_growth_tip", { at: f.DT(gp.at), g: f.W(gp.g), s: f.W(gp.s), pct: gp.pct }) + "</title>");
+                body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="4.5" fill="#ffffff" stroke="' + GROW + '" stroke-width="1.8"><title>' + t("det.rec_growth_tip", { at: f.DT(gp.at), g: f.W(gp.g), s: f.W(gp.s), pct: gp.pct }) + "</title></circle>");
                 const lx = x + 9 > right - 44 ? x - 9 : x + 9;
                 txt(lx, RY(gp.pct) + 3, gp.pct.toFixed(gp.pct >= 100 ? 0 : 1) + "%", { size: 9, weight: "700", color: GROW, anchor: lx < x ? "end" : "start", mono: true });
             });

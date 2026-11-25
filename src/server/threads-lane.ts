@@ -147,6 +147,18 @@ export function isThreadsBody(parsed: unknown): boolean {
     return type === "create" || type === "continue";
 }
 
+/** The message-threads token of an `anthropic-beta` header, when bili should decline it:
+ *  the body is a threads turn of a Claude Code session bili compresses (its bili MCP tools
+ *  are on the wire, or its MCP server registered the session). A continue carries only the
+ *  new messages, so bili could neither nudge nor fold it (#2701). Claude Code answers the
+ *  unknown-beta 400 by dropping the header and threading for the session and retrying with
+ *  the full history. */
+export function threadsBetaToDecline(parsed: unknown, betaHeader: string | string[] | undefined, biliToolsDeclared: boolean): string | undefined {
+    if (!biliToolsDeclared || !isThreadsBody(parsed)) return undefined;
+    const raw = Array.isArray(betaHeader) ? betaHeader.join(",") : betaHeader ?? "";
+    return raw.split(",").map((s) => s.trim()).find((s) => s.startsWith("message-threads-"));
+}
+
 function serializeEntry(entry: ThreadsMirrorEntry): { ok: true; value: ThreadsMirrorEntry } | { ok: false; bytes: number } {
     const bytes = Buffer.byteLength(JSON.stringify(entry), "utf8");
     if (bytes > ENTRY_BYTE_LIMIT) return { ok: false, bytes };
@@ -338,12 +350,18 @@ function renderTranscript(entries: ThreadsMirrorEntry[]): string {
 
 function buildSummaryRequestBody(shape: ThreadsMirrorShape | undefined, model: string | undefined, meta: ThreadsMirrorMeta, entries: ThreadsMirrorEntry[], cut: number, billingBlock: { type: "text"; text: string } | undefined): Record<string, unknown> {
     const system: unknown[] = billingBlock !== undefined ? [billingBlock, { type: "text", text: SUMMARIZER_SYSTEM }] : [{ type: "text", text: SUMMARIZER_SYSTEM }];
+    const transcript = renderTranscript(entries.slice(Math.min(meta.foldedBefore, cut), cut));
+    // A reforge replaces the entire old thread. The next summary must carry
+    // forward the previously folded prefix as well as the newly folded slice.
+    const content = meta.foldedSummary
+        ? `# Previously folded history\n${meta.foldedSummary}\n\n# New history to fold\n${transcript}`
+        : transcript;
     return {
         model: model ?? shape?.model ?? "claude-sonnet-4-5",
         max_tokens: SUMMARY_MAX_TOKENS,
         stream: false,
         system,
-        messages: [{ role: "user", content: renderTranscript(entries.slice(Math.min(meta.foldedBefore, cut), cut)) }],
+        messages: [{ role: "user", content }],
     };
 }
 

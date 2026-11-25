@@ -837,6 +837,38 @@ test("#5959 review: a throwing getter eviction cannot escape the watchdog timer"
     }
 });
 
+// #6829: pi-web-access 0.46+ marks its wrapper with the SHARED flag only
+// (`__piWebAccessSharedProxyFetch`) — the old flag propagates only when the
+// wrapped fetch already has it. The guard must recognize the shared marker
+// as the same supported coexistence handshake (#2435), not an unknown
+// third-party install, and the marker must be visible through the re-chained
+// top so the wrapper's own install guard does not re-install.
+test("#6829: a shared-marker pi-web-access install is quietly adopted as coexistence", async () => {
+    const nativeSink: string[] = [];
+    const { warns, logs, errors, out, err, lines } = await withDiagnosticsCapture(async () => {
+        await withScope(fakeFetch(nativeSink), async () => {
+            installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+            const base = globalThis.fetch;
+            const wrapper = (async (input: string | URL | Request, init?: RequestInit) => base(input, init)) as typeof fetch;
+            Object.defineProperty(wrapper, "__piWebAccessSharedProxyFetch", { value: true });
+            globalThis.fetch = wrapper;
+            tick(); // the supported first adopt fires on the check, not in a setter (#5959 data-property design)
+            // Marker visible through the re-chained top (forwarded, not lost).
+            assert.equal(Reflect.get(globalThis.fetch, "__piWebAccessSharedProxyFetch"), true);
+            const res = await globalThis.fetch("https://api.example.invalid/v1/messages", { method: "POST" });
+            assert.equal(res.status, 200);
+        });
+    });
+    assert.equal(warns.length, 0);
+    assert.equal(logs.length, 0);
+    assert.equal(errors.length, 0);
+    assertNoTerminalBili(out, err);
+    const diags = lines.filter(l => l.includes("[native-client]"));
+    assert.equal(diags.length, 1);
+    assert.match(diags[0], /\[info\] \[v=[^\]]+\] \[native-client\] \[bili-native\] adopted pi-web-access proxy fetch as downstream \(supported coexistence, #2435\)/);
+    assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages"]);
+});
+
 // #5907: the no-guard postures (env escape hatch / non-configurable host
 // property) are exactly where a third-party replacement silently un-routes
 // model traffic — pin that each one names the degraded posture in bili.log

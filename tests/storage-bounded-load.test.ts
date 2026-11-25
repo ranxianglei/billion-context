@@ -82,7 +82,7 @@ test("ordinary sync cold load reads only unique tail/snapshot seqs and bounded b
     const store = (shadow as unknown as { sync: UnifiedStore }).sync;
     t.after(() => { shadow.close(); rmSync(dir, { recursive: true, force: true }); });
     seed(store);
-    const expected = loadLegacyView(allRows(store));
+    const expected = loadLegacyView(allRows(store), undefined, store.getStateFields("bounded"), store.getOrphanViews("bounded") ?? {});
     const getMessages = store.getMessages.bind(store);
     const getBlocks = store.getBlocks.bind(store);
     const requested: number[] = [];
@@ -115,7 +115,7 @@ test("ordinary async cold load uses the snapshot reader for each bounded page", 
     const backend = SqliteBackend.open(join(dir, "index.db"));
     t.after(async () => { await backend.close(); rmSync(dir, { recursive: true, force: true }); });
     seed(backend.store);
-    const expected = loadLegacyView(allRows(backend.store));
+    const expected = loadLegacyView(allRows(backend.store), undefined, backend.store.getStateFields("bounded"), backend.store.getOrphanViews("bounded") ?? {});
     const readSnapshot = backend.readSnapshot.bind(backend);
     const offsets: number[] = [];
     const requested: number[] = [];
@@ -172,7 +172,7 @@ test("resident field reads avoid unrelated JSON, messages, refs, and block paylo
     const store = (shadow as unknown as { sync: UnifiedStore }).sync;
     t.after(() => { shadow.close(); rmSync(dir, { recursive: true, force: true }); });
     seed(store);
-    const expected = loadLegacyView(allRows(store));
+    const expected = loadLegacyView(allRows(store), undefined, store.getStateFields("bounded"), store.getOrphanViews("bounded") ?? {});
     for (const key of ["getSessionRow", "getMessages", "getBlocks", "getRefs", "getDeadRefs"] as const) {
         store[key] = () => { throw new Error(`resident field read called ${key}`); };
     }

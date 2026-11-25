@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { deriveTitle, isContextualUserFragment, isAutoInjectedNotification } from "../src/server.js";
+import { SUBAGENT_PROMPT_PREFIX, displaySessionTitle, firstBlockTopicLead, topicLeadFrom } from "../src/session-title.js";
 import type { CoreMessage } from "acp-kernel";
 
 let seq = 0;
@@ -89,6 +90,9 @@ describe("#2118 isContextualUserFragment mirrors codex matches_marked_text", () 
 const DSH_APPROVAL = 'The approval policy changed from "ask" to "never" (changed by the user).';
 const DSH_RUNTIME_CTX = "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nMode: read-only.";
 const DSH_RUNTIME_CLEARED = "Current runtime context: none. Earlier runtime-context snapshots no longer apply.";
+// #7085: dsh 0.2.2-rc.3 wraps the reworded runtime-context snapshot in a
+// \x3csystem-reminder\x3e envelope (no longer contains "Current runtime context").
+const DSH_RUNTIME_CTX_NEW = '\x3csystem-reminder\x3e\nThe following information describes your current session:\n\nCurrent working directory: "/path/to/repo".\n\nCurrent DSH file policy: danger-full-access.';
 const DSH_TIME_CTX = "Time sampled while preparing turn 1, step 1: 2026-07-15T09:01:01+08:00[Asia/Shanghai]\nBrowser time zone for this request: Asia/Shanghai. Interpret otherwise-unqualified dates and times in this zone.\nElapsed since the preceding model-visible message: unavailable.";
 
 describe("#2286 deriveTitle skips dsh-injected notifications", () => {
@@ -114,6 +118,11 @@ describe("#2286 deriveTitle skips dsh-injected notifications", () => {
     it("the browser-time-zone line embedded in the time-context message is covered by its prefix", () => {
         assert.equal(deriveTitle([msg("user", "text", DSH_TIME_CTX), msg("user", "text", "why is CI red?")]), "why is CI red?");
     });
+
+    it("the 0.2.2-rc.3 reworded snapshot ahead of the real question does not become the title (#7085)", () => {
+        const t = deriveTitle([msg("user", "text", DSH_RUNTIME_CTX_NEW), msg("user", "text", "fix the failing test")]);
+        assert.equal(t, "fix the failing test");
+    });
 });
 
 describe("#2286 isAutoInjectedNotification prefix permitlist", () => {
@@ -122,6 +131,7 @@ describe("#2286 isAutoInjectedNotification prefix permitlist", () => {
         assert.equal(isAutoInjectedNotification(DSH_RUNTIME_CTX), true);
         assert.equal(isAutoInjectedNotification(DSH_RUNTIME_CLEARED), true);
         assert.equal(isAutoInjectedNotification(DSH_TIME_CTX), true);
+        assert.equal(isAutoInjectedNotification(DSH_RUNTIME_CTX_NEW), true, "the 0.2.2-rc.3 reworded snapshot (system-reminder envelope) is recognized too (#7085)");
     });
 
     it("matches a polluted set-once title truncated at 60 chars with ellipsis", () => {
@@ -142,5 +152,99 @@ describe("#2286 isAutoInjectedNotification prefix permitlist", () => {
     it("does not match empty or whitespace-only text", () => {
         assert.equal(isAutoInjectedNotification(""), false);
         assert.equal(isAutoInjectedNotification("  \t\n "), false);
+    });
+});
+
+describe("subagent dispatch prompts: the task after the prefix becomes the title", () => {
+    const TASK = "你是 JavaScript 课程字幕校对员。工作目录：D:\\work\\js-course";
+    const PROMPT = `${SUBAGENT_PROMPT_PREFIX}\n${TASK}`;
+
+    it("derives the title from the task after the dispatch prefix", () => {
+        assert.equal(deriveTitle([msg("user", "text", PROMPT)]), TASK);
+    });
+
+    it("a prefix-only dispatch prompt produces no title", () => {
+        assert.equal(deriveTitle([msg("user", "text", SUBAGENT_PROMPT_PREFIX)]), undefined);
+    });
+
+    it("a prefix-only dispatch prompt does not block a later real user message", () => {
+        const t = deriveTitle([msg("user", "text", SUBAGENT_PROMPT_PREFIX), msg("user", "text", "continue from 151")]);
+        assert.equal(t, "continue from 151");
+    });
+
+    it("matches the dispatch prefix case-insensitively", () => {
+        const t = deriveTitle([msg("user", "text", "you are a subagent spawned by another session.\nFix the login bug")]);
+        assert.equal(t, "Fix the login bug");
+    });
+
+    it("does not strip a real question that merely mentions subagents", () => {
+        const t = deriveTitle([msg("user", "text", "Why does every subagent spawned by another session show the same title?")]);
+        assert.ok(t?.startsWith("Why does every subagent"));
+        assert.ok(t?.endsWith("\u2026"));
+    });
+});
+
+describe("#7595 displaySessionTitle: one display-title fallback for every surface", () => {
+    const BOILER = SUBAGENT_PROMPT_PREFIX;
+
+    it("a stored subagent boilerplate title falls back to the first block topic", () => {
+        assert.equal(displaySessionTitle(null, BOILER, "Fix the login bug"), "Fix the login bug");
+    });
+
+    it("a host-provided name always wins, even over boilerplate", () => {
+        assert.equal(displaySessionTitle("my custom name", BOILER, "Fix the login bug"), "my custom name");
+    });
+
+    it("a normal (non-boilerplate) stored title is never replaced", () => {
+        assert.equal(displaySessionTitle(null, "Fix the login bug", "Some other topic"), "Fix the login bug");
+    });
+
+    it("boilerplate title with no block topic keeps the stored title", () => {
+        assert.equal(displaySessionTitle(null, BOILER, undefined), BOILER);
+        assert.equal(displaySessionTitle(null, BOILER, ""), BOILER);
+    });
+
+    it("no title at all returns undefined (caller renders its own fallback)", () => {
+        assert.equal(displaySessionTitle(null, undefined, "topic"), undefined);
+        assert.equal(displaySessionTitle(undefined, null, "topic"), undefined);
+    });
+
+    it("accepts the merged title (hostTitle ?? title) from the storage fast path", () => {
+        // hostTitle set: merged === hostTitle, and the host name wins
+        assert.equal(displaySessionTitle("my name", "my name", "topic"), "my name");
+        // hostTitle unset: merged === raw title, so the fallback still applies
+        assert.equal(displaySessionTitle(null, BOILER, "Fix the login bug"), "Fix the login bug");
+    });
+});
+
+describe("#7595 firstBlockTopicLead / topicLeadFrom: the shared list-hint value", () => {
+    it("returns the first block's topic, whitespace-normalized", () => {
+        assert.equal(firstBlockTopicLead([{ topic: "  Fix   the\nlogin  bug " }]), "Fix the login bug");
+    });
+
+    it("falls back to the summary when the first block has no topic", () => {
+        assert.equal(firstBlockTopicLead([{ summary: "did the thing" }]), "did the thing");
+    });
+
+    it("skips blocks with neither topic nor summary", () => {
+        assert.equal(firstBlockTopicLead([{}, { topic: "later topic" }]), "later topic");
+    });
+
+    it("caps the hint at 48 chars with an ellipsis", () => {
+        const hint = firstBlockTopicLead([{ topic: "a".repeat(60) }])!;
+        assert.equal(hint.length, 49);
+        assert.ok(hint.endsWith("\u2026"));
+    });
+
+    it("returns undefined when no block carries a topic or summary", () => {
+        assert.equal(firstBlockTopicLead([{}, { summary: "" }]), undefined);
+        assert.equal(firstBlockTopicLead([]), undefined);
+    });
+
+    it("topicLeadFrom prefers topic over summary and is the core of both", () => {
+        assert.equal(topicLeadFrom("topic", "summary"), "topic");
+        assert.equal(topicLeadFrom(undefined, "summary"), "summary");
+        assert.equal(topicLeadFrom(undefined, undefined), undefined);
+        assert.equal(topicLeadFrom("  spaced   out  ", undefined), "spaced out");
     });
 });

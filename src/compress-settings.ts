@@ -1,4 +1,4 @@
-import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type Pack, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CoreMessage, type CcrConfig, type Pack, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, resolveModelEntryOnRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
@@ -67,6 +67,9 @@ export function mergeCompress(
     // `tierNudgeTokens` is another nested-object field merged sub-field-wise
     // like `absorb`: a model-level t2 must not discard a provider-level t1.
     const tierNudgeLevels = [global?.tierNudgeTokens, provider?.tierNudgeTokens, model?.tierNudgeTokens].filter(Boolean) as NonNullable<CompressSettings["tierNudgeTokens"]>[];
+    // #7666: `degenerateRetry` is merged sub-field-wise like `absorb`: a
+    // model-level nudges list must not discard a provider-level maxAttempts.
+    const degenerateRetryLevels = [global?.degenerateRetry, provider?.degenerateRetry, model?.degenerateRetry].filter(Boolean) as NonNullable<CompressSettings["degenerateRetry"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
@@ -81,6 +84,7 @@ export function mergeCompress(
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
         requireNudge: pick("requireNudge"),
         requireRecommendation: pick("requireRecommendation"),
+        postComPressTail: pick("postComPressTail"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
@@ -89,6 +93,7 @@ export function mergeCompress(
         tiers: pick("tiers"),
         protectedLatestTools: pick("protectedLatestTools"),
         protectedTools: pick("protectedTools"),
+        protectedUserPatterns: pick("protectedUserPatterns"),
         neverPreserveRecentTools: pick("neverPreserveRecentTools"),
         preserveRecentTools: pick("preserveRecentTools"),
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
@@ -118,6 +123,7 @@ export function mergeCompress(
         // `externalSummary` object at a deeper level replaces the entire
         // chain above it — there is no per-target or per-budget sub-merge.
         externalSummary: pick("externalSummary"),
+        degenerateRetry: degenerateRetryLevels.length > 0 ? Object.assign({}, ...degenerateRetryLevels) : undefined,
     };
 }
 
@@ -296,8 +302,34 @@ export function hasCompressSettings(s: CompressSettings): boolean {
 // lands in acp-kernel 0.0.93 (acp-kernel#428) but the resolved object is
 // built and typed here regardless of the installed kernel's Config so both
 // release windows compile identically. Older kernels ignore the extra key
-// (validateConfig does not flag unknown keys).
-export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings };
+// (validateConfig does not flag unknown keys). protectedUserPatterns is the
+// clone-safe DATA half of the isMessageProtected predicate: the stamp
+// (storeEffectiveConfig) strips function fields, and effectiveConfig rebuilds
+// the predicate from this list on the session-stamp read path.
+export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings; protectedUserPatterns?: string[] };
+
+/** User-text half of the host predicate: literal substring match on
+ *  user-role text messages only. Both the resolve-time builder
+ *  (applyCompressSettings) and the read-time restore (session.ts
+ *  effectiveConfig) reach it through combineMessageProtectedPredicate, so
+ *  the two can never drift. */
+function matchesProtectedUserPatterns(patterns: readonly string[], msg: CoreMessage): boolean {
+    if (msg.role !== "user" || typeof msg.text !== "string") return false;
+    const text = msg.text;
+    return patterns.some((pattern) => text.includes(pattern));
+}
+
+/** Compose the kernel isMessageProtected hook: the inherited lane predicate
+ *  (if any) OR the configured user-text patterns. Returns undefined when
+ *  neither exists, so callers can keep the config function-free. */
+export function combineMessageProtectedPredicate(
+    inherited: Config["isMessageProtected"],
+    patterns: readonly string[],
+): Config["isMessageProtected"] {
+    if (patterns.length === 0) return inherited;
+    if (inherited === undefined) return (msg) => matchesProtectedUserPatterns(patterns, msg);
+    return (msg) => inherited(msg) === true || matchesProtectedUserPatterns(patterns, msg);
+}
 
 // Single source of truth for raw->resolved absorb: applyCompressSettings and the
 // plugin-lane base stamp (#1359) both go through this or they drift apart.
@@ -372,6 +404,16 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
         };
     }
+    // Host-marked current-task prompts: the kernel already hard-excludes any
+    // message for which Config.isMessageProtected returns true. Map the literal
+    // substrings here so a long-lived session can keep its live task prompt out
+    // of fold ranges even when tool-result/image user messages follow it (the
+    // kernel's last-user protection only covers the last one). The pattern list
+    // ALSO rides the resolved config as clone-safe data — the session stamp
+    // strips the function below, and effectiveConfig restores the predicate
+    // from the list on the plugin tool read path.
+    const protectedUserPatterns = s.protectedUserPatterns ?? [];
+    const isMessageProtected = combineMessageProtectedPredicate(base.isMessageProtected, protectedUserPatterns);
     const resolved: ResolvedKernelConfig = {
         ...base,
         modelContextLimit: limit,
@@ -390,6 +432,11 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         },
         protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         protectedTools: s.protectedTools ?? base.protectedTools,
+        // Clone-safe data twin of the predicate below (see ResolvedKernelConfig).
+        ...(protectedUserPatterns.length > 0 ? { protectedUserPatterns } : {}),
+        // Combined host predicate: literal current-task markers OR whatever
+        // the lane already installed.
+        ...(isMessageProtected !== undefined ? { isMessageProtected } : {}),
         neverPreserveRecentTools: s.neverPreserveRecentTools ?? base.neverPreserveRecentTools,
         // base is Config (0.0.92 lacks the field) — the cast keeps both kernel windows compiling.
         preserveRecentTools: s.preserveRecentTools ?? (base as ResolvedKernelConfig).preserveRecentTools,

@@ -267,7 +267,7 @@ test("external summary HTTP: an exhausted transient chain logs every attempt and
     await upstream((_req, res) => { res.writeHead(503); res.end("upstream unavailable"); }, async (url) => {
         const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
         assert.equal(result.status, "failed");
-        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error" }]);
+        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error", detail: "External summary upstream rejected the request with HTTP 503" }]);
     });
     assert.equal(lines.filter((line) => line.includes("rejected: HTTP 503")).length, 3);
 });
@@ -282,7 +282,7 @@ for (const protocol of ["responses", "anthropic", "openai", "google"] as const) 
         await upstream((_req, res) => res.end(JSON.stringify(body)), async (url) => {
             const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url, protocol), 4096)], budget);
             assert.equal(result.status, "failed");
-            assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error" }]);
+            assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error", detail: "External summary response did not complete" }]);
         });
     });
 }

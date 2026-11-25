@@ -15,6 +15,56 @@ function isOwnChain(v: unknown): boolean {
     return typeof v === "function" && Object.prototype.hasOwnProperty.call(v, CHAIN_MARKER);
 }
 
+/** #6829: pi-web-access's marker for "a proxy fetch is installed". 0.45.x set
+ *  `__piWebAccessProxyFetch` unconditionally; from 0.46.0 it only propagates
+ *  that flag when the wrapped fetch already has it, and marks its own wrapper
+ *  with `__piWebAccessSharedProxyFetch` instead. Recognize BOTH names, or the
+ *  #2435 coexistence branch is unreachable for 0.46+ installs. */
+function isPiWebAccessFetch(v: unknown): boolean {
+    return typeof v === "function" && (Reflect.get(v, "__piWebAccessProxyFetch") === true || Reflect.get(v, "__piWebAccessSharedProxyFetch") === true);
+}
+
+/** #6829: pseudo-origin served in-process by the inline engine. Owned by
+ *  src/inline-engine.ts (`INLINE_ORIGIN`); duplicated here because the chain
+ *  module must stay free of the server graph (inline-engine pulls in
+ *  server.js, which would cycle back through the agent lanes). If the origin
+ *  ever changes, update both. */
+const INLINE_ORIGIN = "http://billion-context.inline";
+
+const INLINE_HOSTNAME = "billion-context.inline";
+
+/** Exact-origin classifier for the inline pseudo-origin. A prefix match
+ *  would also match lookalikes (billion-context.inline.evil.com), an https
+ *  URL, a non-default port, or a URL carrying credentials — none of which is
+ *  the inline engine. The hostname comparison is case-insensitive (URL
+ *  normalises it), the scheme must be plain http, and only the default
+ *  port (:80, or no port) counts. */
+export function isInlineOriginUrl(url: string): boolean {
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return false;
+    }
+    return (
+        parsed.protocol === "http:" &&
+        parsed.hostname === INLINE_HOSTNAME &&
+        (parsed.port === "" || parsed.port === "80") &&
+        parsed.username === "" &&
+        parsed.password === ""
+    );
+}
+
+function fetchUrlOf(input: string | URL | Request): string | undefined {
+    try {
+        if (typeof input === "string") return input;
+        if (input instanceof URL) return input.href;
+        return input.url;
+    } catch {
+        return undefined;
+    }
+}
+
 /** #1158 escape hatch: `BILI_RECLAIM_FETCH_PATCH=0` keeps the classic direct
  *  install — a third-party re-arm (dsh-http-proxy refresh) then wins and
  *  bili stops seeing model traffic (documented degradation, visible instead
@@ -180,9 +230,10 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
         // Windows). The depth check below is the proof of such nesting: an
         // OUR link called from within our own dispatch can only be reached
         // through a foreign wrapper that captured one of our older tops.
-        // A recognized pi-web-access link still owns proxy routing even after
-        // bili dispatched, so retain it at depth 1. Its older bili links must
-        // still be able to truncate unknown wrapper history.
+        // A recognized pi-web-access link (either marker, #6829) still owns
+        // proxy routing even after bili dispatched, so retain it at depth 1.
+        // Its older bili links must still be able to truncate unknown wrapper
+        // history.
         // ponytail: unknown wrappers retain the #1662 cutoff; preserving their
         // deeper hooks requires a shared chain protocol.
         const patched = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -194,9 +245,22 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
             if (chainHop.getStore() === patched) {
                 return dispatchDepth.run((dispatchDepth.getStore() ?? 0) + 1, () => dispatchBody(input, init));
             }
+            // #6841 rework: classify FIRST. An INLINE_ORIGIN request is served
+            // in-process at a fresh depth 1 instead of being handed down the
+            // chain, so it can never reach a foreign wrapper sitting between
+            // this link and the inline link (the pi-web-access wrapper with a
+            // proxy scope on curls it before the #1662 depth-1 fix ever runs).
+            // It cannot loop: once served, the request is never sent down the
+            // chain again, so it terminates here.
+            if (isInlineOriginUrl(fetchUrlOf(input) ?? "")) {
+                return dispatchDepth.run(1, () => dispatchBody(input, init));
+            }
             const depth = dispatchDepth.getStore();
             if (depth === 1) {
-                if (Reflect.get(ds, "__piWebAccessProxyFetch") === true) return send(input, init);
+                if (isPiWebAccessFetch(ds)) return send(input, init);
+                // #6841 rework: INLINE_ORIGIN requests never reach this branch
+                // any more — the classify-first check above serves them
+                // in-process instead, so the old prefix route-down is gone.
                 const anchor = observedFetches.find((f) => !knownDeadFetches.has(f));
                 if (anchor !== undefined && anchor !== ds) {
                     if (!warnedReentry) {
@@ -216,6 +280,12 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
         // Keep the install guard visible, following ds if dead-closure recovery changes it.
         Object.defineProperty(chain, "__piWebAccessProxyFetch", {
             get: () => Reflect.get(ds, "__piWebAccessProxyFetch"),
+        });
+        // #6829: forward the 0.46+ shared marker too, so pi-web-access's own
+        // install guard can see through the chain that a proxy is already in
+        // place and does not re-install on every web tool call.
+        Object.defineProperty(chain, "__piWebAccessSharedProxyFetch", {
+            get: () => Reflect.get(ds, "__piWebAccessSharedProxyFetch"),
         });
         return chain;
     };
@@ -332,7 +402,7 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                 // makeChain each further adopt costs O(1) per request regardless
                 // of history length, so the cap bounds LOGGING only, and routing
                 // authority always returns within one tick.
-                const webAccess = Reflect.get(downstream, "__piWebAccessProxyFetch") === true;
+                const webAccess = isPiWebAccessFetch(downstream);
                 if (webAccess && !webAccessAdopted) {
                     webAccessAdopted = true;
                     logHostEvent("info", "[native-client]", "[bili-native] adopted pi-web-access proxy fetch as downstream (supported coexistence, #2435)");
