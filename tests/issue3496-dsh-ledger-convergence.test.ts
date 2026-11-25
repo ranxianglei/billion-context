@@ -653,6 +653,58 @@ test("#3496: patchPnpmLock structural failures — no partial result", () => {
     assert.ok(r2.kind === "fail" && r2.reason.includes("no billion-context entry"));
 });
 
+for (const field of ["specifier", "version"] as const) {
+    test(`patchPnpmLock rejects a devDependency missing ${field} after a valid dependency`, () => {
+        const broken = pnpmLockV6("^0.1.196", "0.1.196") + [
+            "devDependencies:",
+            "  billion-context:",
+            field === "specifier" ? "    version: 0.1.196" : "    specifier: ^0.1.196",
+            "",
+        ].join("\n");
+        const result = patchPnpmLock(broken, "^0.1.197", "0.1.197");
+        assert.equal(result.kind, "fail");
+        assert.ok(result.kind === "fail" && result.reason.includes("lacks both"));
+    });
+}
+
+test("ledger convergence leaves every file untouched when a later pnpm section is malformed", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-ledger-partial-"));
+    try {
+        const broken = pnpmLockV6("^0.1.196", "0.1.196") + [
+            "devDependencies:",
+            "  billion-context:",
+            "    specifier: ^0.1.196",
+            "",
+        ].join("\n");
+        const dir = makeProfile(root, "partial", { spec: "^1.2.9", copyVersion: "0.1.197", pnpmLock: broken });
+        const before = profileFiles(dir);
+        const beforeMt = profileMtimes(dir);
+        const result = convergeDshLedger(dir, "0.1.197");
+        assert.match(result.error ?? "", /lacks both/);
+        assert.deepEqual(result.changed, []);
+        assert.deepEqual(result.details, []);
+        assertZeroWrites(dir, before, beforeMt);
+    } finally {
+        rmrf(root);
+    }
+});
+
+test("patchPnpmLock accepts a later section containing only unrelated dependencies", () => {
+    const lock = pnpmLockV6("^0.1.196", "0.1.196") + [
+        "devDependencies:",
+        "  other-dev:",
+        "    specifier: ^2.0.0",
+        "    version: 2.0.0",
+        "",
+    ].join("\n");
+    const result = patchPnpmLock(lock, "^0.1.197", "0.1.197");
+    assert.equal(result.kind, "ok");
+    if (result.kind === "ok") {
+        assert.match(result.next, /specifier: \^0\.1\.197\n    version: 0\.1\.197/);
+        assert.ok(result.next.endsWith(lock.slice(lock.indexOf("devDependencies:"))));
+    }
+});
+
 test("#3496: patchNpmLock without the node_modules entry fails cleanly", () => {
     const r = patchNpmLock(JSON.stringify({ packages: { "": { dependencies: { "billion-context": "^1.2.9" } } } }), "^0.1.197", "0.1.197");
     assert.equal(r.kind, "fail");

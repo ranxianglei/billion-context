@@ -15,7 +15,7 @@ import { maybeJudgeContinuity } from "../invariant-judge.js";
 import type { SeparatorSlot } from "../server/responses-ordering.js";
 import { countImagesInParsedBody, countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, releaseNudgeHold, withSessionLock, type Session } from "../session.js";
-import type { BiliMessage } from "acp-kernel/wire";
+import type { BiliMessage, GooglePart } from "acp-kernel/wire";
 import { coreToAnthropic } from "acp-kernel/wire";
 import {
     parseCompressInput,
@@ -52,6 +52,13 @@ import { endsWithAnnouncement, endsWithDraftClose, lastUserSummaryInstruction, r
 import { safePrefix, safeSuffix, scrubLoneSurrogateEscapesOnJson } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
+
+/** Keep the shared view's identity without expanding long histories into function arguments. */
+function replaceMessages(target: CoreMessage[], source: readonly CoreMessage[]): void {
+    if (target === source) return;
+    target.length = 0;
+    for (const message of source) target.push(message);
+}
 
 /** #5220: canonical signature of a failed proxy call — sorted-key JSON so
  *  argument-order noise doesn't defeat the repeat-detection set. Unparseable
@@ -322,7 +329,7 @@ export interface RequestOptions {
 // arrive instead of being re-laid out as [reasoning…, text, tool…].
 type RoundPart =
     | { kind: "reasoning"; text: string; signature: string }
-    | { kind: "text"; text: string }
+    | { kind: "text"; text: string; rawGooglePart?: GooglePart }
     | { kind: "redacted"; data: string }
     // #3158: a Gemini part whose only payload is a thoughtSignature (no text,
     // no functionCall). Recorded in stream order so a proxy-tool rebuild puts
@@ -333,7 +340,7 @@ export type ParsedStreamEvent =
     // rawHandled: the adapter carries this delta in another event's complete
     // frame (or buffers that frame until tool settlement). Keep accounting it,
     // but do not synthesize a second client frame in continuation rounds.
-    | { kind: "text"; delta: string; raw?: Buffer; rawHandled?: boolean }
+    | { kind: "text"; delta: string; raw?: Buffer; rawHandled?: boolean; rawGooglePart?: GooglePart }
     // round2-hold: withheld marks a reasoning PAYLOAD the adapter kept off the
     // client wire (bili-owned round ≥ 2 on a signing upstream — see
     // ParseStreamOpts.upstreamSignsThinking). It still feeds the loop's
@@ -357,7 +364,7 @@ export type ParsedStreamEvent =
     // in message_start, which the anthropic adapter forwards usage-neutral
     // (#1315), so only the synthetic terminal can deliver it to hosts that
     // derive their prompt-cache TTL from the breakdown.
-    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown> }
+    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown>; contextTokens?: number }
     // #1766: keys on the upstream terminal frame that bili does not model
     // (e.g. Anthropic's safeguard_results) — the loop replaces that frame with
     // a synthetic completion, so anything not carried here vanishes from the
@@ -378,7 +385,7 @@ export type ParsedStreamEvent =
 
 export interface EmitCompletionOpts {
     finishReason?: string;
-    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown> };
+    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown>; contextTokens?: number };
     terminalExtra?: Record<string, unknown>;
 }
 
@@ -508,7 +515,7 @@ export function executeProxyTool(
 
 function recordUsage(
     ctx: LoopCtx,
-    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean },
+    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; contextTokens?: number },
     round: number,
 ): void {
     const prompt = usage.inputTokens;
@@ -532,10 +539,10 @@ function recordUsage(
     const foldNew = ctx.session.stats.pendingFoldUsage === true;
     if (foldNew) ctx.session.stats.pendingFoldUsage = false;
     ctx.log(
-        `[acp-usage] round ${round} input=${total} ${reportedCached !== null ? `cached=${reportedCached} (cache hit ${hitPct}%)` : "(no cache report)"}${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
+        `[acp-usage] round ${round} input=${total} ${reportedCached !== null ? `cached=${reportedCached} (cache hit ${hitPct}%)` : "(no cache report)"}${usage.contextTokens !== undefined ? ` context=${usage.contextTokens}` : ""}${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
     );
     if (total > 0 || reportedCached !== null) {
-        settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin, creation: typeof usage.creationTokens === "number" ? usage.creationTokens : undefined });
+        settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin, creation: typeof usage.creationTokens === "number" ? usage.creationTokens : undefined, context: usage.contextTokens });
     }
 }
 
@@ -877,7 +884,7 @@ export async function* runCompressLoop(
             const roundParts: RoundPart[] = [];
             let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
-            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown> } = {};
+            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown>; contextTokens?: number } = {};
             let finishReason: string | undefined;
             let streamError: string | undefined;
             let sawDone = false;
@@ -963,8 +970,8 @@ export async function* runCompressLoop(
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
                         let tp = roundParts[roundParts.length - 1];
-                        if (!tp || tp.kind !== "text") {
-                            tp = { kind: "text", text: "" };
+                        if (!tp || tp.kind !== "text" || tp.rawGooglePart !== undefined || ev.rawGooglePart !== undefined) {
+                            tp = { kind: "text", text: "", ...(ev.rawGooglePart ? { rawGooglePart: ev.rawGooglePart } : {}) };
                             roundParts.push(tp);
                         }
                         tp.text += ev.delta;
@@ -1026,6 +1033,7 @@ export async function* runCompressLoop(
                             creationTokens: ev.creationTokens,
                             declaredInclusive: ev.declaredInclusive,
                             cacheCreation: ev.cacheCreation,
+                            contextTokens: ev.contextTokens,
                         };
                     } else if (ev.kind === "done") {
                         sawDone = true;
@@ -1531,6 +1539,10 @@ export async function* runCompressLoop(
                             role: "assistant",
                             contentType: "text",
                             text: part.text,
+                            ...(part.rawGooglePart ? {
+                                googleThoughtSignature: part.rawGooglePart.thoughtSignature,
+                                rawGoogleParts: [part.rawGooglePart],
+                            } : {}),
                         });
                     } else if (part.kind === "standalone_signature") {
                         // #3158: put the standalone thoughtSignature back at its
@@ -1645,8 +1657,7 @@ export async function* runCompressLoop(
                     const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages, ctx.config.isCompressTool);
                     if (hidden.hidden > 0) {
                         ctx.log(`[acp-loop] round ${round} hideConsumed hid ${hidden.hidden} compress record(s)`);
-                        coreMessages.length = 0;
-                        coreMessages.push(...hidden.messages);
+                        replaceMessages(coreMessages, hidden.messages);
                     }
                 }
                 // #422: a successful compress changed the session state — refresh
@@ -1665,8 +1676,7 @@ export async function* runCompressLoop(
                     try {
                         const refreshed = await ctx.refreshFolded(coreMessages);
                         if (refreshed.length > 0) {
-                            coreMessages.length = 0;
-                            coreMessages.push(...refreshed);
+                            replaceMessages(coreMessages, refreshed);
                             // The fold has now materialized in a request the
                             // model actually sees — the next usage report is
                             // post-fold reality; keeping the credit would net
@@ -1852,8 +1862,7 @@ export async function* runCompressLoop(
                     }
                     degradedRetried = true;
                     const stripped = stripLoopThinking(coreMessages);
-                    coreMessages.length = 0;
-                    coreMessages.push(...stripped);
+                    replaceMessages(coreMessages, stripped);
                     ctx.log(`[acp-loop] round ${round}: re-request rejected (${e.status}: ${e.body.slice(0, 200)}); retrying without replayed thinking blocks`);
                     loggerLog("warn", `[acp-loop] re-request rejected (${e.status}); retrying without thinking replay: ${e.body.slice(0, 200)}`);
                     newBody = await buildLoopRequestBody();

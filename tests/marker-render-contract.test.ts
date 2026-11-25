@@ -16,6 +16,7 @@ import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { consumeAcpStatusBody } from "../src/marker/status-body.ts";
 import { buildVisibilityMarker } from "../src/loop/core.ts";
+import { _resetPckProbeForTest, recordPckAblation } from "../src/pck-probe.ts";
 import type { Session } from "../src/session.ts";
 
 function textMsg(id: string, role: "user" | "assistant", text: string): CoreMessage {
@@ -91,6 +92,39 @@ test("render contract: pre-compaction archive sections are consumed whole (#3105
         const standalone = consumeAcpStatusBody(echo(report));
         assert.equal(standalone.bodies, 1, `${JSON.stringify(args)}: head + body recognized`);
         assert.equal(standalone.text.trim(), "", `${JSON.stringify(args)}: whole report consumed (residual: ${JSON.stringify(standalone.text.slice(0, 160))})`);
+    }
+});
+
+test("render contract: uncovered-history audit section is consumed whole (#4331)", () => {
+    const { ctx } = makeCtx();
+    // Raise minCompressRange above every run so the live offer comes up
+    // empty: m00007-m00012 form one uncovered run outside every active
+    // block. (With a live offer the same msgs sit in the protected zone —
+    // the PROTECTED MASS variant is pinned by the default-variant tests
+    // above, which render it there.)
+    ctx.config.compress.minCompressRange = 100000;
+    const report = handleAcpStatus({}, ctx).text;
+    assert.match(report, /UNCOVERED HISTORY/);
+    const standalone = consumeAcpStatusBody(echo(report));
+    assert.equal(standalone.bodies, 1, "head + body recognized");
+    assert.equal(standalone.text.trim(), "", `whole report consumed (residual: ${JSON.stringify(standalone.text.slice(0, 160))})`);
+});
+
+test("render contract: cache-routing-key-blocked section (overflow + prose tail) is consumed whole (#2645)", () => {
+    const { ctx } = makeCtx();
+    _resetPckProbeForTest();
+    try {
+        for (let i = 0; i < 6; i++) {
+            recordPckAblation({ origin: `https://relay${i}.example.com/v1`, model: "m", sessionId: `s${i}`, statusWithKey: 400, errSnippet: "400 with key" });
+        }
+        const report = handleAcpStatus({}, ctx).text;
+        assert.match(report, /CACHE ROUTING KEY BLOCKED/);
+        assert.match(report, /more destination\(s\)/);
+        const standalone = consumeAcpStatusBody(echo(report));
+        assert.equal(standalone.bodies, 1, "head + body recognized");
+        assert.equal(standalone.text.trim(), "", `whole report consumed (residual: ${JSON.stringify(standalone.text.slice(0, 160))})`);
+    } finally {
+        _resetPckProbeForTest();
     }
 });
 
