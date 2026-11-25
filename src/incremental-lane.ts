@@ -767,6 +767,17 @@ export function incrementalTurnsEnabled(): boolean {
     }
 }
 
+/** #7689 M1: safe gate — is this session egress-on (the messages table is
+ *  frozen, so the lane's rebuild source is stale)? egress-on = the session
+ *  has latched egressAuthority AND the egress plane is live. When true, the
+ *  lane must refuse the incremental path (the host falls back to full
+ *  resend per the existing contract). */
+function isEgressFrozen(sessionId: string): boolean {
+    if (!featureEnabled("egressPlane")) return false;
+    const session = peekSession(sessionId) ?? getStore().loadSync(sessionId);
+    return session?.metadata?.["egressAuthority"] === true;
+}
+
 /** GET probe on the turn path: capabilities for native extensions. A 404 on
  *  older servers means "no incremental support" — clients fall back to full
  *  resend, which is the default everywhere. */
@@ -791,11 +802,14 @@ export function handleIncrementalProbe(res: http.ServerResponse, conversationId?
             boundary: entry !== undefined && entry.sessionId === laneSessionId(conversationId) ? entry.boundary : null,
         };
     }
+    // #7689 M1: safe gate — egress-on conversations have a frozen messages
+    // table. Report enabled: false so the host falls back to full resend.
+    const egressFrozen = conversationId !== undefined && conversationId.length > 0 && isEgressFrozen(conversationId);
     jsonReply(res, 200, {
         ok: true,
         protocol: 1,
         feature: "pluginIncrementalTurns",
-        enabled: featureEnabled("pluginIncrementalTurns") && sidecar,
+        enabled: featureEnabled("pluginIncrementalTurns") && sidecar && !egressFrozen,
         storage: sidecar ? "unified" : "legacy-only",
         // #4491: server-owned history for plugin lanes (msgid pinning + the
         // /__bili/plugin/render endpoint). Shims gate their splice on this.
@@ -898,6 +912,12 @@ export async function handleIncrementalTurn(
     pendingPtrWork.set(conversationId, chain);
     try {
         const sessionId = laneSessionId(conversationId);
+        // #7689 M1: safe gate — egress-on sessions have a frozen messages
+        // table (the lane's rebuild source is stale). Refuse the incremental
+        // path; the host falls back to full resend per the existing contract.
+        if (isEgressFrozen(sessionId)) {
+            return jsonReply(res, 503, { error: "incremental lane unavailable for egress-on sessions (messages table frozen; use full resend)", conversationId });
+        }
         let entry = canonicalCache.get(conversationId);
         if (!entry || entry.sessionId !== sessionId) {
             // Warm cache is per-process; after a restart (or LRU eviction) the
