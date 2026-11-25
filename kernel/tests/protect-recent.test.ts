@@ -390,7 +390,7 @@ test("warnings accumulate across multiple ranges in one batch", () => {
 // --- neverPreserveRecentTools is configurable (billion-context#1277) ---
 
 test("isNeverPreserveRecent defaults to the built-in list when patterns is omitted", () => {
-  for (const name of ["decompress", "search_context", "read", "bash"]) {
+  for (const name of ["decompress", "search_context", "read", "read_file", "bash"]) {
     assert.equal(
       isNeverPreserveRecent(toolResult("x", name, "body")),
       true,
@@ -406,6 +406,34 @@ test("isNeverPreserveRecent defaults to the built-in list when patterns is omitt
     isNeverPreserveRecent(msg("z", "plain text")),
     false,
     "non-tool messages never excluded",
+  );
+});
+
+test("read_file is excluded from the recent zone by default (#7726)", async () => {
+  // Regression: Hermes names its file-read tool `read_file`, not `read`.
+  // Before the fix, a ~10 KB read_file result stayed in `visible` and ate
+  // the 5000-token budget, pinning the protected zone back over older
+  // ranges on every turn → compress was a permanent no-op.
+  const { computeProtectedRefs } = await import("../src/recommend.js");
+  const fileBody = "x".repeat(10000); // ~2500 tokens
+  const messages: CoreMessage[] = [
+    msg("a", "old alpha", "user"),
+    msg("b", "old beta", "assistant"),
+    toolResult("c", "read_file", fileBody),
+    msg("d", "newer user intent", "user"),
+    msg("e", "newer assistant reply", "assistant"),
+    msg("f", "latest user intent", "user"),
+  ];
+  const state = seededState(messages);
+  const refs = computeProtectedRefs(
+    messages,
+    state,
+    config({ preserveRecentTokens: 5000 }),
+  );
+  // The read_file result (m00003) must NOT be in the protected zone.
+  assert.ok(
+    !refs.has("m00003"),
+    "read_file result is excluded from the protected zone by default",
   );
 });
 
