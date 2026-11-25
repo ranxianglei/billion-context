@@ -273,8 +273,13 @@ test("resume-inheritance MISS seeds the timestamp ledger from the closest tracke
     } finally {
         setLogCapture(null);
         store2.closeQuietly();
-        // shared singleton hygiene: leave no chain behind for later tests in this file
+        // shared singleton hygiene: leave no chain behind for later tests in this file.
+        // "old" is re-imported by the phase-2 hydrate-on-listening from the file, so it
+        // must be forgotten here too — the next e2e test in this file reuses id "old"
+        // and a leftover "old:8" (this test's miss-seed content) poisons its tracker
+        // (#5608 v3 gate test, Windows-CI flake run 44864811218).
         prefixAffinity.forget("new");
+        prefixAffinity.forget("old");
         await closeServers([proxy2, upstream], "miss-seed phase 2");
         if (prevStampEnv === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
         else process.env.BILI_MESSAGE_TIMESTAMPS = prevStampEnv;
@@ -430,9 +435,12 @@ test("weak-adoption gate: equal-depth replays and truncated subviews start FRESH
     } finally {
         setLogCapture(null);
         store2.closeQuietly();
-        // shared singleton hygiene: leave no chain behind for later tests
+        // shared singleton hygiene: leave no chain behind for later tests.
+        // "old" was forgotten in phase 1 but re-imported by the phase-2
+        // hydrate-on-listening, so forget it again here.
         prefixAffinity.forget("eq-replay");
         prefixAffinity.forget("trunc-resend");
+        prefixAffinity.forget("old");
         await closeServers([proxy2, upstream], "miss-gate phase 2");
         if (prevStampEnv === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
         else process.env.BILI_MESSAGE_TIMESTAMPS = prevStampEnv;

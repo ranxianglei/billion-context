@@ -106,8 +106,12 @@
 | `rollout.features.salt` | string | the feature name | — | 分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。 |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | 嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。 |
 | `rollout.features.identityChannelHarvest` | boolean \| number | 0(关) | BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST | 身份信道采集的灰度门(#5825):当安装级开关(BILI_IDENTITY_HARVEST)未设置时,允许仅由本灰度键激活回环专属的转录/SQLite 采集(claude-code / codebuddy / mcode / goose / qwen 车道);两者都不设则永不读客户端存储。owner 裁定 2026-11-07:本灰度键与 rollout.features.pluginLaneServerHistory(它管已接纳 id 的行钉住)刻意分离——任一使能方可激活采集。默认 0%,小流量观察退化率后再抬。见 identity-channels.zh-CN.md。 |
-| `rollout.features.pluginLaneServerHistory` | boolean \| number | 0(关) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。 |
-| `rollout.features.pluginFullResendWatermark` | boolean \| number | 5(实验性灰度) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | 全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 technical-notes.zh-CN.md「全量重发水位快路径」。 |
+| `rollout.features.pluginLaneServerHistory` | boolean \| number | 100(开,已 GA) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 100%(GA,owner 裁定 2026-11-13);设 0 可把安装回滚到 GA 前状态。 |
+| `rollout.features.pluginMsgIdIncremental` | boolean \| number | 100(开,已 GA) | BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL | 增量 msgid pin 通道(#7064 §8,owner 裁定 2026-11-18/19):稳态插件轮用**尾形态**申报消息 id——有界的 `x-bili-pf-tail-ids` 头(锚点+新增,≤ 2048 个,`?` 占位槽)或短 body id 数组——替代全量清单;服务端从自己账本的 live 行重盖前缀 id(ingest 是 INSERT OR IGNORE on (session_id,seq)——位置上的 msg_id 只写一次,永不改写)。接受规则(2026-11-19 定型):声明的尾段 [T-L, T-1] 与账本重叠段逐行相等(任一行漂移⇒降级 full,永不 400);超长会话(>2048)截断的尾清单同样可 pin——重叠段更长、证明更强。只有快照轮(账本空/折叠后重锚)发全量形态;全量优先于尾形态同时到达。响应携带 `x-bili-msgid-mode: incremental\|full`(4xx 即清,与 x-bili-pf-seq 同一学习点)。任何失配一轮内自愈。默认 100%;设 0 回滚到全量清单 pin(与特性前字节一致)。需先开 pluginLaneServerHistory。见 session-identity-resolution.zh-CN.md。 |
+| `rollout.features.egressPlane` | boolean \| number | 100(开 — ci:full 验证分支,不作合并) | BILI_ROLLOUT_EGRESS_PLANE | egress 平面——整条新链路的**唯一开关**(#7398/#7439;取代已退役的 egressOpLog/egressServeLog 双键)。开:四条 wire 车道(OpenAI/Anthropic/Responses/Google)每轮把出站会话视图记为稀疏 op(I/D/U)写入 egress_state/egress_flow 双表——行**自包含**(消息字节随行走,不经内容 CAS,裁定 7439-1)——并从 op 日志回放重建出站核心消息段,按构造字节一致(行内字节就是管线自己的最终 core JSON);pinned 插件车道另获服务端权威——内核输入从流水回放(裁定 7439-3/5)。有界回溯阶梯恢复到最近健康日志点;任何不可重建行(缺/空字节、未知 role)、日志损坏或探针失败,整轮降级 legacy 链路——绝不部分替换、绝不客户端为准。system 块两条路径都保持 live 构建(前缀缓存锚点纪律)。仅 SQLite 车道;标题生成/压缩侧路请求排除。默认 0 = 关:legacy 链路,零行,与特性前字节一致。第 2 轮(KDD #23):egress-on 会话的 `messages` 表是**惰性投影**——不逐轮 ingest,pin 通道解析 op log 的 I 行,会话 JSON 信封 bootstrap 冻结——单轮成本恒为 O(存活窗口),与账本规模无关(10w 累计实测 638ms p50;常驻守卫:`tests/egress-bench.test.ts`,PR #6785 文档 §6)。 |
+| `rollout.features.pluginDeltaResend` | boolean \| number | 0(关) | BILI_ROLLOUT_PLUGIN_DELTA_RESEND | Delta 重发——全量重发水位快路径的尾切片形态:稳态轮发 x-bili-pf-delta: 1 + body.messages = **只有**新元素(L = T − stampT,无前置);服务端用钉存前缀核 + 解析出的尾部重建视图(与全量车道同源的命中可证)。任何不成立的声明(count/body/tail-ids 宽度不符、已知清单后锚链断裂、灰度关)返回 400 pf_delta_reanchor + x-bili-msgid-mode: full,客户端当轮改发全量形态——一轮收敛,绝不静默错解。默认**关**:delta body 对未上车的服务端不可处理,故保持 0 直到客户端发送端就位。见 technical-notes.zh-CN.md「Delta 重发」。 |
+| `rollout.features.pluginFullResendWatermark` | boolean \| number | 100(GA — 默认开) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | 全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**GA**——默认开启(owner 裁定 2026-11-22,PR #6785:5% 灰度自 2026-11-02 运行无问题);web 面板对全部安装显示一次性公告、快速配置提供三态开关;`false`(或百分比)/ env = 0 关。见 technical-notes.zh-CN.md「全量重发水位快路径」。 |
+| `rollout.features.passDshExtensions` | boolean \| number | 0(关 = 拦截) | BILI_ROLLOUT_PASS_DSH_EXTENSIONS | DSH 客户端扩展拦截(#7168/#7439):DSH(deepseek-harness)每个请求都带顶层 `dsh_*` 字段——`dsh_session_log`(给官方 DeepSeek API 的 8 MiB 增量无损会话日志,模型根本不读)加孪生字段 `dsh_plugin_packages`;fork/seed 会话在水位追上前每轮从头整段重传。默认 0% = 拦截:bili 在入站 body 解析后、任何协议路径构建出站前,删掉所有**顶层** `dsh_*` 键(src/server/handle.ts),8 MiB 永不转发上游——不浪费带宽,非 DeepSeek 上游也不见陌生大字段。DSH 不受影响:其上传水位只在 2xx 时推进,bili 照常回 2xx,重传自愈。窗口计量另由 #7168 的 dsh_* 豁免(src/preflight.ts)兜底。等服务端权威 egress 工作(#6785 / 讨论 #7439)把客户端扩展旁路带做好后,翻到 100%(或移除裁切)即放开;现在想临时放行用 `true` / env = 1。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `security.adminRelay` | boolean | false | — | 允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。仅 anthropic 线路 —— Responses 线路上本开关无效（见 `subagentSplit` / BOTH-mechanisms 作用域说明）。 |
@@ -123,6 +127,7 @@
 | `compat.roles` | record role → role | {} | — | 把消息角色映射为上游接受的名字（如 developer→system）；仅精确匹配角色，逐 provider 条目按键级胜出。 |
 | `compat.dropFields` | string[] (dot paths) | [] | — | 从每个转发请求体中剔除的点路径字段，面向对未知字段返回 400 的严格 schema 网关；全局与逐 provider 列表加法并集。 |
 | `compat.streamErrorShape` | "protocol" \| "completion" | protocol | BILI_STREAM_ERROR_SHAPE | 200 已提交后上游流失败的呈现方式：协议原生错误帧（默认）或旧版合成完成形态。 |
+| `compat.degenerateTurn` | "error" \| "passthrough" | error | BILI_DEGENERATE_TURN | plugin chat 管道的退化回合重试后仍无可用输出时的终局（#4913）：带内流错误（默认，#870）或把空回合作为正常完成放行（pre-#870）。 |
 | `compat.noCacheControl` | boolean | false | BILI_NO_CACHE_CONTROL | 完全停止 Anthropic 通道的 cache_control 断点打标（面向拒收该字段或有自有断点策略的上游/中继的逃生门）。 |
 | `compat.keepResponseId` | boolean | false | ACP_KEEP_RESPONSE_ID | 在内核重建的 Responses 请求上保留 previous_response_id（默认剔除，使重建请求体永不引用上游从未签发过的响应 id）。 |
 | `dsh` | object | {} | BILI_ALLOW_DSH_COMPACTION | 段仍被识别，但其原逃生门已移除（#3666，取代 #2028）：allowDshCompaction 键与 BILI_ALLOW_DSH_COMPACTION 环境变量已不存在——dsh 原生压缩现在在所有线路上被无条件拒绝。遗留的 dsh.allowDshCompaction 取值会被忽略（一次性弃用警告）；请改用宿主侧抑制（#3354/#2474）。存活的键——dsh.authoredCompaction、dsh.contextTab、dsh.contextTabLabel——见接下来的条目。 |
@@ -147,6 +152,8 @@
 | `pi.inline` | boolean | true (unset env+file runs inline) | BILI_PI_INLINE | pi 内联压缩通道（#3278；自 #5428 起默认开启，取代 #4687 的手动开启规则）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。未设置 env+文件时默认内联；显式宣告的附着目标（launcher 预置的 BILLION_CONTEXT_PROXY/ATTACH）仍压过默认，`bili pi` 照旧用 launcher 代理。不想用就 BILI_PI_INLINE=0/false/no/off 或本键设 false——恢复旧的 attach/spawn 姿态。解析顺序 env > 文件 > 默认；显式开启永远压过附着目标。人类入口:`bili -i/--inline pi`(≡ 一键车道)与 `bili -s/--server pi`(钉死代理姿态,压过继承的内联变量)。 |
 | `pi.commands` | string[] \| boolean | ["acp", "acp-cache"] |  | bili pi 插件注册哪些斜杠命令："acp"、"acp-cache"、"acp-rule"、"acp-fleet"。默认保留状态面板（/acp）与缓存对账（/acp-cache）两个入口，较冷门的 /acp-rule 与 /acp-fleet 不进入补全列表；true 注册全部四个，[] 或 false 一个都不注册。未知命令名告警一次后忽略。会话启动时读取，改配置下一个会话即生效（无需重启代理）。纯 UI 面：关闭命令不影响底层工具（acp_cache / acp_rule 对模型仍可用）与代理。 |
 | `opencode.inline` | boolean | false | BILI_OPENCODE_INLINE | opencode 内联压缩通道（#3278 移植；需手动开启——按 #4687 决定，默认仍是派生代理）：opencode 插件的压缩在进程内完成——不派生代理进程、无临时端口、无 MITM 证书；模型流量与 /__bili/ 工具面由进程内引擎经伪源站服务（已在 Bun 宿主验证）。设 true（或 BILI_OPENCODE_INLINE=1）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili opencode-inline` 一键车道。 |
+| `plugin.snapshotCapBytes` | number | 104857600 (100 MiB) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | 限制每个插件会话为公开 fork API 保留的原始线路历史快照字节数（#2017 D-B）；超限时会话直接失败关闭（409），而不是保留无界原始副本。默认值已从 16 MiB 上调（#2394 G3）；0 完全禁用保留。 |
+| `snapshot.shadow` | boolean | true | BILI_SNAPSHOT_SHADOW | 快照渲染影子观测开关（#3756 后续）：在每个激活的代理轮次上计算快照视图但不使用它（出站字节仍走 legacy 路径），与实际发送内容对比分类差异，并记录由 web 面板和 snapshot-shadow 诊断主题展示的每会话计数器。默认开启（渲染车道本身仍灰度钉在 0%，影子车道是纯观测）。 |
 
 **MITM 通道**
 
@@ -170,10 +177,11 @@
 | `network.exposureLogIntervalMs` | number | 3600000 (0 disables the log) | BILI_EXPOSURE_LOG_INTERVAL_MS | 绑定地址暴露警告在日志中的重复间隔；0 完全禁用。 |
 | `network.streamKeepAliveMs` | number | 15000 (0 disables) | BILI_STREAM_KEEPALIVE_MS | 模型块之间的下游流保活心跳间隔；0 禁用心跳。 |
 | `network.preflightHoldMs` | number | 30000 | BILI_PREFLIGHT_HOLD_MS | preflight 失败后，允许请求未校准放行的持有时长。 |
+| `network.emergencyDigest` | boolean | false (env BILI_PREFLIGHT_EMERGENCY_DIGEST=1 overrides) | BILI_PREFLIGHT_EMERGENCY_DIGEST | 恢复 #2383 紧急摘要 regime（超窗 19.2× 以上时用确定性摘要块折叠）。自 PR #7549 起默认关闭：无法收敛的极端超窗现在会拒绝请求，而不是用模型可见的摘要块替换历史。设为 true 恢复旧行为。 |
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 死胡同 preflight 后，对同一会话重试校准的冷却时长。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | 同一请求在向上游暴露错误前的最大传输失败重放次数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | 重放之间的基础退避延迟（指数增长）。 |
-| `network.throttle429Enabled` | boolean | true | BILI_THROTTLE_429 | 出站 429 治理器（#4204）：连续上游 429 会在本地应答而不再转发。账号限额及无法识别/格式错误的响应按 origin+凭据持有；只有 KeyRing 精确返回 `keyring_model_temporarily_unavailable` 且响应模型与请求模型完全相同时，才按 origin+凭据+模型持有，让其他模型继续可用。模型不匹配或缺失仍按账号级处理；设为 false 恢复旧的总是转发行为。 |
+| `network.throttle429Enabled` | boolean | false | BILI_THROTTLE_429 | 出站 429 治理器（#4204），自 #6639/#5853 起默认关闭：上游 429 原样转发给客户端，bili 每观测到一次 429 打一条 [429-passthrough] warn 日志。设为 true（或 BILI_THROTTLE_429=1）重新启用，作为逃生舱：连续上游 429 会在本地应答而不再转发。账号限额及无法识别/格式错误的响应按 origin+凭据持有；只有 KeyRing 精确返回 `keyring_model_temporarily_unavailable` 且响应模型与请求模型完全相同时，才按 origin+凭据+模型持有，让其他模型继续可用。模型不匹配或缺失仍按账号级处理。 |
 | `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | 连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到账号级 hold 收到任意非 429 响应，或模型级 hold 收到同一模型的非 429 响应后清除。 |
 | `network.throttle429BaseDelayMs` | number | 2000 | BILI_THROTTLE_429_BASE_DELAY_MS | 429 hold 的基础退避（每连续一次 429 翻倍、抖动到 [0.5×, 1×]、以 throttle429MaxDelayMs 封顶；上游 Retry-After 更大时优先）。 |
 | `network.throttle429MaxDelayMs` | number | 30000 | BILI_THROTTLE_429_MAX_DELAY_MS | 429 hold 退避的上限，也是终局阶段探测间隔的上限。 |
@@ -207,27 +215,24 @@
 | `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | 为导出保真保留的最近消息原文 token 尾部大小。 |
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | 连续 EPERM 写失败达到该次数后在日志中告警。 |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM 告警的重复间隔；0 只记录一次。 |
+| `sessions` | object | {} (all defaults) | — | 会话池与 GC 旋钮（#2030）——原 BILI_MAX_SESSIONS / BILI_SESSION_GC* 仅环境变量。 |
+| `sessions.max` | number | 256 | BILI_MAX_SESSIONS | 会话池上限：内存中最多持有的会话数；超出时最冷的会话被 LRU 逐出（其文件仍留在磁盘上）。 |
+| `sessions.warmMax` | number | 0 (warms none) | BILI_SESSION_WARM_MAX | 有界启动（#2803/#3050）：监听前预热最近保存的多少个会话；0 = 不预热（未预热会话首次触及时按需加载一次）。设 8 可恢复 #2803 的急切预热集。 |
+| `sessions.warmMaxBytes` | number | 67108864 (64 MiB) | BILI_SESSION_WARM_MAX_BYTES | 启动预热集的解码字节预算（#2803）；单文件超过预算则永不预热。 |
+| `sessions.residentMaxBytes` | number | 4294967296 (4 GiB) | BILI_SESSION_RESIDENT_MAX_BYTES | 常驻会话字节的软目标（#2803）；活动/在途状态保持钉住。默认值在 #5779 中从 512 MiB 上调。 |
+| `sessions.hardMaxBytes` | number | = sessions.residentMaxBytes (0 disables) | BILI_SESSION_RESIDENT_HARD_MAX_BYTES | 单会话常驻权重的硬字节上限（#4788 D1-A）：约束单个会话，即使对豁免/唯一活跃会话也触发轮间字段丢弃；0 完全禁用该上限检查。 |
+| `sessions.gc.enabled` | boolean | false (off) | BILI_SESSION_GC | 会话文件垃圾回收（#1082，需手动开启）：周期性磁盘扫描仅在两道门同时满足时删除会话文件——最后活动早于 gc.maxAgeDays 且该会话从未被压缩、重发大小 <= gc.maxTokens。每次删除都有审计日志。 |
+| `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC 年龄门（#1082）：会话文件仅在最后活动早于该天数时才可被清扫——阈值刻意远大于任何可能的恢复窗口，因为 id 永不复用，恢复的会话会从 m00001 重新编号。 |
+| `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 大小门（#1082）：会话文件仅在重发大小（rawInputTokens，旧文件为 contextTokens）不超过该 token 数时才可被清扫——有折叠的会话上下文读起来很小却可能携带巨大原始历史，这类文件永远保留。 |
+| `sessions.gc.intervalMs` | number | 3600000 (1 h) | BILI_SESSION_GC_INTERVAL_MS | GC 清扫间隔（毫秒，#1082）。 |
 | `storage` | object | {} (all defaults) | — | 统一 SQLite 存储边车设置（#2671）。 |
 | `storage.unified` | legacy\|shadow\|full\|sqlite | unset (sqlite) | BILI_STORAGE_UNIFIED | 分层存储迁移开关（#2671）：shadow = 统一 SQLite 双写干跑 + digest 对账；full = 平替读路径（unified-first 加载 + 有机导入 + legacy 兜底）；sqlite = 纯 SQLite 模式 —— 与 full 同一套存储机构，但 JSON 信封写入默认 OFF（SQLite 索引是唯一持久副本，不写 JSON 信封）。默认值（两处均未设置）现在是纯 SQLite：双写车队自 #3818 起运行、digest 对账稳定，因此 JSON 信封默认不再写入 —— 显式 full 保留 #3818 的历史双写默认，legacy 仍是一行逃生口（未来拼写沿用同形：mysql = 网络后端，json = 纯信封）。文件层只接受 legacy/shadow/full/sqlite；环境变量层还接受 1/true（=shadow）与 unified（=full）并优先于文件。每个 lane 启动时解析一次 —— 热改动需重启生效。加密（BILI_ENCRYPTION_KEY）会硬阻断边车。 |
 | `storage.backend` | sqlite\|mysql | unset (sqlite) | BILI_STORAGE_BACKEND | 存储后端选择（#3388 / #3931）：统一存储消费操作级的异步 StorageBackend 契约。sqlite 为默认（现有 UnifiedStore 套一层 Promise 包装适配器）。mysql 已完整接线（第二+三步）：openBackend("mysql", dsn) 打开真正的 MysqlBackend,对接 MySQL 8.0 —— 完整契约面（带 CAS 引用计数的 ingest、读取、session_ext、收割台账、归档/恢复/GC、checkpoint、会话绑定）,mysql2 作为常规依赖打包并按需懒加载（从不选 mysql 的启动永不加载它）。代理热路径经异步影子 facade 接线：保存进串行后端队列（水位 delta、孤儿/收割台账、digest 采样 —— sqlite 保持零 await 同步快车道不变）,同步读走 JSON 信封（sidecar 经 ready() 异步挂载;viewFor/importRecord 同步面按设计 miss）,replicas/ext/GC/export/fork 走异步孪生（#4911：fork 车道经它们 await lastLiveSeq + 行克隆；fold-anchor 回填/快照渲染用的同步窗口读按设计仍走信封）。writerOff 仅 sqlite（信封就是 mysql 的同步读路径）。未知名字回退 sqlite 并提示。每个 lane 启动时解析一次。 |
 | `storage.mysql.dsn` | string | unset | BILI_MYSQL_DSN | storage.backend="mysql" 的 MySQL DSN（#3388 第二步，#3931）：mysql://user:pass@host:3306/db。由 StorageBackend 契约路径消费（含热路径 —— 异步影子队列）。环境变量 BILI_MYSQL_DSN 优先于文件键。空/未设置 = mysql 后端无法打开 —— 文档化错误会同时列出两个旋钮和可用的默认值。 |
 | `storage.sqliteAutoDownload` | boolean | true | BILI_SQLITE_AUTO_DOWNLOAD | SQLite 引擎一次性自下载的闸门（#2833）：进程内没有可用引擎（无内置 node:sqlite、宿主未装 better-sqlite3）且本平台希望启用统一边车时，bili 从 npm registry 一次性下载钉死的 better-sqlite3 预编译 tarball（约 11 MB，sha512 校验）到缓存目录，之后每次启动复用。引擎解析顺序：内置 node:sqlite（Node >= 22.5）-> 宿主机已装的 better-sqlite3 -> 缓存的自下载副本 -> 自下载（本开关控制）-> 无引擎（仅 legacy，即 #2825 降级契约）。开关只控制网络下载 —— 为 false 时缓存副本仍会使用；不支持的平台永不下载。 tarball 下载内置镜像列表兜底（#3338）：先试配置的 registry（BILI_UPDATE_REGISTRY / update.registry），再试 https://registry.npmjs.org、https://registry.npmmirror.com —— 第一个通过 sha512 校验的镜像生效；Node < 22.5 且无引擎时，降级原因会给出明确的 Node 升级提示（#3385）。引擎产物按运行时特性分别钉死，因为 binding 无法在包自身声明的范围之外加载：Node >= 22 且 N-API >= 10 用 better-sqlite3 v13（单个 tarball 自带 prebuilds），而 Node 20 与 Node 22.0–22.12（满足 v13 的大版本下限但只带 N-API 9）用 v12.9.0（纯 JS tarball 加与之 ABI 匹配的 prebuild，从二进制镜像获取并经 nativeBinding 注入）—— 低版本 Node 因此留在统一存储车道上，而不是降级到 legacy。任何钉死产物都不支持的运行时（低于所有下限，或 ABI 无对应 prebuild）会在加载之前被拒绝，下载与缓存副本注册都不进行 —— 在那里加载该 binding 会让进程崩溃，而不是优雅失败（#3341、#3894）。下载失败会置一个 6 小时的重试冷却，以标记文件形式持久化在缓存目录下（billion-context/sqlite/.bootstrap-failed.json）；storage 诊断块会显示该标记的绝对到期时间与路径 —— 删除该文件并重启 bili 即可强制立即重试，不必等完整个冷却窗口（#3788）。 |
 | `storage.jsonWriter` | on\|off | unset (off for the pure-sqlite selection — absent/unified=sqlite — and on for explicit full) | BILI_STORAGE_JSON_WRITER | Phase 3 信封开关（#2960）—— 本次发布翻转缺省：UNSET（未设置）现在对纯 SQLite 选择（storage.unified 未设置或 "sqlite"）缺省为 OFF —— SQLite 索引成为唯一持久副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。显式 full 保留 #3818 的历史双写缺省（除非本键另说，信封照写）。有效 full 模式下任一层的显式 on/off 总是生效：shadow/legacy（或加密激活）下请求的 off 会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层（"off"/"on"）。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。恢复双写：设 storage.jsonWriter=on（或 BILI_STORAGE_JSON_WRITER=1）—— 纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 CCR content-store 边车也不再写 —— full 模式下读取时先查索引里的 ccr 镜像，镜像才是持久副本。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。 |
-| `storage.walJournalSizeLimitBytes` | number | 8388608 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | index.db-wal 的 WAL 回收上限（#3250），单位字节：每次完成的 checkpoint 把 WAL 文件截回该大小，约束长驻进程的磁盘占用与崩溃恢复重放。不是每会话数据配额 —— 数据写入时就已落进 index.db，WAL 只是两次 checkpoint 之间的帧暂存区，会话数量/大小不会放大它；大 burst 可能暂时超出，直到下一次完成的 checkpoint 截回。调大 = truncate IO 更稀疏，但稳态磁盘占用更多、崩溃恢复重放尾更长。环境变量层（正整数）优先于配置文件层；env 值非法或非正数时静默落到文件/默认层，boot 不崩。lane 启动、store open 时生效 —— 热改动需重启。实际取值会出现在 unified-enable 日志行与 storage 诊断块中。 |
+| `storage.walJournalSizeLimitBytes` | number | 0 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | index.db-wal 的 WAL 回收上限（#3250），单位字节。0（默认，#7674）= 不限制 —— 引擎不在 checkpoint 后截断 WAL 文件；文件停留在历史高水位（现场 ~55 MiB 稳定），帧仍会在每次周期/收尾 checkpoint（PASSIVE —— 重放尾为零）收敛进 index.db。opencode 就是这么跑的（13 个并发写者、9.55 GB 库、零损坏）。#7674 之前的 8 MiB 默认让引擎在每次完成的 checkpoint 后内部截断 WAL —— 一条 JS 护栏都盖不住的隐式地板回收，把 WAL 从共享会话目录的活 peer 连接脚下抽走（#2671：5 个 daemon、kill-9 换代）—— 正是 #7156 的损伤形。正数 N：每次完成的 checkpoint 把 WAL 截回 N。不是每会话数据配额 —— 数据写入时就已落进 index.db。环境变量层（正整数）优先于配置文件层；env 值非法或非正数时静默落到文件/默认层，boot 不崩。lane 启动、store open 时生效 —— 热改动需重启。 |
 | `storage.archiveAfterDays` | integer | 365 | BILI_STORAGE_ARCHIVE_AFTER_DAYS | GC 年龄清扫窗口（天，#3463/#3901）：闲置超过该时长的会话被归档 —— 以单行 JSON 追加到单一归档日志（会话目录下的 archive/archive.jsonl——不撒每会话小文件），墓碑行保留标签与身份，释放内容/媒体引用，一条 POST 即可恢复。0 关闭年龄清扫；POST /__bili/storage/gc 始终可用并支持 ?vacuum=full 收缩存量 index.db（新写入始终 auto_vacuum=INCREMENTAL）。同一套操作另有 CLI 层（#3928）：bili storage gc [--days N] [--vacuum full\|incremental] [--dry-run]，以及 bili sessions ls/rm/archive/restore <id>（README「存储维护 CLI」一节）。环境变量优先于配置文件层。 |
-| `sessions` | object | {} (all defaults) | — | 会话表容量上限与可选垃圾回收。 |
-| `sessions.max` | number | 256 | BILI_MAX_SESSIONS | 内存会话表上限（空闲会话 LRU 逐出）。 |
-| `sessions.warmMax` | number | 0 | BILI_SESSION_WARM_MAX | 有界启动（#2803/#3050）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。默认 0（不预热——首次访问按需加载一次；设 8 恢复预热行为）。受 sessions.max 封顶。 |
-| `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | 启动预热集的解码字节预算（#2803）。按解码后大小计而非磁盘压缩字节，zstd 归档无法绕过内存上限；单文件超预算则永不预热。 |
-| `sessions.residentMaxBytes` | number | 4294967296 | BILI_SESSION_RESIDENT_MAX_BYTES | 驻留会话估算字节的软目标（#2803；#5779 从 512 MiB 提高到 4 GiB——单个会话经常就超过半 GiB，旧预算下会被反复逐出、永远驻留不下来）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。内存小的机器可调低。 |
-| `sessions.hardMaxBytes` | number | (same as `sessions.residentMaxBytes`) | BILI_SESSION_RESIDENT_HARD_MAX_BYTES | 单会话驻留字节的硬上限（#4788，决策 #4792 D1-A）。不同于池软上限——它只能逐出其他冷会话、从不触碰唯一活跃会话——它约束单个会话：在请求结束边界超过上限时，其可丢弃字段（已折叠块的原文、元数据账本、超出有界视图的原始尾巴）会被强制回写磁盘，即使该会话被池逐出豁免；下一轮通过窄盘读透明地重新读取所需内容。只要上一次保存已被证明落盘，安全丢弃就在每个请求边界运行；该上限额外加入单会话告警（warn，限流至 60 秒）。`0` 关闭该检查。 |
-| `sessions.contentStorePin` | boolean | false | BILI_SESSION_CONTENT_STORE_PIN | #4788 二期驻留丢弃的逃生门：把会话内容存储钉在内存（永不折叠）。默认关闭：每次已证明落盘的保存之后，空闲会话的内容存储在请求间隙被释放，需要时从统一索引镜像或伴生文件按需重读；没有可证明落盘副本的会话（如新建 fork 子会话）自动保持驻留。需要零重读延迟且愿意用内存换时可设此项。 |
-| `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | 过期持久化会话的可选垃圾回收（未开启时用户数据绝不被悄悄清理）。 |
-| `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC 年龄阈值（天）。 |
-| `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 单会话记录的 token 大小阈值。 |
-| `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC 清扫间隔。 |
-| `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | 提供给原生插件的 fork API 公共快照大小上限。 |
-| `snapshot.shadow` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：渲染车道仍处灰度关闭时，每轮已折叠会话都现算一次快照视图，与 legacy 实际出站比对分类，逐会话记账（web 面板行 + /__bili/status snapshotShadow 汇总 + snapshot-shadow 诊断主题）。默认开 —— 这是全舰队干跑，其错误率决定灰度翻转。环境变量 BILI_SNAPSHOT_SHADOW 优先。不想要每轮额外计算可用 false/0/off 关闭。 |
 
 **更新与公告**
 
@@ -302,6 +307,7 @@
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
 | `compress.promptPack` | string (builtin: "default", "lean"; shipped: "chat") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 随包附带（chat）→ 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
+| `compress.protectedUserPatterns` | string[] | none | — | 用户文本消息的字面子串：命中即永不折叠，即使它不是最后一条 user 消息。用于长会话里 host 标记的当前任务 prompt。 |
 | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。 |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
@@ -313,6 +319,7 @@
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
 | `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
 | `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。 |
+| `compress.degenerateRetry` | object | 1 attempt (built-in nudge) | — | 零可见输出回合（退化终端回合）的重试预算与 nudge 句配置。续接 nudge 只附在重试请求体上——不写入会话状态，客户端下一轮不重放。 |
 | `compress.blockOps` | object | off | — | 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，关闭时线上字节与 #5765 之前完全一致。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
 | `compress.search` | object | off | — | search_context 的检索行为设置；当前含 planAware 重排。 |
@@ -329,6 +336,8 @@
 | `compress.absorb.excludeTools` | string[] | [] | — | 排除出吸收范围的工具名。 |
 | `compress.absorb.toolName` | string | "absorb" | — | absorb 工具的注册名。 |
 | `compress.absorb.mediaOnly` | boolean | true | — | 仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。 |
+| `compress.degenerateRetry.maxAttempts` | integer | 1 | — | 空回合重试预算（#7666）：回合以客户端零可见输出收尾时，把 agent 自己的原请求追加一条尾部 user nudge 后重发。0=关（空回合直接放行），1=一次（#7666 前的默认行为），上限 5；第 i 次发 nudges[i]（短了循环）。与断流重发（#2171）预算独立——同一回合各可花一次。 |
+| `compress.degenerateRetry.nudges` | string[] | 3 built-in | — | 自定义空回合重试 nudge 句（#7666）；第 i 次重试发第 i 句（短了循环）。不填 = 内置轮换，首句即默认续接 nudge。 |
 | `compress.blockOps.enabled` | boolean | false | — | 启用三个压缩块生命周期工具（注入 + prompt + manifest）。关闭 = 无工具、无 prompt 段、零每请求开销。 |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | 启用内容缓存与回取块。 |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | 可进入 CCR 存储的工具结果的最小估算 token 大小。 |
@@ -459,6 +468,7 @@
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | 派生通道：标记插件 agent 进程。 |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | 出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。 |
 | `BILI_PLUGIN_BYPASS` | string | auto (unset = the inbound header decides) | — | x-bili-plugin-bypass 透传判定的运维覆盖开关（#6220），逐请求读取（无需重启）。三态：未设置（或 auto）= 现状——由入站头逐请求决定（legacy opencode-acp 会话绕过，其余走完整管线）；1/on/true = 强制 bypass——所有入站请求原样透传（不注入工具、不注入 nudge、不绑定会话）；0/off/false = 永不 bypass——忽略任何入站 x-bili-plugin-bypass 头，即使 legacy opencode-acp 会话也走完整管线。无法识别的取值按 auto 处理（= 现状）。按 #6220 owner 拍板仅环境变量（该头是宿主盖戳的线路契约，覆盖是逐进程运维姿态，而非逐路由配置项）。 |
+| `BILI_SESSION_CONTENT_STORE_PIN` | 1/true | unset (fold after save) | — | 让每个会话的 CCR 内容存储（{byRef}/{byHash} 原文）常驻内存，而不是在落盘后折叠掉（#4788 二期，讨论 #3916-E）；存储会在首次触及时从统一 ccr 镜像或 .content-store.json 侧车重新物化。未设置、0/false 或其他值 = 折叠（默认）。设计上仅环境变量。 |
 
 <!-- /bili:gen -->
 
@@ -546,13 +556,14 @@
 
 ### `compat`
 
-- **类型：** `{ roles?: Record<string, string>; dropFields?: string[]; streamErrorShape?: "protocol" | "completion"; noCacheControl?: boolean; keepResponseId?: boolean }`
+- **类型：** `{ roles?: Record<string, string>; dropFields?: string[]; streamErrorShape?: "protocol" | "completion"; degenerateTurn?: "error" | "passthrough"; noCacheControl?: boolean; keepResponseId?: boolean }`
 - **默认值：** `{}`（禁用）
 - **状态：** ACTIVE
 - **说明：** 全局线上兼容角色映射。`roles` 把消息角色映射为上游接受的角色名，例如 `{"compat":{"roles":{"developer":"system"}}}` 把 `developer` → `system`，用于拒绝 `developer` 角色的上游（#552，新版 codex 客户端会发送）。作用于 `openai` chat-completions 与 `responses` 请求；仅精确匹配角色，体内其它内容不动；压缩重试重发的请求体同样携带。按 provider 的 `compat.roles`（见 [Providers](#providers)）按键优先。默认 `{}` 逐字节透明转发。
 - **失败自学习：** 未配置 compat 时，上游返回 `400 Invalid role: …` 会被自动修复 —— bili 把被拒角色改写为 `system`，重试一次，并把学到的映射记在**会话上**（仅内存，绝不写入配置）。该会话后续请求免 400 往返。修复生效时打印的 info 日志附带可永久化的 per-provider 片段。
 - **dropFields：** 最终转发体中要删除的字段点分路径列表 —— 用于严格 schema 上游拒绝*客户端*固定发送但上游不认的字段（#1757）。路径仅限纯对象段（如 `reasoning.summary`），不支持通配符与数组下标；不存在的路径与非对象中间节点静默跳过；字符串值永不检查或改写 —— 只删结构键，工具参数与消息内容逐字节不变。与 `roles` 不同，适用于所有 wire 协议（任意 JSON 请求体）。全局与 per-provider 列表**相加**合并（并集）—— provider 条目只能追加、不能撤销全局路径。应用于角色映射/输出转向之后的最终出站体（prompt-cache stamp 之前）、压缩重试重发的每个请求体，以及逐字节直通转发。无命中时逐字节不变；实际删除 ≥1 个字段时打一条 info 日志列出被删路径。纯 opt-in，v1 不做失败自学习：`"compat":{"dropFields":["reasoning.summary"]}`。
 - **streamErrorShape：** 200 响应已提交后，上游流式失败在 anthropic/openai 线上如何呈现给客户端（默认 `"protocol"`，或 `"completion"`）。`protocol` 走协议原生失败通道——anthropic/responses 收 `event: error` 帧，openai 收顶层 `error` 帧后跟 `[DONE]`——客户端能区分「这一轮失败了」和「这一轮完成了」，自身重试逻辑保持可用（#1455：旧版合成的 `end_turn`/`finish_reason` 让死掉的回合看起来像正常完成，静默吃掉了客户端的重试预算）。`completion` 恢复该旧形状（失败文本包在合成的成功完成里），供无法呈现带内错误事件的宿主使用。配置文件：`"compat":{"streamErrorShape":"completion"}`；环境变量 `BILI_STREAM_ERROR_SHAPE` 优先。仅 google 线不受影响（本来就是原生错误帧）；responses 线上该开关改变的是服务端出口：从合成的 item 生命周期完成帧改为 `event: error` 帧（其循环内出口本就走 `response.failed` 原生通道）。
+- **degenerateTurn：** plugin chat-completions 管道的退化回合（#2756 门）在重发其唯一一次续写重试（#732/#821）后仍无任何可用输出——即重试也空手而归时——的终局处理（`"error"` 默认，或 `"passthrough"`）。`error` 发 #870 带内流错误：空回合否则与“模型什么都没产出”无法区分，会话看起来空闲实则已死，宿主自己永远不会暴露它——其呈现形态随 `streamErrorShape`。`passthrough` 恢复 pre-#870 终局：空回合作为正常完成放行——这正是 proxy 车道与 responses wire 对该情形已在用的同一终局（它们从未有过致命分支）。配置文件：`"compat":{"degenerateTurn":"passthrough"}`；环境变量 `BILI_DEGENERATE_TURN` 优先。只影响 plugin chat 车道；未知值回落 `"error"`。（#4913：致命终局此前没有出口——只能 thinking 应答的本地模型宿主需要放行回来。）
 - **noCacheControl：**（#2030）`true` 关闭 bili 在 Anthropic 通道上的 `cache_control` 断点标注 —— 用于拒绝该字段的上游或有自己断点策略的中继。环境变量对应项 `BILI_NO_CACHE_CONTROL` 优先；完整机制见其[环境变量条目](#环境变量)。
 - **keepResponseId：**（#2030）`true` 保留 kernel 重建的 Responses 请求上的 `previous_response_id`，不再剥离（默认剥离：重建后的 body 引用的是上游从未为改写后输入签发过的 response id，没有意义）。环境变量对应项 `ACP_KEEP_RESPONSE_ID=1` 优先。
 
@@ -1559,6 +1570,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   - **累积快照** —— 每条新结果取代旧结果（客户端的 todo/任务清单）：用 `protectedLatestTools`。对这类工具保护**全部**实例会让其历史无限膨胀 —— 正是 #639 通过只保护最新一条来规避的故障。
   - 经验法则：低频高价值工具 → `protectedTools`；高频刷屏工具 → 绝不做全历史保护（上下文无界增长）；累积快照型工具 → `protectedLatestTools`。
 
+#### `protectedUserPatterns`
+
+- **类型：** `string[]`（字面文本子串，如 `["【本轮消息】"]`）
+- **默认值：** `[]`（无 —— 按 host 自行开启）
+- **状态：** ACTIVE
+- **说明：** 用户角色文本消息只要包含列表中的任一**字面子串**就永不被压缩（映射到内核 `Config.isMessageProtected`）。为长生命周期 agent 会话而设：当前任务 prompt 往往**不是最后一条 user 消息**（后面还有 tool-result / 图片 user 消息），内核的 last-user 保护覆盖不到它；一旦它被折叠，wire 上可能只剩更早的旧 user 消息，模型会误把旧任务当成当前任务继续执行。host 用稳定标记（例如 `【本轮消息】`）标识当前任务并在这里登记。匹配为字面子串（不是 glob）；只检查 user 角色的文本消息；空数组会被拒绝；跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedUserPatterns": ["【本轮消息】"] } }`。
+
 #### `neverPreserveRecentTools`
 
 - **类型：** `string[]`（工具名模式）
@@ -1631,6 +1649,19 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   - `excludeTools: string[]` — 永不吸收的工具名模式。**已知限制：对工具*结果*目前无效，直到 [ranxianglei/acp-kernel#213](https://github.com/ranxianglei/acp-kernel/issues/213) 修复发布**（wire 投影不把 `toolName` 携带在结果上，内核名称守卫无法命中）。
   - `toolName: string` — 重命名注入工具（默认 `"absorb"`）；声明/注入的模式、系统提示段与按会话裁决在两条车道中都跟随该名称。**车道治理（#1359）：** 插件模式用**基础**配置治理整个 `absorb` 块，因此重命名后的工具既以该名声明、也以该名执行（二者永不背离）；provider/model 层的 `absorb.*` 覆盖**仅限代理车道**（代理注入并裁决合并后的名称）。加载时会输出一条警告，列出任何取值与基础值不同的 provider/model `absorb.*` 字段。
   注入跟随线上原生工具面：代理模式在 anthropic/openai/responses 原生工具线上注入工具（按每请求解析的名称）+ 系统提示段，插件模式在插件清单中广告它（MCP shell 自动拾取）。Responses **marker/文本协议**路由不支持（无原生工具面 — 强制的 absorb 指令不可满足），标题生成请求（`max_tokens ≤ 200`）跳过注入如压缩提示一样。吸收配对在重启后保持隐藏（在会话状态持久化）。
+
+#### `degenerateRetry`
+
+- **类型：** `object`（`{ maxAttempts?, nudges? }`）——子字段按最深优先合并（全局 → provider → model）
+- **默认值：** 未设置 = `{ maxAttempts: 1 }` + 内置 nudge 轮换（即 #7666 前行为）
+- **状态：** ACTIVE
+
+**说明：** 空回合（degenerate terminal turn）的重试预算——以“客户端收不到任何可见内容”收尾的回合（tag-echo 剥光、压缩草稿收尾、空承诺收尾）。每次重试 = agent 自己的原始转发体 + 尾部追加一条 user nudge（`src/degenerate-retry.ts`）；改动不碰会话状态，nudge 是瞬时的——客户端下一轮请求与本来完全一致。子字段：
+
+- `maxAttempts`（integer 0–5，默认 1）——单个回合可花几次 nudge 重试。0 = 完全禁用（空回合直接放行）。预算耗尽：chat 车道向客户端发 #870 in-band 错误（"…after the continuation nudge" / "…after N continuation nudges"），responses 车道放行空回合。
+- `nudges`（string[]，1–8，默认内置 3 句）——第 i 次重试发第 i 句（短了循环）。内置轮换首句 = 默认续接 nudge（"Your previous response ended without a tool call. Continue now: …"）。
+
+与断流重发（#2171）独立，后者保留自己的一次性预算。失败家族与本地 7 天数据（85 次空回合 arm、单次重试救回 93%）见 #7666 / #6034。
 
 #### `blockOps`
 
@@ -1954,6 +1985,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
+| `BILI_DEGENERATE_TURN` | `compat.degenerateTurn` | error |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |
 | `BILI_DSH_CONTEXT_TAB` | `dsh.contextTab` | true |
 | `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
@@ -2005,9 +2037,10 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_PI_INLINE` | `pi.inline` | true (unset env+file runs inline) |
 | `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
+| `BILI_PREFLIGHT_EMERGENCY_DIGEST` | `network.emergencyDigest` | false (env BILI_PREFLIGHT_EMERGENCY_DIGEST=1 overrides) |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
 | `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | 55000 (0 = one-shot connections) |
-| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 104857600 (0 disables snapshots) |
+| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 104857600 (100 MiB) |
 | `BILI_RECEIVE_BODY_BYTES` | `network.receiveBodyBytes` | 5368709120 |
 | `BILI_RELEASE_NOTES_CHECK` | `releaseNotesCheck` | true |
 | `BILI_RELEASE_NOTES_URL` | `releaseNotesUrl` | unset (built-in feed) |
@@ -2019,29 +2052,33 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RESIGN_PASSTHROUGH` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
+| `BILI_ROLLOUT_EGRESS_PLANE` | `rollout.features.egressPlane` | 100 (on — ci:full verification branch) |
 | `BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST` | `rollout.features.identityChannelHarvest` | 0 (off) |
-| `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
-| `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
-| `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
-| `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
-| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
+| `BILI_ROLLOUT_PASS_DSH_EXTENSIONS` | `rollout.features.passDshExtensions` | 0 (off = intercept) |
+| `BILI_ROLLOUT_PLUGIN_DELTA_RESEND` | `rollout.features.pluginDeltaResend` | 0 (off) |
+| `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 100 (GA — on by default) |
+| `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 100 (on, GA) |
+| `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL` | `rollout.features.pluginMsgIdIncremental` | 100 (on, GA) |
+| `BILI_SESSION_GC` | `sessions.gc.enabled` | false (off) |
+| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 (1 h) |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
 | `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
-| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | `sessions.hardMaxBytes` | (same as `sessions.residentMaxBytes`) |
-| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 4294967296 |
-| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 0 |
-| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 |
+| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | `sessions.hardMaxBytes` | = sessions.residentMaxBytes (0 disables) |
+| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 4294967296 (4 GiB) |
+| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 0 (warms none) |
+| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 (64 MiB) |
+| `BILI_SNAPSHOT_SHADOW` | `snapshot.shadow` | true |
 | `BILI_SQLITE_AUTO_DOWNLOAD` | `storage.sqliteAutoDownload` | true |
 | `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | `storage.archiveAfterDays` | 365 |
 | `BILI_STORAGE_BACKEND` | `storage.backend` | unset (sqlite) |
 | `BILI_STORAGE_JSON_WRITER` | `storage.jsonWriter` | unset (off for the pure-sqlite selection — absent/unified=sqlite — and on for explicit full) |
 | `BILI_STORAGE_UNIFIED` | `storage.unified` | unset (sqlite) |
-| `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | `storage.walJournalSizeLimitBytes` | 8388608 |
+| `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | `storage.walJournalSizeLimitBytes` | 0 |
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
-| `BILI_THROTTLE_429` | `network.throttle429Enabled` | true |
+| `BILI_THROTTLE_429` | `network.throttle429Enabled` | false |
 | `BILI_THROTTLE_429_BASE_DELAY_MS` | `network.throttle429BaseDelayMs` | 2000 |
 | `BILI_THROTTLE_429_MAX_CONSECUTIVE` | `network.throttle429MaxConsecutive` | 5 |
 | `BILI_THROTTLE_429_MAX_DELAY_MS` | `network.throttle429MaxDelayMs` | 30000 |

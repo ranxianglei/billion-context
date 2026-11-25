@@ -221,3 +221,86 @@ test("e2e #5794 image doctrine: an over-band body carrying images is NOT refused
         rmrf(root);
     }
 });
+
+// #6908/#7426 tradeoff pin: d351a4d disabled the band BY DEFAULT (0 = no cap,
+// all lanes) because the re-send lanes (dsh/opencode replay the FULL history
+// every round) self-locked once their session grew past the cap — the dsh
+// compaction call is itself a full-history inbound body, so the gate could
+// never let the very call that would shrink it through. That is a CONSCIOUS
+// tradeoff, not an oversight: an operator who re-arms the band accepts that
+// the over-cap re-send lanes get refused at ingest again. Pin both lanes so a
+// future "fix" that exempts opencode/dsh from the armed band does not silently
+// undo the #5794 cost protection for everyone who opted back in.
+test("e2e #6908/#7426: a RE-ARMED ingest band still refuses the re-send lanes (opencode, dsh) — default-off is an opt-in re-arm, not a lane exemption", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-7426b-"));
+    const disarm = armIngestBand();
+    const { ctx, calls, close } = await setup();
+    try {
+        const big = "x".repeat(3 * 1024 * 1024); // ~3 MiB, over the 1 MiB test band
+        for (const lane of ["opencode", "dsh"]) {
+            const r = await fetch(ctx.url, {
+                method: "POST",
+                headers: { ...ctx.headers, "x-bili-plugin": lane },
+                body: JSON.stringify({ model: "gpt-test", stream: true, messages: [{ role: "user", content: big }] }),
+            });
+            const body = await r.text();
+            const parsed = JSON.parse(body) as { error?: { type?: string; stage?: string } };
+            assert.equal(r.status, 413, `re-armed band: the over-cap ${lane} body must be refused again (got ${r.status}): ${body.slice(0, 300)}`);
+            assert.equal(parsed.error?.stage, "ingest", `the ${lane} refusal is at the INGEST stage (the tradeoff is explicit, not hidden)`);
+        }
+        assert.equal(calls.length, 0, "neither over-cap re-send body reached the upstream");
+    } finally {
+        disarm();
+        await close();
+        rmrf(root);
+    }
+});
+
+// #6908: the /v1/responses lane is EXEMPT from the ingest band even when it is
+// re-armed (src/server/handle.ts: protocol === "responses" → band 0). dsh
+// desktop's compaction rides this wire with image-heavy full-history bodies;
+// the byte band was the wrong meter for that lane from the start, so the
+// exemption holds regardless of the operator's re-arm.
+test("e2e #6908: the /v1/responses lane ignores a RE-ARMED ingest band (exempt by protocol, even when the operator opted back in)", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-6908-"));
+    const disarm = armIngestBand();
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const upstream = http.createServer((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            res.end(
+                `event: response.completed\ndata: ${JSON.stringify({ response: { id: "resp_done", status: "completed", output: [], usage: { input_tokens: 100, output_tokens: 5, total_tokens: 105 } } })}\n\n`,
+            );
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startServer(proxyOptions({ [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 30_000 } } } }, 30_000));
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        // ~3 MiB of input text: over the 1 MiB armed band, no images. On the
+        // chat/completions lane the same body is a 413 ingest refusal; on the
+        // responses lane the gate is bypassed.
+        const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "conv-6908" },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "conv-6908", instructions: "test", input: "y".repeat(3 * 1024 * 1024) }),
+        });
+        const body = await r.text();
+        let stage: string | undefined;
+        try { stage = (JSON.parse(body) as { error?: { stage?: string } }).error?.stage; } catch { /* non-JSON body: not an ingest refusal either */ }
+        const refusedAtIngest = r.status === 413 && stage === "ingest";
+        assert.ok(!refusedAtIngest, `the responses lane must NOT be answered by the ingest band (got ${r.status}, stage ${stage}): ${body.slice(0, 300)}`);
+    } finally {
+        disarm();
+        proxy.close();
+        proxy.closeAllConnections?.();
+        upstream.close();
+        upstream.closeAllConnections?.();
+        rmrf(root);
+    }
+});
