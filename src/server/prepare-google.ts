@@ -45,6 +45,7 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { EgressAuthorityRejectError } from "../storage/egress-record.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -478,6 +479,11 @@ export async function prepareGoogle(
             nudgeOutcome = "gated";
         }
     } catch (err) {
+        // Ruling 7439-5 (C3, PR #7684): an unreadable op-log on an armed turn
+        // is a HARD fail (500 + x-bili-egress: unreadable) — the generic
+        // forward below would send the CLIENT'S bytes, which the ruling
+        // forbids (the openai lane already rethrows this exact error).
+        if (err instanceof EgressAuthorityRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
     }
