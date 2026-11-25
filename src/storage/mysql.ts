@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id        VARCHAR(255) NOT NULL PRIMARY KEY,
     parent_session_id VARCHAR(255) NULL,
     fork_point_seq    BIGINT NULL,
+    fork_egress_watermark BIGINT NULL,
     protocol          VARCHAR(64) NULL,
     label             TEXT NULL,
     title             TEXT NULL,
@@ -138,7 +139,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     tail_json         LONGTEXT NOT NULL DEFAULT ('{}'),
     ccr_json          LONGTEXT NULL,
     last_ingested_seq BIGINT NULL,
-    orphans_json      LONGTEXT NULL
+    orphans_json      LONGTEXT NULL,
+    r3_latched_at     BIGINT NULL
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS content (
@@ -444,6 +446,26 @@ export class MysqlBackend implements StorageBackend {
                 }
                 if (!have.has("end_msgid")) {
                     await conn.query("ALTER TABLE blocks ADD COLUMN end_msgid VARCHAR(255) NULL");
+                }
+            }
+            // 身份表收拢 (discussions/7591): the R3 breaker latch moves onto
+            // the sessions row (NULL/0 = not latched, else epoch-ms). Same
+            // probe-first discipline as the blocks block above: every
+            // pre-existing table picks it up, fresh installs get it from
+            // the DDL; no version bump.
+            {
+                const [cols] = (await conn.query(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS " +
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sessions'",
+                )) as unknown as [Row[]];
+                const have = new Set(cols.map((r) => str(r.COLUMN_NAME)));
+                if (!have.has("r3_latched_at")) {
+                    await conn.query("ALTER TABLE sessions ADD COLUMN r3_latched_at BIGINT NULL");
+                }
+                // #7658: probe-first, mirrors the SQLite twin. Stays NULL on
+                // this lane — the egress tables are SQLite-only.
+                if (!have.has("fork_egress_watermark")) {
+                    await conn.query("ALTER TABLE sessions ADD COLUMN fork_egress_watermark BIGINT NULL");
                 }
             }
             // Stamp advances but never downgrades: a future library stamped
@@ -1694,9 +1716,9 @@ export class MysqlBackend implements StorageBackend {
                 if (res.affectedRows === 0) throw new Error(`cloneSessionRows: media content row missing for hash ${String(row.h).slice(0, 16)}… — refusing to fork with an uncounted ref`);
             }
             await conn.query(
-                `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)
-                 VALUES (?, ?, ?, ?, ?)
-                 ON DUPLICATE KEY UPDATE parent_session_id = VALUES(parent_session_id), fork_point_seq = VALUES(fork_point_seq)`,
+                `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq, fork_egress_watermark)
+                 VALUES (?, ?, ?, ?, ?, NULL)
+                 ON DUPLICATE KEY UPDATE parent_session_id = VALUES(parent_session_id), fork_point_seq = VALUES(fork_point_seq), fork_egress_watermark = VALUES(fork_egress_watermark)`,
                 [childId, Date.now(), Date.now(), parentId, throughSeq],
             );
             if (initial && !await this.ingestSessionOn(initial, undefined, { completeLog: true }, conn)) throw new Error("cloneSessionRows: initial child ingest failed");
@@ -1740,7 +1762,7 @@ export class MysqlBackend implements StorageBackend {
 
     private async getSessionRowOn(conn: Pool | PoolConnection, sessionId: string): Promise<SessionRow | null> {
         const [rows] = (await conn.query(
-            `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin, status,
+            `SELECT session_id, parent_session_id, fork_point_seq, fork_egress_watermark, protocol, label, title, host_title, namespace, origin, status,
                     created_at, updated_at, next_block_id, next_run_id,
                     meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json
              FROM sessions WHERE session_id = ?`,
@@ -1752,6 +1774,7 @@ export class MysqlBackend implements StorageBackend {
             sessionId: str(r.session_id),
             parentSessionId: nullableStr(r.parent_session_id),
             forkPointSeq: nullableNum(r.fork_point_seq),
+            forkEgressWatermark: nullableNum(r.fork_egress_watermark),
             protocol: nullableStr(r.protocol),
             label: nullableStr(r.label),
             title: nullableStr(r.title),

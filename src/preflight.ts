@@ -21,7 +21,7 @@ import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
-import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES } from "./upstream-fail.js";
+import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES, UPSTREAM_FIRST_BYTE_TIMEOUT_CODE } from "./upstream-fail.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
@@ -424,25 +424,20 @@ function refNum(ref: string): number {
 // clamp, the image-cost textSide) carries billed-caliber mass. Without it the
 // k̂ sample divides a bill that includes thinking by an estimate that
 // excludes it, and thinking-heavy routes learn an inflated factor.
-// #5116: the estimator runs on EVERY outbound turn over the RESENT full
-// history, so the CJK-aware scan is O(total conversation bytes) per request
-// and O(turns × bytes) per session — the single largest per-turn CPU item on
-// big-context lanes. A message's estimate is a pure function of its identity
-// (text + thinkingTokens), and kernel-minted ids are content digests, so an
-// id-keyed memo makes every call after the first a Map lookup: steady state
-// pays O(new messages) instead of O(full history) and repeated calls within
-// one turn (preflight arming, window gates, output clamp, relay) all hit.
+// #5116/#5130: reuse counts across repeated history and within one turn
+// instead of repeating the CJK-aware token scan. A hit must match the exact
+// counted text: canonical tool arguments can share an ID and length despite
+// having different counts (Unicode escapes versus literal CJK, #7208).
 // Only `h_` digest ids are cached — test fixtures and reserved ids
 // (`acp_summary_*`) may reuse an id across differing texts and bypass it.
-// Kernel ids are *logical* identity, not a digest of the counted text, so two
-// same-id messages can still differ in counted text: (a) converters seed
-// tool-call ids with canonicalToolArgs(args) (whitespace/key-order only — the
-// character multiset, and therefore the CJK-aware count, is unchanged) while
-// CoreMessage.text keeps the verbatim args; (b) view renders (renderTags,
-// snapshot render) rewrite text in place and keep ids. The key therefore also
-// carries text length: every length-changing rewrite misses (a safe recount),
-// and the canonicalization deltas from (a) are count-invariant by construction.
-const messageTokenMemo = new Map<string, number>();
+// Live messages own the immutable text/count entries. The global index is
+// weak so it cannot keep whole histories alive after their messages go away.
+interface MessageTokenEstimate {
+    text: string | undefined;
+    tokens: number;
+}
+const messageTokenMemo = new Map<string, WeakRef<MessageTokenEstimate>>();
+let messageTokenOwners = new WeakMap<CoreMessage, MessageTokenEstimate>();
 const MESSAGE_TOKEN_MEMO_CAP = 200_000;
 const KERNEL_MINTED_ID = /^h_[0-9a-f]{16}(?:_\d+)?$/;
 
@@ -453,14 +448,17 @@ export function estimateCoreMessages(messages: CoreMessage[]): number {
         if (KERNEL_MINTED_ID.test(id)) {
             const textLength = m.text === undefined ? -1 : m.text.length;
             const key = `${id}|${textLength}|${m.thinkingTokens ?? ""}`;
-            const cached = messageTokenMemo.get(key);
-            if (cached !== undefined) {
-                tokens += cached;
+            const cached = messageTokenMemo.get(key)?.deref();
+            if (cached !== undefined && cached.text === m.text) {
+                messageTokenOwners.set(m, cached);
+                tokens += cached.tokens;
                 continue;
             }
             const counted = countMessageTokens(m, defaultCountTokens);
             if (messageTokenMemo.size >= MESSAGE_TOKEN_MEMO_CAP) messageTokenMemo.clear();
-            messageTokenMemo.set(key, counted);
+            const entry = { text: m.text, tokens: counted };
+            messageTokenOwners.set(m, entry);
+            messageTokenMemo.set(key, new WeakRef(entry));
             tokens += counted;
         } else {
             tokens += countMessageTokens(m, defaultCountTokens);
@@ -471,6 +469,7 @@ export function estimateCoreMessages(messages: CoreMessage[]): number {
 
 export function clearEstimateCoreMessagesMemoForTests(): void {
     messageTokenMemo.clear();
+    messageTokenOwners = new WeakMap();
 }
 
 // #554: side requests bypass the pipeline (#388) and are forwarded VERBATIM,
@@ -487,7 +486,21 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // body "measure" ~10M tokens and doom-gates 413'd image turns that belong in
 // the #496/#1800 billing arbitration. OpenAI chat `image_url.url`, Anthropic
 // `source.data` and Gemini `inline_data.data` were already excluded.
-const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
+// Opaque cryptographic thinking signatures (`signature`, `thoughtSignature`,
+// `thought_signature`) are excluded alongside media blobs so multi-megabyte
+// signature payloads never masquerade as ~1M+ prompt tokens. OpenAI Responses
+// `encrypted_content` stays counted because it carries encrypted reasoning
+// token mass that counts toward the context window and must trigger preflight.
+const NON_TEXT_BODY_KEYS = new Set([
+    "data",
+    "url",
+    "b64_json",
+    "file_data",
+    "image_url",
+    "signature",
+    "thoughtSignature",
+    "thought_signature",
+]);
 // DSH official-API extension plugins attach transport-only top-level sibling fields
 // (such as `dsh_session_log` up to 8 MiB and `dsh_plugin_packages`) that consume 0 model
 // tokens and are stripped/ignored before inference, whereas nested fields inside
@@ -1474,6 +1487,15 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
                 deps.log("info", `[preflight] non-streaming summary timed out at the gateway (HTTP ${err.status}); retrying with SSE (learned for this session, #2155)`);
                 continue;
             }
+            if (err instanceof SummaryTransportError && !stream && !deps.streamSummaryOff && deps.protocol !== "google" && err.code === UPSTREAM_FIRST_BYTE_TIMEOUT_CODE) {
+                // Non-streaming summary hit a tightened first-byte budget while
+                // buffering the full completion; flip the session to SSE so
+                // streaming headers/deltas arrive before the phase-1 budget.
+                deps.session.metadata.preflightStreamSummary = true;
+                stream = true;
+                deps.log("info", `[preflight] non-streaming summary timed out before first byte (${err.message}); retrying with SSE (learned for this session)`);
+                continue;
+            }
             if (err instanceof UpstreamHttpError && err.status === 400) {
                 let adapted = false;
                 const paramRejected = deps.protocol === "responses" && includeMaxOutputTokens && MAX_OUTPUT_TOKENS_REJECTED_RE.test(err.body);
@@ -1511,7 +1533,7 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
 // kinds (#1263/#1453 isFailFastUpstreamKind): a summary call must not die
 // faster than the request it protects. TLS trust failures stay OUT on purpose:
 // a bad CA does not self-heal within the backoff window (the main path agrees).
-const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "ECONNABORTED"]);
+const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "ECONNABORTED", UPSTREAM_FIRST_BYTE_TIMEOUT_CODE]);
 const SUMMARY_DIAGNOSTIC_CODES = new Set([
     ...TRANSIENT_SUMMARY_CODES, "ETIMEDOUT", "UND_ERR_ABORTED",
     "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "Z_DATA_ERROR", "Z_BUF_ERROR", "Z_MEM_ERROR",
@@ -1532,6 +1554,9 @@ class SummaryTransportError extends Error {
             if (!code && typeof value.code === "string" && SUMMARY_DIAGNOSTIC_CODES.has(value.code)) code = value.code;
             cause = value.cause;
         }
+        // Tightened phase-1 watchdog stamps UPSTREAM_FIRST_BYTE_TIMEOUT on an
+        // AbortError with zero response bytes received — fail-fast, not idle/client abort.
+        if (code === UPSTREAM_FIRST_BYTE_TIMEOUT_CODE) aborted = false;
         const name = error instanceof Error && ["Error", "TypeError", "AbortError", "TimeoutError"].includes(error.name) ? error.name : "Error";
         super(`summary ${stage} failed (${name}${code ? `, code=${code}` : ""}; ${attempts} attempt${attempts === 1 ? "" : "s"})`);
         this.name = "SummaryTransportError";
@@ -1590,6 +1615,9 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
             // extended beyond the 400 "stream required" shape). Streaming
             // attempts keep the normal transient replay below.
             if (failure instanceof UpstreamHttpError && !stream && !deps.streamSummaryOff && (failure.status === 524 || failure.status === 504)) {
+                throw failure;
+            }
+            if (failure instanceof SummaryTransportError && !stream && !deps.streamSummaryOff && deps.protocol !== "google" && failure.code === UPSTREAM_FIRST_BYTE_TIMEOUT_CODE) {
                 throw failure;
             }
             // #2189: retrying the identical shape cannot succeed — name it and fail fast.
