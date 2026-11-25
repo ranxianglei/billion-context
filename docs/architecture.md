@@ -23,7 +23,7 @@ How to read it:
 |---|---|---|---|
 | `storage` | Unified SQLite: table family, kstate, checkpoints, GC | [storage.md](./architecture/storage.md) · [zh](./architecture/storage.zh-CN.md) · [ja](./architecture/storage.ja.md) | ✅ |
 | `pipeline` | Request pipeline (handle / prepare-* / relay / inject) | [pipeline.md](./architecture/pipeline.md) · [zh](./architecture/pipeline.zh-CN.md) · [ja](./architecture/pipeline.ja.md) | ✅ |
-| `lanes` | Host lanes (dsh / pi / opencode / codex / bare proxy + lane-decisions) | [lanes.md](./architecture/lanes.md) · [zh](./architecture/lanes.zh-CN.md) · [ja](./architecture/lanes.ja.md) | ✅ |
+| `lanes` | Host lanes (dsh / pi / opencode / codex / bare proxy + lane-decisions; Pi Anthropic full-request compatibility) | [lanes.md](./architecture/lanes.md) · [zh](./architecture/lanes.zh-CN.md) · [ja](./architecture/lanes.ja.md) | ✅ |
 | `kernel` | Compression engine (acp-kernel: folds, summaries, ref ledger) | [kernel.md](./architecture/kernel.md) · [zh](./architecture/kernel.zh-CN.md) · [ja](./architecture/kernel.ja.md) | ✅ |
 | `identity` | Session & message identity (session id, persona fork, msgid channels) | [identity.md](./architecture/identity.md) · [zh](./architecture/identity.zh-CN.md) · [ja](./architecture/identity.ja.md) | ✅ |
 | `fastpaths` | Fastpaths (incremental lane, v5 watermark, D-lane snapshot render) | [fastpaths.md](./architecture/fastpaths.md) · [zh](./architecture/fastpaths.zh-CN.md) · [ja](./architecture/fastpaths.ja.md) | ✅ |

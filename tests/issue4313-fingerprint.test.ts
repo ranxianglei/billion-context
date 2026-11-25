@@ -36,14 +36,14 @@ function stubState(stamps?: Record<string, number>): CompressionState {
     return { messageRefs: { byRaw: {}, byRef: {} }, tsStamps: stamps } as unknown as CompressionState;
 }
 
-test("summaryFingerprintLine: pre-feature bytes without a range", () => {
-    assert.equal(summaryFingerprintLine("b1", "S"), ' · b1 full summary 1ch · head "S" … tail "S"');
-    // explicit null behaves like absent (same pre-feature shape)
-    assert.equal(summaryFingerprintLine("b1", "S", null), ' · b1 full summary 1ch · head "S" … tail "S"');
+test("summaryFingerprintLine: excerpt line without a range (labels dropped 2026-11-18)", () => {
+    assert.equal(summaryFingerprintLine("b1", "S"), ' · b1 full summary 1ch "S … S"');
+    // explicit null behaves like absent (same shape)
+    assert.equal(summaryFingerprintLine("b1", "S", null), ' · b1 full summary 1ch "S … S"');
 });
 
 test("summaryFingerprintLine: appends the local-time span; pure and byte-stable across calls", () => {
-    const expected = ` · b1 full summary 1ch [${formatTagTime(T0)} – ${formatTagTime(T1)}] · head "S" … tail "S"`;
+    const expected = ` · b1 full summary 1ch [${formatTagTime(T0)} – ${formatTagTime(T1)}] "S … S"`;
     const a = summaryFingerprintLine("b1", "S", { startTs: T0, endTs: T1 });
     const b = summaryFingerprintLine("b1", "S", { startTs: T0, endTs: T1 });
     assert.equal(a, expected, "appends ' [<local start> – <local end>]' after the fingerprint");
