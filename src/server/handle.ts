@@ -1035,6 +1035,10 @@ async function handleRequest(
     // FALLBACK_EFFECTIVE_WINDOW_FLOOR). Cleared when an async registry hit
     // replaces the value.
     let nativeFromFallback = false;
+    // C4 (PR #7684): model judged on the anonymous default window THIS request
+    // (set inside the window block; read again where the session is bound, to
+    // apply / record the session-local ratchet).
+    let ratchetableWindowModel: string | undefined;
     // Effective compression prompts for this request: resolved from the same
     // three-level cascade (global → provider → model) as the limit above, then
     // threaded into every prepare* path so the system prompt, the nudge text,
@@ -1153,6 +1157,11 @@ async function handleRequest(
             // #2336: agent-registry recipes are the FALLBACK layer — bili's
             // own named providers (file) win per provider name.
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} });
+        // C4 (PR #7684): remember that THIS request judged the model on the
+        // anonymous default window (no declaration of any kind, and an
+        // operator-tuned window never counts as the default). The session-local
+        // ratchet is applied / recorded where the session is bound (below).
+        if (native === undefined && !operatorWindowTuned) ratchetableWindowModel = model;
             {
                 const wsSource = betaWindow ? "anthropic-beta" : suffixWindow ? "model-suffix" : pluginWindow ? "plugin" : runtimeWindow ? "runtime-info" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
                 wsSourceForLog = wsSource;
@@ -3042,7 +3051,31 @@ async function handleRequest(
         // otherwise the request is degenerate (output >= whole window) and the
         // self-heal above handles the resulting overflow. Feeds reqConfig (→
         // processTurn `config`), so diagNudge shows the reserved window (no extra log).
-        const nativeWindow = reqConfig.modelContextLimit;
+        let nativeWindow = reqConfig.modelContextLimit;
+        // C4 (PR #7684): window ratchet — a model with no declared window rides
+        // the anonymous default until this session's own billing proves the
+        // upstream window bigger: settleUsageReport raises
+        // session.metadata.windowRatchet[model] to 2× the observation
+        // (monotonic) when a turn BILLS beyond the window the request was
+        // judged on. Re-resolve the request config with the raised number so
+        // preflight/nudge judge against it (declared windows are never in the
+        // ratchet map; an operator-tuned window outranks it by construction).
+        if (ratchetableWindowModel !== undefined) {
+            const ratchetedRaw = ((session.metadata.windowRatchet ?? {}) as Record<string, unknown>)[ratchetableWindowModel];
+            if (typeof ratchetedRaw === "number" && Number.isFinite(ratchetedRaw) && ratchetedRaw > nativeWindow) {
+                reqConfig = resolveRequestConfig(config, opts.routes, providerDestUrl, ratchetableWindowModel, ratchetedRaw, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} });
+                nativeWindow = reqConfig.modelContextLimit;
+                wsSourceForLog = "ratchet";
+                const ratchetLogKey = `${ratchetableWindowModel}@${ratchetedRaw}`;
+                if (!windowSourceLogged.has(ratchetLogKey)) {
+                    windowSourceLogged.add(ratchetLogKey);
+                    log("info", `[window-ratchet-applied] model=${ratchetableWindowModel} session=${sessionId}: billing proved the anonymous default small — judging this request against the session-raised window ${nativeWindow} (source=ratchet; monotonic, session-local)`);
+                }
+            }
+            // Record what window THIS request judged the model on: the billing
+            // funnel compares the next successful report against this number.
+            session.metadata.windowFallbackModels = { ...((session.metadata.windowFallbackModels ?? {}) as Record<string, number>), [ratchetableWindowModel]: nativeWindow };
+        }
         const headroomOrigin = normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin);
         // #3450 follow-up (#3973): a 400 that stated a completion share disproves
         // any separate-wall evidence for this origin+model — judging input against

@@ -2050,6 +2050,29 @@ export function settleUsageReport(
             : typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel
             : undefined;
         if (stampedModel !== undefined) session.stats.lastInputTokensModel = stampedModel;
+        // C4 (PR #7684): window ratchet — this session judged `stampedModel` on
+        // the anonymous DEFAULT window (recorded per request in
+        // metadata.windowFallbackModels, C4 site in src/server/handle.ts). A
+        // successful report that BILLed input beyond the window it was judged
+        // on proves the upstream window is bigger: raise the session-local
+        // window to 2× the observation, monotonically (never down, never below
+        // a previous raise). Declared / registry / operator windows are never
+        // in windowFallbackModels, so they are never touched. No ledgerSeq /
+        // table write — this is session metadata only.
+        if (stampedModel !== undefined) {
+            const fallbackWindows = (session.metadata.windowFallbackModels ?? {}) as Record<string, number>;
+            const judged = fallbackWindows[stampedModel];
+            if (typeof judged === "number" && Number.isFinite(judged)) {
+                const ratchet = (session.metadata.windowRatchet ?? {}) as Record<string, number>;
+                const current = Math.max(ratchet[stampedModel] ?? judged, judged);
+                if (session.stats.lastInputTokens > current) {
+                    const raised = Math.max(2 * session.stats.lastInputTokens, ratchet[stampedModel] ?? 0);
+                    ratchet[stampedModel] = raised;
+                    session.metadata.windowRatchet = ratchet;
+                    loggerLog("info", `[${session.id}] [window-ratchet] model=${stampedModel} billed ${session.stats.lastInputTokens} input beyond the judged window ${judged} — session window raised to ${raised} (2× the observation; monotonic, session-local)`);
+                }
+            }
+        }
         // #1933 F1: consume the pending pair — the local text estimate of the
         // payload THIS report bills, recorded at prepare time. Same route
         // required. Admitted samples (plausibility band) accumulate in a
