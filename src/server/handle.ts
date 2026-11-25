@@ -24,7 +24,7 @@ import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSes
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
-import { estimateRawBodyTokens } from "../preflight.js";
+import { estimateRawBodyTokens, isBillingAttributionText } from "../preflight.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { countImagesInRawBody, imageTokensInParsedBody } from "../image-tokens.js";
 import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, recordSignedRefusal, signedRefusal } from "../apig-resign.js";
@@ -1567,7 +1567,7 @@ async function handleRequest(
         const personaSystemText = protocol === "openai"
             ? openaiSystemTextForPersona(parsed as OpenAIRequestBody)
             : protocol === "anthropic"
-              ? systemTextsForSplit.join("\n\n")
+              ? systemTextsForSplit.filter((t) => !isBillingAttributionText(t)).join("\n\n")
               : protocol === "google"
                 ? googleSystemText(parsed as GoogleRequestBody)
                 : "";
