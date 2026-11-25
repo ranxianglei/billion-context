@@ -225,6 +225,36 @@ export function resolveEgressAuthority(args: {
     // session metadata (meta_json) so it survives restarts and covers
     // every later turn, not just this one.
     session.metadata["egressAuthority"] = true;
+    // KDD #25 (discussions/7735): persist the MINIMAL identity row the moment
+    // authority is claimed — never rely on the first ingest (egressProjection
+    // Frozen freezes it for armed sessions, so the row would never land and
+    // the session was invisible to list/GC/load after a restart). Every armed
+    // turn re-runs this: idempotent upsert = self-healing + updated_at keeps
+    // the sessions row fresh. Best-effort: a failure degrades to the existing
+    // fallback (isEgressOnSession probes egress_flow directly) — it never
+    // fails the request.
+    try {
+        st.ensureEgressIdentity?.({
+            sessionId: session.id,
+            parentSessionId:
+                typeof session.metadata["derivedFromSessionId"] === "string" && session.metadata["derivedFromSessionId"] !== ""
+                    ? session.metadata["derivedFromSessionId"] as string : null,
+            protocol: session.meta?.protocol ?? null,
+            label: session.meta?.label ?? null,
+            title: session.meta?.title ?? null,
+            hostTitle: session.meta?.hostTitle ?? null,
+            namespace:
+                typeof session.metadata["pluginAgent"] === "string" && session.metadata["pluginAgent"] !== ""
+                    ? session.metadata["pluginAgent"] as string : "proxy",
+            origin: session.meta?.upstreamOrigin ?? null,
+            createdAt: session.createdAt,
+            updatedAt: session.lastSeen,
+            metaJson: JSON.stringify(session.meta ?? {}),
+            metadataJson: JSON.stringify(session.metadata),
+        });
+    } catch (err) {
+        log("warn", `[${sessionId}] egress: identity row upsert failed (best-effort; the egress_flow probe still covers identity): ${String((err as { message?: unknown })?.message ?? err).slice(0, 200)}`);
+    }
     if (base0.view.length === 0) {
         // Turn-1 cold start (ruling 7439-5): the client bytes are the
         // content source EXACTLY ONCE — recordAuthorityTurn puts them in

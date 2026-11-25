@@ -37,7 +37,7 @@ import type { CcrLedgerRow } from "./slim.ts";
 import { splitMediaContent } from "./identity.js";
 import { rebuildEgressKstateOverlay, type EgressBlockSnapshot } from "./egress-block.ts";
 import type { BlockView } from "../session.js";
-import { effectiveJsonWriterOff, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.ts";
+import { effectiveJsonWriterOff, egressPlaneGateOn, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.js";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
@@ -420,6 +420,13 @@ export class UnifiedShadow {
             try {
                 store = UnifiedStore.open(`${dir}/index.db`, undefined, {
                     walJournalSizeLimitBytes: walLimit,
+                    // KDD #25 (discussions/7735): an eg-mode fresh database gets
+                    // only the core trio + egress groups; the 12 legacy tables
+                    // are probed back in on a later open once the flag is off.
+                    // BILI_TEST_FORCE_FULL_DDL (TEST-ONLY escape hatch): suites
+                    // asserting the LEGACY table shape while egressPlane=1
+                    // simulate a pre-gate DB and set it — production never does.
+                    legacyTables: !egressPlaneGateOn() || !!process.env.BILI_TEST_FORCE_FULL_DDL,
                 });
             } catch (err) {
                 // #4175: anything else throwing StorageIntegrityError means quick_check

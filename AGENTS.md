@@ -111,6 +111,12 @@ msgid 真身只有 `messages.msg_id` 一处，`l1_world`/`fold_journal`/`egress_
 
 egress 平面文档收口（#7581 块生命周期/双时钟 + #7617 身份收拢合入后）：`egressPlane` 代码默认**保持 0**（opt-in，owner 裁定 2026-11-24；翻 100 的 GA 曾被提议、未批）——开启 = `rollout.features.egressPlane: true` / `BILI_ROLLOUT_EGRESS_PLANE=1`。新增强文档 `docs/egress-plane.md`（+zh，唯一入口：设计脉络/双时钟/身份收拢/表结构/性能/fork 回退/开关依赖图与 on/off 解析序 env→配置文件→代码默认/操作手册/图×3）与 `docs/deprecations.md`（+zh，退役登记表：l1 占位行、conversations、D-lane 退役触发条件、物理 DROP 批次）；`docs/architecture/storage.{md,zh,ja}` 刷新 + identity/storage 架构图更新。动 egress 平面任何开关或文档前读 docs/egress-plane.md 与 deprecations.md。Full text: design-decisions.md #24.
 
+> 订正（2026-11-25，KDD #25 随批）：本条标题中的「0 → 100」是 GA 提议阶段的措辞，被 owner 随后的「默认保持 0」裁定取代，标题未同步（body 一直是 0，以 body 为准）。另：#7691（ci:full 验证合并）误把 `egressPlane`/`egressKstateRetireWrites`/`egressKstateRebuild` 三默认发到 100，KDD #25 已改回 0。
+
+### #25 — egress 扫尾：arm 时身份行、7 表创建门、kv 256 上限、flag 默认值修正（owner 指令 2026-11-25，discussion #7735） (Tier B)
+
+#7591 假设的「egress-on 会话行在 arm turn 由首次 ingest 落地」不成立：`egressAuthority` latch 在该次保存前已打入（`src/server/egress-lane-io.ts`），首次 ingest 即被 `egressProjectionFrozen` 冻结，sessions 行**永远落不了**（线上实证：sessions 表 0 行；后果 = 重启不可 load/不可见/不进 GC、metadata 只活内存、血缘列永不落库）。本条四件事：(1) **身份行**——arm（latch 行）时 seam 调 `UnifiedStore.ensureEgressIdentity()`：幂等 13 列身份 upsert（parent `COALESCE(存量,新)` 与 ingest 同语义；fork_point_seq 与 payload 列不碰），每个 armed turn 执行（删行自愈）；同事务删除该会话的 arm-turn 死 l1_world 占位行（`armed_at IS NULL AND r3_latched_at IS NULL AND witness_probe <> ''`）。(2) **表创建门**——`egressPlane` 开的实例**新建**库只建 `sessions`/`session_ext`/`kv_store` + 四张 egress 表（7 表），12 张 legacy 表不创建、已有库不删（probe-first 收敛在 flag 关闭后补建）；判定放 `UnifiedShadow.maybeOpen`（`src/knobs.ts` `egressPlaneGateOn()` 无副作用读——`featureEnabled()` 会触发 install-id 引导的 wx 文件竞态，不得在 store open 内调用）；load/fork 读路径 7 个 getter 对缺失 legacy 表按"无数据"短路，eg 实例完整可用；`BILI_TEST_FORCE_FULL_DDL=1` 为测试专用逃生口。(3) **kv_store 256 字符硬上限**（序列化后，普通键，sqlite/mysql 双后端 `setKv` 入口）+ 冻结白名单（`prefix-affinity|v1`/`plugin-conversations|table` 保留 4MB，加条目 = review 事件须登记 deprecations）；eg 模式大 blob 写入侧退役：session-order（已无写入方）、plugin-conversations（不写，miss 等下轮模型请求重建）、prefix-affinity 显式 ID 分支（关门；匿名分支保留——可用性优先，匿名客户端后续单独处理）。(4) **flag 默认值修正**：三个 egress 系 flag 改回 0。全登记 docs/deprecations.md（+zh），docs/egress-plane.md §11（+zh）为准文档。Full text: design-decisions.md #25。
+
 ### Install-Lane & Update-Ownership Contract (#1196)
 
 Every bili presence on a machine follows ONE contract — decide changes against it, not ad hoc:

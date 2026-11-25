@@ -7,18 +7,26 @@ import { UnifiedStore } from "../src/storage/store.ts";
 import { MysqlBackend, type Mysql2Module } from "../src/storage/mysql.ts";
 
 const LIMIT = 4 * 1024 * 1024;
+import { KV_VALUE_MAX_CHARS } from "../src/storage/store.ts";
 
 test("SQLite extension limits measure UTF-8 bytes before changing the existing value", () => {
     const dir = mkdtempSync(join(tmpdir(), "extension-bytes-"));
     const store = UnifiedStore.open(join(dir, "index.db"));
     try {
+        // KDD #25: an ORDINARY kv key caps at KV_VALUE_MAX_CHARS (256 after
+        // serialization) — far below the 4 MB byte budget, which now serves
+        // the whitelisted growing keys and the session_ext side.
         store.setKv("test", "value", "keep");
-        const multibyte = "界".repeat(Math.ceil(LIMIT / 3));
-        assert.throws(() => store.setKv("test", "value", multibyte), /exceeds.*bytes/);
+        assert.throws(
+            () => store.setKv("test", "value", "a".repeat(KV_VALUE_MAX_CHARS + 1)),
+            /kv value too large/,
+        );
         assert.equal(store.getKv("test", "value"), "keep");
-        store.setKv("test", "boundary", "a".repeat(LIMIT - 2));
-        assert.equal((store.getKv("test", "boundary") as string).length, LIMIT - 2);
-        assert.throws(() => store.setKv("test", "boundary", "a".repeat(LIMIT - 1)), /exceeds.*bytes/);
+        // The 4 MB boundary applies to a whitelisted key (the frozen list's
+        // first entry doubles as the contract test fixture).
+        store.setKv("prefix-affinity", "v1", "a".repeat(LIMIT - 2));
+        assert.equal((store.getKv("prefix-affinity", "v1") as string).length, LIMIT - 2);
+        assert.throws(() => store.setKv("prefix-affinity", "v1", "a".repeat(LIMIT - 1)), /exceeds.*bytes/);
     } finally {
         store.close();
         rmSync(dir, { recursive: true, force: true });
@@ -56,10 +64,24 @@ for (const invalid of ["", "x".repeat(257), "bad\u0000key", "bad\u007fkey"]) {
 
 test("MySQL extension writes reject undefined and over-budget values consistently", async () => {
     const { backend, queries } = mysqlFixture();
-    for (const value of [undefined, () => 1, "界".repeat(Math.ceil(LIMIT / 3))]) {
-        await assert.rejects(() => backend.setKv("ns", "key", value), /JSON-serializable|exceeds.*bytes/);
-        await assert.rejects(() => backend.setSessionExt("session", "key", value), /JSON-serializable|exceeds.*bytes/);
+    for (const value of [undefined, () => 1]) {
+        await assert.rejects(() => backend.setKv("ns", "key", value), /JSON-serializable/);
+        await assert.rejects(() => backend.setSessionExt("session", "key", value), /JSON-serializable/);
     }
+    // KDD #25: ordinary kv keys reject at the 256-char cap (before the byte
+    // budget); whitelisted keys and session_ext keep the 4 MB byte budget.
+    await assert.rejects(
+        () => backend.setKv("ns", "key", "a".repeat(300)),
+        /kv value too large/,
+    );
+    await assert.rejects(
+        () => backend.setKv("prefix-affinity", "v1", "界".repeat(Math.ceil(LIMIT / 3))),
+        /exceeds.*bytes/,
+    );
+    await assert.rejects(
+        () => backend.setSessionExt("session", "key", "界".repeat(Math.ceil(LIMIT / 3))),
+        /exceeds.*bytes/,
+    );
     assert.equal(queries.length, 0);
     await backend.setKv("ns", "key", { valid: "界" });
     await backend.setSessionExt("session", "key", null);

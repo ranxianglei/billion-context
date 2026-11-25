@@ -32,6 +32,10 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { setLogCapture } from "../src/logger.ts";
 
 const MODEL = "gpt-test";
+// KDD #25: this suite mixes an egress-on session and a LEGACY control session
+// in one database (unpinned control leg) — it simulates a pre-gate DB, so
+// force the full table set even where egressPlane=1 is set below.
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 
 function listen(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();

@@ -30,6 +30,8 @@
 
 ## 3. 表结构（SQLite，`src/storage/schema.ts`；probe-first DDL，开发期表）
 
+创建说明（KDD #25）：**egressPlane 开**的实例上，**新建**数据库只建核心三件套（`sessions`/`session_ext`/`kv_store`）+ 四张 egress 表——下方 12 张 legacy 表跳过创建，flag 日后关闭时由 probe-first 收敛补建；已有数据库绝不删表。见 §11。
+
 | 表 | 主键 | 作用 | 关键列 |
 |---|---|---|---|
 | `egress_flow` | `(session_id, op_seq)` | **消息**操作日志。保留底线之上表内稠密（#7574 不变量；恢复 = 一步步回退到最新健康 base）。最新 `B` base 以下的行由压实物理删除。 | `row_type` I/D/U/B · I 行：`msgid`、`log_seq`（规范消息号，永不复用）、`ref`、`tokens`、`bytes`、`role`、`type_tag` · B 行：payload `{entries, highWater}`（压实 base = 该点存活视图 + 消息前沿） |
@@ -105,6 +107,7 @@
 | [#7577](https://github.com/ranxianglei/billion-context/discussions/7577) / **#7581**（已合并） | `egress_block_flow`/`egress_block_state`（**双时钟**——共用时钟方案在 review 中被否：它会在第一次折叠时击穿 flow 密度）、checkpoint 退役 → 点位 fork、kstate 裁剪。 |
 | [#7591](https://github.com/ranxianglei/billion-context/discussions/7591) / **#7617**（已合并） | 身份收拢：无状态 stage-0、R3 latch → `sessions`、conversations 对 egress-on 退役、GC/手动归档守卫。 |
 | **#7659（本 PR，2026-11-24）** | 文档收尾：本文档；[deprecations.zh-CN.md](./deprecations.zh-CN.md)；KDD #24；图。egressPlane 默认按 owner 裁定保持 **0**——GA 翻转被提议后否决。 |
+| 讨论 [#7735](https://github.com/ranxianglei/billion-context/discussions/7735)（2026-11-25） | **扫尾**：arm 时身份行（§11）、7 表创建门、kv_store 256 字符策略 + 大 blob 退役、l1 死行清理、三个 flag 默认值修正回 0。 |
 
 **遗留**（已跟踪）：egressPlane 默认翻 100（等 owner 点头）；point-reconstruction materializer（低于最新 base 的 fork 点）；归档格式承载 op log；`egressBlockCompact` 的生产**压缩**调用方（replay 已在 #7664 落地）；退役身份载体的物理 DROP 批次；按退役登记表删开关（硬编码开）。
 
@@ -122,3 +125,13 @@
 6. **系统提示词：输入形态在 `egress_state`，账本形态在 flow。** 一个文本、两种形态、不再第三份：flow 的 system 行保留**拼装成品**（客户端 system `A` + 服务端常驻块 `B`，每轮实时计算；transcript 要的就是真正发出去的东西）。**客户端原文 `A`** 在 egress 表内拿到永久住所——`egress_state` 上固定 `egress-system` msgid、编号 0 的一行，客户端改了就发 U 更新（`sessions` 不动 DDL）。结果：`session_ext` 里的粘性副本（`inc:system`）对 egress-on 会话退役——已登记 [deprecations.zh-CN.md](./deprecations.zh-CN.md)；增量车道对 egress-on 会话从 egress state 读 `A`（legacy/关平面不动）。两种形态都从 egress 表可查，不再"真正的系统提示词在扩展列里"。
 
 **为什么对平面其余部分是安全的。** fork 原样拷贝 flow 行，回填的编号随会话走；压缩 base 存的 `highWater` 是被压掉的最大编号（现在是引用号，stage-0 读的 `MAX(log_seq)` 前沿与下一号兑底两边都对齐）；CCR 与块表以 `op_seq`/`msg_id` 为键，与引用号无关。附带收益：egress-on 的引用空间与 legacy 边**逐字相同**（两边 `m00001` 都是第一条真消息），加载重编号机制（#4316）整体退出 egress-on 路径——"重编号后快照过期"这一 bug 类在 egress-on 上不再存在。
+
+## 11. 扫尾（2026-11-25，讨论 [#7735](https://github.com/ranxianglei/billion-context/discussions/7735)）——身份行、表创建门、kv 策略
+
+**身份行。** #7591 假设 egress-on 会话的 sessions 行在 arm turn 由首次 ingest 落地——不成立：`egressAuthority` latch 在该次保存**之前**就已打入（`src/server/egress-lane-io.ts`），第一次 ingest 就被 `egressProjectionFrozen` 冻结，行**永远落不了**。线上后果：重启后会话丢失（无行⇒不可 load、不可见、不进 GC 视野），metadata（pluginAgent/lastModel/title）只活在内存，血缘列永未持久化。修复：arm（latch 行）时 seam 调 `UnifiedStore.ensureEgressIdentity()`——一次性、幂等的 **13 列身份 upsert**（session_id、parent_session_id、protocol、label、title、host_title、namespace、origin、status、created_at、updated_at、meta_json、metadata_json；parent 用 `COALESCE(存量,新)` 与 ingest 同语义，第一个父赢；fork_point_seq 与全部 payload 列不碰）。每个 armed turn 都执行，删行下一轮自愈。同一事务里还删掉该会话的 **arm-turn 死 l1_world 占位行**（`armed_at IS NULL AND r3_latched_at IS NULL AND witness_probe <> ''`）——arm turn 的 stage-0 仍走 legacy（故意不预 latch），以前每个会话永久留一行死行。
+
+**表创建门。** eg 模式**新建**库只建：`sessions` + `session_ext` + `kv_store`（核心三件套）+ 四张 egress 表 = **7 张表**；12 张 legacy 表**不创建**（probe-first 收敛保证 flag 日后关闭时任何一次打开都会补建）。已有库保留全部现有表——门只管不建、从不删。`session_ext` 按 owner 裁定豁免（fastpath `pf:state` 熔断记忆住在里面）。直接调 `UnifiedStore.open` 的调用方默认建全表；开关判定在 `UnifiedShadow.maybeOpen`（`src/knobs.ts` 的 `egressPlaneGateOn()`——无副作用读法，因为 `featureEnabled()` 会在 store open 中途触发 install-id 引导的 wx 文件竞态写）。load/fork 路径对缺失的 legacy 表按"无数据"处理（7 个读 getter 短路），eg 模式实例完整可用。`BILI_TEST_FORCE_FULL_DDL=1` 是**测试专用**逃生口：断言 legacy 表形状而 flag 又开的套件（模拟门禁前的库）用它，生产永不设。
+
+**kv_store 策略。** `kv_store` 是小配置面（install id、notices、host flags），不是 blob 库：每个值 JSON 序列化后不得超过 **256 字符**（`KV_VALUE_MAX_CHARS`，sqlite/mysql 两后端 `setKv` 入口强制）。冻结白名单（`KV_VALUE_WHITELIST`，加条目 = review 事件，须登记 [deprecations.zh-CN.md](./deprecations.zh-CN.md)）给两个已知会长大的键保留 4MB 上限：`prefix-affinity|v1`、`plugin-conversations|table`。eg 模式下大 blob 在写入侧退役：`session-order` 早已退役（写入模块已被上游移除——孤儿行不再触碰，新库干净）；`plugin-conversations` 不写（路由表纯内存；重启 miss 等下一个模型请求重建——既有 miss 语义）；显式 ID 的 `prefix-affinity` 分支关门，**匿名**分支保留写入（可用性优先——匿名客户端本次不处理，owner 裁定）。
+
+**flag 默认值修正。** `ci:full` 验证合并（#7691）误把 `egressPlane` / `egressKstateRetireWrites` / `egressKstateRebuild` 的默认发到 **100**，违反本文档的 owner 裁定（默认 0、opt-in）。本次扫尾把三个默认在 `src/rollout.ts` 与配置文档中全部改回 **0**。

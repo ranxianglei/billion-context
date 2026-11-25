@@ -61,7 +61,7 @@ import {
     snapR3LatchedListOnSessions,
 } from "./snap.js";
 import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
-import { EGRESS_SYSTEM_MSGID } from "./egress-record.js";
+import { EGRESS_SYSTEM_MSGID, type EgressIdentityInput } from "./egress-record.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
@@ -453,6 +453,26 @@ export function serializeExtValue(value: unknown): string {
     return json;
 }
 
+/** kv_store value hard cap (KDD #25, discussions/7735): kv_store is the
+ *  small-config surface (install id, notices, host flags), NOT a blob
+ *  store — every value must stay at 256 characters after serialization.
+ *  The frozen whitelist holds the two KNOWN growing keys still in service
+ *  (each with a retirement path — see docs/deprecations.md); adding an
+ *  entry is a review event and must be registered there too. The 4 MB
+ *  serializeExtValue ceiling above stays as the last-resort tripwire for
+ *  the session_ext side of the API. */
+export const KV_VALUE_MAX_CHARS = 256;
+export const KV_VALUE_WHITELIST = new Set(["prefix-affinity|v1", "plugin-conversations|table"]);
+
+export function assertKvValueSize(namespace: string, key: string, value: unknown): void {
+    if (KV_VALUE_WHITELIST.has(`${namespace}|${key}`)) return;
+    const json = JSON.stringify(value);
+    const size = json === undefined ? 0 : json.length;
+    if (size > KV_VALUE_MAX_CHARS) {
+        throw new Error(`[storage] kv value too large: ${namespace}|${key} = ${size} chars (max ${KV_VALUE_MAX_CHARS} — retire the payload or add a registered whitelist entry, discussions/7735)`);
+    }
+}
+
 /** Escapes LIKE metacharacters for the ESCAPE '\\' clause used by listKv. */
 function likeEscape(prefix: string): string {
     return prefix.replace(/[\\%_]/g, (ch) => "\\" + ch);
@@ -566,6 +586,14 @@ export class UnifiedStore {
     /** #4175: the live foreign pid found holding <db>.lock at open, if any. */
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
+    /** KDD #25: whether the legacy payload tables exist in THIS database
+     *  (an egress-mode fresh store skips creating them — discussions/7735).
+     *  Missing = "no data" for the legacy read getters below: the egress-on
+     *  read path must work on a 7-table instance (fork endpoint, session
+     *  load), not 503 on the first `no such table: messages`. Probed once
+     *  at open (the group is created atomically, so one probe covers all
+     *  twelve); fault → true (assume present = pre-gate behavior). */
+    private legacyTablesPresent = true;
     private readonly dbPath: string;
     /** #4609: a check that RAN IN THIS LIFETIME (sync scan or background
      * verdict) said the file set is sound — a clean close then refreshes the
@@ -597,12 +625,21 @@ export class UnifiedStore {
         this.lockPath = lockPath;
         this.foreignLockHolder = foreignLockHolder;
         this.dbPath = dbPath;
+        // KDD #25: probe the legacy group ONCE per open (it is created
+        // atomically, so one table answers for all twelve); a fault means
+        // "assume present" (pre-gate behavior — every query stays live).
+        try {
+            this.legacyTablesPresent =
+                (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'").get() as { 1?: number } | undefined) !== undefined;
+        } catch {
+            this.legacyTablesPresent = true;
+        }
     }
 
     static open(
         path: string,
         engine?: SqliteEngineName,
-        opts?: { walJournalSizeLimitBytes?: number },
+        opts?: { walJournalSizeLimitBytes?: number; legacyTables?: boolean },
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
@@ -796,7 +833,22 @@ export class UnifiedStore {
                 }
                 db.exec(pragma);
             }
-            migrateSchema(db);
+            migrateSchema(db, {
+                // egress-mode table creation gate (KDD #25, discussions/7735):
+                // an eg-mode fresh database gets only the core trio plus the
+                // egress groups — the 12 legacy tables are probed back in on
+                // a later open once egressPlane is off (migrateSchema).
+                // The on/off DECISION is made by the caller (UnifiedShadow
+                // .maybeOpen): evaluating featureEnabled() here would run the
+                // install-id bootstrap (rolloutInstallId's wx file race) in
+                // the middle of a store open — a side effect that breaks
+                // fresh-install id semantics (rollout-identity suites).
+                // BILI_TEST_FORCE_FULL_DDL (TEST-ONLY escape hatch) lives at
+                // that call site: suites asserting the LEGACY table shape
+                // while egressPlane=1 simulate a pre-gate DB and set it.
+                // Direct UnifiedStore.open callers default to the full set.
+                legacyTables: opts?.legacyTables ?? true,
+            });
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
             // to be corrupt: the #2771 fallback tells operators to MOVE the
@@ -1131,6 +1183,7 @@ export class UnifiedStore {
     /** #6785 step 8: the unbounded CompressionState field rows (null when
      *  the session has none — legacy sessions read from the column). */
     getStateFields(sessionId: string): Record<string, string> | null {
+        if (!this.legacyTablesPresent) return null; // KDD #25: missing legacy group = no data
         const rows = this.db
             .prepare("SELECT field, value_json FROM state_fields WHERE session_id = ?")
             .all(sessionId) as { field: string; value_json: string }[];
@@ -1145,6 +1198,7 @@ export class UnifiedStore {
      *  in depth: after any ingest the column is NULL). null = no orphans
      *  anywhere (callers keep their "null ⇒ skip merge" semantics). */
     getOrphanViews(sessionId: string): Record<string, { one: unknown; full: unknown }> | null {
+        if (!this.legacyTablesPresent) return null; // KDD #25: missing legacy group = no data
         const rows = this.db
             .prepare("SELECT block_id, one_json, full_json FROM orphan_blocks WHERE session_id = ?")
             .all(sessionId) as { block_id: string; one_json: string | null; full_json: string }[];
@@ -2416,6 +2470,70 @@ export class UnifiedStore {
      *  transaction; src/storage/egress-state.ts egressAppendTurn). */
     egressAppendTurn(sessionId: string, ops: EgressOp[], baseSeq: number, nowMs: number): EgressViewRow[] {
         return egressAppendTurn(this.db, sessionId, ops, nowMs, { baseSeq });
+    }
+
+    /** Minimal identity row for an egress-on session (KDD #25,
+     *  discussions/7735). Landed from the egress seam on EVERY armed turn —
+     *  idempotent upsert = self-healing, and updated_at advancing each turn
+     *  keeps the session visible to the list/GC/stale sweeps that all scan
+     *  FROM sessions. Payload columns (stats/kstate/tail/ccr/last_ingested_
+     *  seq/orphans/next_*) are deliberately never touched: an egress-on row
+     *  carries identity + metadata only, matching the #7591 freeze.
+     *  Conflict semantics mirror the ingest upsert below: first PARENT wins
+     *  (a point-fork child's parent + fork_point_seq, written by the fork
+     *  path, survive every later identity pass); descriptive columns and
+     *  updated_at are latest-wins.
+     *  Same transaction: the arm turn's stage-0 ran BEFORE the egress latch
+     *  and left one dead l1_world row ("one dead l1 row that is never read
+     *  again" — the pre-#7735 NOTE); it is removed here with guards that
+     *  never touch an armed row, an R3 breaker latch row (witness '' +
+     *  r3_latched_at set), or any bound row. An eg-mode fresh DB has no
+     *  l1_world table at all — the cleanup is best-effort there. */
+    ensureEgressIdentity(input: EgressIdentityInput): void {
+        // Snapshot the sess_raw resolution BEFORE the INSERT below: the
+        // arm turn wrote its l1 row while this session was still legacy
+        // (binding = host conversation id), and once the identity row lands
+        // isEgressOnSession flips true and snapSessRawOf would return the
+        // sid — the wrong key for the dead row. A fresh eg-mode DB has no
+        // conversations table at all — fall back to the sid alone (there
+        // can be no l1 row there either).
+        let raws = new Set<string>([input.sessionId]);
+        try {
+            raws.add(this.snapSessRawOf(input.sessionId));
+        } catch { /* no conversations table in a fresh eg db */ }
+        this.db.transaction(() => {
+            this.db.prepare(`
+                INSERT INTO sessions (
+                    session_id, parent_session_id, protocol, label, title, host_title,
+                    namespace, origin, status, created_at, updated_at, meta_json, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                    protocol = excluded.protocol,
+                    label = excluded.label,
+                    title = excluded.title,
+                    host_title = excluded.host_title,
+                    namespace = excluded.namespace,
+                    origin = excluded.origin,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at,
+                    meta_json = excluded.meta_json,
+                    metadata_json = excluded.metadata_json
+            `).run(
+                input.sessionId, input.parentSessionId, input.protocol, input.label,
+                input.title, input.hostTitle, input.namespace, input.origin,
+                input.createdAt, input.updatedAt, input.metaJson, input.metadataJson,
+            );
+            try {
+                this.db.prepare(`
+                    DELETE FROM l1_world
+                    WHERE ledger_id = ? AND sess_raw IN (${[...raws].map(() => "?").join(", ")})
+                      AND armed_at IS NULL AND r3_latched_at IS NULL AND witness_probe <> ''
+                `).run(input.sessionId, ...raws);
+            } catch {
+                // eg-mode fresh DB: l1_world was never created — nothing to clean.
+            }
+        });
     }
 
     /** The serving read: state replay + comparison with the log; a damaged
@@ -3825,6 +3943,7 @@ export class UnifiedStore {
     }
 
     setKv(namespace: string, key: string, value: unknown): void {
+        assertKvValueSize(namespace, key, value);
         validateExtKey(namespace, "namespace");
         validateExtKey(key, "key");
         const valueJson = serializeExtValue(value);
@@ -4558,6 +4677,7 @@ export class UnifiedStore {
         // the full historian record (export/diagnostics) opt in.
         // #5155: fromSeqExclusive narrows the scan to rows appended after a
         // recorded pointer — hot-path pointer upkeep must not walk the table.
+        if (!this.legacyTablesPresent) return []; // KDD #25: missing legacy group = no data
         if (opts?.seqs?.length === 0) return [];
         const seqFilter = opts?.seqs ? ` AND seq IN (${opts.seqs.map(() => "?").join(",")})` : "";
         const afterClause = !opts?.seqs && opts?.fromSeqExclusive !== undefined ? " AND seq > ?" : "";
@@ -4630,6 +4750,7 @@ export class UnifiedStore {
     }
 
     getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): (BlockRow & { summaryHash: string; oneHash: string | null })[] {
+        if (!this.legacyTablesPresent) return []; // KDD #25: missing legacy group = no data
         const rows = this.db
             .prepare(
                 `SELECT b.block_id, b.ord, b.start_seq, b.end_seq, b.start_ref, b.end_ref, b.tier, b.summary_hash, b.one_hash,
@@ -4664,6 +4785,7 @@ export class UnifiedStore {
     }
 
     getDeadRefs(sessionId: string): { ord: number; ref: string; refNum: number; recordedAt: number }[] {
+        if (!this.legacyTablesPresent) return []; // KDD #25: missing legacy group = no data
         const rows = this.db
             .prepare("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord")
             .all(sessionId) as Record<string, unknown>[];
@@ -4676,6 +4798,7 @@ export class UnifiedStore {
     }
 
     getRefs(sessionId: string): RefRow[] {
+        if (!this.legacyTablesPresent) return []; // KDD #25: missing legacy group = no data
         const rows = this.db
             .prepare("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord")
             .all(sessionId) as Record<string, unknown>[];
@@ -4714,6 +4837,7 @@ export class UnifiedStore {
     }
 
     getCcrEntries(sessionId: string): CcrEntryRow[] {
+        if (!this.legacyTablesPresent) return []; // KDD #25: missing legacy group = no data
         const rows = this.db
             .prepare("SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord")
             .all(sessionId) as Record<string, unknown>[];

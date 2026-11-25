@@ -2077,7 +2077,14 @@ async function handleRequest(
                 ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
                 ...(existingProducer ? { producer: existingProducer } : anonProvenance ? { producer: anonProvenance } : {}),
             };
-        } else if (clientProvided && zcodeMemory === undefined) {
+        } else if (clientProvided && zcodeMemory === undefined &&
+            // KDD #25 (discussions/7735): an egress-on session resolves identity
+            // from the op log + its sessions identity row, not from the
+            // content-chain map — skip the #1486 identified-client tracking for
+            // it (the 1.8 MB prefix-affinity kv blob stays out of an eg
+            // database). Anonymous clients keep writing: they have no other
+            // identity source and availability outranks retirement.
+            !(session.metadata?.["egressAuthority"] === true && featureEnabled("egressPlane"))) {
             // #1486: track identified clients' chains too, so a resume that
             // forks a NEW client id (cc --resume) can be matched back to its
             // parent across requests and proxy restarts (the #499 snapshot

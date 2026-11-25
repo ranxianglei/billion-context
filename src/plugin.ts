@@ -8,6 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { rebuildCoreFromLog } from "./storage/egress-serve.js";
+import { featureEnabled } from "./rollout.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -387,6 +388,13 @@ let conversationsDirty = false;
 
 function writeConversationsFile(): void {
     if (!conversationsDirty) return;
+    // KDD #25 (discussions/7735): an egress-on instance does NOT persist the
+    // conversationId→session route table (56 KB kv blob + legacy file) — the
+    // in-memory table keeps serving THIS process; after a restart,
+    // self-binding clients (cid == sid, e.g. pi) re-resolve via their native
+    // session id and the rest re-bind on their next model request
+    // ("有问题再说" — owner ruling 2026-11-25).
+    if (featureEnabled("egressPlane")) return;
     try {
         const obj: Record<string, ConversationEntry> = {};
         for (const [k, v] of conversations) obj[k] = v;
@@ -491,6 +499,12 @@ export function loadConversations(): void {
 export async function hydratePluginConversationsUnified(): Promise<void> {
     const store = kvStore();
     if (convKvReady || !store) return;
+    // KDD #25 (discussions/7735): in egress mode the routing table stays
+    // memory-only — the plugin lane is one-to-one and a restart simply waits
+    // for the next model request to repopulate (its existing miss behavior).
+    // Skipping the store entirely keeps the retired blob out of an eg
+    // database (writeConversationsFile is gated the same way).
+    if (featureEnabled("egressPlane")) return;
     try {
         let raw: unknown;
         try {

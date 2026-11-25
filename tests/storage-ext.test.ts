@@ -145,7 +145,14 @@ test("guards reject hostile keys and oversize values", async () => {
                 assert.throws(() => store.setSessionExt("s", "bad\u0007key", 1), /control characters/);
                 assert.throws(() => store.setKv("".padEnd(300, "n"), "k", 1), /at most 256/);
                 assert.throws(() => store.setKv("ns", "k", undefined), /JSON-serializable/);
-                assert.throws(() => store.setKv("ns", "k", { big: "x".repeat(5 * 1024 * 1024) }), /4194304 bytes/);
+                // KDD #25: an ordinary kv key now rejects at the 256-char cap
+                // (before the 4 MB byte budget); the budget path is exercised
+                // through a whitelisted key.
+                assert.throws(() => store.setKv("ns", "k", { big: "x".repeat(300) }), /kv value too large/);
+                assert.throws(
+                    () => store.setKv("prefix-affinity", "v1", { big: "x".repeat(5 * 1024 * 1024) }),
+                    /4194304 bytes/,
+                );
             } finally {
                 store.closeQuietly();
             }

@@ -57,6 +57,10 @@ const SAVED_PLANE = process.env.BILI_ROLLOUT_EGRESS_PLANE;
 process.env.NODE_ENV = "test";
 process.env.BILI_STORAGE_UNIFIED = "full";
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+// KDD #25: the fork flows read the legacy view getters (viewFor) — these
+// suites simulate a pre-gate DB (full table set) while egressPlane=1;
+// the 7-table invariant lives in tests/eg-sweep-egress-identity.test.ts.
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 
 type Snap = { parentRevision: string; orderHash: string; orderedMessages: Array<{ rawId: string; ref: string | null; identityHash: string }> };
 

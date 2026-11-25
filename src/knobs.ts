@@ -975,6 +975,24 @@ export function fileStorageUnified(): string | undefined {
     return typeof v === "string" ? v : undefined;
 }
 
+/** KDD #25 (discussions/7735): side-effect-free "egressPlane on?" read for
+ *  the store-CREATION gate (which tables a fresh DB gets). featureEnabled()
+ *  is NOT usable there: it resolves against the install id
+ *  (rolloutInstallId), whose first-call bootstrap performs the wx file race
+ *  — a side effect that must not fire from inside UnifiedStore.open.
+ *  Mirrors rollout.resolveInternal's tiers minus install-id bucketing: env
+ *  force ("0"/"false" = off, anything else set = on), then the explicit
+ *  config boolean; percent-only configs fall closed because the built-in
+ *  plan's egressPlane percent is 0 (opt-in feature). */
+export function egressPlaneGateOn(): boolean {
+    const envRaw = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    if (envRaw !== undefined) return envRaw !== "0" && envRaw !== "false";
+    const raw = loadConfigFile().rollout?.features?.egressPlane;
+    if (raw === true) return true;
+    if (typeof raw === "object" && raw !== null) return raw.enabled === true;
+    return false;
+}
+
 export function fileStorageJsonWriter(): string | undefined {
     const v = loadConfigFile().storage?.jsonWriter;
     return typeof v === "string" ? v : undefined;

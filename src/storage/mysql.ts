@@ -39,7 +39,7 @@ import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
 import { mkdirSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
-import { sha256Hex, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
+import { sha256Hex, rewriteArchiveLog, validateExtKey, serializeExtValue, assertKvValueSize } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
@@ -2473,6 +2473,7 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async setKv(namespace: string, key: string, value: unknown): Promise<void> {
+        assertKvValueSize(namespace, key, value);
         validateExtKey(namespace, "namespace");
         validateExtKey(key, "key");
         const valueJson = serializeExtValue(value);

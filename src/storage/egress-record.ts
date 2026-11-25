@@ -162,6 +162,35 @@ export interface EgressOpLogStore {
      *  the production UnifiedStore implements both. */
     egressBlockView?(sessionId: string): Map<string, EgressBlockSnapshot>;
     egressBlockAppendOps?(sessionId: string, ops: EgressBlockOp[], kstateJson: string | null, nowMs: number): number[];
+    /** KDD #25 (discussions/7735): the minimal identity row for an
+     *  egress-on session — landed from the egress seam on every armed turn
+     *  (idempotent upsert; self-heals a deleted row on the next turn).
+     *  Optional: test shims without it keep running; the production
+     *  UnifiedStore implements it (identity row + arm-turn l1 cleanup in
+     *  one transaction). */
+    ensureEgressIdentity?(input: EgressIdentityInput): void;
+}
+
+/** Input to EgressOpLogStore.ensureEgressIdentity — the column mapping the
+ *  lane seam derives from the live Session (mirrors the ingest session-row
+ *  mapping in src/storage/ingest.ts:627-655 — the two must not drift). */
+export interface EgressIdentityInput {
+    sessionId: string;
+    /** parent_session_id: the point-fork origin (metadata.derivedFromSessionId); null otherwise. fork_point_seq is never written here (fork path only). */
+    parentSessionId: string | null;
+    protocol: string | null;
+    label: string | null;
+    title: string | null;
+    hostTitle: string | null;
+    /** namespace: the plugin agent (metadata.pluginAgent), 'proxy' otherwise. */
+    namespace: string;
+    origin: string | null;
+    createdAt: number;
+    updatedAt: number;
+    /** meta_json: the typed identity fields (protocol/label/title/hostTitle/origin + pack fields). */
+    metaJson: string;
+    /** metadata_json: the egressAuthority/egressFlowUnreadable/pluginAgent/derivedFromSessionId/lastModel carrier. */
+    metadataJson: string;
 }
 
 /** Record this turn's outbound conversation view as sparse ops. `prev` is

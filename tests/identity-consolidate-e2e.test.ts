@@ -37,6 +37,12 @@
 
 process.env.BILI_PERSIST_ZSTD = "0";
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+// KDD #25: these suites assert the LEGACY table shape (l1 rows, GC, fork
+// reads) while egressPlane=1 — they simulate a pre-gate DB, so force the
+// full table set (the production gate would skip the 12 legacy tables on
+// this fresh test database; the 7-table invariant is covered by
+// tests/eg-sweep-egress-identity.test.ts).
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY = "1";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
