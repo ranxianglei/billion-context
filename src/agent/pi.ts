@@ -640,7 +640,15 @@ function stampMsgIdEnvelope(
     // the core-aligned length; core space is L short of wire space once the
     // hoisted system run is non-trivial and the shrink check misfired.
     const pfSid = sessionIdOf(ctx);
-    if (pfSid !== undefined && pfChannel.pfSuppressFullMsgIds(pfSid, Array.isArray(base.messages) ? (base.messages as unknown[]).length : ids.length)) return undefined;
+    // #7574: only the OpenAI wire has the watermark plane that READS the
+    // x-bili-pf-tail-ids header the suppressed list travels on. pi can switch
+    // a session to an anthropic- or responses-wire model (/model); the slot
+    // then still holds the OpenAI lane's mode + count, and suppressing the
+    // list left those requests with no ids at all (their lanes never read the
+    // header) until the tail outgrew its byte budget. Same guard as the dsh
+    // site; those wires always send the full list.
+    const openAiWire = detectWireFormat(base) === "openai";
+    if (openAiWire && pfSid !== undefined && pfChannel.pfSuppressFullMsgIds(pfSid, Array.isArray(base.messages) ? (base.messages as unknown[]).length : ids.length)) return undefined;
     return { ...base, biliMsgIds: ids };
 }
 

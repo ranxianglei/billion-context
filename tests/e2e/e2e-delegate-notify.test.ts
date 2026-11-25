@@ -91,6 +91,9 @@ function cleanEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
     if (key.startsWith("BILI") || key.startsWith("BILLION_CONTEXT") || key.startsWith("ACP_")) delete env[key];
   }
   for (const key of ["NODE_EXTRA_CA_CERTS", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "NODE_OPTIONS", "NODE_TEST_CONTEXT"]) delete env[key];
+  // ci:full branch: keep the egress plane off this legacy-persistence lane — see the
+  // e2e-native-pi scope note (egress-on sessions freeze the JSON surface).
+  env.BILI_ROLLOUT_EGRESS_PLANE = "0";
   return { ...env, ...extra } as NodeJS.ProcessEnv;
 }
 
