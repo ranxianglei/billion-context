@@ -11,6 +11,7 @@ import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { isSubagentPrompt } from "../session-title.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
@@ -46,7 +47,7 @@ import { SessionStore } from "../persist.js";
 import { FoundationRejectError } from "../snapshot/plane.js";
 import { runStage0 } from "../snapshot/stage0.js";
 import { applyImageRescalePass } from "../image-rescale.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, outputBudgetField, readOutputBudget, writeOutputBudget } from "./budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudgeArmed, emergencyNudgeForConfig } from "./budget.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
@@ -62,9 +63,40 @@ interface EgressRecordSourceMsg {
     text?: unknown;
 }
 import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
-import { resolveEgressAuthority } from "./egress-lane-io.js";
+import { resolveEgressAuthority, egressAuthorityArmed } from "./egress-lane-io.js";
+import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
+
+/** #7398: put the conversation array back into a body whose parse handle.ts
+ *  deferred. Everything else is kept EXACTLY as it stands on `parsed`.
+ *
+ *  Under the deferral gate `parsed` is the span-scan synthesis (every
+ *  top-level field decoded, `messages` = null marker), and handle.ts has
+ *  since mutated it in place: the dsh client-extension strip (#7168/#7439),
+ *  stale chain-carrier removal, the leaked-tool veto, the #6752 output-budget
+ *  restore, and — at the top of prepareOpenai — the bili msg-id/seqs body
+ *  fields deleted so the real upstream never sees them. Rebuilding the
+ *  top-level object from the raw wire text (what this function replaced)
+ *  resurrected every one of those: a watermark hit forwarded a stripped
+ *  `dsh_session_log` again and a starved max_tokens until #6752 special-cased
+ *  the budget. Taking the fields from `parsed` and only `messages` from the
+ *  wire covers all of them, present and future.
+ *
+ *  `wireOrder` is the wire key order (JSON.parse order, duplicate keys keep
+ *  their first position) so the re-serialized body stays byte-identical to
+ *  the non-deferred path — a moved `messages` key would cost the upstream
+ *  prefix cache the whole conversation. A key `parsed` no longer carries was
+ *  removed on purpose and stays removed. */
+function materializeDeferredBody(parsed: OpenAIRequestBody, wireOrder: Iterable<string>, messages: unknown): OpenAIRequestBody {
+    const top = parsed as unknown as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of wireOrder) {
+        if (key === "messages") out[key] = messages;
+        else if (key in top) out[key] = top[key];
+    }
+    return out as unknown as OpenAIRequestBody;
+}
 
 export async function prepareOpenai(
     parsed: OpenAIRequestBody,
@@ -143,6 +175,7 @@ export async function prepareOpenai(
     // :coreToOpenai chain) — the shadow comparison target for serve-from-log.
     let legacyCoreElements: unknown = undefined;
     let egressBaseRows: EgressViewRow[] | null = null;
+    let egressBaseSeq = 0;
     let egressSwapApplied = false;
     let egressBootstrap = false;
     let egressArmed = false;
@@ -205,41 +238,25 @@ export async function prepareOpenai(
             wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
             log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
         }
-        // #7398 perf: the deferral gate skipped the full JSON.parse in handle.ts
-        // (150-600ms on a 155MiB resend). The lanes above only consumed the span
-        // scan + window fragments; a miss — or the gates staying closed — means
-        // the legacy path needs the whole conversation array, so parse it exactly
-        // once, here. A throw is equivalent to the legacy parse failure (same
-        // catch in handle.ts).
-        if (bodyParseDeferred && !wpOutcome?.hit && !Array.isArray(parsed.messages) && bodyText !== undefined) {
-            parsed = JSON.parse(bodyText) as OpenAIRequestBody;
-        }
-        if (wpOutcome.hit) {
-            wpHit = wpOutcome.hit;
-            // #6752: handle.ts already ran restoreOutputBudget on `parsed` —
-            // the rebind below re-parses scalar fields from the raw wire text,
-            // which would silently discard the restored budget (the log claims
-            // the restore while the wire still carries the client's shrunk
-            // value). Carry the restored budget across the rebind.
-            const budgetField = outputBudgetField(parsed);
-            const restoredBudget =
-                budgetField !== null
-                    ? readOutputBudget(parsed as Record<string, unknown>, budgetField)
-                    : undefined;
-            const fields: Record<string, unknown> = {};
-            for (const [key, span] of wpHit.fieldSpans) {
-                // "messages" keeps its WIRE POSITION (the scanner records it
-                // position-only); every other field is re-parsed from its own
-                // span so no bytes of the prefix are ever decoded.
-                if (key === "messages") fields[key] = wpHit.windowMessages;
-                else fields[key] = JSON.parse(bodyText.slice(span.start, span.end));
-            }
-            if (budgetField !== null && restoredBudget !== undefined) {
-                writeOutputBudget(fields, budgetField, restoredBudget);
-            }
-            parsed = fields as OpenAIRequestBody;
-            inboundMessageCount = wpHit.totalT;
-        }
+    }
+    // #7398 perf: the deferral gate in handle.ts skipped the full JSON.parse
+    // (150-600ms on a 155MiB resend), so `parsed` is still the span-scan
+    // synthesis — every top-level field decoded, the conversation array left
+    // as the null marker. Two ways to materialize it, both keeping every
+    // OTHER field exactly as it stands on `parsed` (see materializeDeferredBody):
+    //   hit   — the window view; no prefix byte is ever decoded;
+    //   else  — the gate stayed closed (non-plugin lane, title-gen, rollout
+    //           flag off) or the lanes missed: the legacy path needs the whole
+    //           array, parsed exactly once here. A throw equals the legacy
+    //           parse failure (same catch in handle.ts).
+    if (wpOutcome?.hit) {
+        wpHit = wpOutcome.hit;
+        parsed = materializeDeferredBody(parsed, wpHit.fieldSpans.keys(), wpHit.windowMessages);
+        inboundMessageCount = wpHit.totalT;
+    } else if (bodyParseDeferred && !Array.isArray(parsed.messages) && bodyText !== undefined) {
+        const full = JSON.parse(bodyText) as OpenAIRequestBody;
+        parsed = materializeDeferredBody(parsed, Object.keys(full), full.messages);
+        inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
     }
     // Full-body text for the whole-wire image accounting (window-only bodies
     // would under-count pre-existing images).
@@ -301,6 +318,13 @@ export async function prepareOpenai(
             incomingSeqs,
             incomingTailIds,
             pluginMode,
+            // Identity consolidation (discussions/7591): egress-on sessions
+            // carry no conversations row — the in-memory metadata field is
+            // the row's source of truth, use it instead of the store lookup.
+            // Predicate mirrors the row write verbatim (ingest.ts namespace =
+            // the pluginAgent when a non-empty string, else "proxy") so the
+            // two cannot drift apart.
+            convBound: session.metadata["egressAuthority"] === true ? (typeof session.metadata["pluginAgent"] === "string" && session.metadata["pluginAgent"] !== "") : undefined,
             wpHit,
             log,
         });
@@ -347,7 +371,7 @@ export async function prepareOpenai(
         // Bootstrap: an armed turn with an EMPTY flow is the turn-1 cold start
         // the ruling allows — the client bytes enter the flow exactly once
         // (the record below), from turn 2 the log is the content source.
-        egressArmed = featureEnabled("egressPlane") && pluginMode && !isTitleGen && s0.pinned !== null;
+        egressArmed = egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: isTitleGen });
         if (egressArmed) {
             // The single shared authority seam (egress-lane-io): latch,
             // recover, hard-fail, bootstrap / swap / legacy — one code path
@@ -357,8 +381,9 @@ export async function prepareOpenai(
             // array (egressRecordSource), diffed against auth.base.
             const st = getStore().egressOpLogStore();
             if (st) {
-                const auth = resolveEgressAuthority({ session, st, sessionId, core: msgs, log });
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: msgs, log, armed: true });
                 egressBaseRows = auth.base;
+                egressBaseSeq = auth.baseSeq;
                 egressBootstrap = auth.bootstrapping;
                 if (auth.swappedCore !== null) {
                     msgs = auth.swappedCore;
@@ -570,7 +595,7 @@ export async function prepareOpenai(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title) || isSubagentPrompt(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
@@ -592,7 +617,7 @@ export async function prepareOpenai(
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
-        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange);
+        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudgeForConfig(turn.nudge, loopConfig);
         // #3482 Step 2.5: the ONE nudge gate (lane-decisions). No compaction trigger
         // and no intercept health window on this wire — those differences are
         // explicit inputs on the responses lane. The standalone `shouldInject`
@@ -607,7 +632,7 @@ export async function prepareOpenai(
             breakerArmed: compressBreakerArmed(session),
             autoFoldEngaged: autoFoldEngaged(loopConfig, session),
             growthFoldingArmed: growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)),
-            modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
+            modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor, loopConfig.nudge.maxContextLimitPct)),
         });
         const caLine = recordNudgeObservation(sessionId, turn, tokenCount, config.modelContextLimit, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool));
         if (caLine) log("info", caLine);
@@ -685,6 +710,7 @@ export async function prepareOpenai(
                         store: st,
                         sessionId,
                         prev: egressBaseRows ?? undefined,
+                        baseSeq: egressBaseSeq,
                         conversation: egressMessages,
                         systemText: openaiOutboundSystem,
                         nowMs: Date.now(),
@@ -942,13 +968,18 @@ export async function prepareOpenai(
                     store: st,
                     sessionId,
                     prev: egressBaseRows ?? undefined,
+                    baseSeq: egressBaseSeq,
                     conversation: egressRecordSource ?? (processedMessages.length > 0 ? processedMessages : originalMessages),
                     systemText: openaiOutboundSystem ?? openaiSystemText,
                     nowMs: Date.now(),
                 });
             }
         } catch (err) {
-            log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
+            if (err instanceof EgressConcurrentWriteError) {
+                log("warn", `[${sessionId}] egress op-log recording skipped this turn (another request on this session recorded first): ${String(err)}`);
+            } else {
+                log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
+            }
         }
     }
     // #7398 seg 4a: SHADOW comparison — rebuild the outbound core portion

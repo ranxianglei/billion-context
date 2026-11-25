@@ -13,13 +13,13 @@ export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { withExitDeadline } from "./exit-deadline.js";
-import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
+import { effectivePromptCacheRouting, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
-import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { buildProxyFailureResponse, isExpectedFailFast, type SkippedProxyInfo } from "./upstream-fail.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
+import { subagentPromptTask } from "./session-title.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
 // (single source of truth shared with the omp/pi adapters): import from
 // "acp-kernel/wire" (kernel #215).
@@ -53,7 +53,7 @@ import { prepareOpenai } from "./server/prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./server/prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./server/prepare-responses.js";
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
-import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD } from "./msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER } from "./msgid-pin.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
@@ -796,9 +796,14 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // raw forward: the host must learn that the envelope is broken.
             // Both lanes rethrow FoundationRejectError into this funnel; it
             // throws before processTurn, so the session is untouched.
+            // #7574 item 5: the answer also carries x-bili-msgid-mode: full —
+            // the same contract as the msgid delta re-anchor 400 in handle.ts:
+            // a rejected identity envelope means "no pin this turn, resend in
+            // full form". Clients recover from the status alone today; the
+            // header keeps the two refusals one protocol.
             if (err instanceof FoundationRejectError) {
                 if (!res.headersSent) {
-                    res.writeHead(400, { "content-type": "application/json", "x-bili-snapshot": "identity" });
+                    res.writeHead(400, { "content-type": "application/json", "x-bili-snapshot": "identity", [MSGID_MODE_HEADER]: "full" });
                     res.end(JSON.stringify({ error: { message: err.message, type: "snapshot_identity_fault" } }));
                 } else {
                     res.end();
@@ -4572,7 +4577,15 @@ export async function preflightCompressIfNeeded(
             pendingRebuild = probe;
             const probeMsgs = probe.processedMessages.length > 0 ? probe.processedMessages : probe.originalMessages;
             const probeTextSize = estimateCoreMessages(probeMsgs) + overheadEstimate;
-            if (probeTextSize > session.stats.lastInputTokens) {
+            // #6865: never let the #5974 probe demote an active overflow-arm
+            // baseline — the arm is the evidence floor that keeps an armed
+            // session folding instead of trusting optimistic local estimates
+            // (same doctrine as the #5880 fix and relay.ts #2484
+            // armFailureShrink). Without this, the probe rewrites the armed
+            // tag to "estimate" before the #5880 guard reads it, re-opening
+            // the #5880 400-livelock on a different code path.
+            if (probeTextSize > session.stats.lastInputTokens
+                && session.stats.lastInputTokensSource !== "overflow-arm") {
                 session.stats.lastInputTokens = probeTextSize;
                 session.stats.lastInputTokensSource = "estimate";
             }
@@ -4657,7 +4670,15 @@ export async function preflightCompressIfNeeded(
         const rebuiltImageTokens = imageReserveFor(session, rebuilt.protocol, rebuilt.body, opts, upstreamUrl);
         remainingImageTokens = rebuiltImageTokens;
         reducedImageWire = result.compressedRanges > 0 && rebuiltImageTokens < imageTokens;
-        if (rebuiltTextSize > session.stats.lastInputTokens) {
+        // #6865: same guard as the #5974 probe above — the post-rebuild anchor
+        // must not demote an active overflow-arm either. The probe guard alone
+        // does not hold the arm through the turn: this anchor runs in the same
+        // preflight flow, on the same local estimate, and rewrites the armed
+        // tag to "estimate" before the #5880 guard reads it (same doctrine as
+        // relay.ts #2484 armFailureShrink — an upstream-proven ceiling must
+        // never be demoted by a local payload estimate).
+        if (rebuiltTextSize > session.stats.lastInputTokens
+            && session.stats.lastInputTokensSource !== "overflow-arm") {
             session.stats.lastInputTokens = rebuiltTextSize;
             session.stats.lastInputTokensSource = "estimate";
         }
@@ -5107,7 +5128,12 @@ export function isAutoInjectedNotification(text: string): boolean {
  *  Used so the web UI can show "Fix auth bug" instead of an opaque hash.
  *  Contextual fragments (#2118) and host-injected notifications (#2286) are
  *  skipped — if no real question has arrived yet, no title is set and
- *  derivation retries on later requests. */
+ *  derivation retries on later requests. Agent-spawned subagent sessions get
+ *  an identical machine-written dispatch prefix + the parent's task in ONE
+ *  first user message: the prefix is stripped and the task becomes the title
+ *  (a prefix-only prompt yields no title and derivation retries on later
+ *  requests); the web list additionally falls back to the first block topic
+ *  for old sessions that already persisted the boilerplate (#7590). */
 export function deriveTitle(messages: CoreMessage[]): string | undefined {
     for (const m of messages) {
         if (m.role !== "user" || m.contentType !== "text") continue;
@@ -5115,7 +5141,9 @@ export function deriveTitle(messages: CoreMessage[]): string | undefined {
         if (!raw.trim()) continue;
         if (isContextualUserFragment(raw)) continue;
         if (isAutoInjectedNotification(raw)) continue;
-        const clean = raw.replace(/\s+/g, " ").trim();
+        const task = subagentPromptTask(raw);
+        const clean = (task === undefined ? raw : task).replace(/\s+/g, " ").trim();
+        if (!clean) continue;
         return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
     }
     return undefined;
