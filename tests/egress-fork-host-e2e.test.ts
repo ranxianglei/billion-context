@@ -41,7 +41,17 @@ import { forkOrderHashOf, tryForkAdoption } from "../src/agent/fork-adopt.ts";
 
 const MODEL = "claude-test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-7658-fork-"));
-test.after(() => rmSync(testRoot, { recursive: true, force: true }));
+// Windows runner: a still-released-by-Defender/GC SQLite handle on this tree
+// makes a plain rmSync throw EPERM (observed CI flake, hookFailed). Bounded
+// retries, swallowed on persistent refusal — same pattern as issue3397.
+function rmBestEffort(p: string): void {
+    try {
+        rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {
+        /* leaked temp dir on a Windows runner is harmless */
+    }
+}
+test.after(() => rmBestEffort(testRoot));
 const SAVED_PLANE = process.env.BILI_ROLLOUT_EGRESS_PLANE;
 process.env.NODE_ENV = "test";
 process.env.BILI_STORAGE_UNIFIED = "full";
