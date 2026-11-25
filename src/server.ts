@@ -99,7 +99,7 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, isUpstreamTerminated, describeUpstreamTerminated, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
 import { configureLogRetention } from "./log-retention.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
@@ -839,6 +839,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
             // throttled [warn] at the throw site is the canonical record, so one dead
             // upstream stops re-emitting a per-request [error]+stack on every round.
+            else if (isUpstreamTerminated(err)) log("error", `${msg} — ${describeUpstreamTerminated(err)}`);
             else if (!isExpectedFailFast(err)) {
                 // #806: cap-include the stack on hard failures — the bare message
                 // gave no clue where the handler died (wedged-request forensics).
