@@ -310,7 +310,7 @@
 | `compress.protectedUserPatterns` | string[] | none | — | 用户文本消息的字面子串：命中即永不折叠，即使它不是最后一条 user 消息。用于长会话里 host 标记的当前任务 prompt。 |
 | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。 |
-| `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
+| `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "read_file", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | 减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。 |
 | `compress.visibilityMarkers` | boolean | true | — | 在 compress/decompress/search_context/acp_status 结果后追加可见性标记；关闭可抑制模型模仿叙述。 |
 | `compress.messageTimestamps` | boolean | true | BILI_MESSAGE_TIMESTAMPS | 为压缩消息记录附加不可变墙钟时间戳：线上 ACP 标签的 time="…" 属性、压缩回执指纹行的 [start – end] 覆盖跨度、渲染摘要的 Occurred 行。默认开启：每条消息首次出现时铸不可变戳、确定性渲染（历史重发字节稳定）；设为 false 可精确复现特性前（pre-#4313）的线上字节。 |
@@ -1580,7 +1580,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 #### `neverPreserveRecentTools`
 
 - **类型：** `string[]`（工具名模式）
-- **默认值：** 未设置 → 内置 `["decompress", "search_context", "read", "bash"]`（需 `acp-kernel` >= 0.0.92）
+- **默认值：** 未设置 → 内置 `["decompress", "search_context", "read", "read_file", "bash"]`（需 `acp-kernel` >= 0.0.92）
 - **状态：** ACTIVE
 - **说明：** 从软保护的最近区（`preserveRecentMessages`/`preserveRecentTokens`）中**排除**的工具名模式：匹配的工具结果在最近窗口内立即可压缩，不再等待超龄。内核默认让 `read`/`bash` 保持可压（它们是最大的可回收体量）—— 但正是这个默认值让批量读文件的工作流把刚读的文件立刻折掉，陷入「折叠→重读」死循环（#1198/#1277）。**推荐解法：只移除 `read`** —— `{ "compress": { "neverPreserveRecentTools": ["decompress", "search_context", "bash"] } }` —— 让新读的文件留在最近区，之后按位置超龄回归可压（不同于 `protectedLatestTools` 会把最新一次 read 永久钉住）。不需要逐字替换语义时优先用更简单的正向形式 `preserveRecentTools: ["read"]` —— 见下一节。请保留 `decompress`/`search_context` 在列表里：重新纳入它们会把刚恢复的大块内容钉死在最近区无法回收 —— 换一种病。**⚠ 空数组 `[]` 合法且表示什么都不排除**（最大保护逃生门）—— 与 `protectedTools`/`protectedLatestTools` 不同，空数组不会被拒绝；显式数组逐字替换默认列表，跨层级整体替换（最深层胜出）。
 

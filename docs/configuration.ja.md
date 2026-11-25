@@ -307,7 +307,7 @@
 | `compress.protectedUserPatterns` | string[] | none | — | ユーザー本文のリテラル部分文字列：一致したプロンプトは最新のユーザーメッセージでなくてもフォールドされない。長寿命セッションでホストが現在のタスクを示す用途。 |
 | `compress.protectedTools` | string[] | none | — | 全履歴に対するハード除外：リストされたツールの結果は決してフォールドされない。パスパターン（`skill/<name>`）は名前でスキルを選択する（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 最新の結果が古いものを上書きする累積スナップショット型ツールの最新インスタンスのみを保護する（例：todo リスト）。パスパターンはスキルごとに最新インスタンスを保持する（`skill/*`, #1947）。 |
-| `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 最近保護ゾーンから除外（即時圧縮可能）。空の配列は何も除外しない（最大保護）。 |
+| `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "read_file", "bash"] (kernel) | — | 最近保護ゾーンから除外（即時圧縮可能）。空の配列は何も除外しない（最大保護）。 |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | 減算形式：最近ゾーンツールからこのリストを引いたものが完全保護される。ここでの空の配列は誤記として拒否される。 |
 | `compress.visibilityMarkers` | boolean | true | — | `compress`/`decompress`/`search_context`/`acp_status` の結果後に可視性マーカーを追加。オフにすると模倣ナレーションが停止する。 |
 | `compress.messageTimestamps` | boolean | true | BILI_MESSAGE_TIMESTAMPS | 圧縮メッセージレコードに不変の壁時計タイムスタンプを付与：ワイヤー上の ACP タグに `time=`、`compress` 受領証に `[start – end]` カバレッジスパン、サマリーに `Occurred` 行。デフォルトで ON：各メッセージに1つの不変な初回表示スタンプが決定論的にレンダリングされるため、再レンダリングされた履歴はバイト安定性を保つ（有効化時の再起動によるプレフィックス書き換えを超えるプロンプトキャッシュコストなし）。`false` に設定すると、#4313 以前のバイトを正確に再現する。 |
@@ -1582,7 +1582,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 #### `neverPreserveRecentTools`
 
 - **型:** `string[]` (ツール名パターン)
-- **デフォルト:** 未設定 → カーネル組み込み `["decompress", "search_context", "read", "bash"]` (`acp-kernel` >= 0.0.92 が必要)
+- **デフォルト:** 未設定 → カーネル組み込み `["decompress", "search_context", "read", "read_file", "bash"]` (`acp-kernel` >= 0.0.92 が必要)
 - **ステータス:** ACTIVE
 - **説明:** ソフト保護された最近ゾーン（`preserveRecentMessages`/`preserveRecentTokens`）から**除外**されるツール名パターン：最近ウィンドウ内の一致するツール結果は、最初に老化するのではなく、すぐに圧縮可能になります。カーネルデフォルトは `read`/`bash` を圧縮可能に保ちます。それらが最大の回収可能マスであるため — しかし、同じデフォルトがバッチ読み取りワークフローで新しく読んだファイルをすぐに折りたたみ、フォールド→再読み取りデスループに陥る原因でもあります (#1198/#1277)。**推奨される対策: `read` のみを削除する** — `{ "compress": { "neverPreserveRecentTools": ["decompress", "search_context", "bash"] } }` — 新鮮な読み取り結果を最近ゾーンに保ち、後に位置によって老化させる（`protectedLatestTools` は最新の読み取りを永遠にピン留めするため、それとは異なる）。逐語置換セマンティクスを必要としない場合、よりシンプルな陽性形式 `preserveRecentTools: ["read"]` を優先してください — 次のセクションを参照。`decompress`/`search_context` はリストに保ってください：それらを再包含すると、ちょうど復元されたブロックを最近ゾーンにピン留めし、回収不能にする — 別の病です。**⚠ 空配列 `[]` は有効であり、何も除外しません**（最大保護のエスケープハッチ）— `protectedTools`/`protectedLatestTools` と異なり、空配列は拒否されません；明示的な配列はデフォルトを逐語で置き換え、最も深く定義されたレベルで配列全体の置換。
 

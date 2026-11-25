@@ -5506,7 +5506,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if (!isNaN(v) && v >= 0 && v !== SUMFLOOR_DEFAULT) d.compress.minSummaryLength = v;
             else { delete d.compress.minSummaryLength; sumfloor.value = String(SUMFLOOR_DEFAULT); }
         }));
-        const NEVER_DEFAULT = ["decompress", "search_context", "read", "bash"];
+        const NEVER_DEFAULT = ["decompress", "search_context", "read", "read_file", "bash"];
         const neInp = textRow("quick-never", t("cfg.q_never"), t("cfg.q_never_ph"));
         qCtrls.push(neInp);
         const neNote = document.createElement("div");
