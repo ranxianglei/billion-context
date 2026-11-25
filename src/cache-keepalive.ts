@@ -150,10 +150,24 @@ export function detectKeepaliveTier(body: unknown): "5m" | "1h" | undefined {
 
 /** Pure: the ping body — the snapshot with ONLY max_tokens and stream
  *  rewritten. Both fields sit after the cached prefix region on every
- *  Anthropic request shape, so the replayed prefix stays byte-identical. */
+ *  Anthropic request shape, so the replayed prefix stays byte-identical.
+ *
+ *  #7741: a budget-based thinking body (thinking.budget_tokens) is rejected
+ *  by strict upstreams when max_tokens <= budget_tokens ("max_completion_tokens
+ *  must be greater than thinking_budget"), so a hardcoded max_tokens=1 makes
+ *  every ping on a thinking model a guaranteed 400. Lift max_tokens to
+ *  budget_tokens + 1 — the minimum that satisfies the constraint. max_tokens
+ *  stays outside the cached prefix region, so the lift does not change the
+ *  cache key. Non-thinking bodies keep max_tokens = 1. */
 export function buildPingBody(snapshot: string): string {
     const obj = JSON.parse(snapshot) as Record<string, unknown>;
-    obj["max_tokens"] = 1;
+    const thinking = obj["thinking"];
+    let maxTokens = 1;
+    if (thinking && typeof thinking === "object" && !Array.isArray(thinking)) {
+        const budget = (thinking as Record<string, unknown>)["budget_tokens"];
+        if (typeof budget === "number" && Number.isFinite(budget)) maxTokens = Math.floor(budget) + 1;
+    }
+    obj["max_tokens"] = maxTokens;
     obj["stream"] = false;
     return JSON.stringify(obj);
 }
