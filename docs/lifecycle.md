@@ -39,6 +39,7 @@
 | `BILI_FAKE_COMPLETION_RETRIES` | fake-completion fallback | 假完成重试（opt-in，默认 0 = 禁用） | fallback 机制定型后转 §2 | opt-in |
 | `BILI_NO_CACHE_CONTROL` | compat | 历史 no-cache-control 怪癖保留（knobs.ts:458 明言 "Historical quirk preserved in the env"） | 兼容窗口结束后退役 | 默认 off |
 | `BILI_STREAM_ERROR_SHAPE` | compat | 给无法带内上报错误的 SDK 的流错误形状兼容 | 兼容保留（长期） | 常设兼容旋钮 |
+| `BILI_DEGENERATE_TURN` | #4913 compat | plugin chat 车道退化回合重试耗尽后的终局：`error` 默认（#870 带内报错）/ `passthrough`（pre-#870 放行空回合为正常完成） | 确认无人用 passthrough 后退役（与 BILI_STREAM_ERROR_SHAPE 同类） | 默认 error |
 | `BILI_SUBAGENT_SPLIT` | #970 | subagent 拆分（默认 on） | 成为既定行为后移 §2 | 默认 ON（`=0` 退出） |
 | `BILI_PERSONA_SPLIT` | Responses personaSplit | Responses 线路 instructions 指纹分叉（默认 on；`=0` / `personaSplit: false` 关闭，剥 `instructionsFingerprintKeyed`、保留 identity） | 成为既定行为后移 §2 | 默认 ON（`=0` 退出） |
 | `BILI_RESUME_INHERITANCE` | resume inheritance | resume 继承行为（默认 on） | 同上 | 默认 ON（`=0` 退出） |

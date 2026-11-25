@@ -23,9 +23,22 @@
  * row under the constant msgid "egress-system" (its byte stability is what
  * the cache anchor relies on, and a system change shows up as a +U on that
  * row — content identity is bytes, position/identity is the msgid).
+ *
+ * RENUMBER (2026-11-25, egress-plane.md §10): the row's canonical `num`
+ * (stored as log_seq) IS the kernel citation number — mNNNNN = m + num —
+ * stamped here from the session's refs ledger when the caller supplies it
+ * (`refMap`); the constant system row is number 0, outside the citation
+ * space, so it can never claim m00001 and every derived view (pin ledgers,
+ * the kstate overlay rebuild) inherits that exclusion for free. The first
+ * record pass of a session whose log is empty is the ARM-TIME BACKFILL: it
+ * sees the whole conversation and I's every pre-existing message with its
+ * existing number, so the op log becomes the complete history with no
+ * separate migration (a log that lost rows re-I's whatever the diff sees
+ * missing — the same mechanism self-heals a corrupted/truncated log).
  */
 
-import { diffEgressView, EgressStateCorruptError, type EgressOp, type EgressViewRow } from "./egress-state.js";
+import { diffEgressView, EgressStateCorruptError, EGRESS_SYSTEM_MSGID, type EgressOp, type EgressViewRow } from "./egress-state.js";
+import { buildEgressBlockSnapshots, diffBlockSet, serializeKstateResidual, type EgressBlockLedgerInput, type EgressBlockOp, type EgressBlockSnapshot } from "./egress-block.js";
 import { log as loggerLog } from "../logger.js";
 
 /** #6785 ruling 7439-5: a pinned (server-authoritative) session whose op-log
@@ -42,8 +55,31 @@ export class EgressAuthorityRejectError extends Error {
 }
 
 /** Constant msgid of the system block row (no hash — identity is the
- * role, not the content; a system change is a +U carrying the new bytes). */
-export const EGRESS_SYSTEM_MSGID = "egress-system";
+ * role, not the content; a system change is a +U carrying the new bytes).
+ * Defined in egress-state.js (the replay validation names it); re-exported
+ * here for the historical import path. */
+export { EGRESS_SYSTEM_MSGID } from "./egress-state.js";
+
+/** The session's kernel refs ledger (state.messageRefs.byRaw): rawId →
+ * "mNNNNN". Renumber (2026-11-25): the citation source for I-row numbering.
+ * Optional — a caller without it (tests, legacy legs) gets the dense
+ * high-water+1 numbering for uncited rows. */
+export interface EgressRefMap {
+    byRaw?: Record<string, string>;
+}
+
+/** The kernel citation number of a message id: from the refs ledger first,
+ * then a direct mNNNNN-shaped id (lanes that mint ids in kernel space). 0
+ * = no citation known (the dense fallback applies). */
+// Internal: the caller (buildEgressViewRows, below) is the only consumer — the gate
+// (scripts/check-unused-exports.mjs) rejects file-scope exports without one.
+function citationNumber(id: string, refMap: EgressRefMap | undefined): number {
+    const direct = /^m\d{4,}$/.test(id) ? id : undefined;
+    const ref = refMap?.byRaw?.[id] ?? direct;
+    if (ref === undefined || ref === "") return 0;
+    const n = Number(ref.slice(1));
+    return Number.isInteger(n) && n > 0 ? n : 0;
+}
 
 /** Minimal structural shape — accepts both BiliMessage (wire sidecar) and
  * bare kernel CoreMessage (the degraded-path originalMessages). Exported:
@@ -60,12 +96,14 @@ export interface EgressSourceMsg {
  * (byte-equal), which is what makes the next diff sparse. `tokens` is a
  * chars/4 estimate (it only needs to be stable while the content is
  * unchanged); `bytes` is the FINAL core JSON of the message — the same
- * bytes the serve path rebuilds from. `num` is left 0 (unnumbered): the
- * canonical number is assigned when the row's I op is appended/replayed
- * (ruling 7439) — an in-process row never carries a real number. */
+ * bytes the serve path rebuilds from. Renumber (2026-11-25): each row's
+ * `num` is its kernel citation number (from `refMap`; 0 = uncited → the
+ * append's dense fallback) — the system row is ALWAYS 0 (outside the
+ * citation space). */
 export function buildEgressViewRows(
     conversation: readonly EgressSourceMsg[],
     systemText: string | undefined,
+    refMap?: EgressRefMap,
 ): EgressViewRow[] {
     const rows: EgressViewRow[] = [];
     if (systemText !== undefined && systemText.length > 0) {
@@ -82,7 +120,7 @@ export function buildEgressViewRows(
     for (const m of conversation) {
         const text = typeof m.text === "string" ? m.text : "";
         rows.push({
-            num: 0,
+            num: citationNumber(m.id, refMap),
             msgid: m.id,
             ref: /^m\d{4,}$/.test(m.id) ? m.id : "",
             tokens: Math.max(1, Math.ceil(text.length / 4)),
@@ -110,11 +148,20 @@ export interface EgressOpLogStore {
     /** op_seq of the newest base row (0 = none). Optional: a store without
      *  it limits the recovery walk to the fixed distance below. */
     egressStateBaseSeq?(sessionId: string): number;
+    /** Renumber (2026-11-25): the client's raw system (A) from the latest
+     *  system row's sysIn (null = not egress-recorded / no A). Optional:
+     *  shims without it keep the legacy ext read. */
+    egressSystemInput?(sessionId: string): string | null;
     /** Recovery (ruling 7439-5): delete rows past `opSeq` in BOTH tables —
      *  rows beyond a corrupt point are unusable by definition (no replay can
      *  ever include them), so recovery = flow back to the last healthy point.
      *  Append-only covers HEALTHY history only. Returns rows removed. */
     egressStateTruncateAfter(sessionId: string, opSeq: number): number;
+    /** #7664 (PR-A): the block-lifecycle ledger (dual-clock tables). Optional
+     *  — a store without block tables (test shims) skips ledgering entirely;
+     *  the production UnifiedStore implements both. */
+    egressBlockView?(sessionId: string): Map<string, EgressBlockSnapshot>;
+    egressBlockAppendOps?(sessionId: string, ops: EgressBlockOp[], kstateJson: string | null, nowMs: number): number[];
 }
 
 /** Record this turn's outbound conversation view as sparse ops. `prev` is
@@ -143,8 +190,18 @@ export function recordEgressTurn(args: {
     conversation: readonly EgressSourceMsg[];
     systemText: string | undefined;
     nowMs: number;
+    /** Kernel messageRefs.byRaw (rawId → "mNNNNN"). Renumber (2026-11-25):
+     *  citation source for I-row numbers; optional — a caller without it
+     *  (tests, pre-arm legs) gets dense high-water+1 numbers for uncited
+     *  rows. */
+    refMap?: EgressRefMap;
+    /** #7664 (PR-A): when present (the egress-on latch is set), the
+     *  in-memory kernel block set is diffed into the block ledger AFTER the
+     *  flow append — the unified-leg recorder's twin, which egress-on
+     *  sessions never run (their unified ingest is frozen). */
+    blockLedger?: EgressBlockLedgerInput;
 }): EgressViewRow[] {
-    const { store, sessionId, conversation, systemText, nowMs } = args;
+    const { store, sessionId, conversation, systemText, nowMs, refMap } = args;
     let prev = args.prev;
     let baseSeq = args.baseSeq;
     if (prev === undefined) {
@@ -153,18 +210,62 @@ export function recordEgressTurn(args: {
         baseSeq = store.egressStateMaxSeq(sessionId);
         prev = store.egressStateView(sessionId);
     }
-    const next = buildEgressViewRows(conversation, systemText);
+    const next = buildEgressViewRows(conversation, systemText, refMap);
     const ops = diffEgressView(prev, next);
-    if (ops.length === 0) return prev;
-    // #7577 D3: stamp the first-observed wall clock on each I row BEFORE the
-    // append — writeOps persists op.ts into the I row's payload. A msgid is
-    // inserted exactly once (kernel ids are one-shot), so the I row IS the
-    // message's birth: ts is fixed at first observation and spine rows inherit
-    // it through the replay. This is what lets tsStamps be derived from a
-    // flow replay (keyed by the I row's msgid = the kernel raw id) instead of
-    // persisted as a kstate map.
-    for (const op of ops) if (op.type === "I" && op.ts === undefined) op.ts = nowMs;
-    return store.egressAppendTurn(sessionId, ops, baseSeq ?? store.egressStateMaxSeq(sessionId), nowMs);
+    let stamped: EgressViewRow[];
+    if (ops.length === 0) {
+        stamped = prev;
+    } else {
+        // #7577 D3: stamp the first-observed wall clock on each I row BEFORE the
+        // append — writeOps persists op.ts into the I row's payload. A msgid is
+        // inserted exactly once (kernel ids are one-shot), so the I row IS the
+        // message's birth: ts is fixed at first observation and spine rows inherit
+        // it through the replay. This is what lets tsStamps be derived from a
+        // flow replay (keyed by the I row's msgid = the kernel raw id) instead of
+        // persisted as a kstate map.
+        for (const op of ops) if (op.type === "I" && op.ts === undefined) op.ts = nowMs;
+        // Renumber (2026-11-25): the system row carries the client's raw
+        // system (A) alongside the assembled outbound (A+B, its `bytes`) —
+        // the incremental lane's sticky input stops living in the
+        // inc:system ext column for egress-on sessions.
+        if (systemText) for (const op of ops) if ((op.type === "I" || op.type === "U") && op.msgid === EGRESS_SYSTEM_MSGID) op.sysIn = systemText;
+        stamped = store.egressAppendTurn(sessionId, ops, baseSeq ?? store.egressStateMaxSeq(sessionId), nowMs);
+    }
+    if (args.blockLedger) ledgerEgressBlocks(store, sessionId, args.blockLedger, stamped, nowMs);
+    return stamped;
+}
+
+/** #7664 (PR-A): the egress-on twin of the unified-leg block recorder
+ *  (store.ts ingest, gate `metadata.egressAuthority`). Runs AFTER the flow
+ *  append (or on a zero-op turn — a block created out-of-band, e.g. by the
+ *  /tool compress endpoint, is picked up on the next successful pass). The
+ *  block tables number themselves (dual clocks) and their flow watermark is
+ *  read inside their own write transaction, so a row landed after a zero-op
+ *  turn points at the flow's current high water — consistent. Best-effort:
+ *  a failure must NOT fail the turn (the flow already advanced); it warns
+ *  and the next turn re-diffs from the stored state replica (the ledger
+ *  self-heals one turn late — same discipline as the message log's
+ *  corrupt-point self-heal). */
+function ledgerEgressBlocks(
+    store: EgressOpLogStore,
+    sessionId: string,
+    ledger: EgressBlockLedgerInput,
+    view: EgressViewRow[],
+    nowMs: number,
+): void {
+    if (typeof store.egressBlockView !== "function" || typeof store.egressBlockAppendOps !== "function") return;
+    try {
+        const current = buildEgressBlockSnapshots(ledger, view);
+        const prev = store.egressBlockView(sessionId);
+        const ops = diffBlockSet(prev, current);
+        if (ops.length === 0) return;
+        store.egressBlockAppendOps(sessionId, ops, serializeKstateResidual(ledger.state), nowMs);
+    } catch (err) {
+        loggerLog(
+            "warn",
+            `[storage] egress session=${sessionId}: block ledger not recorded this turn (self-heals next turn): ${String(err)}`,
+        );
+    }
 }
 
 
