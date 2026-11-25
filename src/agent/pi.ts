@@ -14,7 +14,8 @@ import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
 import { onNudgeInjected, type NudgeDebugEvent } from "../nudge-debug.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegState } from "./pi-subagent-registry.js";
-import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
+import { isModelApiUrl, nativeInterceptInstalled, outgoingHeadersOf } from "./native-intercept.js";
+import { bodyContentEncodingOf, encodeBodyBytes, restoredBodyText } from "./body-encoding.js";
 import { wirePiSubagents, piCommandsEnabled } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
 import { clearIncrementalProbe, createPrepareDirectSend, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
@@ -1069,17 +1070,43 @@ export function createOmpDirectSendGuard(): (url: string, input: string | URL | 
     return async (url, input, init) => {
         const prep = await shared(url, input, init);
         if (prep.outcome === "unrestorable") return prep;
-        let text: string | undefined = prep.outcome === "restored" ? prep.body : undefined;
-        if (text === undefined) {
+        // #7698: the wire body may be content-encoded (omp's Anthropic client
+        // sends the model body as a gzip Uint8Array). Decode it BEFORE stripping
+        // the stamped prompt_cache_key — a TextDecoder over the compressed bytes
+        // is garbage, so JSON.parse failed and the key survived into a strict
+        // upstream (400 "prompt_cache_key: Extra inputs are not permitted").
+        // `encodedWire` is set only when the body actually rode a content
+        // encoding, so the stripped body is re-encoded to the SAME coding (the
+        // content-encoding header stays valid — no request-shape change).
+        const encoding = bodyContentEncodingOf(outgoingHeadersOf(input, init));
+        let text: string | undefined;
+        let encodedWire: Uint8Array | undefined;
+        if (prep.outcome === "restored") {
+            if (typeof prep.body === "string") {
+                text = prep.body;
+            } else {
+                encodedWire = prep.body;
+                text = restoredBodyText(prep.body, encoding);
+            }
+        } else {
             try {
                 if (typeof init?.body === "string") text = init.body;
-                else if (input instanceof Request) text = await input.clone().text();
+                else if (init?.body instanceof Uint8Array) encodedWire = init.body;
+                else if (init?.body instanceof ArrayBuffer) encodedWire = new Uint8Array(init.body);
+                else if (input instanceof Request) encodedWire = new Uint8Array(await input.clone().arrayBuffer());
             } catch {
-                text = undefined; // unreadable body — send as the shared guard decided
+                encodedWire = undefined; // unreadable body — send as the shared guard decided
             }
+            if (encodedWire !== undefined) text = restoredBodyText(encodedWire, encoding);
         }
-        const cleaned = text === undefined ? undefined : withoutStampedPromptCacheKey(text);
-        return cleaned === undefined ? prep : { outcome: "restored", body: cleaned };
+        if (text === undefined) return prep;
+        const cleaned = withoutStampedPromptCacheKey(text);
+        if (cleaned === undefined) return prep;
+        if (encodedWire !== undefined && encoding !== undefined) {
+            const reencoded = encodeBodyBytes(new TextEncoder().encode(cleaned), encoding);
+            if (reencoded !== undefined) return { outcome: "restored", body: reencoded };
+        }
+        return { outcome: "restored", body: cleaned };
     };
 }
 

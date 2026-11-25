@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as zlib from "node:zlib";
 import { createOmpDirectSendGuard, stampPromptCacheKey } from "../src/agent/pi.ts";
 
 // The omp plugin stamps the session id as a top-level prompt_cache_key while a
@@ -63,4 +64,82 @@ test("direct send leaves a body without prompt_cache_key untouched", async () =>
 test("a non-JSON body stays as-is", async () => {
     const prep = await createOmpDirectSendGuard()(URL_MESSAGES, URL_MESSAGES, { method: "POST", body: "not json" });
     assert.equal(prep.outcome, "as-is");
+});
+
+// #7698: omp's Anthropic client sends the model body as a gzip-encoded
+// Uint8Array with content-encoding: gzip. The guard must DECODE the body before
+// stripping the stamped prompt_cache_key (a TextDecoder over the compressed
+// bytes is garbage, so JSON.parse failed and the key survived into a strict
+// upstream — 400 "prompt_cache_key: Extra inputs are not permitted"), then
+// re-encode the stripped body to the SAME coding so the content-encoding header
+// stays valid.
+
+function encodedBodyInit(body: Record<string, unknown>, encode: (b: Buffer) => Buffer, encoding: string): RequestInit {
+    const json = Buffer.from(JSON.stringify(body), "utf8");
+    return { method: "POST", headers: { "content-encoding": encoding, "content-type": "application/json" }, body: new Uint8Array(encode(json)) };
+}
+
+test("gzip body: the stamped prompt_cache_key is stripped and the body re-encoded to gzip", async () => {
+    const body = stampedBody("sess-gzip-1");
+    const init = encodedBodyInit(body, (b) => zlib.gzipSync(b), "gzip");
+    const prep = await createOmpDirectSendGuard()(URL_MESSAGES, URL_MESSAGES, init);
+    assert.equal(prep.outcome, "restored");
+    assert.ok(prep.body instanceof Uint8Array, "re-encoded body is a Uint8Array (gzip)");
+    const decoded = JSON.parse(zlib.gunzipSync(Buffer.from(prep.body)).toString("utf8")) as Record<string, unknown>;
+    assert.equal("prompt_cache_key" in decoded, false);
+    assert.deepEqual(decoded, { model: "m", max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
+});
+
+test("gzip body: a prompt_cache_key the plugin did not stamp is left as-is", async () => {
+    stampedBody("sess-gzip-2");
+    const own = { model: "m", messages: [{ role: "user", content: "hi" }], prompt_cache_key: "host-own-key" };
+    const init = encodedBodyInit(own, (b) => zlib.gzipSync(b), "gzip");
+    const prep = await createOmpDirectSendGuard()(URL_MESSAGES, URL_MESSAGES, init);
+    assert.equal(prep.outcome, "as-is");
+});
+
+test("deflate body: the stamped prompt_cache_key is stripped and the body re-encoded to deflate", async () => {
+    const body = stampedBody("sess-deflate-1");
+    const init = encodedBodyInit(body, (b) => zlib.deflateSync(b), "deflate");
+    const prep = await createOmpDirectSendGuard()(URL_MESSAGES, URL_MESSAGES, init);
+    assert.equal(prep.outcome, "restored");
+    assert.ok(prep.body instanceof Uint8Array, "re-encoded body is a Uint8Array (deflate)");
+    const decoded = JSON.parse(zlib.inflateSync(Buffer.from(prep.body)).toString("utf8")) as Record<string, unknown>;
+    assert.equal("prompt_cache_key" in decoded, false);
+    assert.deepEqual(decoded, { model: "m", max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
+});
+
+test("br body: the stamped prompt_cache_key is stripped and the body re-encoded to br", async () => {
+    const body = stampedBody("sess-br-1");
+    const init = encodedBodyInit(body, (b) => zlib.brotliCompressSync(b), "br");
+    const prep = await createOmpDirectSendGuard()(URL_MESSAGES, URL_MESSAGES, init);
+    assert.equal(prep.outcome, "restored");
+    assert.ok(prep.body instanceof Uint8Array, "re-encoded body is a Uint8Array (br)");
+    const decoded = JSON.parse(zlib.brotliDecompressSync(Buffer.from(prep.body)).toString("utf8")) as Record<string, unknown>;
+    assert.equal("prompt_cache_key" in decoded, false);
+    assert.deepEqual(decoded, { model: "m", max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
+});
+
+test("corrupt gzip body: the guard fails open (as-is, the key survives)", async () => {
+    const body = stampedBody("sess-gzip-corrupt");
+    const json = Buffer.from(JSON.stringify(body), "utf8");
+    // A valid gzip header followed by garbage — gunzipSync throws.
+    const corrupt = Buffer.concat([Buffer.from([0x1f, 0x8b, 0x08, 0x00]), Buffer.from("garbage-not-gzip")]);
+    void json;
+    const init: RequestInit = { method: "POST", headers: { "content-encoding": "gzip", "content-type": "application/json" }, body: new Uint8Array(corrupt) };
+    const prep = await createOmpDirectSendGuard()(URL_MESSAGES, URL_MESSAGES, init);
+    assert.equal(prep.outcome, "as-is", "undecodable body → fail open, the shared guard's verdict stands");
+});
+
+test("gzip body via a Request object: the stamped key is stripped", async () => {
+    const body = stampedBody("sess-gzip-req");
+    const json = Buffer.from(JSON.stringify(body), "utf8");
+    const gz = zlib.gzipSync(json);
+    const req = new Request(URL_MESSAGES, { method: "POST", headers: { "content-encoding": "gzip", "content-type": "application/json" }, body: gz });
+    const prep = await createOmpDirectSendGuard()(URL_MESSAGES, req, undefined);
+    assert.equal(prep.outcome, "restored");
+    assert.ok(prep.body instanceof Uint8Array, "re-encoded body is a Uint8Array (gzip)");
+    const decoded = JSON.parse(zlib.gunzipSync(Buffer.from(prep.body)).toString("utf8")) as Record<string, unknown>;
+    assert.equal("prompt_cache_key" in decoded, false);
+    assert.deepEqual(decoded, { model: "m", max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
 });
