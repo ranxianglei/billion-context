@@ -21,7 +21,7 @@ import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
 import { NUDGE_CREDIT_ROUNDS, unpromptedGateOf } from "./unprompted-gate.js";
-import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
+import { describeUncoveredRuns, formatProtectedMassCompact, PROTECTED_MASS_RENDER_FLOOR, shortTokenCount, uncoveredAudit } from "./uncovered.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -187,7 +187,7 @@ function normalizedSpecKey(ranges: ParsedRange[]): string {
         .sort()
         .join(",");
 }
-function recordCompressFailure(session: Session, key: string, repeatAdvice?: string): string {
+function recordCompressFailure(session: Session, key: string, repeatAdvice?: string, deterministic = true): string {
     if (!key) return "";
     const prev = session.metadata[FAIL_STREAK_KEY];
     const keys = Array.isArray(prev) ? prev.filter((k): k is string => typeof k === "string") : [];
@@ -198,6 +198,7 @@ function recordCompressFailure(session: Session, key: string, repeatAdvice?: str
     markDirty(session);
     if (occurrences < 2) return "";
     const advice = repeatAdvice ?? "Call acp_status and follow its current eligibility advice; continue the task if no eligible ranges remain.";
+    if (!deterministic) return ` [Repeat-failure guard: this spec has failed ${occurrences} time(s) in this session because external summarization failed. Changing ranges alone does not repair the summary service. ${advice}]`;
     return ` [Repeat-failure guard: you have now requested this exact spec ${occurrences} time(s) in this session and it keeps failing with the same error. Repeating it deterministically fails the same way until the visible context changes — do NOT re-issue it. ${advice}]`;
 }
 function clearCompressFailures(session: Session): void {
@@ -231,6 +232,14 @@ function compressFailOccurrencesOf(session: Session, key: string): number {
 const COMPRESS_LOOP_KEY = "compressFailStreak";
 const COMPRESS_LOOP_THRESHOLD = 3;
 const COMPRESS_LOOP_DECAY_MS = 10 * 60 * 1000;
+// #7300: a success only discharges the breaker when it is a SUBSTANTIAL fold.
+// The incident loop was "fail×N → trivial-success×1 → fail×N": each trivial
+// fold (86–290 tokens saved — a barely-over-minimum range) reset the streak,
+// so the 3-strike breaker never armed and the model burned tokens probing
+// forever. A fold below this threshold is still the model probing, not
+// "compression is working" — it must not reset the strikes. Hardcoded by
+// design (config-surface discipline, same as COMPRESS_LOOP_THRESHOLD above).
+const COMPRESS_LOOP_DISCHARGE_MIN_TOKENS = 500;
 
 type CompressLoopStreak = { n: number; lastAt: number; cause?: string };
 
@@ -263,12 +272,13 @@ function loopNoisePauseParagraph(n: number): string {
 // #2432: substrate-destruction is NOT loop noise. When the fold substrate was
 // destroyed by an out-of-band history rewrite, blind stopping leaves the model
 // in a room with no exit — the ONLY recovery is one acp_status plus a
-// live-range re-anchor, and one success clears the breaker. The blanket "do
+// live-range re-anchor, and one substantial success clears the breaker
+// (#7300: a trivial fold does not discharge the streak). The blanket "do
 // not poll acp_status" order above is right for noise and wrong for this
 // cause, so the armed receipt branches on compressFailureCause (#2360 §2.4
 // already computes it at the same sites).
 function substrateDestructionPauseParagraph(n: number): string {
-    return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session — every attempt has failed because the fold substrate was destroyed by an out-of-band history rewrite. STOP calling compress now: do not try other ranges and do not re-issue any previous ones. There is exactly ONE recovery step: run acp_status once, then compress ONLY a range it currently reports as compressible — one success clears this breaker. If acp_status reports no compressible ranges, continue your task without compressing.]`;
+    return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session — every attempt has failed because the fold substrate was destroyed by an out-of-band history rewrite. STOP calling compress now: do not try other ranges and do not re-issue any previous ones. There is exactly ONE recovery step: run acp_status once, then compress ONLY a range it currently reports as compressible — one substantial success clears this breaker (a trivial fold that saves almost nothing does not count). If acp_status reports no compressible ranges, continue your task without compressing.]`;
 }
 
 // #4812: short refusal for parse-failure receipts once the breaker has climbed
@@ -287,7 +297,7 @@ function substrateDestructionPauseParagraph(n: number): string {
 // recovery step — acp_status once, then ONE live range — still goes through
 // and can clear the breaker.
 function armedRefusalReceipt(n: number, decayMinutes: number): string {
-    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' is ONE string holding every range — each block starts with its 'mNNNNN–mNNNNN optional topic' header line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects as that string also works), using refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
+    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' is ONE string holding every range — each block starts with its 'mNNNNN–mNNNNN optional topic' header line followed by its summary markdown, using refs from your visible history. The breaker disarms on one substantial fold (a trivial one that saves almost nothing does not count) or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
 }
 
 // #5986 review fix: the observed failure mode after a compress rejection is the
@@ -300,14 +310,18 @@ const RETURN_TO_TASK_SUFFIX = " This failure only concerns the compress call. Re
 /** #2146: record one total compress failure (any spec) and return "" while
  *  healthy, or the pause paragraph to embed in the receipt once the
  *  consecutive-failure threshold is reached. Only failed-call receipts carry
- *  it: successful calls always go through, and one success clears the streak
- *  (clearCompressLoopStreak). The pause paragraph branches on the failure
- *  cause (#2432): substrate-destruction gets the single-recovery-step
- *  wording, everything else keeps the verbatim loop-noise paragraph. */
+ *  it: successful calls always go through, and one SUBSTANTIAL success clears
+ *  the streak (clearCompressLoopStreak — #7300: a trivial fold below
+ *  COMPRESS_LOOP_DISCHARGE_MIN_TOKENS does not, so the "fail×N → trivial
+ *  success×1 → fail×N" loop can still arm the breaker). The pause paragraph
+ *  branches on the failure cause (#2432): substrate-destruction gets the
+ *  single-recovery-step wording, everything else keeps the verbatim loop-noise
+ *  paragraph. */
 function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: string, forcedCause?: string): string {
     const now = Date.now();
     let streak = readCompressLoopStreak(ctx.session);
     if (streak && now - streak.lastAt > COMPRESS_LOOP_DECAY_MS) streak = undefined;
+    if (streak && (streak.cause === "external-summary") !== (forcedCause === "external-summary")) streak = undefined;
     const n = (streak?.n ?? 0) + 1;
     // #2432: persist the failure cause on the streak so surfaces OUTSIDE the
     // receipt (acp_status) can react to a substrate/stale-ref verdict at n=1
@@ -322,17 +336,26 @@ function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: stri
     if (n < COMPRESS_LOOP_THRESHOLD) return "";
     const label = specLabel || "unparseable call";
     if (n === COMPRESS_LOOP_THRESHOLD) {
-        ctx.log(`[warn: compress-loop] circuit breaker armed after ${n} consecutive compress failures (last spec: ${label}) — receipts now demand a full stop; disarms on success or ${COMPRESS_LOOP_DECAY_MS / 60000} min quiet`);
+        ctx.log(`[warn: compress-loop] circuit breaker armed after ${n} consecutive compress failures (last spec: ${label}) — receipts now demand a full stop; disarms on a substantial fold (≥${COMPRESS_LOOP_DISCHARGE_MIN_TOKENS} tok) or ${COMPRESS_LOOP_DECAY_MS / 60000} min quiet`);
     } else {
         ctx.log(`[warn: compress-loop] failure ${n} in armed streak (last spec: ${label})`);
     }
+    if (freshCause === "external-summary") return externalSummaryPauseParagraph(n);
     if (freshCause.startsWith("substrate-destruction")) {
         return substrateDestructionPauseParagraph(n);
     }
     return loopNoisePauseParagraph(n);
 }
 
-function clearCompressLoopStreak(session: Session): void {
+/** #7300: discharge the breaker streak on a SUBSTANTIAL fold only. A trivial
+ *  success (tokensCompressed < COMPRESS_LOOP_DISCHARGE_MIN_TOKENS) is the
+ *  model still probing (a barely-over-minimum range), not "compression is
+ *  working" — it must not reset the strikes, or the "fail×N → trivial
+ *  success×1 → fail×N" loop never arms the breaker. A substantial fold means
+ *  the model found a range that genuinely shrank the context, so the loop is
+ *  over and the strikes reset. */
+function clearCompressLoopStreak(session: Session, tokensCompressed: number): void {
+    if (tokensCompressed < COMPRESS_LOOP_DISCHARGE_MIN_TOKENS) return;
     if (readCompressLoopStreak(session)) writeCompressLoopStreak(session, undefined);
 }
 
@@ -346,6 +369,39 @@ export function compressBreakerDetail(session: Session): { n: number; threshold:
     if (!s || s.n < COMPRESS_LOOP_THRESHOLD) return undefined;
     if (Date.now() - s.lastAt > COMPRESS_LOOP_DECAY_MS) return undefined;
     return { n: s.n, threshold: COMPRESS_LOOP_THRESHOLD, decayMinutes: Math.round(COMPRESS_LOOP_DECAY_MS / 60000), ...(s.cause !== undefined ? { cause: s.cause } : {}) };
+}
+
+function externalSummaryPauseParagraph(n: number): string {
+    return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session. External summary requests are paused; changing ranges does not repair a failed summary service. Continue the task without compressing. Requests may resume after the external summary configuration or resolved credentials change, or after 10 minutes of cooldown. One successful fold clears the failure streak.]`;
+}
+
+export function externalSummaryBreakerRefusal(ctx: RewriteCtx, planFingerprint: string, ranges: readonly { summaryMaxChars?: number }[] = []): string {
+    const caps = [...new Set(ranges.map((range) => Math.min(range.summaryMaxChars ?? Infinity, ctx.config.compress.maxSummaryLength)))].sort((a, b) => a - b);
+    const fingerprint = createHash("sha256").update(JSON.stringify([
+        planFingerprint, ctx.config.compress.minSummaryLength, ctx.config.compress.maxSummaryLength, caps,
+    ])).digest("hex");
+    const key = "externalSummaryConfigHash";
+    const previous = ctx.session.metadata[key];
+    const streak = readCompressLoopStreak(ctx.session);
+    if (streak?.cause === "external-summary" && ((typeof previous === "string" && previous !== fingerprint) || Date.now() - streak.lastAt > COMPRESS_LOOP_DECAY_MS)) {
+        clearCompressFailures(ctx.session);
+        // #7300 reworked clearCompressLoopStreak into a success gate with a
+        // substantial-fold guard; a config repair is not a compression success,
+        // so erase the streak directly (original #6905 repair semantics).
+        clearCompressFailures(ctx.session);
+        writeCompressLoopStreak(ctx.session, undefined);
+    }
+    if (previous !== fingerprint) {
+        ctx.session.metadata[key] = fingerprint;
+        markDirty(ctx.session);
+    }
+    const detail = compressBreakerDetail(ctx.session);
+    return detail?.cause === "external-summary" ? externalSummaryPauseParagraph(detail.n) : "";
+}
+
+export function recordExternalSummaryFailure(ctx: RewriteCtx, ranges: ParsedRange[], advice: string): string {
+    const key = normalizedSpecKey(ranges);
+    return recordCompressFailure(ctx.session, key, advice, false) + noteCompressLoopFailure(ctx, key, undefined, "external-summary");
 }
 
 export function compressBreakerArmed(session: Session): boolean {
@@ -553,7 +609,15 @@ function currentRefsSnapshot(ctx: RewriteCtx): string {
     }
     if (!loId || !hiId) return "";
     const activeBlocks = ctx.session.state.blocks.filter((b) => b.active).length;
-    return ` [Context snapshot at the moment of THIS receipt — point-in-time only: refs are minted continuously, so every earlier copy of this line in the transcript is stale, and the newest copy is the current frontier. ${ctx.messages.length} visible message(s), refs ${loId}–${hiId}, ${activeBlocks} active block(s). Refs restart at m00001 after a session-generation change — request only refs inside the newest such snapshot, or call acp_status for exact compressible ranges.]`;
+    // 2026-11-24 (session 01a2076a, qwen3.8-27b): the previous wording put the
+    // visible count BEFORE the span ("134 visible message(s), refs m00001–
+    // m01643") and a weak model read it as "134 messages BEYOND m01643" — it
+    // then aimed compress calls at m01643+134=m01777 and other phantom
+    // endpoints (six over-shoots in one session, each clamped). The count is a
+    // SUBSET of the span: state the span + "nothing above hiId exists" FIRST,
+    // then the visible count as an explicit subset — the two numbers must
+    // never read as adjacent ranges.
+    return ` [Context snapshot at the moment of THIS receipt — point-in-time only: refs are minted continuously, so every earlier copy of this line in the transcript is stale, and the newest copy is the current frontier. Refs minted so far: ${loId}–${hiId}; the newest message is ${hiId} — refs are minted in order and never pre-allocated, so NOTHING numbered above ${hiId} exists. Currently visible: ${ctx.messages.length} message(s)${activeBlocks > 0 ? ` and ${activeBlocks} active block(s) (their folded refs sit inside the same range)` : ""} — every visible ref is a SUBSET of ${loId}–${hiId}, not a tail beyond it. Refs restart at m00001 after a session-generation change — request only refs inside the newest such snapshot, or call acp_status for exact compressible ranges.]`;
 }
 
 // #1294 P1: one-line integrity fingerprint per created/updated block — exact
@@ -766,7 +830,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     // verbatim contract string (#1387) stays intact for genuinely-drained
     // sessions. Advisory only: audit failure degrades to the old wording path.
     try {
-        const runs = uncoveredHistoryRuns({
+        const audit = uncoveredAudit({
             core: ctx.core,
             messages: ctx.messages,
             state: ctx.session.state,
@@ -776,6 +840,13 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
             applyView: ctx.compressMessages,
             actionableSpans: remaining,
         });
+        const runs = audit.runs;
+        // #7463: the meter bills protected mass that no offer carries and no
+        // model surface names by default — the bili log is its attribution
+        // surface (offline diagnosis); one line per qualifying fold, tee'd.
+        if (audit.mass.hardTokens + audit.mass.zoneTokens >= PROTECTED_MASS_RENDER_FLOOR) {
+            ctx.log(`[acp-compress-obs] protected mass (metered, in no compress offer): hard ${audit.mass.hardTokens} tok (${audit.mass.hardCount} msg) + zone ${audit.mass.zoneTokens} tok (${audit.mass.zoneCount} msg) — top: ${audit.mass.topCarriers.length > 0 ? audit.mass.topCarriers.map((c) => `${c.label} ~${c.tokens}`).join(", ") : "none"}`);
+        }
         if (runs.length > 0) {
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
             const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
@@ -799,7 +870,13 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
                 // resets the latch (in-memory field) — at most one extra note.
                 if (!ctx.session.uncoveredReceiptNoted) {
                     ctx.session.uncoveredReceiptNoted = true;
-                    return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+                    // #7463: name the protected mass in the same note — before
+                    // this, the meter-vs-offer gap (usage bills it, no offer
+                    // carries it, no surface names it) was unexplainable from
+                    // the model's side after a drained-fold receipt. Rides the
+                    // same #6522 latch: at most one note per nudge cycle.
+                    const protectedNote = formatProtectedMassCompact(audit.mass);
+                    return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions);${protectedNote} inspect with acp_status(scope:"uncompressed").`;
                 }
                 // Latch already fired this cycle but material mass still sits
                 // uncovered (totalTok >= floor): stay silent, do NOT fall
@@ -1261,7 +1338,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             if (lostArmed !== undefined && lostArmed.n > COMPRESS_LOOP_THRESHOLD) {
                 return compressResult(armedRefusalReceipt(lostArmed.n, lostArmed.decayMinutes), "refused", 0, `parse:${diagnostics.kind}:lost-in-transit`);
             }
-            return compressResult(`[Compression FAILED: ARGUMENTS LOST IN TRANSIT — the upstream ${cutStream.protocol} stream carrying this call was cut before its terminal event (${cutStream.cause}), so the compress arguments never arrived. The call reached the proxy EMPTY through no fault of yours; nothing was compressed and this is NOT an empty-intent call. RE-ISSUE the compress call with the content you intended: ONE 'content' STRING holding every range, each block starting with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown (a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string).${lostLoopGuard}]`, "refused", 0, `parse:${diagnostics.kind}:lost-in-transit`);
+            return compressResult(`[Compression FAILED: ARGUMENTS LOST IN TRANSIT — the upstream ${cutStream.protocol} stream carrying this call was cut before its terminal event (${cutStream.cause}), so the compress arguments never arrived. The call reached the proxy EMPTY through no fault of yours; nothing was compressed and this is NOT an empty-intent call. RE-ISSUE the compress call with the content you intended: ONE 'content' STRING holding every range, each block starting with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown.${lostLoopGuard}]`, "refused", 0, `parse:${diagnostics.kind}:lost-in-transit`);
         }
         const parseKey = `parse:${diagnostics.kind}:${diagnostics.invalidItems}:${rawReasons.slice(0, 3).join("|")}`;
         const guard = recordCompressFailure(
@@ -1300,7 +1377,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return compressResult(`[Compression FAILED again — this exact call has now failed ${occurrences} time(s) the same way (kind=${diagnostics.kind}); nothing was compressed. The full format guide and eligible ranges are in the FIRST failed receipt above — do not re-send this call verbatim.${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (isEmptyCall) {
-            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put content as ONE non-empty string in that SAME single call — each block headed by a 'mNNNNN–mNNNNN optional topic' line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string).${guard}${loopGuard}${RETURN_TO_TASK_SUFFIX}]`, "refused", 0, `parse:${diagnostics.kind}`);
+            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put content as ONE non-empty string in that SAME single call — each block headed by a 'mNNNNN–mNNNNN optional topic' line followed by its summary markdown.${guard}${loopGuard}${RETURN_TO_TASK_SUFFIX}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (argCorruption) {
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
@@ -1309,14 +1386,16 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const recovery = loopGuard === "" ? compressionRecovery(ctx) : { hint: "", canRetry: false };
         const retry = recovery.canRetry ? " Re-issue the compress call using those eligible refs." : "";
         // #4252 hole-closure receipt: the shape that most often lands here is a
-        // range OBJECT encoded INSIDE the content string (the parameter's own
-        // description invites a JSON string; after #4252 removed the legal
-        // array, models encode the old object as a string). Point the retry at
-        // the exact repair instead of a generic re-parse.
+        // range OBJECT encoded INSIDE the content string (muscle memory from
+        // the pre-2026-11-23 parameter descriptions, which advertised a JSON
+        // string; the JSON-array invitation was removed on 2026-11-23 after a
+        // weak model digested the dual formats and stopped emitting compress,
+        // session 01a2040e). Point the retry at line form only — never
+        // advertise the JSON fallback back.
         const notArrayHint = diagnostics.kind === "content-not-array"
-            ? " If your 'content' string encoded a single JSON object, wrap it in square brackets so it encodes an ARRAY of entries (\"[...]\"), or use the line-form headers below."
+            ? " Your 'content' was not plain line-form text: do not JSON-encode anything — each range starts with a header line 'mNNNNN–mNNNNN optional topic' and its summary markdown on the following lines."
             : "";
-        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}${notArrayHint} compress takes ONE 'content' STRING holding every range: each block starts with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown; a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string. startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard}${RETURN_TO_TASK_SUFFIX}]`, "refused", 0, `parse:${diagnostics.kind}`);
+        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}${notArrayHint} compress takes ONE 'content' STRING holding every range: each block starts with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown. startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard}${RETURN_TO_TASK_SUFFIX}]`, "refused", 0, `parse:${diagnostics.kind}`);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).
@@ -1353,20 +1432,26 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (offending.length > 0) {
             const listed = offending.slice(0, 3).join(", ") + (offending.length > 3 ? ` (+${offending.length - 3} more)` : "");
             ctx.log(`[acp-proxy: refused out-of-recommendation compress — span(s) ${listed} outside the current recommendation set (compress.requireRecommendation)]`);
-            // #6728: charge the ledger (see the nudge gate above). The
-            // spec-repeat guard text recordCompressFailure returns is dropped
-            // on purpose (one counter, stated once — the collapse below says
-            // it); only the ledger charge matters here.
+            // #6728: charge the SPEC-REPEAT ledger (recordCompressFailure) so
+            // the repeat-collapse below fires on identical re-submission.
+            // #7197: do NOT charge the session-level breaker
+            // (noteCompressLoopFailure) — the scope gate is a range-correctness
+            // gate ("your span was wrong"), not a fold-feasibility signal; its
+            // recovery (acp_status → an in-recommendation retry) is always
+            // available and succeeds if followed, so arming the breaker (which
+            // orders "do not try other ranges … do not poll acp_status") would
+            // forbid the only recovery the code still allows. The nudge gate
+            // above keeps the breaker charge (its recovery is "wait for a
+            // nudge" — the model cannot self-recover).
             const specKey = normalizedSpecKey(ranges);
             recordCompressFailure(ctx.session, specKey);
-            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey) : "";
             const occurrences = compressFailOccurrencesOf(ctx.session, specKey);
             if (trackLoop && occurrences >= 2) {
                 ctx.log(
                     `[acp-proxy: out-of-recommendation receipt collapsed to one-liner (attempt ${occurrences})]`,
                 );
                 return compressResult(
-                    `[Compression REFUSED again — span(s) ${listed} have now been refused ${occurrences} time(s) the same way (compress.requireRecommendation); nothing was compressed. The full refusal and the current compressible ranges are in the FIRST refused receipt above — do not re-send this call verbatim.${loopGuard}]`,
+                    `[Compression REFUSED again — span(s) ${listed} have now been refused ${occurrences} time(s) the same way (compress.requireRecommendation); nothing was compressed. The full refusal and the current compressible ranges are in the FIRST refused receipt above — do not re-send this call verbatim.`,
                     "refused",
                     0,
                     "out-of-recommendation",
@@ -1382,7 +1467,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const advice = recommendedEmpty
                 ? " No compressible ranges remain — the context is already at its minimum; continue the task without compressing. Compression happens again only when there is genuinely new content to fold."
                 : " Call acp_status for the current compressible ranges and stay within them: subdividing a listed span into smaller chunks is fine, and re-folding an already-compressed block to update its summary is fine.";
-            return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding.${advice}${loopGuard}]`, "refused", 0, "out-of-recommendation");
+            return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding.${advice}]`, "refused", 0, "out-of-recommendation");
         }
     }
     if (ctx.messages.length > 0) {
@@ -1679,7 +1764,18 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // its time-attribute mark raise) on a call that folded nothing.
         ctx.session.pendingLedgerAlign = true;
         clearCompressFailures(ctx.session);
-        clearCompressLoopStreak(ctx.session);
+        // #7300: only a SUBSTANTIAL fold discharges the breaker. r.tokensCompressed
+        // is the TOTAL folded mass (kernel sums the folded message tokens and
+        // never subtracts the new summary), so a barely-over-minimum range reads
+        // ~1250 even when the NET saving is 86–290 tokens — the incident's
+        // trivial folds. Use the NET saving (folded mass minus the new summary
+        // mass of the block(s) this fold created/updated): a trivial fold is the
+        // model still probing and must not reset the strikes.
+        const newSummaryTokens = res.state.blocks
+            .filter((b) => !beforeIds.has(b.blockId) || beforeSummaries.get(b.blockId) !== b.summary)
+            .reduce((n, b) => n + defaultCountTokens(b.summary), 0);
+        const netSaved = Math.max(0, r.tokensCompressed - newSummaryTokens);
+        clearCompressLoopStreak(ctx.session, netSaved);
 
         // #189 observability: record the rewrite magnitude + fold point so a
         // downstream transient rejection (GLM 3007) can be correlated with it.
