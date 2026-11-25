@@ -987,6 +987,15 @@ type ToolsOwner = {
     definitions: Map<string, ToolDefinition>;
 };
 let toolsOwner: ToolsOwner | undefined;
+// #7705: DSH's ToolsService.get(name) is an uncached full view() scan and the
+// host emits tools/change on EVERY MCP tool registration during cold boot, so
+// restoring synchronously on each event was an O(N_mcp × 2 × N_bili) CPU spike
+// (12.3s of a 30.9s portToWindow slice). Coalesce the burst on a fixed window:
+// the timer is armed once and never reset by later events, so a sustained
+// startup burst cannot starve restoration (restoreTools runs at most once per
+// window) while the explicit registerTools() path stays synchronous.
+const TOOLS_CHANGE_COALESCE_MS = 50;
+let restoreTimer: NodeJS.Timeout | undefined;
 
 function toolsAreReady(): boolean {
     const owner = toolsOwner;
@@ -1003,6 +1012,12 @@ function restoreTools(owner: ToolsOwner): void {
     register.toolsReady = false;
     try {
         let adopted = 0;
+        // #7705: true once a definition actually went through ctx.tools.register
+        // (was NOT already visible). When it stays false, every definition was
+        // confirmed present in this same synchronous pass, so the post-loop
+        // toolsAreReady() re-scan (a second full ctx.tools.get sweep) is
+        // redundant and skipped.
+        let registeredAny = false;
         for (const [name, definition] of owner.definitions) {
             if (owner.ctx.tools.get?.(name) !== undefined) {
                 adopted++;
@@ -1015,6 +1030,7 @@ function restoreTools(owner: ToolsOwner): void {
                 // activation restore (#6702). Proxy death runs no effect — the
                 // registration survives it (#3380).
                 owner.ctx.tools.register(definition);
+                registeredAny = true;
             } catch (err) {
                 if (!errMessage(err).includes("already registered")) throw err;
                 adopted++;
@@ -1025,15 +1041,51 @@ function restoreTools(owner: ToolsOwner): void {
             persistClientEvent(`tool registration adopted ${adopted} pre-existing registration(s) from this process — continuing`);
         }
         register.toolsReady = owner.definitions.size > 0;
-        if (!toolsAreReady()) throw new Error("bili: tool registrations did not become visible");
+        // #7705: skip the post-loop toolsAreReady() re-scan only when nothing
+        // was registered AND the manifest is non-empty — every definition was
+        // then confirmed visible in this same synchronous pass, so a second
+        // full ctx.tools.get sweep is redundant. When a registration actually
+        // happened the host may attach it to the fiber asynchronously (and an
+        // empty manifest keeps the pre-fix throw), so the re-scan stays intact.
+        if (registeredAny || owner.definitions.size === 0) {
+            if (!toolsAreReady()) throw new Error("bili: tool registrations did not become visible");
+        }
     } finally {
         owner.restoring = false;
+    }
+}
+
+// #7705: fixed-window coalescing for the tools/change burst. scheduleRestoreTools
+// arms the timer once (later events in the same window are no-ops); clearRestoreTimer
+// drops a pending window on teardown / owner replacement / test reset.
+function scheduleRestoreTools(owner: ToolsOwner): void {
+    if (restoreTimer !== undefined) return;
+    restoreTimer = setTimeout(() => {
+        restoreTimer = undefined;
+        try {
+            restoreTools(owner);
+        } catch (err) {
+            register.toolsReady = false;
+            register.lastRegistrationError = errMessage(err);
+            armRecoveryTimer();
+        }
+    }, TOOLS_CHANGE_COALESCE_MS);
+    restoreTimer.unref?.();
+}
+
+function clearRestoreTimer(): void {
+    if (restoreTimer !== undefined) {
+        clearTimeout(restoreTimer);
+        restoreTimer = undefined;
     }
 }
 
 function beginToolsOwner(ctx: PluginContext): ToolsOwner {
     if (ctx.effect === undefined && toolsOwner?.ctx === ctx && !toolsOwner.closed) return toolsOwner;
     if (toolsOwner !== undefined) toolsOwner.closed = true;
+    // #7705: a stale coalescing timer captured the previous owner — drop it so
+    // the new activation's first tools/change arms a fresh window.
+    clearRestoreTimer();
     const owner: ToolsOwner = { ctx, closed: false, restoring: false, definitions: new Map() };
     toolsOwner = owner;
     register.toolsReady = false;
@@ -1044,6 +1096,9 @@ function beginToolsOwner(ctx: PluginContext): ToolsOwner {
         if (toolsOwner === owner) {
             register.toolsReady = false;
             register.pending = undefined;
+            // #7705: the owner is gone — a pending coalescing restore would only
+            // early-return, so clear it to keep the event loop quiet.
+            clearRestoreTimer();
         }
     }, "bili: tool registration lifetime");
     ctx.on?.("tools/change", () => {
@@ -1055,13 +1110,9 @@ function beginToolsOwner(ctx: PluginContext): ToolsOwner {
         // releasing. Hosts without a fiber expose no state and keep restoring.
         const fiberState = (owner.ctx as { fiber?: { state?: number } }).fiber?.state;
         if (fiberState !== undefined && fiberState !== 1 && fiberState !== 2) return;
-        try {
-            restoreTools(owner);
-        } catch (err) {
-            register.toolsReady = false;
-            register.lastRegistrationError = errMessage(err);
-            armRecoveryTimer();
-        }
+        // #7705: coalesce the burst — a fixed-window timer (armed once, never
+        // reset) bounds the restore to one per window instead of one per event.
+        scheduleRestoreTools(owner);
     });
     return owner;
 }
@@ -3183,6 +3234,9 @@ export function _resetRegisterForTest(base: string | undefined, toolsReady = fal
     activeCtx = undefined;
     if (toolsOwner !== undefined) toolsOwner.closed = true;
     toolsOwner = undefined;
+    // #7705: drop a pending coalescing restore so a stale window from an earlier
+    // scenario cannot fire into this one.
+    clearRestoreTimer();
     // #2187: apply() now reaches the respawn arming on every plan, so a stale
     // single-flight wrapper (capturing a previous test's spawn stub) must not
     // survive a reset.
