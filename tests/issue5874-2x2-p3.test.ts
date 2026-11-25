@@ -490,30 +490,50 @@ test("M3.1: the latch roster lists the stuck sids and the clear PERSISTS (surviv
 // hashed probe). For a conversation-bound session the raw id ≠ the ledger
 // sid, so without a self-heal the placeholder would map sessRaw → a
 // DIFFERENT ledger forever and 400 every turn after the operator unlatched.
-test("M3.2: unlatching an R3 LATCH PLACEHOLDER self-heals — the next stage-0 rebinds to the real ledger (no permanent 400)", () => {
+test("M3.2: the R3 latch placeholder is RETIRED (discussions/7591) — new latches land on the sessions row, and PRE-UPGRADE placeholders still self-heal", () => {
     const p = path.join(hermetic, "m3.2", "index.db");
     const a = openPlane(p);
     // Conversation binding: ledger sid "sid-cb" → raw conversation id "conv-cb".
     const db = (a as unknown as { db: DbLike }).db;
     db.exec("INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES ('default', 'conv-cb', 'sid-cb', 0)");
-    // The latch fires on the real sid — the placeholder row is keyed by the
-    // resolved raw id and carries ledger_id = sessRaw (the real sid unknown).
-    a.snapR3Latch("sid-cb");
-    let row = db.prepare("SELECT ledger_id, witness_probe FROM l1_world WHERE sess_raw = ?").get("conv-cb") as { ledger_id: string; witness_probe: string };
-    assert.equal(row.ledger_id, "conv-cb", "placeholder: the ledger id IS the raw id (the real sid was unknown at latch time)");
-    assert.equal(row.witness_probe, "", "placeholder: no witness probe yet (legitimate rows always carry a hash)");
-    // The operator unlatches (POST /__bili/snapshot/r3-unlatch {sessRaw}).
-    assert.equal(a.snapR3LatchClear("conv-cb"), "conv-cb");
-    // The next turn: BEFORE the fix this threw FoundationRejectError (red)
-    // forever. Now the placeholder is rebindable — stage-0 succeeds and the
-    // row anchors the REAL ledger.
-    const d = a.snapStage0("sid-cb", ["m1"]);
+    // NEW CONTRACT (2026-11-23 identity-tables-consolidate; owner ruling
+    // 2026-11-24 GATES the sessions-row latch carrier on egressPlane): with
+    // the switch on, the latch fires on the sessions row — no l1 placeholder
+    // is ever created, so the raw→wrong-ledger trap is structurally
+    // impossible for new latches.
+    const _prevEgress = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+    try {
+        a.snapR3Latch("sid-cb");
+        assert.equal(db.prepare("SELECT sess_raw FROM l1_world WHERE sess_raw = ?").get("conv-cb"), undefined, "no l1 placeholder row is created anymore");
+        assert.equal(a.snapR3Latched("sid-cb"), true, "the latch is readable via the sessions row");
+        // The operator unlatches (POST /__bili/snapshot/r3-unlatch {sessRaw}).
+        assert.equal(a.snapR3LatchClear("conv-cb"), null, "no l1 row, no sessions row for the RAW id → nothing persisted to clear");
+        assert.equal(a.snapR3LatchClear("sid-cb"), "sid-cb", "clearing by the ledger sid hits the sessions row");
+    } finally {
+        if (_prevEgress === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE; else process.env.BILI_ROLLOUT_EGRESS_PLANE = _prevEgress;
+    }
+    // The next turn: conv-bound bookkeeping — an empty stored set anchors
+    // (no red, no rebind needed). Flag-independent (sid-cb is not egress-on).
+    assert.equal(a.snapStage0("sid-cb", ["m1"]).decision.mode, "anchor");
+    // LEGACY GUARD: a PRE-UPGRADE placeholder (written by the old code path,
+    // ledger_id = sessRaw, witness_probe "") must STILL self-heal — old
+    // databases carry these rows, and the rebind path is kept for them.
+    db.exec("INSERT INTO l1_world (sess_raw, ledger_id, witness_probe, issued_at, r3_latched_at) VALUES ('conv-old', 'conv-old', '', 1, 2)");
+    db.exec("INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES ('default', 'conv-old', 'sid-old', 0)");
+    assert.equal(a.snapR3Latched("sid-old"), true, "the pre-upgrade placeholder is still read as latched (l1 fallback)");
+    // Unlatch the legacy row — the clear returns the bound ledger id (raw).
+    assert.equal(a.snapR3LatchClear("conv-old"), "conv-old");
+    // BEFORE the #6785 fix this threw FoundationRejectError (red) forever.
+    // The placeholder is rebindable — stage-0 succeeds and anchors the REAL
+    // ledger.
+    const d = a.snapStage0("sid-old", ["m1"]);
     assert.ok(d, "stage-0 completed — no R3 400 after unlatch");
-    row = db.prepare("SELECT ledger_id, witness_probe FROM l1_world WHERE sess_raw = ?").get("conv-cb") as { ledger_id: string; witness_probe: string };
-    assert.equal(row.ledger_id, "sid-cb", "the placeholder was rebound to the real ledger sid");
+    const row = db.prepare("SELECT ledger_id, witness_probe FROM l1_world WHERE sess_raw = ?").get("conv-old") as { ledger_id: string; witness_probe: string };
+    assert.equal(row.ledger_id, "sid-old", "the legacy placeholder was rebound to the real ledger sid");
     assert.notEqual(row.witness_probe, "", "the rebased row carries a real witness probe");
     // And the FOLLOWING round is a clean echo (the mapping is stable now).
-    assert.doesNotThrow(() => a.snapStage0("sid-cb", ["m1"]));
+    assert.doesNotThrow(() => a.snapStage0("sid-old", ["m1"]));
 });
 
 // #6785 review (regression guard for the self-heal): a REAL ledger row
@@ -632,7 +652,49 @@ async function withProxyT(
 
 const PLUGIN_HEADERS = { "content-type": "application/json", "x-bili-plugin": "e2e-agent", "x-acp-session": "e2e-sess" } as Record<string, string>;
 
-test("B1: a declared host that fails to collect msgids (count mismatch) → 400 + x-bili-snapshot: identity, no upstream forward", async () => {
+test("B1: a declared host that collects broken msgids (empty entry in the array) → 400 + x-bili-snapshot: identity, no upstream forward", async () => {
+    await withProxyT(
+        () => ({ status: 200, payload: sseDone() }),
+        async (url, bodies) => {
+            const res = await fetch(url, {
+                method: "POST",
+                headers: PLUGIN_HEADERS,
+                body: JSON.stringify({
+                    model: "gpt-e2e",
+                    stream: true,
+                    input: [
+                        { type: "message", role: "user", content: "first" },
+                        { type: "message", role: "user", content: "second" },
+                        { type: "message", role: "user", content: "third" },
+                    ],
+                    // a short array (the tail form) whose entries are broken:
+                    // an empty id is never something a real client sends —
+                    // this is the collection fault the B1 channel is for
+                    biliMsgIds: ["b1m1", ""],
+                }),
+            });
+            assert.equal(res.status, 400, "the identity fault is a 400 (the B1 control channel — not the generic 503)");
+            assert.equal(res.headers.get("x-bili-snapshot"), "identity");
+            // #7574 item 5: the refusal also says "no pin this turn — resend in
+            // full form", the same contract as the msgid delta re-anchor 400.
+            assert.equal(res.headers.get("x-bili-msgid-mode"), "full");
+            const err = JSON.parse(await res.text()) as { error: { type: string; message: string } };
+            assert.equal(err.error.type, "snapshot_identity_fault");
+            assert.ok(err.error.message.includes("R3"), "the error names the fault class");
+            assert.equal(bodies.length, 0, "zero side effects: the upstream was never contacted");
+        },
+        { env: { BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY: "1" } },
+    );
+});
+
+test("#7574: a well-formed short id array on an empty ledger no longer fails the turn — it is served and the response asks for the full list", async () => {
+    // Before #7574 this was the B1 "count mismatch" case: a short array on a
+    // session the server has no ledger for was answered with 400 (three of
+    // them latched the session to the unpinned path). With the incremental
+    // form on by default, this is simply an incremental client on its first
+    // turn after the server lost the ledger (restored / recreated database,
+    // removed session) — nothing is broken, nothing can be anchored, so the
+    // turn runs without the pin and the client rebuilds the ledger next turn.
     await withProxyT(
         () => ({ status: 200, payload: sseDone() }),
         async (url, bodies) => {
@@ -646,15 +708,13 @@ test("B1: a declared host that fails to collect msgids (count mismatch) → 400 
                         { type: "message", role: "user", content: "first" },
                         { type: "message", role: "user", content: "second" },
                     ],
-                    biliMsgIds: ["b1m1"], // 1 declared vs 2 elements — the R3 fault
+                    biliMsgIds: ["tail-anchor"], // 1 well-formed id for 2 elements = the tail form
                 }),
             });
-            assert.equal(res.status, 400, "the identity fault is a 400 (the B1 control channel — not the generic 503)");
-            assert.equal(res.headers.get("x-bili-snapshot"), "identity");
-            const err = JSON.parse(await res.text()) as { error: { type: string; message: string } };
-            assert.equal(err.error.type, "snapshot_identity_fault");
-            assert.ok(err.error.message.includes("R3"), "the error names the fault class");
-            assert.equal(bodies.length, 0, "zero side effects: the upstream was never contacted");
+            assert.equal(res.status, 200, "the turn is served");
+            await res.text();
+            assert.equal(bodies.length, 1, "the upstream was contacted");
+            assert.equal(res.headers.get("x-bili-msgid-mode"), "full", "and the client is told to send the full list next turn");
         },
         { env: { BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY: "1" } },
     );
@@ -747,12 +807,14 @@ test("#7064 D2: a conversation-bound sid never takes the R3 fault path", async (
     const log = (level: string, msg: string) => logs.push({ level, msg });
     try {
         assert.ok(store.snapConvBound(sid), "the conversations row makes the sid conversation-bound");
-        // a non-bound sid with the SAME fault 400s (control):
+        // a non-bound sid with a BROKEN array 400s (control; #7574: only a
+        // broken entry is a collection fault — a well-formed short array is
+        // the tail form, see the test below):
         assert.throws(() => runStage0({
             sessionId: "d2-sid-nobound",
             lane: "openai",
             msgs: dMsgs(5),
-            incomingMsgIds: ["a", "b"], // 2 ids for 6 messages
+            incomingMsgIds: ["a", ""], // 2 ids for 6 messages, one of them empty
             incomingSeqs: null,
             pluginMode: true,
             log,
@@ -761,7 +823,7 @@ test("#7064 D2: a conversation-bound sid never takes the R3 fault path", async (
             sessionId: sid,
             lane: "openai",
             msgs: dMsgs(5),
-            incomingMsgIds: ["a", "b"], // the same fault — bound: no throw
+            incomingMsgIds: ["a", ""], // the same broken array — bound: no throw
             incomingSeqs: null,
             pluginMode: true,
             log,
@@ -774,7 +836,7 @@ test("#7064 D2: a conversation-bound sid never takes the R3 fault path", async (
             sessionId: sid,
             lane: "openai",
             msgs: dMsgs(5),
-            incomingMsgIds: ["a"], // worse: 1 id for 6
+            incomingMsgIds: [" "], // worse: 1 id for 6, and it is whitespace
             incomingSeqs: null,
             pluginMode: true,
             wpHit: { view: [] as BiliMessage[], lastSeq: 5 },
@@ -793,6 +855,38 @@ test("#7064 D2: a conversation-bound sid never takes the R3 fault path", async (
     } finally {
         r3FaultTracker.clearLatched(sid);
         r3FaultTracker.clearLatched("d2-sid-nobound");
+    }
+});
+
+test("#7574: a well-formed tail on an empty ledger is not a fault — no throw, no strike, the full signal, and the full list rebuilds the ledger next turn", async (t) => {
+    const { store } = d23Harness(t);
+    const sid = "d7574-sid";
+    const logs: DLog[] = [];
+    const log = (level: string, msg: string): void => { logs.push({ level, msg }); };
+    try {
+        assert.equal(store.snapConvBound(sid), false, "a plain sid (not conversation-bound) — the case that used to 400");
+        // the client is in incremental mode and sends its tail; the server has no ledger
+        const r1 = runStage0({
+            sessionId: sid, lane: "openai", msgs: dMsgs(5),
+            incomingMsgIds: ["anchor", "new-1"], incomingSeqs: null,
+            pluginMode: true, log,
+        });
+        assert.equal(r1.pinned, null, "nothing to anchor against — the turn runs on content-derived ids");
+        assert.equal(r1.pinMode, "full", "the response asks for the full list");
+        assert.ok(!r3FaultTracker.isLatched(sid), "no fault, no latch");
+        assert.ok(logs.some((l) => l.level === "warn" && l.msg.includes("tail form on an empty ledger")), `the reason is logged: ${logs.map((l) => l.msg).join(" | ")}`);
+        // next turn the client sends the full list: the pin applies and the ledger is rebuilt
+        const ids = ["u1", "a1", "u2", "a2", "u3"];
+        const core = dMsgs(5);
+        const r2 = runStage0({
+            sessionId: sid, lane: "openai", msgs: core.map((m, i) => ({ ...m, id: `h-${i}` })),
+            incomingMsgIds: ids, incomingSeqs: null,
+            pluginMode: true, log,
+        });
+        assert.deepEqual(r2.pinned?.map((m) => m.id), ids, "the full list pins every element");
+        assert.equal(r2.pinMode, "incremental");
+    } finally {
+        r3FaultTracker.clearLatched(sid);
     }
 });
 

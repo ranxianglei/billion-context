@@ -31,6 +31,7 @@
  */
 
 import { log as loggerLog } from "../logger.js";
+import { featureEnabled } from "../rollout.js";
 import { planIngest, planIngestDelta, planIngestReanchor, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { CcrLedgerRow } from "./slim.ts";
 import { splitMediaContent } from "./identity.js";
@@ -721,7 +722,11 @@ export class UnifiedShadow {
             phase = "verify-sample";
             const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
             this.ingestCounts.set(legacy.id, count);
-            if (legacy.metadata?.egressAuthority === true && this.driftedSessions.delete(legacy.id)) {
+            // #7574: only while the plane is switched ON. The marker is saved
+            // with the session, so after an install turns the plane off it
+            // would otherwise keep the sampled verification off and keep the
+            // delta fast path latched forever for that session.
+            if (legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane") && this.driftedSessions.delete(legacy.id)) {
                 this.driftStreaks.delete(legacy.id);
                 if (this.frozenEnvelopeIds.delete(legacy.id)) {
                     this.frozenEnvelopeSince.delete(legacy.id);
@@ -733,7 +738,7 @@ export class UnifiedShadow {
             // it re-latches the known canonical≠client divergence (the #5677
             // chronic loop source). The egress probe (client bytes vs flow
             // sampled rows) is the sole verification for egress-on sessions.
-            const egressOn = legacy.metadata?.egressAuthority === true;
+            const egressOn = legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane");
             if (!egressOn && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
@@ -925,7 +930,18 @@ export class UnifiedShadow {
                 builder.addStateFields(store.getStateFields(id) ?? {});
                 // The builder preserves every MERGE_STATE_FIELDS key; its
                 // generic state declaration only needs widening here.
-                return builder.finish() as LegacySessionLike;
+                const view = builder.finish();
+                // #7577 (b): egress-on sessions do not persist tsStamps (it is
+                // trimmed on write — see ingest.ts KSTATE_TRIM_FIELDS); re-derive
+                // it from the live egress view (row.msgid IS the kernel raw id,
+                // row.ts the first-observed wall clock) so the kernel's <acp
+                // time=> stamps survive restarts. The async (MySQL) leg has no
+                // egress tables — the egress plane is the SQLite lane only.
+                if (view.metadata["egressAuthority"] === true && view.state.tsStamps === undefined) {
+                    const derived = store.egressTsStamps(id);
+                    if (derived !== null) view.state.tsStamps = derived;
+                }
+                return view as LegacySessionLike;
             });
             if (!unified) return null;
             warnTailGaps(id, unified as unknown as { tailGaps?: number });
@@ -1524,7 +1540,7 @@ export class UnifiedShadow {
                 this.ingestCounts.set(legacy.id, count);
                 // #7439 item 1: BatchedViewVerification disabled for egress-on
                 // sessions (same rationale as the sync path above).
-                const egressOnAsync = legacy.metadata?.egressAuthority === true;
+                const egressOnAsync = legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane");
                 if (!egressOnAsync && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
                     this.stats.verifySamples++;
                     const sessionRow = await backend.getSessionRow(legacy.id);

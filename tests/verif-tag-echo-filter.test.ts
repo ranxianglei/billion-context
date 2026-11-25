@@ -218,21 +218,6 @@ test("P5 residue duality: strip removes every detectable artifact", () => {
     // detectors keep firing on the preserved close: log-signals, not strip
     // guarantees). When strip acted, nothing strict may remain.
     const acted = stripAcpTags(t) !== t;
-    // #4106 family (single-sweep gated pass ordering): a refs run against an
-    // UNTERMINATED acplike close dies only via DEAD_REF_CLOSE, whose "an
-    // earlier pass already acted" gate is still closed when the sole other
-    // artifact is a marker line removed by a LATER pass — the unit then
-    // survives the sweep. Known open (C#4106 pins the sibling idempotence
-    // gap). While #4106 is open, exclude exactly this shape — and no
-    // iteration carrying any OTHER surviving render-tag evidence.
-    const gatedUnit = /(?<![\w>])m\d{4,}(?:\s*[\u2013\u2014,\-]?\s*m\d{4,})*\s*<\/[a-zA-Z]{1,32}(?![^<>]{0,32}>)/;
-    if (
-      acted &&
-      gatedUnit.test(out) &&
-      /\[ACP\]/.test(t) &&
-      !/\[ACP\]/.test(out) &&
-      !containsRenderTagText(out.replace(new RegExp(gatedUnit.source, "g"), ""))
-    ) continue;
     if (acted && containsRenderTagText(out)) why.push("render-tag");
     if (acted && /(?<![\w>])m\d{4,}\s*<\/[a-zA-Z]/.test(out)) why.push("echo-residue");
     if (acted && /(^|\n)[\u{1F300}-\u{1FAFF}\u2600-\u27BF}\u2B00-\u2BFF] ?\[ACP\]/u.test(out)) why.push("marker-line-at-line-start");
@@ -360,4 +345,17 @@ test("C#4107-2 (fixed #4210): close fragment at chunk boundary is split-invarian
   const whole = run([t]);
   const split = run([t.slice(0, 49), t.slice(49)]);
   assert.equal(whole, split, "#4107-2 regressed: chunk split diverged again");
+});
+// #7604: DEAD_REF_CLOSE matches the whole refs RUN against an unterminated
+// close — the leading refs of a multi-ref dead-close run are residue by
+// construction (a run is never prose, #2023), so they die with the unit in
+// one sweep. This control pins the strip the P5 exclusion used to paper
+// over; P1 covers the same shape family's split invariance.
+test("C#7604: multi-ref dead-close run dies whole in one sweep", () => {
+  const t = "angle < not a tag\nm00001 m00002</acp\n\u{1F4E6} [ACP] Compressed m00120\u2013m0300 \u2192 1 block(s)";
+  const s1 = stripAcpTags(t);
+  assert.ok(!s1.includes("</acp"), `dead close survived — out=${JSON.stringify(s1)}`);
+  assert.ok(!s1.includes("m00001") && !s1.includes("m00002"), `run residue survived — out=${JSON.stringify(s1)}`);
+  assert.ok(s1.includes("angle < not a tag"), "prose lost");
+  assert.equal(stripAcpTags(s1), s1, "not a fixed point");
 });

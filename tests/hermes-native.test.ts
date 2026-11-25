@@ -776,6 +776,12 @@ elif SCENARIO == "output-limits":
 elif SCENARIO.startswith("attach"):
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    # #6862: an operator-provided NO_PROXY present when apply_env runs must be merged in,
+    # never replaced — BC_TEST_NO_PROXY simulates it (the preamble pops the real keys).
+    operator_no_proxy = os.environ.get("BC_TEST_NO_PROXY", "").strip()
+    if operator_no_proxy:
+        os.environ["NO_PROXY"] = operator_no_proxy
+        os.environ["no_proxy"] = operator_no_proxy
     ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
     os.makedirs(ca_dir, exist_ok=True)
     ca_file = os.path.join(ca_dir, "root-ca.pem")
@@ -1191,9 +1197,12 @@ elif SCENARIO == "ready-unload":
     user_proxy = "http://user-proxy.example:9999"   # pre-existing host routing — must survive unload
     os.environ["HTTPS_PROXY"] = user_proxy
     os.environ["https_proxy"] = user_proxy
+    os.environ["NO_PROXY"] = "corp.example"   # #6862: operator NO_PROXY must survive unload too
+    os.environ["no_proxy"] = "corp.example"
     mod.register(ctx)
     out["env_routed"] = os.environ.get("HTTPS_PROXY") == ORIGIN
     ctx.run_unload()
+    out["env_after_unload_no_proxy"] = os.environ.get("NO_PROXY")
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -1315,6 +1324,7 @@ interface DriverOut {
     unload_thread_alive?: boolean;
     state_after_unload?: string;
     env_after_unload?: string | null;
+    env_after_unload_no_proxy?: string | null;
     mw_after_unload_none?: boolean;
     acp_after_unload?: string | null;
     env_routed?: boolean;
@@ -1400,7 +1410,13 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.env_https_proxy_lc, out!.origin);
         assert.equal(out!.env_http_proxy, out!.origin, "a plain-http provider base_url is routed too");
         assert.equal(out!.env_http_proxy_lc, out!.origin);
-        assert.equal(out!.env_no_proxy, "127.0.0.1,localhost,::1", "loopback stays direct");
+        // #6862: loopback stays direct AND the code/dependency hosts the lane cannot serve
+        // bypass it by default, so a hermes update / shell task's git/uv/npm does not route
+        // through the MITM lane and fail. Model routing above is untouched.
+        assert.equal(out!.env_no_proxy,
+            "127.0.0.1,localhost,::1,github.com,api.github.com,objects.githubusercontent.com,"
+            + "codeload.github.com,pypi.org,files.pythonhosted.org,registry.npmjs.org",
+            "loopback + non-model bypass hosts stay direct");
         assert.match(out!.env_ca_bundle!, /root-ca\.pem$/);
         assert.match(out!.env_ssl_cert_file!, /combined-ca\.pem$/, "#1375: ambient trust rides the combined bundle");
         const h1 = out!.first_headers!;
@@ -1450,6 +1466,22 @@ describe("python plugin runtime (subprocess)", () => {
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.
         assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }], "attached session registers its host pid as a watchdog owner");
+    });
+
+    test("attach with an operator NO_PROXY: the operator's entries are merged in, never replaced (#6862)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("attach", { BC_TEST_NO_PROXY: "corp.example" });
+        assert.ok(out, err);
+        assert.equal(out!.env_https_proxy, out!.origin, "model traffic is still routed");
+        const bypassed = (out!.env_no_proxy ?? "").split(",");
+        assert.ok(bypassed.includes("corp.example"), "operator entry survives");
+        assert.ok(bypassed.includes("127.0.0.1") && bypassed.includes("localhost"), "loopback stays direct");
+        assert.ok(bypassed.includes("github.com") && bypassed.includes("pypi.org")
+            && bypassed.includes("registry.npmjs.org"), "non-model bypass hosts still apply");
+        assert.equal(bypassed.filter((h) => h === "corp.example").length, 1, "no duplicate entries");
     });
 
     // A toolset the host DEFERS (Hermes tool_search) is invisible in the outgoing snapshot even
@@ -1953,6 +1985,8 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.env_https_proxy, "http://user-proxy.example:9999",
             "the host's own proxy is restored verbatim, not left at the plugin's origin port");
         assert.equal(out!.env_https_proxy_lc, "http://user-proxy.example:9999");
+        assert.equal(out!.env_after_unload_no_proxy, "corp.example",
+            "the operator's NO_PROXY is restored verbatim, not left at the merged bypass value");
         assert.equal(out!.env_ca_bundle, null, "a key we added is dropped, not left pointing into our CA dir");
         assert.equal(out!.env_ssl_cert_file, null);
     });

@@ -12,6 +12,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { coreAlignEnvelopeIds, laneMsgIdsForResponsesWire } from "../src/agent/pi-msgids.ts";
+import * as pfChannel from "../src/agent/pf-channel.ts";
 import {
     _bodyProxyVisibleForTest,
     _resolveEnvelopeIdsForFullResendForTest,
@@ -332,4 +333,39 @@ test("resolveEnvelopeIds: responses + lead system → hoisted slot dropped, host
     const wire = [{ type: "message", role: "system", content: "sys" }, ...RESP_WIRE_1TO1];
     const parsed = { input: wire, model: "m" };
     assert.deepEqual(_resolveEnvelopeIdsForFullResendForTest(parsed, ctxWithBranch(respBranch())), ["u1", "a2", "t3", "a4"]);
+});
+
+// ---------------------------------------------------------------------------
+// F. #7574 — a session switched from the OpenAI wire to another wire
+// ---------------------------------------------------------------------------
+
+test("stamp (#7574): after a switch to the responses or anthropic wire the full id list rides again", () => {
+    const sid = "s-wire-switch-7574";
+    // The OpenAI lane taught this session "incremental" + its element count.
+    pfChannel.pfLearnStamp({ "x-bili-plugin-conversation": sid }, 200, new Headers({ "x-bili-pf-seq": "4", "x-bili-msgid-mode": "incremental" }));
+    pfChannel.pfCaptureIds(sid, ["u1", "a2", "t3", "a4"]);
+    const ctx = (branch: unknown) => ({
+        ...ctxWithBranch(branch),
+        sessionManager: { ...ctxWithBranch(branch).sessionManager, getSessionId: () => sid },
+    });
+
+    // OpenAI wire, steady state: the list is suppressed (the tail-ids header carries it).
+    assert.equal(_stampMsgIdEnvelopeForTest({ payload: { messages: OAI_WIRE_1TO1, model: "m" } }, ctx(pairBranch()), "pi", undefined), undefined);
+
+    // Responses wire: that lane never reads the tail-ids header → the full list must ride.
+    const resp = _stampMsgIdEnvelopeForTest({ payload: { input: RESP_WIRE_1TO1, model: "m" } }, ctx(respBranch()), "pi", undefined);
+    assert.deepEqual(resp?.biliMsgIds, ["u1", "a2", "t3", "a4"]);
+
+    // Anthropic wire: same.
+    const anthropicWire = [
+        { role: "user", content: "q" },
+        { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "t", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "result" }] },
+        { role: "assistant", content: [{ type: "text", text: "done" }] },
+    ];
+    const anth = _stampMsgIdEnvelopeForTest({ payload: { system: "sys", messages: anthropicWire, model: "m" } }, ctx(pairBranch()), "pi", undefined);
+    assert.deepEqual(anth?.biliMsgIds, ["u1", "a2", "t3", "a4"]);
+
+    // … and the OpenAI wire is still suppressed afterwards (the learned slot is untouched).
+    assert.equal(_stampMsgIdEnvelopeForTest({ payload: { messages: OAI_WIRE_1TO1, model: "m" } }, ctx(pairBranch()), "pi", undefined), undefined);
 });

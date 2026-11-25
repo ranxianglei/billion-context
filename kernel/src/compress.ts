@@ -49,6 +49,7 @@ import {
   buildCompressibleRanges,
   mergeRangesToThreshold,
   screenRecommendedUnits,
+  warnScreenDrop,
 } from "./recommend.js";
 import {
   runPipeline,
@@ -735,12 +736,18 @@ export function createCore(ports: Ports = {}): CompressionCore {
         foldCandidates.push(spec);
       }
       const lengthFailures: string[] = [];
+      // #6730: track the DIRECTION of each length failure so the remediation
+      // text below points the same way the validation failed (grow for
+      // too-short/empty, shrink for too-long) instead of one generic "shorten
+      // to fit its cap" that is backwards for the too-short case.
+      const failureKinds = new Set<SummaryLengthKind>();
       const minLen = input.config.compress.minSummaryLength;
       if (foldCandidates.length === 1) {
         const solo = foldCandidates[0]!;
         try {
           validateSummaryLength(solo, input.config.compress);
         } catch (error) {
+          if (isSummaryLengthError(error)) failureKinds.add(error.kind);
           lengthFailures.push(
             rangeError(
               solo,
@@ -753,6 +760,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
           try {
             validateSummaryLength(spec, input.config.compress, { skipMin: true });
           } catch (error) {
+            if (isSummaryLengthError(error)) failureKinds.add(error.kind);
             lengthFailures.push(
               rangeError(
                 spec,
@@ -767,6 +775,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
             0,
           );
           if (total < minLen) {
+            failureKinds.add("tooShort");
             lengthFailures.push(
               `Batch summary too short (${total} chars across ${foldCandidates.length} ranges, min ${minLen}). The combined summaries must capture the compressed content's key information.`,
             );
@@ -784,7 +793,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
             blocksCreated: 0,
             tokensCompressed: 0,
             errors: [
-              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. Fix it one way or the other and resend: shorten or split each offending range's summary to fit its cap, then resend the whole batch; or drop the offending range(s) and resend only the rest that validate.`,
+              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. ${lengthRemediation(failureKinds)}`,
               ...classificationErrors,
             ],
             warnings: [],
@@ -1497,6 +1506,23 @@ const recommendNode: PipelineNode = {
       ctx.config,
       computeProtectedRefs(screenArray, io.state, ctx.config, ctx.countTokens),
     );
+    // Production 2026-11-09 mega-turn incident: the funnel can zero out BELOW
+    // the "nothing compressible" level — segments exist and hold messages, but
+    // every island dies at the merge gate or the screen, and the host only
+    // sees recommendedRanges=[] while its own message-level diagnostic still
+    // counts collectible material ("collectible>0 yet ranges=0" was
+    // undiagnosable from the host side for a full night). Warn (budgeted)
+    // with the stage-by-stage numbers so the killing stage is named directly.
+    if (contextRanges.compressible.length > 0 && recommendedRanges.length === 0) {
+      const segMsgs = contextRanges.compressible.reduce((s, r) => s + r.count, 0);
+      const minChars = ctx.config.compress.minCompressRange;
+      const subGate = contextRanges.compressible.filter(
+        (r) => (r.chars ?? r.tokens * 4) < minChars,
+      ).length;
+      warnScreenDrop(
+        `funnel zeroed with material present: segments=${contextRanges.compressible.length} (${segMsgs} msgs, ${subGate} below ${minChars}-char merge gate) → all died at merge/screen; host sees no-ranges`,
+      );
+    }
     const recommendation: Recommendation = {
       contextRanges,
       recommendedRanges,
@@ -1852,6 +1878,26 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
         noop: true,
       };
     }
+    // #7596: the integrity withdrawal (a visible tool-call must keep its
+    // reasoning run and its results) removed EVERY message of this fresh fold
+    // — the range sits astride the protected-zone boundary and the kernel
+    // keeps the whole turn intact rather than folding a split turn. Before
+    // this the fatal threw and the ATOMIC batch contract rolled back sibling
+    // ranges that would have folded fine; the model re-sent the same batch
+    // (full context re-read every time) until the breaker fired. Like the
+    // zone fatal above it is now a legal no-op: siblings still fold, and the
+    // warning points the model at older ranges instead of a guaranteed
+    // re-failure. Merge split fatals never carry `degradable` and still throw.
+    if (projection.fatal.kind === "split" && projection.fatal.degradable) {
+      const highest = highestUsedIndex(input.state.messageRefs);
+      return {
+        tokens: 0,
+        warnings: [
+          `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — the integrity gate keeps every visible tool call's reasoning run and its results together, and folding this range would split that turn at the protected-zone boundary, so the range was withdrawn in full instead of split. Nothing failed; do not resend this range as-is — it cannot fold until the whole turn ages out of the protected zone. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"} — target older ranges only.`,
+        ],
+        noop: true,
+      };
+    }
     throw projection.fatal.error;
   }
   const {
@@ -2090,6 +2136,49 @@ function validateCompressionRange(input: SingleRangeInput): void {
   // nothing left to fold.
 }
 
+// #6730: the three direction-distinct summary-length failures. The batch
+// rejection message must advise in the SAME direction as the failure that
+// fired — a "too short" summary must be told to GROW, never "shorten to fit
+// its cap". The old single generic string said "shorten or split ... to fit
+// its cap" for EVERY length failure, so a too-short summary got advice that
+// made it shorter, and the model retried into a guaranteed-fail loop (full
+// context re-read each time) until the circuit breaker fired.
+type SummaryLengthKind = "empty" | "tooShort" | "tooLong";
+
+// The guarded-file subset (verif/subset-guard.ts) excludes class declarations
+// and non-NEWABLE `new` targets, so this is a plain-Error factory plus a type
+// guard instead of a class — same shape and messages, no class.
+type SummaryLengthError = Error & { kind: SummaryLengthKind };
+
+function summaryLengthError(kind: SummaryLengthKind, message: string): SummaryLengthError {
+  const error = new Error(message) as SummaryLengthError;
+  error.name = "SummaryLengthError";
+  error.kind = kind;
+  return error;
+}
+
+function isSummaryLengthError(error: unknown): error is SummaryLengthError {
+  if (!(error instanceof Error) || error.name !== "SummaryLengthError") return false;
+  const kind = (error as SummaryLengthError).kind;
+  return kind === "empty" || kind === "tooShort" || kind === "tooLong";
+}
+
+/** Build the batch-rejection remediation text from the set of failure
+ *  directions actually present. Each direction gets advice pointing the SAME
+ *  way its validation failed; the "drop the range" exit is always offered. */
+function lengthRemediation(kinds: Set<SummaryLengthKind>): string {
+  const parts: string[] = [];
+  if (kinds.has("tooShort") || kinds.has("empty")) {
+    parts.push(
+      "expand each too-short/empty summary until it reaches its minimum — write out the key information the range actually contains (do NOT shorten it)",
+    );
+  }
+  if (kinds.has("tooLong")) {
+    parts.push("shorten or split each too-long summary to fit its cap");
+  }
+  return `Fix it and resend the whole batch: ${parts.join("; and ")}; or drop the offending range(s) and resend only the rest that validate.`;
+}
+
 function validateSummaryLength(
   spec: { summary: string; summaryMaxChars?: number },
   cfg: Config["compress"],
@@ -2098,7 +2187,8 @@ function validateSummaryLength(
   const summary = spec.summary?.trim() ?? "";
 
   if (summary.length === 0) {
-    throw new Error(
+    throw summaryLengthError(
+      "empty",
       "Summary is empty — provide a meaningful summary of the compressed range.",
     );
   }
@@ -2110,14 +2200,16 @@ function validateSummaryLength(
     cfg.minSummaryLength > 0 &&
     summary.length < cfg.minSummaryLength
   ) {
-    throw new Error(
+    throw summaryLengthError(
+      "tooShort",
       `Summary too short (${summary.length} chars, min ${cfg.minSummaryLength}). The summary must capture the compressed range's key information.`,
     );
   }
 
   const effectiveMax = spec.summaryMaxChars ?? cfg.maxSummaryLength;
   if (effectiveMax > 0 && summary.length > effectiveMax) {
-    throw new Error(
+    throw summaryLengthError(
+      "tooLong",
       `Summary too long (${summary.length} chars, max ${effectiveMax}). Strip noise — keep critical paths, decisions, errors, and code references. Or pass summaryMaxChars to increase the limit — don't lose critical info just to fit.`,
     );
   }
