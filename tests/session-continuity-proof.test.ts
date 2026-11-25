@@ -32,11 +32,18 @@
 // WIRE MATRIX: both scenarios run on chat (/v1/chat/completions), anthropic
 // (/v1/messages, system as a top-level field) and responses (/v1/responses,
 // instructions) — the persona wiring is per-call-site in src/server/handle.ts
-// (anthropic :811 / openai :821 / responses :843,:880) and each site has its
-// own system-text extractor, so the contract is proven per wire, not assumed
-// protocol-neutral (#377 lesson: correct-in-one-lane is not correct-in-all).
+// and each site has its own system-text extractor, so the contract is proven
+// per wire, not assumed protocol-neutral (#377 lesson: correct-in-one-lane is
+// not correct-in-all).
 // google is deliberately absent: the google lane has NO persona call site
 // (issue #2730 — wire it or document the exclusion before proving it).
+//
+// 2026-11-23, #7525 GA: the content-forecasting |sub: fork ladder (and its
+// BILI_ROLLOUT_TRUST_STAMPED_ID=0 escape hatch) is retired — scenario A's
+// control now asserts the GA contract (uncorroborated system drift STILL
+// rides the raw key, no fork) instead of the pre-retirement fork it used to
+// pin. Scenario A's absorb path and scenario B's host-driven fork API are
+// untouched by the retirement.
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -64,7 +71,10 @@ const hash = (v: unknown): string => createHash("sha256").update(JSON.stringify(
 
 const SYSTEM_A = "You are DeepSeek Harness, the main coding agent.\nModel: GLM-4.6.\nWorkspace: /tmp.";
 const SYSTEM_B = "You are DeepSeek Harness, the main coding agent.\nModel: GLM-5.3.\nWorkspace: /tmp.";
-const GUARD_TEXT = "Instructions from: /repo/AGENTS.md\n# repo rules\nbehave conservatively and keep diffs minimal.";
+// #7153: the durable baseline carrier is classified on the shape dsh-agent-instructions
+// actually emits — the complete \x3csystem-reminder\x3e frame around the section label.
+// A bare label is now ordinary history (a human paste must not be pinned).
+const GUARD_TEXT = "\x3csystem-reminder\x3e\nInstructions from: /repo/AGENTS.md\n# repo rules\nbehave conservatively and keep diffs minimal.\n\x3c/system-reminder\x3e";
 
 const FILLER = "the quick brown fox jumps over the lazy dog, again and again, folding context away. ";
 
@@ -214,7 +224,7 @@ for (const wire of WIRES) test(`scenario A (${wire}): a model switch (header + s
     }
 });
 
-for (const wire of WIRES) test(`scenario A control (${wire}): system drift WITHOUT header corroboration still forks`, async () => {
+for (const wire of WIRES) test(`scenario A control (${wire}): system drift WITHOUT header corroboration stays on the raw key (GA)`, async () => {
     const h = await harness(wire);
     try {
         const run = `ctl-${Date.now()}`;
@@ -226,8 +236,10 @@ for (const wire of WIRES) test(`scenario A control (${wire}): system drift WITHO
         }
         await h.dshChat(conv, "glm-4.6", SYSTEM_A, turns);
         // Same compacted shape and the same changed system line, but the
-        // header still names the OLD model: the conjunction is not
-        // corroborated, so this is a genuine persona drift → fork.
+        // header still names the OLD model: pre-GA this was "genuine persona
+        // drift → fork"; under the #7525 GA contract the client-stamped id
+        // rides verbatim either way — uncorroborated system drift no longer
+        // mints a fork at all.
         const carrier = `${run} session summary of folded early turns: uncorroborated drift control.`;
         await h.dshChat(conv, "glm-4.6", SYSTEM_B, [
             turns[0]!,
@@ -235,8 +247,9 @@ for (const wire of WIRES) test(`scenario A control (${wire}): system drift WITHO
             turns[4]!, turns[5]!,
             { role: "user", content: userText(run, 9) },
         ]);
-        assert.ok(subForkOf(conv).length === 1, `uncorroborated drift must fork exactly once (got ${JSON.stringify(subForkOf(conv))})`);
-        assert.ok(listSessions().some((s) => s.id === conv), "the raw-key parent session still exists (stale but intact)");
+        assert.equal(resolveConversation(conv).session!.id, conv, "the stamped id rides verbatim regardless of corroboration");
+        assert.deepEqual(subForkOf(conv), [], `uncorroborated drift mints no fork under GA (got ${JSON.stringify(subForkOf(conv))})`);
+        assert.ok(listSessions().some((s) => s.id === conv), "the raw-key session is the single live session");
     } finally {
         await h.close();
     }

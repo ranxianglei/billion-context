@@ -24,6 +24,7 @@ import { defaultConfig, type NudgeDecision } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { getSession } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest, type Session } from "../src/session.ts";
 import { emergencyNudgeArmed } from "../src/server/budget.ts";
@@ -185,6 +186,13 @@ test("#3461 e2e: a payload that can never fit fails fast 413 non-retryable, cool
         const r1 = await post(smallSystem, [{ role: "user", content: "go?" }]);
         assert.equal(r1.status, 200, "turn 1 succeeds");
         await r1.text();
+        // Identity-fast-path guard: turn 1 settles a genuine same-origin usage
+        // baseline, which alone would open the trusted fast path (recorded
+        // upstream reality outranks local doom-math). This fixture pins the
+        // evidence-judged 413 contract, so declare the overflow wall —
+        // statedWall > 0 demotes the fast path and the wall equals the
+        // configured window, so the judge's limit is unchanged.
+        getSession(id)!.stats.overflowArmTokens = WINDOW;
 
         // Turn 2: the client swaps in an oversized system prompt (~60k chars ≈
         // well over the 4k window) on top of the short history. The system

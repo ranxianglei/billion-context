@@ -77,6 +77,10 @@ function cleanEnv(): NodeJS.ProcessEnv {
         if (key.startsWith("BILI") || key.startsWith("BILLION_CONTEXT") || key.startsWith("ACP_") || key.startsWith("DSH_") || key.startsWith("ZCODE")) delete env[key];
     }
     for (const key of ["NODE_EXTRA_CA_CERTS", "NODE_OPTIONS", "NODE_TEST_CONTEXT", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"]) delete env[key];
+    // #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+    // off) — this suite asserts the legacy JSON persistence surface (raw
+    // conversation keys persisting sessions), so pin the dual-write writer.
+    env.BILI_STORAGE_JSON_WRITER = "on";
     return env;
 }
 

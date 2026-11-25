@@ -64,6 +64,7 @@ type UpstreamConnectionStatus = {
 };
 
 const dispatcherCache = new Map<string, ProxyAgent>();
+let dispatcherCaIdentity: string | undefined;
 let lastConnection: UpstreamConnectionStatus = {};
 let windowsProxyCache: { at: number; value: WindowsSystemProxy } | undefined;
 
@@ -401,7 +402,14 @@ export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number
     const t = timeoutMs ?? upstreamTimeoutMs();
     const ka = proxyKeepAliveMaxMs();
     // #3776: include the CA identity in the key so a configured/rotated network.caFile rotates the cached agent.
-    const key = `${proxyUrl}\u0000${t}\u0000${ka}\u0000${upstreamCaIdentity()}`;
+    const caIdentity = upstreamCaIdentity();
+    if (caIdentity !== dispatcherCaIdentity) {
+        // Gracefully drain the old trust identity's proxy and target pools; future
+        // requests use only the current identity without retaining every past Agent.
+        closeProxyDispatchers();
+        dispatcherCaIdentity = caIdentity;
+    }
+    const key = `${proxyUrl}\u0000${t}\u0000${ka}\u0000${caIdentity}`;
     let agent = dispatcherCache.get(key);
     if (!agent) {
         const withTimeouts = (options: object): object => {
@@ -432,11 +440,16 @@ export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number
     return agent;
 }
 
-export function resetProxyCache(): void {
+function closeProxyDispatchers(): void {
     for (const agent of dispatcherCache.values()) {
         try { void agent.close().catch(() => undefined); } catch { }
     }
     dispatcherCache.clear();
+    dispatcherCaIdentity = undefined;
+}
+
+export function resetProxyCache(): void {
+    closeProxyDispatchers();
     lastConnection = {};
 }
 

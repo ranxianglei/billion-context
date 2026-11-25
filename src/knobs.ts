@@ -129,21 +129,32 @@ export function replayBaseDelayMs(): number {
     return Number.isFinite(v) && v >= 0 ? v : REPLAY_BASE_DELAY_MS;
 }
 
+/** BILI_PREFLIGHT_EMERGENCY_DIGEST > network.emergencyDigest > false (owner decision
+ *  2026-11-22: the #2383 CPU digest regime is a model-visible hard truncation —
+ *  default off; "1"/"true" env or an explicit file true restores it). */
+export function preflightEmergencyDigestEnabled(): boolean {
+    const envRaw = process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST;
+    if (envRaw !== undefined) return envRaw === "1" || envRaw === "true";
+    return fileNetwork().emergencyDigest === true;
+}
+
 // --- #4204 egress-side 429 throttle governor ---
 
 const THROTTLE_429_MAX_CONSECUTIVE = 5;
 const THROTTLE_429_BASE_DELAY_MS = 2_000;
 const THROTTLE_429_MAX_DELAY_MS = 30_000;
 
-/** BILI_THROTTLE_429 > network.throttle429Enabled > true. The egress 429
- *  governor (#4204) is ON by default: consecutive upstream 429s put sends to
- *  that origin+credential on local backoff instead of amplifying a
- *  concurrency-style provider limit. "0"/"false" restores the legacy
- *  always-forward behavior. Read per request so the switch flips live. */
+/** BILI_THROTTLE_429 > network.throttle429Enabled > false. The egress 429
+ *  governor (#4204) is OFF by default (#6639/#5853): upstream 429s are
+ *  forwarded to the client untouched — the host owns the retry decision —
+ *  and bili only warns in the log. Opt in ("1"/"true" here, or
+ *  network.throttle429Enabled: true) for accounts where host retry storms
+ *  pin a shared concurrency-style provider limit (#4204). Read per request
+ *  so the switch flips live. */
 export function throttle429Enabled(): boolean {
     const envRaw = process.env.BILI_THROTTLE_429;
     if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
-    return fileNetwork().throttle429Enabled !== false;
+    return fileNetwork().throttle429Enabled === true;
 }
 
 /** BILI_THROTTLE_429_MAX_CONSECUTIVE > network.throttle429MaxConsecutive > 5.
@@ -995,6 +1006,7 @@ export function fileStorageWalJournalSizeLimit(): number | undefined {
     const v = loadConfigFile().storage?.walJournalSizeLimitBytes;
     return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
 }
+
 
 /** Tiered storage-migration switch (#2671): legacy | shadow | full | sqlite.
  *  Lives here per the env-var discipline — env tier BILI_STORAGE_UNIFIED

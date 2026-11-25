@@ -294,6 +294,63 @@ export function _resetOpencodeDeclaredWindowForTest(): void {
     opencodeDeclaredWindow = undefined;
 }
 
+// #6525/#6539 (发) opencode V1: full-resend envelope. V1's host msgids only
+// arrive via the experimental.chat.messages.transform hook (harvested into
+// opencode-msgids' per-session store by harvestMsgIdsTransform); the wire
+// body only exists at fetch time. So the alignment runs HERE, at the shared
+// fetch chokepoint — proving the harvested turn POSITIONALLY against the
+// ACTUAL wire (alignedMsgIdsForWire), never a verbatim copy of the stored
+// list: two concurrent same-session LLM requests can interleave
+// (A-transform, B-transform, A-fetch), and only the fetch-time re-proof
+// converts that race from a mis-pin into a degrade. Anthropic-wire only
+// (opencode's LLM egress); a turn pins only when every message lowers 1:1 to
+// one core (pure-text user/assistant) — tool/reasoning parts or any
+// count/role/text drift drop the whole list to content-derived, exactly like
+// the incremental lane. The server re-proves count parity + canonical shape
+// and strips the field before any upstream forward (#2821).
+const V1_ENVELOPE_MSG_IDS_HEADER = "x-bili-msg-ids"; // == the server's header channel (handle.ts)
+const V1_ENVELOPE_MAX_IDS = 4096;      // == server parser budget (msgid-pin.ts)
+const V1_ENVELOPE_MAX_BYTES = 16 * 1024; // == stampedMsgIdsHeaderFromMessages budget
+export async function opencodeV1EnvelopeBeforeSend(_url: string, init: RequestInit | undefined): Promise<void> {
+    try {
+        if (init === undefined || typeof init.body !== "string" || init.body.length === 0) return;
+        // The incremental lane owns converted turns (delta body + its own
+        // msgIds channel) — never re-stamp a diverted request (same guard as
+        // dsh's envelope, review m2). Never clobber an already-present header
+        // either (a V2 request stamps its own).
+        const headers = new Headers(init.headers);
+        if (headers.has(INCREMENTAL_TURN_MARKER_HEADER) || headers.has(V1_ENVELOPE_MSG_IDS_HEADER)) return;
+        const parsed: unknown = JSON.parse(init.body);
+        if (parsed === null || typeof parsed !== "object") return;
+        const b = parsed as { model?: unknown; messages?: unknown };
+        if (typeof b.model !== "string" || !Array.isArray(b.messages)) return;
+        if (!wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only
+        const sid = headers.get("x-bili-plugin-conversation");
+        if (typeof sid !== "string" || sid.trim().length === 0) return;
+        const ids = alignedMsgIdsForWire(sid.trim(), b.messages);
+        // #5403/#5418: feed the shared watermark channel with the SAME proven
+        // list — undefined (any misalignment) CLEARS the slot; the chokepoint
+        // emitter degrades to count-only rather than riding a stale anchor.
+        // (This replaces the dead host-shaped pfCaptureIds call that sat in
+        // harvestMsgIdsTransform and could only ever clear the slot.)
+        pfChannel.pfCaptureIds(sid.trim(), ids);
+        // #7064 §8 phase 2 (owner 2026-11-18): steady-state turns ride the
+        // TAIL form on this same header (anchor + new cores from the
+        // previous full list) — the server's two-form rule accepts it and
+        // pins the prefix from the ledger (anthropic lane); the mode
+        // signal on the response flips this switch on. Full form stays the
+        // bootstrap / reanchor / degraded shape.
+        const sendIds = pfChannel.pfIdTailForm(sid.trim(), ids) ?? ids;
+        if (sendIds === undefined || sendIds.length === 0 || sendIds.length > V1_ENVELOPE_MAX_IDS) return;
+        const joined = sendIds.join(",");
+        if (Buffer.byteLength(joined, "utf8") > V1_ENVELOPE_MAX_BYTES) return;
+        headers.set(V1_ENVELOPE_MSG_IDS_HEADER, joined);
+        init.headers = headers;
+    } catch {
+        // never break the host's request on adapter failure
+    }
+}
+
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
 // #3304: the opencode swap stamps the turn id atomically with the body, so the
 // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
@@ -304,6 +361,9 @@ state.directPrefixes = zcodeDirectPrefixes(process.env);
 // #5032: arm the guard's second window source — the V1 header stamp never runs
 // on the no-proxy path, so without this arm the reader was always empty there.
 state.declaredWindowForDirect = opencodeDeclaredWindowForDirect;
+// #6525/#6539: full-resend envelope for the V1 lane — armed at the shared
+// chokepoint (fires for every routed V1 model request; see the function).
+state.beforeSend = opencodeV1EnvelopeBeforeSend;
 
 async function bootstrap(): Promise<string | undefined> {
     try {
@@ -532,6 +592,11 @@ interface V1ToolContext {
     messageID?: string;
     agent?: string;
     abort?: AbortSignal;
+    // #7505: Tool.Context.id — the host's tool-call id (opencode schema/tool.ts
+    // CallID), the same id that rides the model wire and is resent verbatim.
+    // Forward it so the server can key the fold block on it and drop the
+    // redundant inline anchor (see dsh-native.ts ToolExec for the twin).
+    id?: string;
 }
 
 interface V1Tool {
@@ -697,7 +762,7 @@ export interface V1NativeDeps {
     z?: ZodLike;
     /** Tool forwarder (tests inject; runtime POSTs /__bili/plugin/tool). #2204:
      *  carries the business outcome so failures surface as host errors. */
-    forward?: (origin: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => Promise<ForwardedToolResult>;
+    forward?: (origin: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean, toolCallId?: string) => Promise<ForwardedToolResult>;
     /** Absorbed opencode-acp for legacy sessions (#920); when present its DCP
      *  tool slots serve BOTH lanes (legacy → acp executor, new → forward). */
     legacy?: LegacyAcpModule;
@@ -727,13 +792,12 @@ function lastSessionFromMessages(messages: unknown): string | undefined {
  *  "context" seam registered in createOpencodeV2Setup). Never mutates the
  *  host's messages. */
 const harvestMsgIdsTransform = async (input: unknown, output: { messages?: unknown }): Promise<void> => {
+    // #4491: record the latest messages.transform fire per session (the ONLY
+    // opencode seam carrying host ids). The wire-shape alignment + delivery
+    // happens at fetch time in opencodeV1EnvelopeBeforeSend — the host shape
+    // ({info, parts}) cannot be aligned here (that was a dead call: it fed
+    // host objects to a wire-shape proof that then always cleared the slot).
     harvestOpencodeMsgIds(lastSessionFromMessages(output?.messages), output?.messages);
-    // #5403/#5418 unified watermark channel: feed the ONE chokepoint emitter
-    // with the SAME validated 1:1 list the harvest just aligned — undefined
-    // (any misalignment) CLEARS the previous list; the emitter degrades to
-    // count-only rather than sending a stale anchor.
-    const sid = (input === null || typeof input !== "object" ? undefined : (input as { sessionID?: unknown }).sessionID);
-    if (typeof sid === "string" && sid.length > 0) pfChannel.pfCaptureIds(sid, alignedMsgIdsForWire(sid, output?.messages));
 };
 
 // #1135: dynamic origin getter instead of a captured constant — after a
@@ -771,7 +835,11 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
         void (async () => {
             try {
                 const res = await get({ path: { id: sid } });
-                const parent = res?.data?.parentID;
+                // #5509: UI user forks store parent_id NULL — their lineage rides
+                // data.fork.sessionID instead; prefer it, fall back to parentID.
+                const data = res?.data;
+                const forkParent = typeof data?.fork?.sessionID === "string" ? data.fork.sessionID : "";
+                const parent = forkParent.length > 0 ? forkParent : data?.parentID;
                 if (typeof parent === "string" && parent.length > 0 && parent !== sid) {
                     await postIdentityRegister(base, sid, "opencode", parent);
                     derivedReported.set(sid, "done");
@@ -895,7 +963,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
             }
             maybeReportDerived(base, input.sessionID);
         };
-        const forward = deps.forward ?? ((o, conversationId, tool, args, nativeCaller) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args, undefined, nativeCaller === true)));
+        const forward = deps.forward ?? ((o, conversationId, tool, args, nativeCaller, toolCallId) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args, undefined, nativeCaller === true, toolCallId)));
         if (legacy !== undefined) {
             // Tool slots carry acp's DCP schemas (kernel-parseable object form)
             // for BOTH lanes; executors route per session. acp_context_recap
@@ -913,7 +981,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         }
                         const base = getOrigin();
                         if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                        const out = await forward(base, v1ctx.sessionID, name, args, true);
+                        const out = await forward(base, v1ctx.sessionID, name, args, true, v1ctx.id);
                         // #2204: V1 tool results are plain strings — a business
                         // failure throws so the host renders an error, not text.
                         if (out.failed) throw new Error(out.text);
@@ -933,7 +1001,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         execute: async (args, v1ctx) => {
                             const base = getOrigin();
                             if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                            const out = await forward(base, v1ctx.sessionID, fn.name, args, true);
+                            const out = await forward(base, v1ctx.sessionID, fn.name, args, true, v1ctx.id);
                             // #2204: same as the legacy-lane slot above — plain-string
                             // results have no error flag, so failures throw.
                             if (out.failed) throw new Error(out.text);

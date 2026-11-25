@@ -18,12 +18,13 @@ process.env.XDG_STATE_HOME = dir;
 const { featureOverrideAbsent, ROLLOUT_FEATURES } = await import("../src/rollout.js");
 const { PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID, dismissedUpgradeNotices, dismissUpgradeNotice } = await import("../src/pck-notice.js");
 
-test("wm fastpath: baked plan stays EXPERIMENTAL grey at 5%", () => {
-    // GA flip was retracted (owner 2026-11-02): small cohort first, web
-    // switch + intro notice ship alongside. A regression to 100 would be
-    // shipping an unreviewed-by-users trust-model change.
+test("wm fastpath: baked plan is GA at 100% (owner ruling 2026-11-22)", () => {
+    // 2026-11-02: the GA flip was retracted (small cohort first). 2026-11-22
+    // (PR #6785): the owner re-ruled GA after the grey ran ~3 weeks without
+    // issues — "已经跑过很长时间 问题不大". Re-pinned 5 → 100 with that
+    // justification; an accidental flip back to a grey percent fails here.
     const plan = ROLLOUT_FEATURES["pluginFullResendWatermark"];
-    assert.equal(plan.percent, 5);
+    assert.equal(plan.percent, 100);
 });
 
 test("#5403 unit: featureOverrideAbsent — nags only users who never chose", () => {

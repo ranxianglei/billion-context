@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DSH_BUILD_CHECK, emitNewerClientBuildNote, maxTestedVersion, newerClientBuildMessage, walkUpNodeModuleVersion } from "../src/agent/client-build-note.ts";
+import { DSH_BUILD_CHECK, emitNewerClientBuildNote, isDshGoHost, maxTestedVersion, newerClientBuildMessage, walkUpNodeModuleVersion } from "../src/agent/client-build-note.ts";
 
 const DSH_PKG = "node_modules/@deepseek-ai/dsh/package.json";
 
@@ -161,5 +161,25 @@ test("emitNewerClientBuildNote: channels and tri-state outcomes", () => {
         console.warn = origWarn;
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = prevXdg;
         fs.rmSync(logDir, { recursive: true, force: true });
+    }
+});
+
+test("isDshGoHost: the runtime-root stamp decides, blank counts as absent (#6588)", () => {
+    assert.equal(isDshGoHost({}), false, "unset: every other host shape");
+    assert.equal(isDshGoHost({ DSH_GO_RUNTIME_ROOT: "" }), false, "empty string is not a stamp");
+    assert.equal(isDshGoHost({ DSH_GO_RUNTIME_ROOT: "   " }), false, "whitespace-only is not a stamp");
+    assert.equal(isDshGoHost({ DSH_GO_RUNTIME_ROOT: "/data/user/0/io.github.ccch1mneyyy.dsh_app/files/runtime/rootfs" }), true);
+    assert.equal(isDshGoHost({ DSH_GO_RUNTIME_ROOT: "  /opt/rootfs  " }), true, "surrounding whitespace still stamps the host");
+});
+
+test("isDshGoHost: the argument-less default reads the live process.env (#6588)", () => {
+    const prev = process.env.DSH_GO_RUNTIME_ROOT;
+    try {
+        delete process.env.DSH_GO_RUNTIME_ROOT;
+        assert.equal(isDshGoHost(), false, "unset in the live env: not the dsh-go host");
+        process.env.DSH_GO_RUNTIME_ROOT = "/data/user/0/io.github.ccch1mneyyy.dsh_app/files/runtime/rootfs";
+        assert.equal(isDshGoHost(), true, "the production call site passes no argument");
+    } finally {
+        if (prev === undefined) delete process.env.DSH_GO_RUNTIME_ROOT; else process.env.DSH_GO_RUNTIME_ROOT = prev;
     }
 });
