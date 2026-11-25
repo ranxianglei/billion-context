@@ -2938,6 +2938,13 @@ export async function pipePluginChatWithStrip(
     // (pre-#7666 behavior); 0 = off; the zero-byte-cut budget (#2171) stays
     // independent of this one.
     degenerateRetryMaxAttempts?: number,
+    // #4913: how an EXHAUSTED degenerate-turn retry (the budget spent with no
+    // usable output) is terminated — "passthrough" passes the empty turn
+    // through as a normal completion (pre-#870, the shape the proxy lane and
+    // the responses wire already take); "error" (default, = omitted) emits the
+    // #870 in-band stream error. Threaded from ProxyOptions.degenerateTurn
+    // (compat.degenerateTurn / BILI_DEGENERATE_TURN).
+    degenerateTurn?: "error" | "passthrough",
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -3173,12 +3180,46 @@ export async function pipePluginChatWithStrip(
             return false;
         }
         if (res.destroyed || res.writableEnded) return false;
+        // A turn the model left genuinely bare — no thought, no stripped echo,
+        // no released markup — is the upstream's own empty answer, not a stall:
+        // re-issuing it double-bills an empty completion (#732/#821 keep the
+        // same boundary in the compress loop). A draft-tail turn is NOT bare:
+        // it delivered a full handoff draft, which is precisely the stall signal.
+        // #4913: this gate must run BEFORE the exhausted-retry branch below —
+        // it was written under it, where a spent retry budget made it
+        // unreachable, so a retry attempt the model left genuinely bare died
+        // as a fatal in-band error instead of taking the pass-through #2756
+        // documents for the same shape on the first pass. On the retry pass
+        // the per-attempt accumulators were reset when the retry took over
+        // (below), so this measures THIS attempt, not signals inherited from
+        // the first.
+        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !stalledTail) {
+            log?.(degenerateRetries > 0
+                ? `[plugin] degenerate terminal turn not retried (bare on the retry pass: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756/#4913) — passing the empty turn through`
+                : `[plugin] degenerate terminal turn not retried (bare: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
+            return false;
+        }
         if (degenerateRetries >= maxDegenerateRetries) {
-            // Every nudge re-issue degenerated too. An empty turn is
-            // indistinguishable from a model that produced nothing and the
-            // session reads as idle while it is dead, so the client gets an
-            // error the host would never surface (#870).
-            log?.(`[plugin] degenerate terminal turn again after ${degenerateRetries} continuation nudge(s); emitting an in-band error (#870)`);
+            // The retry budget is spent and the last attempt was NOT bare (the
+            // gate above): it really did produce thinking or stripped output
+            // and still ended with nothing the host can act on. Default
+            // terminal: an in-band error the host would never surface on its
+            // own — an empty turn is indistinguishable from a model that
+            // produced nothing and the session reads as idle while it is dead
+            // (#870).
+            // #4913: compat.degenerateTurn="passthrough" (env BILI_DEGENERATE_TURN
+            // wins) opts a host back into the pre-#870 shape — the empty turn
+            // passes through as a normal completion, the same terminal the
+            // proxy lane and the responses wire already take for this
+            // condition (they never had this fatal branch).
+            if (degenerateTurn === "passthrough") {
+                log?.(`[plugin] degenerate terminal turn again after ${degenerateRetries} continuation nudge(s): passing the empty turn through (compat.degenerateTurn="passthrough", #4913): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, stalledTail=${stalledTail}, visibleTextChars=${visibleTextChars}, answerChars=${answerChars}, finishReason=${reason}`);
+                return false;
+            }
+            // #4913: name the signal that qualified the attempt. The
+            // accumulators now measure this attempt only (reset below when the
+            // retry takes over), so "again" is measured, not inherited.
+            log?.(`[plugin] degenerate terminal turn again after ${degenerateRetries} continuation nudge(s); emitting an in-band error (#870): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, stalledTail=${stalledTail}, visibleTextChars=${visibleTextChars}, answerChars=${answerChars}, finishReason=${reason}`);
             // #5958: the terminal shape follows the configured streamErrorShape
             // (default protocol → a native error frame the host records as a
             // failure) instead of the old hard-wired completed-turn shape, which
@@ -3193,15 +3234,6 @@ export async function pipePluginChatWithStrip(
                 : `the turn degenerated again after ${degenerateRetries} continuation nudges`,
                 undefined, streamErrorShape, { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
             return true;
-        }
-        // A turn the model left genuinely bare — no thought, no stripped echo,
-        // no released markup — is the upstream's own empty answer, not a stall:
-        // re-issuing it double-bills an empty completion (#732/#821 keep the
-        // same boundary in the compress loop). A draft-tail turn is NOT bare:
-        // it delivered a full handoff draft, which is precisely the stall signal.
-        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !stalledTail) {
-            log?.(`[plugin] degenerate terminal turn not retried (bare: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
-            return false;
         }
         degenerateRetries += 1;
         const attemptNote = maxDegenerateRetries > 1 ? ` (attempt ${degenerateRetries}/${maxDegenerateRetries})` : " once";
@@ -3227,6 +3259,21 @@ export async function pipePluginChatWithStrip(
         // lastChunkMeta.finishReason by design, so a mid-retry flush would
         // otherwise hand the client a chunk carrying the stale reason.
         delete lastChunkMeta["finishReason"];
+        // #4913: per-attempt observability accumulators belong to the attempt
+        // they were set on. Without this reset the retry pass inherits the
+        // first attempt's signals (its thinking, its stripped echo, its
+        // released markup), so "degenerated again" reports the FIRST
+        // attempt's activity and the bare gate above false-qualifies a retry
+        // the model left bare. proseAcc deliberately keeps all attempts: the
+        // #361 tool-call-XML warn and the #3456 phantom-attachment scan are
+        // per-request by design; diag*/blocksForwarded/seenToolCalls are
+        // stream-level and stay untouched.
+        sawThinking = false;
+        sawStrippedEcho = false;
+        sawToolUse = false;
+        visibleTextChars = 0;
+        answerProse = "";
+        releasedMarkupChars = 0;
         retryIndexOffset = blocksForwarded;
         inRetry = true;
         // The first attempt's held filter state belongs to text the client never

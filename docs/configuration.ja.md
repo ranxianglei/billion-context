@@ -124,6 +124,7 @@
 | `compat.roles` | record role → role | {} | — | メッセージロールを上流が受け入れる名前にマッピングします（例：developer→system）；完全一致ロールのみ、プロバイダーごとのエントリがキーごとに優先されます。 |
 | `compat.dropFields` | string[] (dot paths) | [] | — | 未知のフィールドで 400 を返す厳格スキーマゲートウェイ向けに、転送されるすべてのボディからドットパスフィールドを削除します；グローバル + プロバイダーごとのリストは加算的に統合されます。 |
 | `compat.streamErrorShape` | "protocol" \| "completion" | protocol | BILI_STREAM_ERROR_SHAPE | 200 がコミットされた後、上流ストリーム失敗がどのように提示されるか：プロトコルネイティブのエラーフレーム（デフォルト）またはレガシーの合成完了形状。 |
+| `compat.degenerateTurn` | "error" \| "passthrough" | error | BILI_DEGENERATE_TURN | プラグインチャットパイプで退化ターンのリトライ後も利用可能な出力がゼロだった場合の終了処理（#4913）：インバンドストリームエラー（デフォルト、#870）または空ターンを通常の完了として通過させる（#870 以前）。 |
 | `compat.noCacheControl` | boolean | false | BILI_NO_CACHE_CONTROL | Anthropic レーンの cache_control ブレークポイントを完全にスタンプしないようにします（独自のブレークポイントポリシーを持つ上流/リレー用のエスケープハッチ）。 |
 | `compat.keepResponseId` | boolean | false | ACP_KEEP_RESPONSE_ID | カーネル再構築された Responses リクエストで previous_response_id を保持します（デフォルトでは削除するため、再構築されたボディは上流が発行したことのない ID を参照しません）。 |
 | `dsh` | object | {} | BILI_ALLOW_DSH_COMPACTION | セクションは認識されるが、従来のエスケープハッチは削除された（#3666、#2028 を代替）：`allowDshCompaction` キーおよび `BILI_ALLOW_DSH_COMPACTION` 環境変数はもはや存在しない — dsh ネイティブコンパクションは、すべてのレーンにおいてワイヤガードによって無条件に拒否される。残存する `dsh.allowDshCompaction` の値は、一度限りの非推奨警告とともに無視される；代わりにホスト側の抑制を適用すること（#3354/#2474）。ライブキー — `dsh.authoredCompaction`、`dsh.contextTab`、`dsh.contextTabLabel` — は以下のエントリに文書化されている。 |
@@ -551,13 +552,14 @@
   ```
 ### `compat`
 
-- **Type:** `{ roles?: Record<string, string>; dropFields?: string[]; streamErrorShape?: "protocol" | "completion"; noCacheControl?: boolean; keepResponseId?: boolean }`
+- **Type:** `{ roles?: Record<string, string>; dropFields?: string[]; streamErrorShape?: "protocol" | "completion"; degenerateTurn?: "error" | "passthrough"; noCacheControl?: boolean; keepResponseId?: boolean }`
 - **Default:** `{}` (無効)
 - **Status:** ACTIVE
 - **Description:** グローバルなワイヤー互換ロールマップ。`roles` はメッセージのロールを、アップストリームが受け入れるロール名にマッピングします。例: `{"compat":{"roles":{"developer":"system"}}}` は、`developer` ロールを拒否するアップストリーム（#552、新しい codex クライアント）に対して、最終転送ボディ内で `developer` → `system` に書き換えます。`openai` の chat-completions と `responses` リクエストに適用されます。完全一致するロールのみ対象であり、ボディ内の他の部分は変更されません。再送信される compress-retry ボディにも同じ書き換えが適用されます。プロバイダーごとの `compat.roles` エントリ（[Providers](#providers) 参照）はキーごとに優先されます。デフォルトの `{}` では、ボディはバイト単位で変更なしに転送されます。
 - **Learn-on-failure:** compat が設定されていない場合、アップストリームからの `400 Invalid role: …` は自動修正されます — bili は問題のあるロールを `system` に書き換え、1回リトライし、そのマッピングを**セッションスコープ**（セッション内のメモリ上；設定ファイルには書き込まれない）で記憶します。そのセッション内の後続のリクエストでは、400 の往復がスキップされます。修正が発火した際に出力される情報ログには、恒久的なプロバイダーごとのスニペットが含まれます。
 - **dropFields:** 最終転送ボディから削除するフィールドのドットパスリスト — クライアントが常に送信するがアップストリームが受け付けないフィールドを拒否する厳格スキーマのアップストリーム向け（#1757）。パスはプレーンオブジェクトのセグメントのみ使用可能（`reasoning.summary`）；ワイルドカードと配列インデックスはサポートされていません；存在しないパスや非オブジェクトの中間要素はサイレントにスキップされます；文字列値は決して検査・変更されません — 構造キーのみ対象であり、ツール引数やメッセージコンテンツはバイト単位で正確に保たれます。`roles` と異なり、すべてのワイヤープロトコル（任意の JSON リクエストボディ）に適用されます。グローバルとプロバイダーごとのリストは**加算的に**（和集合）マージされます — プロバイダーエントリはパスを追加できますが、グローバルのものを撤回することはできません。最終送信ボディのロールマッピング / 出力ステアリングの後（プロンプトキャッシュスタンプの前）に適用され、compress-retry ループが再送信するすべてのボディおよび逐語パススルー転送にも適用されます。一致するフィールドのないボディはバイト単位で変更なしに転送されます；1つ以上のフィールドが実際に削除された場合、削除されたパスを記録する情報行がログ出力されます。オプトインのみ — v1 では learn-on-failure はありません: `"compat":{"dropFields":["reasoning.summary"]}`。
 - **streamErrorShape:** アップストリームストリーム失敗が、200 レスポンスがすでにコミットされた後に anthropic/openai ワイヤー上でどのように提示されるか（`"protocol"`（デフォルト）または `"completion"`）。`protocol` はプロトコルネイティブの失敗チャネルに乗ります — anthropic/responses は `event: error` フレームを受け取り、openai はトップレベルの `error` フレームに続けて `[DONE]` を受け取ります — これによりクライアントは「このターンが失敗した」と「このターンが完了した」を区別し、独自のリトライロジックを維持できます（#1455: 従来の合成された `end_turn`/`finish_reason` は、死んだターンを通常の完了として装い、クライアントのリトライ予算をサイレントに消費していました）。`completion` は、インバンドエラーイベントを表面化できない SDK を持つホストのために、そのレガシー形状（合成された正常な完了内の失敗テキスト）を復元します。設定ファイル: `"compat":{"streamErrorShape":"completion"}`；環境変数 `BILI_STREAM_ERROR_SHAPE` が優先されます。google ワイヤーのみ影響を受けません（すでにネイティブエラーフレームを使用）；responses ワイヤーでは、このノブはサーバーサイドの終了を合成されたアイテムライフサイクル完了から `event: error` フレームに変更します（ループ内での終了はすでに `response.failed` 経由でネイティブでした）。
+- **degenerateTurn:** プラグインチャットパイプで、退化ターミナルターン（#2756 ゲート）がその一度の継続リトライ再発行（#732/#821）後も依然として利用可能な出力がゼロだった場合（＝リトライも空で終了した場合）の終了処理（`"error"`（デフォルト）または `"passthrough"`）。`error` は #870 のインバンドストリームエラーを送出する：空ターンはそれ以外では「モデルが何も生成しなかった」と区別がつかず、セッションは死んでいるのにアイドルと読み取られ、ホストがそれを自発的に表には出さない — 提示形状は `streamErrorShape` に従う。`passthrough` は #870 以前の終了に戻すオプトイン：空ターンを通常の完了として通過させる — プロキシレーンと responses ワイヤーがこの条件に対してすでに取っている同じ終了（両者に致命的な分岐は元々ない）。設定ファイル：`"compat":{"degenerateTurn":"passthrough"}`；環境変数 `BILI_DEGENERATE_TURN` が優先。影響するのはプラグインチャットレーンのみ；不明な値は `"error"` にフォールバック。（#4913：致命的な終了には以前は出口がなかった — thinking のみで応答するローカルモデルに固定されたホストはパススルーの復元を必要としていた。）
 - **noCacheControl:** (`#2030`) `true` にすると、bili の Anthropic レーンでの `cache_control` ブレークポイントスタンプが無効になります — フィールドを拒否するアップストリームや、独自のブレークポイントポリシーを持つリレーのためのエスケープハッチです。環境変数 `BILI_NO_CACHE_CONTROL` が優先されます；完全なメカニクスはその[環境変数エントリ](#environment-variables)を参照してください。
 - **keepResponseId:** (`#2030`) `true` にすると、カーネル再構築された Responses リクエストで `previous_response_id` を保持し、ストリップしません（デフォルトではストリップするため、再構築されたボディは、書き換えられた入力に対してアップストリームが発行しなかったレスポンス ID を参照することはありません）。環境変数 `ACP_KEEP_RESPONSE_ID=1` が優先されます。
 
@@ -1984,6 +1986,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
+| `BILI_DEGENERATE_TURN` | `compat.degenerateTurn` | error |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |
 | `BILI_DSH_CONTEXT_TAB` | `dsh.contextTab` | true |
 | `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
