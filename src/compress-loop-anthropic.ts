@@ -44,7 +44,7 @@
 
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
 import { isProxyToolFor } from "./absorb.js";
-import { withSessionLock } from "./session.js";
+import { lastCompressSuffix, withSessionLock } from "./session.js";
 import { drainPendingRetrievals } from "./store.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
@@ -153,7 +153,8 @@ export async function compressLoopAnthropicJson(
             undefined,
             options.signal,
         ).catch((e) => {
-            if (e instanceof UpstreamHttpError) log(`[acp-proxy: non-stream anthropic loop upstream error ${e.status}: ${e.body.slice(0, 200)}]`);
+            // #4885: same last-fold attribution as the streaming loop's error line.
+            if (e instanceof UpstreamHttpError) log(`[acp-proxy: non-stream anthropic loop upstream error ${e.status}: ${e.body.slice(0, 200)}${lastCompressSuffix(session.lastCompress)}]`);
             throw e;
         });
         try {

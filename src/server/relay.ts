@@ -52,7 +52,7 @@ import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipe
 import { describeCoreTextDuplication, formatForwardFieldSizes, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
-import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
+import { diagnoseSuccessWithoutUsage, lastCompressSuffix, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
 import { adoptContentStore, ccrLoopConfig, commitRetrievalNotes, commitRetrievals, contentStoreOf, dropRetrievals } from "../store.js";
 import { emitStreamError } from "../stream-error.js";
 import { rewriteGoogleJsonResponseAsync } from "../stream-google.js";
@@ -2186,7 +2186,10 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // this line byte-identical to before). Read-only: no recovery decision
         // here depends on it.
         const terminalCause = rejectionDiagnosticSuffix(bodyText);
-        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}${terminalCause}`);
+        // #4885: attribute the rejection to the session's last fold when one
+        // happened — a thinking-400 right after a compress is the split signature.
+        const lc = lastCompressSuffix(prepared?.session?.lastCompress);
+        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}${terminalCause}${lc}`);
         // #7537 (owner ruling 2026-11-22): local estimate-refusals are gone —
         // when the UPSTREAM itself rejects the body as too large, its verdict
         // is authoritative. bili logs its own measurement as evidence and marks

@@ -8,6 +8,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { getSession } from "../src/session.ts";
 import { activeThrottleHolds, _resetUpstreamThrottleForTest, noteUpstreamThrottle429 } from "../src/upstream-throttle.ts";
 
 /** #2 field report: a relay answered 400 "请求参数无效" for 34 minutes and
@@ -101,6 +102,30 @@ test("non-2xx upstream: body passes through verbatim and proxy logs warn with st
         assert.ok(warn, `expected warn log, got: ${captured.map((c) => c.msg).join(" | ")}`);
         assert.match(warn.msg, /请求参数无效/);
         assert.match(warn.msg, /request-id=202608190253469928499778268d9d6MaylrIZ3/);
+        assert.doesNotMatch(warn.msg, /\[after compress/, "no fold happened: the line stays byte-identical (no attribution suffix, #4885)");
+    } finally {
+        setLogCapture(null);
+        await close(proxy);
+        await close(upstream);
+    }
+});
+
+test("upstream 400 after a fold carries the last-fold attribution on the warn line (#4885)", async () => {
+    const errorBody = JSON.stringify({ error: { message: "thinking or redacted_thinking blocks in the latest assistant message cannot be modified" } });
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(errorBody);
+    });
+    const { proxy, proxyPort, upstreamPort, captured } = await startProxyWith(upstream);
+    try {
+        const session = getSession("fold-attr-1");
+        session.lastCompress = { at: Date.now(), shrinkRatio: 0.42, foldPoint: "m00013", blocks: 1, tokensCompressed: 12345 };
+        const resp = await postChat(proxyPort, upstreamPort, "gpt-test", "fold-attr-1");
+        assert.equal(resp.status, 400);
+        await resp.text();
+        const warn = captured.find((c) => c.level === "warn" && c.msg.includes("← upstream 400"));
+        assert.ok(warn, `expected warn log, got: ${captured.map((c) => c.msg).join(" | ")}`);
+        assert.match(warn.msg, /\[after compress: shrink 42% foldPoint=m00013 blocks=1 ~12345tok\]/);
     } finally {
         setLogCapture(null);
         await close(proxy);
