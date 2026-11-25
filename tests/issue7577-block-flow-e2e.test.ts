@@ -43,6 +43,7 @@ import { join } from "node:path";
 const hermetic = mkdtempSync(join(tmpdir(), "bili-egress-block-e2e-hermetic-"));
 process.env.BILI_CONFIG_FILE = join(hermetic, "no-config.json");
 process.env.BILI_STORAGE_UNIFIED = "full";
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";

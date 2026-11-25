@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
+import { rebuildCoreFromLog } from "./storage/egress-serve.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -1504,8 +1505,45 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     return out;
 }
 
+/** #7658 wiring 2: the egress op-log snapshot source. An egress-on
+ *  session's unified leg is frozen, so once the in-memory raw snapshot is
+ *  gone (dropOverCap under BILI_PUBLIC_SNAPSHOT_CAP_BYTES, or a cold
+ *  process whose reconstruction only sees the frozen-at-arm-point rows)
+ *  the flow is the ONLY place that still holds the full history — and it
+ *  is the content authority by ruling 7439-5, same source the lane serves
+ *  from. Last resort after the raw snapshot and the raw-tail
+ *  reconstruction, so sessions where those still work keep today's
+ *  behavior. */
+function egressOpLogSource(session: Session): CoreMessage[] | null {
+    if (session.metadata.egressAuthority !== true) return null;
+    const st = getStore().egressOpLogStore();
+    if (!st) return null;
+    // The view read is a FLOW REPLAY — it throws EgressStateCorruptError on a
+    // damaged log (the same hard-fail the lanes hit every request). This
+    // helper runs in the fork route OUTSIDE its structured-error try, so a
+    // damaged parent must degrade to "no source" (a clean 409
+    // SNAPSHOT_UNAVAILABLE from forkSnapshot) rather than an unhandled 500.
+    // The child's own recovery walk decides the copied log's health.
+    let view;
+    try {
+        view = st.egressStateView(session.id);
+    } catch (err) {
+        loggerLog("warn", `[plugin] egress op-log fork source unreadable for ${session.id} — fork falls through to the next source: ${String(err)}`);
+        return null;
+    }
+    return view.length > 0 ? rebuildCoreFromLog(view) : null;
+}
+
+/** #7658 wiring 2: ONE source chain for the snapshot identity AND the
+ *  child's inherited pluginSnapshot — the two must agree, so both ride
+ *  this helper (the fork route used to compute the first two links on its
+ *  own and null-slice when only the op-log fallback had a source). */
+function forkSourceOf(session: Session, source?: CoreMessage[] | null): CoreMessage[] | null {
+    return source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session) ?? egressOpLogSource(session);
+}
+
 function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
-    const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
+    const messages = forkSourceOf(session, source);
     if (!messages) {
         const capped = session.metadata.publicSnapshotCapped === true;
         const base = capped ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
@@ -1805,7 +1843,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
             // #5140 item 4: a cold non-retained parent has no resident snapshot;
             // stand in with the verified unified raw tail (no fresh model call).
-            const source = parent.pluginSnapshot ?? reconstructRawTailForFork(parent);
+            const source = forkSourceOf(parent);
             let snapshot: ReturnType<typeof forkSnapshot>;
             try { snapshot = forkSnapshot(parent, source); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
@@ -1926,7 +1964,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
             child.metadata.publicSnapshotTextComparable = true;
             child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
-            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
+            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens", "egressAuthority"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
             child.metadata.parentConversationId = request.parentConversationId;
             child.metadata.parentRevision = request.parentRevision;
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
@@ -2895,6 +2933,11 @@ export async function pipePluginChatWithStrip(
     // #5951: the requesting host already classifies this cut and retries on its
     // own budget — the proxy must not spend a second one.
     hostOwnsTruncationRecovery = false,
+    // #7666: degenerate-terminal retry budget (compress.degenerateRetry.
+    // maxAttempts, three-level resolved by the caller). Absent/undefined = 1
+    // (pre-#7666 behavior); 0 = off; the zero-byte-cut budget (#2171) stays
+    // independent of this one.
+    degenerateRetryMaxAttempts?: number,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -3071,7 +3114,12 @@ export async function pipePluginChatWithStrip(
     // terminal event is dropped when the retry takes over, so the client sees
     // one turn: its framing stays open, and the retry's content blocks are
     // shifted past the ones already streamed.
-    let degenerateRetried = false;
+    // #7666: the budget is a COUNT, not a flag — up to maxDegenerateRetries
+    // nudge re-issues per turn (default 1 = old one-shot; 0 = off), each with
+    // its own nudge sentence (the refetch closure rotates them). The
+    // zero-byte-cut re-issue (#2171) keeps its own independent one-shot.
+    const maxDegenerateRetries = Math.max(0, Math.min(5, Math.floor(degenerateRetryMaxAttempts ?? 1)));
+    let degenerateRetries = 0;
     let truncationRetried = false;
     let forwardedAny = false;
     let inRetry = false;
@@ -3085,11 +3133,12 @@ export async function pipePluginChatWithStrip(
      *  the tag-echo case, where the filter empties the only text block and the
      *  host aborts an empty completed turn. Returns true when the retry stream
      *  took over, in which case the caller drops the terminal event of the
-     *  attempt it came from. Consults truncationRetried: a request whose stream
-     *  already spent its one re-issue on a zero-visible cut (#2171) cannot also
-     *  re-send on a degenerate completion — one re-issue per request, total. */
+     *  attempt it came from. #7666: up to maxDegenerateRetries re-issues per
+     *  turn (each with a fresh nudge sentence); the zero-byte-cut re-issue
+     *  (#2171) no longer shares this budget — each retry kind keeps its own
+     *  one-shot, so a turn may spend one of each. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
-        if (refetch === undefined || truncationRetried) return false;
+        if (refetch === undefined || maxDegenerateRetries === 0) return false;
         // #2303: a terminal turn whose visible prose ends with a compression-draft
         // closing tag and no tool call is non-converged even though it has visible
         // text — the model wrote a handoff/compression draft in prose instead of
@@ -3124,11 +3173,12 @@ export async function pipePluginChatWithStrip(
             return false;
         }
         if (res.destroyed || res.writableEnded) return false;
-        if (degenerateRetried) {
-            // The retry degenerated too. An empty turn is indistinguishable from a
-            // model that produced nothing and the session reads as idle while it is
-            // dead, so the client gets an error the host would never surface (#870).
-            log?.("[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870)");
+        if (degenerateRetries >= maxDegenerateRetries) {
+            // Every nudge re-issue degenerated too. An empty turn is
+            // indistinguishable from a model that produced nothing and the
+            // session reads as idle while it is dead, so the client gets an
+            // error the host would never surface (#870).
+            log?.(`[plugin] degenerate terminal turn again after ${degenerateRetries} continuation nudge(s); emitting an in-band error (#870)`);
             // #5958: the terminal shape follows the configured streamErrorShape
             // (default protocol → a native error frame the host records as a
             // failure) instead of the old hard-wired completed-turn shape, which
@@ -3138,7 +3188,10 @@ export async function pipePluginChatWithStrip(
             // #2689: hand the emitter the client-known stream state — the error
             // block opens at the next free index (blocksForwarded), and no
             // message_start is synthesized when the first attempt already sent one.
-            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge", undefined, streamErrorShape, { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
+            emitStreamError(res, protocol, degenerateRetries === 1
+                ? "the turn degenerated again after the continuation nudge"
+                : `the turn degenerated again after ${degenerateRetries} continuation nudges`,
+                undefined, streamErrorShape, { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
             return true;
         }
         // A turn the model left genuinely bare — no thought, no stripped echo,
@@ -3150,12 +3203,13 @@ export async function pipePluginChatWithStrip(
             log?.(`[plugin] degenerate terminal turn not retried (bare: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
             return false;
         }
-        degenerateRetried = true;
+        degenerateRetries += 1;
+        const attemptNote = maxDegenerateRetries > 1 ? ` (attempt ${degenerateRetries}/${maxDegenerateRetries})` : " once";
         log?.(announceTail
-            ? "[plugin] terminal turn is a bare announcement (ends mid-promise, no tool call); retrying once with a continuation nudge (#3905)"
+            ? `[plugin] terminal turn is a bare announcement (ends mid-promise, no tool call); retrying${attemptNote} with a continuation nudge (#3905)`
             : draftTail
-              ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
-              : "[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
+              ? `[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying${attemptNote} with a continuation nudge (#2303)`
+              : `[plugin] degenerate terminal turn (no usable output); retrying${attemptNote} with a continuation nudge (#732/#821)`);
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -3200,12 +3254,13 @@ export async function pipePluginChatWithStrip(
      *  hung attempt never produced a usage frame, so the retry is
      *  unambiguously safe: no duplication risk (nothing was delivered), no
      *  side effects (stateless completion), zero billing for the dead attempt.
-     *  Shares the single stream-level re-issue budget with retryEmptyTurn so a
-     *  request re-sends at most once; anything parsed, held, or written keeps
-     *  the #721 in-band error (partial content must not be regenerated). */
+     *  #7666: keeps its OWN one-shot re-issue budget (truncationRetried),
+     *  independent of the degenerate-terminal retry budget — a turn may spend
+     *  one of each. Anything parsed, held, or written keeps the #721 in-band
+     *  error (partial content must not be regenerated). */
     const retryZeroByteCut = async (): Promise<boolean> => {
         if (refetch === undefined) return false;
-        if (degenerateRetried || truncationRetried) return false;
+        if (truncationRetried) return false;
         // Zero-visible predicate: no framing opened, no content block started,
         // no prose accumulated or held by the tag filter, no unparseable frame
         // forwarded verbatim, no partial SSE event left in the buffer.
@@ -3242,9 +3297,10 @@ export async function pipePluginChatWithStrip(
      *  transcript, which is the cheaper failure. An answer, a tool call, a partial
      *  argument stream, released markup or a stripped echo still keep the #721
      *  in-band error: regenerating real output would corrupt the turn.
-     *  Shares the single stream-level re-issue budget with retryEmptyTurn and
-     *  retryZeroByteCut, and reuses the mid-turn framing so the retry's blocks
-     *  land after the ones the client already saw. A dangling partial SSE event
+     *  #7666: own one-shot budget (truncationRetried), independent of the
+     *  degenerate-terminal retry budget, like retryZeroByteCut. Reuses the
+     *  mid-turn framing so the retry's blocks land after the ones the client
+     *  already saw. A dangling partial SSE event
      *  left in `buf` is dropped rather than refusing the replay: those bytes were
      *  never written to the client, and the abandoned attempt's filter state goes
      *  with them. `blocksForwarded` keeps the anthropic wire out of this path -
@@ -3252,7 +3308,7 @@ export async function pipePluginChatWithStrip(
      *  accounting belong to the client. */
     const retryReasoningOnlyCut = async (cause?: unknown): Promise<boolean> => {
         if (refetch === undefined) return false;
-        if (degenerateRetried || truncationRetried) return false;
+        if (truncationRetried) return false;
         // Nothing at all reached the client: retryZeroByteCut owns that shape.
         if (!sawThinking) return false;
         // `proseAcc` is not consulted here: the fast path folds reasoning text into
@@ -3314,7 +3370,7 @@ export async function pipePluginChatWithStrip(
         ...(cause === "read-error" && readError !== undefined ? { readError: describeReadError(readError) } : {}),
         ...(cause === "read-error" && readError !== undefined ? { readErrorCause: describeReadErrorCause(readError) } : {}),
         retryZeroByteCutSpent: truncationRetried,
-        retryDegenerateSpent: degenerateRetried,
+        retryDegenerateSpent: degenerateRetries > 0,
         // #5951: the replay predicate's inputs, so a refused cut names the clause
         // that refused it instead of only the read error.
         replay: {
@@ -4486,6 +4542,9 @@ export async function pipePluginResponsesWithStrip(
     upstreamMeta?: UpstreamMeta,
     reply?: HandoffReply,
     hostOwnsTruncationRecovery = false,
+    // #7666: degenerate-terminal retry budget (compress.degenerateRetry.
+    // maxAttempts, three-level resolved by the caller). See the chat-pipe twin.
+    degenerateRetryMaxAttempts?: number,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -4572,7 +4631,11 @@ export async function pipePluginResponsesWithStrip(
     // output_item.added releases them early instead — clients require
     // done(itemN) before added(itemN+1) (#1061) — so by the terminal only the
     // last item's family can still be held.
-    let degenerateRetried = false;
+    // #7666: up to maxDegenerateRetries nudge re-issues per turn (see the
+    // chat-pipe twin); this lane has no #870 in-band error — an exhausted
+    // budget passes the empty turn through instead.
+    const maxDegenerateRetries = Math.max(0, Math.min(5, Math.floor(degenerateRetryMaxAttempts ?? 1)));
+    let degenerateRetries = 0;
     let truncationRetried = false;
     let forwardedAny = false;
     let inRetry = false;
@@ -4608,12 +4671,13 @@ export async function pipePluginResponsesWithStrip(
      *  observed relay failure returns 200 + event-stream headers, never emits
      *  a single data frame, and is cut ~180s later; a manual re-send always
      *  heals with a warm prefix cache and the dead attempt bills nothing, so
-     *  the retry is unambiguously safe. Shares the single stream-level
-     *  re-issue budget with retryEmptyTurn; anything parsed, held, or written
-     *  keeps the #721 in-band error. */
+     *  the retry is unambiguously safe. #7666: own one-shot budget
+     *  (truncationRetried), independent of the degenerate-terminal retry
+     *  budget; anything parsed, held, or written keeps the #721 in-band error.
+     *  */
     const retryZeroByteCut = async (): Promise<boolean> => {
         if (refetch === undefined) return false;
-        if (degenerateRetried || truncationRetried) return false;
+        if (truncationRetried) return false;
         // Zero-visible predicate: no item framing held, no status observed, no
         // prose accumulated or held by the filters, no verbatim frame
         // forwarded, no partial SSE event left in the buffer.
@@ -4799,7 +4863,7 @@ export async function pipePluginResponsesWithStrip(
         ...(cause === "read-error" && readError !== undefined ? { readError: describeReadError(readError) } : {}),
         ...(cause === "read-error" && readError !== undefined ? { readErrorCause: describeReadErrorCause(readError) } : {}),
         retryZeroByteCutSpent: truncationRetried,
-        retryDegenerateSpent: degenerateRetried,
+        retryDegenerateSpent: degenerateRetries > 0,
         // #5951: see the chat-pipe twin — the responses lane has no reasoning-only
         // replay, so `replayAvailable` is the field that says so on a cut.
         replay: {
@@ -4849,8 +4913,11 @@ export async function pipePluginResponsesWithStrip(
      *  Returns true when the retry stream took over, in which case the caller
      *  drops the held done-family events AND the completion it came from. */
     const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
-        // truncationRetried: one re-issue per request, total — see the chat-pipe twin.
-        if (degenerateRetried || truncationRetried || refetch === undefined) return false;
+        // #7666: budget is the configured degenerate count, NOT a shared
+        // stream-level one-shot — the truncation re-issues keep their own
+        // budget (see the chat-pipe twin).
+        if (refetch === undefined || maxDegenerateRetries === 0) return false;
+        if (degenerateRetries >= maxDegenerateRetries) return false;
         // #2303: same shape as the chat-pipe twin — visible prose ending in a
         // compression-draft closing tag with no function call is non-converged.
         // #2612: except when the request itself demands that shape (client
@@ -4882,12 +4949,13 @@ export async function pipePluginResponsesWithStrip(
             log?.(`[plugin] degenerate terminal turn not retried (bare: no reasoning, no stripped echo): visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars} (#2756)`);
             return false;
         }
-        degenerateRetried = true;
+        degenerateRetries += 1;
+        const attemptNote = maxDegenerateRetries > 1 ? ` (attempt ${degenerateRetries}/${maxDegenerateRetries})` : " once";
         log?.(announceTail
-            ? "[plugin] terminal turn is a bare announcement (ends mid-promise, no function call); retrying once with a continuation nudge (#3905)"
+            ? `[plugin] terminal turn is a bare announcement (ends mid-promise, no function call); retrying${attemptNote} with a continuation nudge (#3905)`
             : draftTail
-              ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
-              : "[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+              ? `[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying${attemptNote} with a continuation nudge (#2303)`
+              : `[plugin] degenerate terminal turn (no visible output); retrying${attemptNote} with a continuation nudge (#732/#821)`);
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();

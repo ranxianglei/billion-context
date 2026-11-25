@@ -39,6 +39,8 @@ import { splitMediaContent, identityOfStoredContent } from "./identity.js";
  * (#4192). The loader rebuilds the state object in exactly this order.
  */
 import { COMPRESSION_STATE_FIELDS as MERGE_STATE_FIELDS } from "../state-hydration.js";
+import { KSTATE_RESIDUAL_FIELDS } from "./egress-block.js";
+import { featureEnabled } from "../rollout.js";
 
 /** Fields owned by dedicated tables/columns — never inside kstate_json. */
 const TABLE_OWNED_FIELDS = new Set(["blocks", "messageRefs", "deadRefs", "nextBlockId", "nextRunId"]);
@@ -499,8 +501,9 @@ function finishPlan(
     const seqById = new Map<string, number>();
     for (const e of log) if (!seqById.has(e.msgId)) seqById.set(e.msgId, e.seq);
 
+    const completedViews = completeBlockContents(session.blockContents, session.state.blocks);
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
-        const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
+        const views = completedViews.get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
         const summaryJson = JSON.stringify(full);
@@ -592,10 +595,24 @@ function finishPlan(
     // Excluding them keeps the column bounded (<2KB residual sidecar).
     const egressOn = session.metadata["egressAuthority"] === true;
     const KSTATE_TRIM_FIELDS = new Set(["tsStamps", "tokenSnapshot", "lastPassIds"]);
+    // #7658 PR-B: the write-side half of the kstate retirement. When an
+    // egress-on session DOES get a unified write (the arm point, or the first
+    // legacy ingest after the plane rolls back with a stale in-memory state),
+    // the column carries ONLY the bounded residual — the same field set the
+    // block-ledger sidecar carries. Everything else (blocks, messageRefs,
+    // tsStamps, tokenSnapshot, lastPassIds) is rebuildable from the op log at
+    // load (rebuildEgressKstateOverlay); storing it would only grow the
+    // column and create a second, stale authority. 0 = legacy double-write.
+    // NOTE: an armed egress-on session's unified legs are frozen anyway
+    // (egressProjectionFrozen) — this gate covers the arm-point and
+    // rollback-window writes.
+    const retireWrites = egressOn && featureEnabled("egressKstateRetireWrites");
+    const KSTATE_RESIDUAL_SET = new Set<string>(KSTATE_RESIDUAL_FIELDS);
     const kstateRaw: Record<string, unknown> = {};
     for (const field of MERGE_STATE_FIELDS) {
         if (TABLE_OWNED_FIELDS.has(field)) continue;
         if (egressOn && KSTATE_TRIM_FIELDS.has(field)) continue;
+        if (retireWrites && !KSTATE_RESIDUAL_SET.has(field)) continue;
         const v = (session.state as Record<string, unknown>)[field];
         if (v !== undefined) kstateRaw[field] = v;
     }

@@ -54,7 +54,7 @@ import { collectRequestIds, probeRequestMembership } from "../request-membership
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { currentCalibrationFactor } from "../util.js";
 import { yieldToEventLoop } from "../yield-loop.js";
-import { egressAuthorityArmed, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -602,7 +602,7 @@ export async function prepareAnthropic(
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinMode === "incremental", sideRequest: anthropicTitleGen });
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
-                const served = recordAuthorityTurn(st, sessionId, auth, extractSystem(systemOut) ?? "", log);
+                const served = recordAuthorityTurn(st, sessionId, auth, extractSystem(systemOut) ?? "", log, egressBlockLedgerFor(session));
                 if (served !== null) {
                     rebuiltMessages = coreToAnthropic(served, anthropicCacheMarks ?? clientCacheControls);
                 }

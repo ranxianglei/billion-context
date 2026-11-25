@@ -2924,7 +2924,16 @@ export class SessionStore {
             id: cid,
             meta: structuredClone(parent.meta),
             stats: structuredClone(parent.stats),
-            metadata: { ...parent.metadata, derivedFromSessionId: sessionId },
+            metadata: (() => {
+                // The unreadable latch is a per-session failure state (ruling
+                // 7439-5): the parent's damaged log must not mark the fork as
+                // unreadable — the child got its own verbatim copy, and whether
+                // THAT is healthy is decided by the child's own first recovery
+                // walk.
+                const { egressFlowUnreadable: _dropped, ...rest } = parent.metadata;
+                void _dropped;
+                return { ...rest, derivedFromSessionId: sessionId };
+            })(),
             state: structuredClone(parent.state),
             blockContents: new Map([...(parent.blockContents ?? new Map()).entries()].map(([k, v]) => [k, structuredClone(v)])),
             lastMessages: parent.lastMessages ? structuredClone(parent.lastMessages) : undefined,

@@ -63,7 +63,7 @@ interface EgressRecordSourceMsg {
     text?: unknown;
 }
 import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
-import { resolveEgressAuthority, egressAuthorityArmed } from "./egress-lane-io.js";
+import { resolveEgressAuthority, egressAuthorityArmed, egressBlockLedgerFor } from "./egress-lane-io.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
@@ -714,6 +714,7 @@ export async function prepareOpenai(
                         conversation: egressMessages,
                         systemText: openaiOutboundSystem,
                         nowMs: Date.now(),
+                        blockLedger: egressBlockLedgerFor(session),
                     });
                     const reb = rebuildOutboundFromLog(view);
                     if (reb !== null) {
@@ -972,6 +973,7 @@ export async function prepareOpenai(
                     conversation: egressRecordSource ?? (processedMessages.length > 0 ? processedMessages : originalMessages),
                     systemText: openaiOutboundSystem ?? openaiSystemText,
                     nowMs: Date.now(),
+                    blockLedger: egressBlockLedgerFor(session),
                 });
             }
         } catch (err) {
