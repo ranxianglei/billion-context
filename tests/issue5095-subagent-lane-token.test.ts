@@ -26,8 +26,12 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 // The legacy per-fingerprint/per-fragment fallback lanes were retired with
 // the trust-stamped-id GA (2026-11-23); the negatives assert that.
 
+// #7714: no billing-attribution block in these fixtures — it rotates per turn
+// and is excluded from the identity view (the fix under test), so a fixture
+// carrying one would make the expected lane keys below wrong. The billing
+// exclusion itself is pinned in tests/issue7714-billing-header-identity.test.ts.
 const MAIN_SYSTEM = ["You are Claude Code, Anthropic's official CLI for Claude. You are an interactive agent..."];
-const SUB_AGENT_SYSTEM = ["x-anthropic-billing-header: cc_version=...", "You are a Claude agent, built on Anthropic's...", "You are a file search specialist for..."];
+const SUB_AGENT_SYSTEM = ["You are a Claude agent, built on Anthropic's...", "You are a file search specialist for..."];
 
 const tag = (blocks: string[]): string => blocks.join("\n\n");
 const fp16 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex").slice(0, 16);
