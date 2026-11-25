@@ -370,10 +370,11 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)
 CREATE INDEX IF NOT EXISTS idx_content_refcount ON content(refcount);
 `;
 
-/** The full v1 shape (core + legacy). Fresh legacy instances, tests, and
- *  the backup-repair fresh copy use it; the egress-mode open path splits
- *  it (see migrateSchema's opts). */
-export const STORAGE_DDL_V1 = STORAGE_DDL_V1_CORE + "\n" + STORAGE_DDL_V1_LEGACY;
+/** The full v1 shape (core + legacy). INTERNAL_ONLY — migrateSchema uses
+ *  _CORE/_LEGACY directly and the only consumer is the test alias below
+ *  (STORAGE_DDL_V1_FOR_TESTS); the egress-mode open path splits it (see
+ *  migrateSchema's opts). */
+const STORAGE_DDL_V1 = STORAGE_DDL_V1_CORE + "\n" + STORAGE_DDL_V1_LEGACY;
 
 /** #5874 snapshot foundation v2 (pure-incremental, 2026-11-15 owner ruling) —
  *  one additive table for the stage-0 identity ledger. The original four-table
@@ -546,8 +547,10 @@ CREATE TABLE IF NOT EXISTS egress_block_state (
 );
 `;
 
-/** egress-mode table creation gate (KDD #25, discussions/7735). */
-export interface MigrateSchemaOptions {
+/** egress-mode table creation gate (KDD #25, discussions/7735).
+ *  INTERNAL_ONLY — callers pass an object literal (structural typing);
+ *  no other module imports the name. */
+interface MigrateSchemaOptions {
     /** When false, the 9 legacy unified-projection tables are NOT created
      *  on a fresh database (only the core trio sessions/session_ext/
      *  kv_store plus the probed l1/orphan/state/egress groups follow the
