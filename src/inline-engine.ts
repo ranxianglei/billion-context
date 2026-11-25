@@ -374,6 +374,7 @@ function makeHttpDispatch(ctx: EngineContext): InlineEngine["dispatchHttp"] {
             const e = err as { name?: string; message?: string };
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
             if (clientAbort) ctx.log("info", `client aborted mid-stream: ${msg}`);
+            else if (isUpstreamTerminated(err)) ctx.log("error", `${msg} — ${describeUpstreamTerminated(err)}`);
             else if (err instanceof Error && err.stack) ctx.log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
             else ctx.log("error", msg);
             if (res.destroyed) return;
