@@ -88,6 +88,15 @@ process.env.BILI_CONFIG_FILE = path.join(
 // Absent everywhere now resolves to the shadow DEFAULT (#2815 rollout flip);
 // this suite needs the explicit legacy baseline — per-test legs override it.
 process.env.BILI_STORAGE_UNIFIED = "legacy";
+// ci:full branch (egress family default 100): scope this suite off the egress
+// PLANE. With the plane on, the openai lane SERVES the outbound conversation
+// from the op log for every session (egress-serve.ts, seg 4b) — recorded bytes
+// are replayed verbatim, so a folded summary carrier keeps its <acp> tag while
+// the legacy restart re-renders it without one (measured: turn 13 diverges on
+// all four wires; kstate pair and storage tier alone stay byte-equal). That is
+// egress-serve behavior — pinned by the egress suites — not storage-tier
+// invisibility, which is this suite's contract (goldens pre-date the plane).
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 
 const CORPUS_ROOT = path.resolve(import.meta.dirname, "golden/storage-corpus");
 const RENDER_ROOT = path.resolve(import.meta.dirname, "golden/storage-render");
