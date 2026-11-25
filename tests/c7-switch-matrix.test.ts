@@ -12,15 +12,27 @@
  *  Every cell asserts the contract a switching host can rely on:
  *   1. the switched turn is 200 (never a 500/unreadable);
  *   2. the upstream saw the target wire's URL shape (the switch happened);
- *   3. pinned host ids survive (the op-log swap matched by id — no
- *      "pin rejected" drift line for the cell);
- *   4. the op log stayed alive (the session still has a live view);
- *   5. no cross-lane rendering crash (the response came back shaped).
+ *   3. EXACT live-set equality on the op log: every pinned host id survives
+ *      the switch (the op-log swap matched by id across wires), no row is
+ *      lost, no undeleted row survives the fold's D-ops;
+ *   4. the [lane-switch] line: exactly one, correct direction, for wire /
+ *      both switches — and NONE for a model-only switch on the same wire;
+ *   5. no pin rejection, no egress-unreadable degradation, no kernel
+ *      transform crash (a crash = raw forward = unrecorded).
  *
- *  Fold-active cells first force a REAL kernel fold (tiny window, long
- *  history) and verify the flow shrank — then switch on top of the fold.
- *  Fork cells fork the egress snapshot (point copy) and drive the CHILD's
- *  first turn on the target wire.
+ *  Turn shape: every turn re-sends the FULL current history (how pinned
+ *  hosts actually behave — 7577/Lane W style) and appends one new element,
+ *  reusing the existing host ids. The shared exchange is deliberately
+ *  element-aligned across all four wires (user / assistant tool-call /
+ *  tool-result — no assistant text, so no per-wire element-count drift and
+ *  no split siblings; the split case is covered by
+ *  tests/crosslane-wire-pin.test.ts and the pin unit tests).
+ *
+ *  Fold-active cells model the pinned host's own context management: turn 1
+ *  records the long history, the switch turn re-sends the folded view —
+ *  compact summary + fresh tail, NEW ids — and the op-log diff must emit
+ *  D-ops for every deleted row. Fork cells fork the egress snapshot (point
+ *  copy) and drive the CHILD's first turn on the target wire.
  */
 process.env.BILI_PERSIST_ZSTD = "0";
 import assert from "node:assert/strict";
@@ -128,68 +140,77 @@ test("C7 switch matrix: {model, wire, both} × {bootstrap, steady, fold, fork} a
             assert.equal(await race(store!.afterNextFlush(sessionId), 15_000), true, `${sessionId}: second flush settled`);
         };
 
-        /** One openai-lane turn with an agentic 3-element history. Returns
-         *  the element ids (host-stamped). */
-        const openaiTurn = async (sid: string, n: number, model: string, ids: string[]): Promise<void> => {
-            const r = await post("/v1/chat/completions", sid, {
-                model,
-                stream: false,
-                max_tokens: 1024,
-                messages: [
-                    { role: "user", content: `q${n}` },
-                    { role: "assistant", content: "talking", tool_calls: [{ id: `call_${n}`, type: "function", function: { name: "t", arguments: "{}" } }] },
-                    { role: "tool", tool_call_id: `call_${n}`, content: "result" },
-                ],
-                biliMsgIds: ids,
-            });
-            assert.equal(r.status, 200, `openai turn ${n} -> ${r.status}: ${r.body.slice(0, 200)}`);
+        const SLOTS: Record<string, Array<Record<string, unknown>>> = {
+            openai: [
+                { role: "user", content: "q1" },
+                { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "t", arguments: "{}" } }] },
+                { role: "tool", tool_call_id: "call_1", content: "result" },
+            ],
+            anthropic: [
+                { role: "user", content: [{ type: "text", text: "q1" }] },
+                { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "t", input: {} }] },
+                { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "result" }] },
+            ],
+            responses: [
+                { role: "user", content: "q1" },
+                { type: "function_call", name: "t", arguments: "{}", call_id: "call_1" },
+                { type: "function_call_output", call_id: "call_1", output: "result" },
+            ],
+        };
+        const wireOf = (p: string) => (p === "/v1/messages" ? "anthropic" : p === "/v1/responses" ? "responses" : "openai");
+        /** One full-history turn on any wire: the 3 shared slots (ids
+         *  prefix[0..2]), every prior tail element (same ids, same texts),
+         *  plus the one NEW tail element (`newTail`). A pinned host re-sends
+         *  its whole conversation each turn — this models exactly that. */
+        const fullTurn = async (path: string, model: string, sid: string, prefix: string[], tails: string[], newTail: string): Promise<void> => {
+            const w = wireOf(path);
+            const tailEls = [...tails, newTail].map((id) =>
+                w === "anthropic"
+                    ? { role: "user", content: [{ type: "text", text: `msg ${id}` }] }
+                    : { role: "user", content: `msg ${id}` });
+            const body: Record<string, unknown> = {
+                model, stream: false, max_tokens: 1024,
+                biliMsgIds: [...prefix, ...tails, newTail],
+                ...(path === "/v1/responses" ? { input: [...SLOTS[w], ...tailEls], max_output_tokens: 1024 } : { messages: [...SLOTS[w], ...tailEls] }),
+            };
+            const r = await post(path, sid, body);
+            assert.equal(r.status, 200, `${path} turn (new ${newTail}) -> ${r.status}: ${r.body.slice(0, 200)}`);
+            assert.ok(r.body.includes("ok"), `the response came back shaped (${r.body.slice(0, 120)})`);
             await settle(sid);
         };
-        /** The switched turn on the target wire. */
-        const switchTurn = async (kind: Kind, sid: string, ids: string[]): Promise<void> => {
-            const t = TARGETS[kind];
-            const body: Record<string, unknown> = { model: t.model, stream: false, max_tokens: 1024, biliMsgIds: ids };
-            if (t.path === "/v1/messages") {
-                body.messages = [
-                    { role: "user", content: [{ type: "text", text: `q${ids.length}` }] },
-                    { role: "assistant", content: [{ type: "text", text: "talking" }, { type: "tool_use", id: `call_${ids.length}`, name: "t", input: {} }] },
-                    { role: "user", content: [{ type: "tool_result", tool_use_id: `call_${ids.length}`, content: "result" }] },
-                ];
-            } else if (t.path === "/v1/responses") {
-                body.input = [
-                    { role: "user", content: `q${ids.length}` },
-                    { type: "function_call", name: "t", arguments: "{}", call_id: `call_${ids.length}` },
-                    { type: "function_call_output", call_id: `call_${ids.length}`, output: "result" },
-                ];
-            } else {
-                body.messages = [
-                    { role: "user", content: `q${ids.length}` },
-                    { role: "assistant", content: "talking", tool_calls: [{ id: `call_${ids.length}`, type: "function", function: { name: "t", arguments: "{}" } }] },
-                    { role: "tool", tool_call_id: `call_${ids.length}`, content: "result" },
-                ];
-            }
-            const r = await post(t.path, sid, body);
-            assert.equal(r.status, 200, `${kind} switch -> ${r.status}: ${r.body.slice(0, 300)}`);
-            assert.ok(r.body.includes("ok"), `${kind} switch: the response came back shaped (${r.body.slice(0, 120)})`);
-            await settle(sid);
+
+        /** Live (non-system) msgids of the session's egress flow. */
+        const liveIds = (sid: string): string[] => (store!.egressOpLogStore()?.egressStateView(sid) ?? []).filter((v) => v.msgid !== "egress-system").map((v) => v.msgid);
+        /** Assert the live set CONTAINS the expected host ids and holds NO
+         *  id outside the expected set — catches both missing pins and
+         *  undeleted rows (e.g. a fold that failed to emit its D-ops). */
+        const expectLive = (sid: string, expected: string[], label: string): void => {
+            const live = liveIds(sid);
+            const missing = expected.filter((id) => !live.includes(id));
+            const extra = live.filter((id) => !expected.includes(id));
+            assert.deepEqual(missing, [], `${label}: every pinned id must be in the live flow (missing: ${missing}); live: ${live.join(",")}`);
+            assert.deepEqual(extra, [], `${label}: no undeleted rows may survive (extra: ${extra}); live: ${live.join(",")}`);
         };
+        /** The [lane-switch] lines for `sid` logged since mark, if any. */
+        const laneSwitchLines = (mark: number, sid: string): string[] => logs.slice(mark).filter((l) => l.includes("[lane-switch]") && l.includes(sid));
 
         const cell = async (kind: Kind, phase: Phase): Promise<void> => {
             let sid = `c7-${kind}-${phase}`;
             const logMark = logs.length;
             const seenMark = seen.length;
-            const ids = ["h0", "h1", "h2"];
-            let switched: string[] = [];
-            let switchOnFold = false;
+            let expectedLive: string[] = [];
+            let switchStep: { prefix: string[]; tails: string[]; newTail: string } | null = null;
             switch (phase) {
                 case "bootstrap":
-                    await openaiTurn(sid, 1, MODEL_A, ["b0", "b1", "b2"]);
-                    switched = ids;
+                    await fullTurn("/v1/chat/completions", MODEL_A, sid, ["a0", "a1", "a2"], [], "a3");
+                    expectedLive = ["a0", "a1", "a2", "a3"];
+                    switchStep = { prefix: ["a0", "a1", "a2"], tails: ["a3"], newTail: "a4" };
                     break;
                 case "steady":
-                    await openaiTurn(sid, 1, MODEL_A, ["s0", "s1", "s2"]);
-                    await openaiTurn(sid, 2, MODEL_A, ["s3", "s4", "s5"]);
-                    switched = ids;
+                    await fullTurn("/v1/chat/completions", MODEL_A, sid, ["a0", "a1", "a2"], [], "a3");
+                    await fullTurn("/v1/chat/completions", MODEL_A, sid, ["a0", "a1", "a2"], ["a3"], "a4");
+                    expectedLive = ["a0", "a1", "a2", "a3", "a4"];
+                    switchStep = { prefix: ["a0", "a1", "a2"], tails: ["a3", "a4"], newTail: "a5" };
                     break;
                 case "fold": {
                     // A pinned host manages its own context: turn 1 sends the long
@@ -201,6 +222,8 @@ test("C7 switch matrix: {model, wire, both} × {bootstrap, steady, fold, fork} a
                     const r1 = await post("/v1/chat/completions", sid, { model: MODEL_A, stream: false, max_tokens: 1024, messages: long, biliMsgIds: long.map((_, i) => `f${i}`) });
                     assert.equal(r1.status, 200, `fold-prime turn -> ${r1.status}: ${r1.body.slice(0, 200)}`);
                     await settle(sid);
+                    const primedLive = liveIds(sid);
+                    assert.ok(primedLive.length >= 100, `the prime turn recorded the full history (${primedLive.length} live rows)`);
                     // the switch turn carries the folded view on the target wire
                     const t = TARGETS[kind];
                     const folded: Record<string, unknown> = { model: t.model, stream: false, max_tokens: 1024, biliMsgIds: ["fs0", "fs1", "fs2"] };
@@ -218,52 +241,36 @@ test("C7 switch matrix: {model, wire, both} × {bootstrap, steady, fold, fork} a
                     const r2 = await post(t.path, sid, folded);
                     assert.equal(r2.status, 200, `fold+switch turn -> ${r2.status}: ${r2.body.slice(0, 200)}`);
                     await settle(sid);
-                    const view = store!.egressOpLogStore()?.egressStateView(sid) ?? [];
-                    const liveMsgs = view.filter((v) => v.msgid !== "egress-system").length;
-                    if (liveMsgs >= 20) console.log("FOLD2-DEBUG", logs.filter((l) => /iterable|error|warn|egress|fold|record|blocks/.test(l)).slice(-40).join("\n").slice(-4000));
-                    assert.ok(liveMsgs < 20, `the fold shrank the flow via D-ops (${liveMsgs} live rows vs 100 sent; tail: ${view.slice(-5).map((v) => v.msgid).join(",")})`);
-                    switchOnFold = true;
+                    const liveAfterFold = liveIds(sid);
+                    assert.ok(liveAfterFold.length < 20, `the fold shrank the flow via D-ops (${liveAfterFold.length} live rows vs 100 sent; tail: ${liveAfterFold.slice(-5).join(",")})`);
+                    assert.deepEqual(liveAfterFold, ["fs0", "fs1", "fs2"], `EXACT live set after the fold: the 100 prime rows (f0..f99) must all be D-ed, leaving exactly the folded view`);
+                    expectedLive = ["fs0", "fs1", "fs2"];
                     break;
                 }
                 case "fork": {
-                    await openaiTurn(sid, 1, MODEL_A, ["p0", "p1", "p2"]);
+                    await fullTurn("/v1/chat/completions", MODEL_A, sid, ["p0", "p1", "p2"], [], "p3");
+                    const parentBefore = liveIds(sid);
+                    assert.deepEqual(parentBefore.sort(), ["p0", "p1", "p2", "p3"].sort(), `fork: the parent's live set must be exactly its pinned ids; got ${parentBefore.join(",")}`);
                     const child = `${sid}-child`;
                     const forked = await (store as unknown as { forkEgressSnapshot: (s: string, c?: string) => Promise<{ childId: string }> }).forkEgressSnapshot(sid, child);
                     assert.equal(forked.childId, child);
-                    const r = await post(TARGETS[kind].path, child, {
-                        model: TARGETS[kind].model,
-                        stream: false,
-                        max_tokens: 1024,
-                        biliMsgIds: ["p0", "p1", "p2", "p3"],
-                        ...(TARGETS[kind].path === "/v1/messages"
-                            ? { messages: [
-                                { role: "user", content: [{ type: "text", text: "q1" }] },
-                                { role: "assistant", content: [{ type: "text", text: "talking" }, { type: "tool_use", id: "call_1", name: "t", input: {} }] },
-                                { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "result" }] },
-                                { role: "user", content: [{ type: "text", text: "after fork" }] },
-                            ] }
-                            : TARGETS[kind].path === "/v1/responses"
-                                ? { input: [
-                                    { role: "user", content: "q1" },
-                                    { type: "function_call", name: "t", arguments: "{}", call_id: "call_1" },
-                                    { type: "function_call_output", call_id: "call_1", output: "result" },
-                                    { role: "user", content: "after fork" },
-                                ] }
-                                : { messages: [
-                                    { role: "user", content: "q1" },
-                                    { role: "assistant", content: "talking", tool_calls: [{ id: "call_1", type: "function", function: { name: "t", arguments: "{}" } }] },
-                                    { role: "tool", tool_call_id: "call_1", content: "result" },
-                                    { role: "user", content: "after fork" },
-                                ] }),
-                    });
-                    assert.equal(r.status, 200, `${kind}/fork child turn -> ${r.status}: ${r.body.slice(0, 300)}`);
-                    await settle(child);
+                    // the child's FIRST turn is already on the target wire, reusing
+                    // every inherited host id and appending one new element
+                    await fullTurn(TARGETS[kind].path, TARGETS[kind].model, child, ["p0", "p1", "p2"], ["p3"], "p4");
+                    const childLive = liveIds(child);
+                    assert.deepEqual(childLive.sort(), ["p0", "p1", "p2", "p3", "p4"].sort(), `${kind}/fork: the child must inherit EVERY parent flow row and add exactly the new element; child live: ${childLive.join(",")}`);
+                    const parentAfter = liveIds(sid);
+                    assert.deepEqual(parentAfter.sort(), ["p0", "p1", "p2", "p3"].sort(), `${kind}/fork: the parent must be untouched by the child's turn (point copy, not a shared log); parent live: ${parentAfter.join(",")}`);
                     sid = child;
-                    switched = ["p0", "p1", "p2", "p3"];
+                    expectedLive = ["p0", "p1", "p2", "p3", "p4"];
                     break;
                 }
             }
-            if (phase !== "fork" && !switchOnFold) await switchTurn(kind, sid, switched);
+            if (switchStep) {
+                const t = TARGETS[kind];
+                await fullTurn(t.path, t.model, sid, switchStep.prefix, switchStep.tails, switchStep.newTail);
+                expectedLive = [...switchStep.prefix, ...switchStep.tails, switchStep.newTail];
+            }
 
             // ---- the contract assertions ---------------------------------
             const tailLogs = logs.slice(logMark);
@@ -274,10 +281,23 @@ test("C7 switch matrix: {model, wire, both} × {bootstrap, steady, fold, fork} a
             const last = seen.slice(seenMark).at(-1);
             const wantUrl = t.path === "/v1/messages" ? "/v1/messages" : t.path === "/v1/responses" ? "/v1/responses" : "/v1/chat";
             assert.ok(last && last.url.includes(wantUrl), `${kind}/${phase}: the upstream saw the target wire (${last?.url}); seen tail: ${JSON.stringify(seen.slice(seenMark).map((e) => e.url))}`);
-            const live = store!.snapPinLiveIds(sid);
+            const live = liveIds(sid);
             assert.ok(live.length > 0, `${kind}/${phase}: the op log stayed alive (${live.length} ids)`);
             const view = store!.egressOpLogStore()?.egressStateView(sid) ?? [];
             assert.ok(view.length > 0, `${kind}/${phase}: the live view exists`);
+            // ---- exact-set + lane-switch log assertions -------------------
+            expectLive(sid, expectedLive, `${kind}/${phase}: exact live set — every pinned id survives the switch, nothing extra, nothing lost`);
+            const laneLines = laneSwitchLines(logMark, sid);
+            if (kind === "model") {
+                assert.deepEqual(laneLines, [], `${kind}/${phase}: a MODEL switch on the same wire must NOT log a lane switch: ${laneLines.join(" | ")}`);
+            } else {
+                // covers the fork cells too: forkEgressSnapshot inherits the
+                // parent's lane baseline, so the child's first turn on another
+                // wire is ALSO reported as a switch (inherited openai -> target)
+                assert.equal(laneLines.length, 1, `${kind}/${phase}: exactly ONE [lane-switch] line for the switch turn: ${laneLines.join(" | ")}`);
+                const dir = kind === "wire" ? "openai -> anthropic" : "openai -> responses";
+                assert.ok(laneLines[0].includes(dir), `${kind}/${phase}: the lane-switch line must name the direction ${dir}: ${laneLines[0]}`);
+            }
             console.log(`  ✓ ${kind}/${phase} — ${t.label}: ${live.length} pinned ids, ${view.length} live rows`);
         };
 
