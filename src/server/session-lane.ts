@@ -71,7 +71,9 @@ function observeInbound(messages: readonly unknown[]): LaneLockedEvidence {
         if (typeof b.text === "string" && b.text.includes(REDACTED_PLACEHOLDER)) redacted++;
         if (b.imagePart === true || b.imageBase64 !== undefined) images++;
         if (b.toolIsError === true) toolErrors++;
-        if ((b.role as string) === "system" || (b.role as string) === "developer") midSystem++;
+        // i>0: the leading system/developer line is normal host behavior, not a
+        // mid-body system message — counting it would over-report the loss list.
+        if (i > 0 && ((b.role as string) === "system" || (b.role as string) === "developer")) midSystem++;
     });
     if (signed > 0) e.signedThinking = signed;
     if (redacted > 0) e.redacted = redacted;
@@ -93,7 +95,7 @@ function renderLosses(e: LaneLockedEvidence): string {
     const parts: string[] = [];
     if (e.signedThinking) parts.push(`${e.signedThinking} signed thinking block(s) -> plain text (signatures are lane-private, never re-attested)`);
     if (e.redacted) parts.push(`${e.redacted} redacted-thinking placeholder(s) -> stay placeholders`);
-    if (e.images) parts.push(`${e.images} image(s) -> re-rendered as data-URL / "[image]" text`);
+    if (e.images) parts.push(`${e.images} image(s) -> re-rendered per wire from the media sidecars (faithful); the text marker only when bytes are unstorable`);
     if (e.toolErrors) parts.push(`${e.toolErrors} tool-error result(s) -> the error flag only rides the anthropic wire`);
     if (e.midSystem) parts.push(`${e.midSystem} mid-body system/developer message(s) -> re-voiced per wire`);
     return parts.length > 0

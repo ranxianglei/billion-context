@@ -103,9 +103,10 @@ test("switch + fold across three wires: exact live sets, folds before AND after 
                 lastUpstreamBody = Buffer.concat(chunks).toString("utf8");
                 const seen = MARKERS.filter((mk) => lastUpstreamBody.includes(mk)).length;
                 const model = (() => { try { return (JSON.parse(lastUpstreamBody)?.model as string) ?? "?"; } catch { return "?"; } })();
-                const json = req.url.includes("/v1/messages")
+                const url = req.url ?? "";
+                const json = url.includes("/v1/messages")
                     ? { id: "sfdb-m", type: "message", role: "assistant", model, content: [{ type: "text", text: `MARKERS: ${seen}` }], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 2 } }
-                    : req.url.startsWith("/v1/responses")
+                    : url.startsWith("/v1/responses")
                         ? { id: "sfdb-r", object: "response", model, status: "completed", output: [{ type: "message", id: "m1", status: "completed", role: "assistant", content: [{ type: "output_text", text: `MARKERS: ${seen}`, annotations: [] }] }], usage: { input_tokens: 10, output_tokens: 2 } }
                         : { id: "sfdb-c", object: "chat.completion", model, choices: [{ index: 0, message: { role: "assistant", content: `MARKERS: ${seen}` }, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } };
                 res.writeHead(200, { "content-type": "application/json" });
@@ -168,6 +169,10 @@ test("switch + fold across three wires: exact live sets, folds before AND after 
 
         const short: Array<{ role: string; content: string }> = [];
         for (let i = 0; i < 4; i++) short.push({ role: i % 2 ? "assistant" : "user", content: `short ${i}: ${"a".repeat(1500)}` });
+        // F7 (review): one image rides the whole switch round — a host-side
+        // canary that the media sidecar re-renders natively on every wire:
+        // anthropic image block -> responses input_image -> chat image_url.
+        const IMG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         const long: Array<{ role: string; content: string }> = [];
         for (let i = 0; i < 30; i++) long.push({ role: i % 2 ? "assistant" : "user", content: `long ${i}: ${"x".repeat(500)} ${MARKERS.join(" ")}` });
         const tail = long.slice(15); // d15..d29
@@ -204,13 +209,16 @@ test("switch + fold across three wires: exact live sets, folds before AND after 
         const a3msgs: Array<Record<string, unknown>> = [
             ...short.map((m) => ({ role: m.role, content: [{ type: "text", text: m.content }] })),
             { role: "user", content: [{ type: "text", text: summaryText("d0..d14") }] },
+            { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: IMG_B64 } }] },
             ...tail.map((m) => ({ role: m.role, content: [{ type: "text", text: m.content }] })),
             { role: "user", content: [{ type: "text", text: `z0 recall: ${MARKERS.join(" ")}` }] },
         ];
-        const r3 = await post("/v1/messages", { model: MB, stream: false, max_tokens: 1024, messages: a3msgs, biliMsgIds: ["c0", "c1", "c2", "c3", "s0", ...tail.map((_, i) => `d${15 + i}`), "z0"] });
+        const r3 = await post("/v1/messages", { model: MB, stream: false, max_tokens: 1024, messages: a3msgs, biliMsgIds: ["c0", "c1", "c2", "c3", "s0", "im0", ...tail.map((_, i) => `d${15 + i}`), "z0"] });
         assert.equal(r3.status, 200, `switch turn (anthropic, MB) -> ${r3.status}: ${r3.body.slice(0, 300)}`);
+        const turn3Body = lastUpstreamBody;
         await settle();
-        expectLive(["c0", "c1", "c2", "c3", "s0", ...tail.map((_, i) => `d${15 + i}`), "z0"], "after the switch turn (D-ops deleted d0..d14, c0..c3 survived fold 1)");
+        expectLive(["c0", "c1", "c2", "c3", "s0", "im0", ...tail.map((_, i) => `d${15 + i}`), "z0"], "after the switch turn (D-ops deleted d0..d14, c0..c3 survived fold 1)");
+        assert.ok(turn3Body.includes(`"type":"image"`) && turn3Body.includes(IMG_B64), `the image re-rendered natively on the anthropic wire (upstream body excerpt: ${turn3Body.slice(0, 200)})`);
         assert.ok(r3.body.includes("MARKERS: 12"), `all 12 markers physically reached the anthropic wire (${r3.body.slice(0, 120)})`);
         const ls2 = switchLines(m2);
         assert.equal(ls2.length, 1, `exactly one [lane-switch] line for the switch turn: ${ls2}`);
@@ -231,14 +239,17 @@ test("switch + fold across three wires: exact live sets, folds before AND after 
         const r4input: Array<Record<string, unknown>> = [
             { role: "user", content: summaryText("c0..c3") },
             { role: "user", content: summaryText("d0..d14") },
+            { role: "user", content: [{ type: "input_image", image_url: `data:image/png;base64,${IMG_B64}` }] },
             ...tail.map((m) => ({ role: m.role, content: m.content })),
             { role: "user", content: "z0 recall" },
             { role: "user", content: `z1 recall: ${MARKERS.join(" ")}` },
         ];
-        const r4 = await post("/v1/responses", { model: MC, stream: false, max_output_tokens: 1024, input: r4input, biliMsgIds: ["s1", "s0", ...tail.map((_, i) => `d${15 + i}`), "z0", "z1"] });
+        const r4 = await post("/v1/responses", { model: MC, stream: false, max_output_tokens: 1024, input: r4input, biliMsgIds: ["s1", "s0", "im0", ...tail.map((_, i) => `d${15 + i}`), "z0", "z1"] });
+        const turn4Body = lastUpstreamBody;
         assert.equal(r4.status, 200, `second switch turn (responses, MC) -> ${r4.status}: ${r4.body.slice(0, 300)}`);
         await settle();
-        expectLive(["s1", "s0", ...tail.map((_, i) => `d${15 + i}`), "z0", "z1"], "after turn 4 (fold 2's D-ops deleted c0..c3)");
+        expectLive(["s1", "s0", "im0", ...tail.map((_, i) => `d${15 + i}`), "z0", "z1"], "after turn 4 (fold 2's D-ops deleted c0..c3)");
+        assert.ok(turn4Body.includes("input_image") && turn4Body.includes(IMG_B64), `the image re-rendered as input_image on the responses wire`);
         assert.ok(r4.body.includes("MARKERS: 12"), `markers survived onto the responses wire (${r4.body.slice(0, 120)})`);
         assert.equal(switchLines(m3).length, 1, `one [lane-switch] line for the second switch`);
 
@@ -249,14 +260,17 @@ test("switch + fold across three wires: exact live sets, folds before AND after 
             messages: [
                 { role: "user", content: summaryText("c0..c3") },
                 { role: "user", content: summaryText("d0..d14") },
+                { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${IMG_B64}` } }] },
                 ...tail, { role: "user", content: "z0 recall" }, { role: "user", content: `z1 recall: ${MARKERS.join(" ")}` },
                 { role: "user", content: `z2 final: ${MARKERS.join(" ")}` },
             ],
-            biliMsgIds: ["s1", "s0", ...tail.map((_, i) => `d${15 + i}`), "z0", "z1", "z2"],
+            biliMsgIds: ["s1", "s0", "im0", ...tail.map((_, i) => `d${15 + i}`), "z0", "z1", "z2"],
         });
         assert.equal(r5.status, 200, `third switch turn (back to chat) -> ${r5.status}: ${r5.body.slice(0, 300)}`);
+        const turn5Body = lastUpstreamBody;
         await settle();
-        expectLive(["s1", "s0", ...tail.map((_, i) => `d${15 + i}`), "z0", "z1", "z2"], "after turn 5");
+        expectLive(["s1", "s0", "im0", ...tail.map((_, i) => `d${15 + i}`), "z0", "z1", "z2"], "after turn 5");
+        assert.ok(turn5Body.includes("image_url") && turn5Body.includes(IMG_B64), `the image re-rendered as image_url on the chat wire (round trip complete)`);
         assert.ok(r5.body.includes("MARKERS: 12"), `markers survived the round trip back to chat (${r5.body.slice(0, 120)})`);
         assert.equal(switchLines(m4).length, 1, `one [lane-switch] line for the third switch`);
         assert.equal(switchLines(0).length, 3, `exactly 3 lane-switch lines over the whole session: ${switchLines(0)}`);
@@ -268,10 +282,11 @@ test("switch + fold across three wires: exact live sets, folds before AND after 
             messages: [
                 { role: "user", content: summaryText("c0..c3") },
                 { role: "user", content: summaryText("d0..d14") },
+                { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${IMG_B64}` } }] },
                 ...tail, { role: "user", content: "z0 recall" }, { role: "user", content: `z1 recall: ${MARKERS.join(" ")}` }, { role: "user", content: `z2 final: ${MARKERS.join(" ")}` },
                 { role: "user", content: `rb0 after rollback: ${MARKERS.join(" ")}` },
             ],
-            biliMsgIds: ["s1", "s0", ...tail.map((_, i) => `d${15 + i}`), "z0", "z1", "z2", "rb0"],
+            biliMsgIds: ["s1", "s0", "im0", ...tail.map((_, i) => `d${15 + i}`), "z0", "z1", "z2", "rb0"],
         });
         assert.equal(r6.status, 200, `rollback turn -> ${r6.status}: ${r6.body.slice(0, 300)}`);
         await settle();

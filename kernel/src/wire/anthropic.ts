@@ -651,6 +651,7 @@ export function coreToAnthropic(
               media_type: m.imageMediaType,
               data: m.imageBase64,
             },
+            ...cc(m.id),
           });
           break;
         }

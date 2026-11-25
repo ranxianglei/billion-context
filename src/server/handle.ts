@@ -1213,6 +1213,7 @@ async function handleRequest(
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
+                ratchetableWindowModel = undefined; // the client's declared window now owns this model — the ratchet must never re-parse it back (see :3064)
                 windowShrinkReason = "codex";
                 codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
                 log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
@@ -1223,6 +1224,7 @@ async function handleRequest(
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
+                ratchetableWindowModel = undefined; // bili's own codex table sized this model — declared knowledge, not the anonymous fallback the ratchet may touch
                 codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
                 log("info", `[codex] effective window raised ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}; bili's anonymous fallback undersized the session — #7205) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
@@ -3067,7 +3069,11 @@ async function handleRequest(
                 reqConfig = resolveRequestConfig(config, opts.routes, providerDestUrl, ratchetableWindowModel, ratchetedRaw, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} });
                 nativeWindow = reqConfig.modelContextLimit;
                 wsSourceForLog = "ratchet";
-                const ratchetLogKey = `${ratchetableWindowModel}@${ratchetedRaw}`;
+                // Session-scoped key: windowSourceLogged is process-global, so without
+                // the session id the "applied" line would fire once for the first
+                // session and stay silent for every other session with the same
+                // model@window pair.
+                const ratchetLogKey = `${sessionId}@${ratchetableWindowModel}@${ratchetedRaw}`;
                 if (!windowSourceLogged.has(ratchetLogKey)) {
                     windowSourceLogged.add(ratchetLogKey);
                     log("info", `[window-ratchet-applied] model=${ratchetableWindowModel} session=${sessionId}: billing proved the anonymous default small — judging this request against the session-raised window ${nativeWindow} (source=ratchet; monotonic, session-local)`);

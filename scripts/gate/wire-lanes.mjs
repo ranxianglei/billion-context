@@ -148,6 +148,23 @@ function buildCorpus(tokens) {
   return chunks.join("\n\n");
 }
 
+// Anti-fake gate assertion: how many of the 12 markers appear in the REQUEST
+// BODY the upstream recorder captured for a given path — the body is the op
+// log's render; a client re-sent prompt can fake the model's echo but not
+// this line.
+function bodyMarkerCount(lines, pathPart) {
+  let best = 0;
+  for (const l of lines) {
+    try {
+      const e = JSON.parse(l);
+      if (!(e.path ?? e.url ?? "").includes(pathPart)) continue;
+      const s = typeof e.body === "string" ? e.body : JSON.stringify(e.body ?? "");
+      best = Math.max(best, MARKERS.filter((m) => s.includes(m)).length);
+    } catch { /* non-JSON line — skip */ }
+  }
+  return best;
+}
+
 // ---- wire bodies: the driver's own transcript, stable per-element ids --------
 // Each transcript element is one WIRE element (not one core message) — the
 // ids are wire-aligned exactly as the post-#7684 hosts stamp them.
@@ -277,7 +294,7 @@ async function main() {
     // forwards the client bytes unchanged and bili.log says so — a 200 alone
     // proves nothing then (the C7 vacuous-green trap).
     const noKernelBypass = (label, sinceLogLen) =>
-      record(`${label} no kernel-transform bypass in bili.log`, !/kernel transform failed/.test(readLog().slice(sinceLogLen)), readLog().slice(sinceLogLen).match(/kernel transform failed[^(\n]*)/)?.[0]?.slice(0, 120) ?? "");
+    record(`${label} no kernel-transform bypass in bili.log`, !/kernel transform failed/.test(readLog().slice(sinceLogLen)), readLog().slice(sinceLogLen).match(/kernel transform failed[^\n(]*\(/)?.[0]?.slice(0, 120) ?? "");
 
     const corpus = buildCorpus(CORPUS_TOKENS);
     const t1q = `A long document follows. Which GATE-MARK-Sxx markers does it contain? List every marker you find, nothing else.\n\n${corpus}`;
@@ -313,6 +330,11 @@ async function main() {
     const rec3 = fs.existsSync(recOut) ? fs.readFileSync(recOut, "utf8").split("\n").slice(recBefore3) : [];
     const sawAnthropic = rec3.some((l) => { try { const e = JSON.parse(l); return (e.path ?? e.url ?? "").includes("/v1/messages"); } catch { return false; } });
     record("t3 upstream recorder saw the /v1/messages POST (wire truth)", sawAnthropic, `${rec3.length} new upstream line(s)`);
+    // Anti-fake: a model can echo markers from a CLIENT re-sent prompt even
+    // though the server history is empty. The recorded REQUEST BODY is the
+    // op log's own render — the markers must be in it.
+    const t3bodyMarkers = bodyMarkerCount(rec3, "/v1/messages");
+    record("t3 markers present in the /v1/messages REQUEST BODY (op-log-served, not client re-sent)", t3bodyMarkers >= 3, `saw ${t3bodyMarkers} of 12 in the recorded body`);
     record("t3 markers recalled THROUGH the switch", MARKERS.filter((m) => t3.out.includes(m)).length >= 3, `"${t3.out.slice(0, 160)}"`);
     const log3 = readLog();
     record("t3 [lane-switch] line fired (openai -> anthropic)", /\[lane-switch\][^\n]*openai\s*->\s*anthropic/.test(log3.slice(logBefore3.length)), log3.slice(logBefore3.length).match(/\[lane-switch\][^\n]*/)?.[0]?.slice(0, 160) ?? "no lane-switch line");
@@ -332,6 +354,8 @@ async function main() {
     const rec4 = fs.existsSync(recOut) ? fs.readFileSync(recOut, "utf8").split("\n").slice(recBefore4) : [];
     const sawResponses = rec4.some((l) => { try { const e = JSON.parse(l); return (e.path ?? e.url ?? "").includes("/v1/responses"); } catch { return false; } });
     record("t4 upstream recorder saw the /v1/responses POST (wire truth)", sawResponses, `${rec4.length} new upstream line(s)`);
+    const t4bodyMarkers = bodyMarkerCount(rec4, "/v1/responses");
+    record("t4 markers present in the /v1/responses REQUEST BODY (op-log-served, not client re-sent)", t4bodyMarkers >= 3, `saw ${t4bodyMarkers} of 12 in the recorded body`);
     record("t4 markers recalled through the second switch", MARKERS.filter((m) => t4.out.includes(m)).length >= 3, `"${t4.out.slice(0, 160)}"`);
     const log4 = readLog();
     record("t4 [lane-switch] line fired (anthropic -> responses, switch #2)", /\[lane-switch\][^\n]*anthropic\s*->\s*responses/.test(log4.slice(logBefore4.length)), log4.slice(logBefore4.length).match(/\[lane-switch\][^\n]*/)?.[0]?.slice(0, 160) ?? "no lane-switch line");

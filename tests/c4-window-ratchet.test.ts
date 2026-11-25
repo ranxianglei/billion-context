@@ -139,6 +139,19 @@ test("C4 a successful turn that bills beyond the default window raises the sessi
         assert.equal(t4.status, 200, `small bill turn (got ${t4.status}: ${t4.text.slice(0, 200)})`);
         assert.deepEqual(ratchetRaises().length, 1, `no second raise for a smaller bill (log: ${ratchetRaises().join(" | ")})`);
 
+        // 4b. one anomalous GIANT bill (#6781 class: a 43MB full resend bills
+        //     millions of tokens) must not leap the session window to 2× of it
+        //     in a single step: clamp to the 4×-judged bound. Here the session
+        //     already judged at the raised 240K, so the bound is 4×240K =
+        //     960K instead of 2×5M = 10M. The follow-up bill — judged against
+        //     the raised value — re-raises within the bound, so a genuinely
+        //     large window still converges, in bounded steps.
+        const t4b = await turn("c4-sess", MODEL, 5_000_000, 4);
+        assert.equal(t4b.status, 200, `giant-bill turn (got ${t4b.status}: ${t4b.text.slice(0, 200)})`);
+        await settle("c4-sess");
+        assert.deepEqual(ratchetRaises().length, 2, `exactly one extra raise for the giant bill (log: ${ratchetRaises().join(" | ")})`);
+        assert.ok(ratchetRaises()[1].includes("raised to 960000") && ratchetRaises()[1].includes("clamped"), `the giant bill clamps to the 4×-judged bound (960K) instead of 2× the bill (10M) (${ratchetRaises()[1]})`);
+
         // 5. declared windows are never ratcheted: the control model bills
         //    beyond its DECLARED 50K window and still must not ratchet.
         const d1 = await turn("c4-sess-d", DECLARED_MODEL, 60_000, 0);

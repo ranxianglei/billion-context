@@ -2065,11 +2065,20 @@ export function settleUsageReport(
             if (typeof judged === "number" && Number.isFinite(judged)) {
                 const ratchet = (session.metadata.windowRatchet ?? {}) as Record<string, number>;
                 const current = Math.max(ratchet[stampedModel] ?? judged, judged);
-                if (session.stats.lastInputTokens > current) {
-                    const raised = Math.max(2 * session.stats.lastInputTokens, ratchet[stampedModel] ?? 0);
+                // One anomalous giant bill (e.g. #6781's 43.3MB full resend) must not
+                // turn the session window into a permanent 2× of it in a single leap:
+                // a bill FAR beyond what even a 4×-judged window could contain is
+                // clamped to the 4× bound (the next over-window bill — judged against
+                // the raised value — re-raises monotonically within the same bound, so
+                // a genuinely large window still converges in bounded steps); a bill
+                // INSIDE the 4× bound is trusted at full 2× strength.
+                const trustedCeiling = 4 * judged;
+                let raised = Math.max(2 * session.stats.lastInputTokens, ratchet[stampedModel] ?? 0);
+                if (session.stats.lastInputTokens > trustedCeiling) raised = Math.min(raised, trustedCeiling);
+                if (raised > current) {
                     ratchet[stampedModel] = raised;
                     session.metadata.windowRatchet = ratchet;
-                    loggerLog("info", `[${session.id}] [window-ratchet] model=${stampedModel} billed ${session.stats.lastInputTokens} input beyond the judged window ${judged} — session window raised to ${raised} (2× the observation; monotonic, session-local)`);
+                    loggerLog("info", `[${session.id}] [window-ratchet] model=${stampedModel} billed ${session.stats.lastInputTokens} input beyond the judged window ${judged} — session window raised to ${raised} (${session.stats.lastInputTokens > trustedCeiling ? `clamped to the ${4}×-judged bound ${trustedCeiling} against one anomalous bill` : "2× the observation"}; monotonic, session-local)`);
                 }
             }
         }
