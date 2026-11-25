@@ -44,7 +44,7 @@
 // Rollout gate (egressPlane, default 0 — opt-in per owner ruling 2026-11-24) and each lane's arming condition
 // are owned by the caller.
 
-import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, type EgressOpLogStore } from "../storage/egress-record.js";
+import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
 import type { EgressBlockLedgerInput } from "../storage/egress-block.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { featureEnabled } from "../rollout.js";
@@ -261,6 +261,7 @@ export function recordAuthorityTurn(
     systemText: string,
     log: LaneLog,
     blockLedger?: EgressBlockLedgerInput,
+    refMap?: EgressRefMap,
 ): BiliMessage[] | null {
     if (outcome.recordCore === null) return null;
     try {
@@ -273,6 +274,7 @@ export function recordAuthorityTurn(
             systemText,
             nowMs: Date.now(),
             blockLedger,
+            refMap,
         });
     } catch (err) {
         if (err instanceof EgressConcurrentWriteError) {
