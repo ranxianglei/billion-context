@@ -20,6 +20,10 @@ import { DecodedRequestAdmission, MAX_REQUEST_BYTES } from "../src/request-body-
 process.env.BILI_RECEIVE_BODY_BYTES = "104857600";
 process.env.BILI_DECODED_BODY_BYTES = "209715200";
 process.env.BILI_OUTBOUND_BODY_BYTES = "104857600";
+// The #7277 slot count now defaults to 64 (owner ruling 2026-11-24: effectively-off);
+// the "third large decode" test below occupies exactly two slots and expects the 503
+// admission-busy shape, so pin the legacy two-slot behavior explicitly.
+process.env.BILI_MAX_LARGE_DECODED_REQUESTS = "2";
 
 const isolation = mkdtempSync(join(tmpdir(), "bili-request-budget-"));
 process.env.XDG_STATE_HOME = join(isolation, "state");
