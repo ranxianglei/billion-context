@@ -195,7 +195,7 @@ export function recordEgressTurn(args: {
  *  and the next turn re-diffs from the stored state replica (the ledger
  *  self-heals one turn late — same discipline as the message log's
  *  corrupt-point self-heal). */
-export function ledgerEgressBlocks(
+function ledgerEgressBlocks(
     store: EgressOpLogStore,
     sessionId: string,
     ledger: EgressBlockLedgerInput,

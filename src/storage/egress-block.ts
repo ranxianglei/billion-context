@@ -279,12 +279,12 @@ export interface EgressBlockSnapshot {
     expanded?: boolean | null | undefined;
 }
 
-export interface EgressBlockInsertOp {
+interface EgressBlockInsertOp {
     type: "I";
     blockId: string;
     snapshot: EgressBlockSnapshot;
 }
-export interface EgressBlockUpdateOp {
+interface EgressBlockUpdateOp {
     type: "U";
     blockId: string;
     snapshot: EgressBlockSnapshot;
