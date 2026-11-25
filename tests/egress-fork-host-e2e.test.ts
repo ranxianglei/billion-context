@@ -32,6 +32,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest, peekSession } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
@@ -852,6 +853,54 @@ test("T10 kstate retirement: the cold egress-on load rebuilds blocks/refs/tsStam
     } finally {
         if (savedRebuild === undefined) delete process.env[REBUILD_ENV]; else process.env[REBUILD_ENV] = savedRebuild;
         if (savedRetire === undefined) delete process.env[RETIRE_ENV]; else process.env[RETIRE_ENV] = savedRetire;
+        await h.close(h.store);
+    }
+});
+
+test("#7658 T11: the fork route must not leak a raw corruption error as FORK_FAILED (review fix)", async () => {
+    const logs: string[] = [];
+    const h = await harness(logs);
+    let wdb: { db: import("node:sqlite").DatabaseSync } | null = null;
+    try {
+        await seedParent(h.base, "p11");
+        await settle(h.store, "p11");
+        assert.equal(peekSession("p11")!.metadata.egressAuthority, true, "armed precondition");
+
+        // Capped: the client-side raw snapshot is gone (same simulation as
+        // T4) — the op log is the only remaining source for both routes.
+        const parent = peekSession("p11")!;
+        parent.pluginSnapshot = undefined;
+        parent.metadata.publicSnapshotCapped = true;
+        await h.store.flushSessionNow(parent);
+        await settle(h.store, "p11");
+
+        // A healthy op log still serves the snapshot (T4's wiring).
+        const snap = await snapshot(h.origin, "p11");
+
+        // DAMAGE the flow: a second reader removes the last-but-one row — the
+        // replay density check then throws EgressStateCorruptError on every
+        // egressStateView. The damage lands AFTER the last flush, so no
+        // debounced save can repair it.
+        wdb = openSqliteDatabase(join(h.dir, "sessions", "index.db"));
+        const rows = wdb.db.prepare("SELECT op_seq FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all("p11") as { op_seq: number }[];
+        assert.ok(rows.length >= 5, `flow holds the history (${rows.length} rows)`);
+        wdb.db.prepare("DELETE FROM egress_flow WHERE session_id = ? AND op_seq = ?").run("p11", rows[rows.length - 1].op_seq - 1);
+
+        // The fork route computes its source link OUTSIDE the structured
+        // 409 try: pre-fix the view's throw escaped the lock scope and
+        // surfaced as a 503 FORK_FAILED whose body carries the raw
+        // EgressStateCorruptError text (client-visible DB internals).
+        // Post-fix egressOpLogSource degrades to "no source" and the route's
+        // own try produces the diagnosable 409 SNAPSHOT_UNAVAILABLE.
+        const fork = await postFork(h.origin, {
+            protocolVersion: 2, parentConversationId: "p11", childConversationId: "c11", parentRevision: snap.parentRevision,
+            branchPoint: { messageCount: snap.orderedMessages.length, orderHash: snap.orderHash }, orderedMessages: snap.orderedMessages, idempotencyKey: "fork:c11",
+        });
+        assert.equal(fork.status, 409, JSON.stringify(fork.body));
+        assert.equal(fork.body.code, "SNAPSHOT_UNAVAILABLE", `a damaged op log degrades to the structured 409, not an unhandled 500 (${JSON.stringify(fork.body).slice(0, 200)})`);
+        assert.match(logs.join("\n"), /egress op-log fork source unreadable/, "the degradation is logged (a damaged log is a support incident)");
+    } finally {
+        if (wdb) try { wdb.db.close(); } catch { /* best-effort */ }
         await h.close(h.store);
     }
 });

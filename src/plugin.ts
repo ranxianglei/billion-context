@@ -1518,7 +1518,19 @@ function egressOpLogSource(session: Session): CoreMessage[] | null {
     if (session.metadata.egressAuthority !== true) return null;
     const st = getStore().egressOpLogStore();
     if (!st) return null;
-    const view = st.egressStateView(session.id);
+    // The view read is a FLOW REPLAY — it throws EgressStateCorruptError on a
+    // damaged log (the same hard-fail the lanes hit every request). This
+    // helper runs in the fork route OUTSIDE its structured-error try, so a
+    // damaged parent must degrade to "no source" (a clean 409
+    // SNAPSHOT_UNAVAILABLE from forkSnapshot) rather than an unhandled 500.
+    // The child's own recovery walk decides the copied log's health.
+    let view;
+    try {
+        view = st.egressStateView(session.id);
+    } catch (err) {
+        loggerLog("warn", `[plugin] egress op-log fork source unreadable for ${session.id} — fork falls through to the next source: ${String(err)}`);
+        return null;
+    }
     return view.length > 0 ? rebuildCoreFromLog(view) : null;
 }
 
