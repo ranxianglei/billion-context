@@ -430,18 +430,36 @@ function salvageTable(src: RoDb, fresh: ReturnType<typeof openSqliteDatabase>["d
             // or none do. (A cross-connection INSERT...SELECT is not an
             // option: without ATTACH the SELECT side resolves to the fresh
             // db's own empty table and "succeeds" with 0 rows.)
+            let rows: Array<Record<string, unknown>>;
             try {
                 const colList = cols.map(quoteId).join(", ");
-                const ph = cols.map(() => "?").join(", ");
-                const rows = src.prepare(`SELECT ${colList} FROM ${quoteId(table)}`).all() as Array<Record<string, unknown>>;
-                const stmt = fresh.prepare(`INSERT INTO ${quoteId(table)} (${colList}) VALUES (${ph})`);
+                rows = src.prepare(`SELECT ${colList} FROM ${quoteId(table)}`).all() as Array<Record<string, unknown>>;
+            } catch {
+                report.note = "WITHOUT ROWID table unreadable (corrupt) — skipped";
+                return report;
+            }
+            report.rowsTotal = rows.length;
+            const colList = cols.map(quoteId).join(", ");
+            const ph = cols.map(() => "?").join(", ");
+            const stmt = fresh.prepare(`INSERT INTO ${quoteId(table)} (${colList}) VALUES (${ph})`);
+            try {
                 fresh.transaction(() => {
                     for (const row of rows) stmt.run(...cols.map((c) => row[c]));
                 });
-                report.rowsTotal = rows.length;
                 report.rowsSalvaged = rows.length;
             } catch {
-                report.note = "WITHOUT ROWID table unreadable (corrupt) — skipped";
+                // A whole-table write failure is usually one FK-orphan row
+                // (its parent row was lost to corruption) failing the
+                // transaction. Retry row by row so the good rows still land
+                // and only the orphans are counted as lost.
+                for (const row of rows) {
+                    try {
+                        fresh.transaction(() => { stmt.run(...cols.map((c) => row[c])); });
+                        report.rowsSalvaged++;
+                    } catch {
+                        report.rowsLost++;
+                    }
+                }
             }
             return report;
         }
@@ -479,8 +497,23 @@ function salvageTable(src: RoDb, fresh: ReturnType<typeof openSqliteDatabase>["d
         // Rows came back as a batch: every value in them is known-good.
         // Rowids are dense per insert but deletions leave gaps; the walk
         // uses (lo, hi] BOUNDS, not counts, so gaps are skipped for free.
-        insertRows(fresh, table, cols, rows);
-        report.rowsSalvaged += rows.length;
+        try {
+            insertRows(fresh, table, cols, rows);
+            report.rowsSalvaged += rows.length;
+        } catch {
+            // A batch write failure is almost always one FK-orphan row (its
+            // parent row was lost to corruption) failing the whole-chunk
+            // transaction. Retry row by row so the good rows still land and
+            // only the orphans are counted as lost — never abort the salvage.
+            for (const row of rows) {
+                try {
+                    insertRows(fresh, table, cols, [row]);
+                    report.rowsSalvaged++;
+                } catch {
+                    report.rowsLost++;
+                }
+            }
+        }
         if (hi >= max) break;
         stack.push([hi, Math.min(max, hi + SALVAGE_CHUNK)]);
     }
