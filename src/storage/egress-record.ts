@@ -71,7 +71,9 @@ export interface EgressRefMap {
 /** The kernel citation number of a message id: from the refs ledger first,
  * then a direct mNNNNN-shaped id (lanes that mint ids in kernel space). 0
  * = no citation known (the dense fallback applies). */
-export function citationNumber(id: string, refMap: EgressRefMap | undefined): number {
+// Internal: the caller (buildEgressViewRows, below) is the only consumer — the gate
+// (scripts/check-unused-exports.mjs) rejects file-scope exports without one.
+function citationNumber(id: string, refMap: EgressRefMap | undefined): number {
     const direct = /^m\d{4,}$/.test(id) ? id : undefined;
     const ref = refMap?.byRaw?.[id] ?? direct;
     if (ref === undefined || ref === "") return 0;
