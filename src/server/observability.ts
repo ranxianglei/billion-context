@@ -77,3 +77,18 @@ export function isV1InternalControlPlanePath(path: string): boolean {
     const p = path.split("?", 2)[0];
     return /\/v1internal:(?!streamGenerateContent$|generateContent$|countTokens$)/.test(p);
 }
+
+// Claude Code Remote Control long-polls /v1/environments/<env>/work/poll (about
+// once a second per registered session, each on a fresh MITM tunnel). It is a
+// known, expected passthrough — never compressed — so exempt it from the
+// "unrecognized path" warn/stats like isModelDiscoveryPath /
+// isV1InternalControlPlanePath (#7727). Match the endpoint by suffix (not
+// start-anchored) so a routing prefix (`/bili/<origin>/…`) does not defeat the
+// exemption, mirroring isV1InternalControlPlanePath. PR #7723's isQuietPollPath
+// covers the per-request log-suppression side of the same path; this predicate
+// is the gate-exemption side and is self-contained so it does not depend on
+// #7723 landing.
+export function isRcWorkPollPath(path: string): boolean {
+    const p = path.split("?", 2)[0];
+    return /\/v1\/environments\/[^/?]+\/work\/poll\/?$/.test(p);
+}
