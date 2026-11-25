@@ -121,4 +121,48 @@ describe("#7693 tool-channel image offload", () => {
         assert.equal(recordOf(session)?.[imgTool.id!], undefined, "mismatched toolCallId must not classify as offload");
         assert.ok(r.missing > 0 || r.claims > 0, "genuine mismatch must still be handled");
     });
+
+    test("T3: C3 slot-pairing classifies the offload when byTool's toolCallId bucket is ambiguous", () => {
+        const { session, block, logs, opts } = harness("dsh");
+        const imgTool = makeMsg("tool", "Image loaded successfully", {
+            toolCallId: "call_read_1",
+            toolName: "read_image",
+        });
+        const history = [imgTool, ...baseHistory(34)];
+        block.effectiveMessageIds.push(...history.map((m) => m.id!));
+        const storedRowLookup = (ids: readonly string[]) => ids.filter((id) => id === imgTool.id!).map((id) => ({
+            seq: 1,
+            msgId: id,
+            content: JSON.stringify({
+                id, role: "tool", contentType: "tool-result", toolCallId: "call_read_1", toolName: "read_image",
+                text: "Image loaded successfully",
+                rawOpenaiContentParts: [
+                    { type: "image", attachment: { attachmentId: "abc123", mediaType: "image/png" } },
+                    { type: "text", text: "Image loaded successfully" },
+                ],
+            }),
+        }));
+        const fullOpts = { ...opts, storedRowLookup };
+        reconcileFoldCoverage(session, history, fullOpts);
+        // Two wire candidates share toolCallId "call_read_1": the offload
+        // placeholder at the same position as imgTool, plus a decoy further
+        // down. byTool's bucket is ambiguous (2 usable same-role candidates)
+        // so it skips — C3 is the pass that must classify the same-position
+        // placeholder as the offload. This is the scenario T1 does not cover
+        // (T1's single-candidate bucket is claimed by byTool pre-fix).
+        const placeholder = makeMsg("tool", '[image omitted to fit request image limits; "screenshot.png" (sha256:2e896b95dec003df).]', {
+            toolCallId: "call_read_1",
+            toolName: "read_image",
+        });
+        const decoy = makeMsg("tool", "decoy tool result, different content entirely", {
+            toolCallId: "call_read_1",
+            toolName: "read_image",
+        });
+        const wire2 = [placeholder, ...history.slice(1, 20), decoy, ...history.slice(20)];
+        const r = reconcileFoldCoverage(session, wire2, fullOpts);
+        assert.equal(r.byTool, 0, "byTool must skip the ambiguous bucket (no claim)");
+        assert.equal(recordOf(session)?.[imgTool.id!], "image-offload", "C3 must classify the same-position tool-channel offload");
+        assert.equal(r.missing, 0, "the offloaded fold id must not remain missing");
+        assert.ok(!logs.some(([, m]) => m.includes("no anchor match")), "no no-anchor-match drift for the C3-classified offload");
+    });
 });
