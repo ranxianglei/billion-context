@@ -2,7 +2,8 @@
 
 > 范围:`2026-11-15_msgid-snapshot-unified` @ `39941c816`(base `origin/master` `b10c1a0d4`)。
 > 134 文件 +13740/−367。本文是本 PR 的**审查级**完整梳理:四部分(表结构 / 实现逻辑 / 数据流转 / 开关)+ 实测验证 + 本轮发现与修复。行号均指 head 处源码。
-> **第 2 轮(owner 裁定 7439-2,KDD #23,2026-11-22)已落在同一分支、晚于本快照**——op log 正史编号、窗口 re-anchor delta、messages 惰性投影与常驻性能门。见 **§6**(与本文件 §1.2 egress DDL 草图、§5.4 遗留项冲突处以 §6 为准)。
+> **第 2 轮（owner 裁定 7439-2，KDD #23，2026-11-22）已落在同一分支、晚于本快照**——op log 正史编号、窗口 re-anchor delta、messages 惰性投影与常驻性能门。见 **§6**（与本文件 §1.2 egress DDL 草图、§5.4 遗留项冲突处以 §6 为准）。
+> **退役注（合入后，引用本文表清单前先读）：**截至 #7439 系列终态，`l1_world` 已降级为**占位行**（R3 latch 载体迁至 `sessions.r3_latched_at`；egress-on 的 stage-0 无状态——#7617），`conversations` 对 egress-on 退役，`fold_journal`/`egress_snapshot` 合入前已删。当前表清单——含 `egress_flow`/`egress_state` op log 与双时钟的 `egress_block_flow`/`egress_block_state`——见 [architecture/storage.md](./architecture/storage.zh-CN.md) 与一站式 [egress-plane.md](./egress-plane.zh-CN.md)；退役登记见 [deprecations.md](./deprecations.zh-CN.md)。
 
 
 ---

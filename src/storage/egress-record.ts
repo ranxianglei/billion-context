@@ -26,6 +26,7 @@
  */
 
 import { diffEgressView, EgressStateCorruptError, type EgressOp, type EgressViewRow } from "./egress-state.js";
+import { buildEgressBlockSnapshots, diffBlockSet, serializeKstateResidual, type EgressBlockLedgerInput, type EgressBlockOp, type EgressBlockSnapshot } from "./egress-block.js";
 import { log as loggerLog } from "../logger.js";
 
 /** #6785 ruling 7439-5: a pinned (server-authoritative) session whose op-log
@@ -115,6 +116,11 @@ export interface EgressOpLogStore {
      *  ever include them), so recovery = flow back to the last healthy point.
      *  Append-only covers HEALTHY history only. Returns rows removed. */
     egressStateTruncateAfter(sessionId: string, opSeq: number): number;
+    /** #7664 (PR-A): the block-lifecycle ledger (dual-clock tables). Optional
+     *  — a store without block tables (test shims) skips ledgering entirely;
+     *  the production UnifiedStore implements both. */
+    egressBlockView?(sessionId: string): Map<string, EgressBlockSnapshot>;
+    egressBlockAppendOps?(sessionId: string, ops: EgressBlockOp[], kstateJson: string | null, nowMs: number): number[];
 }
 
 /** Record this turn's outbound conversation view as sparse ops. `prev` is
@@ -143,6 +149,11 @@ export function recordEgressTurn(args: {
     conversation: readonly EgressSourceMsg[];
     systemText: string | undefined;
     nowMs: number;
+    /** #7664 (PR-A): when present (the egress-on latch is set), the
+     *  in-memory kernel block set is diffed into the block ledger AFTER the
+     *  flow append — the unified-leg recorder's twin, which egress-on
+     *  sessions never run (their unified ingest is frozen). */
+    blockLedger?: EgressBlockLedgerInput;
 }): EgressViewRow[] {
     const { store, sessionId, conversation, systemText, nowMs } = args;
     let prev = args.prev;
@@ -155,8 +166,55 @@ export function recordEgressTurn(args: {
     }
     const next = buildEgressViewRows(conversation, systemText);
     const ops = diffEgressView(prev, next);
-    if (ops.length === 0) return prev;
-    return store.egressAppendTurn(sessionId, ops, baseSeq ?? store.egressStateMaxSeq(sessionId), nowMs);
+    let stamped: EgressViewRow[];
+    if (ops.length === 0) {
+        stamped = prev;
+    } else {
+        // #7577 D3: stamp the first-observed wall clock on each I row BEFORE the
+        // append — writeOps persists op.ts into the I row's payload. A msgid is
+        // inserted exactly once (kernel ids are one-shot), so the I row IS the
+        // message's birth: ts is fixed at first observation and spine rows inherit
+        // it through the replay. This is what lets tsStamps be derived from a
+        // flow replay (keyed by the I row's msgid = the kernel raw id) instead of
+        // persisted as a kstate map.
+        for (const op of ops) if (op.type === "I" && op.ts === undefined) op.ts = nowMs;
+        stamped = store.egressAppendTurn(sessionId, ops, baseSeq ?? store.egressStateMaxSeq(sessionId), nowMs);
+    }
+    if (args.blockLedger) ledgerEgressBlocks(store, sessionId, args.blockLedger, stamped, nowMs);
+    return stamped;
+}
+
+/** #7664 (PR-A): the egress-on twin of the unified-leg block recorder
+ *  (store.ts ingest, gate `metadata.egressAuthority`). Runs AFTER the flow
+ *  append (or on a zero-op turn — a block created out-of-band, e.g. by the
+ *  /tool compress endpoint, is picked up on the next successful pass). The
+ *  block tables number themselves (dual clocks) and their flow watermark is
+ *  read inside their own write transaction, so a row landed after a zero-op
+ *  turn points at the flow's current high water — consistent. Best-effort:
+ *  a failure must NOT fail the turn (the flow already advanced); it warns
+ *  and the next turn re-diffs from the stored state replica (the ledger
+ *  self-heals one turn late — same discipline as the message log's
+ *  corrupt-point self-heal). */
+function ledgerEgressBlocks(
+    store: EgressOpLogStore,
+    sessionId: string,
+    ledger: EgressBlockLedgerInput,
+    view: EgressViewRow[],
+    nowMs: number,
+): void {
+    if (typeof store.egressBlockView !== "function" || typeof store.egressBlockAppendOps !== "function") return;
+    try {
+        const current = buildEgressBlockSnapshots(ledger, view);
+        const prev = store.egressBlockView(sessionId);
+        const ops = diffBlockSet(prev, current);
+        if (ops.length === 0) return;
+        store.egressBlockAppendOps(sessionId, ops, serializeKstateResidual(ledger.state), nowMs);
+    } catch (err) {
+        loggerLog(
+            "warn",
+            `[storage] egress session=${sessionId}: block ledger not recorded this turn (self-heals next turn): ${String(err)}`,
+        );
+    }
 }
 
 

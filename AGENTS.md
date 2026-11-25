@@ -62,7 +62,7 @@ When auditing host behavior (plugin APIs, tool-call-id exposure, compaction seam
 
 ### Module Map
 
-The full file-by-file map lives in [reference/architecture.md](reference/architecture.md) — it drifts as modules land, so **regenerate it when you add/remove a source file; don't trust a stale copy** (CI lane `architecture-docs` enforces full `src/` coverage, #5924). Orientation at a glance: `src/server.ts` + `src/server/` (handle / prepare-* / relay / lane-decisions / snapshot-render / threads-lane / fastpath / admin) + `src/loop/**` (core + wire adapters) is the request pipeline; `src/update.ts` is the load-bearing self-updater; `src/persist.ts` + `src/session-id.ts` own persistence/identity; `src/storage/` is the unified storage layer (SQLite by default, opt-in MySQL backend); `tests/e2e/` holds the real-client regression suites; the compression engine itself lives in-repo under `kernel/` (the acp-kernel source, #2092).
+The full file-by-file map lives in [reference/architecture.md](reference/architecture.md) — it drifts as modules land, so **regenerate it when you add/remove a source file; don't trust a stale copy** (CI lane `architecture-docs` enforces full `src/` coverage, #5924). Orientation at a glance: `src/server.ts` + `src/server/` (handle / prepare-* / relay / lane-decisions / snapshot-render / threads-lane / fastpath / admin) + `src/loop/**` (core + wire adapters) is the request pipeline; `src/update.ts` is the load-bearing self-updater; `src/persist.ts` + `src/session-id.ts` own persistence/identity; `src/storage/` is the unified storage layer (SQLite by default, opt-in MySQL backend) — **egress-on sessions live on the op log, not the tables: one-stop doc [docs/egress-plane.md](docs/egress-plane.md), retirement register [docs/deprecations.md](docs/deprecations.md) (KDD #24)**; `tests/e2e/` holds the real-client regression suites; the compression engine itself lives in-repo under `kernel/` (the acp-kernel source, #2092).
 
 ### Key Design Decisions
 
@@ -106,6 +106,10 @@ msgid 真身只有 `messages.msg_id` 一处，`l1_world`/`fold_journal`/`egress_
 ### #23 — egress-on 会话以 op log 为唯一正史、messages 投影惰性化 + 窗口 re-anchor delta（#7474/#7475，owner 裁定 2026-11-22） (Tier B)
 
 10w 行实测两臂稳态 p50 都 ~2s：每回合存储开销正比于 messages 账本总行数而非新增行数。owner 裁定「本 PR 目的就是把 egress_flow 升为唯一正史、messages 降级为惰性投影」：(1) pin 通道单一读入口 `snapPinLiveIds`——egress-on 读 `egress_state`（有界 serving 读、log_seq 序、排除 `EGRESS_SYSTEM_MSGID`），无 op log 会话与 `snapMsgIdLiveIds` 字节等价，op log 损坏降级回 messages 账本（pin 路径永不抛）——KDD #21「msgid 真身」对 egress-on 会话改指 `egress_flow` I 行 msgid（wire 不变、#21/#22 裁决不动）；(2) egress-on 停止逐轮统一 ingest（门 = `metadata.egressAuthority` ∧ `egressPlane` 开）：逐轮磁盘写只剩 egress_flow I 行，messages = 惰性投影（回滚/恢复/web 读时一次性 O(n) 重建），flow 损坏硬失败独立不变；(3) 窗口 re-anchor delta（OFF 臂同受益）：pf 滑动尾窗逐行经**事务内**索引 identity 探针解析（既有行保 seq、新行续 MAX(seq)、疑点 = 逐字节改前全量路径），取代 0.5-0.8s@10w 的每 HIT 轮 O(全表) re-ingest。改 pin 数据源/egress 存储门/window 规划前读 design-decisions.md #23 与 discussion #7439。Full text: design-decisions.md #23。
+
+### #24 — egress 平面默认全量（egressPlane 0 → 100）+ 文档收口（owner 裁定 2026-11-24） (Tier B)
+
+egress 平面文档收口（#7581 块生命周期/双时钟 + #7617 身份收拢合入后）：`egressPlane` 代码默认**保持 0**（opt-in，owner 裁定 2026-11-24；翻 100 的 GA 曾被提议、未批）——开启 = `rollout.features.egressPlane: true` / `BILI_ROLLOUT_EGRESS_PLANE=1`。新增强文档 `docs/egress-plane.md`（+zh，唯一入口：设计脉络/双时钟/身份收拢/表结构/性能/fork 回退/开关依赖图与 on/off 解析序 env→配置文件→代码默认/操作手册/图×3）与 `docs/deprecations.md`（+zh，退役登记表：l1 占位行、conversations、D-lane 退役触发条件、物理 DROP 批次）；`docs/architecture/storage.{md,zh,ja}` 刷新 + identity/storage 架构图更新。动 egress 平面任何开关或文档前读 docs/egress-plane.md 与 deprecations.md。Full text: design-decisions.md #24.
 
 ### Install-Lane & Update-Ownership Contract (#1196)
 

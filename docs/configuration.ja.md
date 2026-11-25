@@ -227,7 +227,7 @@
 | `storage.mysql.dsn` | string | unset | BILI_MYSQL_DSN | storage.backend="mysql" 用の MySQL DSN (#3388 ステップ 2, #3931): mysql://user:pass@host:3306/db。StorageBackend 契約パスによって消費される (ホットパスを含む - 非同期シャドウキュー)。環境変数 BILI_MYSQL_DSN がファイルキーより優先される。空/未設定 = mysql バックエンドが開けない - 文書化されたエラーは両方のノブと動作するデフォルトを名指しする。 |
 | `storage.sqliteAutoDownload` | boolean | true | BILI_SQLITE_AUTO_DOWNLOAD | 1 回限りの SQLite エンジンの自己ダウンロードのゲート (#2833): プロセス内でエンジンが利用可能でない場合 (組み込みの node:sqlite なし、ホストインストールの better-sqlite3 なし) かつこのプラットフォームで統合サイドカーが望まれる場合、bili は npm レジストリからピン留めされた better-sqlite3 プリビルトタールボールを 1 回ダウンロードし (~11 MB、sha512 検証済み)、キャッシュディレクトリに保存し、その後のすべての起動で再利用する。エンジン解決順序: 組み込み node:sqlite (Node >= 22.5) -> ホスト提供の better-sqlite3 -> キャッシュされた自己ダウンロード -> 自己ダウンロード (このスイッチでゲート) -> なし (レガシーのみ、#2825 のデグレード契約)。このスイッチはネットワークフェッチのみをゲートする - キャッシュされたコピーは false でも使用される; 非サポートプラットフォームでは決してダウンロードしない。タールボールのダウンロードは組み込みミラーリストを辿る (#3338): 設定されたレジストリ (BILI_UPDATE_REGISTRY / update.registry) が最初に試され、次に https://registry.npmjs.org、次に https://registry.npmmirror.com - sha512 検証済みのタールボールを返す最初のミラーが勝つ; エンジンなしの Node < 22.5 はデグレード理由に明示的な Node アップグレードヒントが付く (#3385)。エンジン成果物はランタイムごとにピン留めされる。なぜなら、バインディングはそのパッケージが宣言する範囲外ではロードできないため: N-API >= 10 を持つ Node >= 22 は better-sqlite3 v13 を使用 (独自のプリビルドを保持する 1 つのタールボール)、一方 v13 のメジャーフロアは通るが N-API 9 のみ搭載する Node 20 と Node 22.0-22.12 バンドは v12.9.0 を使用 (JS のみのタールボールとその ABI キー付きプリビルド、バイナリミラーから取得され nativeBinding を通じてバインドされる)。これにより、低バージョンの Node でも統合レーンに留まり、レガシーへのデグレードを避ける。ピン留めされた成果物が提供できないランタイム (すべてのフロア未満、またはプリビルドがターゲットとしない ABI) は、ロード前に拒否される。ダウンロードもキャッシュされたコピーも登録されない。そのようなバインディングのロードは優雅に失敗するのではなくプロセスをクラッシュさせるため (#3341, #3894)。ダウンロード失敗は、キャッシュディレクトリ配下にマーカーファイルとして永続化される 6 時間のリトライクールダウンをアームする (billion-context/sqlite/.bootstrap-failed.json); ストレージ診断ブロブはマーカーの絶対期限時間とパスを表示する - そのファイルを削除して bili を再起動すると、ウィンドウ全体を待たずに即座のリトライを強制できる (#3788)。 |
 | `storage.jsonWriter` | on\|off | unset (off for the pure-sqlite selection — absent/unified=sqlite — and on for explicit full) | BILI_STORAGE_JSON_WRITER | フェーズ 3 エンベロープスイッチ (#2960) — 今回のリリースでデフォルト反転: 未設定 (UNSET) はピュア SQLite 選択 (storage.unified 未設定または "sqlite") ではデフォルト OFF — SQLite インデックスが唯一の永続コピーとなる (読み取りはすでに統合優先; 起動時にインデックスの和集合を列挙するため、インデックスのみのセッションは正常にロードされる)。明示的な full は #3818 由来のダブルライトデフォルトを維持 (このキーが指定しない限りエンベロープは書き込まれ続ける)。有効な full モードではいずれの階層でも明示的な on/off が常に優先: shadow/legacy (または暗号化が有効な場合) で要求された off は、JSON ファイルが唯一の真実のソースであるため 1 回限りの警告付きで無視される。環境変数階層 0/false/off = off、1/true/on = on が厳密なファイル表記 ("off"/"on") より優先される。フェイルセーフ: サイドカーが実行中に自身を無効化した場合、次のセーブでエンベロープ書き込みが再開される。ダブルライトの復元: storage.jsonWriter=on (または BILI_STORAGE_JSON_WRITER=1) — インデックスのみのセッションは起動和集合経由で引き続きロードされ、レプリカ/リストアはポータブルな JSON エンベロープを再物質化する。バイナリのダウングレード (または SQLite エンジンの喪失) は、>=v0.1.197 バイナリが再び実行されるまで、インデックスのみのセッションを v0.1.196 以前のバージョンから不可視にする - データは index.db に無傷のまま残るが、古いコードによって読み取られないだけである。セッションごとの CCR コンテンツストアサイドカーも書き込みが停止する - full モードでは、すべての読み取りで最初にインデックスの ccr ミラーが参照されるため、ミラーが永続コピーとなる。jsonWriter=off レーンは、そのセッションディレクトリの唯一のライターでなければならない: off レーンは統合優先で読み取り、決してファイルにフォールバックしないため、同じディレクトリに対して legacy/shadow で実行されるピアインスタンスは静かに分岐する (その JSON コピーは更新を受け取らなくなり、off レーンはピアの書き込みを決して見ない)。 |
-| `storage.walJournalSizeLimitBytes` | number | 8388608 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | index.db-wal の WAL 回収上限 (#3250)、バイト単位: 完了したチェックポイントごとに WAL ファイルがこのサイズまで切り詰められ、長寿命プロセスにおけるディスク使用量とクラッシュ復旧リプレイを制限する。セッションごとのデータクォータではない - データは書き込まれた時点で index.db に着地し、WAL はチェックポイント間のフレームをステージングするだけなので、セッション数/サイズはこれをスケーリングしない; 大きなバーストは、次の完了チェックポイントが切り詰めるまで一時的に超過しうる。高い = 切り詰め IO が稀になるが、定常時のディスク使用量が増え、クラッシュリプレイのテールが長くなる。環境変数階層 (正の整数) がファイル階層より優先される; ゴミまたは非正の環境変数値は、起動を失敗させるのではなくファイル/デフォルト階層にフォールスルーする。レーン起動時にストアが開かれる時点で適用される - ホット編集には再起動が必要。有効な値は統合有効ログ行とストレージ診断ブロブに表示される。 |
+| `storage.walJournalSizeLimitBytes` | number | 0 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | index.db-wal の WAL 回収上限 (#3250)、バイト単位。0 (デフォルト、#7674) = 無制限 — エンジンはチェックポイント後に WAL ファイルを切り詰めない。ファイルは過去の高水位 (現場: 安定して ~55 MiB) に留まり、フレームは毎回定期/終了時のチェックポイント (PASSIVE — リプレイテールゼロ) で index.db に収斂する。opencode がこの運用 (13 並行ライター、9.55 GB db、破損ゼロ)。#7674 前の 8 MiB デフォルトはすべての完了したチェックポイント後にエンジンが WAL を内部で切り詰める暗黙の床回収を生んでいた — JS 側のガードがどこからもカバーせず、共有セッションディレクトリの生きたピア接続 (#2671: 5 daemon、kill-9 交代) の真下から WAL を引き抜く — #7156 の損傷形。正数 N: 完了したチェックポイントごとに WAL を N に切り詰め。セッションごとのデータクォータではない - データは書き込まれた時点で index.db に着地。環境変数階層 (正の整数) がファイル階層より優先される; ゴミまたは非正の環境変数値はファイル/デフォルト階層にフォールスルーし起動は失敗しない。レーン起動時のストアオープン時点で適用 - ホット編集には再起動が必要。 |
 | `storage.archiveAfterDays` | integer | 365 | BILI_STORAGE_ARCHIVE_AFTER_DAYS | 日単位の GC 年齢スイープウィンドウ (#3463, #3901): これより長くアイドル状態のセッションはアーカイブされる - 単一のアーカイブログ (セッションディレクトリ配下の archive/archive.jsonl — セッションごとのファイルスプレーなし) に 1 行の JSON が追記され、トombストーン行がラベルとアイデンティティを保持し、コンテンツ/メディア参照が解放され、リストアは 1 つの POST のみで可能。0 は年齢スイープを無効にする; POST /__bili/storage/gc は常に実行され、既存の index.db を縮小するには ?vacuum=full を取る (新規書き込みには常に auto_vacuum=INCREMENTAL が有効)。同じ操作に CLI レイヤーがある (#3928): bili storage gc [--days N] [--vacuum full\|incremental] [--dry-run]、および bili sessions ls/rm/archive/restore <id> (README の 'Storage maintenance CLI' セクション)。環境変数がファイル階層より優先される。 |
 
 **更新 & アドバイズリー**
@@ -303,6 +303,7 @@
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | クライアントがターン間で履歴を巻き戻しまたは書き換えた場合、フォールド状態を調整する。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 圧縮プロンプトパック。解決順序はプロジェクトパック → ユーザーパック → ビルトイン。`acknowledgePromptsRisk` によるゲートはされない。 |
 | `compress.tiers` | boolean | true | — | T1→T3 の階層型蒸留により、フォールドコストを世代間で分散する。 |
+| `compress.protectedUserPatterns` | string[] | none | — | ユーザー本文のリテラル部分文字列：一致したプロンプトは最新のユーザーメッセージでなくてもフォールドされない。長寿命セッションでホストが現在のタスクを示す用途。 |
 | `compress.protectedTools` | string[] | none | — | 全履歴に対するハード除外：リストされたツールの結果は決してフォールドされない。パスパターン（`skill/<name>`）は名前でスキルを選択する（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 最新の結果が古いものを上書きする累積スナップショット型ツールの最新インスタンスのみを保護する（例：todo リスト）。パスパターンはスキルごとに最新インスタンスを保持する（`skill/*`, #1947）。 |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 最近保護ゾーンから除外（即時圧縮可能）。空の配列は何も除外しない（最大保護）。 |
@@ -314,6 +315,7 @@
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | ウィンドウが埋まるにつれて成長の通知を送信する（グローバルレベルのみ）。 |
 | `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | 2048文字を超える完了ラウンドの推論実行を破棄する（デフォルトで drop: true）；厳格な推論を要求するアップストリームでは drop: false が必要。 |
 | `compress.absorb` | object | opt-in (disabled) | — | ツール結果を短い要約に即時蒸留するオプトイン機能；元データはコンテンツストアに保存される。デフォルトでは画像を含む結果のみが対象となる。 |
+| `compress.degenerateRetry` | object | 1 attempt (built-in nudge) | — | クライアントに見える出力がゼロで終わるターンのリトライ予算と nudge 文の設定。継続 nudge はリトライ本文にのみ付加され、永続化も次のリクエストでの再生もされない。 |
 | `compress.blockOps` | object | off | — | 圧縮ブロック管理用のブロックライフサイクルツール（acp_retire / acp_restore / acp_rewrite）のオプトイン；デフォルト無効により、#5765 以前のワイヤーとバイト単位で同一を維持する。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | コンテンツキャッシュと取得：大きな出力はセッションの隣接にロスカレスで保存され、先頭抜粋とポインタに置き換えられ、acp_retrieve 経由で取得される；上限や退避は行われない。 |
 | `compress.search` | object | off | — | search_context の検索動作設定；現在、planAware リランキングを保持している。 |
@@ -330,6 +332,8 @@
 | `compress.absorb.excludeTools` | string[] | [] | — | 吸収から除外されるツール名。 |
 | `compress.absorb.toolName` | string | "absorb" | — | 吸収ツールの登録名。 |
 | `compress.absorb.mediaOnly` | boolean | true | — | メディア（画像）を伴うツール結果に吸収を制限する。画像バイトはテキストにカウントされないため、minToolTokens の対象外となる。false に設定すると、従来の大規模結果の全文吸収が有効になる。 |
+| `compress.degenerateRetry.maxAttempts` | integer | 1 | — | 退化ターンのリトライ予算（#7666）：クライアントに見える出力が何もないターン終了時に、agent の元のリクエストに末尾ユーザー nudge を追加して再発行する。0 = 無効（そのターンは素通し）、1 = 1 回（#7666 以前の動作）、最大 5；i 回目の試行で nudges[i] を送信（リストが短ければ循環）。ゼロバイト切断の再発行（#2171）とは予算が独立——1 ターンでそれぞれ 1 回まで。 |
+| `compress.degenerateRetry.nudges` | string[] | 3 built-in | — | 退化ターンリトライ用のカスタム nudge 文（#7666）；i 回目のリトライで i 番目の文を送信（短ければ循環）。未設定 = 組み込みローテーション（先頭はデフォルトの継続 nudge）。 |
 | `compress.blockOps.enabled` | boolean | false | — | 3 つのブロックライフサイクルツール（インジェクション + プロンプト + マニフェスト）を有効にする。Off = ツールなし、プロンプトセクションなし、リクエストごとのコストゼロ。 |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | コンテンツキャッシュおよび取得ブロックを有効にする。 |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | CCR ストレージの対象となるツール結果の最小推定トークンサイズ。 |
@@ -1644,6 +1648,19 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
   - `toolName: string` — 注入されたツールの名前を変更（デフォルト `"absorb"`）；宣伝/注入スキーマ、システムプロンプトセクション、セッションごとの裁定は両方のレーンで名前に従います。**レーンガバナンス (#1359):** プラグインモードは**ベース**設定によって `absorb` ブロック全体を支配するため、名前変更されたツールはその名前で宣伝され、その名前で実行されます（決して乖離しません）；プロバイダー/モデルレベルの `absorb.*` 上書きは**プロキシレーンのみ**です（プロキシはマージされた名前で注入し裁定します）。読み込み時の警告は、ベースから乖離するプロバイダー/モデル `absorb.*` フィールドを列挙します。
   注入はワイヤーのネイティブツールサーフェスに従います：プロキシモードは anthropic/openai/responses ネイティブツールワイヤーでツール（リクエストごとに解決された名前で）+ システムプロンプトセクションを注入し、プラグインモードは**有効な間のみ**プラグインマニフェストで宣伝します（ホストはマニフェストのツールを逐語に登録します — 無効なツールの宣伝はそれらを壊します、#1192；MCP シェルは無料で拾います）。Responses **マーカー/テキストプロトコル**ルートはサポートされていません（ネイティブツールサーフェスなし — REQUIRED absorb 指示は満たせません）、タイトル生成リクエスト（`max_tokens ≤ 200`）は compress プロンプトと同様に注入をスキップします。Absorb されたペアは再起動後も隠されたままです（セッション状態に永続化）。
 
+#### `degenerateRetry`
+
+- **型:** `object` (`{ maxAttempts?, nudges? }`) — サブフィールドは最も深い優先でマージ（グローバル → プロバイダー → モデル）
+- **既定:** 未設定 = `{ maxAttempts: 1 }` + 組み込み nudge ローテーション（#7666 以前のスレの動作）
+- **状態:** ACTIVE
+
+**説明:** 空ターンのリトライ予算。空ターン = クライアントに見える出力ゼロで完了イベントに達するターン（tag-echo が唯一のテキストを全剥、圧縮ドラフトの閉じタグ、または宣言のみの末尾）。各試行は、agent 自身の転送済み本体に尾部 user nudge を追加して再送出する（`src/degenerate-retry.ts`）；本体の変異はセッション状態に一切触れないため、nudge は一時物的 — クライアントの次リクエストは本来あるはずのものとバイト同一。サブフィールド：
+
+- `maxAttempts`（integer 0–5、既定 1）— 1 ターンあたりの nudge 再送出上限。0 = 空ターンリトライ全体を無効化（ターンは裸で通過）。予算枯渇時：chat レーンはインバンドの #870 エラー（"…after the continuation nudge" / "…after N continuation nudges"）を送出、responses レーンは空ターンを通過させる。
+- `nudges`（string[]、1–8、既定は組み込み 3 文）— i 回目に使う文（短いと循環）。組み込みローテーションの先頭は既定の継続 nudge（"Your previous response ended without a tool call. Continue now: …"）。
+
+ゼロバイト切断の再送出（#2171）とは独立し、そちらは独自の一発予算を保持する。失敗ファミリーとローカル 7 日間データ（空ターン arm 85 回、単発リトライで 93% 救出）は #7666 / #6034 を参照。
+
 #### `blockOps`
 
 - **型:** `object` (`{ enabled? }`)
@@ -2055,7 +2072,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_STORAGE_BACKEND` | `storage.backend` | unset (sqlite) |
 | `BILI_STORAGE_JSON_WRITER` | `storage.jsonWriter` | unset (off for the pure-sqlite selection — absent/unified=sqlite — and on for explicit full) |
 | `BILI_STORAGE_UNIFIED` | `storage.unified` | unset (sqlite) |
-| `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | `storage.walJournalSizeLimitBytes` | 8388608 |
+| `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | `storage.walJournalSizeLimitBytes` | 0 |
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |

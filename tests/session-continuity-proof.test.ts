@@ -71,7 +71,10 @@ const hash = (v: unknown): string => createHash("sha256").update(JSON.stringify(
 
 const SYSTEM_A = "You are DeepSeek Harness, the main coding agent.\nModel: GLM-4.6.\nWorkspace: /tmp.";
 const SYSTEM_B = "You are DeepSeek Harness, the main coding agent.\nModel: GLM-5.3.\nWorkspace: /tmp.";
-const GUARD_TEXT = "Instructions from: /repo/AGENTS.md\n# repo rules\nbehave conservatively and keep diffs minimal.";
+// #7153: the durable baseline carrier is classified on the shape dsh-agent-instructions
+// actually emits — the complete \x3csystem-reminder\x3e frame around the section label.
+// A bare label is now ordinary history (a human paste must not be pinned).
+const GUARD_TEXT = "\x3csystem-reminder\x3e\nInstructions from: /repo/AGENTS.md\n# repo rules\nbehave conservatively and keep diffs minimal.\n\x3c/system-reminder\x3e";
 
 const FILLER = "the quick brown fox jumps over the lazy dog, again and again, folding context away. ";
 

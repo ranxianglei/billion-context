@@ -158,7 +158,7 @@ describe("#684 regression: protected carve must not split a turn", () => {
     }
   });
 
-  it("fails with a clear error when the range is exactly the split turn", () => {
+  it("no-ops (not an error) when the range is exactly the split turn (#7596)", () => {
     const core = createCore();
     let state = createInitialState();
     const messages = buildMessages();
@@ -179,9 +179,14 @@ describe("#684 regression: protected carve must not split a turn", () => {
         { startRef: "m00003", endRef: "m00007", summary: "s".repeat(400) },
       ],
     });
+    // The guard still holds — nothing of the split turn may fold — but the
+    // doomed range is now a no-op success with a warning instead of the
+    // batch-rolling split error (#7596).
     assert.equal(res.result.blocksCreated, 0);
-    assert.equal(res.result.errors.length, 1);
-    assert.match(res.result.errors[0]!, /split 1 turn/);
+    assert.deepEqual(res.result.errors, []);
+    assert.equal(res.state.blocks.length, 0);
+    assert.match(res.result.warnings[0]!, /folded nothing/);
+    assert.match(res.result.warnings[0]!, /withdrawn in full instead of split/);
   });
 
   it("#564 shape stays allowed: fold call+result, keep reasoning+text (directional)", () => {
