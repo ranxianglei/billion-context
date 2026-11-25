@@ -47,7 +47,7 @@ export function bodyContentEncodingOf(headers: Record<string, string> | undefine
     return normalizeCoding(first);
 }
 
-export type DecodedBody =
+type DecodedBody =
     | { status: "decoded"; bytes: Uint8Array }
     | { status: "too-large" }
     | { status: "undecodable" };
