@@ -119,7 +119,11 @@ function scriptTurns(): Array<{ messages: unknown[]; max_tokens: number; stream:
                 { type: "image_url", image_url: { url: `data:image/png;base64,${PNG_1X1}` } },
             ];
         }
-        turns.push({ messages: history, max_tokens: 64_000, stream: false });
+        // #5687 narrowed the single-shot sidecar gate to small budgets
+        // (hasSingleShotBudget, <=8192): a tool-less 64K turn is now correctly
+        // a MAIN turn. Turn 0 models the real dsh sidecar (4K budget) so it
+        // still rides the side lane and pins the "side lane never stamps" edge.
+        turns.push({ messages: history, max_tokens: t === 0 ? 4_096 : 64_000, stream: false });
     }
     return turns;
 }
@@ -206,10 +210,11 @@ test("#5418 A/B byte-equality + residency band (hermetic dual-proxy)", async () 
         const corpus = scriptTurns();
         for (let i = 0; i < 8; i++) {
             if (i === 0) {
-                // #5656 residual: turn 0 is a tool-less single-shot shape, so it
-                // rides the verbatim side lane (kernel no-touch) in BOTH phases
-                // — the gate predates this feature and ignores the rollout env —
-                // and the side lane neither scans nor stamps.
+                // #5656 residual: turn 0 is a tool-less small-budget sidecar
+                // shape, so it rides the verbatim side lane (kernel no-touch)
+                // in BOTH phases — the gate ignores the rollout env —
+                // and the side lane neither scans nor stamps. (#5687 moved the
+                // shape distinction from "tool-less" to the sidecar budget.)
                 assert.equal(rb[i], null, `B stamp ${i}: side lane must not stamp`);
                 continue;
             }

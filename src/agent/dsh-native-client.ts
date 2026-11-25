@@ -1133,7 +1133,9 @@ export function apply(ctx: ClientContext): void {
             createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, header),
             ...rows.map((r) => {
                 const code = r.code !== undefined ? ` ${r.code}` : "";
-                const s = r.nextProbeInMs !== undefined ? Math.max(1, Math.ceil(r.nextProbeInMs / 1000)) : undefined;
+                // #6026: 0 means fail-fast already lifted (probe-eligible, and probes are
+                // request-driven — bili never auto-retries), so a countdown would be a lie.
+                const s = r.nextProbeInMs !== undefined && r.nextProbeInMs > 0 ? Math.ceil(r.nextProbeInMs / 1000) : undefined;
                 const eta = s !== undefined ? ` · ${t("upstream_retry_hint").replace("{s}", String(s))}` : "";
                 return createElement("div", { key: r.host, style: { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, lineHeight: 1.5 } }, `${r.host} · ${r.kind}${code} ×${r.count}${eta}`);
             }),

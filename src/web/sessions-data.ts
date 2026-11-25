@@ -1,5 +1,5 @@
-import { defaultCountTokens, orderedRefPair } from "acp-kernel";
-import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
+import { defaultCountTokens, orderedRefPair, type CompressionBlock } from "acp-kernel";
+import { blockContentSnapshot, listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
 import { fileNameMatchesId, getStore, isValidRecord, _resetStoreForTest, relPathFor } from "../persist.js";
@@ -16,6 +16,8 @@ type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
+import { displaySessionTitle, firstBlockTopicLead } from "../session-title.js";
+import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
 import { isExternalSummaryBlock } from "../external-summary-marker.js";
@@ -26,7 +28,7 @@ import * as path from "node:path";
 /** #1420/#1937: read-only session browsing for the web UI. Merges the LIVE
  *  in-memory pool (bounded — evicted sessions are gone) with the on-disk
  *  corpus. #1937: the disk side is a BOUNDED SUMMARY INDEX — a directory walk
- *  over metadata only, per-file summaries cached by (mtime,size), and
+ *  over metadata only, per-file summaries cached by (mtime,size,price), and
  *  sequential decode of changed/new files whose parsed records are discarded
  *  right after extraction. List/overview paths never construct or retain full
  *  Session objects, so resident memory stays O(#sessions × ~1KB) regardless of
@@ -37,7 +39,7 @@ import * as path from "node:path";
 // the model, not the host's own history — so per-step cost climbs with it. On
 // plugin lanes (~2 host messages per request, dsh-measured) that becomes
 // visible around 10k messages ≈ 5k requests. The server log warns much earlier
-// (SLOW_SESSION_MSG_WARN = 1000 messages, src/server.ts); this display gate is
+// (SLOW_SESSION_MS_WARN = 1000ms local-processing budget, src/server/request-cost.ts); this display gate is
 // deliberately higher — the badge should mean "worth starting a new session",
 // not "notable".
 const SLOW_SESSION_REQUESTS_WARN = 5000;
@@ -83,6 +85,9 @@ interface WebSessionSummary {
     hasLedger?: boolean;
     /** Display-name fallback: collapsed lead of the first compression block's topic/summary. */
     firstBlockHint?: string;
+    /** Parent session for a subagent/derived session, when the host stamped
+     *  metadata.derivedFromSessionId (or the legacy derivedFrom key). */
+    parentSessionId?: string;
     /** Which client produced this session: plugin agents stamp metadata.pluginAgent,
      *  non-plugin clients get a sniffed/UA-derived metadata.clientHint (server.ts #1426). */
     clientHint?: string;
@@ -302,6 +307,11 @@ interface WebSessionDetail extends WebSessionSummary {
      *  resolution as the banner's clients[]); absent when unresolvable or when
      *  there are no conflicts. */
     conflictClient?: string;
+    /** Context analysis: init size, nudge cadence, compression acceptance
+     *  (harvest) rate, and the plain-language verdict — this process's live
+     *  view (in-memory only; absent for sessions this bili process has not
+     *  observed at least twice yet). */
+    contextAnalysis?: ContextAnalysisView;
     /** #2904: no-ceiling output-budget degraded state for this session's last
      *  starved model ({model,value,ts}); absent when none holds. */
     outputBudgetDegraded?: { model: string; value: number; ts: number };
@@ -355,6 +365,8 @@ type DiskEntry = {
     savedAt: number;
     /** null = undecodable/corrupt or renamed file — skipped (logged), never fatal. */
     summary: WebSessionSummary | null;
+    /** Resolved rates used to derive this summary's dollar fields. */
+    priceKey?: string;
 };
 
 // #4990: read surface rides the persist process singleton (getStore) — a
@@ -491,8 +503,9 @@ function isPristineSessionsRoot(error: unknown): boolean {
     return entries.every((entry) => DATA_DIR_INFRA_ENTRIES.has(entry));
 }
 
-/** Single-flight index refresh. Steady-state cost is one stat per file; only
- *  new/changed files (mtime OR size moved) are decoded, one at a time with a
+/** Single-flight index refresh. Steady-state cost is one stat per file and
+ *  one price lookup per distinct model/origin; new/changed files or summaries
+ *  whose resolved prices changed are decoded, one at a time with a
  *  GC checkpoint between files, and the parsed record is dropped immediately
  *  after summary extraction. Top-level walk failure: serve the previous
  *  snapshot when one exists, else propagate (→ HTTP 500, visible in UI) —
@@ -518,6 +531,17 @@ async function refreshIndex(): Promise<void> {
         }
         const prev = byFile ?? new Map<string, DiskEntry>();
         const next = new Map<string, DiskEntry>();
+        const prices = new Map<string, string>();
+        const priceKey = (summary: WebSessionSummary, fresh = false): string => {
+            const modelKey = JSON.stringify([summary.model, summary.upstreamOrigin]);
+            let key = prices.get(modelKey);
+            if (fresh || key === undefined) {
+                const price = livePriceForModel(summary.model, summary.upstreamOrigin);
+                key = JSON.stringify(price ? [price.input, price.output, price.cacheRead, price.cacheWrite] : null);
+                prices.set(modelKey, key);
+            }
+            return key;
+        };
         const covered = liveCoveredPaths(dir);
         // #3199: shadow mode adopts fresh unified rows instead of decoding the
         // files they describe — cold-start cost drops from "decode the whole
@@ -532,13 +556,14 @@ async function refreshIndex(): Promise<void> {
         for (const f of files) {
             if (covered.has(f.abs)) continue;
             const p = prev.get(f.abs);
-            if (p && p.mtimeMs === f.mtimeMs && p.size === f.size) {
+            if (p && p.mtimeMs === f.mtimeMs && p.size === f.size && (!p.summary || p.priceKey === priceKey(p.summary))) {
                 next.set(f.abs, p);
                 continue;
             }
             const claim = claims?.get(path.basename(f.abs));
             if (claim && f.mtimeMs - claim.updatedAt <= SHADOW_ROW_STALE_WINDOW_MS) {
-                next.set(f.abs, { abs: f.abs, mtimeMs: f.mtimeMs, size: f.size, savedAt: claim.updatedAt, summary: summaryFromRow(claim) });
+                const summary = summaryFromRow(claim);
+                next.set(f.abs, { abs: f.abs, mtimeMs: f.mtimeMs, size: f.size, savedAt: claim.updatedAt, summary, priceKey: priceKey(summary, true) });
                 continue;
             }
             decodeCount++;
@@ -555,6 +580,9 @@ async function refreshIndex(): Promise<void> {
                     if (fileNameMatchesId(path.basename(f.abs), rec.id, proto, origin)) {
                         entry.savedAt = typeof rec.savedAt === "number" ? rec.savedAt : Date.now();
                         entry.summary = summaryFromRecord(rec);
+                        // A config reload can run during the file read. Stamp the
+                        // rates used now, not a memo from before that await.
+                        entry.priceKey = priceKey(entry.summary, true);
                     } else {
                         log("warn", `[acp-web] skipping ${relName}: filename does not match record id`);
                     }
@@ -657,10 +685,14 @@ function str(v: unknown): string | undefined {
  *  Host-aware like the pricing editor (`handlePricingGet`). */
 function livePriceForSummary(s: SummarySource): LivePrice | undefined {
     const model = typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? s.metadata.lastModel : undefined;
+    return livePriceForModel(model, s.meta.upstreamOrigin);
+}
+
+function livePriceForModel(model: string | undefined, upstreamOrigin: string | undefined): LivePrice | undefined {
     if (!model) return undefined;
     let host: string | undefined;
-    if (s.meta.upstreamOrigin) {
-        try { host = new URL(s.meta.upstreamOrigin).host; } catch { host = undefined; }
+    if (upstreamOrigin) {
+        try { host = new URL(upstreamOrigin).host; } catch { host = undefined; }
     }
     return resolveBillingPrice(model, host);
 }
@@ -923,14 +955,12 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             ? { w: livePrice.cacheWrite, r: livePrice.cacheRead, q: livePrice.output }
             : undefined;
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
-    let firstBlockHint = "";
-    const fb = s.state.blocks.find((b) => b.topic || b.summary);
-    if (fb && (fb.topic || fb.summary)) {
-        firstBlockHint = String(fb.topic || fb.summary).replace(/\s+/g, " ").trim();
-        if (firstBlockHint.length > 48) firstBlockHint = firstBlockHint.slice(0, 48) + "…";
-    }
+    const firstBlockHint = firstBlockTopicLead(s.state.blocks) ?? "";
     // #1426: which client this session came from (plugin stamp wins, then sniff/UA hint).
     const metaRec = s.metadata as Record<string, unknown>;
+    // Host-stamped parent for a subagent/derived session. New sessions
+    // stamp derivedFromSessionId; keep derivedFrom as the legacy fallback.
+    const parentSessionId = str(metaRec["derivedFromSessionId"]) ?? str(metaRec["derivedFrom"]);
     // #2155: active self-heal state (zombie plugin degrade / nudge
     // suppression) — surface it so the web list can badge the session.
     const shRaw = metaRec["selfHeal"];
@@ -957,12 +987,16 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // #3376: idle cache-keepalive state — memory-only, so live rows only.
     const keepalive = live ? keepaliveStatusFor(s.id) : undefined;
     const best = displayContextBest(s);
+    // Subagent dispatch prompts are identical across children, so an old
+    // set-once title may be pure boilerplate. displaySessionTitle falls back
+    // to the first block topic for display; a real host-provided title wins.
+    const displayTitle = displaySessionTitle(s.meta.hostTitle, s.meta.title, firstBlockHint);
     return {
         id: s.id,
         ...(best ? { contextBest: best } : {}),
         // #2322: a host-provided name (pi /name) outranks the derived
         // first-message title everywhere the row feeds (list, search, export).
-        ...((s.meta.hostTitle || s.meta.title) ? { title: s.meta.hostTitle || s.meta.title } : {}),
+        ...(displayTitle ? { title: displayTitle } : {}),
         // #1426: meta.label is auto-stamped with the session id on many clients —
         // treat label === id as "no title" so lists/details show 无标题 + block hint.
         ...(s.meta.label && s.meta.label !== s.id ? { label: s.meta.label } : {}),
@@ -990,6 +1024,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),
         ...(firstBlockHint ? { firstBlockHint } : {}),
+        ...(parentSessionId ? { parentSessionId } : {}),
         ...(hasFolds ? { grossSaved, netSaved, repayCost, summaryCost, foldCount } : {}),
         ...(typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? { model: s.metadata.lastModel } : {}),
         ...(costUsd !== undefined ? { costUsd } : {}),
@@ -1050,7 +1085,12 @@ async function mergedSummaries(): Promise<WebSessionSummary[]> {
     }
     if (!fromRows) {
         const files = await ensureIndex();
-        for (const e of files.values()) if (e.summary) out.set(e.summary.id, e.summary);
+        // The index already chooses each id's freshest savedAt, then mtime.
+        // Replaying every file here would let directory order pick a stale twin.
+        for (const abs of byId?.values() ?? []) {
+            const summary = files.get(abs)?.summary;
+            if (summary) out.set(summary.id, summary);
+        }
     }
     for (const s of listSessions()) out.set(s.id, summaryOf(s, true));
     return [...out.values()].sort((a, b) => b.lastSeen.localeCompare(a.lastSeen));
@@ -1070,6 +1110,9 @@ interface SessionPageQuery {
     protocol?: string;
     client?: string;
     state?: SessionPageState;
+    /** "top" excludes derived sessions; "child" keeps only sessions with a
+     *  parentSessionId. Unknown values are ignored, like the other facets. */
+    kind?: "top" | "child";
     page?: number;
     pageSize: number;
 }
@@ -1107,6 +1150,8 @@ export async function buildSessionPage(query: SessionPageQuery): Promise<Session
         }
         if (protocol && (s.protocol ?? "unknown").toLowerCase() !== protocol) return false;
         if (client && (s.clientHint ?? "").toLowerCase() !== client) return false;
+        if (query.kind === "top" && s.parentSessionId) return false;
+        if (query.kind === "child" && !s.parentSessionId) return false;
         if (query.state === "live" && (!s.live || s.restored)) return false;
         if (query.state === "history" && s.live && !s.restored) return false;
         return true;
@@ -1433,29 +1478,48 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // absent from BOTH keep the honest missing marker.
     // `directMessageCount` still tells the UI how many were folded either way.
     const messageById = new Map((session.lastMessages || []).map((m) => [m.id, m]));
-    const hydratedByRefNum = new Map<number, { role: string; content: string }>();
+    // #6029: hydrate pruned leaves by their STABLE msg_id (the content-derived
+    // identity), never by the live ref number. restampRefsToLedger renumbers the
+    // live refs at cold load — the #5196 parked band lands on fresh high numbers
+    // while messages.ref_num stays frozen at index time — so a ref-number join
+    // silently misses every renumbered row (~37% of a long session's block-detail
+    // leaves read as "gone"). msg_id never moves under a restamp, so it is the
+    // correct join key; the ref below stays display-only.
+    const hydratedByMsgId = new Map<string, { role: string; content: string }>();
     try {
-        const pending: number[] = [];
+        const pending: string[] = [];
         for (const b of session.state.blocks) {
             for (const raw of b.directMessageIds || []) {
                 if (!messageById.has(raw)) {
                     const r = byRaw[raw];
                     const num = typeof r === "string" ? /^m(\d+)$/.exec(r) : undefined;
-                    if (num) pending.push(Number(num[1]));
+                    if (num) pending.push(raw);
                 }
             }
         }
         if (pending.length > 0) {
-            const rows = getStore().unifiedMessageContentByRefs(session.id, pending);
+            const rows = getStore().unifiedMessageContentByIds(session.id, pending);
             for (const row of rows ?? []) {
                 const text = storedMessageText(row.content);
-                if (text !== null) hydratedByRefNum.set(row.refNum, { role: row.role, content: text });
+                if (text !== null) hydratedByMsgId.set(row.msgId, { role: row.role, content: text });
             }
         }
     } catch {
         // sidecar unavailable/degraded: fall through to legacy missing leaves
     }
-    const messageLeaves = (rawIds: string[]): Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> => {
+    // Frozen-snapshot hydration for THIS detail build, memoized per block —
+    // a block's rows all come from one call, so at most one snapshot parse
+    // per block, and only when a row actually misses window + store.
+    const snapIndexMemo = new Map<string, Map<string, BlockSnapItem> | null>();
+    const snapshotRefIndex = (block: CompressionBlock): Map<string, BlockSnapItem> | null => {
+        let idx = snapIndexMemo.get(block.blockId);
+        if (idx === undefined) {
+            idx = snapshotRefIndexFor(session, block);
+            snapIndexMemo.set(block.blockId, idx);
+        }
+        return idx;
+    };
+    const messageLeaves = (rawIds: string[], block?: CompressionBlock): Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> => {
         const out: Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> = [];
         for (const raw of rawIds) {
             const ref = byRaw[raw];
@@ -1464,11 +1528,28 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
             // #3917: a folded message whose bytes are gone from the resident
             // window still gets a row — the ref is the identity the user asked
             // for. #4738: bytes gone from the window but stored are hydrated,
-            // never missed; nothing invented either way.
+            // never missed; nothing invented either way. #6029: the lookup keys
+            // off the stable msg_id (raw), not the possibly-restamped ref number.
             if (!msg) {
                 const num = /^m(\d+)$/.exec(ref);
-                const stored = num ? hydratedByRefNum.get(Number(num[1])) : undefined;
-                out.push(stored ? { ref, role: stored.role, preview: messagePreview(stored.content) } : { ref, missing: true });
+                const stored = num ? hydratedByMsgId.get(raw) : undefined;
+                if (stored) {
+                    out.push({ ref, role: stored.role, preview: messagePreview(stored.content) });
+                    continue;
+                }
+                // Window and store are both empty, but the bytes may live on in
+                // the block's frozen content snapshot — leaf blocks re-align by
+                // position (marker-validated); every other case stays an
+                // honest miss.
+                const item = block ? (snapshotRefIndex(block)?.get(ref) ?? undefined) : undefined;
+                out.push(item
+                    ? {
+                          ref,
+                          role: item.role,
+                          ...(item.toolName !== undefined ? { toolName: item.toolName } : {}),
+                          preview: messagePreview(item.text),
+                      }
+                    : { ref, missing: true });
                 continue;
             }
             out.push({
@@ -1534,6 +1615,10 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         handoffTruncated,
         ...(conflicts.length > 0 ? { conflicts } : {}),
         ...(conflictClient ? { conflictClient } : {}),
+        ...(() => {
+            const ca = contextAnalysisView(session.id);
+            return ca ? { contextAnalysis: ca } : {};
+        })(),
         blockDetails: session.state.blocks.map((b) => {
             // Display data: canonicalize to ascending labels so non-monotonic-
             // ref spans don't render reversed in the UI (#2168).
@@ -1558,7 +1643,7 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
                 effectiveMessageCount: (b.effectiveMessageIds || []).length,
                 directMessageCount: (b.directMessageIds || []).length,
                 directMessageRefs: refsOf(b.directMessageIds || []),
-                directMessages: messageLeaves(b.directMessageIds || []),
+                directMessages: messageLeaves(b.directMessageIds || [], b),
                 summaryTokens: defaultCountTokens(b.summary),
                 summaryBytes: utf8Bytes(b.summary),
             };
@@ -1587,8 +1672,172 @@ const MESSAGE_PREVIEW_CHARS = 110;
 
 function messagePreview(text: string): string {
     const flat = text.replace(/\s+/g, " ").trim();
-    const chars = Array.from(flat);
-    return chars.length > MESSAGE_PREVIEW_CHARS ? chars.slice(0, MESSAGE_PREVIEW_CHARS).join("") + "…" : flat;
+    // A tool result can be megabytes long; only walk the displayed code points
+    // instead of allocating an array containing every character of the result.
+    let end = 0;
+    let count = 0;
+    for (const char of flat) {
+        if (count === MESSAGE_PREVIEW_CHARS) return flat.slice(0, end) + "…";
+        end += char.length;
+        count++;
+    }
+    return flat;
+}
+
+/** A frozen full-view snapshot (collectBlockContent) renders each original
+ *  message as a `[role]` (or `[role • toolName]`) header line followed by its
+ *  text; a pi-host user message additionally opens its body with an ACP ref
+ *  marker, which pins one exact ref→position alignment. */
+const BLOCK_ROLE_LINE_RE = /^\[([a-zA-Z]+)(?: • ([^\]]+))?\]$/;
+const ACP_REF_MARK_RE = /^<acp [^>]*>(m\d+)<\/acp>$/;
+
+type BlockSnapItem = { role: string; toolName?: string; text: string; ref?: string };
+
+/** Re-parse a frozen full-view snapshot into its ordered message fragments.
+ *  A body line that merely LOOKS like a role header splits the message — the
+ *  count/marker validation in snapshotRefIndexFor is what keeps a bad parse from
+ *  ever being served. Only the empty line before another header belongs to
+ *  the \n\n separator; leading and trailing body lines remain verbatim. */
+function parseBlockContentMessages(text: string): BlockSnapItem[] {
+    const items: BlockSnapItem[] = [];
+    let cur: BlockSnapItem | null = null;
+    let bodyLines = 0;
+    let hasText = false;
+    const close = (nextHeader: boolean) => {
+        if (!cur) return;
+        if (nextHeader && cur.text.endsWith("\n")) cur.text = cur.text.slice(0, -1);
+        items.push(cur);
+        cur = null;
+    };
+    for (const line of text.split("\n")) {
+        const roleM = BLOCK_ROLE_LINE_RE.exec(line);
+        if (roleM) {
+            close(true);
+            bodyLines = 0;
+            hasText = false;
+            cur = {
+                role: roleM[1],
+                ...(roleM[2] !== undefined ? { toolName: roleM[2] } : {}),
+                text: "",
+            };
+            continue;
+        }
+        if (!cur) continue; // one-view summary preamble — never hydrated
+        const markM = ACP_REF_MARK_RE.exec(line);
+        if (markM && cur.ref === undefined && !hasText) {
+            cur.ref = markM[1];
+            continue;
+        }
+        cur.text += (bodyLines++ === 0 ? "" : "\n") + line;
+        if (line.length > 0) hasText = true;
+    }
+    close(false);
+    return items;
+}
+
+/** ref → snapshot fragment for ONE block, or null when no alignment can be
+ *  proven. The frozen full view is an ordered subsequence of the block's
+ *  direct messages (host native compaction may have pruned some of them
+ *  before the snapshot was taken), so alignment is anchored on the ACP ref
+ *  markers the pi host stamps into user-message bodies. Each marker must be
+ *  anchored by at least one of two independent proofs — otherwise the whole
+ *  block is rejected:
+ *
+ *  · IDENTITY: the marker names the CURRENT ref sitting at the marker's own
+ *    snapshot position (marker number never restamped since creation);
+ *  · ARITHMETIC: the marker's FROZEN number falls inside the block's frozen
+ *    span and `frozenNumber − frozenSpanStart === snapshot position` (the
+ *    span and the markers were written together, so this is immune to the
+ *    cold-load ref RESTAMP — #5196 parked bands take fresh numbers, which
+ *    invalidates the identity proof for exactly the blocks that were
+ *    renumbered). A marker proving neither (foreign content, or a span that
+ *    does not start where the block's messages do) aborts the block.
+ *
+ *  With no markers at all the block degrades to the strict whole-block zip
+ *  (leaf span, exact counts), which is the only unanchored case that can be
+ *  proven; a pinless NON-leaf block can never be aligned (its frozen view
+ *  spans the effective messages, a superset of the direct list).
+ *
+ *  A marker proving neither anchor is rejected for the whole block; between
+ *  anchors, a segment zips positionally ONLY when its fragment count equals
+ *  its ref count — unbalanced segments stay missing. Never serve shifted
+ *  bytes under a ref. */
+function snapshotRefIndexFor(session: Session, block: CompressionBlock): Map<string, BlockSnapItem> | null {
+    const direct = block.directMessageIds || [];
+    const effective = block.effectiveMessageIds || [];
+    if (direct.length === 0) return null;
+    let content: BlockContent | undefined;
+    try {
+        content = blockContentSnapshot(session.blockContents, block);
+    } catch {
+        return null;
+    }
+    const full = content ? content.full : undefined;
+    if (!full || full.text.length === 0) return null;
+    const byRaw = session.state.messageRefs.byRaw;
+    const refs: string[] = [];
+    for (const raw of direct) {
+        const r = byRaw[raw];
+        if (typeof r !== "string" || r.length === 0) return null; // unaligned ledger — abort
+        refs.push(r);
+    }
+    const refPos = new Map<string, number>();
+    refs.forEach((r, i) => refPos.set(r, i));
+    const items = parseBlockContentMessages(full.text);
+    if (items.length === 0) return null;
+    const startN = refNumber(block.startRef);
+    const endN = refNumber(block.endRef);
+    const pins: Array<[number, number]> = []; // [snapshot position, ledger position]
+    for (let i = 0; i < items.length; i++) {
+        const mark = items[i].ref;
+        if (mark === undefined) continue;
+        if (refs[i] === mark) {
+            pins.push([i, i]); // identity — marker number never restamped
+            continue;
+        }
+        // arithmetic — frozen numbering vs the frozen span. Restamp-immune:
+        // the span and the markers were written together, so the offset still
+        // holds even after cold-load restamping renumbers the block's refs.
+        // Takes precedence over a coincidental current-ref match (a restamped
+        // number may equal some OTHER message's new ref).
+        const n = refNumber(mark);
+        if (n !== null && startN !== null && endN !== null && n >= startN && n <= endN && n - startN === i) {
+            pins.push([i, i]);
+            continue;
+        }
+        const p = refPos.get(mark);
+        if (p === undefined) return null; // foreign message in the frozen context — abort
+        pins.push([i, p]); // marker still names a current ref inside the block
+    }
+    if (pins.length === 0 && direct.length !== effective.length) return null; // pinless non-leaf — unprovable
+    for (let k = 1; k < pins.length; k++) {
+        if (pins[k][0] <= pins[k - 1][0] || pins[k][1] <= pins[k - 1][1]) return null; // order disagreement — abort
+    }
+    const map = new Map<string, BlockSnapItem>();
+    const bounds: Array<[number, number]> = [[-1, -1], ...pins, [items.length, refs.length]];
+    for (let s = 0; s < bounds.length - 1; s++) {
+        const [i0, p0] = bounds[s];
+        const [i1, p1] = bounds[s + 1];
+        if (i1 - i0 !== p1 - p0) continue; // segment not balanced — unprovable, stays missing
+        for (let i = i0 + 1; i < i1; i++) {
+            const p = p0 + (i - i0);
+            if (p >= 0 && p < refs.length) map.set(refs[p], items[i]);
+        }
+    }
+    for (const [i, p] of pins) map.set(refs[p], items[i]);
+    return map;
+}
+
+/** mNNNNN → N, or null when not a well-formed message ref. */
+function refNumber(ref: string | undefined): number | null {
+    if (typeof ref !== "string" || ref.length < 2 || ref[0] !== "m") return null;
+    let n = 0;
+    for (let i = 1; i < ref.length; i++) {
+        const c = ref.charCodeAt(i);
+        if (c < 48 || c > 57) return null;
+        n = n * 10 + (c - 48);
+    }
+    return n;
 }
 
 function utf8Bytes(s: string): number {
@@ -1673,7 +1922,7 @@ export async function buildBlockContent(id: string, blockId: string, view: Block
     if (!block) return { ok: false, reason: "unknown-block" };
     let content: BlockContent | undefined;
     try {
-        content = session.blockContents.get(blockId);
+        content = blockContentSnapshot(session.blockContents, block);
     } catch (error) {
         // #3917: a corrupt/unreadable content store must not 500 the panel —
         // report it as "no snapshot" and let the UI explain.
@@ -1725,7 +1974,10 @@ export async function buildMessageContent(id: string, ref: string): Promise<Mess
         const num = /^m(\d+)$/.exec(ref);
         if (typeof raw === "string" && num) {
             try {
-                const rows = getStore().unifiedMessageContentByRefs(id, [Number(num[1])]);
+                // #6029: query by the stable msg_id — the live ref may have been
+                // restamped onto a fresh high number while messages.ref_num stays
+                // frozen at index time, so a ref-number join misses the row.
+                const rows = getStore().unifiedMessageContentByIds(id, [raw]);
                 const row = rows && rows.length > 0 ? rows[0] : undefined;
                 const stored = row ? storedMessageText(row.content) : null;
                 if (row && stored !== null) {
@@ -1743,6 +1995,31 @@ export async function buildMessageContent(id: string, ref: string): Promise<Mess
                 }
             } catch {
                 // sidecar degraded mid-request: report the miss, never 500
+            }
+        }
+        // Last resort: the bytes only survive in the frozen block-content
+        // snapshot (marker-anchored alignment). The ledger still owns
+        // identity — the ref we were asked for must be the one the block's
+        // alignment produced for this raw id; a shifted parse yields null,
+        // never wrong bytes.
+        if (typeof raw === "string") {
+            for (const b of session.state.blocks) {
+                const direct = b.directMessageIds || [];
+                if (direct.indexOf(raw) === -1) continue;
+                const item = snapshotRefIndexFor(session, b)?.get(ref);
+                if (!item) continue;
+                const totalBytes = utf8Bytes(item.text);
+                const truncated = totalBytes > BLOCK_CONTENT_MAX_BYTES;
+                return {
+                    ok: true,
+                    ref,
+                    role: item.role,
+                    ...(item.toolName !== undefined ? { toolName: item.toolName } : {}),
+                    bytes: truncated ? BLOCK_CONTENT_MAX_BYTES : totalBytes,
+                    totalBytes,
+                    truncated,
+                    text: truncated ? sliceUtf8(item.text, BLOCK_CONTENT_MAX_BYTES) : item.text,
+                };
             }
         }
         return { ok: false, reason: "unknown-message" };

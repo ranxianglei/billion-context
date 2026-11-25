@@ -14,6 +14,7 @@ import {
     createContentStore,
     createCore,
     defaultConfig,
+    syncBlocks,
     STORED_PLACEHOLDER_MARKER,
     type Config,
     type CoreMessage,
@@ -37,6 +38,10 @@ import { maybeAdoptForkBlocks } from "../src/fork-adoption.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 process.env.BILI_PERSIST = "0";
+// #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+// off) — this suite reads the companion session ENVELOPE off disk, so pin
+// the dual-write writer explicitly.
+process.env.BILI_STORAGE_JSON_WRITER = "on";
 
 const LIMIT = 200_000;
 const META = { protocol: "openai" as const, upstreamOrigin: "http://upstream.example/v1" };
@@ -137,7 +142,7 @@ test("cloneStoreForRefs: ref-filtered independent clone", () => {
     assert.equal(cloneStoreForRefs(createContentStore(), []), null);
 });
 
-test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341)", async () => {
+for (const shortView of [false, true]) test(`fork of ${shortView ? "view-deactivated" : "armed"} parent retains compression and retrievable originals`, async () => {
     const body: Body = {
         model: "test-model",
         messages: [
@@ -151,6 +156,11 @@ test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341
     };
     const armed = armParent(body, { startId: "m00001", endId: "m00005" }, true);
     const { parent } = armed;
+    if (shortView) {
+        parent.state = syncBlocks([], parent.state).state;
+        assert.equal(parent.state.blocks.some(b => b.active), false);
+    }
+    const stateBefore = JSON.stringify(parent.state);
     const pstore = contentStoreOf(parent);
     // Arrival: m00003 (BIG_A), m00008 (BIG_B). Fold-time: m00001..m00005 minus
     // the already-stored m00003.
@@ -162,6 +172,7 @@ test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341
     forkBody.messages[7] = { role: "tool", tool_call_id: "call_b", content: `${BIG_B}\n(edited branch)` };
     const child = await forkChild(armed, forkBody);
 
+    assert.equal(JSON.stringify(parent.state), stateBefore, "fork recovery never mutates source state");
     assert.equal(child.state.blocks.length, 1);
     assert.ok(child.state.blocks[0].active);
     assert.equal(child.state.blocks[0].blockId, armed.blockId);
@@ -283,6 +294,12 @@ test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)
 });
 
 test("child persists its own companion and survives a proxy restart (#1341)", async () => {
+    // Pure-SQLite is the default storage writer now (2026-11-13): this test
+    // counts the .content-store.json companion envelope on disk, which the
+    // default writer never emits (0 !== 1 in the e2e-dsh-plugin-lane). Pin
+    // dual-write like the other e2e lanes (74a925db/d252543a).
+    const previousWriter = process.env.BILI_STORAGE_JSON_WRITER;
+    process.env.BILI_STORAGE_JSON_WRITER = "1";
     const dir = mkdtempSync(path.join(tmpdir(), "bili-fork-ccr-"));
     _setStoreForTest(new SessionStore({ dir, debounceMs: 0 }));
     try {
@@ -316,6 +333,8 @@ test("child persists its own companion and survives a proxy restart (#1341)", as
         assert.match(ack, /acp-retrieved #m00003/);
         assert.ok(ack.includes(BIG_A.slice(0, 200)), "true original after reload (v2 tool result)");
     } finally {
+        if (previousWriter === undefined) delete process.env.BILI_STORAGE_JSON_WRITER;
+        else process.env.BILI_STORAGE_JSON_WRITER = previousWriter;
         _setStoreForTest(new SessionStore({ enabled: false }));
         rmrf(dir);
     }

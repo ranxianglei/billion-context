@@ -4,15 +4,16 @@ import { log as loggerLog } from "./logger.js";
 import { getStore, effectiveFileStorageMode } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
-import { configFileEpoch, loadConfigFile } from "./config.js";
-import { applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
+import { configFileEpoch, loadConfigFile, loadNamedProviders } from "./config.js";
+import { applyCompressSettings, combineMessageProtectedPredicate, hasCompressSettings, resolveContextLimitValue, type ResolvedKernelConfig } from "./compress-settings.js";
+import { agentProviderRecipes } from "./agent-providers.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
 import { isResponsesTurnSeparatorId } from "./turn-separator.js";
 import type { FoldReconcileResult } from "./fold-reconcile.js";
-import type { UnpromptedGate } from "./unprompted-gate.js";
+import type { UnpromptedGateState } from "./unprompted-gate.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -27,6 +28,22 @@ export type BlockContent = {
     one: BlockView | null;
     full: BlockView;
 };
+
+/** The compression-time snapshot of a block, or undefined when there is none.
+ *  The unified index stores a placeholder for blocks whose legacy record had no
+ *  snapshot ({ one: null, full: { text: block.summary, count: 0 } }, see
+ *  completeBlockContents in src/storage/ingest.ts) so every block row has a view;
+ *  replay serves it back. It is not a snapshot: readers must treat it like a
+ *  missing entry (decompress collects from the live messages, the web view says
+ *  "no snapshot") or a migrated session returns the summary as the block's content. */
+export function blockContentSnapshot(
+    contents: { get(blockId: string): BlockContent | undefined },
+    block: { blockId: string; summary?: string },
+): BlockContent | undefined {
+    const content = contents.get(block.blockId);
+    if (content !== undefined && content.one === null && content.full.count === 0 && content.full.text === block.summary) return undefined;
+    return content;
+}
 
 /** #3050 R3 ②b: block-contents map that folds away to (almost) nothing once
  *  a save has captured it, and re-materializes from the store on the first
@@ -337,12 +354,34 @@ export type Session = {
          *  In-memory only: the abort→resume causality spans one process
          *  lifetime, and a restart replants nothing. */
         abortReanchor?: { anchor: number; at: number };
-        /** #5683: the conversation's latest model-round compression-prompt facts
-         *  for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
-         *  Re-stamped on every prepare; in-memory only — a restart reads the
-         *  all-off default until the first round re-stamps, which is safe: no
-         *  tool call can reach applyRanges before its own round's prepare. */
-        unpromptedGate?: UnpromptedGate;
+        /** The upstream rejected a request that carried a nudge: its stamps were
+         *  rolled back, and no nudge rides until a request succeeds (the nudge may
+         *  be what drew the rejection). Cleared by settleUsageReport. */
+        nudgeHeldAfterReject?: boolean;
+        /** #5683/#5943: the conversation's live nudge CREDIT plus the policy
+         *  flags, for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
+         *  Re-stamped on every prepare (injected rounds re-mint the window,
+         *  un-nudged model rounds decay it); in-memory only — a restart lapses
+         *  any live credit to the all-off default until the first round
+         *  re-stamps, which is safe: no tool call can reach applyRanges before
+         *  its own round's prepare. */
+        unpromptedGate?: UnpromptedGateState;
+        /** #5981: the last model stream on this conversation was CUT before its
+         *  terminal event (src/plugin.ts emitUpstreamTruncation sites). A tool
+         *  call dispatched out of such a stream can carry EMPTY arguments —
+         *  the argument deltas never arrived — and an empty `compress` call is
+         *  otherwise indistinguishable from the model's own "empty companion"
+         *  call (#1366). Without this stamp the parser-side receipt tells the
+         *  model not to re-issue, converting a recoverable transport failure
+         *  into an abandoned compression.
+         *
+         *  Read is non-consuming and TTL-bounded (TRUNCATED_UPSTREAM_MAX_AGE_MS):
+         *  one truncated turn may dispatch several tool calls whose arguments
+         *  were cut, so the first consumer must not clear the fact for the
+         *  rest; a later stream that completes simply stops consulting it once
+         *  the TTL lapses. In-memory only — a restart replants nothing, and a
+         *  restart also drops the truncated stream it described. */
+        truncatedUpstream?: { at: number; protocol: string; cause: "eof" | "read-error" };
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
@@ -436,6 +475,21 @@ export type Session = {
          *  usage report (one-shot, per the #554 contract) and on compression
          *  reset. Absent on legacy session files → treated as no arm. */
         overflowArmTokens?: number;
+        /** One-shot preflight fold gate — 1 when the session's preflight
+         *  fold attempt was ABORTED by a client disconnect (the livelock
+         *  shape: a 3.5-4 min self-summary cut at the client's ~300s stream
+         *  watchdog, payload never shrinking — 2026-11-22 log-32 incident:
+         *  nine runs, each aborted at exactly +300.0s). The preflight
+         *  trigger (server.ts preflightCompressIfNeeded) forwards as-is once
+         *  this is set or the session carries committed compression
+         *  (state.stats.compressionCount). A fast summary failure (429/400/
+         *  empty) does NOT set it — the #726/#4079 retry contract keeps
+         *  re-running the walk on transient outages. Overflow recovery after
+         *  the shot is spent lives in #1195 in-request refold + the egress
+         *  fuse; steady growth is the model's job via the compress tool
+         *  (nudge path). Persisted; cleared on compression reset.
+         *  Absent on legacy session files → treated as fresh. */
+        preflightRuns?: number;
         /** #3450: completion-channel reservation PROVEN by an upstream-stated
          *  overflow ("N in the completion" billed against the same wall) —
          *  preflight folds against window − reserve because the foldable
@@ -531,6 +585,14 @@ export type Session = {
          *  provider says nothing about whether another accepts the payload.
          *  Absent on legacy session files → baseline keeps legacy behavior. */
         lastInputTokensOrigin?: string;
+         /** Identity-fast-path: the REQUEST MODEL that measured lastInputTokens
+          *  — stamped at usage settlement (settleUsageReport / applyUsageSample)
+          *  and at overflow arming, alongside lastInputTokensOrigin. Acceptance
+          *  evidence on one model says nothing about another model's wall on
+          *  the same origin (#2189: 300k billed on claude-big does not bind
+          *  claude-small). Absent on legacy session files → the gate demotes
+          *  conservatively and the protection chain judges. */
+        lastInputTokensModel?: string;
          /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
           *  consistent same-route samples of (upstream-billed input ÷ local
          *  text estimate), clamped to [0.25, 4] — two-way since #2366: the
@@ -565,11 +627,27 @@ export type Session = {
           *  Absent on factors published before this field existed → reads
           *  treat it as compatible and retire it through normal rollover. */
          calibratedEstimateModel?: string;
+         /** #5952: provenance of the published calibratedEstimate —
+          *  "text-only-v1" when every sample in calibrationRing came from a
+          *  text-only final wire estimate (per-request capture pair); absent
+          *  for factors trained on the legacy shared prepare slot, whose
+          *  evidence may include image-billed usage. The read gate
+          *  (currentCalibrationFactor) only applies a factor carrying this
+          *  stamp. Persisted so a restart doesn't silently re-arm a stale
+          *  mixed-modal multiplier; reset at native-compaction boundaries
+          *  with the rest of the baseline stats. */
+         calibratedEstimateProvenance?: string;
          /** #1933 F1 / #2117 B: evidence ring behind calibratedEstimate —
           *  the recent admitted raw samples for ONE origin+model (max 3).
           *  Persisted so a restart doesn't re-arm the warmup delay; reset at
-          *  native-compaction boundaries with the rest of the baseline stats. */
-         calibrationRing?: { origin: string; model?: string; values: number[] };
+          *  native-compaction boundaries with the rest of the baseline stats.
+          *  #5952: provenances[i] is the provenance of values[i] —
+          *  "text-only-v1" for a sample from a text-only final wire
+          *  estimate, undefined for a legacy shared-slot sample. The
+          *  published factor's provenance is "text-only-v1" only when every
+          *  value in the window carries it; one legacy sample in the window
+          *  keeps the factor inert until the window flushes it out. */
+         calibrationRing?: { origin: string; model?: string; values: number[]; provenances?: (string | undefined)[] };
         /** #1933 F1: pending pairing input — local estimate of the LAST
          *  prepared outbound in BILLED caliber (estimateCoreMessages +
          *  system/tools overhead + image reserve, defaultCountTokens rate;
@@ -628,6 +706,15 @@ export type Session = {
      *  the message that now owns the number). A fresh process that never
      *  re-stamped has no map and every ref behaves normally. */
     restampSuperseded?: Map<string, string>;
+    /** #5608-D: set when a fold commits on a not-yet-aligned session. The
+     *  #4316 citation-space alignment used to run at cold load — every
+     *  restart renumbered ALL refs and burned ONE full-prefix provider
+     *  re-bill on the very first post-restart round. Now it defers to the
+     *  NEXT successful fold: that rewrite already invalidates history once,
+     *  so the renumbering rides its boundary free; sessions that never fold
+     *  keep their legacy refs forever (zero cost). Persist consumes the
+     *  marker exactly once on the save path. Process-lifetime only. */
+    pendingLedgerAlign?: boolean;
     createdAt: number;
     lastSeen: number;
     /** Original content of compressed blocks, captured at compress time when
@@ -685,6 +772,18 @@ export type Session = {
      *  model keeps re-fetching. Bounded by trimRetrieveCounts; lost on restart
      *  (advisory signal only). */
     retrieveCountsByRef?: Map<string, number>;
+    /** #6522 in-memory only (NOT persisted): the "Uncovered history remains"
+     *  receipt note has already fired in the current nudge-injection cycle.
+     *  The note fires once per cycle — repeating it after every successful
+     *  fold drove models into an infinite compress→note loop (#6522). Each
+     *  ACTUAL nudge injection (nudgeOutcome === "injected", stamped in
+     *  src/server/handle.ts) re-opens the latch: a fresh nudge is a new
+     *  "big enough, compress while you are at it" moment. The same detail
+     *  stays available on demand via acp_status(scope:"uncompressed").
+     *  Lost on restart (at most one extra note). #7318: only read while
+     *  compress.postComPressTail is on; with the recommendation off the note
+     *  never fires and the latch is inert. */
+    uncoveredReceiptNoted?: boolean;
     /** In-memory only (NOT persisted): request-only injections riding the
      *  nudge channel. Since the GHSA jc6g v2 rework, acp_retrieve delivers its
      *  full text in the tool result itself — this carrier now only serves
@@ -774,7 +873,11 @@ type AnonymousPrefixAffinityStamp = {
 // it; a function value throws at the clone site (DataCloneError → 503
 // FORK_FAILED). Function fields are re-resolved at read time: effectiveConfig()
 // merges over the base kernelConfig, which carries them again (isToolProtected
-// #2578; isMessageProtected re-resolves from the lane id below).
+// #2578); isMessageProtected is rebuilt from the clone-safe
+// protectedUserPatterns data field (restoreProtectedUserPatterns below) —
+// without that restore the plugin tool path (compress/acp_status) would run
+// without the host predicate and protectedUserPatterns would be inert in
+// plugin mode.
 export function storeEffectiveConfig(session: Session, config: Config): void {
     const cloneSafe: Record<string, unknown> = { ...config };
     for (const key of Object.keys(cloneSafe)) {
@@ -804,12 +907,18 @@ function staleEffectiveStamp(session: Session | undefined): boolean {
  *  Config without file settings, so returning it naked would drop every file
  *  knob between the edit and the session's next wire request. Provider/model
  *  cascade levels need the request URL and are deliberately NOT re-resolved
- *  here — the next wire request re-stamps the full cascade. */
+ *  here — the next wire request re-stamps the full cascade. The named-provider
+ *  recipe table IS resolved from the same live sources the request path feeds
+ *  resolveRequestConfig (agent-registry layer under file recipes — see
+ *  server/handle.ts): applyCompressSettings expands global-level
+ *  externalSummary "provider/model" references against that table at resolve
+ *  time, so an empty table disables every valid chain for the whole stale
+ *  window (#5912). */
 function liveFileOverlayConfig(base: Config): Config {
     const compress = loadConfigFile().compress;
     if (!compress || !hasCompressSettings(compress)) return base;
     const limit = resolveContextLimitValue(compress.modelContextLimit, base.modelContextLimit);
-    return applyCompressSettings(base, limit, compress, {});
+    return applyCompressSettings(base, limit, compress, { ...agentProviderRecipes(), ...loadNamedProviders() });
 }
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
@@ -833,9 +942,21 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
     // re-resolve the classifier AND the default `durable/*` policy from it at
     // read time; every consumer (plugin tool, nudge panel) then sees the same
     // protection the wire path used this turn.
+    const restored = restoreProtectedUserPatterns(base);
     const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
     const classifier = lane ? durableMessageToolPaths[lane] : undefined;
-    return classifier && !base.messagePathOf ? withDurableProtection(base, classifier) : base;
+    return classifier && !restored.messagePathOf ? withDurableProtection(restored, classifier) : restored;
+}
+
+/** Rebuild the host isMessageProtected predicate from the clone-safe
+ *  protectedUserPatterns data field after the stamp round-trip stripped the
+ *  function (storeEffectiveConfig drops all function fields). No-op when the
+ *  data field is absent — byte-identical legacy behavior. */
+function restoreProtectedUserPatterns(config: Config): Config {
+    const patterns = (config as ResolvedKernelConfig).protectedUserPatterns;
+    if (!patterns || patterns.length === 0) return config;
+    const isMessageProtected = combineMessageProtectedPredicate(config.isMessageProtected, patterns);
+    return isMessageProtected === config.isMessageProtected ? config : { ...config, isMessageProtected };
 }
 
 // #4383: a positive usage-grade anchor below this share of the billing-caliber
@@ -919,12 +1040,17 @@ export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
     return (stats.localInputEstimate ?? 0) > 0;
 }
 
+/** Last measured usage or bounded overflow evidence, before status fallbacks. */
+export function evidenceInputBaseline(stats: Session["stats"]): number {
+    return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
+        ? stats.lastInputTokens
+        : stats.lastUsageGradeTokens ?? 0;
+}
+
 export function statusInputBaseline(session: Session): number {
     const stats = session.stats;
     if (usageAnchorCycleStale(stats)) return stats.localInputEstimate ?? 0;
-    const baseline = stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
-        ? stats.lastInputTokens
-        : stats.lastUsageGradeTokens ?? 0;
+    const baseline = evidenceInputBaseline(stats);
     return staleSmallAnchorFallback(stats, baseline) ?? baseline;
 }
 
@@ -1017,6 +1143,39 @@ export function diagnoseSuccessWithoutUsage(session: Session, wire: string): voi
  *  cadence reference moves. */
 export const ABORT_REANCHOR_MAX_AGE_MS = 30 * 60 * 1000;
 
+/** #5981: how long a truncated-upstream stamp stays consultable. One cut
+ *  stream dispatches its tool calls within milliseconds (observed 37–115 ms),
+ *  so five minutes is already generous; the bound exists so a stale stamp can
+ *  never re-label a genuinely empty call the model makes much later in the
+ *  conversation. */
+export const TRUNCATED_UPSTREAM_MAX_AGE_MS = 5 * 60 * 1000;
+
+/** #5981: record that the model stream just served on this conversation was
+ *  CUT before its terminal event. Called from the four emitUpstreamTruncation
+ *  sites in src/plugin.ts (chat eof/read-error, responses eof/read-error).
+ *  The fact is what lets the compress receipt distinguish "the argument bytes
+ *  never arrived" from "the model sent an empty call" — the two are bytewise
+ *  identical by the time the parser sees them (#1366). */
+export function noteTruncatedUpstream(session: Session, protocol: string, cause: "eof" | "read-error"): void {
+    session.transient ??= {};
+    session.transient.truncatedUpstream = { at: Date.now(), protocol, cause };
+}
+
+/** #5981: read the truncated-upstream stamp WITHOUT consuming it — one cut
+ *  stream may dispatch several tool calls whose arguments were cut, so the
+ *  first consumer must not clear the fact for the rest. An expired stamp is
+ *  dropped on read so it can never re-label a later genuine empty call. */
+export function truncatedUpstreamOf(session: Session): { at: number; protocol: string; cause: "eof" | "read-error" } | undefined {
+    const t = session.transient;
+    const flag = t?.truncatedUpstream;
+    if (!t || !flag) return undefined;
+    if (Date.now() - flag.at > TRUNCATED_UPSTREAM_MAX_AGE_MS) {
+        delete t.truncatedUpstream;
+        return undefined;
+    }
+    return flag;
+}
+
 /** Stamp a pending aborted-turn re-anchor; call from the plugin pipe's
  *  client-abort path AFTER settleUsage has landed whatever the interrupted
  *  stream reported (the request's input size — the partial output itself
@@ -1067,6 +1226,39 @@ export function absorbAbortedTurnGrowth(session: Session, tokenCount: number): v
     nudge.lastShownByTier = {};
     delete t.abortReanchor;
     loggerLog("info", `[${session.id}] aborted-turn growth absorbed: nudge reference ${oldRef}→${nudge.lastPerMessageNudgeTokens} (meter ${tokenCount}, pre-abort anchor ${flag.anchor}, growth debt +${recovered} → ${nudge.absorbedDebt ?? 0} over ${nudge.absorbCount} absorb(s)) (#5293/#5415)`);
+}
+
+export type NudgeStamps = { shown: number; byTier: Session["state"]["nudge"]["lastShownByTier"] };
+
+export function nudgeStampsOf(session: Session): NudgeStamps {
+    return { shown: session.state.nudge.lastNudgeShownTokens, byTier: session.state.nudge.lastShownByTier };
+}
+
+export function restoreNudgeStamps(session: Session, stamps: NudgeStamps): void {
+    session.state.nudge.lastNudgeShownTokens = stamps.shown;
+    session.state.nudge.lastShownByTier = stamps.byTier;
+}
+
+/** The kernel stamps a nudge as shown when it decides to inject it. When the
+ *  upstream rejects that request the model never saw the nudge, so the stamp
+ *  would hold the cadence against a nudge nobody received (a Claude Code session,
+ *  2026-11-11: the session's only nudge drew a 400 and it never nudged again).
+ *  Roll the stamps back and hold nudges until the next success. */
+export function rejectNudge(session: Session, before: NudgeStamps, status: number): void {
+    restoreNudgeStamps(session, before);
+    (session.transient ??= {}).nudgeHeldAfterReject = true;
+    markDirty(session);
+    loggerLog("info", `[${session.id}] nudge rejected with its request (upstream ${status}): stamps rolled back to shown=${before.shown}; nudges held until a request succeeds`);
+}
+
+/** The hold set by rejectNudge must end on ANY success — including ones that
+ *  never report usage. settleUsageReport only clears it for s.total > 0
+ *  samples, so on routes where the upstream never reports usage the flag
+ *  would latch forever (a single 4xx would kill nudging for the rest of the
+ *  process lifetime — the exact failure #6531 fixes, relocated to the #1595
+ *  route class). Called at every no-usage success site. */
+export function releaseNudgeHold(session: Session): void {
+    if (session.transient?.nudgeHeldAfterReject) delete session.transient.nudgeHeldAfterReject;
 }
 
 // #1820: post-rebuild meter anchor. Right after a big preflight rebuild the
@@ -1682,6 +1874,10 @@ export function resetSessionCompression(session: Session): void {
     // longer bounds this session; drop it so the guard falls back to the
     // declared window instead of clamping to a stale ceiling.
     delete session.stats.overflowArmTokens;
+    // One-shot fold gate: the rebuilt conversation is a fresh lifecycle —
+    // it gets its own first preflight attempt (matches the reset semantics
+    // of the arm and baseline it rides alongside).
+    delete session.stats.preflightRuns;
     // #3450: same boundary — the proven completion reservation described the
     // pre-compaction payload lineage, and the rebuilt conversation re-arms the
     // one-time mismatch warning.
@@ -1698,10 +1894,13 @@ export function resetSessionCompression(session: Session): void {
     // learned against the pre-compaction content class, and the baseline's
     // measuring route no longer bounds this rebuilt session.
     delete session.stats.lastInputTokensOrigin;
+    delete session.stats.lastInputTokensModel;
     delete session.stats.calibratedEstimate;
     delete session.stats.calibratedEstimateOrigin;
     // #2117 B: same boundary — the factor's model provenance dies with it.
     delete session.stats.calibratedEstimateModel;
+    // #5952: same boundary — the factor's text-only provenance dies with it.
+    delete session.stats.calibratedEstimateProvenance;
     delete session.stats.calibrationRing;
     delete session.stats.lastLocalTextEstimate;
     delete session.stats.lastLocalTextEstimateOrigin;

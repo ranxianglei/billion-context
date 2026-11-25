@@ -77,7 +77,10 @@ export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
  * conversations, side lanes) — the shape is the final word, so a marker'd
  * ordinary body replays through the normal pipeline untouched. */
 export function incrementalTurnBodyShape(raw: Buffer): boolean {
-    if (raw.length < 2 || raw.length > 64 * 1024 * 1024) return false;
+    // readBody already enforces the receive-size budget before this check.
+    // A large lane-only envelope must not fall through to ordinary upstream
+    // relay merely because its seed crosses a second, unrelated size limit.
+    if (raw.length < 2) return false;
     let parsed: unknown;
     try {
         parsed = JSON.parse(raw.toString("utf8"));
@@ -421,8 +424,8 @@ function stableMessageKey(m: Record<string, unknown>): string {
  *  handful of fresh rows instead of walking the whole table every turn.
  *  Any miss → leave the previous pointers untouched (never a partial list);
  *  with the debounced save this is the common case right after a turn — a
- *  later settled turn records them. */
-function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l: string, m: string) => void): void {
+ *  later settled turn records them. Exposed for unit tests (#6490). */
+export function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l: string, m: string) => void): void {
     try {
         const store = getStore();
         const prevPtrs = readCanonicalPointers(sessionId);
@@ -430,7 +433,10 @@ function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l
         let rows: { seq: number; content: string; ts: number | null }[] | null;
         if (prevPtrs !== null && prevPtrs.length <= msgs.length) {
             ptrs = [...prevPtrs];
-            rows = store.unifiedRawMessages(sessionId, ptrs.length > 0 ? Math.max(...ptrs) : -1);
+            // reduce, not Math.max(...spread): a long session's pointer list
+            // outgrows V8's argument-spread limit (~65K-125K depending on
+            // build; measured 125K ok / 130K throws on Node 22 x64) → RangeError (#6490).
+            rows = store.unifiedRawMessages(sessionId, ptrs.length > 0 ? ptrs.reduce((m, p) => (p > m ? p : m), 0) : -1);
         } else {
             ptrs = [];
             rows = store.unifiedRawMessages(sessionId);
@@ -454,10 +460,11 @@ function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l
                 // unparseable row -> skip; a miss keeps the previous pointers
             }
         }
+        for (const bucket of byStable.values()) bucket.reverse();
         for (let i = ptrs.length; i < msgs.length; i++) {
             const m = msgs[i]!;
             const bucket = byStable.get(stableMessageKey(m as unknown as Record<string, unknown>).replace(CLUSTER_ID_SUFFIX_RE, "$1"));
-            const seq = bucket === undefined ? undefined : bucket.shift();
+            const seq = bucket?.pop();
             if (seq === undefined) {
                 // #5155: with the debounced save the unsettled tail is the
                 // common case right after a turn — record the settled prefix
@@ -523,6 +530,12 @@ function persistLaneState(sessionId: string, system: unknown, systemSet: boolean
 
 export function loadSystem(sessionId: string): unknown {
     try {
+        // Renumber (2026-11-25): egress-on sessions carry the client's raw
+        // system (A) in the op log's system row (sysIn) — the authoritative
+        // copy (survives kstate retirement, fork-verbatim). The inc:system
+        // ext row stays as the legacy read for everything else.
+        const viaOpLog = getStore().egressOpLogStore()?.egressSystemInput?.(sessionId);
+        if (viaOpLog !== null && viaOpLog !== undefined) return viaOpLog;
         return getStore().getSessionExt(sessionId, EXT_KEY_SYSTEM);
     } catch {
         return undefined;
@@ -559,6 +572,38 @@ function sameWireContent(have: BiliMessage, fresh: BiliMessage): boolean {
 
 function hashWireBoundary(m: { role: string; content: unknown }): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
+}
+
+const CONTENT_ID = /^(h_[0-9a-f]{16})(?:_([1-9]\d*))?$/;
+
+/** Continue separately converted content-ID clusters without rewriting any
+ * payload. A sparse restored prefix must skip its highest retained ordinal. */
+export function continueContentClusters(
+    prefix: readonly BiliMessage[],
+    delta: { msgs: BiliMessage[]; cacheControls: Map<string, unknown> },
+): { msgs: BiliMessage[]; cacheControls: Map<string, unknown> } {
+    const offsets = new Map<string, number>();
+    for (const message of prefix) {
+        const hit = CONTENT_ID.exec(message.id);
+        if (!hit) continue;
+        const ordinal = Number(hit[2] ?? 0);
+        if (Number.isSafeInteger(ordinal + 1)) offsets.set(hit[1], Math.max(offsets.get(hit[1]) ?? 0, ordinal + 1));
+    }
+    if (offsets.size === 0) return delta;
+    const renamed = new Map<string, string>();
+    const msgs = delta.msgs.map((message) => {
+        const hit = CONTENT_ID.exec(message.id);
+        if (!hit) return message;
+        const offset = offsets.get(hit[1]) ?? 0;
+        if (offset === 0) return message;
+        const ordinal = offset + Number(hit[2] ?? 0);
+        if (!Number.isSafeInteger(ordinal)) throw new Error("Content identity cluster exceeds safe ordinal range");
+        const id = `${hit[1]}_${ordinal}`;
+        renamed.set(message.id, id);
+        return { ...message, id };
+    });
+    if (renamed.size === 0) return delta;
+    return { msgs, cacheControls: new Map([...delta.cacheControls].map(([id, mark]) => [renamed.get(id) ?? id, mark])) };
 }
 
 function applyTurn(
@@ -615,7 +660,11 @@ function applyTurn(
             retouchMarks.push({ ids, marks, rawBlocks });
         }
     }
-    const flat = deltaWire.length === 0 ? { msgs: [], cacheControls: new Map<string, unknown>() } : anthropicToCore({ messages: deltaWire as never } as never);
+    const converted = deltaWire.length === 0 ? { msgs: [], cacheControls: new Map<string, unknown>() } : anthropicToCore({ messages: deltaWire as never } as never);
+    // A new conversion starts each duplicate cluster at zero. Continue the
+    // acknowledged prefix so a repeated prompt cannot reuse an earlier row's
+    // identity (and receive the new row's cache mark as a side effect).
+    const flat = resync ? converted : continueContentClusters(entry.msgs, converted);
     let deltaMsgs = flat.msgs;
     if (deltaIds !== undefined) {
         const v = validateMsgIds(deltaIds, flat.msgs.length);
@@ -896,7 +945,20 @@ export async function handleIncrementalTurn(
         // stamp the canonical ids so prepare pins exactly what the lane owns
         // (content-derived when the client sent none; client-pinned when it
         // did). The pipeline strips the field before forwarding upstream.
-        if (featureEnabled("pluginLaneServerHistory")) {
+        //
+        // #6680 (rolling cache marks): a body that carries client cache_control
+        // marks must re-enter EXACTLY as it does with the rollout off — no
+        // stamps. The id/seq stamps make the kernel's first-sight pass
+        // re-render the marked content into <acp>mNNNNN</acp> markers, which
+        // drops the wire-level cache_control breakpoints (and drifts the ACP
+        // refs) — tests/opencode-rolling-cache-marks.test.ts. coreToAnthropic
+        // splices entry.marks into the assembled items, so a non-empty marks
+        // map is the precise signal that this body carries marks. Skipping the
+        // stamps on mark turns is a safe degrade to the pre-GA behavior; the
+        // lane still owns the canonical ids (entry.msgs) and non-mark turns
+        // keep pinning.
+        const markChannelActive = entry.marks.size > 0;
+        if (featureEnabled("pluginLaneServerHistory") && !markChannelActive) {
             body[MSG_IDS_BODY_FIELD] = entry.msgs.map((m) => m.id);
             // #4316 PR2/3: seq stamps ride the same internal transport. The
             // canonical prefix carries its stamps from the unified rows
@@ -1005,6 +1067,19 @@ export async function handleIncrementalTurn(
         inFlight.delete(conversationId);
         const session = peekSession(sessionId);
         settled = true;
+        // #3397 (PR #6326): durability-before-render — the turn's ledger rows are made
+        // durable NOW (synchronous unified-index ingest) so a crash before the
+        // debounced envelope save (#5155) cannot leave the refs the model just
+        // saw unbacked (the #3397 orphaned-generation gap: the lane rendered the
+        // delta, the model could cite it, but the rows only settled in the
+        // debounced flush). The large JSON envelope itself stays debounced —
+        // only the small row ingest moves ahead of it. Best-effort: the
+        // debounced save below retries the full path on failure.
+        try {
+            if (session) getStore().ingestRowsNow(session);
+        } catch {
+            // best-effort, same failure posture as the debounced save
+        }
         // #5155: the debounced save coalesces consecutive turns' full-envelope
         // flushes (a synchronous writeNow per turn serialized + fsynced the
         // whole ~24MB envelope on large histories); pointer upkeep no longer

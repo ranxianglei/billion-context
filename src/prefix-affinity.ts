@@ -264,7 +264,7 @@ function sortKeys(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(sortKeys);
     if (value && typeof value === "object") {
         const record = value as Record<string, unknown>;
-        const out: Record<string, unknown> = {};
+        const out: Record<string, unknown> = Object.create(null);
         for (const key of Object.keys(record).sort()) out[key] = sortKeys(record[key]);
         return out;
     }
@@ -289,7 +289,7 @@ function canonicalize(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(canonicalize);
     if (value && typeof value === "object") {
         const record = value as Record<string, unknown>;
-        const out: Record<string, unknown> = {};
+        const out: Record<string, unknown> = Object.create(null);
         for (const key of Object.keys(record).sort()) {
             if (key === "cache_control") continue; // #2188: transport-layer hint, not content
             out[key] = canonicalize(record[key]);
@@ -622,7 +622,26 @@ export class PrefixAffinityResolver {
         const hashes = fingerprints.hashes;
         const incomingDepth = hashes.length;
         const messages = normalizeAffinityMessages(input);
-        const v1Hashes = chainHashes(messages);
+        // v1 (raw-wire) products are consumable in exactly two situations:
+        // a pre-#2791 chain is still tracked — identified or not (the
+        // orphan-suspect scan at the new-session path also reads v1Hashes
+        // for identified hv1 entries) — or the neutral projection is empty
+        // (incomingDepth === 0): the degenerate-request guard below and the
+        // mint path's tailHash are anchored on the raw domain, so a
+        // machinery-only request (user content the projection drops — client
+        // markers, image placeholders, empty content) keeps its pre-#2791
+        // deterministic mint instead of flipping to the #286 400. In the
+        // steady state (incomingDepth > 0 without an hv1 chain) both the
+        // progressive chainHashes pass and the perItemHashes lineage pass
+        // are dead work — every consumer is guarded by v1Depth > 0 or by an
+        // hv1 entry existing — and skipping them is zero behavior change
+        // (those consumers take their exact v1Depth === 0 branch) instead of
+        // paying two O(n²)-bytes passes per anonymous request.
+        let hasHv1 = false;
+        for (const entry of this.trackedChains.values()) {
+            if (entry.hv === 1) { hasHv1 = true; break; }
+        }
+        const v1Hashes = (hasHv1 || incomingDepth === 0) ? chainHashes(messages) : [];
         const v1Depth = v1Hashes.length;
         if (incomingDepth === 0 && v1Depth === 0) return null;
         const tailHash = incomingDepth > 0 ? hashes[incomingDepth - 1]! : v1Hashes[v1Depth - 1]!;
@@ -785,6 +804,8 @@ export class PrefixAffinityResolver {
         //  the raw-wire products for pre-upgrade chains (UI/debug only —
         //  never used for matching).
         let lineage = this.lineageOf(storedItemHashes, incomingDepth);
+        // v1Depth > 0 implies hasHv1 (chainHashes only ran then), so the raw
+        // lineage scan has at least one hv1 chain to fork/truncate against.
         if (lineage === undefined && v1Depth > 0) {
             lineage = this.lineageOf(perItemHashes(messages).slice(-MAX_STORED_ITEMS), v1Depth);
         }
@@ -1213,18 +1234,18 @@ export class PrefixAffinityResolver {
             //  malformed list degrades the entry to exact-hash resolution.
             let sketches: string[] | undefined;
             if (hv === 2 && Array.isArray(e.sketches)) {
-                const valid = (e.sketches as unknown[]).filter(
-                    (s): s is string => typeof s === "string" && /^[0-9a-f]{16}$/.test(s),
-                );
-                if (valid.length >= ALIGN_MIN_DEPTH) sketches = valid.slice(0, SKETCH_MAX_DEPTH);
+                const slots: unknown[] = Array.from(e.sketches);
+                if (slots.every((s): s is string => typeof s === "string" && /^[0-9a-f]{16}$/.test(s)) &&
+                    slots.length >= ALIGN_MIN_DEPTH) sketches = slots.slice(0, SKETCH_MAX_DEPTH);
             }
             // #2265: user-role flags for the ownership-anchor gate — optional,
             //  malformed lists simply degrade the entry (no user anchor → the
             //  simhash rung skips it, exact-hash resolution still works).
             let userFlags: boolean[] | undefined;
             if (sketches !== undefined && Array.isArray(e.userFlags)) {
-                const validU = (e.userFlags as unknown[]).filter((u): u is boolean => typeof u === "boolean");
-                if (validU.length > 0) userFlags = validU.slice(-MAX_STORED_ITEMS);
+                const flags: unknown[] = Array.from(e.userFlags);
+                if (flags.every((u): u is boolean => typeof u === "boolean") &&
+                    flags.length > 0) userFlags = flags.slice(-MAX_STORED_ITEMS);
             }
             const entry: ChainEntry = {
                 sessionId: e.sessionId,
@@ -1241,9 +1262,13 @@ export class PrefixAffinityResolver {
             // #2807: optional tail-turn fragments for the append-continuation
             //  rung — hv2 only (a v1 entry's fragments were never noted),
             //  malformed lists degrade the entry to exact-ladder behavior.
+            //  Whole-carrier validation like sketches/userFlags above: a
+            //  filtered middle slot would shift later fragments onto the
+            //  wrong source message.
             if (hv === 2 && Array.isArray(e.tailFrags)) {
-                const validF = (e.tailFrags as unknown[]).filter((f): f is string => typeof f === "string" && /^[0-9a-f]{64}$/.test(f));
-                if (validF.length > 0) entry.tailFrags = validF.slice(0, MAX_TURN_FRAGS);
+                const frags: unknown[] = Array.from(e.tailFrags);
+                if (frags.every((f): f is string => typeof f === "string" && /^[0-9a-f]{64}$/.test(f)) &&
+                    frags.length > 0) entry.tailFrags = frags.slice(0, MAX_TURN_FRAGS);
             }
             this.trackedChains.delete(entry.sessionId);
             this.trackedChains.set(entry.sessionId, entry);

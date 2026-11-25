@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import http from "node:http";
 import type { ResponsesRequestBody } from "acp-kernel/wire";
 import { WebSocket as UpstreamWebSocket, type Dispatcher } from "undici";
@@ -12,7 +13,7 @@ import { markWsLaneTransport, withFetchTransport } from "./fetch-transport.js";
 import { BILI_HOP_HEADER } from "./server/context-window.js";
 import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { BILI_TUNNEL_HEADER } from "./tunnel-guard.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings, sseEventData } from "./sse-util.js";
 import type { WsBridgeCodec, WsBridgeContext, WsBridgeSession } from "./ws-bridge.js";
 
 type JsonObject = Record<string, unknown>;
@@ -237,32 +238,33 @@ export class ResponsesWsHistory {
         if (!Array.isArray(request.input)) throw new Error("response.create requires an input array");
         if (previous !== undefined && previous !== null) {
             if (previous !== this.checkpoint?.id) throw new Error("previous_response_not_found");
-            // Walk the checkpoint chain oldest→newest. The base level always
+            // Replay the checkpoint chain oldest→newest. The base level always
             // carries a complete reconstruction in request.input; every later
             // level contributes only its own tail + output (its augmented body
             // would double-count the echoed previous output otherwise).
             const levels: Checkpoint[] = [];
             let cursor: Checkpoint | undefined = this.checkpoint;
             while (cursor) {
-                levels.unshift(cursor);
+                levels.push(cursor);
                 cursor = cursor.base;
             }
-            const base = levels[0];
+            const base = levels[levels.length - 1];
             if (!base || !Array.isArray(base.request.input)) throw new Error("previous_response_not_found");
             // Per-level contribution in conversation order: the base's complete
             // input, then each later level's own tail followed by its output.
-            let input: unknown[] = [];
-            for (let i = 0; i < levels.length; i++) {
+            const input: unknown[] = [];
+            for (let i = levels.length - 1; i >= 0; i--) {
                 const level = levels[i];
-                if (i === 0 && Array.isArray(level.request.input)) input = [...input, ...level.request.input];
-                else if (Array.isArray(level.tail)) input = [...input, ...level.tail];
-                input = [...input, ...level.output];
+                const added = i === levels.length - 1 ? level.request.input : level.tail;
+                if (Array.isArray(added)) for (const item of added) input.push(item);
+                for (const item of level.output) input.push(item);
             }
+            for (const item of request.input) input.push(item);
             // #2966: generate is a per-request action control, not conversation
             // state — a prewarm's generate:false must not leak into a continuation
             // that omits the field (the upstream would then refuse to generate).
-            const { generate: _priorGenerate, ...topRequest } = levels[levels.length - 1].request;
-            return { ...topRequest, ...request, input: [...input, ...request.input] };
+            const { generate: _priorGenerate, ...topRequest } = levels[0].request;
+            return { ...topRequest, ...request, input };
         }
         return request;
     }
@@ -321,8 +323,14 @@ function bodyToText(body: RequestInit["body"]): string | undefined {
     return undefined;
 }
 
+function cacheDiagnosticHash(text: string): string {
+    return createHash("sha256").update(text).digest("hex");
+}
+
 export class ResponsesWsUpstream {
     private socket?: InstanceType<typeof UpstreamWebSocket>;
+    private connectionGeneration = 0;
+    private sendSequence = 0;
     private key?: string;
     private history = new ResponsesWsHistory();
     private active?: { fail: (error: Error, reason?: string) => void };
@@ -372,6 +380,7 @@ export class ResponsesWsUpstream {
         this.log("debug", "upstream connecting phase=handshake");
         const socket = new UpstreamWebSocket(wsUrl, { headers, dispatcher: options.dispatcher as Dispatcher | undefined });
         this.socket = socket;
+        this.connectionGeneration++;
         this.key = key;
         await new Promise<void>((resolve, reject) => {
             const clean = (): void => {
@@ -457,6 +466,9 @@ export class ResponsesWsUpstream {
         }
         if (this.active) throw new Error("Responses WebSocket exchange already active");
         const request = this.history.continuation(body);
+        const connection = this.connectionGeneration;
+        const { input: _diagnosticInput, ...settings } = body;
+        const settingsHash = cacheDiagnosticHash(canonical({ ...settings, ...egressTransportFields }));
         this.log("debug", `upstream request mode=${request.previous_response_id === undefined ? "full" : "delta"}`);
         return new Promise<Response>((resolve, reject) => {
             const output = new ResponsesWsOutput();
@@ -465,12 +477,21 @@ export class ResponsesWsUpstream {
             let ended = false;
             let retryFull = request.previous_response_id !== undefined;
             let receivedEvents = 0;
+            let send = 0;
             const encoder = new TextEncoder();
             // #3701: log the EXACT outbound frame bytes — the upstream gateway judges by
             // bytes, not tokens, so this number is what the ws-byte-shed ladder targets.
             const sendCreate = (payload: JsonObject): void => {
                 const frameText = JSON.stringify({ ...payload, ...egressTransportFields, type: "response.create" });
                 this.log("info", `upstream send mode=${payload.previous_response_id === undefined ? "full" : "delta"} bytes=${Buffer.byteLength(frameText)}`);
+                send = ++this.sendSequence;
+                // Allowlisted fingerprints only: never log payloads, headers, or the connection key.
+                this.log("debug", `upstream cache-diagnostic ${JSON.stringify({
+                    phase: "send", connection, send,
+                    mode: payload.previous_response_id === undefined ? "full" : "delta",
+                    frame_sha256: cacheDiagnosticHash(frameText), settings_sha256: settingsHash,
+                    previous_response_id_sha256: typeof payload.previous_response_id === "string" ? cacheDiagnosticHash(payload.previous_response_id) : null,
+                })}`);
                 socket.send(frameText);
             };
             // Backpressure (#2076): the WS socket cannot be paused, so frames arriving
@@ -532,6 +553,21 @@ export class ResponsesWsUpstream {
                     }
                     if (!object(frame) || typeof frame.type !== "string") throw new Error("Invalid Responses WebSocket event");
                     receivedEvents++;
+                    if (["response.completed", "response.failed", "response.incomplete", "error"].includes(frame.type)) {
+                        const response = object(frame.response) ? frame.response : {};
+                        const usage = object(response.usage) ? response.usage : {};
+                        const details = object(usage.input_tokens_details) ? usage.input_tokens_details : {};
+                        const tokens = (value: unknown): number | null => typeof value === "number" && Number.isFinite(value) ? value : null;
+                        this.log("debug", `upstream cache-diagnostic ${JSON.stringify({
+                            phase: "terminal", connection, send, event: frame.type,
+                            response_id_sha256: typeof response.id === "string" ? cacheDiagnosticHash(response.id) : null,
+                            usage_present: Object.hasOwn(response, "usage"),
+                            input_tokens_details_present: Object.hasOwn(usage, "input_tokens_details"),
+                            input_tokens_present: Object.hasOwn(usage, "input_tokens"), input_tokens: tokens(usage.input_tokens),
+                            output_tokens_present: Object.hasOwn(usage, "output_tokens"), output_tokens: tokens(usage.output_tokens),
+                            cached_tokens_present: Object.hasOwn(details, "cached_tokens"), cached_tokens: tokens(details.cached_tokens),
+                        })}`);
+                    }
                     const completed = output.observe(frame);
                     if (frame.type === "error" && !settled) {
                         const error = object(frame.error) ? frame.error : {};
@@ -627,6 +663,16 @@ class ResponsesWsResponse extends http.ServerResponse {
         Object.defineProperty(this, "socket", { get: () => req.socket });
     }
 
+    // Socket-death semantics, as in InlineRes.destroy(): OutgoingMessage.destroy()
+    // emits 'close' only through its own socket slot (not the `socket` getter
+    // above), and the relay aborts the upstream only on 'close' while !writableEnded.
+    override destroy(error?: Error): this {
+        if (this.destroyed) return this;
+        super.destroy(error);
+        if (!this.ended) this.emit("close");
+        return this;
+    }
+
     override write(chunk: string | Uint8Array, callback?: (error?: Error | null) => void): boolean;
     override write(chunk: string | Uint8Array, encoding: BufferEncoding, callback?: (error?: Error | null) => void): boolean;
     override write(chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void): boolean {
@@ -697,7 +743,7 @@ class ResponsesWsResponse extends http.ServerResponse {
         }
         this.ended = true;
         this.emit("finish");
-        this.emit("close");
+        if (!this.destroyed) this.emit("close");
         const cb = typeof chunk === "function" ? chunk : typeof encoding === "function" ? encoding : callback;
         if (typeof cb === "function") cb();
         return this;
@@ -834,30 +880,29 @@ export class ResponsesWsSession implements WsBridgeSession {
                     let buffer = "";
                     for (;;) {
                         const { done, value } = await reader.read();
-                        if (done) break;
-                        buffer += decoder.decode(value, { stream: true });
+                        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
                         if (buffer.length > this.budget) throw new Error("Warmup output buffer limit exceeded");
+                        buffer = done ? finalizeSseLineEndings(buffer) : normalizeSseLineEndings(buffer);
                         for (;;) {
                             const index = buffer.indexOf("\n\n");
                             if (index < 0) break;
                             const block = buffer.slice(0, index);
                             buffer = buffer.slice(index + 2);
-                            for (const line of block.split("\n")) {
-                                if (!line.startsWith("data: ")) continue;
-                                const payload = line.slice(6);
-                                sendFrame(payload);
-                                let frame: unknown;
-                                try { frame = JSON.parse(payload); } catch { continue; }
-                                if (!object(frame)) continue;
-                                if (["response.completed", "response.failed", "response.incomplete", "error"].includes(String(frame.type))) {
-                                    sawTerminal = true;
-                                    // #3342: even a no-generation warmup must establish a usable
-                                    // client checkpoint, so a later previous_response_id
-                                    // continuation resolves instead of throwing not_found.
-                                    if (frame.type === "response.completed" && object(frame.response)) this.history.commit(body, frame.response);
-                                }
+                            const payload = sseEventData(block);
+                            if (payload === null) continue;
+                            sendFrame(payload);
+                            let frame: unknown;
+                            try { frame = JSON.parse(payload); } catch { continue; }
+                            if (!object(frame)) continue;
+                            if (["response.completed", "response.failed", "response.incomplete", "error"].includes(String(frame.type))) {
+                                sawTerminal = true;
+                                // #3342: even a no-generation warmup must establish a usable
+                                // client checkpoint, so a later previous_response_id
+                                // continuation resolves instead of throwing not_found.
+                                if (frame.type === "response.completed" && object(frame.response)) this.history.commit(body, frame.response);
                             }
                         }
+                        if (done) break;
                     }
                     if (!sawTerminal) {
                         this.history.clear();

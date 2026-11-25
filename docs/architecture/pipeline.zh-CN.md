@@ -1,6 +1,6 @@
 # 模块：请求管道（`src/server` + `src/loop`）
 
-> [架构总览](../architecture.zh-CN.md) 的一个模块 · English: [pipeline.md](./pipeline.md) · 截至 2026-11-08，master
+> [架构总览](../architecture.zh-CN.md) 的一个模块 · English: [pipeline.md](./pipeline.md) · 截至 2026-11-10，master
 
 ![请求管道模块](./assets/pipeline.zh-CN.svg)
 （位图备选：[pipeline.zh-CN.png](./assets/pipeline.zh-CN.png)）
@@ -25,13 +25,13 @@
 
 **统一 loop（`src/loop`）。** 协议中立核心 + 4 个 wire 适配器，做工具裁决与散文 tag-echo 过滤（`tag-echo-filter.ts`——只滤散文、参数不动）。两种压缩模式在这里共用同一条代码路径（KDD #7）：plugin 模式抑制 tool + nudge 注入（agent 自己压）；proxy 模式发 `acp_summary` 载体、改口为 user 消息，让严格后端保持前缀稳定。
 
-**出站。** `stream-*` 按 wire 改写上游 SSE（块框架、cache-control 断点 #1637、`wire-body` 尾 user 回合补位）。协议头（pf-*/信封）永不出代理——上游 hop 头白名单剥掉它们。
+**出站。** `stream-*` 按 wire 改写上游 SSE（块框架、cache-control 断点 #1637、`wire-body` 尾 user 回合补位）。请求侧另有用户可注册的 `egressTransforms[]` 管道（`src/egress-transforms.ts`，#6003）：ESM 插件在所有会话处理之后、re-sign/v1Wrap 之前改写每个出站模型请求体——逐插件 fail-open，可经 `/__bili/config/reload` 热重载，未配置时严格 no-op。协议头（pf-*/信封）永不出代理——上游 hop 头白名单剥掉它们。
 
 **闸门与恢复。** `preflight.ts`（hold 宽限、死路冷却）、`reasoning-guard`（签名载荷永不进折叠输入）、`request-body-budget`（收/解/发字节预算，可用性大于性能 #3128）、`content-encoding`（解压炸弹守卫，413）。错误形态：`stream-error`（最小 SSE 错误+收尾）、`fake-completion`（可选重试提示）、`degenerate-turn` / `degenerate-retry`、`exit-matrix`（wire 出口 × 关注点，#588）。
 
 ## 关键入口
 
-`src/server/handle.ts`（分诊） · `src/server/prepare-*.ts`（按 wire 请求准备） · `src/marker/`（入站剥标签） · `src/loop/`（统一核心+适配器） · `src/server/stream-*.ts`（按 wire 出站） · `src/server/preflight.ts` · `src/server/exit-matrix.ts`
+`src/server/handle.ts`（分诊） · `src/server/prepare-*.ts`（按 wire 请求准备） · `src/marker/`（入站剥标签） · `src/loop/`（统一核心+适配器） · `src/server/stream-*.ts`（按 wire 出站） · `src/egress-transforms.ts`（用户出站体改写插件，#6003） · `src/server/preflight.ts` · `src/server/exit-matrix.ts`
 
 ## 相关
 

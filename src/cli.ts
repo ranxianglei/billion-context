@@ -8,6 +8,9 @@
  *   bili start --port 9000        override listen port
  *   bili start --host 0.0.0.0     override listen host
  *   bili start --debug            verbose logging
+ *   bili start -c NAME            named config: <configDir>/NAME.json
+ *                                  (NAME "billion-context" = the default file;
+ *                                  per-model test configs need no env vars)
  *   bili start --config FILE      path to config file (default: XDG)
  *   bili start --passthrough      forward without compression
  *   bili pi/codex/claude/omp [args]   start a proxy + launch a client via cert-MITM
@@ -18,6 +21,8 @@
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
  *   bili sessions ls|rm|archive|restore [id]   manage persisted sessions
  *   bili storage gc [--days N]    run the storage sweep now (--dry-run plans only)
+ *   bili storage backup [--keep N]             consistent index.db snapshot (+retention)
+ *   bili storage repair [--from <backup.db>]   restore from backup / salvage no-backup
  *   bili pack install <spec>      install a custom compress prompt pack from npm (#5319)
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
@@ -32,7 +37,7 @@ import { startServer, restartForceCloseOf } from "./server.js";
 import { serveStartupFailurePage } from "./startup-failure-page.js";
 import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
 import { recordEngineBootstrap } from "./storage/runtime-status.js";
-import { configFile as defaultConfigFile } from "./paths.js";
+import { configFile as defaultConfigFile, checkNamedConfigRef } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
@@ -41,12 +46,17 @@ import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBloc
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { startRemoteNoticesWatcher } from "./remote-notices.js";
 import { hydrateNoticeReceipts } from "./notice-store.js";
+import { hydrateHostPluginDismissals } from "./host-plugin-notice.js";
+import { hydrateResignPending } from "./apig-resign.js";
+import { hydrateRolloutIdentity } from "./rollout.js";
+import { hydrateAffinityUnified } from "./affinity-persist.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
+import { runStorageBackupCommand, runStorageRepairCommand } from "./storage-backup-repair.js";
 import { installPackFromNpm, removePackFile } from "./pack-install.js";
 import { listResolvedPacks } from "./compress-settings.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
@@ -107,6 +117,13 @@ Usage:
                                     release unreferenced content, shrink index.db
                                     (--days N overrides the age; --vacuum full|incremental;
                                     prints the sweep plan first, --dry-run stops there)
+  bili storage backup               online-consistent index.db snapshot into <sessions>/backups/
+                                    (VACUUM INTO; verified with quick_check; --keep N retention,
+                                    default 3) — safe while the proxy runs
+  bili storage repair [--from f.db] restore a proven index.db from a backup (verified,
+                                    broken file quarantined in place), or WITHOUT --from
+                                    salvage the corrupt file row-by-row into a fresh schema
+                                    (requires the proxy stopped)
   bili pack install <npm-spec>     npm-install a custom compress prompt pack
   bili pack list / remove <name>   list resolvable packs / delete a local pack file
                                    (--project targets ./.billion-context/packs/ instead;
@@ -190,7 +207,10 @@ Options (override config file / env):
   --port <N>                       listen port (start: 8787; launcher default: random free port)
   --host <ADDR>                    listen host (default 127.0.0.1)
   --mitm-domain <domain>           extra MITM domain (repeatable; launcher only)
-  --config <FILE>                  path to config JSON (default: XDG location)
+  -c, --config <NAME|FILE>         config to use (default: XDG location); a bare NAME
+                                   selects <configDir>/NAME.json ("billion-context"
+                                   = billion-context.json), so per-model test configs
+                                   need no BILI_CONFIG_FILE env
   --debug                          verbose logging
   --passthrough                    forward without compression
   --no-passthrough                 force compression on (overrides config)
@@ -234,6 +254,9 @@ type Parsed = {
     storageDays?: number;
     storageVacuum?: "full" | "incremental";
     storageDryRun?: boolean;
+    storageSub?: "gc" | "backup" | "repair";
+    storageKeep?: number;
+    storageFrom?: string;
     jsonOutput?: boolean;
     doctorJson?: boolean;
     doctorFix?: boolean;
@@ -271,6 +294,9 @@ export function parseArgs(argv: string[]): Parsed {
     let storageDays: number | undefined;
     let storageVacuum: Parsed["storageVacuum"];
     let storageDryRun = false;
+    let storageSub: Parsed["storageSub"];
+    let storageKeep: number | undefined;
+    let storageFrom: string | undefined;
     let jsonOutput = false;
     let doctorJson = false;
     let doctorFix = false;
@@ -411,6 +437,29 @@ export function parseArgs(argv: string[]): Parsed {
                 storageVacuum = val as "full" | "incremental";
                 break;
             }
+            case "--keep": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                const n = Number(val);
+                if (!Number.isInteger(n) || n < 1) {
+                    console.error(`bili: --keep expects a positive integer (got "${val}")`);
+                    process.exit(2);
+                }
+                storageKeep = n;
+                break;
+            }
+            case "--from": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value (<backup.db>)`);
+                    process.exit(2);
+                }
+                storageFrom = val;
+                break;
+            }
             case "--no-log":
                 acpCacheNoLog = true;
                 break;
@@ -433,6 +482,7 @@ export function parseArgs(argv: string[]): Parsed {
                 break;
             }
             case "-F":
+            case "-c":
             case "--port":
             case "--host":
             case "--config":
@@ -446,7 +496,7 @@ export function parseArgs(argv: string[]): Parsed {
                 }
                 if (a === "--port") overrides.ACP_PORT = val;
                 else if (a === "--host") overrides.ACP_HOST = val;
-                else if (a === "--config") overrides.BILI_CONFIG_FILE = val;
+                else if (a === "--config" || a === "-c") overrides.BILI_CONFIG_FILE = val;
                 else if (a === "--origin") overrides.BILI_MCP_PROXY = val;
                 else if (a === "--bin") process.env.BILI_CLIENT_BIN = val;
                 else if (a === "-F") overrides.BILI_UPSTREAM_PROXY = val;
@@ -564,10 +614,15 @@ export function parseArgs(argv: string[]): Parsed {
             packSpec = arg;
         } else if (cmd === "storage") {
             command = "storage";
-            if (positional[1] !== "gc") {
-                console.error(`bili storage: unknown action "${positional[1] ?? ""}" (try "bili storage gc")`);
+            const sub = positional[1];
+            // A bare `bili storage` stays an error (the existing contract,
+            // pinned by cli-parseargs): gc archives real sessions, so no
+            // action may be the silent default.
+            if (sub !== "gc" && sub !== "backup" && sub !== "repair") {
+                console.error(`bili storage: unknown action "${sub ?? ""}" (try "bili storage gc|backup|repair")`);
                 process.exit(2);
             }
+            storageSub = sub as Parsed["storageSub"];
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
@@ -600,11 +655,22 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    // -c/--config fail-fast: a bare NAME that resolves to a missing
+    // <configDir>/NAME.json names the typo + the available siblings instead of
+    // silently starting on an empty config (see paths.ts for path behavior).
+    const configRef = overrides.BILI_CONFIG_FILE ?? process.env.BILI_CONFIG_FILE;
+    if (configRef && command !== "help" && command !== "version") {
+        const configErr = checkNamedConfigRef(configRef);
+        if (configErr) {
+            console.error(configErr);
+            process.exit(2);
+        }
+    }
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -617,7 +683,7 @@ export async function main(): Promise<void> {
     }
     if (command === "acp-cache") {
         try {
-            const report = runDiff(acpCacheDir!, { logFile: acpCacheLog, noLog: acpCacheNoLog, session: acpCacheSession });
+            const report = await runDiff(acpCacheDir!, { logFile: acpCacheLog, noLog: acpCacheNoLog, session: acpCacheSession });
             process.stdout.write(jsonOutput ? renderJson(report) : renderText(report));
         } catch (error) {
             console.error(`bili acp-cache: ${error instanceof Error ? error.message : String(error)}`);
@@ -757,7 +823,11 @@ export async function main(): Promise<void> {
         try {
             const r = command === "sessions"
                 ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum, apply: sessionsApply, restoreTarget: sessionsRestoreTarget })
-                : await runStorageGcCommand({ days: storageDays, vacuum: storageVacuum, dryRun: storageDryRun, json: jsonOutput });
+                : storageSub === "backup"
+                    ? await runStorageBackupCommand({ keep: storageKeep, json: jsonOutput })
+                    : storageSub === "repair"
+                        ? await runStorageRepairCommand({ from: storageFrom, json: jsonOutput })
+                        : await runStorageGcCommand({ days: storageDays, vacuum: storageVacuum, dryRun: storageDryRun, json: jsonOutput });
             process.stdout.write(r.text);
             if (r.code !== 0) process.exit(r.code);
         } catch (error) {
@@ -963,4 +1033,12 @@ export async function main(): Promise<void> {
     // #5548: notice dismissal receipts ride the unified storage — hydrate the
     // in-memory view once at boot (and migrate any legacy JSON file one time).
     void hydrateNoticeReceipts();
+    // #5753: the same carrier rules now cover host-plugin dismissals, the
+    // apig-resign pending queue, the rollout install id, and the
+    // prefix-affinity snapshot. All no-op on legacy-only instances and
+    // before anything created the storage singleton.
+    void hydrateHostPluginDismissals();
+    void hydrateResignPending();
+    void hydrateRolloutIdentity();
+    void hydrateAffinityUnified();
 }

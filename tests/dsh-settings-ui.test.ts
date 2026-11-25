@@ -2153,6 +2153,19 @@ test("#4254: shell.overlay upstream-unavailable pill polls /__bili/upstreams, re
     assert.ok(!mt.includes("×2 · 约"), "alert-only (circuit-null) host carries no retry ETA");
     mm.runCleanups();
 
+    // #6026: nextProbeInMs 0 means fail-fast already lifted (probe-eligible, and probes are
+    // request-driven — bili never auto-retries), so the row must NOT render a fake
+    // "约 1s 后重试" countdown; host/kind/tally stay visible.
+    const z = await mountOverlay([{ host: "desktop-dp:18200", kind: "connect-timeout", code: "UND_ERR_CONNECT_TIMEOUT", count: 3, circuit: { state: "open", nextProbeInMs: 0 } }]);
+    z.resetHooks();
+    z.component();
+    await tick();
+    const zt = textOf(z.component());
+    assert.ok(zt.includes("desktop-dp:18200"), "probe-eligible host still renders");
+    assert.ok(zt.includes("connect-timeout") && zt.includes("×3"), "kind + tally stay");
+    assert.ok(!/重试|retry/i.test(zt), "no retry-countdown wording for nextProbeInMs 0 (#6026)");
+    z.runCleanups();
+
     // Defensive parse: malformed entries degrade to fewer rows and never throw —
     // only the well-formed host survives into the banner.
     const g = await mountOverlay([
@@ -2246,4 +2259,34 @@ test("#4406: the Context tab marks the conversation scroll container and hides t
 
     m.runCleanups();
     assert.equal(scrollAttrs.has("data-bili-surface"), false, "leaving the tab drops the marker");
+});
+
+test("#6587: both dark palettes bind color-scheme so native controls follow the theme", () => {
+    // `color-scheme` is what the UA paints native control chrome from: a
+    // <select>'s option popup, checkbox/radio glyphs, scrollbars. The base
+    // :root carries `light dark` (#2473, canvas/ground coupling), but the
+    // BASE value resolves to `light` whenever the OS asks for neither scheme,
+    // so each dark palette rebinds it to dark — otherwise the compress
+    // prompt-pack <select> (#/config -> compress.promptPack) pops a white
+    // option list over the dark settings face while the page itself is dark.
+    // Scope the read: the base :root also declares `color-scheme: light dark`,
+    // so a bare includes() passes even with both dark blocks stripped.
+    const styles = fs.readFileSync(new URL("../src/web/styles.ts", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+    const decls = (open: string): string[] => {
+        const i = styles.indexOf(open);
+        assert.ok(i >= 0, `${open} present`);
+        return styles
+            .slice(i + open.length, styles.indexOf("}", i))
+            .split("\n")
+            .map((l) => l.trim().replace(/;\s*$/, ""))
+            .filter((l) => l !== "");
+    };
+    assert.ok(
+        decls(':root[data-theme="dark"] {').includes("color-scheme: dark"),
+        "the pinned dark palette binds color-scheme: dark",
+    );
+    assert.ok(
+        decls(":root:not([data-theme]) {").includes("color-scheme: dark"),
+        "the OS-driven dark palette binds color-scheme: dark for native controls",
+    );
 });

@@ -1,6 +1,6 @@
 # Documentation
 
-All system documentation for **billion-context** lives in this directory. The repo root keeps only four entry files: `README.md`, `README.zh-CN.md`, `AGENTS.md`, `CHANGELOG.md` (former root doc paths keep one-line redirect stubs at the root, tracked in [lifecycle §5](lifecycle.md#5-卫生记录)).
+All system documentation for **billion-context** lives in this directory. The repo root keeps only four **core** entry files — `README.md`, `README.zh-CN.md`, `AGENTS.md`, `CHANGELOG.md` — and recognized community-maintained README translations (`README.<locale>.md`, e.g. `README.ja.md`, approved 2026-11-09, #6000). Former root doc paths keep one-line redirect stubs at the root (tracked in [lifecycle §5](lifecycle.md#5-卫生记录)).
 
 > **Full catalog:** [index.md](index.md) / [index.zh-CN.md](index.zh-CN.md) — every doc with a one-line description. This page is the directory landing: where things are and which rules keep them live.
 

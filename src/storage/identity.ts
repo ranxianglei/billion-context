@@ -38,7 +38,7 @@ const MEDIA_URL_MARKER_RE = new RegExp(
 );
 
 export function splitMediaContent(content: string): { content: string; hash: string; media: { hash: string; bytes: string }[] } {
-    let media: { hash: string; bytes: string }[] = [];
+    const media: { hash: string; bytes: string }[] = [];
     let split = content;
     if (content.includes("\"imageBase64\"")) {
         let parsed: { imageBase64?: unknown };
@@ -68,7 +68,7 @@ export function splitMediaContent(content: string): { content: string; hash: str
             const mediaHash = sha256Hex(payload);
             if (!byHash.has(mediaHash)) {
                 byHash.set(mediaHash, payload);
-                media = [...media, { hash: mediaHash, bytes: payload }];
+                media.push({ hash: mediaHash, bytes: payload });
             }
             return `data:${mime};base64,{$media:${mediaHash}}`;
         });
@@ -84,12 +84,13 @@ export function splitMediaContent(content: string): { content: string; hash: str
  *  not logical content — keeping it would re-mint the row identity on
  *  every turn and re-append the whole view as fresh rows. */
 function identityInputOf(raw: string): string {
-    let parsed: { id?: unknown; wireIndex?: unknown; ledgerSeq?: unknown };
+    let parsed: { id?: unknown; wireIndex?: unknown; ledgerSeq?: unknown } | null;
     try {
-        parsed = JSON.parse(raw) as { id?: unknown; wireIndex?: unknown; ledgerSeq?: unknown };
+        parsed = JSON.parse(raw) as { id?: unknown; wireIndex?: unknown; ledgerSeq?: unknown } | null;
     } catch {
         return raw;
     }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return raw;
     if (parsed.id === undefined && parsed.wireIndex === undefined && parsed.ledgerSeq === undefined) return raw;
     delete parsed.id;
     delete parsed.wireIndex;

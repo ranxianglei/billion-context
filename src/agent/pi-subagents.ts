@@ -42,6 +42,53 @@ import type { ExtensionAPI, ToolDefinition } from "./pi.js";
 import { loadConfigFile, type PiSubagentsFileConfig } from "../config.js";
 import { logHostEvent } from "./host-log.js";
 
+/** The four bili pi-plugin slash commands ownable via `pi.commands`. */
+export const PI_COMMAND_NAMES = ["acp", "acp-cache", "acp-rule", "acp-fleet"] as const;
+type PiCommandName = (typeof PI_COMMAND_NAMES)[number];
+/** Default surface: status + cache reconciliation stay on, the rarer
+ *  acp-rule / acp-fleet register only when named explicitly. */
+export const DEFAULT_PI_COMMANDS: readonly PiCommandName[] = ["acp", "acp-cache"];
+
+let warnedUnknownPiCommands = false;
+let warnedWrongTypePiCommands = false;
+
+/** Resolve `pi.commands` from billion-context.json into the set of slash
+ *  commands to register. `undefined` → DEFAULT_PI_COMMANDS; `[]` or `false`
+ *  → none; `true` → all four; arrays keep only known names (unknown ones warn
+ *  once, honoring the never-silently-drop-user-config rule §7.3). Each
+ *  warning class is one-shot per process so stderr stays quiet across
+ *  session starts. */
+export function resolvePiCommands(raw: unknown): readonly PiCommandName[] {
+    if (raw === undefined) return DEFAULT_PI_COMMANDS;
+    if (raw === false || (Array.isArray(raw) && raw.length === 0)) return [];
+    if (raw === true) return PI_COMMAND_NAMES;
+    if (Array.isArray(raw)) {
+        const known = new Set<string>(PI_COMMAND_NAMES);
+        const picked: PiCommandName[] = [];
+        for (const item of raw) {
+            if (typeof item === "string" && known.has(item)) {
+                if (!picked.includes(item as PiCommandName)) picked.push(item as PiCommandName);
+            } else if (!warnedUnknownPiCommands) {
+                warnedUnknownPiCommands = true;
+                console.error(`bili-plugin(pi): pi.commands has unknown entry ${JSON.stringify(item)} — known: ${PI_COMMAND_NAMES.join(", ")}`);
+            }
+        }
+        return picked;
+    }
+    // Wrong-typed value: warn and fall back to the default surface.
+    if (!warnedWrongTypePiCommands) {
+        warnedWrongTypePiCommands = true;
+        console.error(`bili-plugin(pi): pi.commands must be an array of command names or a boolean — got ${typeof raw}; using default ${JSON.stringify(DEFAULT_PI_COMMANDS)}`);
+    }
+    return DEFAULT_PI_COMMANDS;
+}
+
+/** Which slash commands should this runtime register? Read per session_start
+ *  so a config edit applies on the next session without a proxy restart. */
+export function piCommandsEnabled(): ReadonlySet<string> {
+    return new Set(resolvePiCommands(loadConfigFile().pi?.commands));
+}
+
 const EMBEDDED_GLOBAL_KEY = Symbol.for("acp-delegate.embedded");
 
 function embeddedClaimed(): boolean {
@@ -123,7 +170,7 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
         // rebuilt runtime gets fresh extension objects (#2875 re-wires after
         // /new/reload), and pi serves commands from the active runner only —
         // re-registering is required across rebuilds and cannot duplicate.
-        if (fleetCommandRegistered === false) {
+        if (fleetCommandRegistered === false && piCommandsEnabled().has("acp-fleet")) {
             fleetCommandRegistered = true;
             pi.registerCommand?.("acp-fleet", {
                 description: "Inspect acp_delegate sub-agent runs: live list + transcript overlay (TUI), text snapshot elsewhere.",

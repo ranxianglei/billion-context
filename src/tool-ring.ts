@@ -32,8 +32,9 @@ interface WitnessEntry {
 
 /** sessionId → ring of recent witness hashes (oldest first, capped). */
 const rings = new Map<string, WitnessEntry[]>();
-/** witness hash → set of sessionIds holding it (populated on lookup sweep). */
+/** witness hash → set of sessionIds holding it (added on record, pruned on sweep). */
 const hashIndex = new Map<string, Set<string>>();
+let lastRecordSweepAt: number | undefined;
 
 /** Fake-clock seam for TTL tests. Undefined = real wall clock. */
 let clockForTest: (() => number) | undefined;
@@ -119,6 +120,12 @@ export function recordToolWitness(sessionId: string, name: string, args: string 
     const hash = witnessHash(name, args);
     if (!hash) return;
     const now = nowMs();
+    // Native-id routing may never look up a hash witness. Reclaim other
+    // sessions on writes too, amortizing the full scan over the TTL window.
+    if (lastRecordSweepAt === undefined || now - lastRecordSweepAt > WITNESS_TTL_MS || now < lastRecordSweepAt) {
+        for (const id of rings.keys()) sweep(id, now);
+        lastRecordSweepAt = now;
+    }
     sweep(sessionId, now);
     const ring = rings.get(sessionId) ?? [];
     if (ring.length > 0 && ring[ring.length - 1].hash === hash) {
@@ -182,23 +189,12 @@ const toolUseIds = new Map<string, { sessionId: string; at: number }>();
  *  recordToolWitness. */
 export function recordToolUseId(toolUseId: string, sessionId: string): void {
     if (toolUseId.length === 0 || toolUseId.length > 512) return;
+    // Refresh insertion order too: wall-clock ties and rollbacks are not recency.
+    toolUseIds.delete(toolUseId);
     toolUseIds.set(toolUseId, { sessionId, at: nowMs() });
     while (toolUseIds.size > TOOL_USE_ID_CAPACITY) {
-        // Evict the entry with the smallest recorded time. Full scan — the cap
-        // is tiny and this only runs past it. A re-record keeps its insertion
-        // slot but refreshes `at`, so position order is NOT age order (a
-        // first-inserted id can be the freshest one in the ring).
-        let oldestKey: string | undefined;
-        let oldestAt = Infinity;
-        for (const [k, v] of toolUseIds) {
-            if (v.at < oldestAt) {
-                oldestAt = v.at;
-                oldestKey = k;
-            }
-        }
-        // Never evict what this call just wrote (clock went backwards): leave
-        // the ring one over the cap until a normal insert can evict someone else.
-        if (oldestKey === undefined || oldestKey === toolUseId) break;
+        const oldestKey = toolUseIds.keys().next().value;
+        if (oldestKey === undefined) break;
         toolUseIds.delete(oldestKey);
     }
 }
@@ -219,6 +215,7 @@ export function lookupToolUseIdSession(toolUseId: string): string | undefined {
 export function resetToolRingForTest(): void {
     rings.clear();
     hashIndex.clear();
+    lastRecordSweepAt = undefined;
     toolUseIds.clear();
     clockForTest = undefined;
 }

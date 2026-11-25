@@ -1,0 +1,21 @@
+# Verdaccio for the container's install / auto-update lanes.
+# - storage is EPHEMERAL (/tmp): each container run gets a clean registry,
+#   so re-publishing the same version across runs never conflicts.
+# - max_body_size raised: the billion-context tarball is ~29MB (>10MB default).
+# - no uplinks: this registry only serves what we publish into it; dependency
+#   installs go to NPM_CONFIG_REGISTRY (public npm) directly.
+storage: /tmp/verdaccio-storage
+max_body_size: 100mb
+web:
+  enable: false
+listen:
+  - 127.0.0.1:4873
+packages:
+  '@*/*':
+    access: $all
+    publish: $authenticated
+  '**':
+    access: $all
+    publish: $authenticated
+logs:
+  - { type: stdout, format: pretty, level: warn }

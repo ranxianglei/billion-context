@@ -405,6 +405,12 @@ test("UPSTREAM_HOP_HEADERS includes expect to prevent undici UND_ERR_NOT_SUPPORT
     assert.ok(UPSTREAM_HOP_HEADERS.has("expect"));
 });
 
+test("OMP recovery ownership marker is stripped before provider egress", () => {
+    assert.ok(UPSTREAM_HOP_HEADERS.has("x-bili-host-recovery-owner"));
+    const out = buildForwardHeaders({ "x-bili-host-recovery-owner": "omp", "content-type": "application/json" });
+    assert.equal(out["x-bili-host-recovery-owner"], undefined);
+});
+
 test("buildForwardHeaders drops expect so undici fetch does not throw UND_ERR_NOT_SUPPORTED (#5369)", async () => {
     const server = http.createServer((req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); });
     await new Promise<void>((resolve) => { server.listen(0, "127.0.0.1", resolve); });
@@ -725,6 +731,9 @@ test("isClaudeHostArgv: exact matches only — never the hook itself or lookalik
     assert.equal(isClaudeHostArgv(["timeout", "40", "claude", "-p", "hi"]), false);
     assert.equal(isClaudeHostArgv(["/bin/sh", "-c", "claude"]), false);
     assert.equal(isClaudeHostArgv(["claude-doctor"]), false);
+    assert.equal(isClaudeHostArgv(["/home/x/.local/share/claude/versions/2.1.323", "--print", "--sdk-url", "https://api.anthropic.com/v1/code/sessions/cse_x"]), true);
+    assert.equal(isClaudeHostArgv(["/home/x/.local/share/claude/versions/2.1.323.tmp"]), false);
+    assert.equal(isClaudeHostArgv(["/opt/other/versions/2.1.323"]), false);
     assert.equal(isClaudeHostArgv(["claudeworkflow"]), false);
     // node with unrelated args must not match just because `claude` appears
     // inside a longer path/argument.

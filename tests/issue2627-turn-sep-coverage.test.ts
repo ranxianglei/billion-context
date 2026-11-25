@@ -1,5 +1,5 @@
 // #2627 regression: bili-synthesized Responses turn separators
-// (repairResponsesAssistantOrdering, src/server.ts) are OUTBOUND-ONLY ordering
+// (repairResponsesAssistantOrdering, src/server/responses-ordering.ts) are OUTBOUND-ONLY ordering
 // markers — no client's resent history ever contains them. When a
 // separator-bearing view reached applyCompression (the plugin lane handed its
 // processed view straight in), their ids were registered into new blocks'
@@ -17,7 +17,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig, refForRaw, coveredMessageIds } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { RESPONSES_TURN_SEPARATOR_ID_PREFIX, coveredRealHistoryIds, foldCoverage, isResponsesTurnSeparatorId, scrubTurnSeparatorIds } from "../src/session.ts";
-import { repairResponsesAssistantOrdering } from "../src/server.ts";
+import { repairResponsesAssistantOrdering } from "../src/server/responses-ordering.ts";
 import { METADATA_FOLD_COVERAGE, reconcileFoldCoverage, type FoldBlockCoverage, type ReconcileOptions } from "../src/fold-reconcile.ts";
 import { SessionStore } from "../src/persist.ts";
 
@@ -74,7 +74,7 @@ describe("#2627 producer coupling (server.ts)", () => {
         const R = msg("r2", "assistant", "thinking about the next question", "reasoning");
         // original: run1=[A], user break, run2=[R]; folded drops U -> A and R
         // become adjacent across runs with a body before reasoning: separator.
-        const out = repairResponsesAssistantOrdering([A, R], [A, U, R]);
+        const out = repairResponsesAssistantOrdering([A, R], [A, U, R]).messages;
         assert.equal(out.length, 3);
         assert.equal(out[0], A);
         assert.equal(out[2], R);
@@ -86,7 +86,7 @@ describe("#2627 producer coupling (server.ts)", () => {
 
     test("no separator when ordering is already legal", () => {
         const A = msg("a1", "assistant", "answer");
-        const out = repairResponsesAssistantOrdering([A], [A]);
+        const out = repairResponsesAssistantOrdering([A], [A]).messages;
         assert.equal(out.length, 1);
         assert.equal(out[0], A);
     });

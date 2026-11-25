@@ -152,6 +152,17 @@ test("e2e: session requests are log-tagged; /__bili/logs serves ctx + win views"
         const rawTxt = await raw.text();
         assert.ok(rawTxt.includes(`[sess=${SID}]`));
         assert.ok(rawTxt.includes(NOISE));
+
+        // Full means every retained row, not an undocumented 100,000-row tail.
+        const rowCount = 100_002;
+        const exportRows = Array.from({ length: rowCount }, (_, i) => `export-boundary-${i}`);
+        fs.appendFileSync(logFile, "\n" + exportRows.join("\n") + "\n");
+        const complete = await fetch(`${base}?raw=1&all=1`);
+        assert.equal(complete.status, 200);
+        const exported = (await complete.text()).split("\n").filter((line) => line.startsWith("export-boundary-"));
+        assert.equal(exported[0], exportRows[0], "full export lost its oldest retained fixture row");
+        assert.equal(exported.length, rowCount, "full export must conserve every retained fixture row");
+        assert.equal(exported.at(-1), exportRows.at(-1));
     } finally {
         await closeLogger();
         proxy.closeAllConnections?.();

@@ -1388,27 +1388,8 @@ test("parseCompressArgs refuses to narrow a ref pair with an unrecognized separa
 });
 
 // ---------------------------------------------------------------------------
-// compressAtFoldPoint v2 pointer echo + stringified single entry (#5949 field)
+// stringified single entry (#5949 field)
 // ---------------------------------------------------------------------------
-
-test("content echoing the v2 relocation pointer classifies as already-folded-echo", () => {
-  // Field shape (billion-context session 01a1b6b3): the model copied the most
-  // recent compress call's rewritten args — the v2 ack pointer — as the
-  // content of a NEW call, wrapped in one more JSON layer.
-  const parsed = parseCompressArgs({
-    content: '{"content": "[bili] compression succeeded — summary relocated to its fold point above (block(s) b49); these ranges are already folded — do not re-compress them."}',
-  });
-  assert.equal(parsed.diagnostics.ok, false);
-  assert.equal(parsed.diagnostics.kind, "already-folded-echo");
-  assert.equal(parsed.ranges.length, 0);
-});
-
-test("bare pointer text in content is already-folded-echo too", () => {
-  const parsed = parseCompressArgs({
-    content: "[bili] compression succeeded — summary relocated to its fold point above (block(s) b50); these ranges are already folded — do not re-compress them.",
-  });
-  assert.equal(parsed.diagnostics.kind, "already-folded-echo");
-});
 
 test("content string encoding ONE entry object is salvaged (refs inside the JSON)", () => {
   const parsed = parseCompressArgs({

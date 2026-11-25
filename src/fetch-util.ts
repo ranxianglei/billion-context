@@ -91,11 +91,19 @@ export function upstreamTimeoutMs(): number {
 // explicit Agent per timeout value so the transport layer matches the watchdog
 // instead of firing first.
 const directDispatchers = new Map<string, Agent>();
+let directCaIdentity: string | undefined;
 
 function directDispatcher(timeoutMs: number): Agent {
     // #3776: key on the CA identity too so a configured/rotated network.caFile
     // rotates the cached Agent (and its connect.ca) instead of reusing a stale trust set.
-    const key = `${timeoutMs}\u0000${upstreamCaIdentity()}`;
+    const caIdentity = upstreamCaIdentity();
+    if (caIdentity !== directCaIdentity) {
+        // Retire the old identity's pools without aborting their in-flight responses.
+        // Keeping every rotated identity here otherwise retains Agents and CA material forever.
+        closeDirectDispatchers();
+        directCaIdentity = caIdentity;
+    }
+    const key = `${timeoutMs}\u0000${caIdentity}`;
     let agent = directDispatchers.get(key);
     if (!agent) {
         const ca = upstreamExtraCa();
@@ -105,11 +113,16 @@ function directDispatcher(timeoutMs: number): Agent {
     return agent;
 }
 
-export function _resetFetchUtilForTest(): void {
+function closeDirectDispatchers(): void {
     for (const agent of directDispatchers.values()) {
         try { void agent.close().catch(() => undefined); } catch { /* already closed */ }
     }
     directDispatchers.clear();
+    directCaIdentity = undefined;
+}
+
+export function _resetFetchUtilForTest(): void {
+    closeDirectDispatchers();
     _resetUpstreamCaForTest();
 }
 
@@ -359,9 +372,40 @@ function armIdleBody(body: ReadableStream<Uint8Array>, rearm: () => void): Reada
     });
 }
 
+const REPLAY_ERROR_BODY_BYTES = 1 << 20;
+
+async function readReplayErrorBody(response: Response): Promise<string> {
+    const reader = response.body?.getReader();
+    if (!reader) return "";
+    const decoder = new TextDecoder();
+    const parts: string[] = [];
+    let kept = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) {
+                parts.push(decoder.decode());
+                return parts.join("");
+            }
+            const take = Math.min(value.byteLength, REPLAY_ERROR_BODY_BYTES - kept);
+            parts.push(decoder.decode(value.subarray(0, take), { stream: true }));
+            kept += take;
+            if (take < value.byteLength) {
+                // Cancellation can await a tee sibling that never consumes its body.
+                void reader.cancel().catch(() => undefined);
+                // Do not flush an incomplete UTF-8 code point cut by the byte budget.
+                return `[upstream error body truncated after ${REPLAY_ERROR_BODY_BYTES} bytes]\n${parts.join("")}`;
+            }
+        }
+    } finally {
+        reader.releaseLock();
+    }
+}
+
 /** Upstream HTTP failure after all retry attempts are exhausted (or a
  *  non-transient error that fails fast). `attempts` is the number of requests
- *  actually made; `body` is the upstream error body (already read). */
+ *  actually made; `body` is the decoded error body, or a marked prefix when
+ *  a replay error exceeds its byte budget. */
 export class UpstreamHttpError extends Error {
     readonly status: number;
     readonly body: string;
@@ -549,8 +593,12 @@ export async function fetchWithRetry(
             continue;
         }
         if (result.response.ok) return result;
-        const errText = await result.response.text().catch(() => "upstream error");
-        result.clearTimer();
+        let errText: string;
+        try {
+            errText = await readReplayErrorBody(result.response);
+        } finally {
+            result.clearTimer();
+        }
         const lastAttempt = attempt >= maxAttempts;
         if (!lastAttempt && isTransientUpstreamError(result.response.status, errText)) {
             const delayMs = replayBackoffMs(attempt);

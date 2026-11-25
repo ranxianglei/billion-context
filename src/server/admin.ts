@@ -6,13 +6,15 @@ import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unres
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { loadConfigFile, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { resetEgressModuleCache } from "../egress-transforms.js";
 import { applyCompressSettings, listResolvedPacks, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
 import { getResolverWedgeState } from "../resolver-wedge.js";
 import { detectCostAdvisories } from "../plugin-advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
-import { log as loggerLog, getLogPath } from "../logger.js";
+import { log as loggerLog, getLogPath, logRetentionStatus } from "../logger.js";
+import { logGenerations } from "../log-retention.js";
 import { getBlindTunnelStats } from "../mitm.js";
 import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
@@ -21,6 +23,7 @@ import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
+import { r3FaultTracker } from "../snapshot/plane.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { dismissUpgradeNotice } from "../pck-notice.js";
@@ -40,12 +43,15 @@ import { handleChangelogGet } from "../web/changelog.js";
 import { kickBlogRefresh } from "../web/blog-refresh.js";
 import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
-import { queryLogLines } from "../web/logs-query.js";
+import { queryLogFiles } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
 import { FAVICON_ICO_BASE64 } from "../web/favicon.js";
 import { ackSplitBrainContest, storageStatusWire } from "../storage/runtime-status.js";
 import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { attributionStatusWire } from "./attribution-status.js";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { readLogFileLines, readLogLines } from "../log-file-lines.js";
 
 interface AdminCtx {
     opts: ProxyOptions;
@@ -254,7 +260,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     }
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
-    if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return await sendDiagnostics(res, req.url);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
     // #4173: compact fold-edge feed for the live tree thumbnail (5s client poll).
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/tree")) return sendWebSessionTree(res, req.url);
@@ -690,6 +696,111 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             return;
         }
     }
+    // #6785 review: R3 breaker latch visibility + operator escape hatch.
+    // A latched raw session id degrades to the legacy path PERSISTENTLY
+    // (it survives restarts) and nothing else clears it — the operator
+    // must be able to see which sids are stuck (and since when) and unstick
+    // one that latched in error. Loopback-gated like every /__bili/ route;
+    // 501 in legacy mode (same discipline as /__bili/replicas).
+    if (req.method === "GET" && (req.url === "/__bili/snapshot/r3-latches" || req.url?.startsWith("/__bili/snapshot/r3-latches?"))) {
+        const store = getStore();
+        if (!store.replicasAvailable()) {
+            res.writeHead(501, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+            return;
+        }
+        const latched = store.snapR3LatchedList();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, count: latched.length, latched }));
+        return;
+    }
+    if (req.method === "POST" && req.url === "/__bili/snapshot/r3-unlatch") {
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessRaw?: unknown };
+            if (typeof parsed.sessRaw !== "string" || parsed.sessRaw.length === 0) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected { sessRaw: string } — take the raw id from GET /__bili/snapshot/r3-latches" }));
+                return;
+            }
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+                return;
+            }
+            // Clear BOTH latch planes: the persisted row (by raw id) and the
+            // in-memory breaker — for every sid the row can resolve to. The
+            // latch row's ledger_id can still be the sessRaw placeholder
+            // (first fault before any stage-0 run) while the breaker is
+            // keyed by the real sid, so clear both resolvable keys (plus the
+            // raw id itself, which is the sid in the common no-conversation
+            // case). clearLatched on a non-latched key is a no-op.
+            const ledgerId = store.snapR3LatchClear(parsed.sessRaw);
+            const keys = new Set<string>([parsed.sessRaw]);
+            if (ledgerId !== null) keys.add(ledgerId);
+            const convSid = store.snapSidOfRaw(parsed.sessRaw);
+            if (convSid !== null) keys.add(convSid);
+            for (const k of keys) r3FaultTracker.clearLatched(k);
+            log("info", `[admin] POST /__bili/snapshot/r3-unlatch sessRaw=${parsed.sessRaw.slice(0, 12)}… ledgerId=${ledgerId ?? "no-row"} in-memory-keys=[${[...keys].join(", ")}]`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, persistedRowCleared: ledgerId !== null, ledgerId: ledgerId ?? undefined }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    // #7574: outbound op-log latch visibility + operator escape hatch. A
+    // session whose log is this session's content authority fails EVERY turn
+    // (500 egress_flow_unreadable) once the log does not replay. The latch is
+    // saved with the session, so it survives restarts, and before this there
+    // was no way to see which sessions are stuck or to unstick one. Same
+    // shape as the R3 latch routes above: loopback-gated, 501 in legacy mode.
+    if (req.method === "GET" && (req.url === "/__bili/egress/latches" || req.url?.startsWith("/__bili/egress/latches?"))) {
+        const latched = listSessions()
+            .filter((s) => s.metadata?.["egressFlowUnreadable"] === true)
+            .map((s) => ({ sessionId: s.id, lastSeen: s.lastSeen }));
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, count: latched.length, latched }));
+        return;
+    }
+    if (req.method === "POST" && req.url === "/__bili/egress/reset") {
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown };
+            if (typeof parsed.sessionId !== "string" || parsed.sessionId.length === 0) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected { sessionId: string } — take the id from GET /__bili/egress/latches" }));
+                return;
+            }
+            const store = getStore()?.egressOpLogStore() ?? null;
+            if (!store) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+                return;
+            }
+            // Drop the whole log of this session. The next turn starts a fresh
+            // one from what the client sends (the turn is recorded, never
+            // swapped, until the log has caught up). A session that is not
+            // loaded right now clears its latch on its next turn: "latched +
+            // no rows" is what the lane reads as "was reset".
+            const hadLog = store.egressStateMaxSeq(parsed.sessionId) > 0;
+            store.deleteEgressOps(parsed.sessionId);
+            const live = peekSession(parsed.sessionId);
+            if (live) {
+                delete live.metadata["egressFlowUnreadable"];
+                delete live.metadata["egressAuthority"];
+            }
+            log("info", `[admin] POST /__bili/egress/reset session=${parsed.sessionId.slice(0, 12)}… hadLog=${hadLog} sessionLoaded=${live !== undefined}`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, hadLog, sessionLoaded: live !== undefined }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
     // #2671 Phase 2: replica/checkpoint management over the unified store.
     // Loopback-gated like every /__bili/ route; 501 in legacy mode so the
     // operator knows the knob, not the URL, is what is missing.
@@ -697,10 +808,10 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url === "/__bili/memory") return await sendMemoryReport(res);
     if (req.method === "POST" && req.url === "/__bili/replicas") {
         try {
-            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown; label?: unknown; pinned?: unknown };
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown; label?: unknown; pinned?: unknown; opSeq?: unknown };
             if (typeof parsed.sessionId !== "string" || !parsed.sessionId) {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: false, error: "expected { sessionId: string, label?: string, pinned?: boolean }" }));
+                res.end(JSON.stringify({ ok: false, error: "expected { sessionId: string, label?: string, pinned?: boolean, opSeq?: number }" }));
                 return;
             }
             const store = getStore();
@@ -713,18 +824,59 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             // the checkpoint freezes what the caller just saw, not the last
             // debounced write.
             const resident = peekSession(parsed.sessionId);
+            // #7577 D5 / review (c): egress-on sessions have no checkpoint
+            // substrate — fork the session to NOW (a full, loadable copy: the
+            // four egress op-log tables + the unified kernel-state rows) instead
+            // of freezing a checkpoint row. op_seq is accepted for API shape;
+            // only the current high water is supported (kernel-state rows only
+            // exist at now — an earlier point would pair content-at-X with
+            // kernel-state-at-now, which is inconsistent).
+            if (resident && resident.metadata["egressAuthority"] === true) {
+                // #7577 (dual clocks, owner ruling 2026-11-24): the point-fork
+                // watermark is the FLOW clock — egressStateMaxSeq (egress_flow's
+                // own MAX). Block rows carry their own op_seq clock plus a
+                // flow_op_seq pointer, so they align to this watermark with no
+                // separate high-water to chase.
+                const highWater = store.egressOpLogStore()?.egressStateMaxSeq(parsed.sessionId) ?? 0;
+                if (parsed.opSeq !== undefined) {
+                    if (typeof parsed.opSeq !== "number" || !Number.isInteger(parsed.opSeq) || parsed.opSeq < 0) {
+                        res.writeHead(400, { "content-type": "application/json" });
+                        res.end(JSON.stringify({ ok: false, error: "opSeq must be a non-negative integer" }));
+                        return;
+                    }
+                    if (parsed.opSeq < highWater) {
+                        res.writeHead(400, { "content-type": "application/json" });
+                        res.end(JSON.stringify({ ok: false, error: `point fork at op_seq ${parsed.opSeq} is not supported — kernel-state rows only exist at the current high water (${highWater}); earlier points need the point-reconstruction materializer (follow-up)` }));
+                        return;
+                    }
+                }
+                try {
+                    const { childId, opSeq } = await store.forkEgressSnapshot(parsed.sessionId);
+                    res.writeHead(201, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: true, pointFork: true, sessionId: childId, opSeq, restoredFrom: parsed.sessionId }));
+                } catch (err) {
+                    const msg = String(err);
+                    res.writeHead(msg.includes("already exists") ? 409 : 500, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: false, error: msg }));
+                }
+                return;
+            }
             if (resident) await store.writeNow(resident);
             try {
                 const row = await store.createReplica(parsed.sessionId, {
                     label: typeof parsed.label === "string" ? parsed.label : undefined,
                     pinned: parsed.pinned === true,
+                    resident,
                 });
                 res.writeHead(201, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, replica: serializeReplica(row) }));
             } catch (err) {
                 const msg = String(err);
-                res.writeHead(msg.includes("not in the unified index") ? 404 : 500, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: false, error: msg }));
+                // A NON-RESIDENT egress-on session reaches createReplica's
+                // guard (it can only fork a resident session) — map it to a
+                // load-it-first 503, not a generic 500.
+                res.writeHead(msg.includes("not in the unified index") ? 404 : msg.includes("use the point-fork path") ? 503 : 500, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: msg.includes("use the point-fork path") ? `${msg} — load the session first, then POST again` : msg }));
             }
             return;
         } catch (err) {
@@ -927,6 +1079,11 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     opts.compat = reloaded.compat;
     opts.imageBilling = reloaded.imageBilling;
     opts.imageTokenCap = reloaded.imageTokenCap;
+    // #6003 phase 2: egress transforms are file-only, so pull them off the fresh
+    // loadOptions() result (already parsed/validated) and drop the loaded-module
+    // cache so a plugin's code + any added/removed entry take effect next request.
+    opts.egressTransforms = reloaded.egressTransforms;
+    resetEgressModuleCache();
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().
@@ -1381,7 +1538,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
 
 /** #3040: generic diagnostics report — copyable blob + prefilled GitHub issue
  *  link. Loopback-gated like every other /__bili/* route; never throws. */
-function sendDiagnostics(res: http.ServerResponse, url: string | null): void {
+async function sendDiagnostics(res: http.ServerResponse, url: string | null): Promise<void> {
     let topic: string | undefined;
     try {
         topic = new URL(url ?? "/__bili/diagnostics", "http://localhost").searchParams.get("topic") ?? undefined;
@@ -1389,7 +1546,7 @@ function sendDiagnostics(res: http.ServerResponse, url: string | null): void {
         topic = undefined;
     }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(buildDiagnostics(topic), null, 2));
+    res.end(JSON.stringify(await buildDiagnostics(topic), null, 2));
 }
 
 /** #1937：携带搜索、协议、客户端、状态或分页参数时，启用服务端筛选分页。
@@ -1404,7 +1561,8 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
             u.searchParams.has("q") ||
             u.searchParams.has("protocol") ||
             u.searchParams.has("client") ||
-            u.searchParams.has("state");
+            u.searchParams.has("state") ||
+            u.searchParams.has("kind");
         if (paged) {
             const rawSize = Number(u.searchParams.get("pageSize"));
             const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
@@ -1412,12 +1570,15 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
             const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
             const rawState = u.searchParams.get("state");
             const state = rawState === "live" || rawState === "history" ? rawState : undefined;
+            const rawKind = u.searchParams.get("kind");
+            const kind = rawKind === "top" || rawKind === "child" ? rawKind : undefined;
             body = {
                 ...(await buildSessionPage({
                     q: u.searchParams.get("q") ?? undefined,
                     protocol: u.searchParams.get("protocol") ?? undefined,
                     client: u.searchParams.get("client") ?? undefined,
                     state,
+                    kind,
                     page,
                     pageSize,
                 })),
@@ -1437,21 +1598,22 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
     res.end(JSON.stringify(body, null, 2));
 }
 
-/** #1426 web UI run-log viewer: tail of the rotated logger files (bili.log.old
- *  + bili.log), optionally filtered by a case-insensitive substring (?q=).
- *  ?lines= caps the tail at 2000; ?raw=1 streams the same tail as a .txt download. */
+/** #1426 web UI run-log viewer: tail of the retained logger generations (sealed
+ *  history oldest-first, then bili.log), optionally filtered by a
+ *  case-insensitive substring (?q=). ?lines= caps the tail at 2000; ?raw=1
+ *  streams the same tail as a .txt download. */
 async function sendWebLogs(res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     const u = new URL(req.url ?? "/__bili/logs", "http://localhost");
     const q = (u.searchParams.get("q") ?? "").trim();
     const fullDownload = u.searchParams.get("raw") === "1" && u.searchParams.get("all") === "1";
     let n = Number(u.searchParams.get("lines") ?? "500");
     if (!Number.isFinite(n) || n <= 0) n = 500;
-    // Full download is the forensic escape hatch: ignore `lines`, capped only
-    // by the memory guard below so users can export the whole .old + cur pair.
-    n = fullDownload ? 100_000 : Math.min(Math.floor(n), 2000);
+    // The viewer and filtered download are bounded tails. Full exports stream
+    // every readable retained row below instead of silently applying a tail cap.
+    n = Math.min(Math.floor(n), 2000);
     // Context expansion (ctx=N rows around each hit) and time window (win=Ss
     // around [firstHit, lastHit]) — selection logic lives in web/logs-query.ts
-    // (unit-tested pure function); win wins over ctx when both are given.
+    // (unit-tested streaming selector); win wins over ctx when both are given.
     let ctx = Number(u.searchParams.get("ctx") ?? "0");
     if (!Number.isFinite(ctx) || ctx < 0) ctx = 0;
     ctx = Math.min(Math.floor(ctx), 50);
@@ -1459,24 +1621,56 @@ async function sendWebLogs(res: http.ServerResponse, req: http.IncomingMessage):
     if (!Number.isFinite(win) || win < 0) win = 0;
     win = Math.min(Math.floor(win), 3600);
     const logFile = getLogPath() ?? defaultLogFile();
-    // Cross-platform dir extraction: a naive "/" split yields "" on Windows
-    // paths and the candidates would silently resolve against cwd.
-    const dir = logFile ? path.dirname(logFile) + path.sep : "";
-    const candidates = [dir + "bili.log.old", dir + "bili.log"];
-    const existing = candidates.filter((f) => {
-        try { return fs.statSync(f).isFile(); } catch { return false; }
-    });
-    let all: string[] = [];
-    for (const f of existing) {
-        let text: string;
-        try { text = fs.readFileSync(f, "utf8"); } catch { continue; }
-        all = all.concat(text.split("\n").filter((l) => l.length > 0));
+    // ONE enumeration shared with every other default reader: the active file
+    // plus every immutable sealed generation, oldest first.
+    const existing = logGenerations(logFile).map((g) => g.path);
+    const unreadable: string[] = [];
+    const onReadError = (file: string, error: NodeJS.ErrnoException): void => {
+        unreadable.push(file);
+        process.stderr.write(`[logs] cannot read ${file}: ${error.code ?? error.message}\n`);
+    };
+    if (fullDownload) {
+        // Probe the first complete line before sending headers, using the same
+        // reader and cleanup path. Later rotation/read failures abort the body;
+        // this is a best-effort traversal, never a stable snapshot.
+        const readable: string[] = [];
+        for (const file of existing) {
+            let opened = true;
+            for await (const _line of readLogFileLines(file, {
+                onError: (failed, error) => { opened = false; onReadError(failed, error); },
+            })) break;
+            if (opened) readable.push(file);
+        }
+        res.writeHead(200, {
+            "content-type": "text/plain; charset=utf-8",
+            "content-disposition": "attachment; filename=\"billion-context-full-log.txt\"",
+            ...(unreadable.length > 0 ? { "x-bili-log-incomplete": String(unreadable.length) } : {}),
+        });
+        async function* exportedLines(): AsyncGenerator<string> {
+            let first = true;
+            for await (const line of readLogLines(readable)) {
+                yield first ? line : "\n" + line;
+                first = false;
+            }
+        }
+        try {
+            await pipeline(Readable.from(exportedLines(), { objectMode: false }), res);
+        } catch (error) {
+            // pipeline closes the response and source iterator. A failed body
+            // must reject the download, not masquerade as a complete export.
+            process.stderr.write(`[logs] full download interrupted: ${String(error)}\n`);
+            res.destroy();
+        }
+        return;
     }
-    const r = queryLogLines(all, q, { ctx, winSec: win, n });
+    const r = await queryLogFiles(existing, q, { ctx, winSec: win, n }, { onError: onReadError });
     if (u.searchParams.get("raw") === "1") {
         res.writeHead(200, {
             "content-type": "text/plain; charset=utf-8",
-            "content-disposition": `attachment; filename="${fullDownload ? "billion-context-full-log.txt" : "billion-context-log.txt"}"`,
+            "content-disposition": "attachment; filename=\"billion-context-log.txt\"",
+            // A download cannot carry an inline caveat without corrupting the
+            // data, so an incomplete answer is flagged in the headers instead.
+            ...(unreadable.length > 0 ? { "x-bili-log-incomplete": String(unreadable.length) } : {}),
         });
         res.end(r.lines.join("\n"));
         return;
@@ -1484,11 +1678,18 @@ async function sendWebLogs(res: http.ServerResponse, req: http.IncomingMessage):
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         path: logFile,
+        // Honest retention answer: which generations exist, how much history
+        // they really span, and why it is short when it is. Never claims a
+        // 48h window the budget did not keep.
+        retention: logRetentionStatus() ?? null,
         total: r.total,
         shown: r.shown,
         omitted: r.omitted,
         lines: r.lines,
         ...(r.isMatch ? { isMatch: r.isMatch } : {}),
+        // Non-empty means the answer covers only the readable generations; the
+        // client must not present it as the whole retained history.
+        ...(unreadable.length > 0 ? { unreadable } : {}),
     }, null, 2));
 }
 
@@ -1615,7 +1816,7 @@ async function sendSessionReport(res: http.ServerResponse, url: string): Promise
         res.end(JSON.stringify({ error: `unknown session: ${id}` }));
         return;
     }
-    const opts = { mask: q.get("mask") !== "off", lang: q.get("lang") === "en" ? "en" : "zh-CN" };
+    const opts = { mask: q.get("mask") !== "off", lang: q.get("lang") === "en" || q.get("lang") === "ko" ? String(q.get("lang")) : "zh-CN" };
     if (q.get("format") === "svg") {
         const r = buildSessionReportSvg(detail, opts);
         res.writeHead(200, { "content-type": "application/json" });

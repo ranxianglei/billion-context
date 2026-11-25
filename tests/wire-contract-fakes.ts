@@ -14,6 +14,8 @@
 // fixing PR.
 
 import http from "node:http";
+import { createHash, createHmac } from "node:crypto";
+import { parse as parseQuery } from "node:querystring";
 import { once } from "node:events";
 
 export type Wire = "anthropic" | "openai-chat" | "responses" | "google";
@@ -29,6 +31,13 @@ interface WireRule {
 }
 
 export const WIRE_RULES: readonly WireRule[] = [
+    {
+        id: "WC-026",
+        wire: "responses",
+        lane: "responses-sse",
+        summary: "Responses text/content-part SSE events carry a non-negative integer content_index identifying the part inside the indexed output item",
+        provenance: "OpenAI openai-node v6.26.0 requires content_index in ResponseTextDeltaEvent/ResponseTextDoneEvent/ResponseContentPartAddedEvent/ResponseContentPartDoneEvent (https://github.com/openai/openai-node/blob/v6.26.0/src/resources/responses/responses.ts); ResponseStream indexes output.content[event.content_index] (https://github.com/openai/openai-node/blob/v6.26.0/src/lib/responses/ResponseStream.ts). Reproduced against that official SDK: bili's synthesized messages, legacy stream-error completions and filtered text tails omitted indices, so finalResponse() rejected with 'missing content at index undefined'. Gates exercise the actual SDK in proxy/plugin paths and the emitted error frames; the fake validates its outgoing SSE frames with the same constraint.",
+    },
     {
         id: "WC-017",
         wire: "responses",
@@ -212,6 +221,22 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             'bili #5432 production 400s (claude-code v2.1.316 + mid-conversation-tool-changes-2026-07-01 through bili v0.1.210 / acp-kernel 0.0.175) produced BOTH live error strings: "messages.N: role \'system\' must follow a \'user\' message or an \'assistant\' message ending in a server tool result; the directive-only form (content: [] with output_config) is accepted at any position" (follow side) and "messages.N: role \'system\' must precede an \'assistant\' message or end the array" (precede side). Repair: kernel/src/wire/anthropic.ts healIllegalSystemPositions enforces both halves (#5438, PR #5522); this validator is the permanent tripwire on every outbound Anthropic body, both lanes',
     },
+    {
+        id: "WC-024",
+        wire: "anthropic",
+        summary:
+            'a "thinking" content block must carry a non-empty signature — preserved thinking is replayed VERBATIM including its signature (bound to the producing model), so a thinking block without one (e.g. a client transcript that stored reasoning only as {type, text}) can never be accepted by a signature-verifying upstream; rebuild paths sending to such upstreams must not emit those blocks',
+        provenance:
+            'bili #5998 production report (DSH self-compression rewrote session messages and the rebuilt request carried signature-less thinking blocks; an opus→sonnet mid-session switch amplifies the failure because signatures are bound to the producing model). Mechanism verified in code: kernel anthropicToCore stamps thinkingSignature only when the inbound block carries one, while coreToAnthropic re-emits EVERY reasoning core as a thinking block — unsigned cores therefore produce signature-less blocks on the wire, which Anthropic proper rejects ("thinking.signature: Field required", #2501). The two affected upstream personalities are byte-indistinguishable on the inbound wire — never-signing relays (DeepSeek /anthropic, #5495) require the unsigned blocks back verbatim — so the repair is learn-on-failure at bili\'s relay egress seam (src/server/thinking-posture.ts): first "Field required" 400 ⇒ one strip-and-resend probe; accepted ⇒ the session drops unsigned thinking proactively for the rest of its life. Constraint source: Anthropic Messages API extended-thinking contract (preserved thinking must be replayed verbatim); the kernel round-trip suite pins the positive half ("signature reattached — Anthropic rejects thinking without it").',
+    },
+    {
+        id: "WC-025",
+        wire: "openai-chat",
+        summary:
+            'a TTS-shaped chat-completions request (a top-level `audio` object — voice/format for audio output) must not carry a leading role:"system" message — TTS models behind OpenAI-compatible endpoints reject it with 400 ("messages[0] system role is not allowed for TTS model"); bili must never inject its ACP system prompt into such a request, and the per-message <acp> tags must never be stamped onto text that will be read aloud',
+        provenance:
+            'bili #6636 production 400 (dsh-fish-soul TTS through bili 0.1.213, Xiaomi MiMo mimo-v2.5-tts over an OpenAI-compatible /chat/completions endpoint): the plugin sends {model, messages:[user, assistant], audio:{format:"mp3",voice:"mimo_default"}, stream:false} with no tools; bili injected the FUNCTION_ACP_TAGS_TIMESTAMPED system prompt as messages[0] plus an <acp> prefix on every message, and the upstream answered 400 "messages[0] system role is not allowed for TTS model". Control experiment in the issue: the same messages undecorated return 200 with audio. Repair: isAudioOutputCall (src/server/side-request.ts) routes tool-less audio requests through the #388 verbatim side passthrough, so neither the system prompt nor the tags are ever injected. The validator keys on the `audio` field, not the model name — the shape, not the spelling, is what makes the call a TTS request.',
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -230,11 +255,78 @@ interface WireHeaderRule {
 
 export const WIRE_HEADER_RULES: readonly WireHeaderRule[] = [
     {
+        id: "WC-025",
+        summary: "Huawei SDK-HMAC-SHA256 signatures use the canonical query: parameter names and repeated values sorted by Unicode scalar order, RFC 3986 encoding, and explicit equals signs for empty values; signing the original query bytes gives a different signature",
+        provenance: "Huawei API Request Signing Guide https://support.huaweicloud.com/eu/devg-apisign/api-sign-algorithm-001.html; golden signatures generated by the unchanged Python SDK Signer at huaweicloud/huaweicloud-sdk-python-v3 commit fea8a3150325831fd3a1e277e6c89b20f699bd05. tests/apig-resign.test.ts exercises the signatures and this verifier in the hermetic APIG upstream.",
+    },
+    {
         id: "WC-016",
         summary: "OpenCode Go (/zen/go) rejects any request lacking a stable x-opencode-session header — HTTP 400 MissingSessionID; bili's independent summary calls must stamp it plus bili's own user agent, derived from bili's own conversation id, never copied from the client's inbound session/auth headers",
         provenance: "#2760: user-reported production 400 against https://opencode.ai/zen/go/v1/chat/completions (real-call A/B, 2026-10-11) — a non-streaming Go summary call returns HTTP 400 MissingSessionID until a stable x-opencode-session is added; stream=true does NOT help. Official contract https://opencode.ai/docs/go/#where-can-i-use-it requires typical coding-agent traffic, the client's own user agent, and a per-conversation stable x-opencode-session for routing + prompt cache.",
     },
 ];
+
+/** Independent verifier: recompute the SDK-HMAC-SHA256 signature from what a
+ * server ACTUALLY received (method / full URL / lowercased headers / raw
+ * body). Written from the wire format on purpose — the signer must round-trip
+ * through an implementation that does not share its code. */
+export function verifySdkHmac(req: {
+    method: string;
+    url: string;
+    headers: Record<string, string | string[] | undefined>;
+    body: Buffer;
+    sk: string;
+    ak?: string;
+}): { ok: boolean; reason?: string; signedHeaders?: string } {
+    const auth = String(req.headers["authorization"] ?? "");
+    const m = /^SDK-HMAC-SHA256 Access=([^,]+),SignedHeaders=([^,]+),Signature=([0-9a-f]{64})$/.exec(auth);
+    if (m === null) return { ok: false, reason: `WC-025 authorization shape: ${auth}` };
+    const [, ak, signedHeaders, sig] = m;
+    if (req.ak !== undefined && ak !== req.ak) return { ok: false, reason: "WC-025 access key mismatch" };
+    const names = signedHeaders.split(";");
+    if (names.length === 0 || new Set(names).size !== names.length) return { ok: false, reason: "WC-025 duplicate/empty signed headers" };
+    if ([...names].sort().join(";") !== signedHeaders) return { ok: false, reason: "WC-025 signed headers not sorted" };
+    const u = new URL(req.url);
+    let uri = u.pathname;
+    if (!uri.endsWith("/")) uri += "/";
+    const headerVal = (n: string): string => {
+        const v = req.headers[n];
+        return Array.isArray(v) ? v.join(",") : String(v ?? "");
+    };
+    const sha256Hex = (data: Uint8Array | string): string => createHash("sha256").update(data).digest("hex");
+    const payloadHash = sha256Hex(req.body);
+    if (headerVal("x-sdk-content-sha256") !== payloadHash) return { ok: false, reason: "WC-025 declared payload hash != sha256(body)" };
+    const query = parseQuery(u.search.slice(1), undefined, undefined, { maxKeys: 0 });
+    const encodedQuery: string[] = [];
+    const encode = (text: string): string => encodeURIComponent(text)
+        .replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+    const compareCodePoints = (a: string, b: string): number => {
+        const left = Array.from(a, (character) => character.codePointAt(0) ?? 0);
+        const right = Array.from(b, (character) => character.codePointAt(0) ?? 0);
+        for (let i = 0; i < Math.min(left.length, right.length); i++) {
+            if (left[i] !== right[i]) return left[i] - right[i];
+        }
+        return left.length - right.length;
+    };
+    for (const key of Object.keys(query).sort(compareCodePoints)) {
+        const values = Array.isArray(query[key]) ? [...query[key]] : [query[key] ?? ""];
+        for (const value of values.sort(compareCodePoints)) encodedQuery.push(`${encode(key)}=${encode(value)}`);
+    }
+    const canonical = [
+        req.method.toUpperCase(),
+        uri,
+        encodedQuery.join("&"),
+        names.map((n) => `${n}:${headerVal(n)}`).join("\n"),
+        "",
+        names.join(";"),
+        payloadHash,
+    ].join("\n");
+    const stringToSign = `SDK-HMAC-SHA256\n${headerVal("x-sdk-date")}\n${sha256Hex(canonical)}`;
+    const expect = createHmac("sha256", req.sk).update(stringToSign).digest("hex");
+    if (expect !== sig) return { ok: false, reason: "WC-025 signature mismatch", signedHeaders };
+    return { ok: true, signedHeaders };
+}
+
 
 /** The exact upstream error Go answers when x-opencode-session is absent (#2760). */
 export function goMissingSessionIdEnvelope(): { status: number; body: string } {
@@ -317,7 +409,28 @@ function midConversationSystemViolations(messages: unknown[]): string[] {
     return out;
 }
 
-/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022, WC-023 on an Anthropic /v1/messages body. Returns violation strings. */
+/** WC-024: preserved thinking must be replayed verbatim WITH its signature —
+ *  a thinking block without a non-empty string signature can never be accepted
+ *  upstream (#5998). Shared by both Anthropic lanes (main + Vertex); system
+ *  messages are exempt (they carry no content blocks of this shape). Returns
+ *  violation strings. */
+function unsignedThinkingViolations(messages: unknown[]): string[] {
+    const out: string[] = [];
+    for (let i = 0; i < messages.length; i++) {
+        const m = messages[i];
+        if (!isPlainObject(m) || m.role === "system" || !Array.isArray(m.content)) continue;
+        for (let j = 0; j < m.content.length; j++) {
+            const b = m.content[j];
+            if (!isPlainObject(b) || b.type !== "thinking") continue;
+            const sig = b.signature;
+            if (typeof sig !== "string" || sig.length === 0)
+                out.push(`WC-024 messages[${i}].content[${j}]: thinking block carries no signature — preserved thinking must be replayed verbatim with its signature (#5998)`);
+        }
+    }
+    return out;
+}
+
+/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022, WC-023, WC-024 on an Anthropic /v1/messages body. Returns violation strings. */
 function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
@@ -329,6 +442,7 @@ function validateAnthropicBody(body: unknown): string[] {
                     out.push(`WC-022 messages[${i}].content: '${b.type}' blocks are only permitted within role:"system" messages`);
         });
     if (Array.isArray(body.messages)) out.push(...midConversationSystemViolations(body.messages));
+    if (Array.isArray(body.messages)) out.push(...unsignedThinkingViolations(body.messages));
     if ("prompt_cache_key" in body)
         out.push("WC-007 top-level prompt_cache_key is not part of the Anthropic Messages API (#1403)");
     // WC-010 runs before the tools early-return: breakpoints can live in
@@ -392,10 +506,25 @@ function validateAnthropicBody(body: unknown): string[] {
     return out;
 }
 
-/** WC-004 on an OpenAI chat/completions body (only function-typed entries). */
+/** WC-004 + WC-025 on an OpenAI chat/completions body (only function-typed entries for WC-004). */
 export function validateOpenAiChatBody(body: unknown): string[] {
     const out: string[] = [];
-    if (!isPlainObject(body) || !Array.isArray(body.tools)) return out;
+    if (!isPlainObject(body)) return out;
+    // WC-025 (#6636): runs before the tools early-return — a TTS-shaped
+    // request (top-level `audio` object, no tools) must never carry a leading
+    // system message: TTS models behind OpenAI-compatible endpoints 400 it
+    // ("messages[0] system role is not allowed for TTS model"). The tripwire
+    // keys on the audio shape, not the model name. The no-tools veto mirrors
+    // isAudioOutputCall: a tool-carrying request is a main turn (its model
+    // has an action surface, is not a TTS model, and accepts a leading
+    // system), so bili's ACP decoration there is legal.
+    const wc025NoTools = !Array.isArray(body.tools) || body.tools.length === 0;
+    if (wc025NoTools
+        && isPlainObject(body.audio) && Object.keys(body.audio).length > 0
+        && Array.isArray(body.messages) && body.messages.length > 0
+        && isPlainObject(body.messages[0]) && body.messages[0].role === "system")
+        out.push(`WC-025 messages[0]: leading role:"system" message on a TTS-shaped request (top-level audio object) — TTS models reject a system message with 400 (#6636)`);
+    if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) return;
         const fn = t.function;
@@ -650,6 +779,8 @@ interface FakeUpstream {
 }
 
 function sse(res: http.ServerResponse, events: Array<[string, unknown]>, opts?: { done?: boolean }): void {
+    const violations = events.flatMap(([, data]) => validateResponsesContentIndex(data));
+    if (violations.length) throw new Error(violations.join("; "));
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
     // OpenAI streams carry no `event:` line at all — only Anthropic/Gemini name their events.
     for (const [ev, data] of events) {
@@ -687,6 +818,13 @@ function openAiChatReply(res: http.ServerResponse, parsed: Record<string, unknow
         choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
         usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
     }));
+}
+
+export function validateResponsesContentIndex(event: unknown): string[] {
+    if (!isPlainObject(event) || !["response.content_part.added", "response.output_text.delta", "response.output_text.done", "response.content_part.done"].includes(String(event.type))) return [];
+    return typeof event.content_index === "number" && Number.isInteger(event.content_index) && event.content_index >= 0
+        ? []
+        : ["WC-026 Responses content-part events require a non-negative integer content_index"];
 }
 
 function responsesReply(res: http.ServerResponse, parsed: Record<string, unknown>, text: string): void {
@@ -755,7 +893,7 @@ export function vertexAnthropicPathInfo(url: string): VertexAnthropicPathInfo | 
 
 /** WC-019, lane-scoped: the version lives in the BODY on the Vertex Anthropic wire. Deliberately silent about a
  *  body `model` field — whether Vertex tolerates one is unverified and the real client never sends it. Also enforces
- *  WC-023 (lane-independent position rule, shared with the main anthropic validator — the same Messages API sits
+ *  WC-023 + WC-024 (lane-independent rules, shared with the main anthropic validator — the same Messages API sits
  *  behind both lanes). */
 export function validateVertexAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
@@ -765,6 +903,7 @@ export function validateVertexAnthropicBody(body: unknown): string[] {
             `WC-019 anthropic_version must be "vertex-2023-10-16" in the body on the Vertex Anthropic wire (saw ${JSON.stringify(body.anthropic_version)}) — the version is a body field here, not a header`,
         );
     if (Array.isArray(body.messages)) out.push(...midConversationSystemViolations(body.messages));
+    if (Array.isArray(body.messages)) out.push(...unsignedThinkingViolations(body.messages));
     return out;
 }
 

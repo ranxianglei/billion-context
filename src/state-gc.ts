@@ -74,13 +74,15 @@ export function gcDebugDir(dir: string, policy: DumpGcPolicy, nowMs: number = Da
 
     let removed = 0;
     let freedBytes = 0;
-    const drop = (f: { name: string; size: number }): void => {
+    const drop = (f: { name: string; size: number }): boolean => {
         try {
             unlinkSync(path.join(dir, f.name));
             removed++;
             freedBytes += f.size;
+            return true;
         } catch {
-            // locked/gone — skip and keep trimming older files
+            // locked/gone — retain its bytes until a deletion succeeds
+            return false;
         }
     };
 
@@ -90,8 +92,7 @@ export function gcDebugDir(dir: string, policy: DumpGcPolicy, nowMs: number = Da
         const cutoff = nowMs - maxAgeMs;
         survivors = [];
         for (const f of files) {
-            if (f.mtime < cutoff) drop(f);
-            else survivors.push(f);
+            if (f.mtime >= cutoff || !drop(f)) survivors.push(f);
         }
     }
     // Byte bound: oldest-first until under the cap.
@@ -100,8 +101,7 @@ export function gcDebugDir(dir: string, policy: DumpGcPolicy, nowMs: number = Da
         for (const f of survivors) remainingBytes += f.size;
         for (const f of survivors) {
             if (remainingBytes <= maxBytes) break;
-            drop(f);
-            remainingBytes -= f.size;
+            if (drop(f)) remainingBytes -= f.size;
         }
     }
 

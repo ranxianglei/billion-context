@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
+import { runCompressLoop, createResponsesAdapter, createAnthropicAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { REPLAY_MAX_ATTEMPTS } from "../src/fetch-util.ts";
 
@@ -17,6 +17,7 @@ function makeCtx(messages: CoreMessage[] = []): {
     log: (m: string) => void;
     proxyUrl?: string;
     textProtocol?: boolean;
+    protocol?: "anthropic" | "google";
     refreshFolded?: (current: CoreMessage[]) => CoreMessage[] | Promise<CoreMessage[]>;
 } {
     return {
@@ -53,6 +54,152 @@ function fcEvents(outputIndex: number, callId: string, name: string, args: strin
 }
 
 const COMPLETED = sse("response.completed", { response: { id: "resp_done", status: "completed", output: [] } });
+
+test("successful compress keeps every message in a large refreshed history", async () => {
+    const ctx = withRefs(makeCtx(Array.from({ length: 7 }, (_, i) =>
+        textMsg(`raw_${i}`, i % 2 === 0 ? "user" : "assistant", `original ${i} ${bigText(5000)}`),
+    )));
+    const refreshed = Array.from({ length: 250_000 }, (_, i) =>
+        textMsg(`folded_${i}`, i % 2 === 0 ? "user" : "assistant", `retained history ${i}`),
+    );
+    const logs: string[] = [];
+    ctx.log = (line) => logs.push(line);
+    let refreshCalls = 0;
+    ctx.refreshFolded = () => { refreshCalls++; return refreshed; };
+    const args = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "The first two messages were compressed; all remaining history must reach the next request." }] });
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    globalThis.fetch = async (_url, init) => {
+        requests.push(String(init?.body));
+        return new Response(COMPLETED);
+    };
+    try {
+        const out = await drain(new Response(fcEvents(0, "large_fold", "compress", args) + COMPLETED).body!, ctx,
+            { model: "test", input: [], stream: true }, { url: "http://mock", headers: {} });
+        assert.equal(refreshCalls, 1, "the real compression succeeded");
+        assert.equal(requests.length, 1);
+        const history = requests[0]!.match(/retained history \d+/g) ?? [];
+        assert.equal(history.length, refreshed.length);
+        assert.equal(history[0], "retained history 0");
+        assert.equal(history.at(-1), "retained history 249999");
+        assert.equal(refreshed.length, 250_000, "the host-owned view is not mutated");
+        assert.equal(logs.some((line) => line.includes("fold refresh failed")), false);
+        assert.match(out, /response\.completed/);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("successful compress accepts a refresh hook returning its current view", async () => {
+    const ctx = withRefs(makeCtx(Array.from({ length: 7 }, (_, i) =>
+        textMsg(`raw_${i}`, i % 2 === 0 ? "user" : "assistant", `identity history ${i} ${bigText(5000)}`),
+    )));
+    let refreshCalls = 0;
+    ctx.refreshFolded = (current) => { refreshCalls++; return current; };
+    const args = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "A successful compression with a host hook retaining its existing in-place view." }] });
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    globalThis.fetch = async (_url, init) => {
+        requests.push(String(init?.body));
+        return new Response(COMPLETED);
+    };
+    try {
+        await drain(new Response(fcEvents(0, "same_fold", "compress", args) + COMPLETED).body!, ctx,
+            { model: "test", input: [], stream: true }, { url: "http://mock", headers: {} });
+        assert.equal(refreshCalls, 1);
+        assert.equal(requests.length, 1);
+        assert.ok(requests[0]!.includes("identity history 0"));
+        assert.ok(requests[0]!.includes("identity history 6"));
+        assert.ok(requests[0]!.includes("[Compressed m00001"));
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("consumed-call cleanup preserves a large history during a proxy-tool round", async () => {
+    const history = Array.from({ length: 250_000 }, (_, i) =>
+        textMsg(`history_${i}`, i % 2 === 0 ? "user" : "assistant", `kept message ${i}`),
+    );
+    const ctx = makeCtx(history);
+    ctx.messages.push(
+        { id: "consumed_call", role: "assistant", contentType: "tool-call", toolName: "compress", toolCallId: "old_compress", text: "{}" },
+        { id: "consumed_result", role: "tool", contentType: "tool-result", toolName: "compress", toolCallId: "old_compress", text: "obsolete compression result" },
+    );
+    ctx.session.state.sweptOrphanCallIds = ["old_compress"];
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    globalThis.fetch = async (_url, init) => {
+        requests.push(String(init?.body));
+        return new Response(COMPLETED);
+    };
+    try {
+        await drain(new Response(fcEvents(0, "check_status", "acp_status", "{}") + COMPLETED).body!, ctx,
+            { model: "test", input: [], stream: true }, { url: "http://mock", headers: {} });
+        assert.equal(requests.length, 1);
+        assert.equal((requests[0]!.match(/kept message \d+/g) ?? []).length, 250_000);
+        assert.match(requests[0]!, /kept message 0/);
+        assert.match(requests[0]!, /kept message 249999/);
+        assert.doesNotMatch(requests[0]!, /obsolete compression result/);
+        assert.equal(ctx.messages.length, 250_002, "the caller's history is not rewritten");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("thinking-strip retry keeps a large history after an Anthropic 400", async () => {
+    const count = 130_000;
+    const history = Array.from({ length: count }, (_, i) =>
+        textMsg(`retry_${i}`, i % 2 === 0 ? "user" : "assistant", `retained retry history ${i}`),
+    );
+    const ctx = makeCtx(history);
+    ctx.protocol = "anthropic";
+    const firstRound = [
+        sse("message_start", { type: "message_start", message: { id: "msg_first", role: "assistant", content: [], usage: { input_tokens: 100, output_tokens: 5 } } }),
+        sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "optional reasoning from this round" } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+        sse("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "retry_status", name: "acp_status", input: {} } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{}" } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 1 }),
+        sse("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } }),
+        sse("message_stop", { type: "message_stop" }),
+    ].join("");
+    const terminal = [
+        sse("message_start", { type: "message_start", message: { id: "msg_done", role: "assistant", content: [], usage: { input_tokens: 10, output_tokens: 2 } } }),
+        sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "recovered" } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+        sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } }),
+        sse("message_stop", { type: "message_stop" }),
+    ].join("");
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    globalThis.fetch = async (_url, init) => {
+        requests.push(String(init?.body));
+        return requests.length === 1
+            ? new Response(JSON.stringify({ error: { message: "internal policy violation" } }), { status: 400, headers: { "content-type": "application/json" } })
+            : new Response(terminal, { headers: { "content-type": "text/event-stream" } });
+    };
+    try {
+        const body = { model: "claude-test", max_tokens: 512, stream: true };
+        const chunks: Buffer[] = [];
+        for await (const chunk of runCompressLoop(new Response(firstRound).body!, ctx, body,
+            { url: "http://mock", headers: {} }, createAnthropicAdapter(body), SYS_PROMPT)) {
+            chunks.push(chunk);
+        }
+        assert.equal(requests.length, 2, "a neutral 400 gets the one permitted thinking-strip retry");
+        const second = JSON.parse(requests[1]!) as { messages: Array<{ content?: Array<Record<string, unknown>> }> };
+        assert.equal(second.messages.flatMap((m) => Array.isArray(m.content) ? m.content : []).some((c) => c.type === "thinking"), false);
+        const retained = requests[1]!.match(/retained retry history \d+/g) ?? [];
+        assert.equal(retained.length, count);
+        assert.equal(retained[0], "retained retry history 0");
+        assert.equal(retained.at(-1), "retained retry history 129999");
+        assert.match(Buffer.concat(chunks).toString("utf8"), /recovered/);
+        assert.equal(history.length, count, "the caller's original view is unchanged");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
 
 const SYS_PROMPT = buildCompressSystemPrompt();
 

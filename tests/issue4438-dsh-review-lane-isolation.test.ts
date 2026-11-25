@@ -224,8 +224,12 @@ test("unit: isDshAutoReviewRequest vetoes every main-turn shape (#4438)", () => 
     assert.equal(isDshAutoReviewRequest("openai", { ...reviewBody(true), tools: [{ type: "function", function: { name: "bash" } }] }), false, "tools present");
     // Multi-turn history (any assistant/tool turn) vetoes.
     assert.equal(isDshAutoReviewRequest("openai", { model: MODEL, messages: [{ role: "system", content: REVIEW_POLICY }, { role: "user", content: "a" }, { role: "assistant", content: "b" }, { role: "user", content: "c" }] }), false, "assistant turn in history");
-    // Two user messages vetoes (the review is ONE freshly-flattened blob).
-    assert.equal(isDshAutoReviewRequest("openai", { model: MODEL, messages: [{ role: "system", content: REVIEW_POLICY }, { role: "user", content: "a" }, { role: "user", content: "b" }] }), false, "two user messages");
+    // #6104: two+ user messages with NO assistant/tool turn is dsh 0.2.2's
+    // history-replaying review body (reviewMessages() flattens the whole
+    // conversation into role:"user" text blobs), not a main turn — a real
+    // resend always carries assistant turns (the case directly above), and a
+    // first main turn carries exactly one user message.
+    assert.equal(isDshAutoReviewRequest("openai", { model: MODEL, messages: [{ role: "system", content: REVIEW_POLICY }, { role: "user", content: "a" }, { role: "user", content: "b" }] }), true, "two user messages, no assistant turn: the #6104 review body");
     // No system carrier at all — the prefix must ride a SYSTEM carrier.
     assert.equal(isDshAutoReviewRequest("openai", { model: MODEL, messages: [{ role: "user", content: "blob" }] }), false, "no system carrier");
     // The prefix quoted inside the USER blob is not a policy carrier.

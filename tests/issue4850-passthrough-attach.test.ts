@@ -120,6 +120,10 @@ function caseDeps(record: Partial<InstanceFile>, spawnCode: number, latePublish 
         sleep: async (ms) => {
             t += ms;
         },
+        // #7156: these mock instances never really ran (nothing listens on
+        // 8787), so the second-writer gate's drain-wait must see the phantom
+        // predecessor as already exited instead of burning the 10s grace.
+        isPidAlive: () => false,
     };
     return { deps, childCreations: () => childCreations };
 }

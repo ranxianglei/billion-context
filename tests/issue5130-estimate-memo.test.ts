@@ -1,15 +1,13 @@
 // #5130: estimateCoreMessages memoizes per-message token counts keyed on the
-// kernel-minted digest id (plus text length and thinkingTokens, the two
-// inputs the digest does not pin). This file pins the properties the
+// kernel-minted digest id, text length and thinkingTokens, with an exact-text
+// check on a live entry. This file pins the properties the
 // optimization stands on:
-// 1) identical id → identical count without recount (the steady-state win);
+// 1) identical id/text/thinking → identical count without recount;
 // 2) same id with different thinkingTokens → recounted (key includes it);
 // 3) same id whose counted text was rewritten in place (renderTags view
 //    prefix, tool-args canonicalization delta that changes length) →
-//    recounted — the length gate keeps a logical id from serving a stale
-//    count for different text;
-// 4) same id, same length, whitespace-only canonical delta → memo hit is
-//    sound because the CJK-aware counter is character-class additive;
+//    recounted — a logical id cannot serve a stale count for different text;
+// 4) whitespace-only canonical deltas retain equal counts;
 // 5) non-kernel ids (short/test-minted) never poison the memo across
 //    differing texts — they always recount.
 import assert from "node:assert/strict";
@@ -83,9 +81,9 @@ test("memo: same id with rewritten text recounts (renderTags view keeps ids)", (
 
 test("memo: same id + same length + whitespace-only delta stays consistent", () => {
     clearEstimateCoreMessagesMemoForTests();
-    // canonicalToolArgs normalizes whitespace/key order only: when a delta
+    // When a canonicalToolArgs-equivalent delta
     // merely moves whitespace (same length, same character multiset) the
-    // CJK-aware counter is unchanged, so the memo hit is exact.
+    // CJK-aware counter is unchanged, so both estimates agree.
     const id = minted(0xdef456);
     const verbatim = estimateCoreMessages([coreMsg(id, '{"cmd": "run","kb":8}')]);
     const spaced = estimateCoreMessages([coreMsg(id, '{"cmd":"run", "kb":8}')]);

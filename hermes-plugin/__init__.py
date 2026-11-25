@@ -193,21 +193,44 @@ def sidecar_path() -> Path:
     return Path(__file__).resolve().parent / "bili.json"
 
 
+def bundled_dist() -> Optional[Path]:
+    """A host-managed copy of the package: `hermes plugins install` runs npm in this
+    plugin's own directory when its package.json declares billion-context."""
+    dist = Path(__file__).resolve().parent / "node_modules" / "billion-context" / "dist" / "index.js"
+    return dist if dist.is_file() else None
+
+
+def path_dist() -> Optional[Path]:
+    """The reference lane (#1196): the global install's dist, reached through the `bili`
+    entry point on PATH — an executable symlink onto dist/index.js."""
+    exe = shutil.which("bili")
+    if not exe:
+        return None
+    real = Path(os.path.realpath(exe))
+    return real if real.is_file() and real.suffix == ".js" else None
+
+
 def load_sidecar() -> Optional[Dict[str, str]]:
-    """The installer's sidecar: which bili dist + node binary to spawn."""
+    """Which bili dist + node binary to spawn. First hit wins, nothing is ever written:
+    1. bili.json, the sidecar `bili plugin install hermes` drops (reference lane);
+    2. this plugin's node_modules, when the host installed the package itself;
+    3. the global install's dist, via `bili` on PATH."""
     try:
         data = json.loads(sidecar_path().read_text(encoding="utf-8"))
     except Exception:
-        return None
+        data = {}
     if not isinstance(data, dict):
-        return None
-    script = data.get("proxyScript")
+        data = {}
     node = data.get("nodePath") or shutil.which("node")
-    if not script or not isinstance(script, str) or not Path(script).is_file():
-        return None
     if not node or not isinstance(node, str):
         return None
-    return {"script": script, "node": node}
+    script = data.get("proxyScript")
+    if not script or not isinstance(script, str) or not Path(script).is_file():
+        script = ""
+    found = Path(script) if script else (bundled_dist() or path_dist())
+    if found is None:
+        return None
+    return {"script": str(found), "node": node}
 
 
 # — gating --------------------------------------------------------------------
@@ -732,6 +755,13 @@ def mitm_domains_from_config() -> List[str]:
                         if entry.get(key):
                             add(entry[key])
                             break
+        # Top-level base_url/url/api sits next to `provider:` in Hermes' documented config (#6022) —
+        # the active provider's endpoint when there is no providers map. Additive, not fallback-only:
+        # a config may carry both shapes, and traffic can legally reach either host.
+        for key in ("base_url", "url", "api"):
+            if data.get(key):
+                add(data[key])
+                break
     return hosts
 
 
@@ -756,8 +786,6 @@ def _provider_base_url(provider: Any) -> Optional[str]:
     """The configured base URL of one hermes provider (best effort; same config keys as
     mitm_domains_from_config). None when absent/unreadable."""
     name = str(provider or "").strip()
-    if not name:
-        return None
     cfg = hermes_home() / "config.yaml"
     try:
         data = _yaml_loader()(cfg.read_text(encoding="utf-8"))
@@ -774,18 +802,28 @@ def _provider_base_url(provider: Any) -> Optional[str]:
                 return str(entry[key]).strip()
         return None
 
-    providers = data.get("providers")
-    if isinstance(providers, dict):
-        found = pick(providers.get(name))
-        if found:
-            return found
-    legacy = data.get("custom_providers")
-    if isinstance(legacy, list):
-        for entry in legacy:
-            if str((entry or {}).get("name") or "").strip() == name:
-                found = pick(entry)
-                if found:
-                    return found
+    if name:
+        providers = data.get("providers")
+        if isinstance(providers, dict):
+            found = pick(providers.get(name))
+            if found:
+                return found
+        legacy = data.get("custom_providers")
+        if isinstance(legacy, list):
+            for entry in legacy:
+                if str((entry or {}).get("name") or "").strip() == name:
+                    found = pick(entry)
+                    if found:
+                        return found
+    # Top-level base_url/url/api overrides the ACTIVE provider's endpoint (#6022). It answers the
+    # active provider's request — an unnamed one included, since the hook surface often carries no
+    # provider kwarg — and never some other named provider's.
+    active = str(data.get("provider") or "").strip()
+    if not name or name == active:
+        for key in ("base_url", "url", "api"):
+            value = data.get(key)
+            if value:
+                return str(value).strip()
     return None
 
 
@@ -1196,7 +1234,39 @@ def ensure_origin(sidecar: Dict[str, str], deadline: Optional[float] = None) -> 
 # — runtime effects -------------------------------------------------------------
 
 # The exact keys apply_env routes; _unroute_env restores them one-for-one on origin death (#4644).
-_ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
+# The HTTP pair and NO_PROXY are here too, so a plain-http provider is unrouted with the rest.
+_ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                    "NO_PROXY", "no_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
+# Loopback stays direct, as the launcher's own plain-http routes do (LAUNCHER_LOOPBACK_NO_PROXY).
+_LOOPBACK_NO_PROXY = "127.0.0.1,localhost,::1"
+# Non-model hosts the MITM lane cannot serve (#6862): the code/dependency hosts the host's
+# git/uv/npm children reach. The lane allowlists model endpoints only, so a scheduled
+# `hermes update` or shell task that inherits the routed env fails against these with
+# "Failed to connect ... via 127.0.0.1". They bypass the lane by default; the operator's own
+# NO_PROXY entries are merged in below, never replaced.
+_DEFAULT_NO_PROXY_HOSTS = (
+    "github.com", "api.github.com", "objects.githubusercontent.com", "codeload.github.com",
+    "pypi.org", "files.pythonhosted.org", "registry.npmjs.org",
+)
+
+
+def _merged_no_proxy(*existing: Optional[str]) -> str:
+    """Union of the loopback default, the #6862 default bypass hosts, and the operator's
+    NO_PROXY entries — comma-joined, deduped (hostnames compare case-insensitively),
+    first-seen order kept. Idempotent: merging an already-merged value changes nothing."""
+    seen: set = set()
+    merged: List[str] = []
+    for source in (_LOOPBACK_NO_PROXY, *_DEFAULT_NO_PROXY_HOSTS, *(e or "" for e in existing)):
+        for part in source.split(","):
+            item = part.strip()
+            if not item:
+                continue
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return ",".join(merged)
 
 
 def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = None) -> bool:
@@ -1216,6 +1286,18 @@ def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = 
                 _state["env_backup"] = {key: os.environ.get(key) for key in _ENV_ROUTED_KEYS}
         os.environ["HTTPS_PROXY"] = origin
         os.environ["https_proxy"] = origin
+        # A plain-http provider base_url (a LAN llama.cpp / vLLM / ollama server) is only routed
+        # by HTTP_PROXY; with the HTTPS pair alone its traffic bypasses the proxy entirely and
+        # the session gets no compression. The proxy forwards absolute-form http requests.
+        os.environ["HTTP_PROXY"] = origin
+        os.environ["http_proxy"] = origin
+        # #6862: the routed env is inherited by every child the host spawns, and the lane
+        # allowlists model endpoints only — git/uv/npm children would route code/dependency
+        # hosts through it and fail. Merge the default bypass hosts (plus the operator's own
+        # NO_PROXY, when set) instead of setdefault-ing a loopback-only value.
+        merged_no_proxy = _merged_no_proxy(os.environ.get("NO_PROXY"), os.environ.get("no_proxy"))
+        os.environ["NO_PROXY"] = merged_no_proxy
+        os.environ["no_proxy"] = merged_no_proxy
         ca_dir = data_dir() / "ca"
         root = ca_dir / "root-ca.pem"
         if root.is_file():
@@ -1341,14 +1423,21 @@ def make_tool_handler(tool_name: str) -> Callable[..., str]:
         # the args conversation_id fallback is model-transcribed and must keep
         # the #1685 witness precedence (no nativeCaller flag on that channel).
         session_id = kwargs.get("session_id")
+        # #7514: the on_pre_tool_call hook smuggles the host's tool_call_id in as
+        # _tool_call_id — transport, not tool input: strip before forwarding so it
+        # never rides in the model-visible args.
+        clean_args = dict(args or {})
+        tool_call_id = clean_args.pop("_tool_call_id", None)
         conversation = session_id or (args or {}).get("conversation_id")
         if not origin:
             return json.dumps({"error": "billion-context proxy is not available in this session"})
         if not conversation:
             return json.dumps({"error": "no hermes session id — cannot bind the compression conversation"})
-        body: Dict[str, Any] = {"conversationId": str(conversation), "tool": tool_name, "args": args or {}}
+        body: Dict[str, Any] = {"conversationId": str(conversation), "tool": tool_name, "args": clean_args}
         if session_id:
             body["nativeCaller"] = True
+        if isinstance(tool_call_id, str) and tool_call_id:
+            body["toolCallId"] = tool_call_id
         status, payload = http_post_json(
             origin.rstrip("/") + "/__bili/plugin/tool",
             body,
@@ -1523,6 +1612,13 @@ def _shutdown() -> None:
     refused by it; the join runs outside the lock, since the bootstrap needs it to observe the
     stop."""
     with _lifecycle_lock:
+        # apply_env routes host traffic by writing HTTPS_PROXY/SSL_CERT_FILE into the
+        # process-global os.environ, and the host does NOT dispose of that on unload — only of
+        # registrations. Leftover routing at a dead origin port breaks every LLM call in the
+        # process until a full restart (#5991), so restore what apply_env overwrote first.
+        # No-op when env was never applied; _unroute_env runs under this same lock.
+        if _state.get("env_applied"):
+            _unroute_env()
         stop = _state.get("stop_event")
         if stop is not None:
             stop.set()
@@ -1682,6 +1778,22 @@ def report_runtime_info(model: str, max_output: Optional[int], context_window: O
         pass
 
 
+def on_pre_tool_call(*, tool_name: str = "", args: Any = None, tool_call_id: str = "", **_: Any) -> Optional[Dict[str, Any]]:
+    """pre_tool_call modifier (#7514): the host drops tool_call_id before dispatch
+    (hermes-agent model_tools.py builds dispatch_kwargs without it) but fires this hook
+    WITH it; smuggle it through args for OUR tools only, so the handler can bind the
+    server-side fold to the wire call — the unique-carrier check then matches the
+    model's own compress call on resend and the redundant inline anchor stops
+    rendering. The key is stripped again in make_tool_handler before forwarding."""
+    try:
+        names = _state.get("tool_names")
+        if not tool_call_id or not names or tool_name not in names:
+            return None
+        return {"action": "modify", "args": {"_tool_call_id": tool_call_id}}
+    except Exception:
+        return None
+
+
 def on_pre_api_request(*, session_id: str = "", model: str = "", max_tokens: Any = None, **_: Any) -> None:
     """pre_api_request observer (fires AFTER llm_request middleware): remember the session's
     max output tokens for the NEXT request's header, and report runtime info to the proxy."""
@@ -1838,14 +1950,17 @@ def register(ctx: Any) -> None:
             return
         sidecar = load_sidecar()
         if not sidecar:
-            logger.warning("billion-context: no usable bili.json sidecar next to the hermes plugin "
-                           "(run `bili plugin install hermes`) — staying inert")
+            logger.warning("billion-context: no bili dist found (no usable bili.json sidecar, no "
+                           "node_modules/billion-context, no `bili` on PATH) — run `bili plugin "
+                           "install hermes` — staying inert")
             return
         # 1) Everything cheap and blocking-free goes in FIRST. The host caps import+register() at
         #    its load deadline (10s) and ABANDONS the load on timeout — every registration made
         #    after that is ignored, so a slow proxy bootstrap must never sit in this path.
         ctx.register_middleware("llm_request", on_llm_request)
         ctx.register_hook("pre_api_request", on_pre_api_request)
+        # #7514: carry the host's tool_call_id into our tool handlers (see on_pre_tool_call).
+        ctx.register_hook("pre_tool_call", on_pre_tool_call)
         # In-session slash commands; hosts without PluginContext.register_command
         # (older builds) skip them — tools keep working, only the command entries are absent.
         if hasattr(ctx, "register_command"):

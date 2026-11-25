@@ -175,6 +175,41 @@ class UpstreamRecorder {
         }
     }
 
+    /** The fake's token bill must sit on the SAME scale as a real tokenizer
+     *  (the text the model reads + tool schemas, ÷4) — NOT on whole-body bytes:
+     *  the wire envelope/JSON structure is ~2x the core text here, so bytes/4
+     *  billing taught the per-route calibration factor (#1933) a false k̂≈1.9,
+     *  and the post-#4933 zero-fold fit verdict (calibrated scale) put the pi
+     *  lane's post-restart baseline ~120 tokens OVER its 12288 wall — a false
+     *  413 on a payload a consistently-billing upstream would accept.
+     *  Scale-matched billing keeps k̂≈1, so the calibrated and raw meters agree,
+     *  as on real routes. The bill is the WHOLE prompt; the anthropic branch
+     *  must then emit it as a DISJOINT partition (input_tokens = uncached
+     *  remainder, cache_read = cached prefix) because promptInputTotal sums
+     *  the two — reporting the full bill in BOTH fields double-counts the
+     *  cached prefix (the pre-fix failure mode above). OpenAI's prompt_tokens
+     *  is inclusive of cached_tokens, so that branch reports the full bill. */
+    static billedTokens(body: string): number {
+        try {
+            const j = JSON.parse(body) as Record<string, unknown>;
+            const text: unknown[] = [];
+            if (j.system !== undefined) text.push(j.system);
+            if (j.instructions !== undefined) text.push(j.instructions);
+            if (Array.isArray(j.messages)) text.push(j.messages);
+            let chars = 0;
+            const walk = (c: unknown): void => {
+                if (typeof c === "string") { chars += c.length; }
+                else if (Array.isArray(c)) { for (const x of c) walk(x); }
+                else if (c && typeof c === "object") { for (const v of Object.values(c)) walk(v); }
+            };
+            for (const t of text) walk(t);
+            chars += JSON.stringify(j.tools ?? []).length;
+            return Math.max(1, Math.ceil(chars / 4));
+        } catch {
+            return Math.max(1, Math.ceil(Buffer.byteLength(body, "utf8") / 4));
+        }
+    }
+
     get recPort(): number {
         return this.port;
     }
@@ -232,7 +267,7 @@ class UpstreamRecorder {
             this.hits.push({ url: key, bytes, prompt, lcpPromptBytes, ack });
             const modelMatch = body.match(/"model"\s*:\s*"([^"]+)"/);
             const model = modelMatch?.[1] ?? "unknown";
-            const promptTokens = Math.ceil(bytes / 4);
+            const promptTokens = UpstreamRecorder.billedTokens(body);
             const cachedTokens = Math.floor(lcpPromptBytes / 4);
             const json = key.includes("/messages")
                 ? JSON.stringify({
@@ -243,7 +278,7 @@ class UpstreamRecorder {
                     content: [{ type: "text", text: ack }],
                     stop_reason: "end_turn",
                     stop_sequence: null,
-                    usage: { input_tokens: promptTokens, output_tokens: 4, cache_read_input_tokens: cachedTokens },
+                    usage: { input_tokens: Math.max(0, promptTokens - cachedTokens), output_tokens: 4, cache_read_input_tokens: cachedTokens },
                 })
                 : JSON.stringify({
                     id: `chatcmpl_${seq}`,
@@ -400,7 +435,17 @@ interface ArmContext {
     history: WireMsg[];
 }
 
-async function sendTurn(ctx: ArmContext, proxy: ProxyHandle, note: string): Promise<UpstreamHit> {
+/** Known post-restart cold-load race (#4599 floors 971/981/1049, load-flake
+ *  family): the first request after a restart can arrive before the proxy has
+ *  finished reloading the folded session state from disk, so the proxy sees
+ *  the full raw context and fails the preflight window check (502/413
+ *  `preflight_compress_failed`). Load-sensitive (CI only); local targeted runs
+ *  are green. A bounded retry distinguishes the one-off race (a later attempt
+ *  succeeds) from a real fold-state loss (every attempt fails). */
+const COLD_LOAD_RETRY = { attempts: 6, backoffMs: 1000 } as const;
+
+async function sendTurn(ctx: ArmContext, proxy: ProxyHandle, note: string,
+    retry: { readonly attempts: number; readonly backoffMs: number } = { attempts: 1, backoffMs: 0 }): Promise<UpstreamHit> {
     const upstreamBase = `http://127.0.0.1:${ctx.recorder.recPort}`;
     const url = `${proxy.origin}/bili/${upstreamBase}${ctx.lane.endpoint}`;
     const messages = ctx.history.map((m) => ({ role: m.role, content: m.content }));
@@ -412,21 +457,33 @@ async function sendTurn(ctx: ArmContext, proxy: ProxyHandle, note: string): Prom
         })
         : JSON.stringify({ model: ctx.lane.model, stream: false, max_tokens: 8192, messages });
     const before = ctx.recorder.hits.length;
-    let res: Response;
-    try {
-        res = await fetch(url, {
-            method: "POST",
-            headers: { ...NOKEEP, "content-type": "application/json", [SESSION_HEADER]: ctx.sessionId },
-            body,
-            signal: AbortSignal.timeout(TURN_TIMEOUT_MS),
-        });
-    } catch (err) {
-        throw new Error(`${note}: request failed: ${String(err)} (proxy log: ${proxy.logPath})`);
+    let status = 0;
+    let text = "";
+    for (let attempt = 1; attempt <= retry.attempts; attempt++) {
+        let res: Response;
+        try {
+            res = await fetch(url, {
+                method: "POST",
+                headers: { ...NOKEEP, "content-type": "application/json", [SESSION_HEADER]: ctx.sessionId },
+                body,
+                signal: AbortSignal.timeout(TURN_TIMEOUT_MS),
+            });
+        } catch (err) {
+            throw new Error(`${note}: request failed: ${String(err)} (proxy log: ${proxy.logPath})`);
+        }
+        status = res.status;
+        text = await res.text().catch(() => "");
+        if (status === 200) break;
+        const isColdLoadRace = (status === 502 || status === 413) && text.includes("preflight_compress_failed");
+        if (isColdLoadRace && attempt < retry.attempts) {
+            await new Promise((r) => setTimeout(r, retry.backoffMs));
+            continue;
+        }
+        break;
     }
-    const text = await res.text().catch(() => "");
-    assert.equal(res.status, 200, `${note}: status ${res.status}: ${text.slice(0, 300)} (proxy log: ${proxy.logPath})`);
+    assert.equal(status, 200, `${note}: status ${status}: ${text.slice(0, 300)} (proxy log: ${proxy.logPath})`);
     const hit = ctx.recorder.hits[before];
-    assert.ok(hit, `${note}: upstream never saw the request despite HTTP ${res.status}`);
+    assert.ok(hit, `${note}: upstream never saw the request despite HTTP ${status}`);
     // No byte-equality check here: the proxy legitimately RESERIALIZES the
     // payload (and, when the wall is hot, FOLDS it before forwarding).
     return hit;
@@ -494,7 +551,7 @@ async function runLane(lane: LaneShape, t: TestContext): Promise<void> {
         history: [...fiber],
     };
     live = await startProxy(mainHome, compressCfg(WALL_TOKENS), `${lane.name}-main-0`);
-    const first = await sendTurn(ctx, live, "initial oversized load");
+    const first = await sendTurn(ctx, live, "initial oversized load", COLD_LOAD_RETRY);
     assert.ok(first.bytes <= POST_FOLD_CAP,
         `fold never engaged: upstream received ${first.bytes} bytes on first contact (fiber ${rawTextBytes(fiber)}, cap ${POST_FOLD_CAP})`);
     assert.ok(first.bytes >= MIN_FORWARD_BODY, `payload appears dropped: only ${first.bytes} bytes forwarded`);
@@ -504,7 +561,7 @@ async function runLane(lane: LaneShape, t: TestContext): Promise<void> {
     for (let c = 0; c < KILL_ORDER.length; c++) {
         const variant = KILL_ORDER[c]!;
         for (let r = 0; r < STEADY_TURNS_PER_CYCLE; r++) {
-            const hit = await sendTurn(ctx, live, `cycle${c}/${variant}/steady ${r}`);
+            const hit = await sendTurn(ctx, live, `cycle${c}/${variant}/steady ${r}`, COLD_LOAD_RETRY);
             assert.ok(hit.bytes <= POST_FOLD_CAP,
                 `cycle${c}/${variant} steady ${r}: OUTBOUND BLOW-UP mid-session — ${hit.bytes} bytes forwarded (cap ${POST_FOLD_CAP})`);
             const denom = Math.min(hit.prompt.length, prev.prompt.length);
@@ -518,7 +575,7 @@ async function runLane(lane: LaneShape, t: TestContext): Promise<void> {
         live = await startProxy(mainHome, compressCfg(WALL_TOKENS), `${lane.name}-main-${c + 1}`);
 
         for (let r = 0; r < RESUMES_PER_KILL; r++) {
-            const hit = await sendTurn(ctx, live, `cycle${c}/${variant}/post-restart ${r}`);
+            const hit = await sendTurn(ctx, live, `cycle${c}/${variant}/post-restart ${r}`, COLD_LOAD_RETRY);
             assert.ok(hit.bytes <= POST_FOLD_CAP,
                 `after ${variant.toUpperCase()} RESTART: fold state did NOT survive — upstream received ${hit.bytes} bytes (cap ${POST_FOLD_CAP}); the reloaded proxy fell back to forwarding raw history`);
             const postDenom = Math.min(hit.prompt.length, prev.prompt.length);
@@ -565,6 +622,13 @@ async function runLane(lane: LaneShape, t: TestContext): Promise<void> {
 function compressCfg(wall: number): Record<string, unknown> {
     return {
         compress: { modelContextLimit: wall },
+        // #2383's deterministic-digest regime is DEFAULT OFF (owner decision
+        // 2026-11-22: it is a model-visible hard truncation). This suite is
+        // DESIGNED around it — the ~150x fiber runs against a dumb recording
+        // upstream that cannot produce summaries — so opt in explicitly. (The
+        // control arm never triggers it: its wall is high enough that folding
+        // itself never engages, so the flag is inert there.)
+        network: { emergencyDigest: true },
         update: { checkIntervalMs: 3_600_000 },
     };
 }

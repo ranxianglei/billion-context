@@ -83,8 +83,14 @@ async function extractInstall(work: string, tgz: string): Promise<string> {
     return installDir;
 }
 
-async function readPkgVersion(dir: string): Promise<string> {
-    return (JSON.parse(await fs.promises.readFile(path.join(dir, "package.json"), "utf8")) as { version: string }).version;
+async function readPkgVersion(dir: string): Promise<string | null> {
+    try {
+        return (JSON.parse(await fs.promises.readFile(path.join(dir, "package.json"), "utf8")) as { version: string }).version;
+    } catch (err) {
+        // A poll landing mid-reinstall sees no package.json yet — "not yet", not an error.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw err;
+    }
 }
 
 function freePort(): Promise<number> {
@@ -299,6 +305,11 @@ test("self-update keeps live compression state: folds survive the OLD→NEW hop 
         envBase.BILI_UPDATE_POLICY_URL = "http://127.0.0.1:1/no-policy.json";
         envBase.BILI_PERSIST_DEBOUNCE_MS = "200";
         envBase.BILI_SESSIONS_DIR = sessionsDir;
+        // Pure-sqlite default (5a80e2b8e, #6480) turns the JSON envelope
+        // writer OFF, but this lane asserts on the on-disk .json session file
+        // (state survival across the update). Pin the writer ON so the
+        // envelope this test was written for is still produced.
+        envBase.BILI_STORAGE_JSON_WRITER = "on";
 
         const port = await freePort();
         proxy = spawnProxy(installDir, port, envBase);

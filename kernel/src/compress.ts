@@ -1,4 +1,4 @@
-import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef } from "./refs.js";
+import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef, refToIndex } from "./refs.js";
 import { remintCoveredLiveIds } from "./instance-reid.js";
 import { prune } from "./prune.js";
 import { syncBlocks } from "./sync.js";
@@ -19,7 +19,6 @@ import { appendAbsorbPrompts, hideAbsorbedMessages } from "./absorb.js";
 import { applyCrushToMessages } from "./crush.js";
 import { applyRetrieve, ccrStoreNode, RETRIEVED_ID_PREFIX } from "./ccr.js";
 import { preTransformSnapshotNode, viewLatchNode } from "./view-latch.js";
-import { relocateCompressCarriers } from "./relocate-compress.js";
 import type { ApplyRetrieveResult, CcrEffect } from "./ccr.js";
 import type { EmergencyTruncateLatchEntry } from "./types.js";
 import { createContentStore } from "./content-store.js";
@@ -50,6 +49,7 @@ import {
   buildCompressibleRanges,
   mergeRangesToThreshold,
   screenRecommendedUnits,
+  warnScreenDrop,
 } from "./recommend.js";
 import {
   runPipeline,
@@ -206,10 +206,6 @@ function numericBlockId(id: string): number {
   return parsed ? Number(parsed[1]) : 0;
 }
 
-function formatK(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
-}
-
 function refGateDiagnostics(
   state: CompressionState,
   requestedRanges: number,
@@ -291,15 +287,22 @@ function coveringBlockIds(
 // Block-ID-boundary advice is only actionable when tier distillation is ready;
 // emitting it otherwise sends the model to retry bN..bM ranges that cannot
 // fire yet (the misleading hint behind ranxianglei/billion-context-pi#470).
-function tierActionHint(config: Config, state: CompressionState): string {
+// Exported so the uncompressed status view (report.ts) can advertise the
+// byte-identical tier-distillation action the nudge and the compress
+// failure receipts use — one wording, every surface.
+export function tierActionHint(config: Config, state: CompressionState): string {
   if (!config.tiers.enabled) return "";
-  const t2 = activeBlocks(state).filter((b) => b.tier === 2);
+  // #5765: retired blocks are excluded from distillation targets — a hint
+  // spanning one would point the model at a range apply refuses (#5765 guard
+  // below), and folding them would pull their material back into the view.
+  const live = activeBlocks(state).filter((b) => !b.retired);
+  const t2 = live.filter((b) => b.tier === 2);
   if (t2.length >= config.tiers.tier3Trigger) {
-    return ` Tier condensation is actionable now: compress({ content: [{ startId: "${t2[0]!.blockId}", endId: "${t2[t2.length - 1]!.blockId}", summary: "...", topic: "..." }] }) merges those tier-2 blocks into one tier-3 block.`;
+    return ` Tier condensation is actionable now: compress({ content: "${t2[0]!.blockId}–${t2[t2.length - 1]!.blockId} optional topic\\nsummary markdown..." }) merges those tier-2 blocks into one tier-3 block.`;
   }
-  const t1 = activeBlocks(state).filter((b) => b.tier === 1);
+  const t1 = live.filter((b) => b.tier === 1);
   if (t1.length >= config.tiers.tier2Trigger) {
-    return ` Tier distillation is actionable now: compress({ content: [{ startId: "${t1[0]!.blockId}", endId: "${t1[t1.length - 1]!.blockId}", summary: "...", topic: "..." }] }) merges those tier-1 blocks into one tier-2 block.`;
+    return ` Tier distillation is actionable now: compress({ content: "${t1[0]!.blockId}–${t1[t1.length - 1]!.blockId} optional topic\\nsummary markdown..." }) merges those tier-1 blocks into one tier-2 block.`;
   }
   return "";
 }
@@ -314,8 +317,14 @@ function applyRefolds(input: {
   runId: string;
   config: Config;
   blockIds: string[];
+  /** #5894: the caller's batch-level FLOOR check already covered this summary
+   *  (multi-candidate batch met minSummaryLength in TOTAL) — waive the
+   *  per-range min here too; EMPTY + MAX stay enforced. */
+  minFloorCovered?: boolean;
 }): void {
-  validateSummaryLength(input.spec, input.config.compress);
+  validateSummaryLength(input.spec, input.config.compress, {
+    skipMin: input.minFloorCovered === true,
+  });
   const targets = new Set(input.blockIds);
   input.state.blocks = input.state.blocks.map((block) => {
     if (!targets.has(block.blockId)) return block;
@@ -378,7 +387,12 @@ export function createCore(ports: Ports = {}): CompressionCore {
         countTokens,
       );
 
-    const preExistingCoverage = collectCoverage(state);
+    // This snapshot is refreshed at the top of the apply loop below (each
+    // sibling range claims against what earlier siblings in the SAME batch
+    // already cover — a frozen pre-batch snapshot let two adjacent ranges
+    // both claim the tool pair on their shared seam, breaking the
+    // no-overlapping-active-siblings invariant at the top of this file).
+    let preExistingCoverage = collectCoverage(state);
 
     // Classify every requested range ONCE. The result feeds overlap
     // skipSpecs, the minCompressRange pre-check, and the per-range loop —
@@ -698,8 +712,15 @@ export function createCore(ports: Ports = {}): CompressionCore {
     // Scope is EXACTLY the fold-candidate set that mutates state in the loop —
     // never every requested range, else a consumed range whose summary happens to
     // be long would wrongly kill a batch whose real candidates all validate.
+    // #5894: the FLOOR judges the BATCH, not each paragraph. A multi-candidate
+    // batch passes when its COMBINED summaries reach minSummaryLength — one
+    // trivial span may honestly earn a few words without atomically killing its
+    // siblings (#3003's own advice was "drop the offending range(s)", which then
+    // failed ALONE against the same floor and spun). A single folding candidate
+    // keeps guarding its own summary; EMPTY and MAX stay per-range in both shapes.
+    let batchFloorByTotal = false;
     {
-      const lengthFailures: string[] = [];
+      const foldCandidates: ApplyCompressionInput["ranges"][number][] = [];
       for (const spec of input.ranges) {
         if (skipSpecs.has(spec)) continue;
         const resolution = classifications.get(spec);
@@ -709,17 +730,56 @@ export function createCore(ports: Ports = {}): CompressionCore {
           resolution.status === "consumed" &&
           refoldDecisions.get(spec)?.kind === "refold";
         if (!foldsFresh && !foldsRefold) continue;
+        foldCandidates.push(spec);
+      }
+      const lengthFailures: string[] = [];
+      // #6730: track the DIRECTION of each length failure so the remediation
+      // text below points the same way the validation failed (grow for
+      // too-short/empty, shrink for too-long) instead of one generic "shorten
+      // to fit its cap" that is backwards for the too-short case.
+      const failureKinds = new Set<SummaryLengthKind>();
+      const minLen = input.config.compress.minSummaryLength;
+      if (foldCandidates.length === 1) {
+        const solo = foldCandidates[0]!;
         try {
-          validateSummaryLength(spec, input.config.compress);
+          validateSummaryLength(solo, input.config.compress);
         } catch (error) {
+          if (isSummaryLengthError(error)) failureKinds.add(error.kind);
           lengthFailures.push(
             rangeError(
-              spec,
+              solo,
               error instanceof Error ? error.message : String(error),
             ),
           );
         }
+      } else {
+        for (const spec of foldCandidates) {
+          try {
+            validateSummaryLength(spec, input.config.compress, { skipMin: true });
+          } catch (error) {
+            if (isSummaryLengthError(error)) failureKinds.add(error.kind);
+            lengthFailures.push(
+              rangeError(
+                spec,
+                error instanceof Error ? error.message : String(error),
+              ),
+            );
+          }
+        }
+        if (minLen > 0 && foldCandidates.length > 1) {
+          const total = foldCandidates.reduce(
+            (sum, spec) => sum + (spec.summary?.trim() ?? "").length,
+            0,
+          );
+          if (total < minLen) {
+            failureKinds.add("tooShort");
+            lengthFailures.push(
+              `Batch summary too short (${total} chars across ${foldCandidates.length} ranges, min ${minLen}). The combined summaries must capture the compressed content's key information.`,
+            );
+          }
+        }
       }
+      batchFloorByTotal = foldCandidates.length > 1;
       if (lengthFailures.length > 0) {
         // Rejected batches carry their dead-ref tombstone side effect (#2362):
         // the clone differs from input.state only in deadRefs before this point,
@@ -730,7 +790,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
             blocksCreated: 0,
             tokensCompressed: 0,
             errors: [
-              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. Fix it one way or the other and resend: shorten or split each offending range's summary to fit its cap, then resend the whole batch; or drop the offending range(s) and resend only the rest that validate.`,
+              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. ${lengthRemediation(failureKinds)}`,
               ...classificationErrors,
             ],
             warnings: [],
@@ -758,6 +818,15 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
 
     for (const spec of input.ranges) {
+      // The batch applies every range to ONE shared state in order, so each
+      // projection must judge "already covered" against the siblings that
+      // landed EARLIER in this same batch, not only the pre-batch snapshot:
+      // without the refresh, two adjacent ranges whose spans share the seam
+      // tool pair both claimed it (two active sibling blocks directly owning
+      // the same messages). First-come-first-served: the earlier range keeps
+      // the seam; the later one shrinks to its own new messages or becomes
+      // the #4521 idempotent no-op. Cheap: active blocks × their id sets.
+      preExistingCoverage = collectCoverage(state);
       if (skipSpecs.has(spec)) continue;
       const resolution = classifications.get(spec);
       if (resolution === undefined) continue;
@@ -771,6 +840,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
               runId: runIdOf(),
               config: input.config,
               blockIds: decision.blocks.map((block) => block.blockId),
+              minFloorCovered: batchFloorByTotal,
             });
             blocksCreated += decision.blocks.length;
           } catch (error) {
@@ -809,6 +879,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
           protectedMessageIds,
           countTokens,
           preExistingCoverage,
+          minFloorCovered: batchFloorByTotal,
         });
         blocksCreated += outcome.noop
           ? 0
@@ -987,38 +1058,18 @@ export function createCore(ports: Ports = {}): CompressionCore {
     }
     const state = { ...result.state, lastPassIds: inboundIds, deadRefs };
     const ccrEffect = result.effects.ccr as CcrEffect | undefined;
-    // #4521: between banner deliveries a compression round can stay armed for
-    // many requests (backoff, tier cadence, model-decided timing). During that
-    // window the model sees NO current refs and starts guessing beyond the
-    // highest allocated ref — every guess a failed round-trip. Emit a compact
-    // boundary line whenever a nudge plan carries offered ranges but its
-    // banner is not being delivered this turn; hosts append it as an ephemeral
-    // trailing user message (same carrier as the nudge, same cache safety).
-    let statusLine: string | undefined;
-    const nudge = result.effects.nudge;
-    // Two shapes authorize the refresh line: a real tiered arm whose banner
-    // is deferred this turn (tier !== null: pressure crossed a threshold but
-    // cadence/backoff holds it), or any plan after at least one banner was
-    // already shown (lastNudgeShownTokens > 0: the model HAS seen refs and
-    // this line only refreshes them). A fresh session's below-threshold plan
-    // (tier === null, nothing shown yet — e.g. an optimistic local estimate)
-    // must stay fully silent: same regime promise as the nudge itself
-    // (#196 regime scoping, #3910 lane baseline).
-    const bannerShown = (result.state.nudge?.lastNudgeShownTokens ?? 0) > 0 || Object.keys(result.state.nudge?.lastShownByTier ?? {}).length > 0;
-    if (nudge && !nudge.shouldInject && (nudge.tier !== null || bannerShown) && (nudge.compressibleRanges?.length ?? 0) > 0) {
-      const highest = highestUsedIndex(state.messageRefs);
-      const offered = nudge.compressibleRanges!
-        .slice(0, 3)
-        .map((r) => `${r.startRef}–${r.endRef} (${formatK(r.tokens)})`)
-        .join(", ");
-      const extra = nudge.compressibleRanges!.length > 3 ? `, +${nudge.compressibleRanges!.length - 3} more` : "";
-      statusLine = `[ACP status: highest allocated ref ${highest > 0 ? indexToRef(highest) : "none"} — refs above it are not minted yet, never guess them; compressible now: ${offered}${extra}; the newest messages stay protected. Use these refs directly; acp_status only if you need the full list.]`;
-    }
+    // #6928: the #4521 armed-but-silent refresh line ("[ACP status: …]",
+    // emitted on turns where a nudge plan is armed but its banner is not
+    // delivered) is removed. It fired precisely when the banner was withheld,
+    // so its "compressible now" list was always below-gate residue — a
+    // standing fold directive contradicting the same turns' compress receipt
+    // ("named for visibility, not as fold suggestions" / "No compressible
+    // ranges remain"). Ref-guessing backstops remain: the compress receipt and
+    // the unknown-ref refusal both report the session's highest allocated ref.
     return {
       messages: result.messages,
       state,
       nudge: result.effects.nudge,
-      statusLine,
       terminalEscape: result.effects.terminalEscape,
       truncationSkipped: result.effects.truncationSkipped,
       contentStore: ccrEffect?.store ?? contentStore,
@@ -1098,11 +1149,6 @@ export function createCore(ports: Ports = {}): CompressionCore {
       absorbPromptNode,
       filterNode,
       hideCompressCallsNode,
-      // EXPERIMENTAL, default off (Config.compressAtFoldPoint): move still-visible
-      // carrier pairs onto their fold point. Must run AFTER hide-compress-calls
-      // (whose orphan sweep just settled which carriers survive) and BEFORE
-      // view-latch so the latch records the relocated bytes.
-      relocateCompressCarriersNode,
       viewLatchNode,
       recommendNode,
       nudgeNode,
@@ -1162,23 +1208,55 @@ function createStampTimestampsNode(enabled: boolean): PipelineNode {
     const stamps = { ...(io.state.tsStamps ?? {}) };
     const knownIds = io.state.messageRefs.byRaw;
     let changed = false;
+    // #5608-C: the time-attribute visibility high-water mark is written EXACTLY
+    // once — the moment this session first runs the timestamp pipeline — to the
+    // PRE-PASS highest ref index. Refs minted afterwards exceed it structurally
+    // (assign-refs continues from highest+1); older refs stay excluded until an
+    // edit/fold re-mints them onto a higher seat, whose tag bytes already change
+    // with the new number (the attribute then costs zero extra).
+    // Consequence: flipping #4313 on mid-session (or the default off→on upgrade)
+    // costs ZERO prefix bytes, and a restart never re-opens the window.
+    const hwmFresh = io.state.timestampsHighWaterRefSeq === undefined;
+    const hwm = hwmFresh
+      ? highestUsedIndex(io.state.messageRefs)
+      : (io.state.timestampsHighWaterRefSeq as number);
+    // #5608-B: the host arms this one-shot from a fresh-child-from-parent path.
+    const suppressed = io.state.suppressMintingOnce === true;
     const messages = io.messages.map((m) => {
       if (!m.id || m.id.startsWith(RETRIEVED_ID_PREFIX)) return m;
       const stamped = stamps[m.id];
       if (stamped !== undefined) {
         if (m.ts === stamped) return m;
+        // Attached earlier (persisted before the #5608-C gate existed): keep the
+        // provider-cached bytes verbatim — stability beats retrospective gating.
+        // Unattached: render the attribute only for ELIGIBLE current refs (minted
+        // after the feature became effective for this session).
+        const cur = knownIds[m.id];
+        const seq = cur === undefined ? null : refToIndex(cur);
+        if (seq === null || seq <= hwm) return m;
         changed = true;
         return { ...m, ts: stamped };
       }
       const carried = typeof m.ts === "number" ? m.ts : undefined;
-      const ts = carried ?? (knownIds[m.id] === undefined ? Date.now() : undefined);
+      // #5608-B: while the host arm is set (a FRESH-state child just inherited
+      // a parent's history — resume adoption / fork clone), NEVER mint
+      // Date.now(): those ids' real times are unknown, and fabricating
+      // "today" for old messages is a lie (spec §5; #5608-A display tier).
+      // Carried values still win; everything else stays honest NULL.
+      const ts =
+        carried ??
+        (!suppressed && knownIds[m.id] === undefined ? Date.now() : undefined);
       if (ts === undefined) return m;
       stamps[m.id] = ts;
       changed = true;
       return { ...m, ts };
     });
-    if (!changed) return io;
-    return { ...io, messages, state: { ...io.state, tsStamps: stamps } };
+    if (!changed && !hwmFresh && !suppressed) return io;
+    const nextState = { ...io.state, tsStamps: stamps, timestampsHighWaterRefSeq: hwm as number };
+    // Self-clear without a phantom key: omitting the property entirely keeps
+    // key-sensitive state comparisons (and JSON shape) clean.
+    if (suppressed) delete nextState.suppressMintingOnce;
+    return { ...io, messages, state: nextState };
   },
   };
 }
@@ -1385,22 +1463,6 @@ const hideCompressCallsNode: PipelineNode = {
   },
 };
 
-const relocateCompressCarriersNode: PipelineNode = {
-  name: "relocate-compress-carriers",
-  run(io, ctx) {
-    const cfg = ctx.config;
-    if (!cfg.compressAtFoldPoint) return io;
-    return {
-      ...io,
-      messages: relocateCompressCarriers(io.messages, io.state, {
-        isCompressTool: cfg.isCompressTool,
-        clearThinking: cfg.compressAtFoldPointClearThinking === true,
-        reasoningDroppable: cfg.reasoningDroppable,
-      }),
-    };
-  },
-};
-
 const recommendNode: PipelineNode = {
   name: "recommend",
   run(io, ctx) {
@@ -1441,6 +1503,23 @@ const recommendNode: PipelineNode = {
       ctx.config,
       computeProtectedRefs(screenArray, io.state, ctx.config, ctx.countTokens),
     );
+    // Production 2026-11-09 mega-turn incident: the funnel can zero out BELOW
+    // the "nothing compressible" level — segments exist and hold messages, but
+    // every island dies at the merge gate or the screen, and the host only
+    // sees recommendedRanges=[] while its own message-level diagnostic still
+    // counts collectible material ("collectible>0 yet ranges=0" was
+    // undiagnosable from the host side for a full night). Warn (budgeted)
+    // with the stage-by-stage numbers so the killing stage is named directly.
+    if (contextRanges.compressible.length > 0 && recommendedRanges.length === 0) {
+      const segMsgs = contextRanges.compressible.reduce((s, r) => s + r.count, 0);
+      const minChars = ctx.config.compress.minCompressRange;
+      const subGate = contextRanges.compressible.filter(
+        (r) => (r.chars ?? r.tokens * 4) < minChars,
+      ).length;
+      warnScreenDrop(
+        `funnel zeroed with material present: segments=${contextRanges.compressible.length} (${segMsgs} msgs, ${subGate} below ${minChars}-char merge gate) → all died at merge/screen; host sees no-ranges`,
+      );
+    }
     const recommendation: Recommendation = {
       contextRanges,
       recommendedRanges,
@@ -1703,6 +1782,10 @@ interface SingleRangeInput {
   protectedMessageIds?: Set<string>;
   countTokens: (text: string) => number;
   preExistingCoverage: Set<string>;
+  /** #5894: the caller's batch-level FLOOR check already covered this summary
+   *  (multi-candidate batch met minSummaryLength in TOTAL) — waive the
+   *  per-range min; EMPTY + MAX stay enforced. */
+  minFloorCovered?: boolean;
 }
 
 interface SingleRangeOutcome {
@@ -1751,6 +1834,26 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
         noop: true,
       };
     }
+    // #7596: the integrity withdrawal (a visible tool-call must keep its
+    // reasoning run and its results) removed EVERY message of this fresh fold
+    // — the range sits astride the protected-zone boundary and the kernel
+    // keeps the whole turn intact rather than folding a split turn. Before
+    // this the fatal threw and the ATOMIC batch contract rolled back sibling
+    // ranges that would have folded fine; the model re-sent the same batch
+    // (full context re-read every time) until the breaker fired. Like the
+    // zone fatal above it is now a legal no-op: siblings still fold, and the
+    // warning points the model at older ranges instead of a guaranteed
+    // re-failure. Merge split fatals never carry `degradable` and still throw.
+    if (projection.fatal.kind === "split" && projection.fatal.degradable) {
+      const highest = highestUsedIndex(input.state.messageRefs);
+      return {
+        tokens: 0,
+        warnings: [
+          `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — the integrity gate keeps every visible tool call's reasoning run and its results together, and folding this range would split that turn at the protected-zone boundary, so the range was withdrawn in full instead of split. Nothing failed; do not resend this range as-is — it cannot fold until the whole turn ages out of the protected zone. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"} — target older ranges only.`,
+        ],
+        noop: true,
+      };
+    }
     throw projection.fatal.error;
   }
   const {
@@ -1760,6 +1863,19 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     outputTier,
     isBlockBoundary,
   } = projection;
+
+  // #5765 retire: consuming a retired block would re-summarize its material
+  // into the new parent's RESIDENT summary and flip the block inactive —
+  // acp_restore would then reject it forever, breaking the rollback
+  // guarantee. Refuse the range; the model excludes the id or restores first.
+  const retiredConsumed = consumedBlockIds.filter(
+    (id) => blockById(input.state, id)?.retired === true,
+  );
+  if (retiredConsumed.length > 0) {
+    throw new Error(
+      `Range ${input.spec.startRef}..${input.spec.endRef} would consume retired block(s) ${retiredConsumed.join(", ")} — their summaries are out of the resident view by explicit user decision. Re-target the range excluding them, or call acp_restore({ blockId }) first if they should be foldable again.`,
+    );
+  }
 
   // Livelock guard (billion-context-pi#199): a message-ref range whose entire
   // content is already owned by active block(s) — its raw ids are all covered
@@ -1788,6 +1904,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
         runId: input.runId,
         config: input.config,
         blockIds: decision.blocks.map((block) => block.blockId),
+        minFloorCovered: input.minFloorCovered,
       });
       return {
         tokens: 0,
@@ -1825,11 +1942,22 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     // reason (e.g. a merge skipped because its turn cannot be closed now) —
     // surface those before the generic explanation.
     const highest = highestUsedIndex(input.state.messageRefs);
+    // Every resolvable message in the range is covered by an active block
+    // that is not fully inside the range — a same-batch sibling that claimed
+    // the seam tool pair, or a pre-existing block straddling the range edge.
+    // Name that class instead of the generic "protected or filtered" one.
+    // The wording must NOT claim same-batch involvement: the pre-existing
+    // straddling case lands here too, with no block created in this batch.
+    const allCovered =
+      effectiveMessageIds.size > 0 &&
+      [...effectiveMessageIds].every((id) => input.preExistingCoverage.has(id));
     return {
       tokens: 0,
       warnings: [
         ...warnings,
-        `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
+        allCovered
+          ? `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — every message in it is already covered by active block(s). Nothing failed; do not resend this range. To rewrite or merge those blocks, reference them by block ID instead.`
+          : `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
       ],
       noop: true,
     };
@@ -1954,7 +2082,9 @@ function resolveCoverageInterval(
 
 function validateCompressionRange(input: SingleRangeInput): void {
   const cfg = input.config.compress;
-  validateSummaryLength(input.spec, cfg);
+  validateSummaryLength(input.spec, cfg, {
+    skipMin: input.minFloorCovered === true,
+  });
 
   // #4521: the empty-range case (no direct messages, no consumed blocks)
   // moved to the caller as an idempotent NO-OP outcome — see applySingleRange.
@@ -1962,27 +2092,80 @@ function validateCompressionRange(input: SingleRangeInput): void {
   // nothing left to fold.
 }
 
+// #6730: the three direction-distinct summary-length failures. The batch
+// rejection message must advise in the SAME direction as the failure that
+// fired — a "too short" summary must be told to GROW, never "shorten to fit
+// its cap". The old single generic string said "shorten or split ... to fit
+// its cap" for EVERY length failure, so a too-short summary got advice that
+// made it shorter, and the model retried into a guaranteed-fail loop (full
+// context re-read each time) until the circuit breaker fired.
+type SummaryLengthKind = "empty" | "tooShort" | "tooLong";
+
+// The guarded-file subset (verif/subset-guard.ts) excludes class declarations
+// and non-NEWABLE `new` targets, so this is a plain-Error factory plus a type
+// guard instead of a class — same shape and messages, no class.
+type SummaryLengthError = Error & { kind: SummaryLengthKind };
+
+function summaryLengthError(kind: SummaryLengthKind, message: string): SummaryLengthError {
+  const error = new Error(message) as SummaryLengthError;
+  error.name = "SummaryLengthError";
+  error.kind = kind;
+  return error;
+}
+
+function isSummaryLengthError(error: unknown): error is SummaryLengthError {
+  if (!(error instanceof Error) || error.name !== "SummaryLengthError") return false;
+  const kind = (error as SummaryLengthError).kind;
+  return kind === "empty" || kind === "tooShort" || kind === "tooLong";
+}
+
+/** Build the batch-rejection remediation text from the set of failure
+ *  directions actually present. Each direction gets advice pointing the SAME
+ *  way its validation failed; the "drop the range" exit is always offered. */
+function lengthRemediation(kinds: Set<SummaryLengthKind>): string {
+  const parts: string[] = [];
+  if (kinds.has("tooShort") || kinds.has("empty")) {
+    parts.push(
+      "expand each too-short/empty summary until it reaches its minimum — write out the key information the range actually contains (do NOT shorten it)",
+    );
+  }
+  if (kinds.has("tooLong")) {
+    parts.push("shorten or split each too-long summary to fit its cap");
+  }
+  return `Fix it and resend the whole batch: ${parts.join("; and ")}; or drop the offending range(s) and resend only the rest that validate.`;
+}
+
 function validateSummaryLength(
   spec: { summary: string; summaryMaxChars?: number },
   cfg: Config["compress"],
+  opts: { skipMin?: boolean } = {},
 ): void {
   const summary = spec.summary?.trim() ?? "";
 
   if (summary.length === 0) {
-    throw new Error(
+    throw summaryLengthError(
+      "empty",
       "Summary is empty — provide a meaningful summary of the compressed range.",
     );
   }
 
-  if (cfg.minSummaryLength > 0 && summary.length < cfg.minSummaryLength) {
-    throw new Error(
+  // #5894: skipMin — the caller judged the FLOOR at batch level (multi-candidate
+  // total); EMPTY + MAX below stay enforced, only the per-range min is waived.
+  if (
+    !opts.skipMin &&
+    cfg.minSummaryLength > 0 &&
+    summary.length < cfg.minSummaryLength
+  ) {
+    throw summaryLengthError(
+      "tooShort",
       `Summary too short (${summary.length} chars, min ${cfg.minSummaryLength}). The summary must capture the compressed range's key information.`,
     );
   }
 
   const effectiveMax = spec.summaryMaxChars ?? cfg.maxSummaryLength;
   if (effectiveMax > 0 && summary.length > effectiveMax) {
-    throw new Error(
+    throw summaryLengthError(
+      "tooLong",
       `Summary too long (${summary.length} chars, max ${effectiveMax}). Strip noise — keep critical paths, decisions, errors, and code references. Or pass summaryMaxChars to increase the limit — don't lose critical info just to fit.`,
     );
   }
@@ -2054,7 +2237,10 @@ function pendingByTier(
     pending: effective.reduce((s, r) => s + r.tokens, 0),
     targetBlocks: [],
   };
-  const active = activeBlocks(state);
+  // #5765: retired summaries are not resident mass and their blocks are not
+  // foldable targets — counting them here would nudge distillation ranges the
+  // apply side refuses.
+  const active = activeBlocks(state).filter((b) => !b.retired);
   const t1 = active.filter((b) => b.tier === 1);
   const t2 = active.filter((b) => b.tier === 2);
   out[2] = {
@@ -2547,6 +2733,17 @@ function cloneState(state: CompressionState): CompressionState {
     // too — same contract as the sync clone (kernel/src/sync.ts); dropping it
     // re-arms the restamp on every applyCompression.
     refLedgerAligned: state.refLedgerAligned,
+    // #5608-C/#5608-B: the visibility mark and the honest-NULL arm ride the
+    // fold clone with the same contract — losing either re-opens its window.
+    // Conditional spread: legacy states carry neither key and must stay
+    // key-free (an explicit undefined would materialize a phantom key that
+    // every state-shape / state-key digest compares).
+    ...(state.timestampsHighWaterRefSeq !== undefined
+        ? { timestampsHighWaterRefSeq: state.timestampsHighWaterRefSeq }
+        : {}),
+    ...(state.suppressMintingOnce !== undefined
+        ? { suppressMintingOnce: state.suppressMintingOnce }
+        : {}),
   };
 }
 

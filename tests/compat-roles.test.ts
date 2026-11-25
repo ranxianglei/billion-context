@@ -280,6 +280,18 @@ test("detectRoleRejection: extracts the offending role, conservative otherwise",
     assert.equal(detectRoleRejection(400, '[{"loc":["body","messages",0,"role"],"msg":"Input should be \'system\', \'user\', \'tool\' or \'assistant\'"}]'), null);
 });
 
+test("detectRoleRejection: serde deserialization shape on 400 and 422 (#6063 DeepSeek)", () => {
+    const serde = JSON.stringify({ code: "invalid_request_error", message: "Failed to deserialize the JSON body into the target type: messages[0].role: unknown variant `developer`, expected one of `system`, `user`, `assistant`, `tool`, `latest_reminder` at line 1 column 57" });
+    assert.deepEqual(detectRoleRejection(422, serde), { role: "developer" });
+    assert.deepEqual(detectRoleRejection(400, serde), { role: "developer" });
+    // Unrelated bodies stay out on the newly admitted 422 as well.
+    assert.equal(detectRoleRejection(422, '{"error":{"message":"insufficient quota"}}'), null);
+    // Stopword capture stays conservative (pattern order cannot skip it).
+    assert.equal(detectRoleRejection(422, 'messages[0].role: unknown variant `must`'), null);
+    // Non-validation statuses never enter the detector.
+    assert.equal(detectRoleRejection(500, serde), null);
+});
+
 test("detectSystemPlacementError: flags #377-class placement 400s, ignores role-name/quota/overflow/auth", () => {
     const positive = [
         "Only one 'system' message is allowed and it must be at the beginning",
@@ -306,6 +318,9 @@ test("detectSystemPlacementError: flags #377-class placement 400s, ignores role-
         assert.equal(detectSystemPlacementError(400, msg), false, `should NOT detect: ${msg}`);
     }
     assert.equal(detectSystemPlacementError(401, "Multiple system messages found"), false);
+    // #6063: serde backends report validation errors as 422; the ladder gate
+    // admits both statuses, so the placement detector must as well.
+    assert.equal(detectSystemPlacementError(422, "Multiple system messages found"), true);
 });
 
 function roleRejectingUpstream(): Promise<{ server: http.Server; seen: string[][] }> {
@@ -387,6 +402,61 @@ test("e2e #552 F: retry that still fails passes the original 400 through verbati
         assert.equal(hits.length, 2, "exactly one retry, no loop");
         await waitFor(() => _liveUpstreamTimersForTest() === 0);
         assert.equal(_liveUpstreamTimersForTest(), 0, "abandoned retry body must not re-arm the idle timer after clearTimer");
+    } finally {
+        await harness.stop();
+        harness.cleanup();
+        await close(upstream);
+    }
+});
+
+function serdeRejectingUpstream(): Promise<{ server: http.Server; seen: string[][] }> {
+    const seen: string[][] = [];
+    const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            let roles: string[] = [];
+            try {
+                const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { input?: Array<{ role?: string }>; messages?: Array<{ role?: string }> };
+                roles = [...(parsed.input ?? []), ...(parsed.messages ?? [])].map((m) => m.role ?? "?");
+            } catch { /* ignore */ }
+            seen.push(roles);
+            if (roles.includes("developer")) {
+                // DeepSeek official API shape (#6063): serde deserialization 422.
+                res.writeHead(422, { "content-type": "application/json" });
+                res.end(JSON.stringify({ code: "invalid_request_error", message: "Failed to deserialize the JSON body into the target type: messages[0].role: unknown variant `developer`, expected one of `system`, `user`, `assistant`, `tool`, `latest_reminder` at line 1 column 57" }));
+            } else {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true }));
+            }
+        });
+    });
+    return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ server, seen })));
+}
+
+test("e2e #6063: serde 422 role rejection auto-retries and learns like the #552 400 path", async () => {
+    const { server: upstream, seen } = await serdeRejectingUpstream();
+    const harness = await startProxy(upstream, { compatJson: `{"providers":{}}` });
+    try {
+        const payload = JSON.stringify({ model: "test", input: [{ type: "message", role: "developer", content: "be terse" }] });
+        const res1 = await fetch(`http://127.0.0.1:${harness.port}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-session-id": "compat-roles-serde-learn" },
+            body: payload,
+        });
+        assert.equal(res1.status, 200, "client sees a transparent 200 after the auto-retry");
+        const res2 = await fetch(`http://127.0.0.1:${harness.port}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-session-id": "compat-roles-serde-learn" },
+            body: payload,
+        });
+        assert.equal(res2.status, 200);
+        // 3 upstream hits total: req1 rejected (developer), req1-retried (system),
+        // req2 rewritten BEFORE fetch via the learned session map (system).
+        assert.equal(seen.length, 3, `expected 3 upstream hits, got ${JSON.stringify(seen)}`);
+        assert.deepEqual(seen[0], ["developer"], "first hit carries the client's developer role (no compat configured)");
+        assert.deepEqual(seen[1], ["system"], "auto-retry rewrote developer→system on the 422 serde rejection");
+        assert.deepEqual(seen[2], ["system"], "second request skipped the 422 round-trip (session learned)");
     } finally {
         await harness.stop();
         harness.cleanup();

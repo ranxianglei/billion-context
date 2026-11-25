@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
     dshImageHandlePath,
+    dshImageOffloadPlaceholderPath,
     dshMcpCatalogPath,
     dshRuntimeContextPath,
     dshSkillCatalogPath,
@@ -25,11 +26,12 @@ function msg(role: CoreMessage["role"], text: string, id = "m1"): CoreMessage {
 }
 
 const CARRIERS: Array<[name: string, marker: string, path: string, cls: (m: CoreMessage) => string | undefined]> = [
-    ["skill catalog", "<available_skills>", "durable/skill-catalog", dshSkillCatalogPath],
-    ["workspace instructions", "Instructions from: ~/.dsh/AGENTS.md", "durable/agents-md", dshWorkspaceInstructionsPath],
+    ["skill catalog", "\x3csystem-reminder\x3e\n\x3cavailable_skills\x3e\n- name: x\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e", "durable/skill-catalog", dshSkillCatalogPath],
+    ["workspace instructions", "\x3csystem-reminder\x3e\nInstructions from: ~/.dsh/AGENTS.md\n\x3c/system-reminder\x3e", "durable/agents-md", dshWorkspaceInstructionsPath],
     ["mcp catalog", "<mcp_catalog>\n- server: fs\n</mcp_catalog>", "durable/mcp-catalog", dshMcpCatalogPath],
     ["runtime context", "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.", "durable/runtime-context", dshRuntimeContextPath],
     ["request-image handle", 'Image "x.png" (sha256:2e896b95dec003df); request preview 1600x900px.', "oneshot/image-handle", dshImageHandlePath],
+    ["image-offload placeholder", '[image omitted to fit request image limits; "x.png" (sha256:2e896b95dec003df). Normalized copy (read-only; may be resized or re-encoded): "normalized/x.png" (1600x900px, image/png).]', "oneshot/image-offload-placeholder", dshImageOffloadPlaceholderPath],
 ];
 
 for (const [name, marker, path, cls] of CARRIERS) {
@@ -44,7 +46,7 @@ for (const [name, marker, path, cls] of CARRIERS) {
 }
 
 test("Path: system-role carrier text still projects — the gate targets model output only (#2766)", () => {
-    assert.equal(dshSkillCatalogPath(msg("system", "<available_skills>")), "durable/skill-catalog");
+    assert.equal(dshSkillCatalogPath(msg("system", "\x3csystem-reminder\x3e\n\x3cavailable_skills\x3e\n- name: x\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e")), "durable/skill-catalog");
 });
 
 test("kernel: an assistant echo cannot take over the latest durable identity (#2766)", () => {

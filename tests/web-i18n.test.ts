@@ -96,12 +96,19 @@ test("#1024: catalog parity — every key in every locale with matching placehol
     }
     for (const key of zhKeys) {
         assert.deepEqual(placeholders(MESSAGES.en[key]), placeholders(MESSAGES["zh-CN"][key]), `placeholder mismatch for "${key}"`);
+        assert.deepEqual(placeholders(MESSAGES.ko[key]), placeholders(MESSAGES.en[key]), `ko placeholder mismatch for "${key}"`);
     }
 });
 
 test("#1024: no Chinese residue in English translations", () => {
     for (const [key, value] of Object.entries(MESSAGES.en)) {
         assert.ok(!han.test(value), `English value for "${key}" still contains Chinese: ${value}`);
+    }
+});
+
+test("#1024: no Chinese residue in Korean translations", () => {
+    for (const [key, value] of Object.entries(MESSAGES.ko)) {
+        assert.ok(!han.test(value), `Korean value for "${key}" still contains Chinese: ${value}`);
     }
 });
 
@@ -125,10 +132,18 @@ function collectRefs(): Set<string> {
     // #5345: the pack editor builds its <option> labels through a pair-array
     // (t(pair[1])), so those catalog keys are only referenced via bare quoted
     // strings — accept any dot-qualified identifier that appears verbatim in
-    // the sources as a live reference too.
+    // the sources as a live reference too. Filenames share the dotted shape
+    // (package.json / config.json in notices.ts) but are not keys: drop tokens
+    // whose final segment is a file extension. Segments already proven to be
+    // key suffixes (summary.key, det.log) stay out of the exclusion, and those
+    // keys are referenced through the explicit t()/data-i18n rules above anyway.
+    const fileExt = new Set(["json", "jsonl", "js", "mjs", "cjs", "ts", "tsx", "map", "db", "sqlite", "sqlite3", "pem", "crt", "cert", "txt", "md", "yml", "yaml", "toml", "lock", "html", "css", "sh", "bat", "ps1", "png", "jpg", "jpeg", "gif", "svg", "ico", "woff", "woff2", "ttf"]);
     for (const src of [pageSrc, clientSrc, reportSrc, noticesSrc]) {
         for (const m of src.matchAll(/"([a-z][\w]*\.[\w.]+)"/g)) {
-            if (/^[a-z][\w]*(\.[\w]+)+$/.test(m[1]) && !m[1].includes("..")) refs.add(m[1]);
+            const token = m[1];
+            if (!/^[a-z][\w]*(\.[\w]+)+$/.test(token) || token.includes("..")) continue;
+            if (fileExt.has(token.slice(token.lastIndexOf(".") + 1))) continue;
+            refs.add(token);
         }
     }
     return refs;
@@ -346,6 +361,9 @@ test("#2321: ?lang= pin outranks stored choice and browser default (real client)
     assert.equal((await runClient(undefined, "en-US", null)).lang, "en", "no pin: en navigator still resolves en");
     assert.equal((await runClient(undefined, "zh-CN", "en")).lang, "en", "no pin: stored choice still beats navigator");
     assert.equal((await runClient(undefined, "zh-CN", null)).lang, "zh-CN", "no pin: nothing stored falls back to zh-CN");
+    assert.equal((await runClient("?embed=1&lang=ko", "en-US", "en")).lang, "ko", "pin ko beats both stored en and en navigator");
+    assert.equal((await runClient(undefined, "zh-CN", "ko")).lang, "ko", "no pin: stored ko beats navigator");
+    assert.equal((await runClient(undefined, "ko-KR", null)).lang, "ko", "no pin: ko navigator resolves ko");
 });
 
 test("#2321: language toggle drops the ?lang= pin so the manual choice sticks", async () => {
@@ -355,6 +373,17 @@ test("#2321: language toggle drops the ?lang= pin so the manual choice sticks", 
     assert.ok(tog, "language toggle rendered");
     assert.ok(tog!.handlers.click, "toggle has a click handler");
     tog!.handlers.click!();
-    assert.deepEqual(r.storageSet, [["bili-language", "zh-CN"]], "manual choice persisted");
+    assert.deepEqual(r.storageSet, [["bili-language", "ko"]], "manual choice persisted");
     assert.equal(r.location.href, "/__bili/?embed=1#/overview", "navigation keeps other params but strips the lang pin");
+});
+
+test("language toggle cycles zh-CN → en → ko → zh-CN and labels the next language", async () => {
+    for (const [from, next, label] of [["zh-CN", "en", "English"], ["en", "ko", "한국어"], ["ko", "zh-CN", "中文"]] as const) {
+        const r = await runClient(`?embed=1&lang=${from}`, "zh-CN", null);
+        assert.equal(r.lang, from);
+        const tog = r.els.get("language-toggle")!;
+        assert.equal(tog.textContent, label, `toggle on ${from} names ${next}`);
+        tog.handlers.click!();
+        assert.deepEqual(r.storageSet, [["bili-language", next]], `${from} toggles to ${next}`);
+    }
 });
