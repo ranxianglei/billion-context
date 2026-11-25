@@ -1930,6 +1930,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                     if (hit === undefined) continue; // stable absence — re-checked next drift pass (bounded read)
                     const content = hit.content;
                     const hasImageMarker = (content.includes("\"rawAnthropicBlock\"") && content.includes("\"type\":\"image\""))
+                        || (content.includes("\"rawOpenaiContentParts\"") && content.includes("\"type\":\"image\""))
                         || content.includes("\"imageBase64\":\"")
                         || content.includes("\"text\":\"[image]\"")
                         || content.includes("data:image/");
@@ -1963,8 +1964,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             const nid = plan.newOrder[oi];
             if (nid === undefined || nid === id || covered.has(nid) || claimedTargets.has(nid)) continue;
             const nm = byId.get(nid);
-            if (nm === undefined || (nm.toolCallId !== undefined && nm.toolCallId !== "")) continue;
+            if (nm === undefined) continue;
             const anchor = anchors[id];
+            if (nm.toolCallId !== undefined && nm.toolCallId !== "") {
+                // #7693: tool-channel offload — the replacement keeps its
+                // toolCallId (tool results are tied to tool calls). Classify
+                // only when it matches the anchor's (the same tool result,
+                // just offloaded).
+                if (anchor?.t === undefined || nm.toolCallId !== anchor.t) continue;
+            }
             if (anchor !== undefined && anchor.r !== undefined && nm.role !== anchor.r) continue;
             if (storedMessageCarriesImage(nm)) continue; // the new side must stay plain text
             expected[id] = "image-offload";
