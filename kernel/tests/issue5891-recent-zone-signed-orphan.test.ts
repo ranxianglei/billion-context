@@ -92,6 +92,33 @@ function foldRange(startId: string, endId: string) {
   return res.state.blocks.filter((b) => b.active).map((b) => new Set(b.effectiveMessageIds));
 }
 
+function foldFull(
+  messages: SignedCore[],
+  startId: string,
+  endId: string,
+  configOverride?: Partial<ReturnType<typeof defaultConfig>["compress"]>,
+) {
+  const cfg = {
+    ...defaultConfig(100_000),
+    compress: { ...defaultConfig(100_000).compress, ...configOverride },
+  };
+  const core = createCore();
+  let state = createInitialState();
+  state = core.processTurn({
+    messages,
+    state,
+    config: cfg,
+    tokenCount: (t) => Math.ceil(t.length / 4),
+  }).state;
+  const refs = state.messageRefs.byRaw;
+  return core.applyCompression({
+    state,
+    messages,
+    config: cfg,
+    ranges: [{ startRef: refs[startId]!, endRef: refs[endId]!, summary: "s".repeat(400) }],
+  });
+}
+
 describe("issue5891 recent-zone signed-thinking orphan", () => {
   it("folding the Read exchange alone must not strand its signed thinking", () => {
     for (const ids of foldRange("c1", "r1")) {
@@ -109,5 +136,39 @@ describe("issue5891 recent-zone signed-thinking orphan", () => {
         `orphaned signed thinking: block ${[...ids].join(",")} folded c1 without th1`,
       );
     }
+  });
+
+  it("a range starting INSIDE the recent zone must not sieve out the signed thinking", () => {
+    // 2026-11-11 field report (billion-context#4885 thread, 0.1.213): every
+    // 400 followed a compress whose range reached into the recent protected
+    // zone, logged as "Excluded N protected message(s) ..." WITHOUT the
+    // "Range truncated at that boundary" suffix. That is the
+    // firstProtectedIdx === 0 fallthrough: the #3953 truncation is skipped
+    // and the per-id sieve keeps the zone-protected signed thinking visible
+    // while the unprotected bash pair (built-in neverPreserveRecentTools)
+    // folds — orphaning the signature.
+    const messages: SignedCore[] = [
+      { id: "u0", role: "user", contentType: "text", text: "old task " + "x".repeat(200) },
+      { id: "thA", role: "assistant", contentType: "reasoning", text: "plan-a ", thinkingSignature: "sig-A" },
+      { id: "cA", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tA", text: "{}" },
+      { id: "rA", role: "tool", contentType: "tool-result", toolName: "bash", toolCallId: "tA", text: "ok " + "r".repeat(200) },
+      { id: "thB", role: "assistant", contentType: "reasoning", text: "plan-b ", thinkingSignature: "sig-B" },
+      { id: "cB", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tB", text: "{}" },
+      { id: "rB", role: "tool", contentType: "tool-result", toolName: "bash", toolCallId: "tB", text: "ok " + "r".repeat(40_000) },
+    ];
+    const res = foldFull(messages, "thB", "rB", { preserveRecentMessages: 3 });
+    for (const b of res.state.blocks.filter((x) => x.active)) {
+      const ids = new Set(b.effectiveMessageIds);
+      assert.ok(
+        !ids.has("cB") || ids.has("thB"),
+        `orphaned signed thinking: block ${[...ids].join(",")} folded cB without thB (sieve path)`,
+      );
+    }
+    // Non-vacuity: the range folded NOTHING — the degradable split fatal
+    // degrades to a "folded nothing" warning (#4521 no-op success), not an
+    // error and not a block. The only compressible content in the range is
+    // the bash pair, and folding it orphans thB.
+    assert.ok(res.state.blocks.length === 0, "expected no block for the sieved range");
+    assert.match(res.result.warnings.join(" "), /folded nothing|integrity gate/i);
   });
 });

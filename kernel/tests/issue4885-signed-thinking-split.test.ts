@@ -246,6 +246,26 @@ describe("#4885 INV3 gate (computeIntegrityWithdrawals)", () => {
     assert.ok(withdrawn.has("ra"), "thinking withdrawn on re-check");
   });
 
+  it("withdraws the run on the post-sieve state (recent-zone carve keeps thinking, folds the bash pair)", () => {
+    // The #3953 advisory carve, when the range STARTS at a protected id
+    // (firstProtectedIdx === 0), skips truncation and sieves protected ids
+    // out per-message instead (#5891 field shape, 2026-11-11 report): the
+    // zone-protected signed thinking stays visible while the unprotected
+    // bash pair (built-in neverPreserveRecentTools) enters the fold.
+    const msgs: SignedCore[] = [
+      reasoning("thB", "sig-B"),
+      toolCall("cB", "call_B"),
+      toolResult("rB", "call_B"),
+    ];
+    const { withdrawn } = computeIntegrityWithdrawals(
+      msgs,
+      new Set(["cB", "rB"]),
+    );
+    for (const id of ["thB", "cB", "rB"]) {
+      assert.ok(withdrawn.has(id), `${id} must be withdrawn`);
+    }
+  });
+
   it("keeps the #564 reverse split allowed for UNSIGNED runs", () => {
     const unsigned: SignedCore[] = [
       reasoning("ra"),
