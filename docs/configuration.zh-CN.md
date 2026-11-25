@@ -2038,7 +2038,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL` | `rollout.features.pluginMsgIdIncremental` | 100 (on, GA) |
 | `BILI_ROLLOUT_WATERMARK_V6_MSG_ID` | `rollout.features.watermarkV6MsgId` | 0 (off) |
 | `BILI_ROLLOUT_WATERMARK_V6_RENDER` | `rollout.features.watermarkV6Render` | 0 (off) |
-| `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false (off) |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 (1 h) |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
