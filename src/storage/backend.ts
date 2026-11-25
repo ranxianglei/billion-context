@@ -86,12 +86,19 @@ export interface StorageBackend {
     readSnapshot<T>(read: (reader: StorageReadView) => Promise<T>): Promise<T>;
     getCcr(sessionId: string): Promise<MessageContentStore | null>;
     getCcrEntries(sessionId: string): Promise<CcrEntryRow[]>;
+    /** #6785 step 7: the merged reaped-block journal (table rows ∪ legacy
+     *  column). null = none. */
+    getOrphanViews(sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null>;
+    /** #6785 step 8: row-backed CompressionState fields (state_fields table). */
+    getStateFields(sessionId: string): Promise<Record<string, string> | null>;
 
     // --- ingest watermark / pointers (#3253, #3798) ------------------------
     ingestWatermark(sessionId: string): Promise<{ seq: number; tailSeqs: number[] } | null>;
     tailSeqs(sessionId: string): Promise<number[] | null>;
     clearIngestWatermark(sessionId: string): Promise<void>;
-    resetAllIngestWatermarks(): Promise<void>;
+    /** #3285 (2026-11-21 per-session rework): first-touch trust prime — drop
+     *  any FOREIGN-set watermark for one session; idempotent per process. */
+    primeIngestTrust(sessionId: string): Promise<void>;
     probeIngestBoundary(sessionId: string, seq: number): Promise<{ msgId: string; contentHash: string; maxSeq: number } | null>;
 
     // --- reap journal (#3841) ----------------------------------------------
@@ -146,7 +153,7 @@ export interface StorageBackend {
     init?(): Promise<void>;
 }
 
-export type StorageReadView = Pick<StorageBackend, "getSessionRow" | "getMessages" | "getBlocks" | "getDeadRefs" | "getRefs">;
+export type StorageReadView = Pick<StorageBackend, "getSessionRow" | "getMessages" | "getBlocks" | "getDeadRefs" | "getRefs" | "getCcrEntries" | "getOrphanViews" | "getStateFields">;
 
 /** The sqlite backend: the existing UnifiedStore behind the async contract.
  *  Synchronous under the hood; `Promise.resolve` wrapping only. */
@@ -216,6 +223,9 @@ export class SqliteBackend implements StorageBackend {
             getBlocks: async (id, opts) => store.getBlocks(id, opts),
             getDeadRefs: async (id) => store.getDeadRefs(id),
             getRefs: async (id) => store.getRefs(id),
+            getCcrEntries: async (id) => store.getCcrEntries(id),
+            getOrphanViews: async (id) => store.getOrphanViews(id),
+            getStateFields: async (id) => store.getStateFields(id),
         }));
     }
     getCcr(sessionId: string): Promise<MessageContentStore | null> {
@@ -223,6 +233,13 @@ export class SqliteBackend implements StorageBackend {
     }
     getCcrEntries(sessionId: string): Promise<CcrEntryRow[]> {
         return Promise.resolve(this.store.getCcrEntries(sessionId));
+    }
+    getOrphanViews(sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null> {
+        return Promise.resolve(this.store.getOrphanViews(sessionId));
+    }
+
+    getStateFields(sessionId: string): Promise<Record<string, string> | null> {
+        return Promise.resolve(this.store.getStateFields(sessionId));
     }
     ingestWatermark(sessionId: string): Promise<{ seq: number; tailSeqs: number[] } | null> {
         return Promise.resolve(this.store.ingestWatermark(sessionId));
@@ -233,8 +250,8 @@ export class SqliteBackend implements StorageBackend {
     clearIngestWatermark(sessionId: string): Promise<void> {
         return Promise.resolve(this.store.clearIngestWatermark(sessionId));
     }
-    resetAllIngestWatermarks(): Promise<void> {
-        return Promise.resolve(this.store.resetAllIngestWatermarks());
+    primeIngestTrust(sessionId: string): Promise<void> {
+        return Promise.resolve(this.store.primeIngestTrust(sessionId));
     }
     probeIngestBoundary(sessionId: string, seq: number): Promise<{ msgId: string; contentHash: string; maxSeq: number } | null> {
         return Promise.resolve(this.store.probeIngestBoundary(sessionId, seq));
