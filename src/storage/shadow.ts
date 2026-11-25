@@ -35,6 +35,7 @@ import { featureEnabled } from "../rollout.js";
 import { planIngest, planIngestDelta, planIngestReanchor, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { CcrLedgerRow } from "./slim.ts";
 import { splitMediaContent } from "./identity.js";
+import { rebuildEgressKstateOverlay, type EgressBlockSnapshot } from "./egress-block.ts";
 import type { BlockView } from "../session.js";
 import { effectiveJsonWriterOff, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
@@ -937,9 +938,39 @@ export class UnifiedShadow {
                 // row.ts the first-observed wall clock) so the kernel's <acp
                 // time=> stamps survive restarts. The async (MySQL) leg has no
                 // egress tables — the egress plane is the SQLite lane only.
-                if (view.metadata["egressAuthority"] === true && view.state.tsStamps === undefined) {
-                    const derived = store.egressTsStamps(id);
-                    if (derived !== null) view.state.tsStamps = derived;
+                const egressOn =
+                    view.metadata["egressAuthority"] === true
+                    // The skeleton row a fork materializes for an egress-on
+                    // parent carries no metadata_json (the unified upsert
+                    // never runs for armed sessions) — but the flow rows
+                    // themselves are the egress-on proof.
+                    || store.egressStateMaxSeq(id) > 0;
+                if (egressOn) {
+                    // #7658 PR-B: the FULL egress-on kstate retirement — the
+                    // unified legs are frozen for these sessions (the
+                    // kstate_json column never tracks the live state), so the
+                    // load IS the rebuild point: blocks + messageRefs +
+                    // tsStamps + the residual sidecar come from the op log
+                    // (block ledger replay at its own high-water + the live
+                    // message-flow view). ANY replay corruption keeps the
+                    // stored state verbatim (no fuzzy guessing — same
+                    // discipline as the message-log degrade ladder); lastPassIds
+                    // self-heals on the first pass (deliberately not rebuilt).
+                    if (featureEnabled("egressKstateRebuild")) {
+                        try {
+                            const max = store.egressBlockMaxSeq(id);
+                            const replay = max > 0
+                                ? store.egressBlockReplay(id, max)
+                                : { blocks: new Map<string, EgressBlockSnapshot>(), kstate: null };
+                            Object.assign(view.state, rebuildEgressKstateOverlay(replay, store.egressStateView(id)));
+                        } catch (err) {
+                            loggerLog("warn", `[storage] egress kstate rebuild failed for ${id} (${String(err)}) — stored kstate kept`);
+                        }
+                    }
+                    if (view.state.tsStamps === undefined) {
+                        const derived = store.egressTsStamps(id);
+                        if (derived !== null) view.state.tsStamps = derived;
+                    }
                 }
                 return view as LegacySessionLike;
             });

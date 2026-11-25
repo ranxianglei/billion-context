@@ -44,7 +44,8 @@
 // Rollout gate (egressPlane, default 0 — opt-in per owner ruling 2026-11-24) and each lane's arming condition
 // are owned by the caller.
 
-import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, type EgressOpLogStore } from "../storage/egress-record.js";
+import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
+import type { EgressBlockLedgerInput } from "../storage/egress-block.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { featureEnabled } from "../rollout.js";
 import { outputBudgetField, readOutputBudget } from "./budget.js";
@@ -142,6 +143,17 @@ export function egressTinyBudget(parsed: unknown): boolean {
     if (field === null) return false;
     const value = readOutputBudget(parsed as Record<string, unknown>, field);
     return typeof value === "number" && value > 0 && value <= 200;
+}
+
+/** #7664 (PR-A): the in-memory kernel block set for the egress block ledger —
+ *  present only for egress-on sessions (the latch set by
+ *  resolveEgressAuthority). The lane passes it to recordAuthorityTurn / the
+ *  inline recordEgressTurn call so the block tables get their per-turn diff
+ *  (the unified-leg recorder never runs for these sessions). */
+export function egressBlockLedgerFor(session: Session): EgressBlockLedgerInput | undefined {
+    return session.metadata?.["egressAuthority"] === true
+        ? { state: session.state, blockContents: session.blockContents }
+        : undefined;
 }
 
 /** The single authority decision (ruling 7439-5): latch, recover,
@@ -248,6 +260,8 @@ export function recordAuthorityTurn(
     outcome: EgressAuthorityOutcome,
     systemText: string,
     log: LaneLog,
+    blockLedger?: EgressBlockLedgerInput,
+    refMap?: EgressRefMap,
 ): BiliMessage[] | null {
     if (outcome.recordCore === null) return null;
     try {
@@ -259,6 +273,8 @@ export function recordAuthorityTurn(
             conversation: outcome.recordCore,
             systemText,
             nowMs: Date.now(),
+            blockLedger,
+            refMap,
         });
     } catch (err) {
         if (err instanceof EgressConcurrentWriteError) {

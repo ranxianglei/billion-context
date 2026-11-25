@@ -92,6 +92,15 @@ function emptyRetryTurn(): string[] {
     return [chatChunk({ role: "assistant" }), chatStop(), DONE];
 }
 
+/** A retry that thought but produced no visible text: NOT bare (sawThinking),
+ *  so the #2756 bare exemption does not fire and the degenerate budget is
+ *  actually spent. Under #4913's per-attempt reset an empty retry would pass
+ *  through as bare before the budget is exhausted, so the budget tests need a
+ *  non-bare retry shape. */
+function thinkingRetryTurn(text = "The retry still only thought."): string[] {
+    return [chatChunk({ role: "assistant" }), chatChunk({ reasoning_content: text }), chatStop(), DONE];
+}
+
 function proseTurn(text: string): string[] {
     return [chatChunk({ role: "assistant" }), chatChunk({ content: text }), chatStop(), DONE];
 }
@@ -284,22 +293,22 @@ test("chat: with maxAttempts=2 the second retry's prose lands without #870", asy
     let calls = 0;
     const refetch = () => {
         calls += 1;
-        return Promise.resolve(streamOf(calls === 1 ? emptyRetryTurn() : proseTurn("finally the real answer")));
+        return Promise.resolve(streamOf(calls === 1 ? thinkingRetryTurn() : proseTurn("finally the real answer")));
     };
     await pipePluginChatWithStrip(streamOf(echoOnlyTurn()), makeRes(out), "openai", makeSession(), undefined, refetch, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 2);
     const text = out.join("");
-    assert.equal(calls, 2, "the first retry is empty, the second is used");
+    assert.equal(calls, 2, "the first retry is thinking-only, the second is used");
     const deltas = [...text.matchAll(/"content":"((?:[^"\\]|\\.)*)"/g)].map((m) => JSON.parse(`"${m[1]}"`) as string).join("");
     assert.equal(deltas, "finally the real answer", "the second retry's prose reaches the client");
     assert.ok(!text.includes('"code":"stream_error"'), "no #870: the budget had room");
 });
 
-test("chat: default budget stays 1 — an empty second attempt raises the historical singular #870", async () => {
+test("chat: default budget stays 1 — a degenerate second attempt raises the historical singular #870", async () => {
     const out: string[] = [];
     let calls = 0;
     const refetch = () => {
         calls += 1;
-        return Promise.resolve(streamOf(emptyRetryTurn()));
+        return Promise.resolve(streamOf(thinkingRetryTurn()));
     };
     await pipePluginChatWithStrip(streamOf(echoOnlyTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
     const text = out.join("");
@@ -314,7 +323,7 @@ test("chat: with maxAttempts=2 the exhausted error names the plural nudges", asy
     let calls = 0;
     const refetch = () => {
         calls += 1;
-        return Promise.resolve(streamOf(emptyRetryTurn()));
+        return Promise.resolve(streamOf(thinkingRetryTurn()));
     };
     await pipePluginChatWithStrip(streamOf(echoOnlyTurn()), makeRes(out), "openai", makeSession(), undefined, refetch, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 2);
     const text = out.join("");

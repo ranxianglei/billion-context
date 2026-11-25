@@ -1,9 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { pipePluginChatWithStrip, pipePluginResponsesWithStrip } from "../src/plugin.ts";
+import { loadOptions } from "../src/config.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { DEGENERATE_RETRY_NUDGE, injectContinuationNudge } from "../src/degenerate-retry.ts";
 import type { Session } from "../src/session.ts";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 // The plugin pipe is what serves plugin-mode agents (this machine's omp
 // sessions among them). A turn whose ONLY text is an echoed render tag is
@@ -464,10 +468,30 @@ test("plugin chat retries a turn whose only visible output was an unclosed rende
     );
 });
 
+/** The #4913 production shape (issue dataset: 13/13 double-degenerates were
+ *  thinking-only): the model emits only reasoning, then ends cleanly — no
+ *  answer prose, no tool call, no stripped echo. */
+function thinkingOnlyTurn(text = "The retry still only thought."): string[] {
+    return [chatChunk({ role: "assistant" }), chatChunk({ reasoning_content: text }), chatStop(), DONE];
+}
+
 test("plugin chat emits an in-band error when the retry degenerates too", async () => {
     const out: string[] = [];
-    const refetch = () => Promise.resolve(streamOf([chatChunk({ role: "assistant" }), chatStop(), DONE]));
-    await pipePluginChatWithStrip(streamOf(unclosedEchoTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => {
+        logs.push(msg);
+    });
+    // #4913 re-pin: the old pin used a truly BARE second attempt, which is
+    // exactly the shape #2756 documents as pass-through — the fix below now
+    // gives it that, so the fatal branch is pinned with the production shape
+    // instead (issue dataset: every double-degenerate second attempt carried
+    // thinking).
+    const refetch = () => Promise.resolve(streamOf(thinkingOnlyTurn()));
+    try {
+        await pipePluginChatWithStrip(streamOf(unclosedEchoTurn()), makeRes(out), "openai", makeSession(), (msg) => logs.push(msg), refetch);
+    } finally {
+        setLogCapture(null);
+    }
     const text = out.join("");
     // #5958: an exhausted retry is a FAILURE, not a completed turn. The default
     // streamErrorShape is "protocol", so the client gets the wire-native error
@@ -479,11 +503,94 @@ test("plugin chat emits an in-band error when the retry degenerates too", async 
     // The error's own terminal plus the retry stream's trailing terminator both
     // close the turn; the client stops at the error either way.
     assert.equal((text.match(/\[DONE\]/g) ?? []).length, 2, "the error's terminal, then the retry's trailing terminator");
+    // #4913 item 3: the fatal log names the signal that qualified the attempt,
+    // measured on the RETRY pass (accumulators are reset when the retry takes
+    // over), not inherited from the first attempt. #7666 reworded the budget
+    // spent as "after N continuation nudge(s)".
+    const fatal = logs.find((l) => l.includes("continuation nudge(s)"));
+    assert.ok(fatal, `the fatal retry log is present, got: ${JSON.stringify(logs)}`);
+    assert.ok(fatal.includes("sawThinking=true"), `the qualifying signal is named, got: ${fatal}`);
+    assert.ok(fatal.includes("releasedMarkupChars=0"), "the first attempt's released markup is not inherited into the retry's verdict");
+});
+
+test("plugin chat: a retry attempt the model left genuinely bare passes through instead of dying (#4913)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => {
+        logs.push(msg);
+    });
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf([chatChunk({ role: "assistant" }), chatStop(), DONE]));
+    };
+    try {
+        await pipePluginChatWithStrip(streamOf(unclosedEchoTurn()), makeRes(out), "openai", makeSession(), (msg) => logs.push(msg), refetch);
+    } finally {
+        setLogCapture(null);
+    }
+    const text = out.join("");
+    assert.equal(calls, 1, "the first attempt is still retried once");
+    // Before the fix this shape died as a fatal in-band error: the #2756 bare
+    // exemption sat under the exhausted-retry branch and was unreachable on
+    // the second pass. It now takes the same pass-through as the same shape
+    // on the first pass — the upstream's own empty answer, not a proxy-invented
+    // failure.
+    assert.ok(!text.includes("stream_error"), "no protocol error frame for a bare second attempt");
+    assert.ok(!text.includes("[ACP] stream error"), "no completed-turn error frame for a bare second attempt");
+    assert.ok(text.includes('"finish_reason":"stop"'), "the turn completes as an (empty) answer");
+    assert.equal((text.match(/\[DONE\]/g) ?? []).length, 1, "a single terminal closes the turn");
+    const bare = logs.find((l) => l.includes("bare on the retry pass"));
+    assert.ok(bare, `the bare-on-retry log is present, got: ${JSON.stringify(logs)}`);
+    assert.ok(!logs.some((l) => l.includes("continuation nudge(s)")), "no fatal verdict for a bare second attempt");
+});
+
+test("plugin chat (chat wire): a thinking-only second attempt dies with the qualifying signal logged (#4913)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => {
+        logs.push(msg);
+    });
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(thinkingOnlyTurn("second attempt thought again")));
+    };
+    try {
+        await pipePluginChatWithStrip(streamOf(thinkingOnlyTurn("first attempt thought")), makeRes(out), "openai", makeSession(), (msg) => logs.push(msg), refetch);
+    } finally {
+        setLogCapture(null);
+    }
+    const text = out.join("");
+    assert.equal(calls, 1, "one retry, then the fatal verdict");
+    assert.ok(text.includes('"code":"stream_error"'), "the #870 in-band failure is emitted");
+    const fatal = logs.find((l) => l.includes("continuation nudge(s)"));
+    assert.ok(fatal, `the fatal retry log is present, got: ${JSON.stringify(logs)}`);
+    assert.ok(fatal.includes("sawThinking=true"), `the retry's own thinking qualifies the verdict, got: ${fatal}`);
+    assert.ok(!fatal.includes("first attempt thought"), "the verdict is measured, not inherited from the first attempt's bytes");
+    assert.ok(fatal.includes("visibleTextChars=0") && fatal.includes("answerChars=0"), `the verdict carries the empty-shape counters, got: ${fatal}`);
+});
+
+test("plugin chat: a healthy second attempt after a degenerate first completes cleanly", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(proseTurn("the answer arrives on the retry")));
+    };
+    await pipePluginChatWithStrip(streamOf(thinkingOnlyTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
+    const text = out.join("");
+    assert.equal(calls, 1, "the degenerate first attempt is retried");
+    assert.ok(!text.includes("stream_error"), "a recovered turn carries no error");
+    assert.ok(textDeltas(text, "openai").endsWith("the answer arrives on the retry"), "the retry's answer reaches the client");
+    assert.ok(text.includes('"finish_reason":"stop"'), "the recovered turn completes normally");
 });
 
 test("plugin chat keeps the legacy completed-turn shape when streamErrorShape is \"completion\"", async () => {
     const out: string[] = [];
-    const refetch = () => Promise.resolve(streamOf([chatChunk({ role: "assistant" }), chatStop(), DONE]));
+    // #4913 re-pin: a bare second attempt now passes through, so the legacy
+    // error shape is pinned with the thinking-only (production) second attempt.
+    const refetch = () => Promise.resolve(streamOf(thinkingOnlyTurn()));
     await pipePluginChatWithStrip(
         streamOf(unclosedEchoTurn()), makeRes(out), "openai", makeSession(), undefined, refetch,
         undefined, undefined, undefined, undefined, undefined, "completion",
@@ -543,4 +650,99 @@ test("plugin chat (anthropic) #7235: the second-failure fallback passes through 
     assert.ok(!text.includes("[ACP] stream error"), "no synthetic completed-turn error block (#7235)");
 });
 
+// #4913: compat.degenerateTurn="passthrough" (env BILI_DEGENERATE_TURN wins)
+// opts the chat lane back into the pre-#870 terminal for an EXHAUSTED
+// degenerate-turn retry — the empty turn passes through as a normal completion
+// instead of the fatal in-band error. Only the chat pipe has the fatal branch;
+// the proxy lane and responses wire already pass this condition through.
+test("plugin chat: an exhausted degenerate retry passes through when degenerateTurn=passthrough (#4913)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(thinkingOnlyTurn("second attempt thought again")));
+    };
+    await pipePluginChatWithStrip(
+        streamOf(thinkingOnlyTurn("first attempt thought")),
+        makeRes(out),
+        "openai",
+        makeSession(),
+        (msg) => logs.push(msg),
+        refetch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        false,
+        undefined,
+        "passthrough",
+    );
+    const text = out.join("");
+    assert.equal(calls, 1, "the degenerate first attempt is retried once");
+    assert.ok(!text.includes("stream_error"), "passthrough mode carries no in-band error");
+    assert.ok(text.includes('"finish_reason":"stop"'), "the empty turn passes through as a normal completion");
+    const passthrough = logs.find((l) => l.includes('compat.degenerateTurn="passthrough"'));
+    assert.ok(passthrough, `the passthrough verdict is logged with the counters, got: ${JSON.stringify(logs)}`);
+    assert.ok(passthrough.includes("sawThinking=true"), `the logged signal is the retry's own thinking, got: ${passthrough}`);
+    assert.ok(!logs.some((l) => l.includes("emitting an in-band error")), "no fatal branch ran");
+});
 
+test("plugin chat: an exhausted degenerate retry still dies when degenerateTurn=error is explicit (#4913)", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(thinkingOnlyTurn("second attempt thought again")));
+    };
+    await pipePluginChatWithStrip(
+        streamOf(thinkingOnlyTurn("first attempt thought")),
+        makeRes(out),
+        "openai",
+        makeSession(),
+        undefined,
+        refetch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        false,
+        undefined,
+        "error",
+    );
+    assert.equal(calls, 1);
+    assert.ok(out.join("").includes('"code":"stream_error"'), "the explicit error value keeps the #870 in-band failure");
+});
+
+// #4913 config wiring: file compat.degenerateTurn + env BILI_DEGENERATE_TURN,
+// env > file > default("error"), unknown values fall back to the default.
+test("config: compat.degenerateTurn resolves env > file > default (#4913)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-4913-"));
+    const cfg = path.join(dir, "config.json");
+    try {
+        const prevFile = process.env["BILI_CONFIG_FILE"];
+        const prevEnv = process.env["BILI_DEGENERATE_TURN"];
+        try {
+            process.env["BILI_CONFIG_FILE"] = cfg;
+            writeFileSync(cfg, JSON.stringify({ compat: { degenerateTurn: "passthrough" } }));
+            assert.equal(loadOptions({}).degenerateTurn, "passthrough", "the file value applies");
+            writeFileSync(cfg, JSON.stringify({ compat: { degenerateTurn: "error" } }));
+            assert.equal(loadOptions({}).degenerateTurn, "error", "error value parses");
+            assert.equal(loadOptions({ BILI_DEGENERATE_TURN: "passthrough" }).degenerateTurn, "passthrough", "env wins over the file");
+            assert.equal(loadOptions({ BILI_DEGENERATE_TURN: "error" }).degenerateTurn, "error", "env error wins");
+            writeFileSync(cfg, JSON.stringify({ compat: { degenerateTurn: "bogus" } }));
+            assert.equal(loadOptions({}).degenerateTurn, "error", "unknown file values fall back to the default");
+            writeFileSync(cfg, JSON.stringify({}));
+            assert.equal(loadOptions({}).degenerateTurn, "error", "absent value defaults to error (status quo)");
+        } finally {
+            if (prevFile === undefined) delete process.env["BILI_CONFIG_FILE"]; else process.env["BILI_CONFIG_FILE"] = prevFile;
+            if (prevEnv === undefined) delete process.env["BILI_DEGENERATE_TURN"]; else process.env["BILI_DEGENERATE_TURN"] = prevEnv;
+        }
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});

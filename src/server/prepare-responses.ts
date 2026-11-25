@@ -55,7 +55,7 @@ import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, 
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { egressAuthorityArmed, egressTinyBudget, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, egressBlockLedgerFor, egressTinyBudget, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -567,7 +567,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 // row). Unreadable flow → hard fail.
                 const armed = egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: egressSide });
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCore, log, armed });
-                const served = recordAuthorityTurn(st, sessionId, auth, projection.systemParts.join("\n\n"), log);
+                const served = recordAuthorityTurn(st, sessionId, auth, projection.systemParts.join("\n\n"), log, egressBlockLedgerFor(session), session.state.messageRefs);
                 if (served !== null) laneCore = served;
             }
         }
