@@ -181,14 +181,15 @@ test("recording: nudge-shaped churn is EXCLUDED (ephemeral rows never recorded)"
     }
 });
 
-test("#3617 negative direction: rollout key OFF by default → gate never opens", () => {
+test("#3617 negative direction: the plane can be forced OFF → gate never opens", () => {
     const saved = process.env.BILI_ROLLOUT_EGRESS_PLANE;
-    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     try {
-        // egressPlane stays opt-in (owner ruling 2026-11-24): with neither env
-        // nor config the prepare-openai gate (featureEnabled) sees it OFF and
+        // this ci:full branch bakes egressPlane to 100 — the rollback path is
+        // the forced "0" (the env always wins over the baked-in percent):
+        // with the env at 0 the prepare-openai gate (featureEnabled) sees it OFF and
         // records no rows. The documented force-on is env "1" or config true.
-        assert.equal(featureEnabled("egressPlane"), false, "egressPlane default 0 — unset env/config resolves OFF");
+        assert.equal(featureEnabled("egressPlane"), false, "forced 0 resolves OFF even against the branch default 100");
         process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
         assert.equal(featureEnabled("egressPlane"), true, "explicit 1 (the documented force-on) opens the gate");
     } finally {
