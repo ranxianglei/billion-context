@@ -837,6 +837,34 @@ test("#5959 review: a throwing getter eviction cannot escape the watchdog timer"
     }
 });
 
+// #5959 review: a configurable accessor masking our own top — a passthrough
+// getter returning top PLUS a setter that swallows writes. Pre-fix the plain
+// write went through the setter (no-op) and the readback still returned top
+// → failures=0 → silent permanent non-heal (the slot stayed an accessor and
+// the inspector guard kept failing). The heal must convert the slot back to a
+// data property.
+test("#5959 review: a configurable accessor masking our own top (getter + setter) is converted back to a data property", async () => {
+    const nativeSink: string[] = [];
+    const nativeFetch = fakeFetch(nativeSink);
+    await withScope(nativeFetch, async () => {
+        installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+        const top = globalThis.fetch;
+        Object.defineProperty(globalThis, "fetch", {
+            get: () => top,
+            set: () => { /* swallow */ },
+            configurable: true,
+            enumerable: true,
+        });
+        tick();
+        const descriptor = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+        assert.ok(descriptor !== undefined && "value" in descriptor, "the heal converts the slot back to a data property");
+        assert.equal(descriptor.value, top);
+        // The DSH inspector guard passes verbatim.
+        if (descriptor !== void 0 && !("value" in descriptor))
+            throw new Error("inspector: globalThis.fetch is an accessor and cannot be observed safely");
+    });
+});
+
 // #6829: pi-web-access 0.46+ marks its wrapper with the SHARED flag only
 // (`__piWebAccessSharedProxyFetch`) — the old flag propagates only when the
 // wrapped fetch already has it. The guard must recognize the shared marker
