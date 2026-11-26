@@ -38,17 +38,6 @@
 import type { Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 
-
-
-
-
-
-
-
-
-
-
-
 type LogFn = (level: string, msg: string) => void;
 
 const REDACTED_PLACEHOLDER = "[redacted_thinking]";
