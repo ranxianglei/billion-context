@@ -232,6 +232,16 @@ const COMPRESS_LOOP_KEY = "compressFailStreak";
 const COMPRESS_LOOP_THRESHOLD = 3;
 const COMPRESS_LOOP_DECAY_MS = 10 * 60 * 1000;
 
+// #7762: the summary-length failure class — fixable by the CALLER (pass
+// summaryMaxChars, or shorten/split the offending summary). It is NOT loop
+// noise: the breaker's "further attempts will keep failing" premise is false
+// for it, because a further attempt WITH the fix succeeds. Counting it armed
+// the breaker whose STOP text forbids the very remedy the kernel's per-range
+// error advertises ("Or pass summaryMaxChars to increase the limit"), leaving
+// a long session unable to compress. The per-receipt "pass summaryMaxChars"
+// instruction is the right tool for steering the fix, not the breaker.
+const SUMMARY_LENGTH_FAIL_RE = /failed summary-length validation|Summary too long|Summary too short|Summary is empty|Batch summary too short/;
+
 type CompressLoopStreak = { n: number; lastAt: number; cause?: string };
 
 function readCompressLoopStreak(session: Session): CompressLoopStreak | undefined {
@@ -306,6 +316,11 @@ const RETURN_TO_TASK_SUFFIX = " This failure only concerns the compress call. Re
  *  wording, everything else keeps the verbatim loop-noise paragraph. */
 function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: string, forcedCause?: string): string {
     const now = Date.now();
+    // #7762: a summary-length failure is fixable by the caller, so it is NOT
+    // loop noise — exclude it from the streak entirely (no increment, no
+    // cause write, no disarm-extension). The per-receipt "pass summaryMaxChars"
+    // instruction steers the fix; arming the breaker here would forbid it.
+    if (errs !== undefined && SUMMARY_LENGTH_FAIL_RE.test(errs)) return "";
     let streak = readCompressLoopStreak(ctx.session);
     if (streak && now - streak.lastAt > COMPRESS_LOOP_DECAY_MS) streak = undefined;
     const n = (streak?.n ?? 0) + 1;
