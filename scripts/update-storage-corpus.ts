@@ -22,13 +22,12 @@
  *  fork-retained — publicSnapshotRetained only: snapshot persisted, store
  *                  NOT (the #2675 ② asymmetry, pinned as-is)
  *  image         — base64 image content + pre-#3266 legacy image keys on disk (dropped on load)
- *  ccr           — content-store.json sibling (CCR originals, #1097)
  *  twinfile      — namespaced v2 file + stale flat v1 twin (#2671 ①)
  *  zstd          — BILIZSTD1-framed twin of `folded` (identical digest)
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createCore, createInitialState, defaultConfig, assignRefs, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import { createCore, createInitialState, defaultConfig, assignRefs, type CompressionState, type CoreMessage } from "acp-kernel";
 import { flatFileNameFor } from "acp-kernel/persist";
 import { SessionStore, relPathFor, type Session } from "../src/persist.ts";
 import { canonicalize, sha256 } from "../tests/golden-canonical.ts";
@@ -40,6 +39,12 @@ const CREATED_AT = 1_700_000_000_000;
 // with persist.zstd=true in its config file must not silently re-frame every
 // case. The `zstd` case flips this on for its own writes.
 process.env.BILI_PERSIST_ZSTD = "0";
+
+// The corpus pins the LEGACY JSON on-disk format and the test reads it back
+// with BILI_STORAGE_UNIFIED=legacy. The storage default is now pure-sqlite
+// (index.db only, JSON not written), so the generator must force the legacy
+// write path explicitly or it emits index.db and there are no files to pin.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 // ── kernel engine (idioms lifted from tests/pins-storage-refactor.test.ts) ──
 
@@ -101,14 +106,12 @@ function baseSession(id: string, protocol: Session["meta"]["protocol"], e: Engin
             requests: 7, tokensSaved: 12345, inputTokens: 234567, cachedTokens: 123456, outputTokens: 3456,
             cacheSamples: 7, lastInputTokens: 45678, contextTokens: 45678, contextTokensSource: "usage",
             localInputEstimate: 45000, lastUsageGradeTokens: 44000, lastInputTokensOrigin: "http://127.0.0.1:8199",
-            retrieveCalls: 3, retrieveHits: 2, retrieveMisses: 1, retrieveDelivered: 3,
         },
         metadata: { corpus: id },
         state: e.state,
         createdAt: CREATED_AT,
         lastSeen: CREATED_AT,
         restored: false,
-        ccrReconcilePending: false,
         blockContents: new Map(),
         lastMessages: undefined,
         lastMessagesFolded: false,
@@ -152,7 +155,6 @@ function sessionDigest(loaded: Session): string {
         lastMessages: loaded.lastMessages,
         lastMessagesFolded: loaded.lastMessagesFolded,
         pluginSnapshot: loaded.pluginSnapshot,
-        contentStore: loaded.contentStore,
     };
     return sha256(JSON.stringify(canonicalize(view)));
 }
@@ -272,17 +274,9 @@ async function main(): Promise<void> {
         syncRefs(e);
         fold(e, refFor(e, "raw2")!, refFor(e, "raw20")!, "fork fixture fold over raw2..raw20 ".repeat(8));
         const block = e.state.blocks.find((b) => b.active)!;
-        const contentStore: MessageContentStore = {
-            version: 1,
-            byHash: { [sha256("original tool output corpus-1")]: "original tool output corpus-1" },
-            byRef: {
-                [refFor(e, "raw4")!]: { kind: "tool_result", rawId: "raw4", ref: refFor(e, "raw4")!, text: "original tool output corpus-1", tokens: 40, chars: 27, head: "original tool output c" },
-            },
-        };
         const session = baseSession("corpus-fork-receipt", "chat", e, {
             blockContents: new Map([[block.blockId, { one: null, full: { text: "fork fixture fold over raw2..raw20 ".repeat(8), count: 19 } }]]),
             pluginSnapshot: e.messages,
-            contentStore,
             metadata: {
                 corpus: "corpus-fork-receipt",
                 publicForkReceipt: { childId: "corpus-fork-child", cutAtRef: refFor(e, "raw15")!, revision: sha256("corpus-fork-receipt-parent-rev"), at: CREATED_AT },
@@ -307,15 +301,13 @@ async function main(): Promise<void> {
         const session = baseSession("corpus-fork-retained", "chat", e, {
             blockContents: new Map([[block.blockId, { one: null, full: { text: "retained fixture fold over raw2..raw20 ".repeat(8), count: 19 } }]]),
             pluginSnapshot: e.messages,
-            contentStore: { version: 1, byHash: {}, byRef: {} },
             metadata: { corpus: "corpus-fork-retained", publicSnapshotRetained: true },
         });
         const res = await writeAndPin("fork-retained", session, { protocol: "chat", upstreamOrigin: "http://127.0.0.1:8199" });
         manifest["fork-retained"] = {
             ...res,
-            description: "publicSnapshotRetained only — pluginSnapshot persisted, forkContentStore DROPPED (pins the #2675 ② asymmetry verbatim)",
+            description: "publicSnapshotRetained only — pluginSnapshot persisted (pins the #2675 ② retention)",
 
-            notes: { expectContentStoreOnLoad: "absent" },
         };
     }
 
@@ -361,39 +353,6 @@ async function main(): Promise<void> {
         manifest["image"] = {
             ...res,
             description: "base64 image message with pre-#3266 legacy image keys on disk (dropped on load)",
-
-        };
-    }
-
-    // ── ccr (content-store.json sibling) ────────────────────────────────────
-    {
-        const e = newEngine();
-        e.messages = makeMsgs(24);
-        syncRefs(e);
-        const contentStore: MessageContentStore = {
-            version: 1,
-            byHash: {
-                [sha256("ccr original one")]: "ccr original one",
-                [sha256("ccr original two")]: "ccr original two",
-            },
-            byRef: {
-                [refFor(e, "raw6")!]: { kind: "tool_result", rawId: "raw6", ref: refFor(e, "raw6")!, text: "ccr original one", tokens: 33, chars: 16, head: "ccr original one" },
-                [refFor(e, "raw8")!]: { kind: "tool_result", rawId: "raw8", ref: refFor(e, "raw8")!, text: "ccr original two", tokens: 33, chars: 16, head: "ccr original two" },
-            },
-        };
-        const session = baseSession("corpus-ccr", "responses", e, {
-            contentStore,
-            contentStoreDirty: true,
-            stats: {
-                requests: 2, tokensSaved: 6000, inputTokens: 50000, cachedTokens: 0, outputTokens: 200,
-                cacheSamples: 2, lastInputTokens: 50000, contextTokens: 50000, contextTokensSource: "estimate",
-                storedBytes: 32, storeBytesSaved: 64,
-            },
-        });
-        const res = await writeAndPin("ccr", session, { protocol: "responses", upstreamOrigin: "http://127.0.0.1:8199" });
-        manifest["ccr"] = {
-            ...res,
-            description: "content-store.json sibling with two CCR originals (#1097 envelope)",
 
         };
     }
