@@ -164,7 +164,7 @@ export interface SessionRow {
      *  pluginSnapshotSeqs?: number[]|null} (loadLegacyView's contract).
      *  Content itself lives in messages. */
     tailJson: string;
-    /** Verbatim CCR store JSON (dying subsystem, Phase 3 removes it). */
+    /** Verbatim content-store JSON (removed with CCR, #7755; column kept for backward compat). */
     ccrJson: string | null;
     /** #3133 ingest watermark: highest absolute message seq whose bytes this
      *  index has verified (NULL = no trusted prefix → next save ingests

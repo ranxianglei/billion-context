@@ -46,7 +46,7 @@ import { gcSettings as knobGcSettings } from "./knobs.js";
  * once #1083 lands — works via the store's format-agnostic reader).
  * Corrupt/unreadable files are left in place, never guessed at.
  *
- * #1180: the per-session CCR content store (#1097) lives next to its session
+ * #1180: the per-session content store lives next to its session
  * file as `<hash>.content-store.json` and shares the session's lifecycle —
  * it holds lossless payload bytes (originals of oversized tool results), so
  * deleting the session loses exactly those bytes, the class of file this
@@ -230,7 +230,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
     } catch {
         return result;
     }
-    // #1180: split sessions from CCR companions (#1097); companion path is the
+    // #1180: split sessions from content-store companions; companion path is the
     // deterministic sibling per contentStoreRelPathFor — no decode to pair them.
     const companionSuffix = ".content-store.json";
     const sessionFiles: string[] = [];

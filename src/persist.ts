@@ -1867,7 +1867,7 @@ export class SessionStore {
      *  alignment, now invoked NOT at cold load but from scheduleSave after
      *  the session's next successful fold (session.pendingLedgerAlign
      *  marker). The body is unchanged in intent: aligns refs onto store-row
-     *  seq+1 in one atomic pass, re-keys the CCR store and token snapshot in
+     *  seq+1 in one atomic pass, re-keys the token snapshot in
      *  the SAME pass (#4733/#4599), publishes the superseded map so stale
      *  citations are refused rather than misattributed. Guards:
      *  state already aligned, no ref map, unified store unavailable, or no
@@ -1928,17 +1928,17 @@ export class SessionStore {
      *  first SAVE boundary after a fold commit. Every write entry point
      *  (scheduleSave / flushSync / writeNow) calls this BEFORE
      *  saveContentStore / guardedBuild, so the aligned state and the
-     *  re-keyed CCR store land in the SAME serialized record (the invariant
+     *  re-keyed state land in the SAME serialized record (the invariant
      *  #4733 exists for). No fold ⇒ marker never set ⇒ pure legacy no-op. */
     private consumePendingLedgerAlign(session: Session): void {
         if (!session.pendingLedgerAlign) return;
         delete session.pendingLedgerAlign;
         // #6780 P0 (review F1): the restamp below mutates state that this tick's
         // pre-forward durability ingest (ingestRowsNow) already made durable —
-        // it renumbers refs and re-keys the CCR store AFTER that ingest. Consuming
+        // it renumbers refs AFTER that ingest. Consuming
         // the arm here forces the restamp turn's coalesced build to run in full
         // (once per session lifetime — maybeRestampToLedger no-ops once aligned),
-        // keeping the #4733 invariant: aligned state and re-keyed CCR land in the
+        // keeping the #4733 invariant: aligned state land in the
         // SAME serialized record. Without this, pendingLedgerAlign is already
         // deleted by the time the writer-off gate reads it, so the gate's own
         // align check would be a dead signal and the restamped bytes would ride
@@ -3208,7 +3208,7 @@ export class SessionStore {
      *  that made long sessions cite refs the gate rejects as "above the highest
      *  allocated ref"). The large JSON envelope stays debounced — only the small
      *  row ingest moves ahead of it. Mirrors the debounced path's ingest legs
-     *  (stale-disk guard + rawTail + live CCR + noteOwnCommit), minus the
+     *  (stale-disk guard + rawTail + noteOwnCommit), minus the
      *  envelope write and its landing stamp. */
     ingestRowsNow(session: Session): void {
         if (!this.shadow) return; // legacy-only (no unified index) — nothing to back
@@ -3280,7 +3280,7 @@ export class SessionStore {
         if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
             if (frozen) this.noteFrozenSkip(session.id, "scheduled");
             // Phase 3 (#2960): index-only persistence — the builder closure
-            // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
+            // runs the sidecar ingest (raw tail) and the stale-disk
             // guard; no envelope write is armed, so no debounce is needed.
             // #3133: coalesce same-tick markDirty storms into ONE build — the
             // builder reads session state at run time, so the batched run
@@ -3299,7 +3299,7 @@ export class SessionStore {
                 // state. If nothing changed since — the epoch moved by exactly
                 // prepare's own markDirty (markDirty is the mutation chokepoint),
                 // the same lastMessages array is live (a re-snapshot does not
-                // bump the epoch), no new decomposition payload, no CCR re-key,
+                // bump the epoch), no new decomposition payload,
                 // no pending ledger align, and the metadata bytes are untouched —
                 // the full rebuild + full delta-ingest below is a pure no-op
                 // that still pays the three-table full reads, the whole-record

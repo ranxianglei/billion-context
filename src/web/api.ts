@@ -298,7 +298,7 @@ export async function handleConfigPut(
     if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough && !hasDsh && !hasBilling && !hasFile) return sendError(res, 400, "expected providers, upstream proxy, compress, billing, passthrough, or the full config file");
     // Raw whole-file save (web config card): validate the known fields exactly like the
     // structured payload, then replace the ENTIRE config — preserving unknown keys such
-    // as promptPack/ccr that per-field PUTs cannot touch.
+    // as promptPack that per-field PUTs cannot touch.
     if (hasFile) {
         if (typeof body.file !== "string") return sendError(res, 400, "file must be a string (raw config JSON text)");
         let next: ConfigShape;

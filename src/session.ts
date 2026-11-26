@@ -599,7 +599,7 @@ export type Session = {
          *  request, so persisting it would be stale by definition. */
         lastCalibrationPolicy?: { disabled?: boolean; max?: number };
         lastCalibrationPolicyOrigin?: string;
-        /** #1179 CCR v2: range-level decompress restores served (ephemeral channel). */
+        /** Range-level decompress restores served (ephemeral channel). */
         rangeRestores: number;
         /** #1336: whole-block decompress restores served. Optional — absent in
          *  pre-#1336 records. */
@@ -2149,7 +2149,7 @@ function evictOldest(opts?: { overrideGrace?: boolean }): boolean {
     const ok = getStore().flushSync(s);
     if (!ok) {
         // A prior save does not contain the latest mutations. Keep newer
-        // state resident whenever its flush fails, including CCR failures.
+        // state resident whenever its flush fails, including store failures.
         return false;
     }
     sessions.delete(oldestId);

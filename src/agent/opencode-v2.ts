@@ -518,7 +518,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
 
         const STATIC_TOOL_NAMES = new Set(V2_BILI_TOOLS.map((t) => t.name));
 
-        // #2443: the static list covers only the always-on core. The manifest is the host's authoritative declaration of the CONDITIONAL surface (acp_retrieve while CCR is armed, acp_rule while rules are on); without consulting it a CCR placeholder points at a tool the model can never call. The base is discovered lazily (native bootstrap / per-request routing), so register the delta on first routed request — single-flight, degrading inertly (tools stay unregistered) when the manifest is unreachable.
+        // #2443: the static list covers only the always-on core. The manifest is the host's authoritative declaration of the CONDITIONAL surface (acp_rule while rules are on); without consulting it a placeholder points at a tool the model can never call. The base is discovered lazily (native bootstrap / per-request routing), so register the delta on first routed request — single-flight, degrading inertly (tools stay unregistered) when the manifest is unreachable.
         const ensureConditionalTools = (): void => {
             if (state.toolDeltaReady || state.toolDelta !== undefined || pluginDisabled()) return;
             const base = state.proxyBase;
@@ -543,7 +543,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                         // #2443: latch readiness only when the registration
                         // actually settles. A rejected transform previously
                         // left toolDeltaReady=true with the conditional tools
-                        // (acp_retrieve / acp_rule) silently absent until host
+                        // (acp_rule) silently absent until host
                         // restart — no retry, no log (PR #2581 review). Now:
                         // surface the rejection and re-arm the retry cadence
                         // (the outer .finally clears toolDelta, so the next
@@ -564,7 +564,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                     state.toolDeltaRetryAt = undefined;
                 })
                 .catch((err) => {
-                    console.error(`bili: opencode conditional-tool manifest fetch failed (${err instanceof Error ? err.message : String(err)}) — acp_retrieve/acp_rule stay unregistered; will retry on the next routed request (#2656)`);
+                    console.error(`bili: opencode conditional-tool manifest fetch failed (${err instanceof Error ? err.message : String(err)}) — acp_rule stays unregistered; will retry on the next routed request (#2656)`);
                     state.toolDeltaRetryAt = Date.now() + TOOL_DELTA_RETRY_MS;
                 })
                 .finally(() => {

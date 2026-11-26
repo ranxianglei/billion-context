@@ -2757,7 +2757,7 @@ function changelogCatOf(rawLine) {
     function toolChipCls(name) {
         if (name === "bash" || name === "shell" || name === "run_command") return "t-shell";
         if (name === "read" || name === "write" || name === "edit" || name === "ls" || name === "glob" || name === "note") return "t-file";
-        if (name === "grep" || name === "search_context" || name === "decompress" || name === "acp_retrieve") return "t-seek";
+        if (name === "grep" || name === "search_context" || name === "decompress" || name === "acp_rule") return "t-seek";
         if (name === "compress" || name === "acp_status" || name === "acp_cache" || name === "acp_retire" || name === "acp_restore" || name === "acp_rewrite") return "t-fold";
         return "";
     }

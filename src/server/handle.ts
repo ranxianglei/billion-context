@@ -1938,7 +1938,7 @@ async function handleRequest(
             const pluginAnnounced = pluginAgentHeader(req.headers) !== undefined;
             if (artifactKind !== null && !pluginAnnounced && !hasProcessedState(sessionId, { protocol })) {
                 // #1357 Phase 1: historical ACP content is ADVISORY, never
-                // decisive. It can be user-authored (AGENTS.md / docs / CCR
+                // decisive. It can be user-authored (AGENTS.md / docs
                 // lossless originals / pastes), so judging it a foreign chain
                 // and forwarding verbatim here permanently locked FRESH sessions
                 // into passthrough — the decision returned before any session was
@@ -2740,7 +2740,7 @@ async function handleRequest(
                 ? buildDshCompactionForgeBody(protocol as "openai" | "anthropic" | "responses", forgeText, { inputTokens: Math.max(1, estimateCjkTokens(forgeText)), outputTokens: 0 }, (parsed as { stream?: unknown }).stream === true)
                 : null;
             if (authored !== null) {
-                log("info", `[${session.id}] dsh compaction call identified (${identifiedAs}, ${inboundMsgs} msgs) — ANSWERED LOCALLY with the bili snapshot (#3733 authored checkpoint): upstream not contacted, dsh records our tagged checkpoint; originals stay recoverable via CCR/export`);
+                log("info", `[${session.id}] dsh compaction call identified (${identifiedAs}, ${inboundMsgs} msgs) — ANSWERED LOCALLY with the bili snapshot (#3733 authored checkpoint): upstream not contacted, dsh records our tagged checkpoint; originals stay recoverable via export`);
             } else if (session.metadata.dshCompactionRefused !== true) {
                 session.metadata.dshCompactionRefused = true;
                 const shapeDrift = inboundMsgs !== null && inboundMsgs > DSH_COMPACTION_SHAPE_MSGS ? `, shape drifted from the ≤${DSH_COMPACTION_SHAPE_MSGS}-msg rc.1 envelope — rc.2 replays the full shadowed region (#2193)` : "";

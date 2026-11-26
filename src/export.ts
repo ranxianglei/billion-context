@@ -276,7 +276,7 @@ function safeJson(raw: string | null | undefined): unknown {
 }
 
 /** JSONL dump rendered from the unified tables (#2671 Phase 2c). One JSON
- * record per line: a session header, then messages ordered by seq (CCR
+ * record per line: a session header, then messages ordered by seq
  * placeholders dereferenced to their stored originals when `full`; retired
  * rows included carrying `retiredAt`, live rows omit it — #4390/#4664), then
  * blocks ordered by ord, then dead refs. Deterministic for a given store
@@ -349,7 +349,7 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
 }
 
 /** JSONL fallback when no unified index exists: the legacy record's tail
- * snapshot + block summaries + CCR store. The header says so. */
+ * snapshot + block summaries + store. The header says so. */
 export function renderSessionJsonlFromSession(s: Session): string {
     const lines: string[] = [];
     lines.push(

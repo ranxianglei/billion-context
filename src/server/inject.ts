@@ -94,8 +94,8 @@ function mergeOwnedTools<T>(tools: readonly T[] | undefined, acp: readonly T[], 
 }
 
 export function injectTool(tools: unknown[] | undefined, extras?: readonly { name: string }[], toolPrompts?: ToolPrompts, externalOn = false): unknown[] {
-    // #1712: decompress's startId/endId execute only on CCR-armed sessions
-    // (#1179), so serve the no-range schema when CCR is off.
+    // #1712: decompress's startId/endId execute only on sessions with the relevant store state
+    // (#1179), so serve the no-range schema when the store is off.
     // #3252: when the client's own tools are code-mode-shaped (run_code
     // present), the ACP entries get the exempt note — see compress-tool.ts.
     const mode = ptcNoteMode((tools ?? []).map((t) => (t as { name?: string })?.name));

@@ -1760,7 +1760,7 @@ function recentZoneBoundaryRef(deps: PreflightDeps, messages: CoreMessage[], tok
 
 // #2383: CPU-only stand-in for the LLM summary in the emergency-fold regime.
 // A fold only needs a summary the kernel accepts that nets a shrink; the
-// folded originals stay restorable because applyRanges caches them (CCR store)
+// folded originals stay restorable because applyRanges caches them
 // exactly like any other preflight fold. The digest is structural — per-entry
 // ref/label/size plus a head fragment — so a reader can see what was folded
 // and where it lives. Three fallback forms guarantee the result fits BOTH

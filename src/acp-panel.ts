@@ -209,7 +209,7 @@ const LEGACY_STATUS_SECTION_STARTS = [
     "The Compressible-ranges list above was re-derived",
     "FOLD BASE GENERATION MISMATCH — ",
     "FOLD SUBSTRATE INVALID — ",
-    "STORE (CCR) — ",
+    "STORE — ",
     "RETRIEVAL QUALITY — ",
     "BLOCK SPANS — ",
     "STORAGE — ",

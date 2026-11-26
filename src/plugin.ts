@@ -1371,7 +1371,7 @@ export function publicForkInputCheck(session: Session, protocol: WireProtocol, p
 
 /** Cheap, cache-backed read of the fork parentRevision. forkSnapshot() is a
  *  pure function of the session content and status polling would otherwise
- *  re-hash the entire history (plus the CCR store, payload by payload) on
+ *  re-hash the entire history (plus the store, payload by payload) on
  *  every call (#2017 review item E); revisionEpoch — bumped by markDirty on
  *  every mutation — keys the cache, so an unchanged session costs O(1).
  *  Same fail-closed errors as forkSnapshot itself propagate to the caller. */
@@ -1534,7 +1534,7 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
     // #2671 Phase 2b (fork protocol v2): the revision token is now
     // {sessionId, seq, active block set} — stable across any churn that does
     // not move the ordered snapshot or the active blocks (v1 hashed the whole
-    // state incl. every CCR payload, so unrelated store activity flipped it;
+    // state incl. every store payload, so unrelated store activity flipped it;
     // see forkParentRevisionLegacy). The deep fork checks (orderHash +
     // byte-exact prefix comparison below) remain the correctness boundary;
     // the revision is only the cheap early-exit token.

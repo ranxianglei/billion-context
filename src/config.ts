@@ -1161,7 +1161,7 @@ export type ProxyOptions = {
      *  request carries ACP artifacts / a `<bili-chain …/>` checkpoint in the
      *  BODY but no x-bili-hop header, record an advisory observation and/or apply
      *  first-processor-wins passthrough (#1086/#1421). OFF by default (#1683
-     *  follow-up): scanning the body can false-positive on CCR/file-introduced
+     *  follow-up): scanning the body can false-positive on file-introduced
      *  text and model-echoed tags, so by default ONLY the x-bili-hop header drives
      *  chain recognition. Re-enable via env BILI_CHAIN_CONTENT=1 or
      *  `chainContentDetection: true` in the config file (env wins). The
@@ -2091,7 +2091,7 @@ type FileConfig = {
     resumeInheritance?: boolean;
     /** Set `true` to enable body-content detection of the bili→bili chain
      *  awareness (#1086/#1421); OFF by default — by default only x-bili-hop drives
-     *  chain recognition, since body scanning can false-positive on CCR/file-
+     *  chain recognition, since body scanning can false-positive on file-
      *  introduced text and model-echoed tags (#1683). Env BILI_CHAIN_CONTENT=1
      *  wins over the file. */
     chainContentDetection?: boolean;
@@ -2267,7 +2267,7 @@ type FileConfig = {
         mysql?: { dsn?: string };
         /** Phase 3 (#2960): "off" stops writing the legacy JSON envelope AND
          *  the per-session CCR content-store sidecar while storage.unified is
-         *  "full" — the SQLite index (session row + ccr mirror) becomes the
+         *  "full" — the SQLite index (session row) becomes the
          *  only persistent copy (reads were already unified-first; boot
          *  enumerates the index union). Ignored with a one-time warning under
          *  shadow/legacy, where the JSON file remains the sole source of

@@ -211,7 +211,7 @@ export function resolveDecompress(
     // emit "" for optional fields, and treating that as a range request produced
     // an unsatisfiable retry loop (fill in a real range → refused in plugin mode).
     if (hasRangeArgs(args)) {
-        // #7755: range restore (startId/endId) depended on the CCR content
+        // #7755: range restore (startId/endId) depended on the content
         // store and was removed with it — whole-block restore still works.
         return toolFail(`[decompress FAILED: range restore (startId/endId) was removed (#7755) — restore the whole block: {"blockId":"${blockId}"}]`);
     }
@@ -359,7 +359,7 @@ function coveredMessages(state: CompressionState, block: CompressionBlock): Cove
     return { raws, text: head.map(fmtRun).join(", ") + (rest > 0 ? ` …+${rest} more` : "") };
 }
 
-/** #1179 CCR v2: the message refs a block covers, as compact span text
+/** #1179: the message refs a block covers, as compact span text
  *  ("m00044–m00097") plus count — or null when no individual refs are
  *  resolvable (older blocks whose raw ids left the map). */
 export function coveredRefSpan(state: CompressionState, block: CompressionBlock): { text: string; count: number } | null {
@@ -792,8 +792,8 @@ export function executeSearchContext(
     const lines = blocks.map((b) => {
         const topic = b.topic ?? "(no topic)";
         const preview = evidenceSnippet(b.summary, terms, freq);
-        // #1179 CCR v2: covered message-ref span(s) — connect block space to
-        // store space so the model can target acp_retrieve / range decompress
+        // #1179: covered message-ref span(s) — connect block space to
+        // store space so the model can target range decompress
         // at individual messages instead of whole blocks.
         const span = coveredRefSpan(state, b);
         const spanNote = span ? ` [${span.text} · ${span.count} msgs]` : "";

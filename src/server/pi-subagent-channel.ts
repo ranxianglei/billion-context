@@ -49,7 +49,7 @@ const PI_SUBAGENT_CHILD_MARKER_RE = /\x3cactive_agent name="([^"]+)"/;
 
 /** Tool names bili may add to the request tools array when serving the
  *  proxy-style channel: the core ACP four plus the feature extras at their
- *  default names (absorb.toolName / ccr.toolName are config-renamable — a
+ *  default names (absorb.toolName is config-renamable — a
  *  renamed extra colliding with a role-whitelisted name is an accepted residual
  *  edge, see PR #2268 discussion). */
 const BILI_INJECTABLE_TOOL_NAMES = new Set([
@@ -58,7 +58,6 @@ const BILI_INJECTABLE_TOOL_NAMES = new Set([
     "search_context",
     "acp_status",
     "acp_rule",
-    "acp_retrieve",
     "absorb",
     "acp_retire",
     "acp_restore",

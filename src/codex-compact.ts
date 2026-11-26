@@ -61,7 +61,7 @@ export function isCodexClient(headers: Record<string, string | string[] | undefi
  *  the requesting host authoritatively: a native host that ships a
  *  codex-shaped UA for relay compatibility (pi over a strict codex relay) is
  *  still THAT host, and must not inherit codex-only compaction policy (the 0.9
- *  health bar, forge/reconcile lanes, CCR/image disarm, compact-trigger
+ *  health bar, forge/reconcile lanes, image disarm, compact-trigger
  *  dispatch, codex-table window alignment, instructions-fingerprint keying).
  *  No marker → fall back to the UA guess exactly as before, so headerless
  *  clients keep their detection unchanged. Wire-shape decisions (the

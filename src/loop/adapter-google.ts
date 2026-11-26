@@ -20,7 +20,7 @@ const PROXY_TOOL_SET = new Set([
     // here or their chunks raw-replay to the client as "real" calls. acp_cache
     // had the same gap before this change.
     "acp_retire", "acp_restore", "acp_rewrite", "acp_cache",
-    "acp_retrieve", "acp_rule", "acp_read_original_image",
+    "acp_rule", "acp_read_original_image",
     "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
 ]);
 

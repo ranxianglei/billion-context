@@ -441,7 +441,7 @@ function parsePercent(v: number | string): number {
  *  context window (the caller handles the async registry lookup), this merges
  *  global → provider → model compress settings and applies them onto `base`,
  *  returning the tuned Config (or `base` unchanged when nothing is configured
- *  and the limit is unchanged — CCR is opt-in, so an unset `ccr` never forces
+ *  and the limit is unchanged — the store is opt-in, so an unset store key never forces
  *  a fresh config). This is the exact function the proxy calls for every
  *  request, extracted so the three-level cascade is testable end-to-end
  *  without spinning up the HTTP server. */

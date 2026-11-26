@@ -515,9 +515,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url === "/__bili/plugin/manifest") {
         // [#1271/#1278] kernelConfig carries no file/global compress settings; resolve the
         // GLOBAL view exactly like the request path does (applyCompressSettings) so every
-        // opt-in tool — acp_retrieve (#1271), absorb (#1278) — is advertised exactly when the
+        // opt-in tool — absorb (#1278) — is advertised exactly when the
         // operator enabled it at the global level. Unset fields floor to kernel defaults
-        // (DEFAULT_CCR_CONFIG et al. inside applyCompressSettings); per-request/route overrides
+        // (applyCompressSettings); per-request/route overrides
         // are still enforced at execution time, so the manifest stays conservative as #1192
         // requires. Do not "simplify" this back to `config`.
         // #3243: pass the pack surface's tool descriptions too — resolved from the SAME

@@ -552,10 +552,10 @@ export function sessionResidentHardMaxBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : sessionResidentMaxBytes();
 }
 
-/** BILI_SESSION_CONTENT_STORE_PIN (1/true): keep each session's CCR content
+/** BILI_SESSION_CONTENT_STORE_PIN (1/true): keep each session's content
  *  store ({byRef}/{byHash} originals) RESIDENT in memory instead of folding
  *  it away after its save lands (#4788 phase 2, discussion #3916-E; the
- *  store re-materializes on first touch from the unified ccr mirror or the
+ *  store re-materializes on first touch from the unified mirror or the
  *  .content-store.json sidecar — payload-first write order, #2674). Unset,
  *  0/false or any other value = fold (the default). */
 export function contentStorePinned(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -635,7 +635,7 @@ export function updateStaggerMaxDelayMs(): number | undefined {
     return Number.isInteger(v) && v >= 0 ? Math.floor(v) : undefined;
 }
 
-// --- CCR / codex / misc host-adjacent knobs ---
+// --- codex / misc host-adjacent knobs ---
 
 /** BILI_PUBLIC_SNAPSHOT_CAP_BYTES > plugin.snapshotCapBytes > 100 MiB (#2017
  *  D-B). Caps the raw wire-history snapshot retained per plugin session for
