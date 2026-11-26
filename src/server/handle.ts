@@ -2762,6 +2762,21 @@ async function handleRequest(
             const identifiedAs = declaredDshCompaction
                 ? "declared purpose=compaction (#6880)"
                 : "final user message = COMPACTION_INSTRUCTION";
+            // #7745: track compaction calls per session, distinguishing auto/manual.
+            // Manual = text match (final user message is COMPACTION_INSTRUCTION);
+            // auto = declaration-only (purpose=compaction without text match).
+            const isManualCompaction = isDshCompactionCall(protocol, parsed);
+            if (isManualCompaction) {
+                session.metadata["dshCompactionCallsManual"] = (typeof session.metadata["dshCompactionCallsManual"] === "number" ? session.metadata["dshCompactionCallsManual"] as number : 0) + 1;
+            } else {
+                session.metadata["dshCompactionCallsAuto"] = (typeof session.metadata["dshCompactionCallsAuto"] === "number" ? session.metadata["dshCompactionCallsAuto"] as number : 0) + 1;
+            }
+            const prevMaxMsgs = typeof session.metadata["dshMaxInboundMsgs"] === "number" ? session.metadata["dshMaxInboundMsgs"] as number : 0;
+            if (inboundMsgs !== null && inboundMsgs > prevMaxMsgs) {
+                session.metadata["dshMaxInboundMsgs"] = inboundMsgs;
+            }
+            markDirty(session);
+            log("info", `[${session.id}] dsh compaction call tracked: auto=${session.metadata["dshCompactionCallsAuto"] ?? 0}, manual=${session.metadata["dshCompactionCallsManual"] ?? 0}, inboundMsgs=${inboundMsgs}, maxInboundMsgs=${session.metadata["dshMaxInboundMsgs"] ?? 0}, contextTokensSource=${session.stats.contextTokensSource ?? "unknown"}`);
             // #3733: AUTHORED compaction — when the knob is on and the session
             // holds active fold blocks, answer the call LOCALLY with our folded
             // snapshot instead of refusing: zero egress (autoModeForge #2740
