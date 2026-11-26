@@ -8,7 +8,7 @@ import { getSession } from "../src/session.ts";
 
 function makeCtx() {
     const core = createCore();
-    const config = defaultConfig(200000) as Config;
+    const config = { ...defaultConfig(200000), minFoldBenefitTokens: 0 } as Config;
     const session = getSession(`test-${Math.random().toString(36).slice(2)}`);
     return { core, config, session };
 }

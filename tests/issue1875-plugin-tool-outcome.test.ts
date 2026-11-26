@@ -17,6 +17,7 @@ import { createCore, defaultConfig, type Config, type CoreMessage } from "acp-ke
 import { type PluginToolDeps, _resetPluginStateForTest, handlePluginTool } from "../src/plugin.ts";
 import { getSession } from "../src/session.ts";
 import { applyRanges } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { forwardTool } from "../src/mcp.ts";
 
@@ -90,7 +91,7 @@ describe("#1875: plugin tool endpoint reports business outcome, not just ok:true
 describe("#1875: applyRanges outcome mapping (applied / partial / refused)", () => {
     function makeCtx() {
         const core = createCore();
-        const config = defaultConfig(200000) as Config;
+        const config = { ...defaultConfig(200000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig;
         const session = getSession(`t-1875-ar-${Math.random().toString(36).slice(2)}`);
         const msgs: CoreMessage[] = [];
         for (let i = 0; i < 12; i++) {

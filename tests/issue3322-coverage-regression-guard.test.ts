@@ -30,7 +30,7 @@ afterEach(() => {
 
 function makeCtx(prefix: string) {
     const core = createCore();
-    const config = defaultConfig(200_000) as Config;
+    const config = { ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as Config;
     config.compress.maxSummaryLength = 0;
     // Fold ANY message: the guard under test must not depend on where the
     // token-based recent-zone boundary falls inside this small fixture.

@@ -32,7 +32,7 @@ const RAW = "Historical source src/example.ts:27 E_TEST; do not deploy; still ad
 
 function context(externalSummary?: unknown): RewriteCtx {
     const core = createCore();
-    const config = defaultConfig(400_000) as Config & { externalSummary?: unknown };
+    const config = { ...defaultConfig(400_000), minFoldBenefitTokens: 0 } as Config & { externalSummary?: unknown };
     // The chain now rides the request Config rail (#833) — ctx.config is the
     // session's effective resolved config, exactly like the proxy serves it.
     if (externalSummary !== undefined) config.externalSummary = externalSummary;

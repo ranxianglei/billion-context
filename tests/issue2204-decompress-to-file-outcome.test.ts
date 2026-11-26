@@ -21,7 +21,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { createCore, defaultConfig, type Config, type CoreMessage } from "acp-kernel";
-import { applyCompressSettings } from "../src/compress-settings.ts";
+import { applyCompressSettings, type ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { drainPendingRetrievals, storeEffectiveCcr } from "../src/store.ts";
 import { getSession } from "../src/session.ts";
 import { applyRanges } from "../src/stream.ts";
@@ -43,7 +43,7 @@ const pad = (n: number): string => String(n).padStart(5, "0");
 function foldBlock(tag: string, endRef: number, msgChars: number = 2000, log?: (msg: string) => void) {
     const count = endRef + 8;
     const core = createCore();
-    const config = defaultConfig(200_000) as Config;
+    const config = { ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig;
     const session = getSession(`tf2204-${tag}-${Math.random().toString(36).slice(2)}`);
     const msgs: CoreMessage[] = [];
     for (let i = 0; i < count; i++) {
@@ -68,7 +68,7 @@ function foldCcr() {
     const config = applyCompressSettings(
         defaultConfig(200_000),
         200_000,
-        { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: true, minToolTokens: 50 } },
+        { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: true, minToolTokens: 50 }, minFoldBenefitTokens: 0 },
     ) as Config;
     const session = getSession(`tfr2204-${Math.random().toString(36).slice(2)}`);
     storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
@@ -254,7 +254,7 @@ test("#2204 range toFile write failure → outcome:failure, no injection, block 
 test("#2204 endpoint: a failed export answers ok:true + outcome:failure (and success stays outcome:success)", async () => {
     _resetPluginStateForTest();
     const core = createCore();
-    const config = defaultConfig(200_000) as Config;
+    const config = { ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig;
     const session = getSession(`t2204-ep-${Math.random().toString(36).slice(2)}`);
     const msgs: CoreMessage[] = [];
     // The kernel's recent-zone trims the span tail and its min-compress

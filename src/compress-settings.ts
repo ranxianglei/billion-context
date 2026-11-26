@@ -77,6 +77,7 @@ export function mergeCompress(
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
         minPressureBenefitTokens: pick("minPressureBenefitTokens"),
+        minFoldBenefitTokens: pick("minFoldBenefitTokens"),
         requireUsageSampleForPressure: pick("requireUsageSampleForPressure"),
         maxEstimateHoldRounds: pick("maxEstimateHoldRounds"),
         tierNudgeTokens: tierNudgeLevels.length > 0 ? Object.assign({}, ...tierNudgeLevels) : undefined,
@@ -306,7 +307,7 @@ export function hasCompressSettings(s: CompressSettings): boolean {
 // clone-safe DATA half of the isMessageProtected predicate: the stamp
 // (storeEffectiveConfig) strips function fields, and effectiveConfig rebuilds
 // the predicate from this list on the session-stamp read path.
-export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings; protectedUserPatterns?: string[] };
+export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings; protectedUserPatterns?: string[]; minFoldBenefitTokens?: number };
 
 /** User-text half of the host predicate: literal substring match on
  *  user-role text messages only. Both the resolve-time builder
@@ -446,6 +447,11 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         // HERE, at resolve time — the executor still receives a fully
         // expanded ExternalSummarySettings and never sees references.
         externalSummary: s.externalSummary !== undefined ? expandExternalSummaryChainTolerant(s.externalSummary, recipes) : (base as ResolvedKernelConfig).externalSummary,
+        // #7333: host-only min-benefit floor for the model-initiated compress
+        // commit gate (applyRanges) — never on the raw kernel Config, carried
+        // like externalSummary. Absent (undefined) = the gate's default
+        // (AUTO_FOLD_MIN_BENEFIT_TOKENS) applies.
+        minFoldBenefitTokens: s.minFoldBenefitTokens ?? (base as ResolvedKernelConfig).minFoldBenefitTokens,
         ...(absorb !== undefined ? { absorb } : {}),
         // #5765: one-switch opt-in — absent `s.blockOps` leaves base untouched
         // (off); a present block normalizes enabled (absent/false = off).

@@ -8,6 +8,7 @@ import { getSession, reapDestroyedSubstrate } from "../src/session.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
 import { recordProbeFailures } from "../src/loop/core.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 _setStoreForTest(new SessionStore({ enabled: false }));
 
@@ -26,7 +27,7 @@ function makeCtx(count: number, preserveRecentMessages = 5): RewriteCtx & { mess
     storeUnpromptedGate(session, { nudgeInjected: false, requireNudge: false, requireRecommendation: false, postComPressTail: true });
     return {
         core: createCore(),
-        config: defaultConfig(200000, { preserveRecentMessages, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(200000, { preserveRecentMessages, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages,
         session,
         log: () => {},

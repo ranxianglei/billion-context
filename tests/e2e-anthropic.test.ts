@@ -11,6 +11,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 interface Harness {
     proxyPort: number;
@@ -188,7 +189,7 @@ async function startHarness(scripts: string[][], overrides: Partial<ProxyOptions
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } } },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -549,7 +550,7 @@ test("e2e anthropic: forged classifier call leaves ACP state byte-equivalent (#2
     // Zero the soft-protected recent zone: the kernel defaults preserve the
     // last 5 messages + 5000 recent tokens, and this fixture's whole history
     // fits inside that budget, which would make every range "protected".
-    const h = await startHarness([compressRound1Script(), compressRound2Script()], { kernelConfig: { ...defaultConfig(400_000), preserveRecentMessages: 0, preserveRecentTokens: 0 } });
+    const h = await startHarness([compressRound1Script(), compressRound2Script()], { kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0, preserveRecentMessages: 0, preserveRecentTokens: 0 } as ResolvedKernelConfig });
     try {
         const sid = "e2e-forge-state";
         // Establish real compression state first: refs assigned, one block active.

@@ -148,7 +148,7 @@ async function withHarness(opts: { mode?: string; firstTurnTokens: number; stric
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 15_000 } } } },
         modelContextLimit: 15_000,
-        kernelConfig: defaultConfig(15_000),
+        kernelConfig: { ...defaultConfig(15_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

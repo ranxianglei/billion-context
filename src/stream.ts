@@ -20,6 +20,8 @@ import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSu
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
+import type { ResolvedKernelConfig } from "./compress-settings.js";
+import { AUTO_FOLD_MIN_BENEFIT_TOKENS } from "./external-summary-settings.js";
 import { NUDGE_CREDIT_ROUNDS, unpromptedGateOf } from "./unprompted-gate.js";
 import { describeUncoveredRuns, formatProtectedMassCompact, PROTECTED_MASS_RENDER_FLOOR, shortTokenCount, uncoveredAudit } from "./uncovered.js";
 
@@ -1235,6 +1237,27 @@ function outOfRecommendedRanges(ranges: ParsedRange[], ctx: RewriteCtx): string[
     return offending;
 }
 
+/** #7333: is this request in the pressure band (usage ≥ maxContextLimit) or
+ *  emergency (usage ≥ emergencyThreshold)? Mirrors the kernel's own check
+ *  (kernel/src/nudge-text.ts: `!!breakdown?.emergencyOverride ||
+ *  !!breakdown?.overLimit`). The min-benefit floor drops to 1 in-band so
+ *  survival folds are never blocked. Fails safe to "not in band" (apply the
+ *  floor) when the prepare-time nudge is absent — a band fold is typically
+ *  large, and `minFoldBenefitTokens = 0` is the escape hatch. */
+function inPressureBandOrEmergency(ctx: RewriteCtx): boolean {
+    const b = ctx.lastNudge?.breakdown;
+    return !!b?.emergencyOverride || !!b?.overLimit;
+}
+
+/** #7333: the minimum net-reclaim (tokens) a model-initiated compress must
+ *  achieve to commit, below the pressure band. Default
+ *  AUTO_FOLD_MIN_BENEFIT_TOKENS (4096) — the same bar bili's own auto-fold
+ *  producer applies (#3444), so both fold producers share one benefit floor.
+ *  0 restores the legacy any-positive-shrink gate (the caller clamps to ≥ 1). */
+function minFoldBenefitTokens(config: Config): number {
+    return (config as ResolvedKernelConfig).minFoldBenefitTokens ?? AUTO_FOLD_MIN_BENEFIT_TOKENS;
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
     // #2146: preflight overflow-compress is bili's OWN internal lane — its
     // failures have separate reporting (noteSkip) and must not arm the
@@ -1584,23 +1607,47 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 netDelta += defaultCountTokens(prev) - defaultCountTokens(b.summary);
             }
         }
-        if (r.blocksCreated > 0 && touchedBlocks > 0 && netDelta <= 0) {
+        // #7333: minimum-benefit floor — generalizes the #2748 no-net-shrink
+        // gate. A committed fold rewrites the context prefix and re-bills the
+        // prompt-cache tail, so a burst of tiny model-initiated folds (one
+        // nudge → many small folds) re-bills the tail repeatedly for almost no
+        // reclaim. Below the pressure band, refuse sub-floor folds with a
+        // teaching receipt (batch the listed ranges into ONE call, or continue)
+        // instead of committing them. At/above maxContextLimit or in emergency
+        // the floor drops to 1 — survival folds are never blocked.
+        // minFoldBenefitTokens = 0 restores the legacy any-positive-shrink gate
+        // (floor clamps to 1). Refold-only calls (blocksCreated = 0) keep
+        // skipping this gate, exactly as today.
+        // The floor is a MODEL-FACING bar: it gates the model-initiated path
+        // (trackLoop) only. Bili's own overflow backstop folds ride
+        // loopTracking:false and must not be gated by a benefit floor — for
+        // them the floor stays at 1, i.e. the original no-net-shrink gate.
+        const minBenefitFloor = trackLoop
+            ? (inPressureBandOrEmergency(ctx) ? 1 : Math.max(1, minFoldBenefitTokens(ctx.config)))
+            : 1;
+        if (r.blocksCreated > 0 && touchedBlocks > 0 && netDelta < minBenefitFloor) {
+            const gateReason = netDelta <= 0 ? "gate:no-net-shrink" : "gate:below-min-benefit";
             const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
             const revNote = revs.length > 0
                 ? ` Note: startId > endId in range(s) ${revs.map((rg) => `${rg.startRef}→${rg.endRef}`).join(", ")} — your refs were reversed and normalized to ascending order before evaluation.`
                 : "";
-            const netDesc = netDelta < 0
-                ? `committing it would grow the context by ${-netDelta} token(s)`
-                : `committing it leaves the context size unchanged`;
             // #847 repeat-guard: re-issuing the SAME bloated range escalates
             // advice; deliberately NOT fed into the #2146 circuit breaker — a
             // too-long summary is recoverable (write a shorter one), so arming
             // "stop calling compress entirely" would wrongly kill legit folds.
             const specKey = normalizedSpecKey(ranges);
             const repeatGuard = recordCompressFailure(ctx.session, specKey);
-            ctx.log(`[acp-proxy: compress REFUSED ${detail} — no net shrink (net delta=${netDelta} tok across ${touchedBlocks} touched block(s)); state left uncommitted, prefix cache untouched]`);
-            const receipt = `[Compression refused: no net shrink — the summary you supplied is not smaller than the range it replaces (${netDesc}). Nothing was folded: no block was created and the context prefix/cache were left untouched.${revNote} Do not re-issue this same range and summary; supply a much shorter summary for the range, target a larger span so the summary shrinks it, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}]`;
-            return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
+            ctx.log(`[acp-proxy: compress REFUSED ${detail} — ${gateReason} (net delta=${netDelta} tok across ${touchedBlocks} touched block(s), floor=${minBenefitFloor}); state left uncommitted, prefix cache untouched]`);
+            let receipt: string;
+            if (gateReason === "gate:below-min-benefit") {
+                receipt = `[Compression refused: below minimum benefit — this call would reclaim only ${netDelta} token(s), below compress.minFoldBenefitTokens (${minBenefitFloor}). Every committed fold rewrites the context prefix and re-bills the prompt-cache tail, so a burst of tiny folds re-bills the tail for almost no reclaim.${revNote} Put the other listed ranges into ONE compress call so the summary covers them together, or continue your task without compressing. Nothing was folded and the cache is untouched.${repeatGuard !== "" ? " " + repeatGuard : ""}]`;
+            } else {
+                const netDesc = netDelta < 0
+                    ? `committing it would grow the context by ${-netDelta} token(s)`
+                    : `committing it leaves the context size unchanged`;
+                receipt = `[Compression refused: no net shrink — the summary you supplied is not smaller than the range it replaces (${netDesc}). Nothing was folded: no block was created and the context prefix/cache were left untouched.${revNote} Do not re-issue this same range and summary; supply a much shorter summary for the range, target a larger span so the summary shrinks it, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}]`;
+            }
+            return compressResult(receipt, "refused", 0, gateReason);
         }
         ctx.session.state = res.state;
         // #2627 backstop: no committed state may carry outbound-only turn-

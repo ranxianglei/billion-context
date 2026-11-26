@@ -20,6 +20,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 /**
  * #1333: pi RLM inline spawns create DERIVED sessions — the child's pi
@@ -59,12 +60,12 @@ function residentFixture(id: string): Session {
         messages.push({ id: `a${i}`, role: "assistant", contentType: "text", text: `assistant reply ${i} with enough prose to fold comfortably`.repeat(3) });
     }
     const core = createCore({ countTokens });
-    const seeded = core.processTurn({ messages, state: createInitialState(), config: defaultConfig(100000), tokenCount: 500 });
+    const seeded = core.processTurn({ messages, state: createInitialState(), config: { ...defaultConfig(100000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig, tokenCount: 500 });
     const compressed = core.applyCompression({
         ranges: [{ startRef: "m00001", endRef: "m00008", summary: "fixture summary about early user turn exchanges of the derived inheritance test conversation" }],
         messages: seeded.messages,
         state: seeded.state,
-        config: defaultConfig(100000, { compress: { minCompressRange: 0, minSummaryLength: 1, maxSummaryLength: 5000 }, preserveRecentMessages: 2, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(100000, { compress: { minCompressRange: 0, minSummaryLength: 1, maxSummaryLength: 5000 }, preserveRecentMessages: 2, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
     });
     const session = getSession(id, { protocol: "openai", upstreamOrigin: "http://upstream" });
     session.state = compressed.state;
@@ -181,7 +182,7 @@ test("decompress and search_context fall back to the parent chain read-only (#13
     const child = getSession(`pfa-child-ro-${run}`, { protocol: "openai", upstreamOrigin: "http://upstream" });
     child.metadata.derivedFromSessionId = parent.id;
     const core = createCore({ countTokens });
-    const config = defaultConfig(100000);
+    const config = { ...defaultConfig(100000), minFoldBenefitTokens: 0 };
     const ctx: ProxyToolCtx = { core, config, messages: [], session: child, log: () => undefined };
 
     // Child-local decompress of the PARENT's block id: read-only fallback.
@@ -350,11 +351,11 @@ function proxyOpts(relayPort: number): ProxyOptions {
         upstream: "http://127.0.0.1",
         routes: {} as ProxyOptions["routes"],
         modelContextLimit: 1_000_000,
-        kernelConfig: defaultConfig(1_000_000, {
+        kernelConfig: { ...defaultConfig(1_000_000, {
             preserveRecentMessages: 2,
             preserveRecentTokens: 400,
             compress: { minCompressRange: 200, minSummaryLength: 20, maxSummaryLength: 5000 },
-        }),
+        }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         compat: { roles: {} },

@@ -120,7 +120,7 @@ async function harness(wire: Wire) {
     const upstreamUrl = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
     const proxy = await startServer({
         port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: {},
-        modelContextLimit: 400_000, kernelConfig: defaultConfig(400_000),
+        modelContextLimit: 400_000, kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: false, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100 },
         promptCache: { routing: "auto" }, sessionHeader: "x-acp-session",
         log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] },
