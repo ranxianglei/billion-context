@@ -22,7 +22,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { defaultConfig } from "acp-kernel";
@@ -34,6 +34,8 @@ import { migrateSchema } from "../src/storage/schema.ts";
 import { UnifiedStore, KV_VALUE_MAX_CHARS, KV_VALUE_WHITELIST } from "../src/storage/store.ts";
 import { EGRESS_IDENTITY_METADATA_KEYS, sanitizeEgressIdentityMetadata } from "../src/storage/egress-record.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
+import { prefixAffinity } from "../src/prefix-affinity.ts";
+import { _resetAffinityPersistForTest, flushPrefixAffinity, hydrateAffinityUnified, scheduleAffinityPersist } from "../src/affinity-persist.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
@@ -307,6 +309,68 @@ test("A5: the identity row's metadata_json is sanitized to identity keys — the
     // absent optional keys are dropped, not undefined-stamped
     assert.deepEqual(sanitizeEgressIdentityMetadata({}), { egressAuthority: true });
     assert.ok(JSON.stringify(out).length < 512, "the sanitized bag stays tiny (identity, not chat content)");
+});
+
+// ---------------------------------------------------------------------------
+// A6: prefix-affinity persistence — eg mode is memory-only (KDD #25)
+// ---------------------------------------------------------------------------
+
+const A6_ENTRY = { sessionId: "s-legacy", depth: 2, tailHash: "th", itemHashes: ["a", "b"], lastSeen: 1000 };
+
+async function affinityArm(plane: string): Promise<void> {
+    const savedPlane = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    const savedXdg = process.env.XDG_STATE_HOME;
+    const dir = mkdtempSync(join(testRoot, `a6-${plane}-`));
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = plane;
+    process.env.XDG_STATE_HOME = dir;
+    const stateFile = join(dir, "billion-context", "prefix-affinity.json");
+    const dbPath = join(dir, "sessions", "index.db");
+    const store = new SessionStore({ dir: join(dir, "sessions"), enabled: true, debounceMs: 15 });
+    _setStoreForTest(store);
+    _resetAffinityPersistForTest();
+    const original = JSON.stringify({ version: 1, entries: [A6_ENTRY] });
+    mkdirSync(join(dir, "billion-context"), { recursive: true });
+    writeFileSync(stateFile, original);
+    try {
+        await hydrateAffinityUnified();
+        const snapshotIds = prefixAffinity.exportSnapshot().map((e) => e.sessionId);
+        assert.ok(snapshotIds.includes("s-legacy"), "the in-memory import works in both modes");
+        const db = new DatabaseSync(dbPath, { readOnly: true });
+        try {
+            const rows = db.prepare("SELECT value_json FROM kv_store WHERE namespace = 'prefix-affinity'").all() as { value_json: string }[];
+            if (plane === "1") assert.equal(rows.length, 0, "eg: the one-time file→kv migration is gated (KDD #25) — the chain table never lands in kv_store");
+            else assert.equal(rows.length, 1, "legacy: the one-time file→kv migration still runs");
+        } finally { db.close(); }
+        // a new mutation, the debounce window, and the shutdown flush
+        prefixAffinity.note("s-new", 1, "tn", ["c"], false);
+        scheduleAffinityPersist();
+        await new Promise((r) => setTimeout(r, 2000));
+        await flushPrefixAffinity();
+        if (plane === "1") {
+            assert.equal(readFileSync(stateFile, "utf8"), original, "eg: the legacy file is never rewritten");
+            const db2 = new DatabaseSync(dbPath, { readOnly: true });
+            try {
+                assert.equal((db2.prepare("SELECT 1 FROM kv_store WHERE namespace = 'prefix-affinity'").all() as unknown[]).length, 0, "eg: the debounce window and the shutdown flush stay dry");
+            } finally { db2.close(); }
+        } else {
+            const db2 = new DatabaseSync(dbPath, { readOnly: true });
+            try {
+                const rows2 = db2.prepare("SELECT value_json FROM kv_store WHERE namespace = 'prefix-affinity'").all() as { value_json: string }[];
+                assert.equal(rows2.length, 1, "legacy: still exactly one row");
+                assert.ok(rows2[0].value_json.includes("s-new"), "legacy: the kv rewrite lands the new chain");
+            } finally { db2.close(); }
+        }
+    } finally {
+        _resetAffinityPersistForTest();
+        store.cancelAll();
+        if (savedPlane === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE; else process.env.BILI_ROLLOUT_EGRESS_PLANE = savedPlane;
+        if (savedXdg === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = savedXdg;
+    }
+}
+
+test("A6 (dual gate): eg mode keeps prefix-affinity memory-only (no kv row, no file rewrite); legacy mode is unchanged (migration + kv persist)", async () => {
+    await affinityArm("1");
+    await affinityArm("0");
 });
 
 // ---------------------------------------------------------------------------
