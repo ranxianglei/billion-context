@@ -32,6 +32,7 @@ import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb
 import { storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { buildBlockOpsSystemPrompt } from "acp-kernel";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
+import { foldSummariesToCcrPlaceholders } from "./fold-summary-ccr.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
@@ -679,6 +680,20 @@ export async function prepareOpenai(
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        // #6111 POC (#6025): when the fold-summary→CCR rollout is on, carry each
+        // rendered summary out as a deterministic `[acp-stored …]` placeholder
+        // (its prose stored under its own ref for acp_retrieve) instead of inline
+        // prose, so weak models can't misread a user-voiced summary as the current
+        // question. Egress-view only — session state stays untouched.
+        let voicedSource = egressMessages;
+        // Proxy mode only: plugin mode is manifest-governed — bili advertises no
+        // acp_retrieve there, so without CCR armed a placeholder would leave the
+        // stored prose unreachable (96-char head only).
+        if (!pluginMode && featureEnabled("foldSummaryCcr")) {
+            const folded = foldSummariesToCcrPlaceholders(egressMessages, turn.state, contentStoreOf(session), retrieveToolName(session));
+            if (folded.changed) adoptContentStore(session, folded.store);
+            voicedSource = folded.messages as BiliMessage[];
+        }
         // #4166: re-voice ONLY bili's own summary carriers (isRenderedSummaryMessage).
         // Client-origin mid system/developer messages (DSH tool_addition and
         // friends) are conversation data — they re-emit verbatim through the
@@ -730,7 +745,7 @@ export async function prepareOpenai(
             }
         }
         if (!egressServedFromLog) {
-            rebuiltMessages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
+            rebuiltMessages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(voicedSource, (m) => isRenderedSummaryMessage(m))));
         }
         legacyCoreElements = rebuiltMessages;
         egressRecordSource = egressMessages;
@@ -749,7 +764,8 @@ export async function prepareOpenai(
         // #532: openaiOutboundSystem was captured above (seg 4b moved it up so
         // the op-log recording stores the outbound system text).
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOpsActive ? blockOps.openai : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
+            const retrieveAdvertised = ccrEnabled(session) || featureEnabled("foldSummaryCcr");
+            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(retrieveAdvertised ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOpsActive ? blockOps.openai : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
