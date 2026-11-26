@@ -31,20 +31,34 @@ export function rememberStrictThinkingPosture(session: Pick<Session, "metadata">
 
 /**
  * The signature-verifying upstream's rejection of a signature-less thinking
- * block ("thinking.signature: Field required", #2501). Deliberately narrow:
- * the #5495 mandatory-thinking wording ("must be passed back") and the #1960
- * tamper wording ("cannot be modified") are different pathologies with
- * different fixes — probing either would re-manufacture the 400 or rewrite a
- * signed channel (KDD#10), so both are excluded here.
+ * block. Two wordings reach the egress seam:
+ *   - Anthropic proper: "thinking.signature: Field required" (#2501) — carries
+ *     "thinking" + "required"/"missing";
+ *   - OpenRouter (Zod): a thinking block whose signature field is absent fails
+ *     the union — the path ends in "signature" and the complaint is "expected
+ *     string, received undefined" (#6988). This wording carries NEITHER
+ *     "thinking" NOR "required"/"missing", so the Anthropic gate alone misses
+ *     it; the Zod type complaint on the signature path is the tell.
+ * Deliberately narrow otherwise: the #5495 mandatory-thinking wording
+ * ("must be passed back") and the #1960 tamper wording ("cannot be modified")
+ * are different pathologies with different fixes — probing either would
+ * re-manufacture the 400 or rewrite a signed channel (KDD#10), so both are
+ * excluded here.
  */
 export function detectThinkingSignatureRejection(status: number, bodyText: string): boolean {
     if (status !== 400) return false;
     if (!/signature/i.test(bodyText)) return false;
-    if (!/thinking/i.test(bodyText)) return false;
-    if (!/(required|missing)/i.test(bodyText)) return false;
     if (/must be passed back/i.test(bodyText)) return false;
     if (/cannot be modified/i.test(bodyText)) return false;
-    return true;
+    // Anthropic proper: "thinking.signature: Field required" (#2501) /
+    // "thinking signature is missing".
+    if (/thinking/i.test(bodyText) && /(required|missing)/i.test(bodyText)) return true;
+    // OpenRouter (Zod): the path ends in "signature" and the complaint is
+    // "expected string". The path rides inside a JSON string in the OpenRouter
+    // envelope, so it arrives escaped (\"signature\"]); match the tail with or
+    // without the backslash.
+    if (/signature\\?"\]/i.test(bodyText) && /expected string/i.test(bodyText)) return true;
+    return false;
 }
 
 interface UnsignedThinkingStrip {

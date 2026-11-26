@@ -56,6 +56,34 @@ test("#5998 detector: unrelated 400s and non-400 statuses never match", () => {
     assert.equal(detectThinkingSignatureRejection(500, FIELD_REQUIRED), false);
 });
 
+// #6988 — OpenRouter (Zod) wording: a thinking block whose signature is absent
+// fails the union. The path ends in "signature" and the complaint is "expected
+// string, received undefined". The path rides inside a JSON string in the
+// envelope, so it arrives escaped (\"signature\"]); the detector must match the
+// tail with or without the backslash.
+const OPENROUTER_ZOD = JSON.stringify({
+    type: "error",
+    error: { type: "invalid_request_error", message: "Invalid Anthropic Messages API request", error_type: "invalid_request" },
+    metadata: { raw: '[{"code":"invalid_union","path":["messages",1,"content",0,"signature"],"message":"expected string, received undefined"}]' },
+});
+
+test("#6988 detector: OpenRouter Zod signature-missing wording matches", () => {
+    assert.equal(detectThinkingSignatureRejection(400, OPENROUTER_ZOD), true);
+});
+
+test("#6988 detector: OpenRouter Zod on a NON-signature field never matches", () => {
+    const other = JSON.stringify({
+        type: "error",
+        error: { type: "invalid_request_error", message: "Invalid Anthropic Messages API request" },
+        metadata: { raw: '[{"code":"invalid_union","path":["messages",1,"content",0,"text"],"message":"expected string, received undefined"}]' },
+    });
+    assert.equal(detectThinkingSignatureRejection(400, other), false);
+});
+
+test("#6988 detector: 'signature' + 'expected string' without the path tail never matches", () => {
+    assert.equal(detectThinkingSignatureRejection(400, '{"error":{"message":"signature expected string somewhere"}}'), false);
+});
+
 // ---------------------------------------------------------------------------
 // stripUnsignedThinkingFromWire — the wire-level drop
 // ---------------------------------------------------------------------------
@@ -158,9 +186,9 @@ function anthropicStream(): string {
     );
 }
 
-type Personality = "lenient" | "strict" | "poisoned-signature" | "mandatory-thinking" | "tamper";
+type Personality = "lenient" | "strict" | "poisoned-signature" | "mandatory-thinking" | "tamper" | "openrouter";
 
-const WORDINGS: Record<Exclude<Personality, "lenient" | "strict">, string> = {
+const WORDINGS: Record<Exclude<Personality, "lenient" | "strict" | "openrouter">, string> = {
     "poisoned-signature": "messages.1.content.0.thinking.signature: Field required",
     "mandatory-thinking": "The `content[].thinking` in the thinking mode must be passed back to the API.",
     tamper: "Invalid signature: thinking blocks cannot be modified",
@@ -218,6 +246,15 @@ async function startRig(): Promise<Rig> {
                     break;
                 case "tamper":
                     rejectWith(WORDINGS.tamper);
+                    break;
+                case "openrouter":
+                    // #6988 — OpenRouter's full 400 envelope for a signature-less
+                    // thinking block (the Zod complaint rides inside metadata.raw,
+                    // path ending in "signature").
+                    if (bodyHasUnsignedThinking(raw)) {
+                        res.writeHead(400, { "content-type": "application/json" });
+                        res.end(OPENROUTER_ZOD);
+                    }
                     break;
                 default:
                     break;
@@ -314,6 +351,30 @@ test("#5998 e2e: strict upstream self-heals in one turn; later turns drop proact
         // Turn 2: posture learned — the drop happens BEFORE egress, so exactly
         // ONE upstream hit, already clean.
         const r2 = await post(rig, "ts-strict-1");
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.equal(rig.upstreamBodies.length, 3);
+        assert.equal(bodyHasUnsignedThinking(rig.upstreamBodies[2]!), false, "proactive drop — no second 400 round trip");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("#6988 e2e: OpenRouter Zod 400 self-heals in one turn; later turns drop proactively", async () => {
+    const rig = await startRig();
+    try {
+        rig.setPersonality("openrouter");
+        // Turn 1: the send 400s (OpenRouter Zod), the probe strips the unsigned
+        // block and the retry is accepted — the client never sees the 400.
+        const r1 = await post(rig, "ts-openrouter-1");
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.equal(rig.upstreamBodies.length, 2);
+        assert.equal(bodyHasUnsignedThinking(rig.upstreamBodies[0]!), true, "original attempt carried the unsigned block");
+        assert.equal(bodyHasUnsignedThinking(rig.upstreamBodies[1]!), false, "probe dropped it");
+        // Turn 2: posture learned — the drop happens BEFORE egress, so exactly
+        // ONE upstream hit, already clean.
+        const r2 = await post(rig, "ts-openrouter-1");
         assert.equal(r2.status, 200);
         await r2.text();
         assert.equal(rig.upstreamBodies.length, 3);
