@@ -9,9 +9,9 @@ import { UnifiedStore } from "../src/storage/store.ts";
 
 /**
  * Phase 3 (#2960): `storage.jsonWriter = "off"` — while the unified store
- * runs in full mode, the legacy JSON envelope AND the per-session CCR
- * content-store sidecar are no longer written; the SQLite index (session
- * row + ccr mirror, ingested from the same record) is the only persistent
+ * runs in full mode, the legacy JSON envelope
+ * are no longer written; the SQLite index (session
+ * row) is the only persistent
  * copy. Reads were already
  * unified-first (#2671 Phase 1.5) and boot enumerates the index union
  * (#2992), so an index-only session must survive a store restart with its
@@ -40,7 +40,7 @@ function loadCorpusCase(dir: string, name: string, id: string, protocol: string)
 }
 
 /** Session envelopes live at <proto>/<host>_<hash>.json; the probe counts
- *  only real session records. (The CCR content-store sidecar is not
+ *  only real session records. (The content-store sidecar is not
  *  written under jsonWriter=off either — asserted separately — and a
  *  replica/export re-materialization may legitimately add a NEW envelope
  *  name that an original-absence assertion must not see.) */

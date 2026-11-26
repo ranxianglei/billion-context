@@ -51,7 +51,6 @@ function mkSessionRow(id: string): SessionRow {
         metadataJson: "{}",
         kstateJson: "{}",
         tailJson: "{}",
-        ccrJson: "null",
     };
 }
 
