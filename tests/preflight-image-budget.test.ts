@@ -83,6 +83,13 @@ test(`preflight image budget: ${mode}`, async () => {
         seeded.stats.lastInputTokens = 70_000;
         seeded.stats.lastInputTokensSource = mode === "upstream-overflow" ? "overflow-arm" : "usage";
         seeded.stats.lastInputTokensOrigin = origin;
+        // Identity-fast-path guard: the seed settles a same-origin+model usage
+        // baseline, which alone would open the trusted fast path. The
+        // upstream-overflow pin targets the confirmed-overflow 502 contract, so
+        // declare the stated wall (overflowArmTokens) — statedWall > 0 demotes
+        // the fast path; the wall equals the configured limit, so the judge's
+        // limit is unchanged. The other two modes keep the fast path open.
+        if (mode === "upstream-overflow") seeded.stats.overflowArmTokens = limit;
         if (partial) seeded.metadata.learnedImageCosts = { "127.0.0.1": { cost: 20_000, seen: 1, ts: Date.now(), fp: "pixels:0" } };
         forwards.length = 0;
         const input: unknown[] = [

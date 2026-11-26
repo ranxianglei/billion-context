@@ -95,8 +95,20 @@ test("#1029-③: zero-block rejection inlines the current ref span (stale refs f
         ctx,
     ).text;
     assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
-    assert.match(out, /\[Current context: 3 visible message\(s\), refs m00001–m00003, \d+ active block\(s\)\./, "current span inlined");
-    assert.match(out, /refs inside this span|acp_status/i, "points at actionable refs or acp_status");
+    // The span line is PERSISTED in visible history with every failure receipt,
+    // so it must self-label as a point-in-time snapshot — a long session
+    // otherwise accumulates stale copies with different max refs that a weak
+    // model reads as simultaneously true (2026-11-17, session 01a1e89d:
+    // phantom endpoints m02383/m02489 aimed at a "frontier" that never existed).
+    assert.match(out, /\[Context snapshot at the moment of THIS receipt — point-in-time only: refs are minted continuously, so every earlier copy of this line in the transcript is stale, and the newest copy is the current frontier\. Refs minted so far: m00001–m00003; the newest message is m00003 — refs are minted in order and never pre-allocated, so NOTHING numbered above m00003 exists\. Currently visible: 3 message\(s\) — every visible ref is a SUBSET of m00001–m00003, not a tail beyond it\./, "snapshot span inlined and labeled point-in-time");
+    // 2026-11-24 (session 01a2076a, qwen3.8-27b): the pre-fix wording put the
+    // visible count BEFORE the span ("134 visible message(s), refs m00001–
+    // m01643") and the model read it as "134 messages BEYOND m01643" — it then
+    // aimed compress calls at frontier+visible = m01777 and other phantom
+    // endpoints (six over-shoots, each clamped). Both directions pinned:
+    assert.doesNotMatch(out, /\d+ visible message\(s\), refs /, "count-first adjacency is gone");
+    assert.match(out, /NOTHING numbered above m00003 exists/, "frontier is stated explicitly");
+    assert.match(out, /newest such snapshot|acp_status/i, "points at actionable refs or acp_status");
 });
 
 test("#1029-①: incoming history resends are stripped of ACP status marker lines", () => {

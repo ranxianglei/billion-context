@@ -94,14 +94,14 @@ function makeUpstream(firstRejectBody?: string): { server: http.Server; calls: C
     return { server, calls };
 }
 
-function proxyOptions(routes: Record<string, object>): ProxyOptions {
+function proxyOptions(routes: Record<string, object>, window = WINDOW): ProxyOptions {
     return {
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: routes as ProxyOptions["routes"],
-        modelContextLimit: WINDOW,
-        kernelConfig: defaultConfig(WINDOW, {
+        modelContextLimit: window,
+        kernelConfig: defaultConfig(window, {
             preserveRecentMessages: 2,
             preserveRecentTokens: 2000,
             compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
@@ -126,14 +126,14 @@ function proxyOptions(routes: Record<string, object>): ProxyOptions {
 
 type Ctx = { url: string; headers: Record<string, string>; upstreamPort: number };
 
-async function setup(firstRejectBody?: string): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<void> }> {
+async function setup(firstRejectBody?: string, window = WINDOW): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<void> }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const { server: upstream, calls } = makeUpstream(firstRejectBody);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
-    const proxy = await startServer(proxyOptions({ [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: WINDOW } } } }));
+    const proxy = await startServer(proxyOptions({ [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: window } } } }, window));
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
     return {
@@ -159,6 +159,32 @@ const post = (ctx: Ctx, messages: Array<{ role: string; content: string }>) =>
         headers: { ...ctx.headers },
         body: JSON.stringify({ model: "gpt-test", stream: true, messages }),
     });
+
+for (const pluginMode of [false, true]) test(`a probe that the local egress fuse would reject folds before forwarding (${pluginMode ? "plugin" : "proxy"})`, async () => {
+    const { ctx, calls, close } = await setup(undefined, 1_000_000);
+    try {
+        const sessionId = `probe-egress-cjk-${pluginMode ? "plugin" : "proxy"}`;
+        if (pluginMode) ctx.headers["x-bili-plugin"] = "test-agent";
+        await seedStuckMeter(ctx, sessionId);
+        // Below the 7.5 MB byte floor, but above the egress meter's 1M bar.
+        const messages = Array.from({ length: 120 }, (_, i) => ({
+            role: i % 2 === 0 ? "user" : "assistant",
+            content: `turn ${i}: ` + "历史".repeat(6_000),
+        }));
+        const response = await post(ctx, messages);
+        const body = await response.text();
+        assert.equal(response.status, 200, body.slice(0, 1_000));
+        assert.ok(body.includes("forwarded answer"), "the restored turn reaches the mock model");
+        assert.ok(calls.some((c) => c.summary), "normal preflight compression runs");
+        const forwards = calls.filter((c) => !c.summary);
+        assert.equal(forwards.length, 2, "seed plus one compressed forward; no oversized probe");
+        assert.ok(forwards[1]!.contentChars < 1_000_000);
+        assert.equal(getSession(sessionId)?.metadata.localRefusals, undefined,
+            "the request-scoped decision must not poison a future route");
+    } finally {
+        await close();
+    }
+});
 
 // Create the session with one real turn, then corrupt its meter into the
 // #2313 stuck state: estimate-sourced baseline at phantom scale, measured on

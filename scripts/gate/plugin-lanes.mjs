@@ -72,6 +72,39 @@ const MODEL1 = {
 // comma-separated MODEL1_MODEL (host wrapper passes a pair) — register every id,
 // drive with the first (matches Lane A's model rotation semantics).
 const MODEL_IDS = String(MODEL1.model).split(",").map((s) => s.trim()).filter(Boolean);
+
+// GATE_SNAPBASE / GATE_SNAPSHOT_RENDER (#6785 verification): flip the
+// candidate's new-plane rollouts LIVE through the CONFIG tier —
+// rollout.features.<name>=true (a forced-on shorthand the rollout resolver
+// honors above bucketing). The env tier (BILI_ROLLOUT_*) does NOT reach the
+// lane proxies: cleanEnv() strips BILI_* from the spawn env by design
+// (2026-11-16 gate run 3 showed snapshotRender=off(bucket) with the env set).
+//
+// GATE_SNAPBASE: the EGRESS op-log plane — successor of the retired snapBase
+// v2 plane (bc51c9445, ruling 7439: `storage.snapBase.*` left the config
+// surface, `rollout.egressPlane` is the one switch). Unset/0/off = off
+// (byte-identical gate); any other value ("all" or a protocol cohort list)
+// forces egressPlane=true. The egress plane has NO per-protocol cohort
+// surface (one switch for all lanes, ruling 7439), so every on-value turns
+// the whole plane on.
+// GATE_SNAPSHOT_RENDER: snapshotRender plus the msgid-plane rollouts that
+// ship with this candidate (pluginMsgIdIncremental, identityChannelHarvest).
+export function gateRolloutCfg() {
+  const snap = String(process.env.GATE_SNAPBASE || "");
+  const render = String(process.env.GATE_SNAPSHOT_RENDER || "");
+  const snapOn = !!snap && snap !== "0" && snap.toLowerCase() !== "off";
+  const renderOn = !!render && render !== "0" && render.toLowerCase() !== "off";
+  if (!snapOn && !renderOn) return {};
+  const features = {};
+  if (snapOn) features.egressPlane = true;
+  if (renderOn)
+    Object.assign(features, {
+      snapshotRender: true,
+      pluginMsgIdIncremental: true,
+      identityChannelHarvest: true,
+    });
+  return { rollout: { features } };
+}
 const MODEL_MAIN = MODEL_IDS[0];
 const AGENTS = (process.env.GATE_AGENTS || "dsh,pi,codex,opencode,claude")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -277,6 +310,7 @@ async function runLane(agent, recipe) {
         },
       },
       compress: { preserveRecentTokens: 0 },
+      ...gateRolloutCfg(),
     }, null, 2));
   writeWindow(BIG_WINDOW);
 
@@ -361,7 +395,7 @@ async function runLane(agent, recipe) {
     // the corpus middle — models sometimes elide it despite the chunk-read
     // instruction (observed in proxy mode). Verify the precondition at t1
     // instead of letting downstream recalls fail for fixture reasons.
-    const t1 = await recipe.turn(ctx, `Read corpus.md in your cwd fully (~1300 lines). Your read tool may truncate or ELIDE the middle of a long file (e.g. claude-code's Read shows head+tail with "... N lines elided ...") — read in sequential chunks (offset 1, 201, 401, …, ~200 lines each, or equivalent line-range calls) until you have seen EVERY line including the middle; do not stop at a truncation or elision. Then reply with ONLY the TITLE lines of sections S40 and S07 (one per line). Do not run any other tool or command.`, sid, "t1");
+    const t1 = await recipe.turn(ctx, `Read corpus.md in your cwd fully (it is ${fs.readFileSync(path.join(laneDir, "work", "corpus.md"), "utf8").split("\n").length} lines — do not stop early because the file looks shorter than you expected). Your read tool may truncate or ELIDE the middle of a long file (e.g. claude-code's Read shows head+tail with "... N lines elided ...") — read in sequential chunks (offset 1, 201, 401, …, ~200 lines each, or equivalent line-range calls) until you have seen EVERY line including the middle; do not stop at a truncation or elision. Then reply with ONLY the TITLE lines of sections S40 and S07 (one per line). Do not run any other tool or command.`, sid, "t1");
     fs.writeFileSync(path.join(ctx.laneDir, `turn-t1.txt`), t1.out || "");
     record(agent, "t1 read @ big window completes", t1.ok, t1.why.slice(0, 160));
     record(agent, "S40 marker answered (t1)", MARK_RE(39).test(t1.out), `"${t1.out.trim().slice(0, 80)}"`);

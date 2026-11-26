@@ -205,6 +205,15 @@ function cleanEnv(): NodeJS.ProcessEnv {
     )
       delete env[key];
   }
+  // #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+  // off) — this suite asserts the legacy JSON persistence surface, so pin
+  // the dual-write writer explicitly.
+  env.BILI_STORAGE_JSON_WRITER = "on";
+  // ci:full branch: the egress plane (default 100) arms these REAL plugin lanes —
+  // egress-on sessions freeze the legacy JSON persistence surface (op log +
+  // index.db are the authority), which this legacy-persistence e2e asserts.
+  // Scope the plane off; the armed behavior is pinned by the egress suites.
+  env.BILI_ROLLOUT_EGRESS_PLANE = "0";
   // NODE_TEST_CONTEXT: set by the node:test runner and inherited by the spawned
   // pi — pi-native.ts deliberately stands down inside node:test (unit-test
   // guard), which would silently disable the very bootstrap this suite

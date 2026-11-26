@@ -117,7 +117,7 @@ test("#2391: output headroom includes loaded schemas without adding them again t
     assert.equal(usageBody.max_output_tokens, capOf(200_000), "usage-grade baseline still bounds the headroom (no double-counted reserve, #2558)");
 });
 
-test("#2391: a 272k Responses proxy forwards the full deferred catalog and rejects eager/loaded overflow", async () => {
+test("#2391: a 272k Responses proxy forwards the full deferred catalog (eager/loaded overflow forwards — the upstream decides, #7537)", async () => {
     const received: Record<string, unknown>[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -159,12 +159,15 @@ test("#2391: a 272k Responses proxy forwards the full deferred catalog and rejec
         assert.deepEqual(received[0].tools, tools, "full upstream definitions must stay unchanged");
         seedEvidence(upstreamPort, "2391-eager");
         const eager = await send({ ...body, tools: [{ ...deferred, defer_loading: false }, search] }, "2391-eager");
-        assert.notEqual(eager.status, 200, await eager.text());
-        assert.equal(received.length, 1, "eager overflow must be stopped before forwarding");
+        // #7537: the old measured-tier 413 is gone — over-budget tool mass is
+        // forwarded; the upstream is the size authority. The full catalog
+        // still rides unchanged (#2391's original contract).
+        assert.equal(eager.status, 200, await eager.text());
+        assert.equal(received.length, 2, "eager overflow was forwarded (upstream decides, #7537)");
         seedEvidence(upstreamPort, "2391-loaded");
         const loaded = await send({ ...body, input: [{ type: "additional_tools", tools: [deferred] }, ...body.input] }, "2391-loaded");
-        assert.notEqual(loaded.status, 200, await loaded.text());
-        assert.equal(received.length, 1, "loaded overflow must be stopped before forwarding");
+        assert.equal(loaded.status, 200, await loaded.text());
+        assert.equal(received.length, 3, "loaded overflow was forwarded (upstream decides, #7537)");
         const small = { ...deferred, description: "small loaded definition" };
         const loadedItems = [
             { type: "additional_tools", tools: [small] },
