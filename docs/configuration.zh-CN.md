@@ -123,6 +123,7 @@
 | `chainContentDetection` | boolean | false | BILI_CHAIN_CONTENT | 按请求体内容识别 bili→bili 链（默认关：正文扫描会对 CCR/模型回声文本误报）；默认仅 x-bili-hop 驱动链识别。 |
 | `chainEgressStamp` | boolean | false | BILI_CHAIN_STAMP | 在出口消息上打模型可见的 <bili-chain/> 链完整性标记（默认关：模型会把它当幽灵输入而消耗 token）。 |
 | `stableSystemAnchor` | boolean | false | BILI_STABLE_SYSTEM_ANCHOR | 线路层尽力而为的前缀缓存锚点：客户端改动头部 system 时仍重发首次见到的字节（仅纯代理通道）。 |
+| `degenerateRetry.exemptEnvelopes` | string[] | ["task-notification", "system-reminder"] | — | 标记后台事件消息的 harness 标签名。当出站插件请求的最后一条 user 消息是纯后台事件——仅由这些信封（外加 bili 渲染标签与 harness 尾行）组成的纯文本、别无其他——时，跳过空回合退避重试，因为模型的空回合就是对后台事件的正确答案（#7235）；整条消息匹配，所以「通知 + 人类提问」仍会重试。追加标签名可扩展豁免（如 teammate-message）；空列表或全非字符串列表回落到默认值。 |
 | `compat` | { roles?, dropFields?, streamErrorShape?, noCacheControl?, keepResponseId? } | {} (disabled) | — | 全局线上兼容块：角色映射、严格 schema 字段剔除、流式错误形态、缓存控制处理。 |
 | `compat.roles` | record role → role | {} | — | 把消息角色映射为上游接受的名字（如 developer→system）；仅精确匹配角色，逐 provider 条目按键级胜出。 |
 | `compat.dropFields` | string[] (dot paths) | [] | — | 从每个转发请求体中剔除的点路径字段，面向对未知字段返回 400 的严格 schema 网关；全局与逐 provider 列表加法并集。 |

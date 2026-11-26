@@ -374,6 +374,13 @@ entries:
     desc_ja: "ベストエフォートのワイヤーレイヤープレフィックスキャッシュアンカー：クライアントが変更した場合でも、最初に確認されたヘッドシステムバイトを再送信します（プレーンプロキシレーンのみ）。"
     site_en: "<code>stableSystemAnchor</code> — best-effort wire-layer prefix-cache anchor (off; plain-proxy lanes)."
     site_zh: "<code>stableSystemAnchor</code> —— 线路层尽力而为的前缀缓存锚点（默认关；纯代理通道）。"
+  - key: degenerateRetry.exemptEnvelopes
+    type: "string[]"
+    default: "[\"task-notification\", \"system-reminder\"]"
+    group: behavior
+    desc_en: "Harness tag names that mark a background-event message. When the last user message of an outgoing plugin request is a pure background event — plain text made up solely of these envelopes (plus bili render tags and the harness tail line), nothing else — the degenerate-terminal empty-turn retry is skipped, because the model's empty turn IS the correct answer to a background event (#7235); whole-message match, so \"notification + human question\" still retries. Add tag names to extend the exemption (e.g. teammate-message); an empty or all-non-string list falls back to the default."
+    desc_zh: "标记后台事件消息的 harness 标签名。当出站插件请求的最后一条 user 消息是纯后台事件——仅由这些信封（外加 bili 渲染标签与 harness 尾行）组成的纯文本、别无其他——时，跳过空回合退避重试，因为模型的空回合就是对后台事件的正确答案（#7235）；整条消息匹配，所以「通知 + 人类提问」仍会重试。追加标签名可扩展豁免（如 teammate-message）；空列表或全非字符串列表回落到默认值。"
+    desc_ja: "バックグラウンドイベントメッセージをマークするハーネスタグ名。送信先プラグインリクエストの最後の user メッセージが純粋なバックグラウンドイベント（これらのエンベロープ＋bili レンダリングタグ＋ハーネスの末尾行のみで構成されるプレーンテキスト）の場合、空ターンの退避リトライをスキップします——バックグラウンドイベントに対するモデルの空ターンが正解だからです（#7235）。メッセージ全体のマッチングのため「通知＋人間の質問」は引き続きリトライします。タグ名を追加して対象を拡張可能（例: teammate-message）；空リストまたは全て非文字列のリストはデフォルトにフォールバックします。"
   - key: compat
     type: "{ roles?, dropFields?, streamErrorShape?, noCacheControl?, keepResponseId? }"
     default: "{} (disabled)"

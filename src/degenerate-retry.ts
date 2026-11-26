@@ -4,6 +4,7 @@ import { hasCompactionTrigger } from "./codex-compact.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { WireProtocol } from "./util.js";
 import { appendTrailingUserText } from "./wire-body.js";
+import { loadConfigFile } from "./config.js";
 
 const MAX_THROTTLE_ERROR_BODY_BYTES = 16 * 1024;
 // Keep callback latency separate from the bounded body read used for scope refinement.
@@ -39,10 +40,13 @@ function releaseThrottleErrorReader(reader: ReadableStreamDefaultReader<Uint8Arr
 // the client's next request.
 // Wording covers BOTH retry shapes: the empty-turn shape (#732/#821) and the
 // draft-tail shape (#2303, visible prose ending in a compression-draft closing
-// tag) — both are "ended without a tool call", and both need the same push:
-// issue the pending action or state the final answer explicitly.
+// tag) — both are "ended without a tool call". #7235: the old "take your next
+// concrete action" pushed the model to FABRICATE an action for a turn that
+// legitimately needs none (a teammate message, an already-reported
+// notification); the new wording lets an intentional no-op stay silent while
+// still nudging a genuine stall to issue its pending action or answer.
 export const DEGENERATE_RETRY_NUDGE =
-    "[billion-context] Your previous response ended without a tool call. Continue now: take your next concrete action — issue the tool call you were about to make, or state your final answer explicitly.";
+    "[billion-context] Your previous response ended without a tool call. If you intended to call a tool or give an answer, do so now; if no response is needed, output nothing.";
 
 /** #7666: built-in nudge rotation when the user configured no `nudges` list.
  *  Attempt i sends the i-th sentence (cycling), so repeated attempts do not
@@ -91,6 +95,26 @@ interface ContinuationRetryOpts {
     wrapBody?: (body: string | Buffer) => string | Buffer;
 }
 
+/** The continuation refetch handed to the stream pipes. Callable as a plain
+ *  re-issue function (the retry's response body, or null when the retry cannot
+ *  be issued), and carrying a LAZY background-event probe (#7235) the pipe's
+ *  empty-turn retry checks BEFORE nudging. The probe is a property of the
+ *  closure (not inside the refetch body) so the zero-byte-cut and
+ *  reasoning-only-cut retries that share the refetch keep working unchanged. */
+export interface ContinuationRefetch {
+    (): Promise<ReadableStream<Uint8Array> | null>;
+    /** True when the forwarded request's last user message is a pure
+     *  background event — the empty turn is the correct answer and must not be
+     *  nudged (#7235). Optional so test mocks that only supply the callable
+     *  half keep working; the pipe treats a missing probe as "not a background
+     *  event". */
+    isBackgroundEvent?(): boolean;
+    /** Classify the forwarded request's last user message for the
+     *  degenerate-nudge observability log (#7235): "background-event" /
+     *  "non-text" / "human". Optional for the same reason. */
+    lastUserMessageCategory?(): string;
+}
+
 async function readSmallThrottleErrorBody(response: Response): Promise<Uint8Array | undefined> {
     const reader = response.body?.getReader();
     if (!reader) return undefined;
@@ -126,14 +150,14 @@ async function readSmallThrottleErrorBody(response: Response): Promise<Uint8Arra
  *  when the retry cannot be issued (unbuildable body, upstream error, client
  *  already gone) — the caller then passes the original empty turn through
  *  unchanged. */
-export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Promise<ReadableStream<Uint8Array> | null> {
+export function makeContinuationRefetch(opts: ContinuationRetryOpts): ContinuationRefetch {
     const nudges = opts.nudges && opts.nudges.length > 0 ? opts.nudges : DEFAULT_DEGENERATE_RETRY_NUDGES;
     // #7666: self-counted attempt index for nudge rotation. The pipe only ever
     // calls this within its configured budget, so the index can never run past
     // what the user allowed; the modulo keeps a short list cycling instead of
     // stalling on a missing sentence.
     let attempt = 0;
-    return async () => {
+    const refetch = async (): Promise<ReadableStream<Uint8Array> | null> => {
         if (opts.signal.aborted) return null;
         // A body whose final input item is a compaction trigger must never be
         // re-issued: appending the nudge after it breaks the wire shape (#283:
@@ -265,4 +289,175 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             return null;
         }
     };
+    // #7235: the lazy background-event probe. Computed on demand (the pipe's
+    // empty-turn retry asks before nudging); it reads the forwarded body's last
+    // user message, never the retry body.
+    refetch.isBackgroundEvent = (): boolean => isBackgroundEventRequest(opts.protocol, opts.body, resolveExemptEnvelopes());
+    refetch.lastUserMessageCategory = (): string => lastUserMessageCategory(opts.protocol, opts.body, resolveExemptEnvelopes());
+    return refetch;
+}
+
+// #7235: background-event exemption for the degenerate-terminal retry. A turn
+// whose LAST outgoing user message is a pure background event (a
+// task-notification / system-reminder with nothing else) is an intentional
+// no-op: the model's empty end_turn is the correct answer. Nudging it turns the
+// no-op into boilerplate text, unrequested tool calls, or (on the chat path) an
+// in-band stream error written into the persisted session record. The probe
+// checks the OUTGOING request body's last user message (NOT
+// lastUserSummaryInstruction, which walks back past tool_result to an EARLIER
+// message and cannot say what THIS turn is answering).
+
+/** The default envelopes that mark a background-event message. Harness tags
+ *  differ across clients, so the list is configurable via
+ *  `degenerateRetry.exemptEnvelopes` in the config file. */
+export const DEFAULT_EXEMPT_ENVELOPES: readonly string[] = ["task-notification", "system-reminder"];
+
+// The Claude Code harness appends a tail line after a notification block telling
+// the model when to act. It is not part of the notification content, so the
+// probe strips it before checking for emptiness.
+const HARNESS_TAIL_RE = /(?:^|\n)\s*If this event is something the user would act on now[^\n]*/g;
+
+// bili's own render tags (KDD #2): <acp tokens="N" type="text">mNNNNN</acp>.
+// Hex-escaped per the source-file rule.
+const ACP_TAG_RE = /\x3cacp\b[^\x3e]*\x3e[\s\S]*?\x3c\/acp\x3e/g;
+
+function escapeRegExp(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Strip the background-event envelopes, bili render tags, and the harness
+ *  tail line from `text`. Returns the residual content. */
+function stripBackgroundEventContent(text: string, envelopes: readonly string[]): string {
+    let residual = text.replace(ACP_TAG_RE, "");
+    for (const envelope of envelopes) {
+        if (!envelope) continue;
+        const re = new RegExp(`<${escapeRegExp(envelope)}>[\\s\\S]*?<\\/${escapeRegExp(envelope)}>`, "g");
+        residual = residual.replace(re, "");
+    }
+    return residual.replace(HARNESS_TAIL_RE, "");
+}
+
+/** True when `text` is a pure background-event message: it contains at least
+ *  one configured envelope, and after stripping envelopes + render tags + the
+ *  harness tail line, nothing remains. Whole-message match — "notif + human
+ *  question" leaves a residual and is NOT exempted. */
+export function isBackgroundEventText(text: string, envelopes: readonly string[]): boolean {
+    let hasEnvelope = false;
+    for (const envelope of envelopes) {
+        if (envelope && text.includes(`<${envelope}>`)) {
+            hasEnvelope = true;
+            break;
+        }
+    }
+    if (!hasEnvelope) return false;
+    return stripBackgroundEventContent(text, envelopes).trim() === "";
+}
+
+/** Extract the last user message's text from a PARSED request body. Returns
+ *  undefined when the last message is not a pure-text user message (it is a
+ *  tool_result / image / file / function-output tail, an assistant message, or
+ *  a trailing system run) — those are never background events. */
+export function lastUserTextFromParsed(protocol: WireProtocol, obj: Record<string, unknown>): string | undefined {
+    if (protocol === "responses") {
+        const input = obj.input;
+        if (typeof input === "string") return input;
+        if (!Array.isArray(input)) return undefined;
+        const arr = input as Record<string, unknown>[];
+        const last = arr[arr.length - 1];
+        if (!last || typeof last !== "object" || last.role !== "user") return undefined;
+        const c = last.content;
+        if (typeof c === "string") return c;
+        if (!Array.isArray(c)) return undefined;
+        let text = "";
+        for (const part of c as Record<string, unknown>[]) {
+            if (!part || typeof part !== "object" || part.type !== "input_text" || typeof part.text !== "string") return undefined;
+            text += part.text;
+        }
+        return text;
+    }
+    if (protocol === "google") {
+        const contents = obj.contents;
+        if (!Array.isArray(contents)) return undefined;
+        const arr = contents as Record<string, unknown>[];
+        const last = arr[arr.length - 1];
+        if (!last || typeof last !== "object" || last.role !== "user" || !Array.isArray(last.parts)) return undefined;
+        let text = "";
+        for (const part of last.parts as Record<string, unknown>[]) {
+            if (!part || typeof part !== "object" || typeof part.text !== "string") return undefined;
+            text += part.text;
+        }
+        return text;
+    }
+    // anthropic / openai (messages array)
+    const messages = obj.messages;
+    if (!Array.isArray(messages)) return undefined;
+    const arr = messages as Record<string, unknown>[];
+    const last = arr[arr.length - 1];
+    if (!last || typeof last !== "object" || last.role !== "user") return undefined;
+    const c = last.content;
+    if (typeof c === "string") return c;
+    if (!Array.isArray(c)) return undefined;
+    let text = "";
+    for (const part of c as Record<string, unknown>[]) {
+        if (!part || typeof part !== "object" || part.type !== "text" || typeof part.text !== "string") return undefined;
+        text += part.text;
+    }
+    return text;
+}
+
+/** True when the OUTGOING request body's last user message is a pure
+ *  background event (see isBackgroundEventText). The probe the three degenerate
+ *  retry paths check before nudging (#7235). */
+export function isBackgroundEventRequest(protocol: WireProtocol, body: string | Buffer, envelopes: readonly string[]): boolean {
+    let obj: Record<string, unknown>;
+    try {
+        obj = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
+    } catch {
+        return false;
+    }
+    return isBackgroundEventRequestFromParsed(protocol, obj, envelopes);
+}
+
+/** Parsed twin of isBackgroundEventRequest for callers that already hold the
+ *  parsed body (the acp-loop path). */
+export function isBackgroundEventRequestFromParsed(protocol: WireProtocol, obj: Record<string, unknown>, envelopes: readonly string[]): boolean {
+    const text = lastUserTextFromParsed(protocol, obj);
+    if (text === undefined) return false;
+    return isBackgroundEventText(text, envelopes);
+}
+
+/** Resolve the exempt-envelope list from the config file
+ *  (`degenerateRetry.exemptEnvelopes`), falling back to the default. The list
+ *  is read per-probe (degenerate turns are rare; loadConfigFile is cached). */
+export function resolveExemptEnvelopes(): string[] {
+    const file = loadConfigFile().degenerateRetry?.exemptEnvelopes;
+    if (Array.isArray(file) && file.length > 0) {
+        const clean = file.filter((s): s is string => typeof s === "string" && s !== "");
+        if (clean.length > 0) return clean;
+    }
+    return [...DEFAULT_EXEMPT_ENVELOPES];
+}
+
+/** Classify the last user message in the outgoing request body for the
+ *  degenerate-nudge observability log (#7235). Returns one of:
+ *  "background-event" (a pure notification / system-reminder), "non-text" (the
+ *  last message is not a pure-text user message — tool_result / image /
+ *  function output / assistant / trailing system run), or "human" (a plain
+ *  text user message). */
+export function lastUserMessageCategory(protocol: WireProtocol, body: string | Buffer, envelopes: readonly string[]): string {
+    let obj: Record<string, unknown>;
+    try {
+        obj = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
+    } catch {
+        return "other";
+    }
+    return lastUserMessageCategoryFromParsed(protocol, obj, envelopes);
+}
+
+/** Parsed twin of lastUserMessageCategory for callers that already hold the
+ *  parsed body (the acp-loop path). */
+export function lastUserMessageCategoryFromParsed(protocol: WireProtocol, obj: Record<string, unknown>, envelopes: readonly string[]): string {
+    if (isBackgroundEventRequestFromParsed(protocol, obj, envelopes)) return "background-event";
+    if (lastUserTextFromParsed(protocol, obj) === undefined) return "non-text";
+    return "human";
 }

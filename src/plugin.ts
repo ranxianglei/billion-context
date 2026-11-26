@@ -65,6 +65,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
         /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
 }
 import { degenerateTurnWarning, endsWithAnnouncement, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
+import type { ContinuationRefetch } from "./degenerate-retry.js";
 import { getChangelog, latestChangelog, warmChangelogOnce } from "./web/changelog.js";
 import { warmBlogRefreshOnce } from "./web/blog-refresh.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
@@ -2908,7 +2909,7 @@ export async function pipePluginChatWithStrip(
     protocol: WireProtocol,
     session?: Session,
     log?: (msg: string) => void,
-    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
+    refetch?: ContinuationRefetch,
     upstreamOrigin?: string,
     // True when the outbound request carried the [ACP absorb] instruction:
     // the model may then answer with a tool call written as prose, and the
@@ -3180,6 +3181,15 @@ export async function pipePluginChatWithStrip(
             return false;
         }
         if (res.destroyed || res.writableEnded) return false;
+        // #7235: a background-event request (last user message is a pure
+        // task-notification / system-reminder) is an intentional no-op — the
+        // model's empty turn is the correct answer. Pass it through instead of
+        // nudging. Stalled-tail turns (the model produced a draft/announcement)
+        // are NOT exempt: the model is not being silent there.
+        if (!stalledTail && refetch.isBackgroundEvent?.() === true) {
+            log?.("[plugin] degenerate terminal turn on a background-event request; the empty turn is the correct answer, passing through (#7235)");
+            return false;
+        }
         // A turn the model left genuinely bare — no thought, no stripped echo,
         // no released markup — is the upstream's own empty answer, not a stall:
         // re-issuing it double-bills an empty completion (#732/#821 keep the
@@ -3200,6 +3210,19 @@ export async function pipePluginChatWithStrip(
             return false;
         }
         if (degenerateRetries >= maxDegenerateRetries) {
+            // #7235: the retry degenerated too. The old behavior (#870) emitted an
+            // in-band stream error, which the host records as an assistant message
+            // in the persisted session record — every subsequent turn re-feeds it
+            // to the model, and the model believes its previous turn crashed. For
+            // the Anthropic protocol (Claude Code) the empty end_turn is
+            // protocol-legal: the acp-loop path already passes it through, and the
+            // Responses path silently stops. Downgrade to log + pass through for
+            // Anthropic; keep the in-band error for the other protocols (OpenAI,
+            // Responses, Google) whose wires require a non-empty completion.
+            if (protocol === "anthropic") {
+                log?.(`[plugin] degenerate terminal turn again after ${degenerateRetries} continuation nudge(s); passing the empty turn through (anthropic, no in-band error) (#7235)`);
+                return false;
+            }
             // The retry budget is spent and the last attempt was NOT bare (the
             // gate above): it really did produce thinking or stripped output
             // and still ended with nothing the host can act on. Default
@@ -3236,12 +3259,13 @@ export async function pipePluginChatWithStrip(
             return true;
         }
         degenerateRetries += 1;
+        const userCat = refetch.lastUserMessageCategory?.() ?? "unknown";
         const attemptNote = maxDegenerateRetries > 1 ? ` (attempt ${degenerateRetries}/${maxDegenerateRetries})` : " once";
         log?.(announceTail
-            ? `[plugin] terminal turn is a bare announcement (ends mid-promise, no tool call); retrying${attemptNote} with a continuation nudge (#3905)`
+            ? `[plugin] terminal turn is a bare announcement (ends mid-promise, no tool call); retrying${attemptNote} with a continuation nudge (last-user-msg=${userCat}) (#3905)`
             : draftTail
-              ? `[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying${attemptNote} with a continuation nudge (#2303)`
-              : `[plugin] degenerate terminal turn (no usable output); retrying${attemptNote} with a continuation nudge (#732/#821)`);
+              ? `[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying${attemptNote} with a continuation nudge (last-user-msg=${userCat}) (#2303)`
+              : `[plugin] degenerate terminal turn (no usable output); retrying${attemptNote} with a continuation nudge (last-user-msg=${userCat}) (#732/#821)`);
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -4578,7 +4602,7 @@ export async function pipePluginResponsesWithStrip(
     res: ServerResponse,
     session?: Session,
     log?: (msg: string) => void,
-    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
+    refetch?: ContinuationRefetch,
     upstreamOrigin?: string,
     // See pipePluginChatWithStrip: whole-field tool-call emission drop,
     // gated on the request carrying the [ACP absorb] instruction (m00885).
@@ -4987,6 +5011,14 @@ export async function pipePluginResponsesWithStrip(
             return false;
         }
         if (res.destroyed || res.writableEnded) return false;
+        // #7235: background-event exemption — see the chat-pipe twin. A pure
+        // background-event request (last input item is a task-notification /
+        // system-reminder) is an intentional no-op; the empty turn is the
+        // correct answer. Stalled-tail turns are NOT exempt.
+        if (!stalledTail && refetch.isBackgroundEvent?.() === true) {
+            log?.("[plugin] degenerate terminal turn on a background-event request (responses); the empty turn is the correct answer, passing through (#7235)");
+            return false;
+        }
         // A turn the model left genuinely bare — no reasoning, no stripped
         // echo — is the upstream's own empty answer, not a stall: re-issuing it
         // double-bills an empty completion (#732/#821 keep the same boundary in
@@ -4997,12 +5029,13 @@ export async function pipePluginResponsesWithStrip(
             return false;
         }
         degenerateRetries += 1;
+        const userCat = refetch.lastUserMessageCategory?.() ?? "unknown";
         const attemptNote = maxDegenerateRetries > 1 ? ` (attempt ${degenerateRetries}/${maxDegenerateRetries})` : " once";
         log?.(announceTail
-            ? `[plugin] terminal turn is a bare announcement (ends mid-promise, no function call); retrying${attemptNote} with a continuation nudge (#3905)`
+            ? `[plugin] terminal turn is a bare announcement (ends mid-promise, no function call); retrying${attemptNote} with a continuation nudge (last-user-msg=${userCat}) (#3905)`
             : draftTail
-              ? `[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying${attemptNote} with a continuation nudge (#2303)`
-              : `[plugin] degenerate terminal turn (no visible output); retrying${attemptNote} with a continuation nudge (#732/#821)`);
+              ? `[plugin] terminal turn ends with a compression-draft closing tag and no function call); retrying${attemptNote} with a continuation nudge (last-user-msg=${userCat}) (#2303)`
+              : `[plugin] degenerate terminal turn (no visible output); retrying${attemptNote} with a continuation nudge (last-user-msg=${userCat}) (#732/#821)`);
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();

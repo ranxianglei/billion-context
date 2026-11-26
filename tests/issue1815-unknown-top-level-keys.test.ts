@@ -140,6 +140,9 @@ test("#1815: the full documented top-level surface produces no warning (#2062)",
                 update: { checkIntervalMs: 180000 }, diagnostics: { dumpBody: false },
                 fakeCompletion: { retries: 0 }, codexCompact: "intercept",
                 ccrRetrievalTtlMs: 600000, decompressTmpCap: 50,
+                // #7243: the degenerateRetry block was missing from KNOWN_TOP_LEVEL_KEYS —
+                // a documented key warned as unknown on load (same class as #5706).
+                degenerateRetry: { exemptEnvelopes: ["task-notification", "system-reminder"] },
             }),
             () => {
                 loadRoutes();

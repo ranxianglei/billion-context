@@ -47,7 +47,7 @@ import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
-import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
+import { DEGENERATE_RETRY_NUDGE, isBackgroundEventRequestFromParsed, lastUserMessageCategoryFromParsed, resolveExemptEnvelopes } from "../degenerate-retry.js";
 import { endsWithAnnouncement, endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogateEscapesOnJson } from "../text-safe.js";
 
@@ -1242,6 +1242,16 @@ export async function* runCompressLoop(
                     }
                 }
 
+                // #7235: background-event exemption — compute the probe once from
+                // the outgoing request body. A pure background-event request (last
+                // user message is a task-notification / system-reminder) is an
+                // intentional no-op; the empty turn is the correct answer. The
+                // probe is computed from requestBody (the ORIGINAL request, not
+                // roundBody, which may carry a continuation nudge from a prior
+                // retry).
+                const isBackgroundEvent = ctx.protocol
+                    ? isBackgroundEventRequestFromParsed(ctx.protocol, requestBody, resolveExemptEnvelopes())
+                    : false;
                 // #732 (completes the auto-retry groundwork of #673/#674), extended by #821: a reasoning model can end a turn with ONLY a thinking block — zero visible text, zero tool calls, status completed — most often right after a post-compress re-request, where it sees the freshly-shrunk context and "wraps up" into a silent thought. The client then receives an empty completed turn and stalls until manually nudged. Retriable when no VISIBLE output reached the client yet (!forwardedVisible): on Responses rounds the framing is suppressed so nothing was forwarded at all; on openai/anthropic a thinking-only prefix WAS streamed verbatim, but it is invisible to host turn semantics and its chunks carry no finish_reason, so appending the retry's content to the same stream is safe. Re-fetch once with a continuation nudge (a plain re-fetch reproduces the same silent output deterministically). One-shot per request. `sawThinking` is mandatory so a genuinely empty (no-reasoning) terminal turn is left untouched — only the "silent thought" shape retries.
                 if (
                     !degenerateRetried &&
@@ -1259,11 +1269,17 @@ export async function* runCompressLoop(
                     // forwardedVisible: they need forwarded-not-parsed semantics.)
                     assistantText.trim().length === 0 &&
                     calls.length === 0 &&
-                    !signal?.aborted
+                    !signal?.aborted &&
+                    // #7235: a background-event request is an intentional no-op —
+                    // the empty turn is the correct answer, do not nudge.
+                    !isBackgroundEvent
                 ) {
                     degenerateRetried = true;
-                    ctx.log(`[acp-loop] round ${round}: degenerate terminal turn (completed, zero visible output); retrying once with continuation nudge (#732/#821)`);
-                    loggerLog("warn", `[acp-loop] degenerate-turn auto-retry round ${round} (session ${ctx.session.id})`);
+                    const userCat = ctx.protocol
+                        ? lastUserMessageCategoryFromParsed(ctx.protocol, requestBody, resolveExemptEnvelopes())
+                        : "non-text";
+                    ctx.log(`[acp-loop] round ${round}: degenerate terminal turn (completed, zero visible output); retrying once with continuation nudge (last-user-msg=${userCat}) (#732/#821)`);
+                    loggerLog("warn", `[acp-loop] degenerate-turn auto-retry round ${round} (session ${ctx.session.id}, last-user-msg=${userCat})`);
                     const nudge: CoreMessage = {
                         id: `acp_degenerate_retry_r${round}`,
                         role: "user",

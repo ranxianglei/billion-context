@@ -120,6 +120,7 @@
 | `chainContentDetection` | boolean | false | BILI_CHAIN_CONTENT | bili→bili チェーンのボディコンテンツ検出（オフ：ボディスキャンは CCR/モデルエコーテキストで誤検出する可能性がある）；デフォルトでは x-bili-hop のみでチェーン認識を駆動します。 |
 | `chainEgressStamp` | boolean | false | BILI_CHAIN_STAMP | 送信時にモデル可視の <bili-chain/> チェックポイントキャリアを発行します（オフ：モデルはこれを幻覚入力として扱い、トークンを消費します）。 |
 | `stableSystemAnchor` | boolean | false | BILI_STABLE_SYSTEM_ANCHOR | ベストエフォートのワイヤーレイヤープレフィックスキャッシュアンカー：クライアントが変更した場合でも、最初に確認されたヘッドシステムバイトを再送信します（プレーンプロキシレーンのみ）。 |
+| `degenerateRetry.exemptEnvelopes` | string[] | ["task-notification", "system-reminder"] | — | バックグラウンドイベントメッセージをマークするハーネスタグ名。送信先プラグインリクエストの最後の user メッセージが純粋なバックグラウンドイベント（これらのエンベロープ＋bili レンダリングタグ＋ハーネスの末尾行のみで構成されるプレーンテキスト）の場合、空ターンの退避リトライをスキップします——バックグラウンドイベントに対するモデルの空ターンが正解だからです（#7235）。メッセージ全体のマッチングのため「通知＋人間の質問」は引き続きリトライします。タグ名を追加して対象を拡張可能（例: teammate-message）；空リストまたは全て非文字列のリストはデフォルトにフォールバックします。 |
 | `compat` | { roles?, dropFields?, streamErrorShape?, noCacheControl?, keepResponseId? } | {} (disabled) | — | グローバルワイヤー互換性ブロック：ロールリマップ、厳格スキーマフィールドの削除、ストリームエラー形状、cache-control 処理。 |
 | `compat.roles` | record role → role | {} | — | メッセージロールを上流が受け入れる名前にマッピングします（例：developer→system）；完全一致ロールのみ、プロバイダーごとのエントリがキーごとに優先されます。 |
 | `compat.dropFields` | string[] (dot paths) | [] | — | 未知のフィールドで 400 を返す厳格スキーマゲートウェイ向けに、転送されるすべてのボディからドットパスフィールドを削除します；グローバル + プロバイダーごとのリストは加算的に統合されます。 |

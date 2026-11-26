@@ -2207,6 +2207,13 @@ type FileConfig = {
      *  `keepResponseId` (#2030): set `true` to preserve previous_response_id
      *  on rebuilt Responses requests (env ACP_KEEP_RESPONSE_ID=1 wins). */
     compat?: { roles?: Record<string, string>; streamErrorShape?: string; degenerateTurn?: string; dropFields?: string[]; noCacheControl?: boolean; keepResponseId?: boolean };
+    /** #7235: degenerate-terminal retry block. `exemptEnvelopes` is the list of
+     *  harness tag names that mark a background-event message (default
+     *  ["task-notification", "system-reminder"]); a request whose LAST user
+     *  message is a pure background event is exempted from the empty-turn
+     *  continuation nudge. Harness tags differ across clients — extend the list
+     *  here to exempt teammate / other-session messages. */
+    degenerateRetry?: { exemptEnvelopes?: string[] };
     /** Global image billing mode (#767): "auto" | "pixels" | "bytes".
      *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
      *  over both. See ProviderRoute.imageBilling. */
@@ -2659,6 +2666,9 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
     "autoModeForge", "imageRescale", "guardrails",
+    // #7243: degenerateRetry block (exemptEnvelopes) — without this mirror entry
+    // a documented key warned as unknown on load (same class as #5706).
+    "degenerateRetry",
     // #3376:
     "cacheKeepalive",
     // #6003 phase 2: user-registerable egress body-rewrite pipeline.

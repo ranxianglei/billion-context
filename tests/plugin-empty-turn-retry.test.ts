@@ -619,66 +619,35 @@ function sseEvents(raw: string): { event: string; data: Record<string, unknown> 
         .filter((e): e is { event: string; data: Record<string, unknown> } => e !== null);
 }
 
-// #2689: the #870 in-band error on the ANTHROPIC wire must be a well-formed
-// block lifecycle at the client's next free index — strict clients (ZCode)
-// validate every content_block_* frame against the Anthropic SSE schema and
-// rejected the old bare delta (no numeric index, no owning content_block_start)
-// for the whole turn. Pipe-level pin: the emitter gets its state from the real
-// pipe counters, not a hand-built argument.
-test("plugin chat (anthropic) #870: the in-band error block is well-formed at the next free index", async () => {
+// #7235: the Anthropic protocol (Claude Code) accepts an empty end_turn, so the
+// second-failure fallback passes the empty turn through instead of emitting an
+// in-band error (which the host would record as an assistant message in the
+// persisted session record). The OpenAI/Responses/Google paths keep the #870
+// in-band error because their wires require a non-empty completion.
+test("plugin chat (anthropic) #7235: the second-failure fallback passes through (no in-band error)", async () => {
     const out: string[] = [];
     const refetch = () => Promise.resolve(streamOf(anthropicEchoOnlyTurn()));
-    // #2689 pins the OPT-IN completion shape: hosts that set streamErrorShape:
-    // "completion" get the well-formed block lifecycle (ZCode schema compat).
     await pipePluginChatWithStrip(
         streamOf(anthropicEchoOnlyTurn()), makeRes(out), "anthropic", makeSession(), undefined, refetch,
         undefined, undefined, undefined, undefined, undefined, "completion",
     );
     const text = out.join("");
-    assert.ok(text.includes("[ACP] stream error"), "#870 fired");
-
-    // No re-opening of the message: the retry's own message_start was consumed.
-    assert.equal((text.match(/"type":"message_start"/g) ?? []).length, 1, "exactly one message_start");
-
-    const events = sseEvents(text);
-    // The exact reported defect: EVERY content_block_delta must carry a numeric
-    // index (ZCode's zod validator failed on `index` being undefined).
-    for (const e of events.filter((ev) => ev.event === "content_block_delta")) {
-        assert.equal(typeof e.data["index"], "number", `delta missing numeric index: ${JSON.stringify(e.data)}`);
-    }
-    // The error delta specifically must NOT be an orphan: an owning
-    // content_block_start precedes it and a content_block_stop follows it, all
-    // sharing the same index.
-    const errPos = events.findIndex((e) => e.event === "content_block_delta" && JSON.stringify(e.data).includes("[ACP] stream error"));
-    assert.notEqual(errPos, -1, "error delta present");
-    const idx = events[errPos].data["index"];
-    const startsBefore = events.slice(0, errPos).filter((e) => e.event === "content_block_start" && e.data["index"] === idx).length;
-    const stopsAfter = events.slice(errPos + 1).filter((e) => e.event === "content_block_stop" && e.data["index"] === idx).length;
-    assert.equal(startsBefore, 1, "error delta has an owning content_block_start before it");
-    assert.equal(stopsAfter, 1, "error delta is closed by a content_block_stop after it");
-    // Next-free-index: the error block's index equals the number of distinct
-    // block indices already forwarded to the client BEFORE the error block's
-    // own start (no reuse / collision).
-    let ownStartPos = -1;
-    for (let i = errPos - 1; i >= 0 && ownStartPos === -1; i--) {
-        if (events[i].event === "content_block_start" && events[i].data["index"] === idx) ownStartPos = i;
-    }
-    assert.notEqual(ownStartPos, -1, "owning start located");
-    const priorIndices = new Set(events.slice(0, ownStartPos).filter((e) => e.event === "content_block_start").map((e) => e.data["index"]));
-    assert.equal(idx, priorIndices.size, `error block opened at the next free index (got ${idx}, expected ${priorIndices.size})`);
+    // #7235: the Anthropic protocol passes the empty turn through on the second
+    // failure — no in-band error is emitted.
+    assert.ok(!text.includes("[ACP] stream error"), "no in-band error for anthropic (#7235)");
+    assert.ok(!text.includes("event: error"), "no native error event for anthropic (#7235)");
 });
 
-test("plugin chat (anthropic) defaults to a native error event, not a synthetic completion", async () => {
+test("plugin chat (anthropic) #7235: the second-failure fallback passes through (no native error event)", async () => {
     const out: string[] = [];
     const refetch = () => Promise.resolve(streamOf(anthropicEchoOnlyTurn()));
     await pipePluginChatWithStrip(streamOf(anthropicEchoOnlyTurn()), makeRes(out), "anthropic", makeSession(), undefined, refetch);
     const text = out.join("");
-    // Default streamErrorShape="protocol": the exhausted retry surfaces as the
-    // Anthropic-native error event — NOT a synthetic content_block carrying the
-    // error text (that is the completion-only shape pinned above for opt-in hosts).
-    assert.ok(text.includes("event: error"), "a native Anthropic error event marks the failure");
-    assert.ok(text.includes('"code":"stream_error"'), "the error carries the stream_error code");
-    assert.ok(!text.includes("[ACP] stream error"), "no synthetic completed-turn error block by default");
+    // #7235: the Anthropic protocol passes the empty turn through on the second
+    // failure — no native error event is emitted.
+    assert.ok(!text.includes("event: error"), "no native Anthropic error event (#7235)");
+    assert.ok(!text.includes('"code":"stream_error"'), "no stream_error code (#7235)");
+    assert.ok(!text.includes("[ACP] stream error"), "no synthetic completed-turn error block (#7235)");
 });
 
 // #4913: compat.degenerateTurn="passthrough" (env BILI_DEGENERATE_TURN wins)
