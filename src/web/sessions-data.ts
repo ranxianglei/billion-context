@@ -1,5 +1,5 @@
 import { defaultCountTokens, orderedRefPair, type CompressionBlock } from "acp-kernel";
-import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
+import { blockContentSnapshot, listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
 import { fileNameMatchesId, getStore, isValidRecord, _resetStoreForTest, relPathFor } from "../persist.js";
@@ -19,7 +19,7 @@ import { markdownToHtml } from "./markdown.js";
 import { displaySessionTitle, firstBlockTopicLead } from "../session-title.js";
 import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
-import { dataDir } from "../paths.js";
+import { dataDir, sessionsDirRelocated } from "../paths.js";
 import { isExternalSummaryBlock } from "../external-summary-marker.js";
 import { readdirSync, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
@@ -485,14 +485,14 @@ const DATA_DIR_INFRA_ENTRIES = new Set(["ca"]);
 
 /** #2180: a top-level ENOENT means "pristine" — no session file can exist
  *  anywhere — only when the DEFAULT layout is in effect: BILI_SESSIONS_DIR
- *  unset AND the XDG data root either absent or holding ONLY bili's own infra
+ *  unset AND no `sessions.dir` config key AND the XDG data root either absent or holding ONLY bili's own infra
  *  dirs (a fresh install where ensureRootCA() already ran). An explicit
  *  override pointing nowhere, or a data root containing anything else, stays
  *  loud (#1937): silence there would hide a moved/misconfigured path while
  *  real sessions sit elsewhere. */
 function isPristineSessionsRoot(error: unknown): boolean {
     if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") return false;
-    if (process.env.BILI_SESSIONS_DIR) return false;
+    if (sessionsDirRelocated()) return false;
     let entries: string[];
     try {
         statSync(dataDir());
@@ -1768,7 +1768,7 @@ function snapshotRefIndexFor(session: Session, block: CompressionBlock): Map<str
     if (direct.length === 0) return null;
     let content: BlockContent | undefined;
     try {
-        content = session.blockContents.get(block.blockId);
+        content = blockContentSnapshot(session.blockContents, block);
     } catch {
         return null;
     }
@@ -1922,7 +1922,7 @@ export async function buildBlockContent(id: string, blockId: string, view: Block
     if (!block) return { ok: false, reason: "unknown-block" };
     let content: BlockContent | undefined;
     try {
-        content = session.blockContents.get(blockId);
+        content = blockContentSnapshot(session.blockContents, block);
     } catch (error) {
         // #3917: a corrupt/unreadable content store must not 500 the panel —
         // report it as "no snapshot" and let the UI explain.

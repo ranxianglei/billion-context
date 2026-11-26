@@ -554,7 +554,8 @@ export interface RegistryEntry {
      *  while consumers that wait for the process to EXIT (findSameLanePredecessor
      *  → wait-predecessor) keep counting them. */
     portReleasedAt?: number;
-    /** #5046: resolved sessions directory (BILI_SESSIONS_DIR or the XDG
+    /** #5046: resolved sessions directory (BILI_SESSIONS_DIR / the
+     *  `sessions.dir` config key, or the XDG
      *  default) — lets the #394 warning judge by DIRECTORY instead of lane
      *  overlap alone: a peer whose lanes overlap but whose sessions dir
      *  differs shares no state (isolated via BILI_SESSIONS_DIR), and the

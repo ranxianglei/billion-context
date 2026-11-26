@@ -176,7 +176,25 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // rows, byte-identical to pre-feature.
     // Force with `rollout.features.egressPlane: true` or
     // `BILI_ROLLOUT_EGRESS_PLANE=1`.
-    egressPlane: { percent: 0 },
+    egressPlane: { percent: 100 }, // ci:full verification branch: default ON (not to be merged as-is)
+    // #7658 PR-B (owner ruling 2026-11-25): the egress-on kstate retirement,
+    // two independent gates so the rollout (and the rollback) is staged.
+    // egressKstateRetireWrites: the sessions.kstate_json column stops
+    // carrying the FULL kernel state of egress-on sessions — only the
+    // bounded residual (the same field set the block-ledger sidecar carries);
+    // blocks/messageRefs/tsStamps/tokenSnapshot/lastPassIds are all
+    // reconstructable from the op log. 0 = legacy double-write.
+    // Force with BILI_ROLLOUT_EGRESS_KSTATE_RETIRE_WRITES=1.
+    egressKstateRetireWrites: { percent: 100 }, // ci:full verification branch: default ON (not to be merged as-is)
+    // egressKstateRebuild: at LOAD, the egress-on kstate is rebuilt from
+    // (message flow → messageRefs/tsStamps) + (block ledger → blocks +
+    // sidecar residual); any replay corruption keeps the stored column
+    // verbatim (no fuzzy guessing). 0 = legacy (read the column verbatim).
+    // Force with BILI_ROLLOUT_EGRESS_KSTATE_REBUILD=1.
+    // Rollback order matters: flip RetireWrites back to 0 FIRST (the next
+    // save re-fills the full column), only then Rebuild back to 0 — a
+    // residual-only column has nothing to read verbatim.
+    egressKstateRebuild: { percent: 100 }, // ci:full verification branch: default ON (not to be merged as-is)
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
     // message identity aligned from their OWN local transcript/sqlite

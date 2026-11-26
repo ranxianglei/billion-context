@@ -398,16 +398,22 @@ function seedWal(dir: string): { seed: DatabaseSync; dbPath: string; walSize: nu
     return { seed, dbPath, walSize };
 }
 
-// #7156 fix 2 (owner 2026-11-20): the corruption vector is not merely "two
-// writers" — it is a TRUNCATE checkpoint reclaiming the WAL + its -shm index
-// state out from under a peer that still holds a STALE view of it. The
+// #7156 fix 2 (owner 2026-11-20) said: while a live foreign writer is proven
+// present (the #4175 lockfile), the open-time and close-time TRUNCATE
+// checkpoints must SKIP — a TRUNCATE reclaims the WAL file and its -shm
+// index state out from under a peer holding a STALE view of it (the
 // incident's old sidecar ran exactly this: its shutdown checkpoint while its
-// replacement was already writing. So while a live foreign writer is proven
-// present (the #4175 lockfile), NEITHER the open-time nor the close-time
-// TRUNCATE checkpoint runs — the WAL simply stays until the peer exits and
-// the next clean pass converges it. Nothing is lost by the skip: WAL frames
-// are durable and are replayed/checkpointed by whoever closes cleanly later.
-test("a live foreign writer suppresses the WAL checkpoint (TRUNCATE) on open and close (#7156 fix 2)", { timeout: 30_000 }, async (t) => {
+// replacement was already writing).
+//
+// #7674 (owner 2026-11-24) supersedes the skip with a stronger guarantee:
+// the open/close checkpoints are now PASSIVE, which by definition never
+// touches the WAL file — the reclaim vector is gone for every peer, alive
+// or not, so there is nothing left to suppress. This suite pins the new
+// contract in both directions: under a live foreign writer the file must
+// NEVER shrink (frames may backfill, the floor must not move), and the data
+// must stay intact; the pre-fix tree truncates the file here (size → 0
+// plus bootstrap residue), so the no-shrink assertion is the discriminator.
+test("a live foreign writer: open/close checkpoints never shrink the WAL file (#7156 → #7674)", { timeout: 30_000 }, async (t) => {
     resetIntegrityCheckStateForTests();
     setIntegritySyncThresholdForTests(null);
     const dir = tmpDir();
@@ -424,47 +430,48 @@ test("a live foreign writer suppresses the WAL checkpoint (TRUNCATE) on open and
     });
     let seed: DatabaseSync | null = null;
     try {
-        // ---- foreign writer present: both checkpoints must SKIP ----
+        // ---- foreign writer present: the checkpoints run, but NEVER shrink the file ----
         const seeded = seedWal(dir);
         seed = seeded.seed;
         const dbPath = join(dir, "index.db");
         writeFileSync(dbPath + ".lock", JSON.stringify({ pid: holder.pid, boot: Date.now() }));
-        let skipOpen = "", skipClose = "";
-        setLogCapture((level, m) => {
-            const msg = String(m);
-            if (level === "info" && msg.includes("live foreign writer pid")) {
-                if (msg.includes("on open")) skipOpen = msg;
-                if (msg.includes("on close")) skipClose = msg;
-            }
-        });
         try {
             const store = UnifiedStore.open(dbPath);
-            // TRUNCATE would have reclaimed the seeded frames (wal → 0, then
-            // small bootstrap writes); with the skip the seeded frames must
-            // still be IN the wal, so its size can only have grown.
-            assert.ok(walSizeOf(dbPath) >= seeded.walSize, `open() did NOT truncate the WAL out from under the live peer (now ${walSizeOf(dbPath)}, seeded ${seeded.walSize})`);
-            assert.ok(skipOpen.length > 0, `open reported the checkpoint skip: ${skipOpen}`);
+            // The seeded frames must still be in the file: a TRUNCATE would
+            // have reclaimed them (wal → 0, then small bootstrap residue). A
+            // PASSIVE may backfill frames into the main db (safe) but the
+            // FILE can only stay put or grow.
+            assert.ok(walSizeOf(dbPath) >= seeded.walSize, `open() did NOT reclaim the WAL out from under the live peer (now ${walSizeOf(dbPath)}, seeded ${seeded.walSize})`);
             store.setKv("test", "key", { x: 1 }); // a committed frame stays in the WAL
             store.close();
-            assert.ok(statSync(dbPath + "-wal").size > 0, "close() did NOT run the final checkpoint under a live peer — the WAL stays for the peer's next clean pass");
-            assert.ok(skipClose.length > 0, `close reported the checkpoint skip: ${skipClose}`);
-            assert.ok(skipOpen.includes(String(holder.pid)), "the skip log names the peer pid");
+            assert.ok(statSync(dbPath + "-wal").size >= seeded.walSize, "close() did NOT shrink the WAL file under a live peer — the floor is not reclaimed from under the successor");
         } finally {
             setLogCapture(null);
         }
+        // The data the peer wrote on top of the seeded frames must survive the
+        // whole dance.
+        const verify = new DatabaseSync(dbPath);
+        const kvRow = verify.prepare("SELECT value_json FROM kv_store WHERE namespace = ? AND key = ?").get("test", "key") as { value_json: string };
+        assert.ok(kvRow.value_json.length > 0, "the kv row must survive open+close over the live peer");
+        verify.close();
         seed?.close();
 
-        // ---- control: no foreign writer → both checkpoints run ----
+        // ---- control: no foreign writer → PASSIVE converges the tail, file stays ----
         const dir2 = tmpDir();
         t.after(() => rmSync(dir2, { recursive: true, force: true }));
-        seed = seedWal(dir2).seed;
+        const seeded2 = seedWal(dir2);
+        seed = seeded2.seed;
         const db2 = join(dir2, "index.db");
         const store2 = UnifiedStore.open(db2);
-        assert.equal(walSizeOf(db2), 0, "open() ran the TRUNCATE checkpoint (fast path preserved without a peer)");
+        assert.ok(walSizeOf(db2) >= seeded2.walSize, "open() must NOT truncate the WAL file even without a peer (#7674: PASSIVE never shrinks)");
         store2.setKv("test", "key", { x: 1 });
         assert.ok(walSizeOf(db2) > 0, "the committed frame is in the WAL before close");
         store2.close();
-        assert.equal(walSizeOf(db2), 0, "close() converged the WAL (single-writer behavior unchanged)");
+        assert.ok(walSizeOf(db2) >= seeded2.walSize, "close() leaves the WAL file at its high-water mark (single-writer behavior under #7674)");
+        const verify2 = new DatabaseSync(db2);
+        const rows = verify2.prepare("SELECT count(*) AS n FROM t").get() as { n: number };
+        assert.equal(rows.n, 50, "seeded rows must survive the open/close checkpoints");
+        verify2.close();
         // seed is closed by the outer finally.
     } finally {
         seed?.close();

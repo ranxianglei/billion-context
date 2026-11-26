@@ -29,18 +29,36 @@ import {
     egressStateAt,
     egressStateBaseSeq,
     egressStateRead,
+    egressStateView,
     egressFork,
+    egressMessageHighWater,
     EgressStateCorruptError,
     type EgressOp,
     type EgressViewRow,
 } from "./egress-state.js";
 import { featureEnabled } from "../rollout.js";
 import {
+    diffBlockSet,
+    egressBlockAppend,
+    egressBlockCompact,
+    egressBlockReplay,
+    egressBlockView,
+    egressPointFork,
+    serializeKstateResidual,
+    serializeKstateResidualFromKstateJson,
+    type EgressBlockOp,
+    type EgressBlockSnapshot,
+} from "./egress-block.js";
+import {
     snapL1Record,
     snapR3LatchedRead,
+    snapR3LatchedReadOnSession,
     snapR3LatchClear,
+    snapR3LatchClearOnSession,
     snapR3LatchWrite,
+    snapR3LatchWriteOnSession,
     snapR3LatchedList,
+    snapR3LatchedListOnSessions,
 } from "./snap.js";
 import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
 import { EGRESS_SYSTEM_MSGID } from "./egress-record.js";
@@ -54,9 +72,12 @@ import type { MessageContentStore } from "acp-kernel";
  *  built-in autocheckpoint alone cannot guarantee reclamation in a long-lived
  *  process: while a foreign connection holds a read snapshot (dashboard /
  *  export / second lane sharing the directory — #2671 topology) WAL backfill
- *  is blocked at that snapshot and the file grows until the reader lets go.
- *  PASSIVE never blocks the ingest path; a failed checkpoint is logged and
- *  forgotten — the next tick retries and journal_size_limit does the rest. */
+ *  is blocked at that snapshot and frames pile up. PASSIVE moves committed
+ *  frames into the main db WITHOUT touching the WAL file (no floor reclaim
+ *  under live peers — the #7156/#7674 discipline) and never blocks the
+ *  ingest path; a failed checkpoint is logged and forgotten — the next tick
+ *  retries. File-size reclamation is a separate concern: an explicit
+ *  journal_size_limit (when configured) or an operator's ?vacuum=full. */
 const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 
 /** PR #4725 N3: covered-seq span point queries chunk the msg_id IN (…) list
@@ -112,6 +133,13 @@ export interface SessionRow {
     sessionId: string;
     parentSessionId?: string | null;
     forkPointSeq?: number | null;
+    /** #7658: the FLOW-clock watermark (MAX op_seq of the parent's
+     *  egress_flow at fork time) the four egress tables were copied at.
+     *  fork_point_seq carries the unified-message through-seq — NULL for
+     *  egress-on parents whose unified leg is frozen, so the egress fork
+     *  point needs its own carrier. NULL = no egress copy (egress-off or
+     *  the MySQL lane, which has no egress tables). */
+    forkEgressWatermark?: number | null;
     protocol?: string | null;
     label?: string | null;
     title?: string | null;
@@ -789,33 +817,26 @@ export class UnifiedStore {
         const store = new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
         if (foreignLockHolder !== null) store.noteForeignWriterSeen(foreignLockHolder.pid);
         if (bootVerdictFresh) store.noteIntegrityOk();
-        // #3250: converge the WAL an unclean exit left behind (SIGKILL / power
-        // loss never reaches close()). Moving committed frames into the main db
-        // now shortens the NEXT crash's recovery replay. Isolated from the open
-        // contract above on purpose: under a multi-process shared directory
-        // (#2671) a TRUNCATE can come back busy while a foreign connection is
-        // mid-transaction — that must log, not fail the open; the periodic and
-        // close-time passes retry the reclamation.
-        // #7156 fix 2 (owner 2026-11-20): a TRUNCATE checkpoint does not merely
-        // move frames — it RECLAIMS the WAL file and its -shm index state out
-        // from under every peer. A live peer holding a STALE view of that index
-        // (a wedged predecessor mid-fold, a predecessor still draining after
-        // accepting shutdown) then writes or checkpoints from the invalidated
-        // view, and its frames land in reclaimed offsets — the #7156 damage
-        // shape (child pointers beyond EOF, "2nd reference to page", ptrmap
-        // mismatches). So while a live foreign writer is proven present, skip
-        // the truncate: the WAL simply stays until the peer exits, and the
-        // periodic/close/next-open passes converge it then. With no live
-        // foreign writer the behavior is byte-identical to before.
-        const foreignAtOpen = store.activeForeignWriter();
-        if (foreignAtOpen === null) {
-            try {
-                db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
-            } catch (err) {
-                loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
-            }
-        } else {
-            loggerLog("info", `[storage] skipping the WAL checkpoint (TRUNCATE) on open for ${path}: live foreign writer pid ${foreignAtOpen} present — truncating the WAL index under a live peer risks the #7156 corruption shape; the periodic/close/next-open passes converge the WAL after it exits`);
+        // #3250: converge the frames an unclean exit left behind (SIGKILL /
+        // power loss never reaches close()). Moving committed frames into the
+        // main db now shortens the NEXT crash's recovery replay. Isolated from
+        // the open contract above on purpose: under a multi-process shared
+        // directory (#2671) a checkpoint can come back busy while a foreign
+        // connection is mid-transaction — that must log, not fail the open;
+        // the periodic and close-time passes retry. #7674: PASSIVE, not
+        // TRUNCATE — a TRUNCATE reclaim fetches the WAL file and its -shm
+        // index out from under live peers; a peer holding a stale view of
+        // that index then writes into reclaimed offsets, the #7156 damage
+        // shape (pages double-allocated, "2nd reference to page", index
+        // pages corrupting before table pages). PASSIVE moves every frame it
+        // can without touching the file: same replay shortening, no floor
+        // reclaim. The file stays at its historical high-water mark
+        // (bounded; shrink on demand with ?vacuum=full or an explicit
+        // storage.walJournalSizeLimitBytes).
+        try {
+            db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
         // #4609: a large store's cache-miss check runs post-open on a second
         // read-only connection — open() returns immediately; the verdict
@@ -877,21 +898,17 @@ export class UnifiedStore {
         // leaves nothing for the next boot's recovery to replay. Same isolation
         // as open(): a checkpoint hiccup logs and never throws — callers treat
         // close() as best-effort shutdown work.
-        // #7156 fix 2: the same live-foreign-writer guard as open(). The dying
-        // process's FINAL checkpoint is the proven vector — the incident's old
-        // sidecar ran its shutdown checkpoint while its replacement was already
-        // writing, and that truncate reclaimed the WAL under a live peer. A
-        // skip only delays reclamation: the WAL stays, the peer's next clean
-        // pass converges it, nothing is lost.
-        const foreignAtClose = this.activeForeignWriter();
-        if (foreignAtClose === null) {
-            try {
-                this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
-            } catch (err) {
-                loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
-            }
-        } else {
-            loggerLog("info", `[storage] skipping the WAL checkpoint (TRUNCATE) on close for ${this.dbPath}: live foreign writer pid ${foreignAtClose} present (#7156) — the WAL is left for the peer's next clean pass to converge`);
+        // #7674: PASSIVE, not TRUNCATE. The dying process's FINAL checkpoint
+        // was the proven #7156 vector — the incident's old sidecar ran its
+        // shutdown checkpoint while its replacement was already writing, and
+        // that truncate reclaimed the WAL under a live peer. PASSIVE moves
+        // every committable frame into the main db without touching the WAL
+        // file: the replay tail is converged, the floor is not reclaimed from
+        // under a live successor.
+        try {
+            this.db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
         }
         this.db.close();
         // #4609: a clean close of a VERIFIED store refreshes the PASS memo onto
@@ -1726,6 +1743,10 @@ export class UnifiedStore {
                     start_msgid = COALESCE(excluded.start_msgid, blocks.start_msgid),
                     end_msgid = COALESCE(excluded.end_msgid, blocks.end_msgid)`,
             );
+            // #7577: collect the transcript-resolved coordinates per block so
+            // the egress block recorder (below) can build self-contained
+            // snapshots without re-reading the egress flow view.
+            const blockCoords = new Map<string, { startSeq: number; endSeq: number; startMsgid: string | null; endMsgid: string | null }>();
             for (const b of input.blocks) {
                 if (skipIncomingBlocks) continue;
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
@@ -1749,6 +1770,7 @@ export class UnifiedStore {
                 } else {
                     [bStartMsgid, bEndMsgid] = msgidBoundsForCovered(b.payloadJson);
                 }
+                blockCoords.set(b.blockId, { startSeq: bStartSeq, endSeq: bEndSeq, startMsgid: bStartMsgid, endMsgid: bEndMsgid });
                 const incomingSummaryBytes = b.summaryBytes ?? b.summary;
                 if (ex &&
                     ex.ord === b.ord &&
@@ -1815,6 +1837,48 @@ export class UnifiedStore {
                     if (ex.one_hash !== null) {
                         if (ex.one_hash === oneHash && oneHash !== null) this.releaseContent(oneHash);
                         else this.releaseContent(ex.one_hash);
+                    }
+                }
+            }
+
+            // #7577: EGRESS BLOCK LIFECYCLE LOG — record the block set for
+            // egress-on sessions (dual clocks: the block table numbers itself;
+            // each row carries the flow watermark pointer). Snapshots are
+            // built from the incoming blocks + the transcript-resolved
+            // coordinates collected above. Gated on the egress-on latch (set
+            // by resolveEgressAuthority) AND a non-envelope save (envelope
+            // imports preserve the stored lineage — the block flow is not
+            // updated for them). A live block leaving the set emits a terminal
+            // reaped U (D6), not a DELETE + orphan_blocks copy.
+            if (!skipIncomingBlocks) {
+                let egressOn = false;
+                try {
+                    const meta = JSON.parse(s.metadataJson) as Record<string, unknown>;
+                    egressOn = meta["egressAuthority"] === true;
+                } catch { /* metadataJson parse failure → not egress-on */ }
+                if (egressOn) {
+                    const currentBlocks = new Map<string, EgressBlockSnapshot>();
+                    for (const b of input.blocks) {
+                        const coords = blockCoords.get(b.blockId);
+                        if (!coords) continue;
+                        currentBlocks.set(b.blockId, {
+                            tier: b.tier,
+                            startMsgid: coords.startMsgid,
+                            startSeq: coords.startSeq,
+                            endMsgid: coords.endMsgid,
+                            endSeq: coords.endSeq,
+                            supersedesBlockId: b.supersedesBlockId,
+                            active: b.active,
+                            reaped: false,
+                            one: b.one,
+                            full: b.summary,
+                        });
+                    }
+                    const prevBlocks = this.egressBlockView(s.sessionId);
+                    const blockOps = diffBlockSet(prevBlocks, currentBlocks);
+                    if (blockOps.length > 0) {
+                        const kstateResidual = serializeKstateResidualFromKstateJson(s.kstateJson);
+                        this.egressBlockAppendOps(s.sessionId, blockOps, kstateResidual, Date.now());
                     }
                 }
             }
@@ -1987,10 +2051,58 @@ export class UnifiedStore {
         // conversation binding when the host supplied one, the sid otherwise.
         // (Same resolution as the save path below — stage 0 and the plane
         // commit must address the SAME l1 row.)
+        // Identity consolidation (discussions/7591): an egress-on session's
+        // conversations row is a self-claim (conversation_id = session_id —
+        // the v1 identity map), so the answer is the sid itself and the
+        // lookup is dropped entirely for those sessions.
+        if (this.isEgressOnSession(sid)) return sid;
         return (
             (this.db.prepare("SELECT conversation_id FROM conversations WHERE session_id = ?").get(sid) as { conversation_id: string } | undefined)
                 ?.conversation_id ?? sid
         );
+    }
+
+    /** Identity consolidation (discussions/7591): whether this sid's
+     *  session table is the identity authority — the row latched
+     *  metadata.egressAuthority (the lane latches BEFORE the first ingest
+     *  upsert, so the flag is present from the very first row) or, as the
+     *  fallback for pre-flag edges, the egress op log already carries the
+     *  session. Storage faults read NOT egress-on (the legacy path is the
+     *  floor — a false negative costs one redundant l1 row, never an
+     *  identity decision). */
+    private isEgressOnSession(sid: string): boolean {
+        try {
+            const row = this.db
+                .prepare("SELECT metadata_json FROM sessions WHERE session_id = ?")
+                .get(sid) as { metadata_json: string | null } | undefined;
+            if (row) {
+                try {
+                    const md = JSON.parse(row.metadata_json || "{}") as Record<string, unknown>;
+                    if (md["egressAuthority"] === true) return true;
+                } catch { /* corrupt metadata_json — fall through to the flow probe */ }
+            }
+            return !!this.db.prepare("SELECT 1 FROM egress_flow WHERE session_id = ? LIMIT 1").get(sid);
+        } catch {
+            return false; // egress tables not probed in yet / fault — legacy path
+        }
+    }
+
+    /** Identity consolidation (discussions/7591, GC half): the effective
+     *  freshness of a session — the row's updated_at, or the last egress
+     *  op when the op log is newer. Egress-on rows freeze updated_at after
+     *  the arm turn (per-turn saves never land), so the plain column says
+     *  "dead" for a session whose op log is the sole content authority and
+     *  still being written. Storage fault → the plain column (the legacy
+     *  behavior is the floor; the exclusion below is the safety net). */
+    private egressAwareFreshness(sid: string, updatedAt: number): number {
+        try {
+            const r = this.db
+                .prepare("SELECT MAX(created_at) AS m FROM egress_flow WHERE session_id = ?")
+                .get(sid) as { m: number | null } | undefined;
+            return r?.m != null && r.m > updatedAt ? r.m : updatedAt;
+        } catch {
+            return updatedAt;
+        }
     }
 
     /** Stage 0 for one turn: ensure the l1 row exists (idempotent session-
@@ -2001,6 +2113,73 @@ export class UnifiedStore {
      *  any kernel side effect.
      */
     snapStage0(sid: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): Stage0Result {
+        // Identity consolidation (discussions/7591): an egress-on session is
+        // STATELESS here — no l1 row is ever read or written. The op log is
+        // the authority (R1): the echo/anchor verdict is replay math against
+        // the flow's live msgids, and the "cursor" moves only in the lane's
+        // memory (the anchorAdvanced markDirty is a no-op for these
+        // sessions — their saves never land). No ledger conflict can exist
+        // (v1 identity map), so FoundationRejectError is unreachable here by
+        // construction — the branch simply cannot throw it.
+        if (this.isEgressOnSession(sid)) {
+            const now = Date.now();
+            const live = this.snapPinLiveIds(sid);
+            const known = new Set(live);
+            const seqs = opts?.seqs ?? null;
+            // Two cursors (egress-state.nextSeqs semantics): op_seq orders
+            // EVERY row (B/I/D/U) and is the seqs-carrier guard; log_seq
+            // numbers I rows only and is never reused across folds (D rows
+            // keep their log_seq gone). The message frontier is the highest
+            // number EVER ISSUED — MAX(log_seq) over the rows, falling back
+            // to the newest base's highWater once a compaction physically
+            // removed the I rows it subsumes (#7574 leaves only the B row —
+            // the exact rule nextSeqs applies, egressMessageHighWater).
+            // live.length understates it after any fold, so derive positions
+            // from it, not the live view (discussions/7591 review L1:
+            // bookkeeping-only, but the persisted witness must stay truthful).
+            // NOTE (review L2): the arm turn itself — runStage0 runs in the
+            // lane BEFORE the egress flag is latched to the sessions row —
+            // still takes the legacy path and may write one dead l1 row that
+            // is never read again; we deliberately do NOT pre-latch (that
+            // would move arm timing for zero functional gain).
+            const fr = (this.db
+                .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_flow WHERE session_id = ?")
+                .get(sid) as { o: number });
+            const seqFrontier = fr.o;   // op-ordering cursor (seqs guard)
+            const msgFrontier = egressMessageHighWater(this.db, sid);   // canonical message frontier (positions)
+            const allKnown = incoming.length > 0 && incoming.every((id) => known.has(id));
+            const seqsAtFrontier = seqs === null || seqs.every((s) => s <= seqFrontier);
+            const newIds = incoming.filter((id) => !known.has(id));
+            if (allKnown && seqsAtFrontier && !opts?.resync) {
+                return {
+                    decision: {
+                        mode: "echo",
+                        replay: true,
+                        window: { tailIds: [], headIds: [], count: incoming.length, maxPos: msgFrontier },
+                        newIdPos: [],
+                        goneIds: [],
+                        issuedAt: now,
+                        witness: `echo: egress-on, all ${incoming.length} ids in the op log (msg frontier ${msgFrontier})`,
+                    },
+                    explainedGone: new Set<string>(),
+                };
+            }
+            // anchor: fresh / grown / rewritten array — the flow ingest in
+            // this same request is the persistence; the decision is pure
+            // bookkeeping (D1: never reject).
+            const newIdPos = newIds.map((id, i) => ({ id, pos: msgFrontier + i + 1 }));
+            return {
+                decision: {
+                    mode: "anchor",
+                    window: { tailIds: incoming.slice(-64), headIds: incoming.slice(0, 8), count: incoming.length, maxPos: msgFrontier + newIds.length },
+                    newIdPos,
+                    goneIds: [],
+                    issuedAt: now,
+                    witness: `anchor: egress-on, ${newIds.length}/${incoming.length} ids new (msg frontier ${msgFrontier})`,
+                },
+                explainedGone: new Set<string>(),
+            };
+        }
         const sessRaw = this.snapSessRawOf(sid);
         const now = Date.now();
         const l1 = snapL1Record(this.db, sessRaw, sid, this.snapWitnessProbe(sid), now);
@@ -2051,6 +2230,11 @@ export class UnifiedStore {
      *  a resync re-baselines the ENVELOPE, never the session identity.
      */
     snapStage0Reset(sid: string): void {
+        // Identity consolidation (discussions/7591): egress-on sessions have
+        // NO l1 cursor — there is nothing to reset; the op log is never
+        // re-baselined by this path (the lane takes the legacy full path
+        // this turn and the next pin re-anchors from the client's array).
+        if (this.isEgressOnSession(sid)) return;
         const sessRaw = this.snapSessRawOf(sid);
         this.db
             .prepare("UPDATE l1_world SET tail_json = NULL, head_json = NULL, count = NULL, max_pos = NULL WHERE sess_raw = ?")
@@ -2129,6 +2313,11 @@ export class UnifiedStore {
      *  re-400 the same broken envelope). */
     snapR3Latched(sid: string): boolean {
         try {
+            // Identity consolidation (discussions/7591): the sessions row is
+            // the carrier of record; the l1_world column is a legacy
+            // READ-FALLBACK only (pre-migration latches stay readable until
+            // that table is dropped — nothing NEW ever lands there).
+            if (snapR3LatchedReadOnSession(this.db, sid)) return true;
             return snapR3LatchedRead(this.db, this.snapSessRawOf(sid));
         } catch {
             return false; // schema/column edge: treat as unlatched, the in-memory breaker still fires
@@ -2137,10 +2326,23 @@ export class UnifiedStore {
 
     /** #6181 M3: persist the R3 breaker latch (best-effort — a failed
      *  write degrades to the in-memory latch, which still fires this
-     *  process). */
+     *  process). Identity consolidation (discussions/7591, owner ruling
+     *  2026-11-24): the carrier switch is GATED on egressPlane — when it is
+     *  on, new latches land on the SESSIONS row (of record); when it is off,
+     *  the legacy l1_world carrier (placeholder-row ritual) is used, so
+     *  behavior is byte-identical to pre-migration until the switch flips.
+     *  Read / clear / list stay dual-carrier (a superset, always correct). */
     snapR3Latch(sid: string): void {
         try {
-            snapR3LatchWrite(this.db, this.snapSessRawOf(sid), Date.now());
+            if (featureEnabled("egressPlane")) {
+                snapR3LatchWriteOnSession(this.db, sid, Date.now());
+            } else {
+                // egressPlane off → legacy l1 carrier, byte-identical to
+                // pre-migration: the l1 row is keyed by the SESSION RAW id
+                // (conversation id for conv-bound sessions), matching the
+                // `snapR3Latched` read path.
+                snapR3LatchWrite(this.db, this.snapSessRawOf(sid), Date.now());
+            }
         } catch { /* best-effort — see above */ }
     }
 
@@ -2149,10 +2351,22 @@ export class UnifiedStore {
      *  (the caller uses it to clear the in-memory breaker too) or null when
      *  no row exists / a fault. Keyed by sess_raw (the roster key), not by
      *  sid — the admin surface has the raw id, and the latch row predates
-     *  the sid→raw resolution in its placeholder phase. */
+     *  the sid→raw resolution in its placeholder phase. Identity
+     *  consolidation (discussions/7591): clears BOTH carriers — the
+     *  sessions row (of record) and the legacy l1 row. */
     snapR3LatchClear(sessRaw: string): string | null {
         try {
-            return snapR3LatchClear(this.db, sessRaw);
+            // discussions/7591 review M1: clear BOTH carriers unconditionally.
+            // A session latched pre-migration (l1 row) and re-latched
+            // post-migration (sessions row) holds a timestamp under the same
+            // key in both tables; bailing out after the first hit would leave
+            // the legacy read-fallback (snapR3Latched below) still latched and
+            // pin the session on the legacy path until the l1 table is
+            // dropped. Return non-null when EITHER carrier was latched — the
+            // admin caller uses that to clear the in-memory breaker too.
+            const fromSession = snapR3LatchClearOnSession(this.db, sessRaw);
+            const fromL1 = snapR3LatchClear(this.db, sessRaw);
+            return fromSession ?? fromL1;
         } catch {
             return null;
         }
@@ -2160,10 +2374,19 @@ export class UnifiedStore {
 
     /** #6785 review: the persisted-latch roster (an operator must be able
      *  to SEE which raw ids are stuck before clearing them). Empty on a
-     *  fault — the roster is diagnostic, never load-bearing. */
+     *  fault — the roster is diagnostic, never load-bearing. Identity
+     *  consolidation (discussions/7591): the union of both carriers
+     *  (sessions row of record + legacy l1 fallback), deduped per raw id
+     *  (the newer latch wins). */
     snapR3LatchedList(): Array<{ sessRaw: string; ledgerId: string; latchedAt: number }> {
         try {
-            return snapR3LatchedList(this.db);
+            const byRaw = new Map<string, { sessRaw: string; ledgerId: string; latchedAt: number }>();
+            for (const r of snapR3LatchedListOnSessions(this.db)) byRaw.set(r.sessRaw, r);
+            for (const r of snapR3LatchedList(this.db)) {
+                const have = byRaw.get(r.sessRaw);
+                if (!have || r.latchedAt > have.latchedAt) byRaw.set(r.sessRaw, r);
+            }
+            return [...byRaw.values()].sort((a, b) => b.latchedAt - a.latchedAt);
         } catch {
             return [];
         }
@@ -2209,6 +2432,25 @@ export class UnifiedStore {
         return egressStateAt(this.db, sessionId, logSeq);
     }
 
+    /** Renumber (2026-11-25, egress-plane.md §10): the client's raw system
+     *  (A) — the latest system row's sysIn. The incremental lane's sticky
+     *  input stops living in the inc:system ext column for egress-on
+     *  sessions (reads consult this first; the ext write stays for legacy). */
+    egressSystemInput(sessionId: string): string | null {
+        const row = this.db
+            .prepare(
+                "SELECT payload FROM egress_state WHERE session_id = ? AND msgid = 'egress-system' ORDER BY op_seq DESC LIMIT 1",
+            )
+            .get(sessionId) as { payload?: string } | undefined;
+        if (!row?.payload) return null;
+        try {
+            const p = JSON.parse(row.payload) as { sysIn?: unknown };
+            return typeof p.sysIn === "string" ? p.sysIn : null;
+        } catch {
+            return null;
+        }
+    }
+
     egressStateMaxSeq(sessionId: string): number {
         // op_seq is the row-ordering high-water (log_seq is the per-message
         // number and only I rows carry it — it is not the row cursor).
@@ -2250,7 +2492,76 @@ export class UnifiedStore {
         this.db.transaction(() => {
             this.db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(sessionId);
+            // #7577: the block lifecycle log rides the same session — delete it too.
+            this.deleteEgressBlockOps(sessionId);
         });
+    }
+
+
+    /** #7577: EGRESS BLOCK LIFECYCLE LOG — the store surface over
+     *  src/storage/egress-block.ts (dual table: bounded state replica + total
+     *  flow, sharing the egress_flow op_seq clock). Corruption throws
+     *  EgressBlockCorruptError — callers degrade per the degrade ladder. */
+    egressBlockAppendOps(sessionId: string, ops: EgressBlockOp[], kstateJson: string | null, nowMs: number): number[] {
+        return egressBlockAppend(this.db, sessionId, ops, kstateJson, nowMs);
+    }
+
+    egressBlockView(sessionId: string): Map<string, EgressBlockSnapshot> {
+        return egressBlockView(this.db, sessionId);
+    }
+
+    /** Fork/rollback reconstruction of the block set at the block's OWN
+     *  op_seq x (dual clocks — this is egress_block_flow's sequence, not the
+     *  flow watermark), plus the kstate sidecar from the last row at/before
+     *  x. */
+    egressBlockReplay(sessionId: string, x: number): { blocks: Map<string, EgressBlockSnapshot>; kstate: string | null } {
+        return egressBlockReplay(this.db, sessionId, x);
+    }
+
+    egressBlockCompact(sessionId: string, blocks: Map<string, EgressBlockSnapshot>, kstateJson: string | null, nowMs: number): number {
+        return egressBlockCompact(this.db, sessionId, blocks, kstateJson, nowMs);
+    }
+
+    /** The block table's own op_seq high-water (dual clocks — diagnostic
+     *  only; the point-fork watermark is the FLOW clock, egressStateMaxSeq,
+     *  because every block row's flow_op_seq pointer <= the flow MAX). */
+    egressBlockMaxSeq(sessionId: string): number {
+        const block = this.db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_block_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
+        return Number(block.mx) || 0;
+    }
+
+    /** #7577 D5: point fork — copy the parent's egress + block op logs up to
+     *  (and including) FLOW watermark wm to the child (one transaction; the
+     *  child inherits the parent's number space). Block rows are selected by
+     *  their flow_op_seq pointer. wm = egressStateMaxSeq is the whole-copy
+     *  special case. */
+    egressPointForkSession(parentId: string, childId: string, wm: number): boolean {
+        return egressPointFork(this.db, parentId, childId, wm) > 0;
+    }
+
+    /** #7577 (b): tsStamps for an egress-on session is NOT persisted (the
+     *  write path trims it — see ingest.ts KSTATE_TRIM_FIELDS); it is DERIVED
+     *  from the live egress view, where each row's msgid IS the kernel raw
+     *  message id and ts is the first-observed wall clock. Returns null when
+     *  the session has no egress rows (egress-off) or a corrupt log. */
+    egressTsStamps(sessionId: string): Record<string, number> | null {
+        try {
+            const view = egressStateView(this.db, sessionId);
+            const out: Record<string, number> = {};
+            for (const row of view) {
+                if (row.ts !== undefined) out[row.msgid] = row.ts;
+            }
+            return Object.keys(out).length > 0 ? out : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /** Delete the session's block op-log rows (state AND flow). Runs inside
+     *  the caller's sweep transaction. */
+    deleteEgressBlockOps(sessionId: string): void {
+        this.db.prepare("DELETE FROM egress_block_state WHERE session_id = ?").run(sessionId);
+        this.db.prepare("DELETE FROM egress_block_flow WHERE session_id = ?").run(sessionId);
     }
 
 
@@ -2867,10 +3178,25 @@ export class UnifiedStore {
         let candidates: GcPlanCandidate[] = [];
         if (archiveAfterDays > 0) {
             const cutoff = now - archiveAfterDays * 86_400_000;
-            candidates = (this.db
+            const rows = (this.db
                 .prepare("SELECT session_id, label, updated_at FROM sessions WHERE status = 'active' AND updated_at < ? ORDER BY updated_at")
                 .all(cutoff) as Array<{ session_id: string; label: string | null; updated_at: number }>
-            ).map((r) => ({ sessionId: r.session_id, label: r.label ?? undefined, updatedAt: r.updated_at }));
+            );
+            for (const r of rows) {
+                // Identity consolidation (discussions/7591): two guards —
+                // (1) freshness: an egress-on row's updated_at froze at the
+                // arm turn (per-turn saves never land), the op log IS the
+                // activity; (2) ARCHIVABILITY: archiveSession exports the
+                // messages/blocks projection and DELETEs the egress op log
+                // without exporting it — for an egress-on session (op log =
+                // sole content authority) that sweep is DATA LOSS. Excluded
+                // until the archive format carries the op log (follow-up,
+                // same release train as the l1/conversations DROP batch).
+                const fresh = this.egressAwareFreshness(r.session_id, r.updated_at);
+                if (fresh >= cutoff) continue;
+                if (this.isEgressOnSession(r.session_id)) continue;
+                candidates.push({ sessionId: r.session_id, label: r.label ?? undefined, updatedAt: r.updated_at });
+            }
         }
         const zeroRef = this.contentZeroRefReport();
         const pageSize = (this.db.prepare("PRAGMA page_size").get() as { page_size?: number } | undefined)?.page_size ?? 4096;
@@ -2892,7 +3218,9 @@ export class UnifiedStore {
      *  (#2671/#394) may hold a read transaction; busy_timeout already
      *  absorbs most contention. Throws when all attempts fail: the deletion
      *  itself is already committed, the caller reports the shrink as
-     *  partial. */
+     *  partial. #7674 note: this stays TRUNCATE — vacuum is an explicit
+     *  operator request, so the reclaim is a requested shrink, not the
+     *  implicit engine-internal truncate that the corruption came from. */
     vacuum(mode: "full" | "incremental"): void {
         if (mode === "incremental") {
             this.db.exec("PRAGMA incremental_vacuum");
@@ -2942,6 +3270,16 @@ export class UnifiedStore {
     archiveSession(sessionId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
         const row = this.getSessionRow(sessionId);
         if (!row) return { ok: false, reason: "not-found" };
+        // Identity consolidation (discussions/7591): the GC age-sweep excludes
+        // egress-on sessions; the MANUAL paths (unifiedArchiveSession —
+        // `bili sessions archive`) share this chokepoint and would otherwise
+        // hit the same data loss: the export carries the messages/blocks
+        // projection (frozen at the arm turn for these sessions) while the
+        // egress op log — the sole content authority — is neither exported
+        // nor re-imported by restoreSession. Refuse until the archive format
+        // carries the op log (follow-up, same batch as the l1/conversations
+        // physical DROP).
+        if (this.isEgressOnSession(sessionId)) return { ok: false, reason: "egress-on session: the archive format does not carry the egress op log yet — refusing (follow-up)" };
         // #3901 review: sessions are small and numerous — a per-session file
         // per archive would spray tiny files across the archive dir. One
         // append-only JSONL holds every archived session, one line each.
@@ -3236,7 +3574,7 @@ export class UnifiedStore {
             if (c) content[hash] = Buffer.from(c.bytes).toString("utf8");
         }
         mkdirSync(opts.archiveDir, { recursive: true });
-        appendFileSync(exportPath, JSON.stringify({ version: 1, sessionId, blockId, archivedAt: Date.now(), block: row, content }) + "\n");
+        const archiveLine = JSON.stringify({ version: 1, sessionId, blockId, archivedAt: Date.now(), block: row, content }) + "\n";
         let contentRowsDeleted = 0;
         this.db.transaction(() => {
             this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(sessionId, blockId);
@@ -3245,6 +3583,8 @@ export class UnifiedStore {
             const zero = this.db.prepare("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0").get() as { n: number };
             contentRowsDeleted = zero.n;
             this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+            // Publish only after the sweep, while append failures can still roll it back.
+            appendFileSync(exportPath, archiveLine);
         });
         loggerLog("info", `[#5312] archived block ${blockId} from ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
         return { ok: true, exportPath, contentRowsDeleted };
@@ -3265,7 +3605,7 @@ export class UnifiedStore {
         let rawLines: string[];
         try { rawLines = readFileSync(exportPath, "utf8").split("\n"); } catch { return { ok: false, reason: "export-corrupt" }; }
         let lineNo = -1;
-        for (let i = 0; i < rawLines.length; i++) {
+        for (let i = rawLines.length - 1; i >= 0; i--) {
             if (!rawLines[i].trim()) continue;
             let head: unknown;
             try { head = JSON.parse(rawLines[i]) as unknown; } catch { continue; }
@@ -3339,8 +3679,15 @@ export class UnifiedStore {
         let contentRowsDeleted = 0;
         if (opts.archiveAfterDays > 0) {
             const cutoff = now - opts.archiveAfterDays * 86_400_000;
-            const stale = this.db.prepare("SELECT session_id FROM sessions WHERE status = 'active' AND updated_at < ?").all(cutoff) as { session_id: string }[];
+            const stale = this.db.prepare("SELECT session_id, updated_at FROM sessions WHERE status = 'active' AND updated_at < ?").all(cutoff) as { session_id: string; updated_at: number }[];
             for (const s of stale) {
+                // Identity consolidation (discussions/7591): same two guards
+                // as gcPlan — egress-aware freshness (the op log is the
+                // activity), and egress-on exclusion (archiveSession would
+                // delete the op log WITHOUT exporting it — data loss until
+                // the archive format carries it).
+                if (this.egressAwareFreshness(s.session_id, s.updated_at) >= cutoff) continue;
+                if (this.isEgressOnSession(s.session_id)) continue;
                 const r = this.archiveSession(s.session_id, { archiveDir: opts.archiveDir });
                 if (r.ok) archived++;
                 if (r.contentRowsDeleted) contentRowsDeleted += r.contentRowsDeleted;
@@ -3404,8 +3751,11 @@ export class UnifiedStore {
             deleted += Number(r.changes);
             // Best-effort shrink between batches: committed frames move into
             // the main db and the WAL file truncates back to the cap
-            // (#3250 discipline). A busy checkpoint loses nothing — the next
-            // batch retries.
+            // (#3250 discipline). This stays TRUNCATE under #7674: gc is an
+            // explicit operator action (?gc=full / admin), so the reclaim is
+            // a requested shrink, not the implicit engine-internal truncate
+            // the corruption came from. A busy checkpoint loses nothing — the
+            // next batch retries.
             try {
                 this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
             } catch { /* best-effort; retried by the next batch */ }
@@ -4336,7 +4686,7 @@ export class UnifiedStore {
     getSessionRow(sessionId: string): SessionRow | null {
         const row = this.db
             .prepare(
-                `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin, status,
+                `SELECT session_id, parent_session_id, fork_point_seq, fork_egress_watermark, protocol, label, title, host_title, namespace, origin, status,
                         created_at, updated_at, next_block_id, next_run_id,
                         meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json
                  FROM sessions WHERE session_id = ?`,
@@ -4347,6 +4697,7 @@ export class UnifiedStore {
             sessionId: row.session_id as string,
             parentSessionId: (row.parent_session_id as string | null) ?? null,
             forkPointSeq: (row.fork_point_seq as number | null) ?? null,
+            forkEgressWatermark: (row.fork_egress_watermark as number | null) ?? null,
             protocol: (row.protocol as string | null) ?? null,
             label: (row.label as string | null) ?? null,
             title: (row.title as string | null) ?? null,
@@ -4428,12 +4779,34 @@ export class UnifiedStore {
             if (initial && existing !== null) throw new Error("cloneSessionRows: conflicting fork lineage (child already exists)");
             const parent = this.getSessionRow(parentId);
             if (parent === null) {
-                // A legacy-only parent has no ledger to clone. Still create
-                // the prepared child atomically rather than falling back to
-                // an unchecked upsert after releasing this transaction.
-                if (!initial) return false;
-                if (!this.ingestSession(initial, undefined, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
-                return true;
+                // #7658: an egress-on-from-birth parent has NO unified
+                // sessions row — #7474 P2 froze every unified leg
+                // (persist.ts egressProjectionFrozen), so ingestSession
+                // never ran — but its egress op log IS the ledger (ruling
+                // 7439). The legacy-only early return below would silently
+                // drop the R-B whole-table copy and the lineage pair: the
+                // child would re-bootstrap from client bytes, re-issue the
+                // number space, and lose the retired marks and the parent
+                // link. Detect it by the flow watermark.
+                if (this.egressStateMaxSeq(parentId) === 0) {
+                    // A legacy-only parent has no ledger to clone. Still
+                    // create the prepared child atomically rather than
+                    // falling back to an unchecked upsert after releasing
+                    // this transaction.
+                    if (!initial) return false;
+                    if (!this.ingestSession(initial, undefined, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
+                    return true;
+                }
+                // Materialize a minimal parent skeleton row (the same
+                // pattern as the #7591 R3-latch upsert in snap.ts) so the
+                // child's lineage pair points at a durable row. The JSON
+                // columns keep their DDL defaults ('{}'): an egress-on
+                // parent's unified leg is frozen (persist.ts
+                // egressProjectionFrozen), so no full ingest ever fills
+                // them — the egress op log is the parent's authority and
+                // the skeleton row is a lineage anchor only. The upsert
+                // never reparents an existing pair (COALESCE).
+                this.db.prepare(`INSERT OR IGNORE INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)`).run(parentId, Date.now(), Date.now());
             }
             if (existing !== null) {
                 // The pair, not the presence of messages, identifies a replay.
@@ -4486,14 +4859,25 @@ export class UnifiedStore {
             // space and retired marks, nothing is re-issued across the
             // fork, and no other logic changes. No-op when the parent has
             // no egress rows (proxy-mode / egress-off sessions).
-            this.egressForkSession(parentId, childId);
+            // #7577 (dual clocks, owner ruling 2026-11-24): the watermark is
+            // the FLOW clock (egressStateMaxSeq — the flow table keeps its
+            // exclusive number pool). The point fork copies ALL FOUR tables
+            // (egress_state, egress_flow, egress_block_state, egress_block_flow):
+            // block rows align on wm via their flow_op_seq pointer, so the
+            // child inherits the parent's block set as of that flow point.
+            this.egressPointForkSession(parentId, childId, this.egressStateMaxSeq(parentId));
+            // #7658: record the egress fork point next to the (often NULL)
+            // unified fork_point_seq — the FLOW watermark the four tables
+            // were copied at. NULL when the parent has no egress rows.
+            const egressWatermark = this.egressStateMaxSeq(parentId) > 0 ? this.egressStateMaxSeq(parentId) : null;
             this.db
                 .prepare(
-                    `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)
-                     VALUES (?, ?, ?, ?, ?)
+                    `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq, fork_egress_watermark)
+                     VALUES (?, ?, ?, ?, ?, ?)
                      ON CONFLICT(session_id) DO UPDATE SET
                        parent_session_id = excluded.parent_session_id,
-                       fork_point_seq = excluded.fork_point_seq`,
+                       fork_point_seq = excluded.fork_point_seq,
+                       fork_egress_watermark = excluded.fork_egress_watermark`,
                 )
                 .run(
                     childId,
@@ -4501,6 +4885,7 @@ export class UnifiedStore {
                     Date.now(),
                     parentId,
                     throughSeq,
+                    egressWatermark,
                 );
             if (initial && !this.ingestSession(initial, undefined, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
             return true;

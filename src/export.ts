@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { indexToRef, matchSession as matchSessionKernel, parseStoredPlaceholder, refForRaw, renderHandoff as renderHandoffKernel, renderMessage, type CompressionBlock, type MessageContentStore, type CoreMessage } from "acp-kernel";
-import type { Session } from "./session.js";
+import { blockContentSnapshot, type Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 import { SqliteBackend, backendSelectionNotice, listBackendNames, openBackend, resolveBackendName, resolveMysqlDsn, selectedBackendRaw, type StorageBackend } from "./storage/backend.js";
 import { fileStorageBackend, fileStorageMysqlDsn } from "./knobs.js";
@@ -65,7 +65,7 @@ function blockLedgerLine(s: Session, b: CompressionBlock): string {
             }
         }
     }
-    const orig = s.blockContents.get(b.blockId)?.full.text.length;
+    const orig = blockContentSnapshot(s.blockContents, b)?.full.text.length;
     const status = !b.active ? "consumed" : b.retired ? "retired" : "active";
     return `messages ${range} · original ${orig !== undefined ? `${orig} chars` : "not cached"} · summary ${b.summary.length} chars · ${status}`;
 }
@@ -205,7 +205,7 @@ export function renderHandoff(s: Session, full: boolean): string {
         lines.push("");
         lines.push(b.summary.trim());
         lines.push("");
-        const content = s.blockContents.get(b.blockId);
+        const content = blockContentSnapshot(s.blockContents, b);
         if (full && content) {
             lines.push(`### Original messages (${content.full.count})`);
             lines.push("");
@@ -251,7 +251,7 @@ function blockSummariesSection(s: Session, includeOriginals: boolean, priorDoc: 
             lines.push(summary);
         }
         lines.push("");
-        const content = includeOriginals ? s.blockContents.get(b.blockId) : undefined;
+        const content = includeOriginals ? blockContentSnapshot(s.blockContents, b) : undefined;
         if (content) {
             lines.push(`#### Original messages (${content.full.count})`);
             lines.push("");
@@ -401,7 +401,7 @@ export function renderSessionJsonlFromSession(s: Session, full: boolean, content
         lines.push(JSON.stringify({ type: "message", seq: i, rawId: m.id, role: m.role, message: out }));
     }
     for (const [i, b] of s.state.blocks.entries()) {
-        const orig = s.blockContents.get(b.blockId)?.full.text.length;
+        const orig = blockContentSnapshot(s.blockContents, b)?.full.text.length;
         lines.push(
             JSON.stringify({
                 type: "block",
