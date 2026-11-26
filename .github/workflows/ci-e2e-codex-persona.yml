@@ -48,7 +48,7 @@ jobs:
           run=true
           if [ "$EVENT" = "pull_request" ]; then
             # only the ci:full label itself may trigger; other label events skip
-            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then run=false
+            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ] && [ "$LABEL_EVENT" != "ci:force" ]; then run=false
             elif ! grep -qw ci:full <<<"$PR_LABELS"; then run=false; fi
           elif [ "$EVENT" = "schedule" ]; then
             LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci-e2e-codex-persona.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
