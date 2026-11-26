@@ -580,3 +580,27 @@ test("e2e: responses wire — authored answer + landed checkpoint recognized on 
 
     }
 });
+
+test("e2e: compaction call counters track auto/manual distinction (#7744)", async () => {
+    await withHarness(async (h) => {
+        await armBlock(h, "s-counters");
+        process.env.BILI_DSH_AUTHORED_COMPACTION = "1";
+        // Manual compaction: text match (final user message is COMPACTION_INSTRUCTION).
+        const r1 = await turn(h, "s-counters", [
+            { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense.` },
+        ]);
+        assert.equal(r1.status, 200, r1.body);
+        let s = h.sessionOf("s-counters")!;
+        assert.equal(s.metadata["dshCompactionCallsManual"], 1, "manual counter after text-match call");
+        assert.equal(s.metadata["dshCompactionCallsAuto"] ?? 0, 0, "auto counter unchanged");
+        assert.ok(typeof s.metadata["dshMaxInboundMsgs"] === "number", "max inbound msgs tracked");
+        // Auto compaction: declaration-only (x-bili-plugin=dsh + purpose=compaction, no text match).
+        const r2 = await turn(h, "s-counters", [
+            { role: "user", content: "regular message, not a compaction instruction" },
+        ], { "x-bili-plugin": "dsh", "x-bili-plugin-purpose": "compaction" });
+        assert.equal(r2.status, 200, r2.body);
+        s = h.sessionOf("s-counters")!;
+        assert.equal(s.metadata["dshCompactionCallsManual"], 1, "manual counter unchanged");
+        assert.equal(s.metadata["dshCompactionCallsAuto"], 1, "auto counter after declaration-only call");
+    });
+});
