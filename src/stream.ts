@@ -353,8 +353,17 @@ function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: stri
  *  working" — it must not reset the strikes, or the "fail×N → trivial
  *  success×1 → fail×N" loop never arms the breaker. A substantial fold means
  *  the model found a range that genuinely shrank the context, so the loop is
- *  over and the strikes reset. */
-function clearCompressLoopStreak(session: Session, tokensCompressed: number): void {
+ *  over and the strikes reset.
+ *  2026-11-25 (session 01a20b76, qwen3.8-27b): the same shape reappeared with
+ *  PHANTOM folds — the model aimed endIds past the session's highest allocated
+ *  ref (m04152–m04235, then m04249–m04300), the kernel clamped each to the
+ *  live frontier and reported a 2K-token success, and each success discharged
+ *  the streak between failures, so the 3-strike breaker never armed while the
+ *  model walked m04261 → m04300 → m04365 → m04433 → m04503. A fold the kernel
+ *  had to clamp from a phantom endId is the model still probing numbers that
+ *  cannot exist — it must not reset the strikes either (frontierClamped). */
+function clearCompressLoopStreak(session: Session, tokensCompressed: number, frontierClamped = false): void {
+    if (frontierClamped) return;
     if (tokensCompressed < COMPRESS_LOOP_DISCHARGE_MIN_TOKENS) return;
     if (readCompressLoopStreak(session)) writeCompressLoopStreak(session, undefined);
 }
@@ -565,6 +574,21 @@ export function effectiveCompressedDetail(
             return clamped ? `${rg.startRef.trim()}–${hi}` : `${rg.startRef}–${rg.endRef}`;
         })
         .join(", ");
+}
+
+/** 2026-11-25 (session 01a20b76): did THIS fold's kernel warnings carry the
+ *  #4521 frontier clamp — a requested endpoint above the session's highest
+ *  ALLOCATED ref, clamped down to the live frontier? That is the model aiming
+ *  at numbers that cannot exist (a phantom endId): the success is a probe, so
+ *  it must not discharge the breaker streak (same rule as #7300's trivial
+ *  fold) and the receipt must re-state the frontier. The other snap notes
+ *  (pruned content, covered blocks, orphan calls, consumed tiers) anchor on
+ *  things that exist and stay harmless. String-matched against the kernel's
+ *  snap sentence in kernel/src/boundaries.ts ("is above this session's highest
+ *  allocated ref … clamped to it"); if it drifts the detection misses and the
+ *  pre-fix behavior returns, which is no worse than today. */
+export function hasFrontierClampWarning(warnings: readonly string[]): boolean {
+    return warnings.some((w) => w.includes("is above this session's highest allocated ref"));
 }
 
 /** #2592/F3: after a host-native compaction rebase (resetSessionCompression)
@@ -1775,7 +1799,19 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             .filter((b) => !beforeIds.has(b.blockId) || beforeSummaries.get(b.blockId) !== b.summary)
             .reduce((n, b) => n + defaultCountTokens(b.summary), 0);
         const netSaved = Math.max(0, r.tokensCompressed - newSummaryTokens);
-        clearCompressLoopStreak(ctx.session, netSaved);
+        // 2026-11-25 (session 01a20b76, qwen3.8-27b): a fold the kernel had to
+        // CLAMP from a phantom endId (above the session's highest allocated
+        // ref) is the model probing numbers that cannot exist — the same
+        // "still probing, not done" signal as #7300's trivial fold, so it must
+        // not discharge the breaker streak either. In the incident the clamped
+        // ~2K-token successes discharged the strikes between failures and the
+        // model walked m04261 → m04300 → m04365 → m04433 → m04503 while the
+        // breaker sat disarmed.
+        const frontierClamped = hasFrontierClampWarning(r.warnings);
+        if (frontierClamped && netSaved >= COMPRESS_LOOP_DISCHARGE_MIN_TOKENS && readCompressLoopStreak(ctx.session)) {
+            ctx.log(`[warn: compress-loop] frontier-clamped success (requested endId above the session's highest allocated ref) does NOT discharge the breaker streak — refs above the frontier cannot exist`);
+        }
+        clearCompressLoopStreak(ctx.session, netSaved, frontierClamped);
 
         // #189 observability: record the rewrite magnitude + fold point so a
         // downstream transient rejection (GLM 3007) can be correlated with it.
@@ -1879,7 +1915,16 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // #6855: headline echoes the EFFECTIVE (kernel-clamped) range, not the
         // requested one — the requested number stays in `warn` for correlation.
         const effectiveDetail = effectiveCompressedDetail(ranges, highestMappedRef(ctx.session.state), r.warnings);
-        let msg = `[Compressed ${effectiveDetail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}${applyErrorNote(r)}]`;
+        // 2026-11-25 (session 01a20b76): when the kernel clamped a phantom
+        // endId, the success headline reads clean and the model's NEXT call
+        // anchors further above the frontier — that session walked six
+        // over-shoots, each receipt repeating "higher numbers do not exist"
+        // with no working pointer. Re-state the frontier with the same
+        // snapshot the failure path already carries ("NOTHING numbered above
+        // hiId exists … request only refs inside the newest such snapshot, or
+        // call acp_status") — the one line a clamped success is missing.
+        const frontierFix = frontierClamped ? currentRefsSnapshot(ctx) : "";
+        let msg = `[Compressed ${effectiveDetail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}${frontierFix}${applyErrorNote(r)}]`;
         // 2026-11-18 (owner): receipts are the only system lines that quote
         // user speech (Last-user anchor / summary content) yet carry NO <acp>
         // time tag on the wire — a weak model cannot tell when a fold happened

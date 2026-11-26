@@ -28,10 +28,17 @@ export function parseBlocksCreated(value: unknown): number | undefined {
  *  indistinguishable from a full one without this line. Appended by the
  *  forwarding layer (agent/shared.ts + mcp.ts) ONLY when the endpoint reported
  *  outcome:"partial": applied needs no marker (the leading line says all-folded)
- *  and refused/failure already surface as isError/throw on every lane. */
+ *  and refused/failure already surface as isError/throw on every lane.
+ *  2026-11-25 (session 01a20b76, qwen3.8-27b): the unconditional "Retry ONLY
+ *  the failed range(s)" contradicted the kernel's own stale-ref verdict in the
+ *  SAME receipt ("NO superset of them can ever compress") and drove the
+ *  confabulating model to re-issue the next batch of phantom refs (m04301–
+ *  m04364 → m04365–m04503). The retry order is now conditional on the
+ *  per-range error text; the forwarding layer cannot see the causes, so the
+ *  condition is spelled out in the wording itself. */
 export function partialOutcomeNote(blocksCreated?: number): string {
     const created = blocksCreated !== undefined ? `${blocksCreated} block(s) created; ` : "";
-    return `[acp-result: PARTIAL — ${created}some requested range(s) were NOT folded. Retry ONLY the failed range(s) listed above; do not re-fold the ranges that were applied.]`;
+    return `[acp-result: PARTIAL — ${created}some requested range(s) were NOT folded. Retry ONLY the failed range(s) listed above, and only if their error text says they may resolve on retry — a range whose refs are stale/unknown or above this session's highest allocated ref can NEVER fold (those numbers do not exist): do NOT retry it, call acp_status for the live ranges instead. Do not re-fold the ranges that were applied.]`;
 }
 
 export interface ProxyToolResult {
