@@ -32,6 +32,7 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import path from "node:path";
 import { cacheDir } from "./paths.js";
+import { safePrefix } from "./text-safe.js";
 import { parsePinDuration, readPin, writePin, type PinRecord } from "./update-pin.js";
 
 /** The repo every ref is resolved against (this package's own source). */
@@ -127,7 +128,10 @@ function run(file: string, args: string[], opts: { cwd: string; timeout: number;
     } catch (error) {
         const err = error as { message?: string; stderr?: unknown };
         const stderr = typeof err.stderr === "string" ? err.stderr.trim() : "";
-        const tail = stderr.split("\n").slice(-3).join(" ").slice(0, 300);
+        const tailLines = stderr.split("\n");
+        // text-safe family gate: no raw negative slice literals; head-keep,
+        // surrogate-safe via safePrefix (#816/#1615 discipline).
+        const tail = safePrefix((tailLines.length > 3 ? tailLines.slice(tailLines.length - 3) : tailLines).join(" "), 300);
         if (/ENOENT/.test(String(err.message))) throw new Error(`${path.basename(file)} was not found on PATH`);
         throw new Error(`${path.basename(file)} ${args.slice(0, 3).join(" ")} failed${tail ? `: ${tail}` : `: ${String(err.message)}`}`);
     }
