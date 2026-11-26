@@ -459,40 +459,51 @@ CREATE TABLE IF NOT EXISTS state_fields (
 `;
 
 /** #6785 perf (proposal discussions/7398 + revised design discussions/7439,
- *  owner design 2026-11-20/21): the EGRESS STATE LOG — the op-log view of the
- *  outbound conversation (B base / I insert / D delete-range / U
- *  update-content; anchors are msgids, never positions). DUAL TABLES:
- *  egress_state is what serving reads and compaction physically trims below
- *  the watermark; egress_flow is the record — compaction trims it below the
- *  watermark as well (#7574: it used to keep every row AND gain one full
- *  snapshot per fold, so a long session grew without bound), so every op_seq
- *  from the newest base on stays reconstructible — rollback is based on this
- *  table, not on client resends. SELF-CONTAINED BYTES (ruling 7439-1): the `bytes` column holds
- *  the message's final core JSON for I/U rows — no hash refs, no content
- *  table; replay needs only this table pair. TWO SEQUENCES (ruling 7439,
- *  canonical message number): op_seq orders EVERY row (the primary key);
- *  log_seq is the canonical message number set ONLY on I rows (one number
- *  per message, session-scoped, never re-issued — U/D/B carry NULL). The
- *  secondary index serves +U targeting and -D endpoint resolution.
- *  Probe-first, no version bump. */
-const EGRESS_STATE_DDL = `-- #6785 perf (proposals discussions/7398 + 7439): op-log outbound view (state + flow), self-contained bytes, canonical per-message numbers.
+ *  owner design 2026-11-20/21, MATERIALIZED form discussions/7773 owner
+ *  ruling 2026-11-26): the EGRESS STATE LOG — the op-log view of the
+ *  outbound conversation. DUAL TABLES:
+ *  egress_flow is the RECORD — every I/D/U op in order, append-only,
+ *  physically NEVER deleted (the B base row never existed in the 7773
+ *  ruling: not written, not read, no letter in this CHECK); growth
+ *  optimization is a separate, deferred project (#7475 family), nothing
+ *  here ever prunes it. egress_state is the MATERIALIZED live view — one
+ *  row per LIVE message (PK (session_id, msgid), pos = its position in the
+ *  current view); I inserts (suffix shifts), U edits in place, D physically
+ *  deletes the range. Serving reads are `ORDER BY pos` DIRECT reads — no
+ *  replay, no compaction, no base concept. SELF-CONTAINED BYTES (ruling
+ *  7439-1): the `bytes` column holds the message's final core JSON; replay
+ *  needs only the flow table. TWO NUMBER COLUMNS on the state row (7773
+ *  dual clocks of citation): log_seq = the number the I op assigned,
+ *  IMMUTABLE (the row's anchor to its I twin in the flow — same msgid AND
+ *  same I-time log_seq); num = the row's CURRENT canonical number (a U with
+ *  an explicit num changes it; 0 = demoted/uncited — the system row is 0 by
+ *  construction, outside the citation space). The number frontier is the
+ *  flow's MAX(log_seq) — the ONLY source (the flow is never pruned). The
+ *  state PK covers (session_id, msgid), so no separate state index. The
+ *  flow index serves +U targeting and -D endpoint resolution.
+ *  Probe-first, no version bump (the tables never shipped). */
+const EGRESS_STATE_DDL = `-- #6785 perf (proposals discussions/7398 + 7439, materialized at 7773): op-log outbound view (flow record + materialized live state), self-contained bytes, canonical per-message numbers.
 CREATE TABLE IF NOT EXISTS egress_state (
     session_id TEXT NOT NULL,
-    op_seq INTEGER NOT NULL,
-    log_seq INTEGER,
-    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
-    msgid TEXT,
-    payload TEXT NOT NULL,
-    bytes TEXT,
+    msgid TEXT NOT NULL,
+    pos INTEGER NOT NULL,
+    log_seq INTEGER NOT NULL,
+    num INTEGER NOT NULL,
+    ref TEXT NOT NULL,
+    tokens INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    role TEXT,
+    ts INTEGER,
+    sys_in TEXT,
+    bytes TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    PRIMARY KEY (session_id, op_seq)
+    PRIMARY KEY (session_id, msgid)
 );
-CREATE INDEX IF NOT EXISTS idx_egress_state_msgid ON egress_state (session_id, msgid);
 CREATE TABLE IF NOT EXISTS egress_flow (
     session_id TEXT NOT NULL,
     op_seq INTEGER NOT NULL,
     log_seq INTEGER,
-    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
+    row_type TEXT NOT NULL CHECK (row_type IN ('I','D','U')),
     msgid TEXT,
     payload TEXT NOT NULL,
     bytes TEXT,
@@ -504,13 +515,18 @@ CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msg
 
 /** #7577 (follow-up to #7439, owner design 2026-11-23): the BLOCK LIFECYCLE
  *  log — the op-log of the fold blocks, symmetric to the message egress log.
- *  egress_block_flow is append-only (row types B base / I block-born / U
- *  block-state-change; NEVER deleted) and carries the bounded kstate residual
- *  snapshot in `kstate_json` on every row (D4: no fifth table — the sidecar
- *  rides the block-change rows, whose count = fold count, 2-3 orders of
- *  magnitude below the message count). egress_block_state is the current
- *  block-set read replica (PK (session_id, block_id), one latest snapshot per
- *  block; compaction may physically trim it). SELF-CONTAINED BYTES (D2,
+ *  egress_block_flow is append-only (row types I block-born / U
+ *  block-state-change / D reaped — the D row carries the TERMINAL full
+ *  snapshot, re-lettered from the old terminal-U at discussions/7773; there
+ *  is no B base row and no compaction; NEVER deleted) and carries the
+ *  bounded kstate residual snapshot in `kstate_json` on every row (D4: no
+ *  fifth table — the sidecar rides the block-change rows, whose count = fold
+ *  count, 2-3 orders of magnitude below the message count).
+ *  egress_block_state is the MATERIALIZED live view (7773): one row per
+ *  LIVE block (PK (session_id, block_id), pos = its position in the current
+ *  set) — I inserts, U edits in place, D physically deletes the row;
+ *  serving reads are `ORDER BY pos` DIRECT reads, no replay.
+ *  SELF-CONTAINED BYTES (D2,
  *  ruling 7439-1): the one/full block content is inlined in the payload —
  *  zero content-CAS refs, zero hash columns. DUAL CLOCKS (owner ruling
  *  2026-11-24): the block tables number THEMSELVES (op_seq dense within
@@ -519,7 +535,7 @@ CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msg
  *  original shared-clock design was rejected in review because it broke the
  *  flow's density invariant on the first fold. Probe-first, no version
  *  bump (the tables never shipped, like the egress pair). */
-const EGRESS_BLOCK_DDL = `-- #7577: block lifecycle log (flow + state), self-contained bytes, kstate sidecar.
+const EGRESS_BLOCK_DDL = `-- #7577: block lifecycle log (flow + materialized live state), self-contained bytes, kstate sidecar.
 -- Dual clocks (owner ruling 2026-11-24): the block tables number THEMSELVES
 -- (op_seq dense within egress_block_flow); flow_op_seq is the pointer to the
 -- egress_flow clock (its MAX at write time) used for cross-table alignment at
@@ -528,7 +544,7 @@ CREATE TABLE IF NOT EXISTS egress_block_flow (
     session_id TEXT NOT NULL,
     op_seq INTEGER NOT NULL,
     flow_op_seq INTEGER NOT NULL DEFAULT 0,
-    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','U')),
+    row_type TEXT NOT NULL CHECK (row_type IN ('I','U','D')),
     block_id TEXT,
     payload TEXT NOT NULL,
     kstate_json TEXT,
@@ -539,6 +555,7 @@ CREATE INDEX IF NOT EXISTS idx_egress_block_flow_block ON egress_block_flow (ses
 CREATE TABLE IF NOT EXISTS egress_block_state (
     session_id TEXT NOT NULL,
     block_id TEXT NOT NULL,
+    pos INTEGER NOT NULL,
     op_seq INTEGER NOT NULL,
     flow_op_seq INTEGER NOT NULL DEFAULT 0,
     payload TEXT NOT NULL,
@@ -641,11 +658,28 @@ export function migrateSchema(db: {
     // whole migration.
     const egressCols = (db.prepare("PRAGMA table_info(egress_state)").all() as unknown as { name?: unknown }[])
         .map((c) => c.name);
-    if (egressCols.length > 0 && !egressCols.includes("op_seq")) {
+    const egressFlowSql = String((db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'egress_flow'")
+        .get() as { sql?: unknown } | undefined)?.sql ?? "");
+    // 7773: the OLD shapes are (a) the pre-7773 op-copy state shape
+    // (egress_state with an op_seq column — it was an op mirror, now it is
+    // the materialized live view), (b) an interrupted state table that has
+    // neither op_seq nor pos, and (c) any flow table whose row_type CHECK
+    // still names the retired 'B'. The two tables NEVER shipped in any
+    // release, so a fresh recreate is the whole migration for every variant
+    // (the group is probed as a pair above, so the flow CHECK is replaced
+    // together with the state shape whenever the state is old — the sql
+    // check stays for a DB where only the flow row survived). The NEW shape
+    // is recognized by the ABSENCE of op_seq plus the presence of pos —
+    // that is the exact opposite of the old op-copy shape, never "old".
+    const egressOldShape = (egressCols.length > 0 && (egressCols.includes("op_seq") || !egressCols.includes("pos")))
+        || egressFlowSql.includes("('B','I','D','U')");
+    if (egressOldShape) {
         // #7574 item 10: drop + recreate is one step (same transaction rule).
         db.transaction(() => {
             db.exec("DROP TABLE IF EXISTS egress_flow");
             db.exec("DROP TABLE IF EXISTS egress_state");
+            db.exec("DROP INDEX IF EXISTS idx_egress_state_msgid");
             db.exec(EGRESS_STATE_DDL);
         });
     }
@@ -656,10 +690,17 @@ export function migrateSchema(db: {
     const blockCols = hasEgressBlockFlow
         ? (db.prepare("PRAGMA table_info(egress_block_flow)").all() as unknown as { name?: unknown }[]).map((c) => c.name)
         : [];
-    if (!hasEgressBlockFlow || !blockCols.includes("flow_op_seq")) {
-        // Never-shipped dev table; a dev DB that created the old-shape
-        // (shared-clock) layout is dropped and recreated (one step, same
-        // #7574 rule). Data loss is the accepted dev cost.
+    const blockStateCols = (db.prepare("PRAGMA table_info(egress_block_state)").all() as unknown as { name?: unknown }[])
+        .map((c) => c.name);
+    const blockFlowSql = String((db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'egress_block_flow'")
+        .get() as { sql?: unknown } | undefined)?.sql ?? "");
+    // 7773 old shapes: the shared-clock dev layout (no flow_op_seq), the
+    // pre-7773 state replica (no pos column), or a flow whose row_type
+    // CHECK still names the retired 'B'. Never-shipped dev tables; a dev DB
+    // with any of them is dropped and recreated (one step, same #7574
+    // rule). Data loss is the accepted dev cost.
+    if (!hasEgressBlockFlow || !blockCols.includes("flow_op_seq") || (blockStateCols.length > 0 && !blockStateCols.includes("pos")) || blockFlowSql.includes("'B'")) {
         db.transaction(() => {
             db.exec("DROP TABLE IF EXISTS egress_block_flow");
             db.exec("DROP TABLE IF EXISTS egress_block_state");

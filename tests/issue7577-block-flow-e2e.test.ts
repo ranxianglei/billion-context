@@ -26,11 +26,10 @@
  *   4. after restart: the view is byte-equal, tsStamps derive, and the block
  *      table replays to the live block set;
  *   5. fork-to-now copies all four tables (row counts + byte-equal views);
- *      the fold's D batch compacts IN its transaction (a B base row is
- *      appended and the STATE rows below it trimmed — the flow is
- *      append-only, #7439), so a point fork BELOW the newest base
- *      reconstructs the EXACT pre-fold view from the retained rows (pinned),
- *      while a point fork AT the base watermark (= the block's pointer)
+ *      the flow is append-only (7773: no compaction base rows — the fold's
+ *      D batch is the only record of the fold), so a point fork BELOW the
+ *      fold's flow watermark reconstructs the EXACT pre-fold view from the
+ *      retained rows (pinned), while a point fork AT the block's pointer
  *      yields the folded view plus the block, and the fork-to-now child has
  *      one more row — the point is real.
  */
@@ -235,15 +234,13 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
             assert.equal(n(childId), n(sid), `${t} row count carried over`);
         }
 
-        // ---------------- point fork: BELOW the newest base ----------------
-        // Under the #7439 restoration the flow keeps every row it ever wrote,
-        // so a point at/before the base seq is reconstructable again: the fork
-        // copies the retained rows and rebuilds the state replica by replay.
+        // ---------------- point fork: BELOW the fold watermark ------------
+        // The flow keeps every row it ever wrote (append-only, 7773), so ANY
+        // point below the high water is reconstructable: the fork copies the
+        // retained rows and rebuilds the state view by replay.
         // (The admin endpoint still refuses these points with 400 — a
         // conservative gate on the public surface, not a data constraint.)
-        const baseSeq = (dbv.prepare(`SELECT op_seq FROM egress_flow WHERE session_id = ? AND row_type = 'B' ORDER BY op_seq DESC LIMIT 1`).get(sid) as { op_seq: number } | undefined)?.op_seq;
-        assert.ok(baseSeq !== undefined && baseSeq > wm1, "the fold wrote a compaction base past turn 1");
-        assert.equal(ptrRow.flow_op_seq, baseSeq, "the block row's pointer IS the base point (save ran after the fold's own base write)");
+        assert.ok(ptrRow.flow_op_seq > wm1, "the block row's pointer is past turn 1 (save ran after the fold's own flow ops — 7773 has no compaction base; the pointer is the flow watermark at save time)");
         const floorId = "child-belowbase";
         const floorSession = createSession(floorId);
         floorSession.metadata["egressAuthority"] = true;

@@ -19,11 +19,11 @@
  *      why the lane passes the in-memory value);
  *   C. the position frontier is the message frontier, NOT the live-view
  *      length — after a REAL kernel fold the live view is 50 rows while
- *      the frontier is 82. The fold's compaction physically removed the I
- *      rows its base subsumed (#7574), so raw MAX(log_seq) is 0 right
- *      after a fold: the frontier lives in the base payload's highWater,
- *      and the stateless branch must read it through egressMessageHighWater
- *      (the review-critical fix this test pins);
+ *      the frontier is 82. The fold's D ops shrink the STATE view (7773),
+ *      but the flow is append-only and keeps every row it ever wrote, so
+ *      raw MAX(log_seq) IS the frontier: the stateless branch must read it
+ *      through egressMessageHighWater (the review-critical fix this test
+ *      pins);
  *   D. the R3 latch lands on the SESSIONS row (no l1 row for the sid),
  *      survives a restart, and the operator clear releases it;
  *   F. double-latched migration state (pre-migration l1 latch +
@@ -282,23 +282,22 @@ test("C: after a REAL kernel fold the position frontier is MAX(log_seq), not the
         await store.writeNow(persistable(ctx, folded));
 
         // the split this test pins: the live view SHRANK, the frontier did not.
-        // The flow is append-only (#7439): the fold's compaction trims the STATE
-        // table below the new base, but the flow keeps every row it ever wrote,
-        // so raw MAX(log_seq) IS the frontier — and it equals the base
-        // payload's highWater (two independent carriers of the same fact).
+        // The flow is append-only (#7439/7773): the fold's D ops trim the
+        // STATE rows of the covered messages, but the flow keeps every row it
+        // ever wrote, so raw MAX(log_seq) IS the frontier.
         const view = egressStateView(vd(), sid);
         assert.equal(view.length, 51, "system row + the folded 50 — the live view SHRANK");
         const flowTypes = (vd().prepare("SELECT row_type FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(sid) as { row_type: string }[]).map((r) => r.row_type);
         // the flow keeps everything (append-only, #7439): turn 1's 81 I rows
         // intact, then the fold's ops (the -D range for the covered originals,
-        // the -U re-renders of the 49 survivors, the -I summary), then the
-        // base. The STATE table in contrast is trimmed to the base row alone.
-        const expectedFlowTypes = [...Array(81).fill("I"), "D", ...Array(49).fill("U"), "I", "B"] as string[];
-        assert.deepEqual(flowTypes, expectedFlowTypes, "the flow keeps everything (append-only, #7439): turn 1's 81 I rows, then the fold's ops (1 D for the covered range, 49 U re-renders of the survivors, 1 I summary), then the base — only the STATE table is trimmed to the base");
+        // the -U re-renders of the 49 survivors, the -I summary). The STATE
+        // table in contrast holds the materialized live view (7773).
+        const expectedFlowTypes = [...Array(81).fill("I"), "D", ...Array(49).fill("U"), "I"] as string[];
+        assert.deepEqual(flowTypes, expectedFlowTypes, "the flow keeps everything (append-only, #7439): turn 1's 81 I rows, then the fold's ops (1 D for the covered range, 49 U re-renders of the survivors, 1 I summary) — the state plane is materialized, no base row");
         const stateRows = (vd().prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = ?").get(sid) as { n: number }).n;
-        assert.equal(stateRows, 1, "the state table (the serving copy) is trimmed to the base row alone");
-        const basePayload = JSON.parse((vd().prepare("SELECT payload FROM egress_flow WHERE session_id = ? AND row_type = 'B' ORDER BY op_seq DESC LIMIT 1").get(sid) as { payload: string }).payload) as { highWater: number };
-        assert.equal(basePayload.highWater, 81, "the system row is 0, the 80 originals 1..80, the fold's summary I-row 81 — the base carries the frontier too");
+        assert.equal(stateRows, 51, "the state table is the materialized live view (7773) — 51 live rows, no op copies, no base row");
+        const highWater = (vd().prepare("SELECT COALESCE(MAX(log_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(sid) as { m: number }).m;
+        assert.equal(highWater, 81, "the system row is 0, the 80 originals 1..80, the fold's summary I-row 81 — the flow's MAX(log_seq) IS the frontier");
 
         // a steady-state turn echoing three LIVE ids: the verdict carries the
         // FRONTIER as maxPos. This computed 0 the turn right after every fold

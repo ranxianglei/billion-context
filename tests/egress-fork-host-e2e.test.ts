@@ -428,12 +428,15 @@ test("#7658 T5: fork-then-compress — the child's client-side fold books correc
         assert(summaryRow!.num > parentHighWater, `summary number ${summaryRow!.num} continues above the parent high water ${parentHighWater}`);
         for (const id of ["p5-id-1", "p5-id-2", "p5-id-3"]) assert(!liveIds.has(id), `covered cell ${id} must be retired from the child flow`);
 
-        // Compaction: a D-bearing batch wrote the B base row and physically
-        // pruned the log before it — the flow is not a raw append-only dump.
+        // 7773: the flow is a raw append-only dump — the fold's D ops stay in
+        // it, and it is the STATE plane that is materialized (covered rows
+        // physically deleted, no compaction base rows).
         const { DatabaseSync } = await import("node:sqlite");
         const raw = new DatabaseSync(`${h.dir}/sessions/index.db`, { readOnly: true });
-        const bCount = (raw.prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = 'c5' AND row_type = 'B'").get() as { n: number }).n;
-        assert.ok(bCount >= 1, `the D-run triggered compaction (B rows: ${bCount})`);
+        const dCount = (raw.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = 'c5' AND row_type = 'D'").get() as { n: number }).n;
+        assert.ok(dCount >= 1, `the fold's D ops are in the append-only flow (D rows: ${dCount})`);
+        const stateCount = (raw.prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = 'c5'").get() as { n: number }).n;
+        assert.ok(stateCount < childView.length + 1, `the state plane is materialized and shrank with the fold (state rows: ${stateCount}, live view: ${childView.length})`);
         raw.close();
 
         // The next turn still serves from the child's own flow (no legacy

@@ -22,11 +22,11 @@
 | 7439-1 | **自包含行**——消息字节直接挂在 `I` 行上（不 join 内容 CAS）。 | 日志必须能脱离整库单独重放（fork、恢复、审计）。 |
 | 7439-2 | **块的读/写侧落 blocks 表**——`summary_bytes` 内联块摘要；`start_msgid`/`end_msgid` 在折叠时一次性对齐到 flow 的 msgid 坐标。 | 折叠产物写在 kernel 读取的地方；每轮不做跨表身份对账。 |
 | 7439-3/5 | **服务端权威 + 硬失败**——kernel 输入从 flow 重放；日志**没有任何健康点**时响亮地硬失败，而不是静默地拿客户端字节应答。 | 「答错但没声音」正是本平面要消灭的失败模式；响亮的 500 + 恢复日志可接受。 |
-| KDD #23 | **`messages` 降级为惰性投影**——egress-on 会话停止逐轮统一 ingest；messages 表只在平面回滚 / web 读 / 恢复时一次性 O(n) 重建。 | 存储开销曾正比于 messages 账本**总行数**（~20µs/行，10w 行 2× 双账本放大）。op log 每轮写入 = O(新增消息)，serving 读被压实有界。 |
+| KDD #23 | **`messages` 降级为惰性投影**——egress-on 会话停止逐轮统一 ingest；messages 表只在平面回滚 / web 读 / 恢复时一次性 O(n) 重建。 | 存储开销曾正比于 messages 账本**总行数**（~20µs/行，10w 行 2× 双账本放大）。op log 每轮写入 = O(新增消息)，serving 读与 live 上下文本身一样小（state 表即物化 live 视图，#7773）。 |
 | 双时钟（#7581） | **块表自己编号**；每个块行用 `flow_op_seq` 指向 flow 时钟（单调不减 ⇒ `<= X` 是前缀）。 | 共用一个时钟时，折叠的块行（**保存时**写）落在该轮最后一条 flow 行（**准备时**写）之后两个 op_seq 处，下一轮第一次读就击穿 flow 的密度不变量。两时钟 + 单向指针让两张表各自稠密、互不阻塞。 |
-| 无状态身份（#7617） | egress-on 的 stage-0 直接从 op log 前沿计算（`MAX(op_seq)` + 最新 base 的 high water），无 `l1_world` 游标、无 resync。 | 日志本身已经是身份账本——第二个游标就是第三个时钟。R3 故障 latch 迁到 `sessions.r3_latched_at`（与旧列双载体读/清）。 |
+| 无状态身份（#7617） | egress-on 的 stage-0 直接从 op log 前沿计算（`MAX(op_seq)` + flow 的 `MAX(log_seq)` 前沿），无 `l1_world` 游标、无 resync。 | 日志本身已经是身份账本——第二个游标就是第三个时钟。R3 故障 latch 迁到 `sessions.r3_latched_at`（与旧列双载体读/清）。 |
 
-**为什么压缩（折叠）能在 flow 上做。** 折叠就是一组操作：`D` × 被覆盖原文 + `I`（摘要消息——它是上下文，所以进 flow）+ 同一事务里一条 `B` base。摘要的**块对象**（生命周期 active/superseded/reaped、覆盖区间、被覆盖原文的 `one`/`full` 全文）住在**块表**里——flow 记「上下文现在是什么」，块表记「折叠做了什么得到它」。按需取全文（`decompress`）读块行，不读 flow。折叠的压实只**物理裁剪 state 表** base 以下的行（服务副本有界）；**flow 保留它写过的每一行**——append-only 是 #7439 裁定，任意历史点位永远可重建。（2026-11-23 起实现曾把 flow 也删到最新 base 以下，本 PR 恢复裁定——见 issue 历史。）
+**为什么压缩（折叠）能在 flow 上做。** 折叠就是一组操作：`D` × 被覆盖原文 + `I`（摘要消息——它是上下文，所以进 flow），同一事务。摘要的**块对象**（生命周期 active/superseded/reaped、覆盖区间、被覆盖原文的 `one`/`full` 全文）住在**块表**里——flow 记「上下文现在是什么」，块表记「折叠做了什么得到它」。按需取全文（`decompress`）读块行，不读 flow。折叠**物化**：被覆盖的行从 **state 表**（服务视图）里被物理删除，而 **flow 保留它写过的每一行**——append-only 是 #7439 裁定，任意历史点位永远可重建。（2026-11-23 起实现曾把 flow 也删到最新 base 以下，本 PR 恢复裁定——见 issue 历史。曾用来给 state 副本封顶的 base 行/压实机制已整体退役——讨论 [#7773](https://github.com/ranxianglei/billion-context/discussions/7773)。）
 
 ## 3. 表结构（SQLite，`src/storage/schema.ts`；probe-first DDL，开发期表）
 
@@ -34,23 +34,25 @@
 
 | 表 | 主键 | 作用 | 关键列 |
 |---|---|---|---|
-| `egress_flow` | `(session_id, op_seq)` | **消息**操作日志。表内稠密（#7574 不变量）。**append-only：压实从不裁剪它**（#7439）；恢复 = 一步步回退到最新健康 base；任意点位（含低于最新 `B` base 的点位）可完整重建（`egressStateAt`）。 | `row_type` I/D/U/B · I 行：`msgid`、`log_seq`（规范消息号，永不复用）、`ref`、`tokens`、`bytes`、`role`、`type_tag` · B 行：payload `{entries, highWater}`（压实 base = 该点存活视图 + 消息前沿） |
-| `egress_state` | `(session_id, op_seq)` | 存活视图的**读副本**（每次写入同事务内从 flow 重放；按 `log_seq` 排序、`msgid` 上有索引）。被压实有界。 | 同 I 行形状；`snapPinLiveIds`/serving 读命中它 |
-| `egress_block_flow` | `(session_id, op_seq)` | 追加式**块**历史。**独立编号池**（双时钟）。 | `row_type` I/U/B · 快照 payload `{tier, startMsgid, startSeq, endMsgid, endSeq, supersedesBlockId, active, reaped, one, full}` · **`flow_op_seq`** = 写入时刻 flow 的 `MAX(op_seq)`（跨表指针）· kstate 边车（残差字段清单） |
-| `egress_block_state` | `(session_id, block_id)` | 每块最新快照（同一指针）。 | 快照 payload + `flow_op_seq` |
+| `egress_flow` | `(session_id, op_seq)` | **消息**操作日志。表内稠密（#7574 不变量）。**append-only：任何机制都不裁剪它**（#7439）；恢复 = 回退到最新健康点；任意点位可完整重建（`egressStateAt`）。 | `row_type` I/D/U（退役的 `B` base 行已不存在，#7773）· I 行：`msgid`、`log_seq`（规范消息号，永不复用）、`ref`、`tokens`、`bytes`、`role`、`type_tag` · D 行：区间 `(start_msgid, end_msgid)` + 终态全量快照 · U 行：`msgid` + 新字节（再引用时带 `num`） |
+| `egress_state` | `(session_id, msgid)` | **物化 live 视图**（7773）：每条**存活**消息一行，按 `pos` 排序。每次 append 在同一事务内把 op 应用到行上——`I` 插入（`pos` 后移）、`U` 就地改、`D` 物理删 + 前移。构造上以 live 视图大小为界；没有压实、没有 base 行、没有 op 镜像。 | `pos`、`log_seq`（I 孪生在 flow 里的编号，不可变——孪生锚点）、`num`（当前内核引用号；0 = 无引用/已退役）、`msgid`、`ref`、`tokens`、`type`、`role`、`ts`、`sys_in`、`bytes`、`created_at`。`snapPinLiveIds`/serving 读命中它。 |
+| `egress_block_flow` | `(session_id, op_seq)` | 追加式**块**历史。**独立编号池**（双时钟）。 | `row_type` I/U/D（reap = 一条 `D` 行，带该块的**终态全量快照**，#7773；退役的 `B` 行已不存在）· 快照 payload `{tier, startMsgid, startSeq, endMsgid, endSeq, supersedesBlockId, active, reaped, one, full}` · **`flow_op_seq`** = 写入时刻 flow 的 `MAX(op_seq)`（跨表指针）· kstate 边车（残差字段清单） |
+| `egress_block_state` | `(session_id, block_id)` | **物化** live 块：每个未 reap 的块一行，按 `pos` 排序；reap 物理删行（flow 保留终态 `D` 快照）。 | 快照 payload + `pos` + `op_seq`/`flow_op_seq` |
 | `sessions.r3_latched_at` | — | R3 身份故障 latch 载体（#7617）。NULL/0 = 未 latch。 | 双载体：读 `?? l1_world.r3_latched_at`，清**两个都清** |
 | `conversations` | — | 宿主身份认领表。egress-on 会话不再需要认领行（身份无状态）；物理 DROP 在退役登记。 | |
 
-保留规则：state 在压实时**剪到最新 B base 为止**（有界服务副本）；**flow append-only、从不裁剪**（#7439——它的增长是已推迟的优化项 #7475，另行解决，绝不用裁剪解决）；block_flow 追加式（压实路径 `egressBlockCompact` 存在但尚无生产调用方，见遗留）。
+保留规则：**flow append-only、从不裁剪**（#7439——它的增长是已推迟的优化项 #7475，另行解决，绝不用裁剪解决）；**state 表 = 物化 live 视图**——它的大小就是 live 视图的大小，被覆盖行在折叠时物理删除（base 行/压实路径 `egressStateCompact`/`egressBlockCompact` 已退役，#7773）；block_flow 与消息 flow 一样 append-only。
+
+**结构不变量（7773 §6，每次写入后断言，两平面）。** ① flow 总行数只增（append-only）；② state 行数 == live 视图行数（物化，不是聚合、不是 op 镜像）；③ flow/state 里最大 value 大小 == 历史最大**单行**大小——针对退役 `B` 行全视图聚合 payload 的回归防线；④ 行字母表恰为 I/D/U（消息平面）与 I/U/D（块平面）——`B` 永不出现。套件：`tests/egress-invariants-7773.test.ts`。
 
 ## 4. 一轮的生命周期
 
-1. **准备**——插件轮到达，车道仲裁选中 egress 路径；**`recordEgressTurn`** 把本轮出站视图与上一轮 diff，**立即（准备阶段，不是保存）追加 I/D/U 行到 flow**——单事务：事务内 `nextSeqs`（密度安全，#7574）、并发写守卫、若本轮有删除（折叠）则**同事务写 B base + 剪枝 state 表**。
+1. **准备**——插件轮到达，车道仲裁选中 egress 路径；**`recordEgressTurn`** 把本轮出站视图与上一轮 diff，**立即（准备阶段，不是保存）追加 I/D/U 行到 flow**——单事务：事务内 `nextSeqs`（密度安全，#7574）、并发写守卫、然后把同一批 op 应用到**物化 state 行**（I 插入 + `pos` 后移、U 就地改、D 物理删 + 前移），最后跑不变量检查（state 行数 == live 视图长度，7773 §6）。
 2. **Pin**——pin 通道用 op log 存活视图校验宿主的 msgid 信封（`snapPinLiveIds`，有界 serving 读）。失配 ⇒ 该轮降级（发 full 信号，下轮重锚），永不拒绝。
 3. **Kernel**——kernel 输入**从 flow 重放**（服务端权威）。折叠决策 = 下一轮的 flow 操作 + **块表操作**（摘要块生命周期的 I/U，带 `one`/`full`）。
 4. **上游**——回复中继；pf 头盖章。
 5. **保存**——会话信封保存为**仅索引**（bootstrap 起冻结）；**块记录器**把 `state.blocks` 与 `egress_block_state` diff，追加块 I/U 行，每行盖 `flow_op_seq = flow.MAX(op_seq)`。无逐轮统一 ingest（KDD #23）。
-6. **重启**——加载时重放 flow → `egress_state`（有界）；`tsStamps`/token 统计**从重放推导**，不再持久化；kstate 只留残差清单。尾部损坏时 `recoverEgressBase` 逐步回退（跨过每个健康 base 截断）直到健康点；无任何健康点 ⇒ 响亮硬失败（7439-5）。
+6. **重启**——加载时重放 flow → `egress_state`（物化）；`tsStamps`/token 统计**从重放推导**，不再持久化；kstate 只留残差清单。state 副本损坏时，serving 读**全史重放重建**后照常服务（flow 是正史）；FLOW 本身不可重放时，`recoverEgressBase` 走**一趟全史 walk**（`egressFlowWalkBack`）：最新健康前缀截掉尾部、会话从那里继续；无任何健康点 ⇒ 响亮硬失败（7439-5）。
 
 ## 5. 为什么更快
 
@@ -58,16 +60,16 @@
 |---|---|
 | 统一 ingest O(**总** messages 行数) ≈ p50 2s，双账本 2× | 每轮写入 = **仅新增 flow 行** |
 | 每个水位 HIT 轮 O(全表) re-ingest 0.5–0.8s | 滑动尾窗 **re-anchor delta**：逐行索引 identity 探针，**在写事务内**裁决；任何疑点 = 改前的全量路径 |
-| serving 读打在不断增长的 messages 账本上 | **有界 serving 读**——存活视图被压实 base 保持紧凑 |
+| serving 读打在不断增长的 messages 账本上 | **有界 serving 读**——state 表**就是** live 视图（7773）：被覆盖行折叠时物理删除，每次 serving 读与 live 上下文本身一样小 |
 | `tsStamps`/token 统计随 kernel 状态一起持久化 | **加载时从 flow 重放推导**（kstate 残差裁剪到残差字段清单） |
 | 每次身份判定读写 `l1_world` 游标 + resync | **无状态 stage-0** 从 op log 前沿计算 |
 
-让这一切成立的不变量：**serving 路径需要的每个读都被压实有界**；剩下的唯一 O(n) 路径（投影重建）只在回滚/web 读/恢复时各跑一次，不再逐轮。
+让这一切成立的不变量：**serving 路径需要的每个读都不超过 live 上下文本身**；仅有的几个 O(全史) 路径（全史重放）只在重建/恢复/回退时各跑一次，不逐轮。
 
 ## 6. Fork 与回退
 
 - **Fork-to-now**（默认）：四张表逐字拷贝 + `sessions`；子会话两时钟各自独立继续。
-- **真·点位 fork**（水位 `wm` = flow 的 `op_seq`）：拷 flow 行 `op_seq <= wm`，拷**块行 `flow_op_seq <= wm`**（用指针而不是块自己的编号——这正是双时钟存在的意义），然后重放重建两个 state 副本。低于最新 base ⇒ 仍拒绝（400），直到 point-reconstruction materializer 落地——这是保守门，不是数据约束：flow 保留了那些行。
+- **真·点位 fork**（水位 `wm` = flow 的 `op_seq`）：拷 flow 行 `op_seq <= wm`，拷**块行 `flow_op_seq <= wm`**（用指针而不是块自己的编号——这正是双时钟存在的意义），然后**重放到该点位物化两张 state 表**（7773：`egressStateAt(wm)` + 块重放）——任意点位都可行，不再有「低于最新 base」门。
 - **回滚/降级**（关掉平面开关，或跑旧二进制）：messages 表的**惰性投影从 flow 一次性 O(n) 重建**；legacy 读者（messages + 信封）看到的会话字节完整。egress 行保留；重新开启零迁移（日志仍在最前）。
 - **降级安全性**：egress-on 会话 bootstrap 后**没有信封行**——旧二进制读不了它；所以升级只能向前，回滚走投影重建这条路，而不是「读旧文件」。
 
@@ -92,10 +94,11 @@
 - **on/off 在哪读（解析序）**：env `BILI_ROLLOUT_EGRESS_PLANE`（`"0"`/`"false"` = 关，其他值 = 开）→ 配置文件 `$XDG_CONFIG_HOME/billion-context/billion-context.json`（默认 `~/.config/billion-context/billion-context.json`）键 `rollout.features.egressPlane`（`true`/`false` 或 `{"percent": n}`）→ 代码默认（`src/rollout.ts`）：**0（关）**。开启除旗标外不需要别的（`storage.unified` 标准安装已设）。
 - **整体退出**：`BILI_ROLLOUT_EGRESS_PLANE=0`（env 优先于 config）或 `"rollout": {"features": {"egressPlane": false}}`。新轮走 legacy；已有行保留（投影重建仍读它们）。
 - **降级（无需动作）**：任何不可建行 / 损坏点 / 探针失败 ⇒ **该轮**降级 legacy。完全没有健康点 ⇒ 响亮硬失败。
-- **点位 fork**：`POST /__bili/replicas`——201 点位 fork / 503 非驻留 / 400 低于最新 base。Fork-to-now 四表逐字拷贝。
+- **点位 fork**：`POST /__bili/replicas`——201 点位 fork（任意水位；state 表重放到该点位物化，7773）/ 503 非驻留。Fork-to-now 四表逐字拷贝。
 - **R3 latch 卡住**：`SELECT r3_latched_at FROM sessions WHERE session_id = ?`（旧二进制另查 `l1_world`）；清除**两个载体都清**。
 - **GC / 归档**：egress-on 会话**完全排除在按龄 GC 之外**，手动归档（`bili sessions archive`）**被拒绝**——归档格式尚未承载 op log（遗留项）。
 - **诊断**：`/__bili/status`；恢复事件（回退截断、降级轮）在代理日志里响。
+- **交接——毁库重建开发库（7773 §7，owner 执行）**：egress 表从未以旧形态随版本发布，所以**没有迁移**——持有 #7773 前旧 egress 表的开发库靠删库文件 + 重启重建：停掉 bili，删 `<sessions 目录>/index.db`、`index.db-wal`、`index.db-shm`（默认 sessions 目录：`~/.local/share/billion-context/sessions/`，即 `$XDG_DATA_HOME/billion-context/sessions/`），再启动 bili——`migrateSchema` 探针本来就会检测到旧形态（`op_seq` 列 / 缺 `pos` 列 / flow CHECK 含 `B`）并在首次打开时 drop 重建四张 egress 表；手动删除只是干净路径。旧库里 egress-on 会话历史按设计丢弃（仅开发数据——平面从未发给过用户）。
 
 ## 9. PR / 提案时间线
 
@@ -108,8 +111,9 @@
 | [#7591](https://github.com/ranxianglei/billion-context/discussions/7591) / **#7617**（已合并） | 身份收拢：无状态 stage-0、R3 latch → `sessions`、conversations 对 egress-on 退役、GC/手动归档守卫。 |
 | **#7659（本 PR，2026-11-24）** | 文档收尾：本文档；[deprecations.zh-CN.md](./deprecations.zh-CN.md)；KDD #24；图。egressPlane 默认按 owner 裁定保持 **0**——GA 翻转被提议后否决。 |
 | 讨论 [#7735](https://github.com/ranxianglei/billion-context/discussions/7735)（2026-11-25） | **扫尾**：arm 时身份行（§11）、7 表创建门、kv_store 256 字符策略 + 大 blob 退役、l1 死行清理、三个 flag 默认值修正回 0。 |
+| 讨论 [#7773](https://github.com/ranxianglei/billion-context/discussions/7773)（2026-11-26） | **形态再裁定**：两平面的 `B` base 行退役；state 表变为**物化 live 视图**（PK `(session_id, msgid)`、`pos` 序；D 物理删、折叠 O(尾长)）；恢复变为一趟全史 walk（`egressFlowWalkBack`）；点位 fork 重放物化到**任意**点位；每次写入后断言结构不变量（§3）。存量不迁移——表从未随版本发布，已有库把四张 egress 表 drop 重建（owner 操作手册：删 `index.db*` + 重启）。 |
 
-**遗留**（已跟踪）：egressPlane 默认翻 100（等 owner 点头）；point-reconstruction materializer（低于最新 base 的 fork 点）；归档格式承载 op log；`egressBlockCompact` 的生产**压缩**调用方（replay 已在 #7664 落地）；退役身份载体的物理 DROP 批次；按退役登记表删开关（硬编码开）。
+**遗留**（已跟踪）：egressPlane 默认翻 100（等 owner 点头）；归档格式承载 op log；退役身份载体的物理 DROP 批次；按退役登记表删开关（硬编码开）。（point-reconstruction materializer 与 `egressBlockCompact` 生产调用方已被 #7773 退役——点位 fork 重放物化，块压实不复存在。）
 
 ## 10. 重编号——log_seq 就是引用号（定稿设计，2026-11-25）
 
@@ -123,9 +127,9 @@
 4. **`refs` 表：egress-on 停写，读兑底保留。** 回填后 op log 覆盖全部历史，egress-on 会话停止写 `refs` 行（已登记 [deprecations.zh-CN.md](./deprecations.zh-CN.md)）；读方对回填前/legacy 会话继续回退到该表，直到物理 DROP 批次。
 5. **kstate overlay 成为正当路径。** 冷加载按 `{rawId → m + log_seq}` 从 op log 视图推导 `messageRefs`——由规则 1，这正是内核在进程内分配的同一个映射。"别让 overlay 覆盖已存 refs"的权宜补丁不再需要：编号一致后它本来就是对的。
 6. **系统提示词：输入形态在 `egress_state`，账本形态在 flow。** 一个文本、两种形态、不再第三份：flow 的 system 行保留**拼装成品**（客户端 system `A` + 服务端常驻块 `B`，每轮实时计算；transcript 要的就是真正发出去的东西）。**客户端原文 `A`** 在 egress 表内拿到永久住所——`egress_state` 上固定 `egress-system` msgid、编号 0 的一行，客户端改了就发 U 更新（`sessions` 不动 DDL）。结果：`session_ext` 里的粘性副本（`inc:system`）对 egress-on 会话退役——已登记 [deprecations.zh-CN.md](./deprecations.zh-CN.md)；增量车道对 egress-on 会话从 egress state 读 `A`（legacy/关平面不动）。两种形态都从 egress 表可查，不再"真正的系统提示词在扩展列里"。
-7. **编号生命周期——存储行跟随内核引用事实（2026-11-26 定稿）。** 一行的 `num` 是它**当前**的内核引用号；**无引用时为 0**。稠密兜底（规则 1）给没有账本条目的行（受保护/BLOCKED 行、内核摘要行）发一个占位号——占位号是内核计数器**永远看不见**的。于是内核计数器日后完全可能引用一个仍被占位号持有的槽位；这个分叉是结构性的，不是数据损坏。日志在一轮内、于 diff 处对账：spine 行的有效 num 相对 refs 账本变化时发一条**带 `num` 的 +U**（payload 加字段；该 op 自身的 `log_seq` 仍为 NULL）——N→0 = 降级（该号**退役**，永不复用），0→N = 回落到内核引用号上，N→M = 跟随重钉。重放先于同批后续 I 应用 U 的 `num`（D、U、I 的 op 顺序），所以刚释放槽位的再引用合法，而与该行仍**存活**的引用号相撞仍然拒绝（那才是真内核损坏）。base 条目允许 `num` 0（非 system 行校验放宽）；稠密游标仍从 flow 高水位之后起走，退役槽位永不复用。没有这次对账时，此后每一轮写入都被拒（`cited number N is already live`）——op log 冻结、服务降级到客户端字节，正是本修复消除的故障形态。
+7. **编号生命周期——存储行跟随内核引用事实（2026-11-26 定稿）。** 一行的 `num` 是它**当前**的内核引用号；**无引用时为 0**。稠密兜底（规则 1）给没有账本条目的行（受保护/BLOCKED 行、内核摘要行）发一个占位号——占位号是内核计数器**永远看不见**的。于是内核计数器日后完全可能引用一个仍被占位号持有的槽位；这个分叉是结构性的，不是数据损坏。日志在一轮内、于 diff 处对账：spine 行的有效 num 相对 refs 账本变化时发一条**带 `num` 的 +U**（payload 加字段；该 op 自身的 `log_seq` 仍为 NULL）——N→0 = 降级（该号**退役**，永不复用），0→N = 回落到内核引用号上，N→M = 跟随重钉。重放先于同批后续 I 应用 U 的 `num`（D、U、I 的 op 顺序），所以刚释放槽位的再引用合法，而与该行仍**存活**的引用号相撞仍然拒绝（那才是真内核损坏）。稠密游标仍从 flow 高水位之后起走，退役槽位永不复用。没有这次对账时，此后每一轮写入都被拒（`cited number N is already live`）——op log 冻结、服务降级到客户端字节，正是本修复消除的故障形态。
 
-**为什么对平面其余部分是安全的。** fork 原样拷贝 flow 行，回填的编号随会话走；压缩 base 存的 `highWater` 是被压掉的最大编号（现在是引用号，stage-0 读的 `MAX(log_seq)` 前沿与下一号兑底两边都对齐）；CCR 与块表以 `op_seq`/`msg_id` 为键，与引用号无关。附带收益：egress-on 的引用空间与 legacy 边**逐字相同**（两边 `m00001` 都是第一条真消息），加载重编号机制（#4316）整体退出 egress-on 路径——"重编号后快照过期"这一 bug 类在 egress-on 上不再存在。
+**为什么对平面其余部分是安全的。** fork 原样拷贝 flow 行，回填的编号随会话走；前沿 = flow 上的 `MAX(log_seq)`（退役 base payload 的 `highWater` 已不存在，7773）——stage-0 读的 `MAX(log_seq)` 前沿与下一号兑底两边都引用对齐；CCR 与块表以 `op_seq`/`msg_id` 为键，与引用号无关。附带收益：egress-on 的引用空间与 legacy 边**逐字相同**（两边 `m00001` 都是第一条真消息），加载重编号机制（#4316）整体退出 egress-on 路径——"重编号后快照过期"这一 bug 类在 egress-on 上不再存在。
 
 ## 11. 扫尾（2026-11-25，讨论 [#7735](https://github.com/ranxianglei/billion-context/discussions/7735)）——身份行、表创建门、kv 策略
 

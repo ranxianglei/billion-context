@@ -535,6 +535,121 @@ test("B2 (dual gate): a fresh LEGACY-mode database still persists the route tabl
     }
 });
 
+// ---------------------------------------------------------------------------
+// C: the 7-table gate must not strand lifecycle maintenance (KDD #25)
+// ---------------------------------------------------------------------------
+
+function openEgStore(dir: string): UnifiedStore {
+    // Fresh egress-mode database: the gate ON, so migrateSchema creates
+    // exactly the 7 core+egress tables (none of the 12 legacy ones).
+    const saved = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+    let store: UnifiedStore;
+    try {
+        store = UnifiedStore.open(join(dir, "index.db"));
+    } finally {
+        if (saved === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE; else process.env.BILI_ROLLOUT_EGRESS_PLANE = saved;
+    }
+    return store;
+}
+
+test("C1 (KDD #25 gate): deleteSession on a 7-table instance — the identity row and the op log both die", () => {
+    const dir = mkdtempSync(join(testRoot, "c1-"));
+    const store = openEgStore(dir);
+    const db = (store as unknown as { db: Db }).db;
+    try {
+        store.ensureEgressIdentity(identityInput("c1-s1"));
+        db.prepare(
+            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+             VALUES ('c1-s1', 1, 0, 'I', 'egress-system', '{"t":1}', '7', 1000)`,
+        ).run();
+        db.prepare(
+            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+             VALUES ('c1-s1', 2, 1, 'I', 'm1', '{"t":2}', '7', 1000)`,
+        ).run();
+        // Pre-gate this threw on the missing messages table and rolled the
+        // whole transaction back — silently keeping every row of the session.
+        store.deleteSession("c1-s1");
+        const n = (t: string) => Number((db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n);
+        assert.equal(n("sessions"), 0, "the identity row dies");
+        assert.equal(n("session_ext"), 0, "ext rows die");
+        assert.equal(n("egress_flow"), 0, "the op log dies");
+    } finally {
+        try { store.close(); } catch { /* already closed */ }
+        rmBestEffort(dir);
+    }
+});
+
+test("C2 (KDD #25 gate): gc on a 7-table instance — the legacy CAS sweep is skipped, not a crash; legacy arm still sweeps", () => {
+    const dir = mkdtempSync(join(testRoot, "c2-"));
+    let store = openEgStore(dir);
+    let db = (store as unknown as { db: Db }).db;
+    try {
+        store.ensureEgressIdentity(identityInput("c2-s1"));
+        db.prepare(
+            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+             VALUES ('c2-s1', 1, 1, 'I', 'm1', '{"t":2}', '7', 1000)`,
+        ).run();
+        // Pre-gate this threw on the missing content table (the zero-ref
+        // report) and the whole gc run aborted as a silent no-op.
+        const r = store.gc({ archiveAfterDays: 30, archiveDir: join(dir, "gc"), now: Date.now() });
+        assert.deepEqual(r, { archived: 0, contentRowsDeleted: 0 }, "gc completes on a 7-table instance");
+        try { store.close(); } catch { /* already closed */ }
+        // Legacy arm in the SAME directory (probe-first convergence brings
+        // the 12 tables back): the sweep must run again and collect.
+        store = openLegacyStore(dir);
+        db = (store as unknown as { db: Db }).db;
+        db.prepare(`INSERT INTO content (hash, byte_len, refcount, algo, bytes) VALUES ('c2h', 1, 0, 'sha256', x'00')`).run();
+        const r2 = store.gc({ archiveAfterDays: 30, archiveDir: join(dir, "gc"), now: Date.now() });
+        assert.equal(r2.contentRowsDeleted, 1, "the converged legacy sweep collects the zero-ref row");
+        assert.equal(Number((db.prepare(`SELECT COUNT(*) AS n FROM content`).get() as { n: number }).n), 0);
+    } finally {
+        try { store.close(); } catch { /* already closed */ }
+        rmBestEffort(dir);
+    }
+});
+
+test("C3 (KDD #25 gate): gcPlan on a 7-table instance — the zero-ref report is empty, not a crash", () => {
+    const dir = mkdtempSync(join(testRoot, "c3-"));
+    const store = openEgStore(dir);
+    const db = (store as unknown as { db: Db }).db;
+    try {
+        store.ensureEgressIdentity(identityInput("c3-s1"));
+        db.prepare(
+            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+             VALUES ('c3-s1', 1, 1, 'I', 'm1', '{"t":2}', '7', 1000)`,
+        ).run();
+        const plan = store.gcPlan(30);
+        assert.equal(plan.zeroRefRows, 0, "no content table → an empty report");
+        assert.equal(plan.candidates.length, 0, "the egress-on identity row is archive-ineligible");
+    } finally {
+        try { store.close(); } catch { /* already closed */ }
+        rmBestEffort(dir);
+    }
+});
+
+test("C4: legacy instance — deleteSession still sweeps the projection (the gate is off there)", () => {
+    const dir = mkdtempSync(join(testRoot, "c4-"));
+    const store = openLegacyStore(dir);
+    const db = (store as unknown as { db: Db }).db;
+    try {
+        store.ensureEgressIdentity(identityInput("c4-s1"));
+        db.prepare(`INSERT INTO content (hash, byte_len, refcount, algo, bytes) VALUES ('c4h', 3, 1, 'sha256', x'616263')`).run();
+        db.prepare(
+            `INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts)
+             VALUES ('c4-s1', 1, 'm1', NULL, NULL, 'user', 'message', 'c4h', '', NULL, NULL)`,
+        ).run();
+        store.deleteSession("c4-s1");
+        const n = (t: string) => Number((db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n);
+        assert.equal(n("messages"), 0, "the message projection is swept");
+        assert.equal(n("content"), 0, "the released CAS row is collected");
+        assert.equal(n("sessions"), 0, "the identity row dies");
+    } finally {
+        try { store.close(); } catch { /* already closed */ }
+        rmBestEffort(dir);
+    }
+});
+
 test.after(() => {
     if (SAVED_PLANE === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE; else process.env.BILI_ROLLOUT_EGRESS_PLANE = SAVED_PLANE;
 });

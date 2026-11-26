@@ -134,20 +134,24 @@ export function buildEgressViewRows(
 
 /** The storage seam (UnifiedStore today; keeps the recorder testable). */
 export interface EgressOpLogStore {
-    /** Record one turn: guarded, validated, appended, compacted — in ONE
-     *  transaction (see egressAppendTurn). Throws EgressConcurrentWriteError
-     *  when the log moved past `baseSeq` (nothing written) and
-     *  EgressStateCorruptError when the log or the batch does not replay.
-     *  Returns the stamped view the tables now hold. */
+    /** Record one turn: guarded, validated, appended, applied to the
+     *  materialized live view — in ONE transaction (see egressAppendTurn).
+     *  Throws EgressConcurrentWriteError when the log moved past `baseSeq`
+     *  (nothing written) and EgressStateCorruptError when the log or the
+     *  batch does not replay. Returns the stamped view the tables now hold. */
     egressAppendTurn(sessionId: string, ops: EgressOp[], baseSeq: number, nowMs: number): EgressViewRow[];
     egressStateView(sessionId: string): EgressViewRow[];
-    /** Rollback reconstruction at any op_seq at or above the newest base. */
+    /** Rollback reconstruction at any op_seq (full history from 0 — there
+     *  is no base row). */
     egressStateViewAt(sessionId: string, opSeq: number): EgressViewRow[];
     /** Highest op_seq in the flow (0 = no rows). */
     egressStateMaxSeq(sessionId: string): number;
-    /** op_seq of the newest base row (0 = none). Optional: a store without
-     *  it limits the recovery walk to the fixed distance below. */
-    egressStateBaseSeq?(sessionId: string): number;
+    /** 7773 walk-back: one O(n) pass over the flow's FULL history returning
+     *  the newest healthy NON-EMPTY prefix (seq + view), or null when no
+     *  non-empty healthy prefix exists (corruption reaching the floor).
+     *  The flow is append-only — there is no base row to anchor to, so the
+     *  walk has no fixed distance bound. */
+    egressFlowWalkBack(sessionId: string): { seq: number; view: EgressViewRow[] } | null;
     /** Renumber (2026-11-25): the client's raw system (A) from the latest
      *  system row's sysIn (null = not egress-recorded / no A). Optional:
      *  shims without it keep the legacy ext read. */
@@ -226,12 +230,12 @@ export function sanitizeEgressIdentityMetadata(metadata: Record<string, unknown>
  * this turn's starting point — the previous turn's view when present,
  * otherwise a one-shot hydrate from the tables (owner ruling 7439-3: the
  * tables are the only state; there is no long-lived in-memory view cache).
- * The append, the compaction it may trigger (a batch with a -D — the fold
- * shape; cancellation is the trigger, per the proposal) and the guard
- * against a log that moved since `baseSeq` was read are ONE transaction
- * (egressAppendTurn). Any EgressStateCorruptError / EgressConcurrentWriteError
- * propagates — the caller handles it per the degrade ladder (no fuzzy
- * fallback, KDD discipline).
+ * The append, the in-place apply to the materialized live view (7773 —
+ * there is no compaction step: the flow keeps every row forever) and the
+ * guard against a log that moved since `baseSeq` was read are ONE
+ * transaction (egressAppendTurn). Any EgressStateCorruptError /
+ * EgressConcurrentWriteError propagates — the caller handles it per the
+ * degrade ladder (no fuzzy fallback, KDD discipline).
  *
  * Returns the STAMPED view — the replay of the log as the tables now hold
  * it, whose rows carry the canonical numbers (I rows: the number their
@@ -330,24 +334,19 @@ function ledgerEgressBlocks(
 }
 
 
-/** Bounded walk-back distance when the flow's current point is corrupt. */
-const EGRESS_HEALTHY_WALK_MAX = 16;
-
-/** Ruling 7439-5 degrade ladder — hydrate the flow's CURRENT point; when it
- * fails replay (a corrupt row), walk back to the NEWEST healthy op_seq
- * (bounded walk) and TRUNCATE past it: rows beyond a corrupt point are
- * unusable by definition (no replay can ever include them), so recovery
- * means flowing back to the last healthy point in the tables themselves —
- * never to the client's bytes. Returns null = no healthy NON-EMPTY point:
- * a session that HAS rows but none that replay is whole-flow-unreadable,
- * and the caller hard-fails the turn instead of falling back to client
- * bytes (ruling 7439-5). The only legitimate empty flow is a ROW-LESS
- * session, which the try path above returns as seq 0 / degraded=false
- * (the turn-1 bootstrap). An empty replay at a lower op_seq while rows
- * exist is corruption reaching the floor, not a live empty session — an
- * empty base row is never written (recordEgressTurn no-ops an empty diff
- * and compaction only runs on non-empty views). The truncated count is
- * observability for the warn log. */
+/** Ruling 7439-5 degrade ladder — hydrate the flow's CURRENT point; when
+ * the log cannot replay (a corrupt row), WALK BACK (7773: one O(n) pass
+ * over the flow's FULL history — it is append-only, there is no base row to
+ * anchor to, so there is no fixed distance bound) to the NEWEST healthy
+ * op_seq and TRUNCATE past it: rows beyond a corrupt point are unusable by
+ * definition (no replay can ever include them), so recovery means flowing
+ * back to the last healthy point in the tables themselves — never to the
+ * client's bytes. Returns null = no healthy NON-EMPTY point: a session that
+ * HAS rows but none that replay is whole-flow-unreadable, and the caller
+ * hard-fails the turn instead of falling back to client bytes (ruling
+ * 7439-5). The only legitimate empty flow is a ROW-LESS session, which the
+ * try path above returns as seq 0 / degraded=false (the turn-1 bootstrap).
+ * The truncated count is observability for the warn log. */
 export function recoverEgressBase(
     store: EgressOpLogStore,
     sessionId: string,
@@ -370,29 +369,25 @@ export function recoverEgressBase(
     // loses rows over it — no walk-back, no truncation. The turn is served
     // unrecorded until an operator resets the log (POST /__bili/egress/reset).
     if (options.walk === false) return null;
-    // Walk back to the NEWEST healthy op_seq: at most EGRESS_HEALTHY_WALK_MAX
-    // steps, but never stop above the newest base row — the base is a full
-    // view on its own, so it is always a healthy point and the walk must be
-    // able to reach it (a busy folding session compacts every few ops).
-    const walkFloor = Math.max(0, maxSeq - EGRESS_HEALTHY_WALK_MAX);
-    const baseSeq = store.egressStateBaseSeq?.(sessionId) ?? 0;
-    const floor = baseSeq > 0 ? Math.min(walkFloor, baseSeq) : walkFloor;
-    for (let x = maxSeq - 1; x >= floor; x--) {
-        let view: EgressViewRow[];
-        try {
-            view = store.egressStateViewAt(sessionId, x);
-        } catch (err) {
-            if (err instanceof EgressStateCorruptError) continue; // keep walking
-            throw err;
-        }
-        if (view.length > 0) {
-            const truncated = store.egressStateTruncateAfter(sessionId, x);
-            loggerLog(
-                "error",
-                `[storage] egress session=${sessionId}: the outbound log did not replay (${damage}) — ${truncated} row(s) after op_seq ${x} were removed and the session continues from op_seq ${x} (${view.length} rows)`,
-            );
-            return { view, seq: x, degraded: true, truncated };
-        }
+    // 7773: single-pass full-history walk-back. The flow is append-only, so
+    // every healthy point is a prefix from 0; the first row that does not
+    // apply delimits the newest healthy prefix (a prefix that includes a bad
+    // row can never replay). A walk-back that itself reports the flow as
+    // whole-unreadable is "no healthy point" (null → the caller hard-fails
+    // the turn); any other failure still rethrows — the next step DELETES
+    // rows, so it must never run on a guess.
+    let healthy: { seq: number; view: EgressViewRow[] } | null;
+    try {
+        healthy = store.egressFlowWalkBack(sessionId);
+    } catch (err) {
+        if (!(err instanceof EgressStateCorruptError)) throw err;
+        healthy = null;
     }
-    return null;
+    if (healthy === null) return null;
+    const truncated = store.egressStateTruncateAfter(sessionId, healthy.seq);
+    loggerLog(
+        "error",
+        `[storage] egress session=${sessionId}: the outbound log did not replay (${damage}) — ${truncated} row(s) after op_seq ${healthy.seq} were removed and the session continues from op_seq ${healthy.seq} (${healthy.view.length} rows)`,
+    );
+    return { view: healthy.view, seq: healthy.seq, degraded: true, truncated };
 }

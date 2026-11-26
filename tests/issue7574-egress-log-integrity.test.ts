@@ -1,22 +1,26 @@
-// #7574 (review of PR #6785), the outbound op log:
-//   - two requests on one session: the second writer is REFUSED (it started
-//     from a view that is no longer the log) — before, its ops were written on
-//     top of the first writer's and the conversation silently changed order;
-//   - a turn that deletes compacts in the same write, and the compaction
-//     shrinks BOTH tables (the flow used to keep every row and gain one full
-//     snapshot per fold);
-//   - a system prompt that shows up in a later turn lands where the lane
-//     serves it (first row), not at the end;
-//   - a damaged serving copy is copied again from the log, a copy that ran
-//     ahead of the log is cut back, a hole in the log is reported;
-//   - recovery walks back ONLY on a real corruption — any other error (a busy
-//     database, a failed read) is passed on and deletes nothing.
+// #7574 (part 1), the op-log invariant, checked against a REAL SQLite
+// database through the UnifiedStore wrapper (not a fake):
+//   - one writer per session: a second request that starts from the same
+//     turn is refused, and nothing of it reaches either table;
+//   - a batch whose ops cannot apply to the current view is refused before
+//     any row is written;
+//   - a turn that deletes (a fold) physically deletes the state rows in the
+//     same write — the flow keeps its full history and its letter alphabet
+//     is I/D/U (7773 — there is no base row, no compaction step);
+//   - the numbers the lane hands out never repeat, even across such a turn;
+//   - the materialized state is a read-time replica of the flow: damage to
+//     the state alone is healed by a full-history replay in the same read,
+//     a state row the flow does not carry is not served, and a hole in the
+//     flow itself is reported with nothing deleted.
+//
+// The operator surfaces (truncate / full reset) are the admin endpoints;
+// they must remove whole spans, row for row, from BOTH tables.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { BiliMessage } from "acp-kernel/wire";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
@@ -26,16 +30,15 @@ import {
     EgressStateCorruptError,
     diffEgressView,
     egressRebuildState,
-    type EgressOp,
     type EgressViewRow,
 } from "../src/storage/egress-state.ts";
-import { EGRESS_SYSTEM_MSGID, buildEgressViewRows, recoverEgressBase, recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
+import { EGRESS_SYSTEM_MSGID, buildEgressViewRows, recordEgressTurn, recoverEgressBase, type EgressOpLogStore } from "../src/storage/egress-record.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 process.env.BILI_CONFIG_FILE = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bili-7574-egress-hermetic-")), "no-config.json");
 process.env.BILI_STORAGE_UNIFIED = "legacy";
 
-const M = (id: string, text: string, role: BiliMessage["role"] = "user"): BiliMessage => ({ id, role, contentType: "text", text });
+const M = (id: string, text: string, role: "user" | "assistant" = "user") => ({ id, role, contentType: "text" as const, text });
 
 interface Harness {
     store: UnifiedStore;
@@ -45,7 +48,7 @@ interface Harness {
 }
 
 function open(): Harness {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-7574-egress-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-egress-7574-"));
     const file = path.join(dir, "index.db");
     const { db } = openSqliteDatabase(file);
     migrateSchema(db);
@@ -55,7 +58,7 @@ function open(): Harness {
         egressStateView: (s) => store.egressStateView(s),
         egressStateViewAt: (s, x) => store.egressStateViewAt(s, x),
         egressStateMaxSeq: (s) => store.egressStateMaxSeq(s),
-        egressStateBaseSeq: (s) => store.egressStateBaseSeq(s),
+        egressFlowWalkBack: (s) => store.egressFlowWalkBack(s),
         egressStateTruncateAfter: (s, x) => store.egressStateTruncateAfter(s, x),
     };
     return { store, ops, db, dir };
@@ -67,10 +70,11 @@ function close(H: Harness): void {
     fs.rmSync(H.dir, { recursive: true, force: true });
 }
 
-/** rows of a session per table, by row type in op_seq order */
+/** the two planes, by what each table says: the state's live msgids in pos order and the flow's row types in op_seq order */
 function shape(H: Harness, S: string): { state: string[]; flow: string[] } {
-    const q = (table: string) => (H.db.prepare(`SELECT row_type FROM ${table} WHERE session_id = ? ORDER BY op_seq`).all(S) as { row_type: string }[]).map((r) => r.row_type);
-    return { state: q("egress_state"), flow: q("egress_flow") };
+    const state = (H.db.prepare("SELECT msgid FROM egress_state WHERE session_id = ? ORDER BY pos").all(S) as { msgid: string }[]).map((r) => r.msgid);
+    const flow = (H.db.prepare("SELECT row_type FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[]).map((r) => r.row_type);
+    return { state, flow };
 }
 
 const ids = (rows: EgressViewRow[]) => rows.map((r) => r.msgid);
@@ -116,25 +120,23 @@ test("a batch that would break the log is refused before anything is written", (
     }
 });
 
-test("a turn that deletes compacts in the same write: both tables hold the base row, numbers continue", () => {
+test("a turn that deletes removes the state rows in the same write; the flow keeps its full history (7773)", () => {
     const H = open();
     try {
         const S = "s-fold";
         const base = recordEgressTurn({ store: H.ops, sessionId: S, prev: undefined, conversation: [M("a", "1"), M("b", "2"), M("c", "3"), M("d", "4"), M("e", "5")], systemText: "sys", nowMs: 1 });
         // fold b..d into one summary
-        const folded = buildEgressViewRows([M("a", "1"), M("sum", "…", "assistant"), M("e", "5")], "sys");
         const view = recordEgressTurn({ store: H.ops, sessionId: S, prev: base, conversation: [M("a", "1"), M("sum", "…", "assistant"), M("e", "5")], systemText: "sys", nowMs: 2 });
-        void folded;
         assert.deepEqual(ids(view), [SYS, "a", "sum", "e"]);
         const s = shape(H, S);
-        assert.deepEqual(s.state, ["B"], "state: the base row, nothing else");
-        assert.deepEqual(s.flow, ["I", "I", "I", "I", "I", "I", "D", "I", "B"], "flow: append-only (#7439) — turn 1's six +I rows (system + a..e), then the fold's D + I, then the base");
+        assert.deepEqual(s.state, [SYS, "a", "sum", "e"], "state: the live rows only — b..d physically deleted with the D op");
+        assert.deepEqual(s.flow, ["I", "I", "I", "I", "I", "I", "D", "I"], "flow: append-only — turn 1's six +I rows (system + a..e), then the fold's D + I; no base row (7773)");
         // the next message gets the next number, none is issued twice
         const high = Math.max(...view.map((r) => r.num));
         assert.equal(high, 6, "five messages (numbers 1..5) + the summary row = six numbers issued (the system row is number 0, outside the citation space — renumber 2026-11-25)");
         const grown = recordEgressTurn({ store: H.ops, sessionId: S, prev: view, conversation: [M("a", "1"), M("sum", "…", "assistant"), M("e", "5"), M("f", "6")], systemText: "sys", nowMs: 3 });
-        assert.equal(grown.find((r) => r.msgid === "f")!.num, high + 1, "numbering continues after the base — none is issued twice");
-        assert.deepEqual(shape(H, S).flow, ["I", "I", "I", "I", "I", "I", "D", "I", "B", "I"], "the flow never loses rows; only the state table compacts");
+        assert.equal(grown.find((r) => r.msgid === "f")!.num, high + 1, "numbering continues after the fold — none is issued twice");
+        assert.deepEqual(shape(H, S).flow, ["I", "I", "I", "I", "I", "I", "D", "I", "I"], "the flow never loses rows; only the state plane is materialized");
     } finally {
         close(H);
     }
@@ -158,51 +160,53 @@ test("a system prompt that shows up in a later turn becomes the first row, not t
     }
 });
 
-test("a damaged serving copy is copied again from the log; a copy that ran ahead of the log is cut back", () => {
+test("the materialized state is healed by a full-history replay; a state row the flow lacks is not served; a hole in the flow is reported", () => {
     const H = open();
     try {
         const S = "s-copy";
         recordEgressTurn({ store: H.ops, sessionId: S, prev: undefined, conversation: [M("a", "1"), M("b", "2")], systemText: "sys", nowMs: 1 });
         const good = ids(H.store.egressStateView(S));
         const max = H.store.egressStateMaxSeq(S);
-        // 1. the serving copy alone is damaged
-        H.db.prepare("INSERT INTO egress_state (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, NULL, 'U', 'ghost', ?, ?, 9)")
-            .run(S, max + 1, JSON.stringify({ role: "user" }), "x");
-        assert.deepEqual(ids(H.store.egressStateView(S)), good, "the read answers from the log");
-        assert.equal(H.store.egressStateMaxSeq(S), max, "the extra row was removed when the copy was rebuilt");
-        assert.deepEqual(shape(H, S).state, shape(H, S).flow, "copy and log agree again");
-        // 2. the copy alone ran AHEAD of the log (a write that reached one table)
-        H.db.prepare("INSERT INTO egress_state (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, 9, 'I', 'ghost', ?, ?, 9)")
-            .run(S, max + 1, JSON.stringify({ after: "b", ref: "m00009", tokens: 1, type: "text" }), "x");
-        assert.deepEqual(ids(H.store.egressStateView(S)), good, "a row the log does not have is not served");
-        assert.deepEqual(shape(H, S).state, shape(H, S).flow, "copy and log agree again");
-        // 3. the LOG itself has a hole: reported, nothing is deleted
+        // 1. the state alone is damaged (an orphan row): the self-healing
+        //    read replays the flow and rebuilds the state in place
+        H.db.prepare("INSERT INTO egress_state (session_id, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 9)")
+            .run(S);
+        assert.deepEqual(ids(H.store.egressStateView(S)), good, "the read answers from the flow, healed");
+        assert.equal(H.store.egressStateMaxSeq(S), max, "the flow is untouched");
+        assert.deepEqual(shape(H, S).state, good, "the orphan row was removed when the state was rebuilt");
+        // 2. the state alone runs AHEAD of the flow (a write that reached
+        //    one table): the row the flow does not carry is not served
+        H.db.prepare("INSERT INTO egress_state (session_id, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 'ghost', 99, 9, 9, 'm00009', 1, 'text', 'user', 0, 0, 'x', 9)")
+            .run(S);
+        assert.deepEqual(ids(H.store.egressStateView(S)), good, "a row the flow does not have is not served");
+        assert.deepEqual(shape(H, S).state, good, "the state is the flow, row for row");
+        // 3. the FLOW itself has a hole: reported, nothing is deleted
         H.db.prepare("DELETE FROM egress_flow WHERE session_id = ? AND op_seq = 2").run(S);
-        H.db.prepare("DELETE FROM egress_state WHERE session_id = ? AND op_seq = 2").run(S);
         assert.throws(() => H.store.egressStateView(S), (e: unknown) => e instanceof EgressStateCorruptError && /op_seq jumps from 1 to 3/.test(e.message));
-        assert.equal(H.store.egressStateMaxSeq(S), max, "a corrupt log is left as it is");
+        assert.equal(H.store.egressStateMaxSeq(S), max, "a corrupt flow is left as it is");
     } finally {
         close(H);
     }
 });
 
-test("the rebuild copies the log row for row and leaves nothing of the old copy", () => {
+test("the rebuild replays the flow row for row and leaves nothing of the old state", () => {
     const H = open();
     try {
         const S = "s-rebuild";
         const view = recordEgressTurn({ store: H.ops, sessionId: S, prev: undefined, conversation: [M("a", "1"), M("b", "2")], systemText: "sys", nowMs: 1 });
         H.db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(S);
-        H.db.prepare("INSERT INTO egress_state (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, 99, NULL, 'U', 'ghost', ?, ?, 9)")
-            .run(S, JSON.stringify({ role: "user" }), "x");
+        H.db.prepare("INSERT INTO egress_state (session_id, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 9)")
+            .run(S);
         const rebuilt = egressRebuildState(H.db, S);
-        assert.deepEqual(rebuilt, view, "the view comes back from the log");
-        assert.deepEqual(shape(H, S).state, shape(H, S).flow, "the copy is the log, row for row");
+        assert.deepEqual(rebuilt, view, "the view comes back from the flow");
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_state WHERE session_id = ?").get(S) as { c: number }).c, view.length, "the state is the replay, row for row");
+        assert.deepEqual(ids(H.store.egressStateView(S)), ids(view), "and the read serves it");
     } finally {
         close(H);
     }
 });
 
-test("truncation removes the rows of both tables; the operator's reset removes the whole log", () => {
+test("truncation removes the flow span and re-materializes the state; the operator's reset removes the whole log", () => {
     const H = open();
     try {
         const S = "s-truncate";
@@ -210,8 +214,8 @@ test("truncation removes the rows of both tables; the operator's reset removes t
         const max = H.store.egressStateMaxSeq(S);
         assert.equal(max, 4, "system + 3 messages");
         const removed = H.store.egressStateTruncateAfter(S, max - 1);
-        assert.equal(removed, 2, "one row in each table");
-        assert.deepEqual(shape(H, S), { state: ["I", "I", "I"], flow: ["I", "I", "I"] });
+        assert.equal(removed, 1, "one flow row past the point; the state is re-materialized from the replay, not row-deleted");
+        assert.deepEqual(shape(H, S), { state: [SYS, "a", "b"], flow: ["I", "I", "I"] });
         H.store.deleteEgressOps(S);
         assert.deepEqual(shape(H, S), { state: [], flow: [] });
         assert.equal(H.store.egressStateMaxSeq(S), 0);
@@ -222,38 +226,45 @@ test("truncation removes the rows of both tables; the operator's reset removes t
 
 test("recovery walks back only on a real corruption — any other error is passed on and deletes nothing", () => {
     const busy = new Error("SQLITE_BUSY: database is locked");
-    let scans = 0;
+    let reads = 0;
     let truncations = 0;
     const fake: EgressOpLogStore = {
         egressAppendTurn: () => { throw new Error("not used"); },
-        egressStateView: () => { scans++; throw busy; },
-        egressStateViewAt: () => { scans++; throw new Error("must not be reached"); },
+        egressStateView: () => { reads++; throw busy; },
+        egressStateViewAt: () => { throw new Error("must not be reached"); },
         egressStateMaxSeq: () => 40,
+        egressFlowWalkBack: () => { throw new Error("must not be reached"); },
         egressStateTruncateAfter: () => { truncations++; return 0; },
     };
     assert.throws(() => recoverEgressBase(fake, "s-busy"), (e: unknown) => e === busy, "the error is passed on unchanged");
-    assert.equal(scans, 1, "no walk-back was attempted");
+    assert.equal(reads, 1, "no walk-back was attempted");
     assert.equal(truncations, 0, "nothing was deleted");
 
     // a real corruption at the tail: the newest healthy point is kept, the
-    // rows after it are removed from BOTH tables, in one step
-    let reads = 0;
+    // rows after it are removed from the flow in one step, the state is
+    // re-materialized from the surviving span
+    let corruptReads = 0;
+    let walkCalls = 0;
     const corrupt = new EgressStateCorruptError("s-broken", "payload at op_seq=40 is not an object");
-    const walked: number[] = [];
+    const healthy = buildEgressViewRows([M("a", "1")], "sys");
     const fake2: EgressOpLogStore = {
         egressAppendTurn: () => { throw new Error("not used"); },
-        egressStateView: () => { reads++; throw corrupt; },
+        egressStateView: () => { corruptReads++; throw corrupt; },
         egressStateViewAt: (_sid, seq) => {
-            walked.push(seq);
             if (seq >= 40) throw corrupt;
-            return buildEgressViewRows([M("a", "1")], "sys");
+            return healthy;
         },
         egressStateMaxSeq: () => 40,
+        egressFlowWalkBack: (sid) => {
+            walkCalls++;
+            assert.equal(sid, "s-broken");
+            return { seq: 39, view: healthy };
+        },
         egressStateTruncateAfter: (sid, seq) => { truncations++; assert.equal(sid, "s-broken"); assert.equal(seq, 39); return 2; },
     };
     const out = recoverEgressBase(fake2, "s-broken");
-    assert.equal(reads, 1);
-    assert.deepEqual(walked, [39], "the walk stops at the newest healthy point");
-    assert.deepEqual(out, { view: buildEgressViewRows([M("a", "1")], "sys"), seq: 39, degraded: true, truncated: 2 });
+    assert.equal(corruptReads, 1);
+    assert.equal(walkCalls, 1, "exactly one full-history pass (7773)");
+    assert.deepEqual(out, { view: healthy, seq: 39, degraded: true, truncated: 2 });
     assert.equal(truncations, 1);
 });

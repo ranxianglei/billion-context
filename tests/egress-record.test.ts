@@ -7,7 +7,9 @@
  *   - turn 1 = one +I per row; turn 2 tail append = exactly ONE +I op;
  *   - the four upper-layer shapes produce the expected op batches
  *     (append / nudge-excluded / fold = -D + +I summary / edit = +U);
- *   - a -D batch triggers compaction (state table collapses to base + tail);
+ *   - a -D batch physically deletes the state rows (7773 materialized
+ *     view — there is no compaction step, no base row; the flow keeps its
+ *     full history and its letter alphabet is I/D/U);
  *   - #3617 both directions: with the rollout key off the recorder is not
  *     called (zero rows) — asserted at the gate level (featureEnabled
  *     default) since the wiring sits behind it in prepare-openai.
@@ -22,7 +24,10 @@ import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
 import {
     egressAppendTurn,
+    egressFlowWalkBack,
+    egressMaterializeState,
     egressStateAt,
+    egressStateRead,
     egressStateView,
     type EgressOp,
 } from "../src/storage/egress-state.ts";
@@ -46,14 +51,15 @@ function open(): Harness {
     migrateSchema(db);
     const store: EgressOpLogStore = {
         egressAppendTurn: (sid, ops, baseSeq, nowMs) => egressAppendTurn(db, sid, ops, nowMs, { baseSeq }),
-        egressStateView: (sid) => egressStateView(db, sid),
+        egressStateView: (sid) => egressStateRead(db, sid),
         egressStateViewAt: (sid, seq) => egressStateAt(db, sid, seq),
         egressStateMaxSeq: (sid) => (db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
         egressStateTruncateAfter: (sid, seq) => {
-            const a = db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
             const b = db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
-            return Number(a.changes) + Number(b.changes);
+            egressMaterializeState(db, sid, egressStateAt(db, sid, seq), Date.now());
+            return Number(b.changes);
         },
+        egressFlowWalkBack: (sid) => egressFlowWalkBack(db, sid),
     };
     return { db, store, dir };
 }
@@ -108,7 +114,7 @@ test("recording: turn1 = full +I batch; turn2 tail append = exactly one +I", () 
     }
 });
 
-test("recording: fold shape = -D range + +I summary, and the -D triggers compaction", () => {
+test("recording: fold shape = -D range + +I summary, state rows physically deleted (7773)", () => {
     const H = open();
     try {
         const S = "sess-r2";
@@ -116,9 +122,9 @@ test("recording: fold shape = -D range + +I summary, and the -D triggers compact
         let view = recordEgressTurn({ store, sessionId: S, prev: undefined, conversation: [M("a", "1"), M("b", "2"), M("c", "3"), M("d", "4"), M("e", "5")], systemText: "SYS", nowMs: 1000 });
         // fold: b..d replaced by one summary row
         const folded = [M("a", "1"), M("acp_summary_9", "…", "assistant"), M("e", "5")];
-        // read the op list through the store: the compaction the -D triggers
-        // collapses the STATE table to the base row; the FLOW keeps its full
-        // history (append-only, #7439)
+        // read the op list through the store: the -D physically deletes the
+        // b..d rows from the MATERIALIZED state view (7773 — there is no
+        // compaction step); the FLOW keeps its full history (append-only)
         const batches: EgressOp[][] = [];
         const spy: EgressOpLogStore = {
             ...store,
@@ -134,14 +140,14 @@ test("recording: fold shape = -D range + +I summary, and the -D triggers compact
         assert.ok(types.includes("D"), "fold emits a -D");
         assert.ok(types.includes("I"), "fold emits a +I for the summary");
         assert.equal(view.length, 4);
-        // compaction fired, in the same write as the ops: state table = base
-        // row + nothing else (the D and the I were replayed INTO the base)
-        const stateRows = H.db.prepare("SELECT row_type FROM egress_state WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
-        assert.deepEqual(stateRows.map((r) => r.row_type), ["B"], "the state table holds only the base row");
+        // state = the live view exactly: 4 rows (system + a + summary + e),
+        // b..d physically gone in the same write as the ops
+        const stateCount = H.db.prepare("SELECT COUNT(*) AS c FROM egress_state WHERE session_id = ?").get(S) as { c: number };
+        assert.equal(stateCount.c, 4, "the state table holds only the live rows");
         const flowRows = H.db.prepare("SELECT row_type FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
-        assert.deepEqual(flowRows.map((r) => r.row_type), ["I", "I", "I", "I", "I", "I", "D", "I", "B"], "the flow is append-only: turn 1's six +I rows (system + a..e), then the fold's D + I, then the base (#7439)");
+        assert.deepEqual(flowRows.map((r) => r.row_type), ["I", "I", "I", "I", "I", "I", "D", "I"], "the flow is append-only: turn 1's six +I rows (system + a..e), then the fold's D + I — no B row in this form (7773)");
         assert.equal(egressStateView(H.db, S).length, 4, "view has the system row + a + summary + e");
-        assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), view.map((r) => r.msgid), "view survives compaction byte-identical");
+        assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), view.map((r) => r.msgid), "view survives the fold byte-identical");
     } finally {
         close(H);
     }

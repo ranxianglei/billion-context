@@ -249,7 +249,17 @@ export function resolveEgressAuthority(args: {
             origin: session.meta?.upstreamOrigin ?? null,
             createdAt: session.createdAt,
             updatedAt: session.lastSeen,
-            metaJson: JSON.stringify(session.meta ?? {}),
+            // KDD #25: identity keys only — NEVER the raw session.meta bag
+            // (it carries handle.ts's runtime keys: summaryInstructions = the
+            // full multi-KB compress prompt, activePack, …). The typed fields
+            // ride their own columns; verifyProjections cross-checks exactly
+            // these four against meta_json.
+            metaJson: JSON.stringify({
+                protocol: session.meta?.protocol ?? null,
+                label: session.meta?.label ?? null,
+                title: session.meta?.title ?? null,
+                hostTitle: session.meta?.hostTitle ?? null,
+            }),
             // KDD #25: NEVER the full runtime bag — it can carry the #6947
             // turn-final reply stashes (handoffReply/handoffResponse, up to
             // 1.5 MB each of chat content). Identity keys only.
