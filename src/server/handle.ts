@@ -20,7 +20,7 @@ import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
-import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
+import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, removeOrphanSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
@@ -2825,7 +2825,17 @@ async function handleRequest(
             if ((session.metadata["dshCompactionRefusals"] as number) % DSH_REFUSAL_STORM_LOG_EVERY === 0) {
                 log("info", `[${session.id}] dsh native compaction refusal #${session.metadata["dshCompactionRefusals"]} on this session (raw-ledger high-water ${(session.metadata["dshCompactionRefusedBytes"] as number)} bytes) — dsh keeps retrying because its own raw pressure ledger never shrinks (#2490), and every retry of this call will be refused (terminal, #3013). Disable dsh auto-compaction (profile recipe #2474) or manage context via bili's compress. If bili's own compression looks idle while this repeats, the nudge channel may be dead — report it (#3004/#3013).`);
             }
-            markDirty(session);
+            if (session.stats.requests === 0) {
+                // #7271 M2: orphan cleanup — the session was created by
+                // prefix-affinity for this dsh compaction request and never
+                // processed a real request. Remove it from the in-memory map
+                // and schedule a DB deletion to prevent unbounded orphan
+                // accumulation (11-21: 150 orphans, 11-23: 394 orphans).
+                removeOrphanSession(session.id);
+                getStore().removeSession(session.id).catch(() => {});
+            } else {
+                markDirty(session);
+            }
             const refusal = dshCompactionRefusal(protocol);
             if (!res.headersSent && !res.writableEnded && !res.destroyed) {
                 res.writeHead(refusal.status, { "content-type": "application/json" });
