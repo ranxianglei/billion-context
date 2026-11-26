@@ -69,7 +69,7 @@ import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, 
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
-import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
+import { DSH_COMPACTION_SHAPE_MSGS, DSH_COMPACTION_OBS_LOG_EVERY, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
@@ -2221,6 +2221,21 @@ async function handleRequest(
             // the raw key stays owned by the main session.
             recordPluginSession((claudeSub !== undefined || personaForked || zcodeMemory !== undefined) ? conversation : (pluginConversation ?? conversation), session.id);
         }
+        // #7744: dsh compaction observability — periodic log line (the
+        // high-water sampling above runs on every request; this line is
+        // dsh-lane gated so other lanes don't get a per-50-requests log
+        // entry). Fires on the session's FIRST request (proves the sampler
+        // is live) and then every 50th main-lane request: a session that
+        // sends no compaction calls at all (the stuck anthropic direct-lane
+        // case) still leaves a trail, and the context-token state makes
+        // "threshold not reached" (estimate + low count) distinguishable
+        // from "no call at all" (counters 0 while maxInboundMsgs grows).
+        // The same three signals are also pollable on /__bili/sessions.
+        if (pluginAgent === "dsh" || session.metadata.clientHint === "dsh") {
+            if (session.stats.requests === 0 || session.stats.requests % DSH_COMPACTION_OBS_LOG_EVERY === 0) {
+                log("info", `[${session.id}] dsh compaction obs: auto=${session.metadata["dshCompactionCallsAuto"] ?? 0}, manual=${session.metadata["dshCompactionCallsManual"] ?? 0}, maxInboundMsgs=${session.metadata["dshMaxInboundMsgs"] ?? 0}, contextTokens=${session.stats.contextTokens}, contextTokensSource=${session.stats.contextTokensSource ?? "unknown"}`);
+            }
+        }
         // #1206: first request of this session — identify the client and scan
         // its plugin registry for a co-resident THIRD-PARTY compression plugin
         // (two compressors on one conversation double-compress and corrupt
@@ -2772,13 +2787,14 @@ async function handleRequest(
             const identifiedAs = declaredDshCompaction
                 ? "declared purpose=compaction (#6880)"
                 : "final user message = COMPACTION_INSTRUCTION";
-            // #7745: track compaction calls per session, distinguishing auto/manual.
-            // Manual = text match (final user message is COMPACTION_INSTRUCTION);
-            // auto = declaration-only (purpose=compaction without text match).
+            // #7744: track compaction calls per session, distinguishing auto/manual.
+            // Manual = text match (final user message starts with
+            // COMPACTION_INSTRUCTION); auto = declaration-only
+            // (purpose=compaction without text match).
             // When BOTH match (text + declaration), the text match wins (manual)
             // — the text is the stronger signal (a user-typed instruction
             // outranks a machine-stamped header). This priority is deliberate;
-            // do not swap it without re-reading #7745's rationale.
+            // do not swap it without re-reading #7744's rationale.
             const isManualCompaction = isDshCompactionCall(protocol, parsed);
             if (isManualCompaction) {
                 session.metadata["dshCompactionCallsManual"] = (typeof session.metadata["dshCompactionCallsManual"] === "number" ? session.metadata["dshCompactionCallsManual"] as number : 0) + 1;
