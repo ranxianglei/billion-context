@@ -235,8 +235,10 @@ export async function compressLoopResponsesJson(
         }).catch((e) => {
             if (e instanceof UpstreamHttpError) {
                 const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
-                ctx.log(`[acp-proxy: responses compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);
-                loggerLog("error", `[acp-compress-responses] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
+                // #4885: same last-fold attribution as the replay-rejection lines above.
+                const lc = lastCompressSuffix(ctx.session.lastCompress);
+                ctx.log(`[acp-proxy: responses compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}${lc}]`);
+                loggerLog("error", `[acp-compress-responses] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}${lc}`);
             }
             throw e;
         });
