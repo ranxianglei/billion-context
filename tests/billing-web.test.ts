@@ -553,3 +553,60 @@ test("#4899 v3 payback: a fold whose one-time cost outruns its avoidance reads N
     assert.equal(ov.foldsTotal, 1);
     assert.deepEqual(ov.moneyRates, { w: 3.75, r: 0.3, q: 15 });
 });
+
+test("#7237 multi-model session: savings priced at the SESSION's billed average, not the last model's list price", async () => {
+    resetState();
+    // Two models in the price table: an expensive one (most of the session)
+    // and a cheap one (the LAST request — metadata.lastModel lands here).
+    setRegistryForTest({}, {
+        "somehost/claude-bill": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
+        "somehost/cheap-model": { input: 0.15, output: 0.6, cache_read: 0.003, cache_write: 0.15 },
+    });
+    const s = getSession("multi-model-1", { protocol: "anthropic", upstreamOrigin: "http://api.somehost.com" });
+    s.metadata.lastModel = "cheap-model"; // the last request ran on the cheap model
+    s.stats.requests = 2;
+    // The session's ACTUAL billed history (persisted per-request ledger): most
+    // of it ran on the expensive model, so the billed averages are high even
+    // though lastModel is the cheap one.
+    s.stats.inputTokens = 20_000_000;
+    s.stats.cachedTokens = 10_000_000; // billed avg cacheRead = 3.0 / 10M * 1e6 = 0.3
+    s.stats.outputTokens = 1_000_000;  // billed avg output   = 15.0 / 1M * 1e6 = 15
+    s.stats.costUsd = { input: 5.0, cacheRead: 3.0, cacheWrite: 3.75, output: 15.0 };
+    s.metadata.cacheLedger = { folds: [{ S: 50000, sigma: 5000, T: 3000, requestsAfter: 10 }] };
+
+    const list = await buildSessionList();
+    const row = list.find((x) => x.id === "multi-model-1");
+    assert.ok(row);
+    // The spend card reads the persisted ledger (cross-model exact) — unchanged.
+    assert.ok(row!.costUsd && Math.abs(row!.costUsd.total - 26.75) < 1e-9, `spend ${row!.costUsd?.total}`);
+    // The savings card must price the fold at the SESSION's billed average
+    // {w:3.75, r:0.3, q:15} — NOT the cheap lastModel's {w:0.15, r:0.003,
+    // q:0.6}. perTurn=(50000−5000)·10·0.3=135000, oneTime=(3.75−0.3)·3000
+    // +15·5000−0.3·50000=70350 → net=0.0647. Without the fix this row priced
+    // the fold at the cheap tiers → net≈−0.0019 (the reported $400→$6.35 jump).
+    assert.ok(row!.savedUsd !== undefined && Math.abs(row!.savedUsd! - 0.0647) < 1e-9, `savedUsd ${row!.savedUsd}`);
+    // The exposed rates follow the calibration (the panel prints them inside
+    // the formula) — the cheap model's 0.003/0.15/0.6 must NOT leak here.
+    assert.deepEqual(row!.rates, { w: 3.75, r: 0.3, q: 15 }, `calibrated rates ${JSON.stringify(row!.rates)}`);
+    // gross-$ face rides the same calibrated r=0.3.
+    assert.ok(Math.abs((row!.savedUsdGross ?? 0) - 0.135) < 1e-9, `savedUsdGross ${row!.savedUsdGross}`);
+});
+
+test("#7237 single-model session: billed average == list price → calibration is a no-op", async () => {
+    resetState();
+    const s = getSession("single-model-1", { protocol: "anthropic", upstreamOrigin: "http://api.somehost.com" });
+    s.metadata.lastModel = "claude-bill";
+    s.stats.requests = 2;
+    s.stats.cachedTokens = 10_000_000; // billed avg cacheRead = 3.0 / 10M * 1e6 = 0.3 == list price
+    s.stats.outputTokens = 1_000_000;  // billed avg output   = 15.0 / 1M * 1e6 = 15 == list price
+    s.stats.costUsd = { input: 5.0, cacheRead: 3.0, cacheWrite: 3.75, output: 15.0 };
+    s.metadata.cacheLedger = { folds: [{ S: 50000, sigma: 5000, T: 3000, requestsAfter: 10 }] };
+
+    const list = await buildSessionList();
+    const row = list.find((x) => x.id === "single-model-1");
+    assert.ok(row);
+    // Billed average == list price → the calibrated profile is byte-identical
+    // to the raw live tiers {w:3.75, r:0.3, q:15}; behavior unchanged.
+    assert.deepEqual(row!.rates, { w: 3.75, r: 0.3, q: 15 }, `no-op rates ${JSON.stringify(row!.rates)}`);
+    assert.ok(row!.savedUsd !== undefined && Math.abs(row!.savedUsd! - 0.0647) < 1e-9, `savedUsd ${row!.savedUsd}`);
+});

@@ -703,9 +703,39 @@ function livePriceForModel(model: string | undefined, upstreamOrigin: string | u
  *  profile (model no longer in any price table); (3) legacy dimensionless
  *  ratio profiles anchored against the stamped billing price (kernel defaults
  *  1/0.1/4 fill partial profiles, as before). Nothing usable → undefined:
- *  tokens only, never fabricated dollars. */
+ *  tokens only, never fabricated dollars.
+ *
+ *  #7237: when the session has a persisted spend ledger (stats.costUsd,
+ *  billed per-request at each request's stamped price — cross-model exact,
+ *  the same source the 花费 card reads), the live profile's price LEVEL is
+ *  calibrated to the session's ACTUAL billed average before pricing the
+ *  historical folds. Without this, the savings card prices the whole fold
+ *  history at the LAST model's list price (metadata.lastModel is written on
+ *  every inbound request), so a single request to a cheaper model re-prices
+ *  the entire history by orders of magnitude and the two cards contradict
+ *  each other. The live model's w:r:q SHAPE is kept (only the level is
+ *  re-anchored); a single-model session's billed average ≈ its list price, so
+ *  behavior is unchanged there. No ledger / no cached tokens → fall back to
+ *  the raw live tiers (legacy + ledger-less sessions, as before). */
 function savedUsdProfileForSummary(s: SummarySource, live?: LivePrice): { w: number; r: number; q: number } | undefined {
-    if (live !== undefined) return { w: live.cacheWrite, r: live.cacheRead, q: live.output };
+    if (live !== undefined) {
+        const cu = validCostUsd(s.stats.costUsd);
+        const histRead = cu !== undefined && s.stats.cachedTokens > 0 && cu.cacheRead > 0
+            ? (cu.cacheRead / s.stats.cachedTokens) * 1e6
+            : undefined;
+        if (histRead !== undefined && live.cacheRead > 0) {
+            const r = histRead;
+            const histOut = cu !== undefined && s.stats.outputTokens > 0 && cu.output > 0
+                ? (cu.output / s.stats.outputTokens) * 1e6
+                : undefined;
+            const q = histOut ?? (live.output / live.cacheRead) * r;
+            const w = live.cacheWrite > 0 && live.output > 0
+                ? (live.cacheWrite / live.output) * q
+                : (live.cacheWrite / live.cacheRead) * r;
+            return { w, r, q };
+        }
+        return { w: live.cacheWrite, r: live.cacheRead, q: live.output };
+    }
     const o = s.metadata["cachePriceProfile"];
     if (!o || typeof o !== "object" || Array.isArray(o)) return undefined;
     const rec = o as Record<string, unknown>;
@@ -948,7 +978,8 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         : undefined;
     // #4899 v4: publish the unit rates this session's dollars were computed
     // with so the panel can print them INSIDE the formulas (fold math uses
-    // usdProf; spend/miss mirrors use livePrice — same tiers whenever both).
+    // usdProf — calibrated to the session's billed average when its spend
+    // ledger exists, #7237; spend/miss mirrors use the raw livePrice tiers).
     const rates = usdProf !== undefined
         ? { w: usdProf.w, r: usdProf.r, q: usdProf.q }
         : livePrice !== undefined
