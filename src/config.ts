@@ -2483,6 +2483,14 @@ type FileConfig = {
          *  is not a valid "beyond model window" proxy. 0 = no ingest cap (the default); set a byte
          *  value to re-enable. Env BILI_INGEST_BODY_BYTES wins. */
         ingestBodyBytes?: number;
+        /** #7277: how many decoded bodies over largeDecodedAdmissionBytes may be admitted at once
+         *  (the #5794 large-decode slot budget); the next one gets a retryable 503 (stage decode).
+         *  Was a hardcoded 2. Env BILI_MAX_LARGE_DECODED_REQUESTS wins. */
+        maxLargeDecodedRequests?: number;
+        /** #7277: the decoded-byte band above which a request consumes one of the
+         *  maxLargeDecodedRequests admission slots (keyed min() with receiveBodyBytes at the call
+         *  site). Was a hardcoded 32 MiB. Env BILI_LARGE_DECODED_ADMISSION_BYTES wins. */
+        largeDecodedAdmissionBytes?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {
