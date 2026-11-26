@@ -15,9 +15,8 @@ import { yieldToEventLoop } from "./yield-loop.js";
 import { bufferedSseEvents } from "./sse-util.js";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
-import { applyAbsorbView } from "./absorb.js";
-import { adoptContentStore, ccrLoopConfig, contentStoreOf } from "./store.js";
-import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
+ import { applyAbsorbView } from "./absorb.js";
+ import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
@@ -1748,10 +1747,9 @@ function recentZoneBoundaryRef(deps: PreflightDeps, messages: CoreMessage[], tok
     const probe = deps.core.processTurn({
         messages,
         state: deps.session.state,
-        config: noEmergencyTruncate(ccrLoopConfig(deps.session, deps.config)),
+        config: noEmergencyTruncate(deps.config),
         tokenCount,
         renderTags: "text-only",
-        contentStore: contentStoreOf(deps.session),
     });
     let boundary = -1;
     for (const r of probe.nudge?.compressibleRanges ?? []) {
@@ -2179,12 +2177,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         let measuredNudge: NudgeDecision | undefined;
         const measureEst = (): number => {
             const turn = deps.core.processTurn({
-                messages, state: deps.session.state, config: noEmergencyTruncate(ccrLoopConfig(deps.session, activeConfig)),
-                tokenCount: currentTokens, renderTags: "text-only", contentStore: contentStoreOf(deps.session),
+                messages, state: deps.session.state, config: noEmergencyTruncate(activeConfig),
+                tokenCount: currentTokens, renderTags: "text-only",
             });
             measuredNudge = turn.nudge;
             deps.session.state = turn.state;
-            adoptContentStore(deps.session, turn.contentStore);
             const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
             refreshImages(view);
             const est = applyEstimateCalibration(estimateCoreMessages(view) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve;
@@ -2401,13 +2398,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const turn = deps.core.processTurn({
             messages,
             state: deps.session.state,
-            config: noEmergencyTruncate(ccrLoopConfig(deps.session, activeConfig)),
+            config: noEmergencyTruncate(activeConfig),
             tokenCount: currentTokens,
             renderTags: "text-only",
-            contentStore: contentStoreOf(deps.session),
         });
         deps.session.state = turn.state;
-        adoptContentStore(deps.session, turn.contentStore);
         // Absorbed pairs are hidden on the wire, so the fit check must see the
         // same reduced payload prepare* will actually forward.
         turn.messages = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
@@ -2581,10 +2576,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const probe = deps.core.processTurn({
                         messages,
                         state: deps.session.state,
-                        config: noEmergencyTruncate(ccrLoopConfig(deps.session, relaxedConfig(deps.config))),
+                        config: noEmergencyTruncate(relaxedConfig(deps.config)),
                         tokenCount: currentTokens,
                         renderTags: "text-only",
-                        contentStore: contentStoreOf(deps.session),
                     });
                     // #2638: structural verdicts hold under relax too (coverage-based, zone-independent) — dead mass cannot close the gap either.
                     const relaxedRanges = filterDeadRanges(deps.session, viableRanges(probe.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars));

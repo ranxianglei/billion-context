@@ -140,7 +140,6 @@ function plainSession(id: string, n: number): LegacySessionLike {
         lastMessages: msgs,
         lastMessagesFolded: true,
         pluginSnapshot: undefined,
-        contentStore: undefined,
     };
 }
 

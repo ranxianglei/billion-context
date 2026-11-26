@@ -89,7 +89,7 @@ import { yieldToEventLoop } from "../yield-loop.js";
 import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js";
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
-import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
+import { storeEffectiveImageRescale } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { featureEnabled } from "../rollout.js";
 import { BodyTooLargeError, buildForwardTarget, declPinConflictWarned, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, scrubMsgIdFields, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
@@ -1044,10 +1044,6 @@ async function handleRequest(
     let reqSurface: PackSurface = {};
     let reqSurfacePack = "default";
     let wsSourceForLog: string | undefined;
-    // [#1097] host-only CCR policy for this request scope (three-level
-    // merge); resolved before the session is bound, then stamped onto it below so
-    // every view / injection / execution site reads one value.
-    let resolvedCcrCfg: CcrSettings | undefined;
     // [#1336] host-only plan-aware search flag for this request scope (three-
     // level merge); stamped onto the session below like the other per-request
     // policies. Off unless compress.search.planAware=true at some level.
@@ -1219,12 +1215,6 @@ async function handleRequest(
                 windowShrinkReason = "operator";
             }
             const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
-            // [#1207 owner decision] CCR is opt-in on every lane: the raw
-            // three-level merge IS the arming decision — no `ccr` key at any
-            // level leaves resolvedCcrCfg undefined and the session never
-            // arms. Turn it on only by setting compress.ccr.enabled=true at
-            // some config level, after local verification.
-            resolvedCcrCfg = compressCfg.ccr;
             resolvedSearchPlanAware = compressCfg.search?.planAware === true;
             reqPrompts = resolveCompressPrompts(compressCfg);
             const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
@@ -2580,50 +2570,15 @@ async function handleRequest(
         }
         // Memory workers retain the parent's host-side tool binding, not the internal child id.
         const pluginMode = zcodeMemory === undefined && pluginAgent !== undefined && !pluginLaneDegraded(session) && !subagentFallback.present && !compressionProxy;
-        // [#1097/#1271] Stamp the resolved CCR policy. acp_retrieve needs a tool
-        // channel that can round-trip the full original, so CCR arms only where
-        // that channel exists and is resolvable: proxy mode always (the proxy
-        // executes compress/retrieve server-side), and — #1271 — plugin mode on
-        // the anthropic/openai wires (the agent advertises acp_retrieve from the
-        // manifest and rides the full text back via the request-only injection in
-        // prepare*). Every processTurn site strips `ccr` from the loop config
-        // unless this stamp says armed — the kernel's ccr-store node must never
-        // substitute placeholders the wire cannot resolve (we must never emit a
-        // placeholder the model cannot retrieve = silent loss).
-        // The responses wire stays out even in plugin mode: its developer-message /
-        // strict-alternation injection mechanics have no proven request-only carrier
-        // here (and no real plugin lane uses it), so arming it would risk silent loss.
-        // The responses text/marker protocol has no native tool channel either
-        // (absorb/rules strip themselves there for the same reason), and
-        // ACP_NO_INJECT_TOOL disables all injection on that wire — both would
-        // leave placeholders unretrievable.
+        // Tool-injection channel gate: true where bili can inject a native tool
+        // that round-trips (proxy owns execution, or a plugin lane registers it).
+        // The responses wire stays out: its developer-message / strict-alternation
+        // injection mechanics have no proven request-only carrier, and the
+        // text/marker protocol has no native tool channel (absorb/rules strip
+        // themselves there for the same reason); ACP_NO_INJECT_TOOL disables all
+        // injection on that wire too.
         const storeChannelOk = protocol !== "responses" ||
             (!knobNoInjectTool() && !FORCE_TEXT_PROTOCOL && resolveCompressProtocol(opts.routes, upstreamOrigin) !== "marker");
-        // [#1345/#1273] Plugin mode: the static manifest (handlePluginManifest
-        // sees opts.compress.ccr, never the route/model-scoped merge) is the ONLY
-        // declaration of the retrieve surface, so the executed policy must be the
-        // base block verbatim — arm iff base enabled=true, whole block
-        // (toolName + thresholds) from base. Any provider/model ccr.* override
-        // splits declared from dispatched: toolName renames the session gate away
-        // from the registered name (calls 400 as unknown), enabled=false disarms
-        // a session whose manifest advertises (stored content unreachable,
-        // placeholders dangling). Provider/model ccr.* overrides are therefore
-        // proxy-lane-only (the proxy declares+dispatches per request under the
-        // merged block, per-route renames intact); findCcrPluginDivergences warns
-        // at config load about every divergent level/field.
-        const pluginCcrStamp = pluginMode
-            ? (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true ? opts.compress.ccr : undefined)
-            : (resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
-        // [#3272/#3266] Same structural gate as the removed image_full restore channel (#3270):
-        // the codex host rejects bili-injected tools at its tool router and records a
-        // synthetic "unsupported call" output in its own resent history — every
-        // acp_retrieve round-trip permanently forks that history from ours (prefix-cache
-        // collapse) and leaves placeholderized content unretrievable (silent loss). Disarm
-        // CCR on that host so neither an unreachable tool declaration nor a dangling
-        // placeholder is ever emitted; regular compress/decompress folding is unaffected
-        // (the codex lane simply keeps large tool results verbatim until they are folded).
-        // #3686: host policy, not wire profile — declared plugin hosts register bili's tools natively.
-        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexHost(req.headers)) ? pluginCcrStamp : undefined);
         // #3400: acp_read_original_image arms where the model can actually reach
         // it — the injection lanes (proxy owns tool execution) or the plugin
         // lanes (the agent registers it natively from handlePluginManifest,

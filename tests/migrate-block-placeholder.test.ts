@@ -11,7 +11,6 @@ process.env.BILI_PERSIST = "0";
 
 import { createCore, defaultConfig, type Config, type CoreMessage } from "acp-kernel";
 import { applyCompressSettings } from "../src/compress-settings.ts";
-import { storeEffectiveCcr } from "../src/store.ts";
 import { getSession, blockContentSnapshot } from "../src/session.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges } from "../src/stream.ts";
@@ -22,9 +21,8 @@ const pad = (n: number): string => String(n).padStart(5, "0");
 
 function fold() {
     const core = createCore();
-    const config = applyCompressSettings(defaultConfig(200_000), 200_000, { ccr: { enabled: true, minToolTokens: 50 } }) as Config;
+    const config = applyCompressSettings(defaultConfig(200_000), 200_000, {}) as Config;
     const session = getSession(`mig-ph-${Math.random().toString(36).slice(2)}`);
-    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
     const raw: CoreMessage[] = [];
     for (let i = 0; i < 20; i++) {
         raw.push({

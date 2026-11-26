@@ -7,7 +7,7 @@ import { SessionStore } from "../src/persist.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { exportSession, renderSessionJsonlFromTables, renderSessionJsonlFromSession } from "../src/export.ts";
 import { SqliteBackend } from "../src/storage/backend.ts";
-import { buildStoredPlaceholder, createInitialState } from "acp-kernel";
+import { createInitialState } from "acp-kernel";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 import type { Session } from "../src/session.ts";
 
@@ -78,7 +78,7 @@ test("--jsonl renders from the unified tables: header, blocks, dead refs (folded
             const unified = UnifiedStore.open(path.join(dir, "folded", "index.db"));
             try {
                 assert.ok(unified.getSessionRow(session.id), "full mode must have ingested the session");
-                const lines = parseLines(await renderSessionJsonlFromTables(new SqliteBackend(unified), session.id, false));
+                const lines = parseLines(await renderSessionJsonlFromTables(new SqliteBackend(unified), session.id));
                 assert.equal(lines[0]!.type, "session");
                 assert.equal(lines[0]!.source, "unified");
                 assert.equal(lines[0]!.sessionId, session.id);
@@ -142,7 +142,7 @@ test("--jsonl includes retired (rewound) rows marked by retiredAt; live rows omi
             assert.equal(all.length, 3);
             assert.ok(all[0]!.retiredAt != null, "id-a is retired at the store level");
 
-            const lines = parseLines(await renderSessionJsonlFromTables(new SqliteBackend(store), "retired-1", false));
+            const lines = parseLines(await renderSessionJsonlFromTables(new SqliteBackend(store), "retired-1"));
             assert.equal(lines[0]!.type, "session");
             const msgsOut = lines.filter((l) => l.type === "message") as Record<string, unknown>[];
             assert.equal(msgsOut.length, 3, "the export must include the retired row (#4664)");
@@ -181,42 +181,7 @@ test("--jsonl falls back to the legacy tail when no index exists (deadrefs corpu
     }
 });
 
-test("--jsonl prefers the unified index when it exists (ccr corpus, --full dereferences CCR placeholders)", async () => {
-    await withMode("full", async () => {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jsonl-ccr-"));
-        try {
-            const session = await loadCorpusCase(dir, "ccr", "corpus-ccr", "responses");
-            // The ccr corpus pins the envelope (entries m00006/m00008) but its
-            // tail holds no placeholder; graft one on to exercise deref.
-            const placeholder = buildStoredPlaceholder({ ref: "m00001", kind: "file read", tokens: 5, head: "ORIGINAL HEAD", retrieveToolName: "acp_retrieve" });
-            session.lastMessages = [{ id: "msg-ccr-1", role: "user", contentType: "text", text: placeholder } as never];
-            session.contentStore = { version: 1, byHash: { h1: "THE ORIGINAL LONG TEXT" }, byRef: { m00001: { hash: "h1", rawId: "raw-1", kind: "file read", tokens: 5, chars: 22, head: "ORIGINAL HEAD" } } };
-            session.contentStoreDirty = true; // rewrite content-store.json so the disk sibling carries the graft
-            const store = new SessionStore({ dir: path.join(dir, "ccr"), debounceMs: 1, enabled: true });
-            await store.writeNow(session);
-            await store.flushAll(); // closes the unified handle (Windows: an open index.db blocks rmSync)
-            store.cancelAll();
-
-            // --full: placeholders in the tail dereference to their stored originals
-            const fullText = await exportSession(session.id, { dir: path.join(dir, "ccr"), jsonl: true, full: true });
-            const fullLines = parseLines(fullText);
-            assert.equal(fullLines[0]!.source, "unified", "index.db present + indexed → tables render");
-            const derefed = fullLines.filter((l) => l.type === "message" && (l.message as Record<string, unknown>).dereferencedFrom !== undefined);
-            assert.ok(derefed.length > 0, "ccr corpus tail holds placeholders that must dereference");
-            // every dereferenced text is non-empty
-            for (const m of derefed) assert.ok(((m.message as Record<string, unknown>).text as string).length > 0);
-
-            // without --full the placeholder ships verbatim
-            const plainText = await exportSession(session.id, { dir: path.join(dir, "ccr"), jsonl: true });
-            const plainLines = parseLines(plainText);
-            assert.equal(plainLines.filter((l) => l.type === "message" && (l.message as Record<string, unknown>).dereferencedFrom !== undefined).length, 0);
-        } finally {
-            try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
-        }
-    });
-});
-
-test("renderSessionJsonlFromSession dereferences via an injected content store", () => {
+test("renderSessionJsonlFromSession renders the session tail", () => {
     const session = {
         id: "sess-jsonl-synthetic",
         createdAt: 5,
@@ -226,7 +191,7 @@ test("renderSessionJsonlFromSession dereferences via an injected content store",
         state: { blocks: [], deadRefs: [] },
         lastMessages: [{ id: "msg-1", role: "user", contentType: "text", text: "hello" }],
     } as unknown as Session;
-    const lines = parseLines(renderSessionJsonlFromSession(session, false, null));
+    const lines = parseLines(renderSessionJsonlFromSession(session));
     const msg = lines.find((l) => l.type === "message") as { message: { text: string } };
     assert.equal(msg.message.text, "hello");
 });

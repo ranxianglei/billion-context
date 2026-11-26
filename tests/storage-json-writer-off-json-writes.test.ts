@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionStore, contentStoreRelPathFor, relPathFor, storageStatusLabel } from "../src/persist.ts";
+import { SessionStore, relPathFor, storageStatusLabel } from "../src/persist.ts";
 
 
 /**
@@ -12,7 +12,7 @@ import { SessionStore, contentStoreRelPathFor, relPathFor, storageStatusLabel } 
  * (unified full), the sessions directory may gain a .json file ONLY through
  * the whitelisted materialization paths below. The off switch promises "the
  * SQLite index is the ONLY persistent copy" — any code that starts writing
- * JSON there (the CCR content-store sidecar used to, #5988) is a regression
+ * JSON there is a regression
  * of that contract and must fail CI, not wait for a human audit.
  *
  * Mechanism: snapshot diff, not fs interception. Before and after each phase
@@ -30,9 +30,9 @@ import { SessionStore, contentStoreRelPathFor, relPathFor, storageStatusLabel } 
  *                                              (guards against a vacuous gate)
  *
  * The whitelist: the ONLY .json writes off mode may make are the
- * materialization files of a restored id (its portable envelope + its CCR
- * sidecar), named by relPathFor / contentStoreRelPathFor — the index is not
- * a restore source, and it does not carry forked/restored CCR stores. Any
+ * materialization files of a restored id (its portable envelope)
+ * file), named by relPathFor — the index is not
+ * a restore source. Any
  * .json write outside that set (including one for a NON-restored id) is a
  * contract regression and fails here. Adding a new legitimate writer: name
  * the code path (file:function) and why the index cannot carry the bytes in
@@ -57,19 +57,15 @@ process.env.BILI_STORAGE_UNIFIED = "legacy";
  *  names cannot anchor a restore. */
 const JSON_WRITE_WHITELIST: ReadonlyArray<{ re: RegExp; reason: string }> = [
     // restoreReplica materialization (persist.ts restoreReplica → kernel
-    // store.writeNow + writeContentStoreSidecar): the index is not a
-    // restore source, and it does not carry forked/restored CCR stores —
-    // buildRecord drops forkContentStore on the next live save, so the
-    // sidecar is the durable copy for the restored id.
-    { re: /^restore-.*\.json$/, reason: "restore materialization (portable envelope + CCR sidecar)" },
+    // store.writeNow): the index is not a
+    { re: /^restore-.*\.json$/, reason: "restore materialization (portable envelope)" },
 ];
 
 /** The concrete whitelist set for one restore: the restored id's envelope
- *  and CCR sidecar, named exactly as the writers name them. */
+ *  named exactly as the writer names it. */
 function materializedFilesFor(id: string, protocol: string, origin: string): Set<string> {
     return new Set([
         relPathFor(id, protocol, origin).split(path.sep).join("/"),
-        contentStoreRelPathFor(id, protocol, origin).split(path.sep).join("/"),
     ]);
 }
 
@@ -85,7 +81,7 @@ function loadCorpusCase(dir: string, name: string, id: string, protocol: string)
     return loaded;
 }
 
-/** relpath → sha256 of every *.json file under dir (sidecars included). */
+/** relpath → sha256 of every *.json file under dir. */
 function jsonSnapshot(dir: string): Map<string, string> {
     const out = new Map<string, string>();
     const walk = (p: string) => {
@@ -149,15 +145,9 @@ test("jsonWriter=off: only whitelisted .json files may be written in the session
     try {
         assert.equal(storageStatusLabel(), "storage: sqlite (unified-only, json envelope off)");
         const seed = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jwgate-seed-"));
-        // The ccr corpus case: a non-trivial content store, so any CCR write
-        // regression shows up as bytes in the diff.
-        const session = loadCorpusCase(seed, "ccr", "corpus-ccr", "responses");
-        session.contentStore = {
-            version: 1,
-            byHash: { h1: "THE ORIGINAL LONG TEXT" },
-            byRef: { m00001: { hash: "h1", rawId: "raw-1", kind: "file read", tokens: 5, chars: 22, head: "ORIGINAL HEAD" } },
-        } as typeof session.contentStore;
-        session.contentStoreDirty = true;
+        // The folded corpus case: a non-trivial folded session, so any stray
+        // .json write regression shows up as bytes in the diff.
+        const session = loadCorpusCase(seed, "folded", "corpus-folded", "responses");
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jwgate-full-"));
         try {
             // Phase A: first save of a fresh store — the index-only landing.

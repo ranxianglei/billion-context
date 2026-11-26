@@ -11,7 +11,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { defaultConfig, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME, type CoreMessage } from "acp-kernel";
+import { defaultConfig, ABSORB_TOOL_NAME, RULE_TOOL_NAME, type CoreMessage } from "acp-kernel";
 import { settleUsageReport } from "../src/cache-ledger.ts";
 import { startServer, BILI_TOOL_NAMES, effectiveTokenCount } from "../src/server.ts";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../src/compress-tool.ts";
@@ -386,7 +386,6 @@ test("(H) extracted relay module keeps the side-lane boundary (#1440 P2 cut 4)",
 test("(I) revival (#3402): the absorb tool name is bili-owned again", () => {
     assert.ok(BILI_TOOL_NAMES.has(ABSORB_TOOL_NAME), "absorb is back in the bili-owned set");
     assert.ok(BILI_TOOL_NAMES.has(RULE_TOOL_NAME), "rules tool still bili-owned");
-    assert.ok(BILI_TOOL_NAMES.has(RETRIEVE_TOOL_NAME), "retrieve tool still bili-owned");
 });
 
 // (#3400): acp_read_original_image is bili's own context-management tool. A

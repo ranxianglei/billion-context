@@ -47,17 +47,12 @@ interface Stats {
     cacheSamples: number;
     lastInputTokens: number;
     contextTokens: number;
-    retrieveCalls: number;
-    retrieveHits: number;
-    retrieveMisses: number;
-    storedBytes: number;
-    storeBytesSaved: number;
     compressCreditTokens: number;
     rangeRestores: number;
 }
 
 function zeroStats(): Stats {
-    return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, compressCreditTokens: 0, rangeRestores: 0 };
+    return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, rangeRestores: 0 };
 }
 
 function makeSession(id: string, meta: Session["meta"] = {}, patch: Partial<Stats> = {}, lastSeen = Date.now()): Session {

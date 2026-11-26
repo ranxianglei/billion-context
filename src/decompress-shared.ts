@@ -409,7 +409,7 @@ export function derivedAncestorSessions(session: Session): Session[] {
 const EFFECTIVE_SEARCH_PLAN_KEY = "searchPlanAware";
 
 /** Stamp the last-resolved plan-aware flag onto the session (per-request,
- *  latest wins — same pattern as storeEffectiveCcr/storeEffectiveConfig). */
+ *  latest wins — same pattern as storeEffectiveConfig). */
 export function storeEffectiveSearchPlanAware(session: Session, on: boolean): void {
     session.metadata[EFFECTIVE_SEARCH_PLAN_KEY] = on;
 }

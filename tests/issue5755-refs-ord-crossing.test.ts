@@ -44,7 +44,6 @@ const mkSession = (id: string, byRaw: Record<string, string>): LegacySessionLike
         lastMessages: [],
         lastMessagesFolded: false,
         pluginSnapshot: undefined,
-        contentStore: undefined,
     } as unknown as LegacySessionLike;
 };
 

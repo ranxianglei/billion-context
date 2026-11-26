@@ -63,30 +63,6 @@ test("cold state resumes transparently; corrupt state no longer fails closed (#3
     assert.doesNotThrow(() => store.loadSync(session.id));
 }));
 
-test("failed CCR save blocks state flush and retains dirty originals", async () => fixture(async (dir, store) => {
-    const session = createSession("failed-originals", { label: "failed-originals" });
-    session.stats.requests = 1;
-    await store.writeNow(session);
-    const rel = relPathFor(session.id);
-    const before = readFileSync(path.join(dir, rel));
-    mkdirSync(path.join(dir, rel.replace(/\.json$/, ".content-store.json")));
-    session.stats.requests = 2;
-    session.contentStoreDirty = true;
-    assert.equal(store.flushSync(session), false);
-    assert.equal(session.contentStoreDirty, true);
-    assert.deepEqual(readFileSync(path.join(dir, rel)), before);
-}));
-
-test("bounded server reads refuse corrupt originals without replacing them", async () => fixture(async (dir, store) => {
-    const session = createSession("corrupt-originals", { label: "corrupt-originals" });
-    await store.writeNow(session);
-    await store.boot({ maxSessions: 0, maxBytes: 0 });
-    const file = path.join(dir, relPathFor(session.id).replace(/\.json$/, ".content-store.json"));
-    const broken = "{truncated historical original";
-    writeFileSync(file, broken);
-    assert.throws(() => store.loadContentStore(session), /refusing to replace its originals/);
-    assert.equal(readFileSync(file, "utf8"), broken);
-}));
 
 test("corrupt newly written live state is quarantined and yields a fresh start (#3157)", async () => fixture(async (dir, store) => {
     const session = createSession("ses_live_corrupt", { label: "ses_live_corrupt" });

@@ -8,7 +8,6 @@ import http from "node:http";
 import { once } from "node:events";
 import { createCore, defaultConfig, type Config, type CoreMessage } from "acp-kernel";
 import { applyCompressSettings } from "../src/compress-settings.ts";
-import { recordRetrieveHit, storeEffectiveCcr } from "../src/store.ts";
 import { getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { applyRanges } from "../src/stream.ts";
@@ -21,7 +20,6 @@ import {
     resolveDecompress,
     storeEffectiveSearchPlanAware,
 } from "../src/decompress-shared.ts";
-import { handleAcpStatus } from "../src/acp-status.ts";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -53,11 +51,10 @@ const BLOCKS: Array<[string, string]> = [
 
 type Folded = { core: ReturnType<typeof createCore>; config: Config; session: ReturnType<typeof getSession>; msgs: CoreMessage[] };
 
-function foldBlocks(ccr: boolean): Folded {
+function foldBlocks(): Folded {
     const core = createCore();
-    const config = applyCompressSettings(defaultConfig(200_000), 200_000, { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: ccr, minToolTokens: 50 } }) as Config;
+    const config = applyCompressSettings(defaultConfig(200_000), 200_000, { absorb: { enabled: true, minToolTokens: 50 } }) as Config;
     const session = getSession(`sp-${Math.random().toString(36).slice(2)}`);
-    if (ccr) storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
     const turn = core.processTurn({ messages: makeMsgs(40), state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
     session.state = turn.state;
     const ctx = { core, config, messages: turn.messages, session, log: () => {} };
@@ -123,7 +120,7 @@ test("extractPlanState: bounded to the last 40 messages", () => {
 });
 
 test("byte-identical output when plan state is absent or the pool fits the limit", () => {
-    const f = foldBlocks(true);
+    const f = foldBlocks();
     const base = executeSearchContext({ query: "token" }, f.core, f.session.state).text;
     const emptyPlan = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, { messages: [], session: f.session, log: () => {} }).text;
     assert.equal(emptyPlan, base, "no plan state in context → identical output");
@@ -133,7 +130,7 @@ test("byte-identical output when plan state is absent or the pool fits the limit
 });
 
 test("plan-aware re-ranking lifts the plan-relevant block to the top (deterministic)", () => {
-    const f = foldBlocks(true);
+    const f = foldBlocks();
     const plain = executeSearchContext({ query: "token" }, f.core, f.session.state).text;
     assert.match(plain, /Found 5 block\(s\) for "token"/);
     assert.ok(plain.indexOf('"token auth history"') < plain.indexOf('"token ratelimit"'), "lexical order without plan state");
@@ -149,48 +146,23 @@ test("plan-aware re-ranking lifts the plan-relevant block to the top (determinis
     assert.equal(again, aware, "fully deterministic across calls");
 });
 
-test("steering output: top fetch targets first, repeat-retrieve hint only with history", () => {
-    const f = foldBlocks(true);
+test("steering output: top fetch targets listed with their spans", () => {
+    const f = foldBlocks();
     const b5 = blockByTopic(f, "token ratelimit");
-    const b1 = blockByTopic(f, "token auth history");
     const aware = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, planOpts(f, [])).text;
     assert.match(aware, /\n\n\[plan-aware\] top fetch targets: /);
-    assert.match(aware, new RegExp(`top fetch targets: ${b5.blockId} \\[m00021\u2013m00025 · 5 msgs\\]`), "boosted block span listed first");
-    assert.ok(!aware.includes("retrieved "), "no repeat hint without retrieve history");
-    recordRetrieveHit(f.session, "m00003");
-    recordRetrieveHit(f.session, "m00003");
-    const aware2 = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, planOpts(f, [])).text;
-    assert.match(aware2, new RegExp(`m00003 retrieved 2 times this session \u2014 decompress\\(\\{blockId:"${b1.blockId}",startId:"m00003",endId:"m00003"}\\)`));
+    assert.match(aware, new RegExp(`top fetch targets: ${b5.blockId} \\[m00021–m00025 · 5 msgs\\]`), "boosted block span listed first");
 });
 
-test("whole-block restore stats feed the RETRIEVAL QUALITY line", () => {
-    const f = foldBlocks(true);
+test("whole-block restore is counted in the session stats", () => {
+    const f = foldBlocks();
     const b = blockByTopic(f, "token auth history");
     resolveDecompress({ blockId: b.blockId }, ctxOf(f));
     assert.equal(f.session.stats.wholeBlockRestores, 1);
-    assert.equal(f.session.stats.wholeBlockRestoresPreciseAvailable, 1, "precise path existed (CCR armed + span recorded)");
-    const status = handleAcpStatus({}, ctxOf(f)).text;
-    assert.match(status, /RETRIEVAL QUALITY — whole-block restores: 1 total, 1 had a cheaper precise path available \(100%\)/);
-});
-
-test("whole-block restore without CCR: counted, precise path not credited", () => {
-    const f = foldBlocks(false);
-    const b = blockByTopic(f, "token auth history");
-    resolveDecompress({ blockId: b.blockId }, ctxOf(f));
-    assert.equal(f.session.stats.wholeBlockRestores, 1);
-    assert.equal(f.session.stats.wholeBlockRestoresPreciseAvailable ?? 0, 0);
-});
-
-test("recordRetrieveHit: per-ref counts with a bounded map", () => {
-    const s = getSession(`sp-cap-${Math.random().toString(36).slice(2)}`);
-    for (let i = 0; i < 520; i++) recordRetrieveHit(s, `m${String(i).padStart(5, "0")}`);
-    recordRetrieveHit(s, "m00000");
-    assert.ok((s.retrieveCountsByRef?.size ?? 0) <= 512, "map stays under the cap");
-    assert.equal(s.retrieveCountsByRef?.get("m00000"), 1, "FIFO-evicted ref restarts its count");
 });
 
 test("own-session target entry point: flag off → plain; flag on → re-ranked", () => {
-    const f = foldBlocks(true);
+    const f = foldBlocks();
     storeEffectiveSearchPlanAware(f.session, false);
     const off = executeSearchContextTarget({ query: "token" }, f.core, f.session.id, f.session.state, { messages: planMessages(), config: f.config, session: f.session, log: () => {} }).text;
     assert.equal(off, executeSearchContext({ query: "token" }, f.core, f.session.state).text, "unflagged ctx → plain output");
@@ -201,7 +173,7 @@ test("own-session target entry point: flag off → plain; flag on → re-ranked"
 });
 
 test("foreign-session search stays read-only lexical (no plan state, no steering)", () => {
-    const a = foldBlocks(true);
+    const a = foldBlocks();
     storeEffectiveSearchPlanAware(a.session, true);
     const foreign = getSession(`sp-foreign-${Math.random().toString(36).slice(2)}`);
     const fcore = createCore();
@@ -303,7 +275,7 @@ async function startPlanProxy(captured: string[], planAware: boolean): Promise<{
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: false, minCompressRangeChars: 1000, ccr: { enabled: true }, search: planAware ? { planAware: true } : undefined },
+        compress: { injectTool: true, injectNudge: false, minCompressRangeChars: 1000, search: planAware ? { planAware: true } : undefined },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,

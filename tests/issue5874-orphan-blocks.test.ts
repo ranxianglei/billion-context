@@ -99,7 +99,6 @@ const loadView = (store: UnifiedStore, id: string) => {
     const builder = new LegacyViewBuilder(rows.session, rows.refs, rows.deadRefs);
     builder.addBlocks(rows.blocks);
     builder.addMessages(rows.messages);
-    builder.addCcrEntries(store.getCcrEntries(id));
     builder.addOrphanViews(store.getOrphanViews(id) ?? {});
     return builder.finish();
 };

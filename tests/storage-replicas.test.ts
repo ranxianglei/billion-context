@@ -52,7 +52,6 @@ function viewDigest(view: ReturnType<typeof loadLegacyView>): string {
         lastMessages: view.lastMessages,
         lastMessagesFolded: view.lastMessagesFolded,
         pluginSnapshot: view.pluginSnapshot,
-        contentStore: view.contentStore,
     })));
 }
 function loadCorpusCase(dir: string, name: string, id: string, protocol: string) {

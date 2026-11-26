@@ -3467,9 +3467,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         } else {
             parts.push('<div class="dim small" style="margin-top:10px">' + t("common.context") + ctxMark + ": " + fmtW(ctxVal) + "</div>");
         }
-        if ((d.retrieveCalls || 0) > 0) parts.push('<div class="dim small" style="margin-top:10px">' + t("det.ccr") + ' · <span class="mono">' + t("det.ccr_detail", { calls: d.retrieveCalls, hits: d.retrieveHits || 0, misses: d.retrieveMisses || 0 }) + "</span></div>");
         if ((d.wholeBlockRestores || 0) > 0 || (d.rangeRestores || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.decompress") + ' · <span class="mono">' + t("det.decompress_detail", { blocks: d.wholeBlockRestores || 0, precise: d.wholeBlockRestoresPreciseAvailable || 0, ranges: d.rangeRestores || 0 }) + "</span></div>");
-        if ((d.storedBytes || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.store") + ' · <span class="mono">' + fmtB(d.storedBytes) + ((d.storeBytesSaved || 0) > 0 ? " / " + fmtB(d.storeBytesSaved) + " " + t("common.saved") : "") + "</span></div>");
         parts.push("</div></div>");
         const ledger = d.ledger || {};
         const lines = ledger.lines || [];

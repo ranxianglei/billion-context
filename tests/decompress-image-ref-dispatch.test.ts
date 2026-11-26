@@ -61,7 +61,7 @@ function fold(): FoldResult {
     const config = applyCompressSettings(
         defaultConfig(200_000),
         200_000,
-        { ccr: { enabled: false, minToolTokens: 50 } },
+        {} as never,
     ) as Config;
     const session = getSession(`d2626-${Math.random().toString(36).slice(2)}`);
     const raw = makeMsgs();

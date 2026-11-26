@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { buildStoredPlaceholder, createInitialState } from "acp-kernel";
+import { createInitialState } from "acp-kernel";
 import { exportSession, renderSessionJsonlFromTables } from "../src/export.ts";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
@@ -16,7 +16,7 @@ function session(): Session {
         id: "jsonl-content", meta: { title: "Historical content", protocol: "responses" },
         stats: { requests: 1, tokensSaved: 0, inputTokens: 10, cachedTokens: 0, outputTokens: 0,
             cacheSamples: 0, lastInputTokens: 10, contextTokens: 10, compressCreditTokens: 0,
-            retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+            rangeRestores: 0 },
         metadata: {}, createdAt: 1, lastSeen: 2, state: createInitialState(), pendingRetrievals: [],
         blockContents: new Map(), inFlight: 0, persisted: false, lastMessagesFolded: false,
         lastMessages: [
@@ -66,7 +66,7 @@ for (const [name, raw, expected] of [
             const value = session();
             seed(store, value, raw, false);
             const before = store.getMessages(value.id, { includeRetired: true });
-            const output = records(await renderSessionJsonlFromTables(new SqliteBackend(store), value.id, true));
+            const output = records(await renderSessionJsonlFromTables(new SqliteBackend(store), value.id));
             assert.equal(output[0]!.source, "unified");
             const messages = output.filter((line) => line.type === "message");
             assert.equal(messages.length, 2);
@@ -112,26 +112,3 @@ for (const full of [false, true]) {
         }
     });
 }
-
-test("full export still resolves object placeholders after a non-object row", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "jsonl-content-ccr-"));
-    const store = UnifiedStore.open(join(dir, "index.db"));
-    try {
-        const value = session();
-        const placeholder = buildStoredPlaceholder({ ref: "m00002", kind: "file read", tokens: 5, head: "head", retrieveToolName: "acp_retrieve" });
-        value.lastMessages![1]!.text = placeholder;
-        seed(store, value, "null", false);
-        const ccr = new Map([["m00002", "original content\nwith Unicode 日本語"]]);
-        for (const full of [false, true]) {
-            const output = records(await renderSessionJsonlFromTables(new SqliteBackend(store), value.id, full, ccr));
-            const messages = output.filter((line) => line.type === "message");
-            assert.equal(messages[0]!.message, null);
-            assert.deepEqual(messages[1]!.message, full
-                ? { ...value.lastMessages![1], text: ccr.get("m00002"), dereferencedFrom: "m00002" }
-                : value.lastMessages![1]);
-        }
-    } finally {
-        store.close();
-        rmSync(dir, { recursive: true, force: true });
-    }
-});

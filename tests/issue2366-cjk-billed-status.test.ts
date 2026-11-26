@@ -95,8 +95,8 @@ function makeCtx(messages: CoreMessage[], o?: CtxOverrides): {
                 requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0,
                 lastInputTokens: o?.lastInputTokens ?? 0,
                 ...(o?.source !== undefined ? { lastInputTokensSource: o.source as never } : {}),
-                compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0,
-                storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0,
+                compressCreditTokens: 0, contextTokens: 0,   
+  rangeRestores: 0,
             },
             metadata: {
                 ...(o?.contextTokensAt !== undefined ? { contextTokensAt: o.contextTokensAt } : {}),

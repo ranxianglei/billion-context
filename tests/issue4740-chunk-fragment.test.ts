@@ -51,7 +51,7 @@ function pairFixture(): { core: ReturnType<typeof createCore>; config: ReturnTyp
     const turn = core.processTurn({ messages, state: createInitialState(), config: { ...config, modelContextLimit: WINDOW * 1000 }, tokenCount: 23_000, renderTags: "text-only" });
     const session: Session = {
         id: "issue4740-chunk-fragment", meta: {}, metadata: {}, state: turn.state,
-        stats: { requests: 1, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 30_000, compressCreditTokens: 0, contextTokens: 30_000, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        stats: { requests: 1, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 30_000, compressCreditTokens: 0, contextTokens: 30_000, rangeRestores: 0 },
         pendingRetrievals: [],
         createdAt: Date.now(), lastSeen: Date.now(), blockContents: new Map(), inFlight: 0, persisted: false,
     };

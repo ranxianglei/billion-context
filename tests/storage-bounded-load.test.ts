@@ -33,7 +33,6 @@ function fixture(): LegacySessionLike {
         pluginSnapshot: messages.slice(0, 36),
         lastMessages: [messages[65], messages[33], messages[65]],
         lastMessagesFolded: true,
-        contentStore: { version: 1, byHash: { h: "retained CCR" }, byRef: {} },
     };
 }
 
@@ -71,7 +70,6 @@ function assertHistory(view: LegacySessionLike | null): asserts view is LegacySe
     assert.strictEqual(view.lastMessages![1], view.pluginSnapshot![33], "tail and snapshot overlap shares one parsed message");
     assert.deepEqual(view.state.messageRefs, fixture().state.messageRefs, "ghost and BLOCKED refs survive verbatim");
     assert.deepEqual(view.state.deadRefs, ["m90001", "m90002"]);
-    assert.deepEqual(view.contentStore, fixture().contentStore);
     assert.equal((view as unknown as { tailGaps: number }).tailGaps, 2);
 }
 
@@ -82,7 +80,7 @@ test("ordinary sync cold load reads only unique tail/snapshot seqs and bounded b
     const store = (shadow as unknown as { sync: UnifiedStore }).sync;
     t.after(() => { shadow.close(); rmSync(dir, { recursive: true, force: true }); });
     seed(store);
-    const expected = loadLegacyView(allRows(store), undefined, store.getStateFields("bounded"), store.getOrphanViews("bounded") ?? {});
+    const expected = loadLegacyView(allRows(store), store.getStateFields("bounded"), store.getOrphanViews("bounded") ?? {});
     const getMessages = store.getMessages.bind(store);
     const getBlocks = store.getBlocks.bind(store);
     const requested: number[] = [];
@@ -115,7 +113,7 @@ test("ordinary async cold load uses the snapshot reader for each bounded page", 
     const backend = SqliteBackend.open(join(dir, "index.db"));
     t.after(async () => { await backend.close(); rmSync(dir, { recursive: true, force: true }); });
     seed(backend.store);
-    const expected = loadLegacyView(allRows(backend.store), undefined, backend.store.getStateFields("bounded"), backend.store.getOrphanViews("bounded") ?? {});
+    const expected = loadLegacyView(allRows(backend.store), backend.store.getStateFields("bounded"), backend.store.getOrphanViews("bounded") ?? {});
     const readSnapshot = backend.readSnapshot.bind(backend);
     const offsets: number[] = [];
     const requested: number[] = [];
@@ -172,7 +170,7 @@ test("resident field reads avoid unrelated JSON, messages, refs, and block paylo
     const store = (shadow as unknown as { sync: UnifiedStore }).sync;
     t.after(() => { shadow.close(); rmSync(dir, { recursive: true, force: true }); });
     seed(store);
-    const expected = loadLegacyView(allRows(store), undefined, store.getStateFields("bounded"), store.getOrphanViews("bounded") ?? {});
+    const expected = loadLegacyView(allRows(store), store.getStateFields("bounded"), store.getOrphanViews("bounded") ?? {});
     for (const key of ["getSessionRow", "getMessages", "getBlocks", "getRefs", "getDeadRefs"] as const) {
         store[key] = () => { throw new Error(`resident field read called ${key}`); };
     }

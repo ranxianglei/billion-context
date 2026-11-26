@@ -446,8 +446,6 @@ function stableState(d: Record<string, unknown>): Record<string, unknown> {
         blocks: d.blocks,
         lastInputTokens: d.lastInputTokens,
         compressCreditTokens: d.compressCreditTokens,
-        storedBytes: d.storedBytes,
-        storeBytesSaved: d.storeBytesSaved,
         // generatedAt is wall-clock (ms drift between snapshots), not state.
         blockDetails: (Array.isArray(d.blockDetails) ? d.blockDetails : []).map((b) => { const c = { ...(b as Record<string, unknown>) }; delete c.generatedAt; return c; }),
         ledger,

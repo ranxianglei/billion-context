@@ -142,7 +142,7 @@ for (const fail of [false, true]) {
             raw.prepare("INSERT INTO messages (session_id, seq, msg_id, role, kind, content_hash, identity) VALUES ('parent', 0, 'm1', 'user', 'text', ?, '')").run(hash);
             const initial: IngestSessionInput = {
                 session: { ...store.getSessionRow("parent")!, sessionId: "child", kstateJson: '{"nextBlockId":9}', metadataJson: '{"cloneReady":true}' },
-                messages: [], blocks: [], deadRefs: [], ccrEntries: [],
+                messages: [], blocks: [], deadRefs: [],
                 refs: [{ ord: 0, rawId: "m1", ref: "m00001", refNum: 1 }],
             };
             if (fail) {
@@ -204,7 +204,7 @@ for (const scenario of ["success", "ingest-failure", "existing-child", "missing-
         const initial: IngestSessionInput = {
             session: { sessionId: "child", parentSessionId: null, forkPointSeq: null, createdAt: 1, updatedAt: 1,
                 nextBlockId: 9, nextRunId: 1, metaJson: "{}", statsJson: "{}", metadataJson: "{}", kstateJson: "{}", tailJson: "{}", ccrJson: null },
-            messages: [], blocks: [], refs: [], deadRefs: [], ccrEntries: [],
+            messages: [], blocks: [], refs: [], deadRefs: [],
         };
         if (scenario === "success") assert.equal(await store.cloneSessionRows("parent", "child", 0, initial), true);
         else if (scenario === "missing-parent") assert.equal(await store.cloneSessionRows("parent", "child", 0, initial), true);
@@ -253,7 +253,7 @@ test("#4982: MySQL atomic sparse clone persists absolute snapshot and tail point
         session: { sessionId: "child", parentSessionId: null, forkPointSeq: null, createdAt: 1, updatedAt: 1,
             nextBlockId: 9, nextRunId: 1, metaJson: "{}", statsJson: "{}", metadataJson: "{}", kstateJson: "{}",
             tailJson: JSON.stringify({ tailSeqs: [0, 1, 2], pluginSnapshotSeqs: [0, 1, 2] }), ccrJson: null },
-        messages, blocks: [], refs: [], deadRefs: [], ccrEntries: [], tailSeqs: [0, 1, 2], pluginSnapshotSeqs: [0, 1, 2],
+        messages, blocks: [], refs: [], deadRefs: [], tailSeqs: [0, 1, 2], pluginSnapshotSeqs: [0, 1, 2],
     };
     assert.equal(await store.cloneSessionRows("parent", "child", 4, initial), true);
     assert.deepEqual(writtenSeqs, absoluteSeqs);

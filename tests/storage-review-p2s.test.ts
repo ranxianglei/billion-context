@@ -220,7 +220,6 @@ test("S7: loadLegacyView reports tail pointer gaps instead of silently shrinking
             metadataJson: "{}",
             kstateJson: JSON.stringify(createInitialState()),
             tailJson: JSON.stringify({ pluginSnapshotSeqs: null, tailSeqs: [0, 7, 8], tailFolded: false }),
-            ccrJson: null,
             orphansJson: null,
         },
         messages: [

@@ -34,7 +34,7 @@ function makeSession(id: string): Session {
     return {
         id,
         meta: { protocol: "openai", upstreamOrigin: "http://up:1", title: "tail test" },
-        stats: { requests: 3, tokensSaved: 0, inputTokens: 10, cachedTokens: 0, outputTokens: 5, cacheSamples: 0, lastInputTokens: 10, contextTokens: 1000, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        stats: { requests: 3, tokensSaved: 0, inputTokens: 10, cachedTokens: 0, outputTokens: 5, cacheSamples: 0, lastInputTokens: 10, contextTokens: 1000, compressCreditTokens: 0, rangeRestores: 0 },
         metadata: {},
         createdAt: Date.now() - 1000,
         lastSeen: Date.now(),

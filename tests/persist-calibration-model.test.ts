@@ -16,7 +16,7 @@ function session(id: string, model?: string): Session {
   return {id, meta:{protocol:'anthropic',upstreamOrigin:'http://synthetic.invalid'},
     stats:{requests:3,tokensSaved:0,inputTokens:10,cachedTokens:0,outputTokens:5,
       cacheSamples:0,lastInputTokens:10,contextTokens:1000,compressCreditTokens:0,
-      retrieveCalls:0,retrieveHits:0,retrieveMisses:0,storedBytes:0,storeBytesSaved:0,rangeRestores:0,
+      rangeRestores:0,
       calibratedEstimate:0.8,calibratedEstimateOrigin:'http://synthetic.invalid',
       calibratedEstimateModel:model,
       // #5952: the seeded factor is text-only evidence, so it may decide.

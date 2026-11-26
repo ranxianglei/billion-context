@@ -93,7 +93,6 @@ function ingestInput(sessionId: string, covered: string[]): IngestSessionInput {
         blocks: [blockRow(covered)],
         deadRefs: [],
         refs: [],
-        ccrEntries: [],
     };
 }
 

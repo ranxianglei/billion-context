@@ -17,7 +17,7 @@ function makeSession(id: string): Session {
     return {
         id,
         meta: { protocol: "responses", upstreamOrigin: "https://api.openai.com/v1", title: "auth debugging" },
-        stats: { requests: 12, tokensSaved: 0, inputTokens: 100, cachedTokens: 0, outputTokens: 50, cacheSamples: 1, lastInputTokens: 100, contextTokens: 99000, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        stats: { requests: 12, tokensSaved: 0, inputTokens: 100, cachedTokens: 0, outputTokens: 50, cacheSamples: 1, lastInputTokens: 100, contextTokens: 99000, compressCreditTokens: 0, rangeRestores: 0 },
         metadata: {},
         createdAt: Date.now() - 1000,
         lastSeen: Date.now(),

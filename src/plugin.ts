@@ -1,4 +1,4 @@
-import { ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME, BLOCKED_REF, BLOCK_OP_TOOL_NAMES, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME, BLOCKED_REF, BLOCK_OP_TOOL_NAMES, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type ToolPrompts, applyAcpToolOverrides, countMessageTokens, prune } from "acp-kernel";
 import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -8,11 +8,10 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { rebuildCoreFromLog } from "./storage/egress-serve.js";
-import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
-import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, blockOpsTools, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, blockOpsTools, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
 import { blockOpsEnabled, effectiveBlockOpsConfig } from "./acp-block-ops.js";
 import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
@@ -24,7 +23,6 @@ import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
-import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { formatProtectedMass, uncoveredAudit, type ProtectedMassLedger } from "./uncovered.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
@@ -358,13 +356,6 @@ function parseConvTable(value: unknown): Record<string, ConversationEntry> | nul
 }
 
 const conversations = new Map<string, ConversationEntry>();
-// #2077: which content-store object each session's stored-refs list was last
-// evaluated against. Store updates are immutable (storeOriginal returns a new
-// object), so a changed object identity is the exact signal that the refs
-// list needs re-evaluation — an unchanged-view resend can skip even the refs
-// walk. Restored sessions are fresh objects, so their first remember
-// re-evaluates automatically.
-const snapshotRefsEvaluatedStore = new WeakMap<Session, unknown>();
 
 // #1158: one-shot "no model requests arrived" warnings, keyed by conversation
 // id. A tool call proves the model already answered, so an id with ZERO model
@@ -689,22 +680,6 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
                 changed = true;
             }
         }
-        // The refs list must re-evaluate whenever the store object changed —
-        // CCR can gain entries between remembers without any history change,
-        // and the fork-time fail-closed check reads this list against the
-        // CURRENT store.
-        const storeChanged = snapshotRefsEvaluatedStore.get(session) !== session.contentStore;
-        if (changed || storeChanged) {
-            const previousRefs = session.metadata.publicSnapshotStoredRefs;
-            session.metadata.publicSnapshotStoredRefs = [...new Set([
-                ...(Array.isArray(previousRefs) ? previousRefs : []),
-                ...(session.pluginSnapshot ?? []).flatMap((m) => {
-                    const ref = session.state.messageRefs.byRaw[m.id];
-                    return ref && session.contentStore?.byRef[ref] ? [ref] : [];
-                }),
-            ])];
-            snapshotRefsEvaluatedStore.set(session, session.contentStore);
-        }
         if (rawWire !== undefined) {
             // The handler captures this evidence before forwarding so it need
             // not retain the raw body. Buffer callers keep the hash-gated parse.
@@ -730,7 +705,7 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
                 }
             }
         }
-        if (changed || storeChanged) markDirty(session);
+        if (changed) markDirty(session);
     }
 }
 
@@ -1133,25 +1108,12 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     const blockOpsOn = blockOpsEnabled(config);
     const blockOps = blockOpsOn ? blockOpsTools() : undefined;
     const rulesOn = rulesEnabled(config);
-    // [#1271] acp_retrieve is advertised only while the base config enables CCR (same
-    // #1192 conservative rule as absorb/acp_rule). The proxy wires it on the anthropic/
-    // openai lanes in plugin mode; the responses wire is deliberately NOT advertised —
-    // that proxy disarms CCR there, so advertising would break #1192.
-    const ccrOn = config.ccr?.enabled === true;
-    const ccrName = config.ccr?.toolName ?? RETRIEVE_TOOL_NAME;
-    const ccrTools = ccrOn ? retrieveToolsFor(ccrName) : undefined;
     // #3400: acp_read_original_image restores the full-resolution original of a
-    // downscaled image from local session storage. Same conservative #1192
-    // rule as acp_retrieve: advertised only while the base knob enables the
-    // rescale pass (disabled ⇒ no [bili] note ever names it, so a registered
-    // copy could only be dead weight). Execution stays always-allowed: it is
-    // an idempotent local read, never a state mutation.
+    // downscaled image from local session storage. Advertised only while the base
+    // knob enables the rescale pass (disabled ⇒ no [bili] note ever names it, so a
+    // registered copy could only be dead weight). Execution stays always-allowed:
+    // it is an idempotent local read, never a state mutation.
     const rescaleOn = imageRescaleEnabled();
-    // #1712: decompress's startId/endId (range restore) executes only on CCR-armed
-    // sessions, so the manifest advertises them only when the base config enables
-    // CCR (#1345 plugin policy = base block verbatim) — same conservative #1192
-    // rule as acp_retrieve above. CCR-off manifests serve the no-range variants so
-    // a registered agent never sees range fields execution would refuse.
     const externalSummary = externalSummaryEnabled(config);
     // #3252: the manifest serves code-mode harnesses too (dsh registers the
     // dsh-bili plugin and its "PTC" preset renders these descriptions as the
@@ -1160,12 +1122,8 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // harness will reject nor dodges the direct call native hosts expect.
     // #3243: the pack surface's tool descriptions (toolPrompts) override the
     // stock descriptions where a promptPack declares its own.
-    const acpAnthropic = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalSummary), "binding");
-    const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalSummary), "binding");
-    // Responses wire: plugin mode structurally disarms CCR there (#1271 —
-    // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
-    // registered agent on that wire — always the no-range variant, mirroring
-    // how ccrTools above is never spread into the responses array.
+    const acpAnthropic = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalSummary), "binding");
+    const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalSummary), "binding");
     const acpResponses = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, toolPrompts), externalSummary), "binding");
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
@@ -1174,10 +1132,10 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         proxy: "billion-context",
         version: VERSION,
         commit: BUILD_COMMIT,
-        toolNames: [...PROXY_TOOL_NAMES, ...(absorbTools ? [absorbName] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_NAME] : []), ...(blockOpsOn ? [ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME] : [])],
+        toolNames: [...PROXY_TOOL_NAMES, ...(absorbTools ? [absorbName] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_NAME] : []), ...(blockOpsOn ? [ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME] : [])],
         tools: {
-            anthropic: [...acpAnthropic, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL] : []), ...(blockOps ? blockOps.anthropic : [])],
-            openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOps ? blockOps.openai : [])],
+            anthropic: [...acpAnthropic, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL] : []), ...(blockOps ? blockOps.anthropic : [])],
+            openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOps ? blockOps.openai : [])],
             responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : []), ...(blockOps ? blockOps.responses : [])],
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER, compression: PLUGIN_COMPRESSION_HEADER },
@@ -1563,12 +1521,6 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
     // identity hash, so only genuinely uncomparable content (images, audio,
     // publicSnapshotTextComparable === false) still refuses.
     if (session.metadata.publicSnapshotTextComparable === false) throw new Error("multimodal or opaque content cannot be compared by text");
-    const store = contentStoreOf(session);
-    const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
-    if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
-    const indexedHashes = new Set(Object.values(store.byRef).map((entry) => entry.hash));
-    if (Object.entries(store.byHash).some(([hash, text]) => !indexedHashes.has(hash) || typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash)) throw new Error("CCR original payload/index inconsistent");
-    if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || (session.state.messageRefs.byRaw[entry.rawId] !== undefined && (session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)))) throw new Error("CCR original alias inconsistent");
     const orderedMessages = messages.map((m, i): ForkIdentity => {
         const ref = session.state.messageRefs.byRaw[m.id];
         // #2620: protected tool calls/results map to the kernel BLOCKED sentinel by design
@@ -1577,9 +1529,6 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
         // #2676: name the offending message in the error — a bare invariant string gave no
         // clue which of hundreds of snapshot entries broke the mapping.
         if (!ref || (ref !== BLOCKED_REF && session.state.messageRefs.byRef[ref] !== m.id)) throw new Error(`raw/ref mapping inconsistent (msg ${i + 1}/${messages.length} role=${m.role} tool=${m.toolName ?? "-"} ref=${ref ?? "MISSING"} rawId=${m.id.slice(0, 16)})`);
-        const entry = store.byRef[ref];
-        const placeholder = m.text ? parseStoredPlaceholder(m.text) : null;
-        if ((entry && (entry.rawId !== m.id || typeof store.byHash[entry.hash] !== "string")) || (placeholder && (placeholder.ref !== ref || !entry))) throw new Error("CCR original unavailable or alias inconsistent");
         return { rawId: m.id, ref: ref === BLOCKED_REF ? null : ref, identityHash: forkMessageIdentityHash(m) };
     });
     // #2671 Phase 2b (fork protocol v2): the revision token is now
@@ -1595,21 +1544,20 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
 }
 
 /** #2671 Phase 2b transition digest: fork protocol v1 hashed the ENTIRE
- *  snapshot ({sessionId, messages, state, blockContents, contentStore}) so
- *  any unrelated store churn (post-snapshot CCR activity, stats nudges,
- *  image-restore rewrites) flipped parentRevision and forced spurious 409s.
- *  v2 hashes only {sessionId, seq, active block set}. The POST handler still
- *  ACCEPTS a v1 hash for one transition version (clients that snapshotted
- *  under an older proxy); this legacy digest is recomputed ONLY on that
- *  fallback path — GET snapshot and status polling never pay O(store)
- *  hashing. Drop this (and the fallback) once no v1 client can exist. */
-export function forkParentRevisionLegacy(session: Session): string {
-    const messages = session.pluginSnapshot;
-    if (!messages) throw new Error("raw snapshot unavailable");
-    const store = contentStoreOf(session);
-    const state = { ...session.state };
-    return forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
-}
+ *  snapshot ({sessionId, messages, state, blockContents}) so any unrelated
+ *  state churn (stats nudges, image-restore rewrites) flipped parentRevision
+ *  and forced spurious 409s. v2 hashes only {sessionId, seq, active block
+ *  set}. The POST handler still ACCEPTS a v1 hash for one transition version
+ *  (clients that snapshotted under an older proxy); this legacy digest is
+ *  recomputed ONLY on that fallback path — GET snapshot and status polling
+ *  never pay O(state) hashing. Drop this (and the fallback) once no v1 client
+ *  can exist. */
+ export function forkParentRevisionLegacy(session: Session): string {
+     const messages = session.pluginSnapshot;
+     if (!messages) throw new Error("raw snapshot unavailable");
+     const state = { ...session.state };
+     return forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents) });
+ }
 
 // #4942: async — on network storage backends the existence probes must be
 // able to reach the DB (the sync facade misses by design there). Materialization
@@ -1955,16 +1903,8 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
                 )) ?? []);
             child.lastMessages = structuredClone(child.pluginSnapshot);
             child.lastMessagesFolded = false;
-            const parentStore = contentStoreOf(parent);
-            for (const { ref, rawId } of prefix) {
-                if (ref === null) continue;
-                const entry = parentStore.byRef[ref];
-                if (entry && (entry.rawId !== rawId || typeof parentStore.byHash[entry.hash] !== "string")) return forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "CCR original unavailable or alias inconsistent" });
-            }
-            child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
             child.metadata.publicSnapshotTextComparable = true;
-            child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
-            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens", "egressAuthority"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
+            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens", "egressAuthority"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
             child.metadata.parentConversationId = request.parentConversationId;
             child.metadata.parentRevision = request.parentRevision;
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
@@ -2035,7 +1975,6 @@ function disabledOptionalToolNote(tool: string, session: Session, config: Config
     const absorbName = effectiveAbsorbConfig(session, config)?.toolName ?? ABSORB_TOOL_NAME;
     if (tool === absorbName) return `${tool} is not enabled on this bili proxy (compress.absorb.enabled is not true) — nothing was absorbed.`;
     if (tool === RULE_TOOL_NAME) return `${tool} is not enabled on this bili proxy (compress.rules.enabled is not true) — nothing was recorded.`;
-    if (!ccrEnabled(session) && tool === retrieveToolName(session)) return `${tool} is not enabled on this bili proxy (compress.ccr.enabled is not true) — nothing was retrieved.`;
     // #5765: block-lifecycle tools — per-session effective config (a manifest
     // served while enabled may outlive a config change).
     if (BLOCK_OP_TOOL_NAMES.has(tool) && effectiveBlockOpsConfig(session, config)?.enabled !== true) {
@@ -2196,10 +2135,9 @@ export async function handlePluginStatus(conversationId: string, res: import("no
             nudge = deps.core.processTurn({
                 messages,
                 state: session.state,
-                config: ccrLoopConfig(session, pluginCfg),
+                config: pluginCfg,
                 tokenCount: statusInputBaseline(session),
                 renderTags: "none",
-                contentStore: contentStoreOf(session),
                 // #3236: screen advertised ranges on the apply class — the raw
                 // history, not this panel's processed view (#2627 split).
                 applyView: mem && mem.original.length > 0 ? mem.original : undefined,
@@ -2228,9 +2166,8 @@ export async function handlePluginStatus(conversationId: string, res: import("no
                 core: deps.core,
                 messages,
                 state: session.state,
-                config: ccrLoopConfig(session, pluginCfg),
+                config: pluginCfg,
                 tokenCount: statusInputBaseline(session),
-                contentStore: contentStoreOf(session),
                 applyView: mem && mem.original.length > 0 ? mem.original : undefined,
                 normalRanges: nudge?.compressibleRanges,
             });
@@ -2598,7 +2535,6 @@ export async function handlePluginTool(
     const callId = typeof parsed.toolCallId === "string" ? parsed.toolCallId : `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
     acquireInFlight(session);
     let result: ProxyToolResult | undefined;
-    let retrievalExport: RetrievalExport | undefined;
     try {
         result = await withSessionLock(session, async () => {
             if (parsed.expectedRevision !== undefined) {
@@ -2638,11 +2574,6 @@ export async function handlePluginTool(
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
-            if (nativeCaller && tool === retrieveToolName(session) && typeof args.ref === "string") {
-                // Preserve the session's export before a same-ref concurrent lookup.
-                const retrieved = applyRetrieve({ store: contentStoreOf(session), ref: args.ref, exportDir: path.join(stateDir(), "retrieve") });
-                if (retrieved.ok && retrieved.toolResultText === toolResult.text) retrievalExport = retrieved.export;
-            }
             const creditDelta = (session.stats.compressCreditTokens ?? 0) - creditBefore;
             const restoredInjections = session.pendingRetrievals.filter((p) => !pendingBefore.has(p.ref));
             // The string tool protocol has distinct success headers for whole/derived and range restores.
@@ -2668,7 +2599,7 @@ export async function handlePluginTool(
     // (sticky) — the next model request stops injecting the duplicate ephemeral wire
     // tools. Guarded: only flips a session with NO existing agent binding, never
     // overriding a pi/omp/opencode plugin or a launcher-registered agent.
-    if (typeof session.metadata.pluginAgent !== "string" && tool !== retrieveToolName(session)) {
+    if (typeof session.metadata.pluginAgent !== "string") {
         session.metadata.pluginAgent = "mcp";
     }
     markDirty(session);
@@ -2689,7 +2620,6 @@ export async function handlePluginTool(
     if (result.outcome !== undefined) body.outcome = result.outcome;
     if (result.blocksCreated !== undefined) body.blocksCreated = result.blocksCreated;
     body.result = sentResult;
-    if (retrievalExport !== undefined) body.retrievalExport = retrievalExport;
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(body));
 }

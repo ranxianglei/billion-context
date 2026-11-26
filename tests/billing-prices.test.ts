@@ -179,7 +179,7 @@ function fakeSession(): Session {
         id: "bill-1",
         meta: { protocol: "anthropic" },
         metadata: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, contextTokens: 0, cacheSamples: 0, lastInputTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, compressCreditTokens: 0, rangeRestores: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, contextTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, rangeRestores: 0 },
         state: { blocks: [], messages: [], lastCompressedIndex: 0, blockSeq: 0, refCounter: 0, messageRefs: {}, byRef: {}, byRaw: {} },
         lastSeen: Date.now(),
         restored: false,

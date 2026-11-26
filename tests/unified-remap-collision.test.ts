@@ -72,7 +72,6 @@ function fullInput(id: string, content: string): IngestSessionInput {
         blocks: [],
         deadRefs: [],
         refs: [],
-        ccrEntries: [],
         pluginSnapshotSeqs: [],
         tailSeqs: [],
     };

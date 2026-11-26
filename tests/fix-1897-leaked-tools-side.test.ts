@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { defaultConfig, createInitialState } from "acp-kernel";
 import { startServer, stripLeakedBiliTools, BILI_TOOL_NAMES } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { PROXY_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "../src/compress-tool.ts";
+import { PROXY_TOOL_NAMES, ABSORB_TOOL_NAME, RULE_TOOL_NAME } from "../src/compress-tool.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getSession, _resetSessionsForTest } from "../src/session.ts";
@@ -59,9 +59,9 @@ test("stripLeakedBiliTools: google functionDeclarations (one entry may declare m
 });
 
 test("stripLeakedBiliTools: opt-in bili extras count as bili-owned", () => {
-    const body = { model: "m", tools: [openAiTool(ABSORB_TOOL_NAME), openAiTool(RULE_TOOL_NAME), openAiTool(RETRIEVE_TOOL_NAME)] };
+    const body = { model: "m", tools: [openAiTool(ABSORB_TOOL_NAME), openAiTool(RULE_TOOL_NAME)] };
     assert.equal(stripLeakedBiliTools(body), true);
-    for (const n of [ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME]) {
+    for (const n of [ABSORB_TOOL_NAME, RULE_TOOL_NAME]) {
         assert.ok(BILI_TOOL_NAMES.has(n), `${n} in the bili set`);
     }
 });

@@ -522,7 +522,6 @@ export async function prepareOpenai(
         session.state = turn.state;
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
-        adoptContentStore(session, turn.contentStore);
         // In-request ledger flush: the transcript up to THIS user message is
         // durable before the model call (#3397 durability-before-render) and
         // the stage-0 envelope / M2 evidence read a current ledger.

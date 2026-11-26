@@ -54,7 +54,6 @@ function session(id: string, tail: CoreMessage[], blocks: CompressionBlock[]): L
         lastMessages: tail,
         lastMessagesFolded: false,
         pluginSnapshot: undefined,
-        contentStore: undefined,
     };
 }
 

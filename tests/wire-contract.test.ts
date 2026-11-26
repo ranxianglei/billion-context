@@ -4,7 +4,7 @@
 // into one module with four layers:
 //   A. kernel exports — every tool constant the pinned acp-kernel ships, per wire
 //   B. bili surfaces — everything bili itself builds/serves (BILI_* tools, synthesized
-//      variants, retrieveToolsFor)
+//      variants)
 //   C. plugin manifest — what handlePluginManifest advertises (default + opt-in configs)
 //   D. live forward matrix — scripted client request -> proxy -> validation-parity fake
 //      upstream, one lane per protocol (item 1 + item 4 phase (a)): the forwarded body
@@ -53,7 +53,6 @@ import {
     RULE_TOOL_OPENAI,
     RULE_TOOL_RESPONSES,
     RULE_TOOL_GOOGLE,
-    retrieveToolsFor,
 } from "../src/compress-tool.ts";
 import { verifySdkHmac, WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
 
@@ -446,7 +445,6 @@ const KERNEL_INDIVIDUALS: Array<[string, Wire]> = [
     ["ACP_CACHE_TOOL", "anthropic"], ["ACP_CACHE_TOOL_OPENAI", "openai-chat"], ["ACP_CACHE_TOOL_RESPONSES", "responses"],
     // opt-in tools the kernel ships individually (host-registered)
     ["ABSORB_TOOL", "anthropic"], ["ABSORB_TOOL_OPENAI", "openai-chat"], ["ABSORB_TOOL_GOOGLE", "google"],
-    ["RETRIEVE_TOOL", "anthropic"], ["RETRIEVE_TOOL_OPENAI", "openai-chat"], ["RETRIEVE_TOOL_RESPONSES", "responses"],
 ];
 
 test("wire-contract A: every kernel-exported tool passes its wire validator", () => {
@@ -490,7 +488,6 @@ const BILI_CONSTANTS: Record<string, unknown> = {
     BILI_SEARCH_CONTEXT_TOOL, BILI_SEARCH_CONTEXT_TOOL_OPENAI, BILI_SEARCH_CONTEXT_TOOL_RESPONSES, BILI_SEARCH_CONTEXT_TOOL_GOOGLE,
     BILI_DECOMPRESS_TOOL, BILI_DECOMPRESS_TOOL_OPENAI, BILI_DECOMPRESS_TOOL_RESPONSES, BILI_DECOMPRESS_TOOL_GOOGLE,
     ABSORB_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, RULE_TOOL_GOOGLE,
-    RETRIEVE_TOOLS: retrieveToolsFor("acp_retrieve"),
 };
 
 test("wire-contract B: every bili-built tool surface passes its wire validator", () => {
@@ -504,12 +501,6 @@ test("wire-contract B: every bili-built tool surface passes its wire validator",
     for (const [constName, wire] of BILI_INDIVIDUALS) {
         const t = BILI_CONSTANTS[constName] as ToolShape;
         failures.push(...VALIDATORS[wire](syntheticBody(wire, t)).map((s) => `${constName}: ${s}`));
-    }
-    // retrieveToolsFor keys are {anthropic, openai, responses, google} — map onto this module's Wire names.
-    const r = BILI_CONSTANTS.RETRIEVE_TOOLS as { anthropic: ToolShape; openai: ToolShape; responses: ToolShape; google: ToolShape };
-    const retrieve: [Wire, ToolShape][] = [["anthropic", r.anthropic], ["openai-chat", r.openai], ["responses", r.responses], ["google", r.google]];
-    for (const [wire, t] of retrieve) {
-        failures.push(...VALIDATORS[wire](syntheticBody(wire, t)).map((s) => `retrieveToolsFor(acp_retrieve).${wire}: ${s}`));
     }
     assert.equal(failures.length, 0, `bili serves wire-illegal tool schemas:\n${failures.join("\n")}`);
 });
@@ -555,26 +546,25 @@ test("wire-contract C: default manifest serves only legal base tools", () => {
     assertManifestLegal(m, "default");
     const anthNames = new Set(m.tools.anthropic.map((t) => t.name));
     for (const n of BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name)) assert.ok(anthNames.has(n), `default manifest: base tool ${n} present`);
-    for (const optIn of ["absorb", "acp_retrieve"]) assert.ok(!anthNames.has(optIn), `default manifest: ${optIn} absent when disabled (#1192)`);
+    for (const optIn of ["absorb"]) assert.ok(!anthNames.has(optIn), `default manifest: ${optIn} absent when disabled (#1192)`);
     assert.ok(!anthNames.has("acp_rule"), "default manifest: acp_rule absent — opt-in like absorb (#1192 discipline)");
     const offM = captureManifest({ ...defaultConfig(100_000), rules: { enabled: false } });
     assert.ok(!new Set(offM.tools.anthropic.map((t) => t.name)).has("acp_rule"), "disabled manifest: acp_rule absent (#1192)");
     assertCompressFormsKept(m.tools.anthropic.find((t) => t.name === "compress") as ToolShape, "manifest-default");
 });
 
-test("wire-contract C: opt-in manifest advertises absorb/acp_rule/acp_retrieve legally", () => {
-    const config = { ...defaultConfig(100_000), absorb: { ...K.DEFAULT_ABSORB_CONFIG, enabled: true }, rules: { enabled: true }, ccr: { ...K.DEFAULT_CCR_CONFIG, enabled: true } };
+test("wire-contract C: opt-in manifest advertises absorb/acp_rule legally", () => {
+    const config = { ...defaultConfig(100_000), absorb: { ...K.DEFAULT_ABSORB_CONFIG, enabled: true }, rules: { enabled: true } };
     const m = captureManifest(config);
     assertManifestLegal(m, "optin");
     const anthNames = new Set(m.tools.anthropic.map((t) => t.name));
     const openAiNames = new Set(m.tools.openai.map((t) => toolNameOf("openai-chat", t)));
     const respNames = new Set(m.tools.responses.map((t) => t.name));
-    for (const n of ["absorb", "acp_rule", "acp_retrieve"]) {
+    for (const n of ["absorb", "acp_rule"]) {
         assert.ok(anthNames.has(n), `optin manifest: anthropic advertises ${n}`);
         assert.ok(openAiNames.has(n), `optin manifest: openai advertises ${n}`);
     }
     for (const n of ["absorb", "acp_rule"]) assert.ok(respNames.has(n), `optin manifest: responses advertises ${n}`);
-    assert.ok(!respNames.has("acp_retrieve"), "optin manifest: responses does NOT advertise acp_retrieve (#1271)");
     assertCompressFormsKept(m.tools.anthropic.find((t) => t.name === "compress") as ToolShape, "manifest-optin");
 });
 
@@ -697,7 +687,7 @@ interface Rig {
 
 // Opt-in features arm through bili's CompressSettings namespace (`opts.compress`),
 // resolved per request by resolveCompress + applyCompressSettings — not through
-// the raw kernelConfig (server.ts stamps effectiveCcr from compressCfg.ccr only).
+// the raw kernelConfig.
 async function startRig(fakeUrl: string, model: string, compressOverrides: Record<string, unknown>, rigOpts?: { dropFields?: string[]; protocol?: string }): Promise<Rig> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -770,12 +760,12 @@ for (const lane of LANES) {
     });
 }
 
-test("wire-contract D: opt-in lane (absorb+rules+ccr) forwards the extended surface legally", async () => {
+test("wire-contract D: opt-in lane (absorb+rules) forwards the extended surface legally", async () => {
     const lane = LANES[0];
     const fake = await startFakeUpstream(lane.wire);
     let rig: Rig | undefined;
     try {
-        rig = await startRig(fake.url, lane.model, { absorb: { enabled: true }, rules: true, ccr: { enabled: true } });
+        rig = await startRig(fake.url, lane.model, { absorb: { enabled: true }, rules: true });
         const res = await fetch(`${rig.proxyUrl}${lane.path}`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "wc-anth-optin" },
@@ -785,8 +775,8 @@ test("wire-contract D: opt-in lane (absorb+rules+ccr) forwards the extended surf
         await res.text();
         assert.equal(fake.violations.length, 0, `opt-in fake violations:\n${fake.violations.join("\n")}`);
         const fwdNames = extractForwardedNames(lane.wire, fake.requests[0].body);
-        const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames, "acp_rule", "absorb", "acp_retrieve"].sort();
-        assert.deepEqual(fwdNames.sort(), expected, "opt-in lane forwards base + acp_rule (rules:true) + absorb/acp_retrieve + client tools");
+        const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames, "acp_rule", "absorb"].sort();
+        assert.deepEqual(fwdNames.sort(), expected, "opt-in lane forwards base + acp_rule (rules:true) + absorb + client tools");
         const fwdTools = (fake.requests[0].body as ToolShape).tools;
         const compress = (Array.isArray(fwdTools) ? fwdTools : []).find((t) => (t as ToolShape).name === "compress") as ToolShape;
         assert.ok(compress, "opt-in forwarded body carries compress");

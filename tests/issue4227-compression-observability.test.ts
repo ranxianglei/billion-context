@@ -46,7 +46,7 @@ function makeCtx(messages: CoreMessage[], overrides?: Record<string, unknown>): 
         session: {
             id: "issue4227-metric",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -179,7 +179,7 @@ test("#4227 wiring: internal-lane receipts judge on the round's own offer, not t
     assert.equal(c0.state.blocks.filter((b) => b.active).length, 1, "fixture seeds one mid-history block");
     const session: Session = {
         id: "issue4227-wiring", meta: {}, metadata: {}, state: c0.state,
-        stats: { requests: 1, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 1200, compressCreditTokens: 0, contextTokens: 1200, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        stats: { requests: 1, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 1200, compressCreditTokens: 0, contextTokens: 1200, rangeRestores: 0 },
         pendingRetrievals: [], createdAt: Date.now(), lastSeen: Date.now(), blockContents: new Map(), inFlight: 0, persisted: false,
     };
     session.stats.lastInputTokensSource = "usage"; // usage-grade: statusInputBaseline returns it verbatim

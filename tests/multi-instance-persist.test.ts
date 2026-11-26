@@ -24,7 +24,7 @@ function makeSession(id: string): Session {
     return {
         id,
         meta: { protocol: "openai", upstreamOrigin: "http://upstream" },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -128,41 +128,6 @@ await withTempDir("documented residual: counter catch-up re-clobbers newer conte
     assert.equal(after.payload.metadata.lineage, "B-older", "CURRENT behavior: tie passthrough clobbers newer content");
     assert.equal(after.payload.stats.requests, 10, "counter itself does not roll back");
     assert.ok(!warnings.some((w) => w.includes("rejected stale snapshot")), "the clobbering write is silently accepted — that is the residual");
-    storeA.cancelAll();
-    storeB.cancelAll();
-});
-
-await withTempDir("content-store companion has no guard: last writer wins (documented degradation)", async (dir) => {
-    const storeA = new SessionStore({ dir, debounceMs: 1, enabled: true, log: () => {} });
-    const storeB = new SessionStore({ dir, debounceMs: 1, enabled: true, log: () => {} });
-
-    const mkEntry = (rawId: string): { hash: string; rawId: string; kind: string; tokens: number; chars: number; head: string } => ({ hash: `h-${rawId}`, rawId, kind: "shell output", tokens: 3, chars: 9, head: "A payload" });
-    const mkStore = (rawId: string): NonNullable<Session["contentStore"]> => ({ version: 1, byHash: { [`h-${rawId}`]: `payload ${rawId}` }, byRef: { [rawId]: mkEntry(rawId) } });
-    const a = makeSession("ccs");
-    a.stats.requests = 5;
-    a.contentStore = mkStore("r1");
-    a.contentStoreDirty = true;
-    await storeA.writeNow(a);
-
-    const b = makeSession("ccs");
-    b.stats.requests = 6; // fresher main record
-    b.contentStore = mkStore("r2");
-    b.contentStoreDirty = true;
-    await storeB.writeNow(b);
-
-    // The main envelope guard sees requests 6 > 5 → fine. The CONTENT-STORE
-    // companion file (persist.ts saveContentStore) has no lineage guard at
-    // all: B's byRef REPLACES A's — refs only A stored are now missing from
-    // disk (degraded retrieves, not main-record corruption). Pinned as-is.
-    let companion: string | null = null;
-    for (const d of readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory())) {
-        for (const f of readdirSync(join(dir, d.name))) {
-            if (f.endsWith(".content-store.json")) companion = join(dir, d.name, f);
-        }
-    }
-    assert.ok(companion, "content-store companion file must exist");
-    const parsed = JSON.parse(readFileSync(companion!, "utf8")) as { byRef: Record<string, { rawId: string }> };
-    assert.deepEqual(Object.keys(parsed.byRef).sort(), ["r2"], "CURRENT behavior: companion is last-writer-wins, A's r1 is gone");
     storeA.cancelAll();
     storeB.cancelAll();
 });

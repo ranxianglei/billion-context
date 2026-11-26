@@ -21,7 +21,7 @@ test("residentBreakdown attributes big fields and sums to total", () => {
     assert.ok(breakdown.lastMessages >= BIG * 2, `lastMessages attributed: ${breakdown.lastMessages}`);
     assert.ok(breakdown.blockContents >= (BIG / 2) * 2, `blockContents attributed: ${breakdown.blockContents}`);
     const fieldsSum = breakdown.lastMessages + breakdown.pluginSnapshot + breakdown.blockContents
-        + breakdown.contentStore + breakdown.state + breakdown.metadata + breakdown.other;
+        + breakdown.state + breakdown.metadata + breakdown.other;
     assert.equal(fieldsSum, breakdown.total, "columns sum to total (other absorbs the remainder)");
     assert.ok(breakdown.other >= 0 && breakdown.state > 0, "state weighed, other non-negative");
 });

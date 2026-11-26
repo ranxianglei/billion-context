@@ -59,7 +59,7 @@ async function freshSession(tag: string) {
     const session = {
         id: `refused-align-${tag}`,
         meta: { protocol: "anthropic" },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100000, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100000, compressCreditTokens: 0, contextTokens: 0, rangeRestores: 0 },
         metadata: {},
         state: first.state,
         createdAt: Date.now(),

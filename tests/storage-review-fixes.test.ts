@@ -180,20 +180,12 @@ test("review 3: corrupt index.db alarms loudly — boots envelope-served, files 
     }
 });
 
-test("reviews 4+5: restore refuses live-id overwrite and materializes the CCR sidecar", async () => {
+test("reviews 4+5: restore refuses live-id overwrite and lands a fresh id", async () => {
     await withMode("shadow", async () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-review-restore-"));
         try {
-            const session = loadCorpusCase(dir, "ccr", "corpus-ccr", "responses");
-            // Graft a content store so the replica freezes real CCR payloads
-            // (same graft as tests/export-jsonl.test.ts).
-            session.contentStore = {
-                version: 1,
-                byHash: { h1: "THE ORIGINAL LONG TEXT" },
-                byRef: { m00001: { hash: "h1", rawId: "raw-1", kind: "file read", tokens: 5, chars: 22, head: "ORIGINAL HEAD" } },
-            } as typeof session.contentStore;
-            session.contentStoreDirty = true;
-            const store = new SessionStore({ dir: path.join(dir, "ccr"), debounceMs: 1, enabled: true });
+            const session = loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
+            const store = new SessionStore({ dir: path.join(dir, "folded"), debounceMs: 1, enabled: true });
             await store.writeNow(session);
             store.cancelAll();
 
@@ -209,20 +201,6 @@ test("reviews 4+5: restore refuses live-id overwrite and materializes the CCR si
             const out = await store.restoreReplica(replica.cp_id);
             assert.ok(out.sessionId.startsWith("restore-"), "default restore target is a fresh id");
             store.closeQuietly();
-
-            // Review 6 (durability half): the restored id must own a materialized
-            // content-store sidecar — the record alone loses forkContentStore on
-            // the next live save (no fork receipt), so the sidecar is the layer
-            // that survives save/restart cycles. Prove it through the REAL load
-            // path (fresh handle, no cache): loadSync + loadContentStore must
-            // hand back the stored CCR originals.
-            const fresh = new SessionStore({ dir: path.join(dir, "ccr"), debounceMs: 1, enabled: true });
-            const restored = fresh.loadSync(out.sessionId, { protocol: "responses", upstreamOrigin: "http://127.0.0.1:8199" });
-            assert.ok(restored, "restored session must reload from disk");
-            const ccr = fresh.loadContentStore(restored);
-            assert.ok(ccr, "restored session must resolve a content-store sidecar");
-            assert.equal(ccr!.byHash.h1, "THE ORIGINAL LONG TEXT", "CCR originals must survive the restore");
-            fresh.closeQuietly();
         } finally {
             rmBestEffort(dir);
         }

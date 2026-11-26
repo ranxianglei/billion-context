@@ -289,7 +289,7 @@ function storeSession(id: string, tail: CoreMessage[]): LegacySessionLike {
         meta: { protocol: "openai" }, stats: {}, metadata: {},
         state: { blocks: [blk as never], nextBlockId: 2, nextRunId: 2, messageRefs: { byRaw, byRef } },
         blockContents: new Map(), lastMessages: tail, lastMessagesFolded: false,
-        pluginSnapshot: undefined, contentStore: undefined,
+        pluginSnapshot: undefined,
     };
 }
 

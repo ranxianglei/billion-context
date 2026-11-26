@@ -35,7 +35,7 @@ function makeCtx(): LoopCtx {
         session: {
             id: "issue5495-unsigned-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),

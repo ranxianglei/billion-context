@@ -20,7 +20,7 @@ function input(count = 8, sessionId = "target"): IngestSessionInput {
             role: seq % 2 ? "assistant" : "user", kind: "text", ts: 1000 + seq,
             content: JSON.stringify({ id: `m${seq}`, role: seq % 2 ? "assistant" : "user", contentType: "text", text: `${sessionId} ${seq} 日本語 😀\u0000` }),
         })),
-        blocks: [], refs: [], deadRefs: [], ccrEntries: [],
+        blocks: [], refs: [], deadRefs: [],
     };
 }
 

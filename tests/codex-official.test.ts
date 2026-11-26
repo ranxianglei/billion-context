@@ -51,7 +51,7 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true, ccr: { enabled: true }, rules: true },
+        compress: { injectTool: true, injectNudge: true, rules: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,

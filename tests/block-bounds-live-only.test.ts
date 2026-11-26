@@ -60,7 +60,6 @@ function session(id: string, tail: CoreMessage[]): LegacySessionLike {
         lastMessages: tail,
         lastMessagesFolded: false,
         pluginSnapshot: undefined,
-        contentStore: undefined,
     };
 }
 

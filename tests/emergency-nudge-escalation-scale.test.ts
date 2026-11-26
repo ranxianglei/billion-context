@@ -67,11 +67,6 @@ function makeSession(): Session {
             lastInputTokens: 0,
             compressCreditTokens: 0,
             contextTokens: 0,
-            retrieveCalls: 0,
-            retrieveHits: 0,
-            retrieveMisses: 0,
-            storedBytes: 0,
-            storeBytesSaved: 0,
             rangeRestores: 0,
         },
     };

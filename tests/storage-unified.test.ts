@@ -101,7 +101,6 @@ function sessionDigest(view: ReturnType<typeof loadLegacyView>): string {
         lastMessages: view.lastMessages,
         lastMessagesFolded: view.lastMessagesFolded,
         pluginSnapshot: view.pluginSnapshot,
-        contentStore: view.contentStore,
     })));
 }
 
@@ -175,7 +174,7 @@ function runCase(engine: SqliteEngineName, name: string): void {
                 deadRefs: store.getDeadRefs(loaded.id),
                 refs: store.getRefs(loaded.id),
             };
-            const view = loadLegacyView(rows, store.getCcrEntries(loaded.id), store.getStateFields(loaded.id));
+            const view = loadLegacyView(rows, store.getStateFields(loaded.id));
             assert.equal(sessionDigest(view), manifest[name]!.digest, `${engine}/${name}: unified round-trip digest drift`);
         } finally {
             store.close();
@@ -239,7 +238,7 @@ test("storage unified: re-ingest is idempotent across the whole corpus (digest s
                     deadRefs: store.getDeadRefs(loaded.id),
                     refs: store.getRefs(loaded.id),
                 };
-                assert.equal(sessionDigest(loadLegacyView(rows, store.getCcrEntries(loaded.id), store.getStateFields(loaded.id))), manifest[name]!.digest, `${name}: digest drift after re-ingest`);
+                assert.equal(sessionDigest(loadLegacyView(rows, store.getStateFields(loaded.id))), manifest[name]!.digest, `${name}: digest drift after re-ingest`);
             } finally {
                 store.close();
             }
@@ -306,7 +305,7 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                     // what the override received, whichever that is.
                     const overridePresent = !!liveTail && liveTail.length > 0 && liveFolded !== true;
                     assert.equal(
-                        sessionDigest(loadLegacyView(rows, unified.getCcrEntries(loaded.id), unified.getStateFields(loaded.id))),
+                        sessionDigest(loadLegacyView(rows, unified.getStateFields(loaded.id))),
                         overridePresent
                             ? recordDigest({ ...written, messages: liveTail, messagesFolded: liveFolded })
                             : recordDigest(written),
@@ -646,7 +645,6 @@ test("storage: sliding folded tail replays the latest turn, not the first", () =
                 lastMessages: [msg],
                 lastMessagesFolded: true,
                 pluginSnapshot: undefined,
-                contentStore: undefined,
             };
             return legacy;
         };
@@ -710,7 +708,6 @@ test("storage: block ids are per-session — no cross-session steal in one db", 
                 lastMessages: undefined,
                 lastMessagesFolded: undefined,
                 pluginSnapshot: undefined,
-                contentStore: undefined,
             };
         };
         store.ingestSession(planIngest(mkSession("sess-A", 3)));
@@ -978,7 +975,6 @@ test("#6325: unchanged large session columns are not rewritten on delta ingest",
             lastMessages: [{ id: "m1", role: "user", contentType: "text", text } as unknown as CoreMessage],
             lastMessagesFolded: false,
             pluginSnapshot: undefined,
-            contentStore: undefined,
         } as unknown as LegacySessionLike);
         const session = makeSession("sess-6325", "hello");
         const before = store.ingestSession(planIngest(session));

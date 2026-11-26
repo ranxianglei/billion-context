@@ -21,7 +21,7 @@ function input(sessionId = "target"): IngestSessionInput {
             seq, msgId: `m${seq}`, ref: null, refNum: null, role: "user", kind: "message",
             content: JSON.stringify({ id: `m${seq}`, role: "user", contentType: "text", text: `source ${seq}` }),
         })),
-        refs: [], deadRefs: [], ccrEntries: [], orphansJson: orphan,
+        refs: [], deadRefs: [], orphansJson: orphan,
         blocks: ["b-z", "b-c", "b-b", "b-a"].map((blockId, i) => {
             const summary = JSON.stringify({ text: `${sessionId} ${blockId} 海🌊\u0000`, count: 2 });
             const one = i === 3 ? null : i === 0 ? summary : JSON.stringify({ text: `one ${blockId}`, count: 1 });

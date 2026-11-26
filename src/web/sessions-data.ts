@@ -257,11 +257,6 @@ interface WebOverview {
 interface WebSessionDetail extends WebSessionSummary {
     lastInputTokens: number;
     compressCreditTokens: number;
-    retrieveCalls: number;
-    retrieveHits: number;
-    retrieveMisses: number;
-    storedBytes: number;
-    storeBytesSaved: number;
     /** #3671 direction 4: decompress usage — whole-block restores, how many of
      *  those had a cheaper precise path available at restore time (#1336), and
      *  range restores. Lets a human judge what the retained originals are worth. */
@@ -1566,11 +1561,6 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         ...summaryOf(session, live),
         lastInputTokens: session.stats.lastInputTokens,
         compressCreditTokens: session.stats.compressCreditTokens,
-        retrieveCalls: session.stats.retrieveCalls,
-        retrieveHits: session.stats.retrieveHits,
-        retrieveMisses: session.stats.retrieveMisses,
-        storedBytes: session.stats.storedBytes,
-        storeBytesSaved: session.stats.storeBytesSaved,
         wholeBlockRestores: session.stats.wholeBlockRestores ?? 0,
         wholeBlockRestoresPreciseAvailable: session.stats.wholeBlockRestoresPreciseAvailable ?? 0,
         rangeRestores: session.stats.rangeRestores,

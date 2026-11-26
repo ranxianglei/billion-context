@@ -207,7 +207,7 @@ function makeSession(overrides?: Partial<Session["stats"]> & { metadata?: Record
     return {
         id: "issue3148-test",
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 15000, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0, ...overrides },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 15000, compressCreditTokens: 0, contextTokens: 0, rangeRestores: 0, ...overrides },
         metadata: overrides?.metadata ?? {},
         state: createInitialState(),
         createdAt: Date.now(),
