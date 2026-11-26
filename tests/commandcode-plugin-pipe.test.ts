@@ -50,15 +50,15 @@ test("plugin JSONL pipe: prose tag-echo is stripped, everything else is byte-ver
     const finish = JSON.stringify({ type: "finish", finishReason: "stop", totalUsage: { inputTokens: 11, outputTokens: 7 } });
     const junk = "not json at all";
     const { res, out } = makeCollector();
-    await pipePluginJsonlWithStrip(jsonlStream([dirty, usage, finish, junk]), res);
+    await pipePluginJsonlWithStrip(jsonlStream([dirty, usage, junk, finish]), res);
     const lines = out().split("\n").filter((l) => l.length > 0);
     assert.equal(lines.length, 4, "four lines out for four in");
     const textEv = JSON.parse(lines[0]) as { type: string; text: string };
     assert.equal(textEv.type, "text-delta");
     assert.equal(textEv.text, clean, "render tag stripped from prose");
     assert.equal(lines[1], usage, "non-prose line passes byte-verbatim");
-    assert.equal(lines[3], junk, "malformed JSON line passes byte-verbatim");
-    assert.equal(lines[2], finish, "finish passes byte-verbatim");
+    assert.equal(lines[2], junk, "malformed JSON line before the terminal passes byte-verbatim");
+    assert.equal(lines[3], finish, "finish passes byte-verbatim");
 });
 
 test("plugin JSONL pipe: clean prose survives to a terminal finish; unresolvable tag fragment is dropped", async () => {
