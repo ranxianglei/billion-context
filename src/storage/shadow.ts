@@ -385,6 +385,13 @@ export class UnifiedShadow {
             : { name: "mysql", source: "network" };
     }
 
+    /** #7561: the sqlite file behind this shadow (null on network backends) —
+     *  the online-backup worker opens it read-only to run VACUUM INTO off the
+     *  proxy's event loop. */
+    get dbFilePath(): string | null {
+        return this.dbPath;
+    }
+
     /** Opens the sidecar when a knob asks for one; null (no cost) otherwise.
      *  THROWS when the environment is broken (transient open failures) or
      *  when a PROVEN-corrupt index would leave a pure-sqlite process without
