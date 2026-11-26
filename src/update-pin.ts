@@ -30,7 +30,7 @@ import { parseDurationField } from "./duration.js";
 /** Provenance of a pin set by `bili install <ref>` (#7806). `ref` is the
  *  user-supplied ref (PR number / branch / tag / master); `sha` is the exact
  *  commit the installed tree was built from. */
-export interface PinSource {
+interface PinSource {
     kind: "git";
     ref: string;
     sha: string;
@@ -105,7 +105,7 @@ export async function clearPin(): Promise<boolean> {
     return true;
 }
 
-export type PinState =
+type PinState =
     | { kind: "none" }
     | { kind: "active"; pin: PinRecord }
     | { kind: "expired"; pin: PinRecord }

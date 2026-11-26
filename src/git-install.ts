@@ -89,7 +89,7 @@ function resolveNpmExec(): { file: string; argsPrefix: string[] } {
 }
 
 /** A ref the user passed to `bili install`. */
-export interface ResolvedRef {
+interface ResolvedRef {
     /** The git ref to fetch (branch name / tag / `pull/<n>/head`). */
     gitRef: string;
     /** True when the ref is a PR head. */
@@ -214,7 +214,7 @@ function verifyInstall(installDir: string): string {
     return version;
 }
 
-export interface InstallResult {
+interface InstallResult {
     ok: true;
     /** The version now on disk (from the cloned package.json). */
     version: string;
@@ -230,7 +230,7 @@ export interface InstallResult {
     pinUntil?: number;
 }
 
-export interface InstallError {
+interface InstallError {
     ok: false;
     error: string;
 }
@@ -292,7 +292,7 @@ export async function installFromGitRef(refInput: string, durationText?: string)
     }
 }
 
-export interface InstallStatus {
+interface InstallStatus {
     /** True when the on-disk pin records a git-source (dev) install. */
     hasDevInstall: boolean;
     /** The on-disk version the pin holds (undefined = pin absent/foreign). */
