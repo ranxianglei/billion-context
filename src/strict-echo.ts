@@ -10,9 +10,18 @@ import type { Logger } from "./logger.js";
  *  reasoning_text, #2169 — see the loop's UpstreamHttpError handler), then static
  *  detection: the upstream origin OR the request's own model id (#1027 —
  *  DeepSeek models served from non-deepseek gateways never trip the host
- *  check, so every fresh session re-paid the 400 through the learned flag). */
-export function isStrictReasoningEcho(session: Session, upstreamOrigin: string | undefined, model?: string): boolean {
+ *  check, so every fresh session re-paid the 400 through the learned flag).
+ *  #5257: an operator verdict (`configured`, from providers.<url>.models.<m>
+ *  .strictReasoningEcho / providers.<url>.strictReasoningEcho) beats the
+ *  static detection — explicit false stops the blank-echo injection for
+ *  gateways whose schema REJECTS the field (Mistral answers 422, and its
+ *  error never mentions the field so the learned flag can never rescue). The
+ *  learned flag still outranks the verdict: a real upstream 400 naming the
+ *  reasoning field is direct evidence the echo is required, whatever the
+ *  operator declared. */
+export function isStrictReasoningEcho(session: Session, upstreamOrigin: string | undefined, model?: string, configured?: boolean): boolean {
     if (session.metadata.strictReasoningEcho === true) return true;
+    if (configured === true || configured === false) return configured;
     if (upstreamOrigin !== undefined && /deepseek/i.test(upstreamOrigin)) return true;
     return typeof model === "string" && model.length > 0 && /deepseek/i.test(model);
 }

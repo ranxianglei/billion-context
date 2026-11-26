@@ -5,7 +5,7 @@ import { recordNudgeInject } from "../cache-ledger.js";
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
-import { effectivePromptCacheRouting } from "../config.js";
+import { effectivePromptCacheRouting, resolveStrictReasoningEcho } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
@@ -162,6 +162,12 @@ export async function prepareOpenai(
     // core.processTurn — see planReasoningDrop for why the post-turn view is
     // too late (the kernel hides consumed call+result pairs inside it).
     let reasoningPlan = new Set<string>();
+    // #5257: operator strict-echo verdict (providers.<url>.models.<m>
+    // .strictReasoningEcho / providers.<url>.strictReasoningEcho) — passed to
+    // every isStrictReasoningEcho below so a gateway whose schema rejects the
+    // injected reasoning_content field (Mistral 422) can opt out; undefined =
+    // the static /deepseek/ detection applies unchanged.
+    const strictEchoConfigured = resolveStrictReasoningEcho(opts.routes, billingUpstream ?? upstreamOrigin, modelIdOf(parsed));
     let attachedRetrievals: PendingRetrieval[] = [];
     let attachedRetrievalNoteIds: string[] = [];
     let originalMessages: CoreMessage[] = [];
@@ -509,7 +515,7 @@ export async function prepareOpenai(
         // #3222: BEFORE processTurn — its hide-compress-calls node removes
         // inactive call+result pairs inside, which would strip the anchors
         // this pass needs (the leak applies to the bare name too).
-        reasoningPlan = planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+        reasoningPlan = planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed), strictEchoConfigured));
         // #4528: processTurn is the largest single synchronous pass over the
         // resent history; yield before it so UI/API requests that queued during
         // this turn are served, not frozen behind the whole turn.
@@ -786,7 +792,7 @@ export async function prepareOpenai(
                 const ranges = turn.nudge.compressibleRanges ?? [];
                 // Mirror the post-try strict-echo repair on the stable prefix so
                 // the side call's bytes match the main request's cache line.
-                const stable = normalizeStrictEchoReasoning([...rebuiltMessages], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+                const stable = normalizeStrictEchoReasoning([...rebuiltMessages], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed), strictEchoConfigured), log, sessionId);
                 const sideBody: Record<string, unknown> = { ...parsed, messages: [...stable, { role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut as OpenAITool[] | undefined, stream: false };
                 sideBody[typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens"] = decide.maxTokens;
                 delete sideBody.prompt_cache_retention;
@@ -856,7 +862,7 @@ export async function prepareOpenai(
 
     // #762: repair the strict-echo rejection class BEFORE the sentinel sees
     // the array — a normalized body must not fire its own canary.
-    rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+    rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed), strictEchoConfigured), log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
     clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });

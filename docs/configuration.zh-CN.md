@@ -376,6 +376,7 @@
 | `models.output` | number | unset | — | 为该模型名声明的输出 token 上限。 |
 | `models.compress` | object | unset | — | 该模型的第 3 级压缩覆盖（全局→provider→模型合并中最深）。 |
 | `models.benefit` | boolean | false | — | 在经济学账本中标记该模型为免费额度计费。 |
+| `models.strictReasoningEcho` | boolean | unset (provider-level, then static detection) | — | 逐模型 strict-echo 开关（#5257，最深层）：false 表示即使该模型 id 匹配 /deepseek/i 也不注入空白 reasoning_content（Mistral 等网关会以 422 拒绝该字段）；true 强制注入。优先于 provider 级设置，但让位于会话学习到的标志。 |
 | `proxy` | string ("" = explicit direct) | unset | — | 本路由出站代理地址。 |
 | `compressProtocol` | "tools" (default) \| "marker" | "tools" | — | 本通道的 ACP 注入面。 |
 | `protocol` | "anthropic" \| "openai" \| "responses" \| "google" | inferred from the URL marker | — | 声明本通道的线上协议；客户端侧 /bili/<protocol>/ URL 标记优先级更高。 |
@@ -391,6 +392,7 @@
 | `credentialRef` | string (store name) | unset | — | 经私有摘要凭据存储的通道凭据覆盖（secret:NAME 语义）。 |
 | `calibration` | { disabled?: boolean, max?: number } | unset (learned k̂ applies) | — | 按路由的 k̂ 校准策略（#3211）：对虚报报数线路做退出或钳制；见[线路级 k̂ 校准策略](#route-level-k-calibration-policy)。 |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | 仅命名条目：把非 http(s) baseUrl 供应商纳入压缩所有权（pi/omp 车道）；与 env BILI_NON_HTTP_PROVIDERS 取并集。 |
+| `strictReasoningEcho` | boolean | unset (static /deepseek/ detection + learned flag) | — | 逐 provider 的 strict-echo 开关（#5257）：false 表示即使模型 id 匹配 /deepseek/i 也不在该路由注入空白 reasoning_content（针对 Mistral 等以 422 拒绝该字段的网关）；true 强制注入。让位于逐模型条目与会话学习到的标志。 |
 
 **仅环境变量（无配置文件键）**
 

@@ -70,6 +70,13 @@ export type ProviderRoute = {
     protocol?: WireProtocol;
     /** Per-provider compression overrides (level 2 of 3). See CompressSettings. */
     compress?: CompressSettings;
+    /** #5257 per-provider strict-echo opt in/out — beats the static
+     *  /deepseek/ origin+model-id detection, loses to a per-model entry and
+     *  to the session's learned flag (set after a real upstream 400 that
+     *  names the reasoning field). `false` for a gateway like Mistral whose
+     *  schema rejects the injected `reasoning_content` with 422; `true`
+     *  forces the echo for a host/model the /deepseek/ match misses. */
+    strictReasoningEcho?: boolean;
     /** Per-provider wire-compat overrides. `roles` maps message roles to the
      *  role name this upstream accepts (e.g. `"developer": "system"`) —
      *  applied at the forward boundary to the FINAL wire body, covering
@@ -201,6 +208,12 @@ export type ModelEntry = {
     /** #3376 per-model idle-cache-keepalive override — the deepest config
      *  tier (env > model > provider > global) for that model's snapshots. */
     cacheKeepalive?: CacheKeepaliveSettings;
+    /** #5257 per-model strict-echo opt in/out — the deepest tier (model >
+     *  provider > static /deepseek/ detection). `false` stops bili from
+     *  injecting the blank `reasoning_content` echo for THIS model even when
+     *  its id matches /deepseek/i (gateways like Mistral reject the field
+     *  with 422); `true` forces the echo for a non-matching id. */
+    strictReasoningEcho?: boolean;
 };
 
 /** User-facing compression tuning. Configurable at three levels — global
@@ -969,6 +982,28 @@ export function resolveConfiguredContextLimit(
     const m = resolveModelEntry(routes, upstreamUrl, model).entry;
     if (m?.context && m.context > 0) return m.context;
     return undefined;
+}
+
+/** #5257: resolved strict-echo verdict for a request's provider/model —
+ *  explicit `false` opts the route (or just the model) OUT of the static
+ *  /deepseek/ detection so gateways that reject the injected
+ *  `reasoning_content` field (Mistral 422) are never patched; explicit
+ *  `true` forces it in. Model level wins over provider level; unset at both
+ *  returns undefined and the static detection applies unchanged. The
+ *  session's learned flag (real upstream 400 evidence) outranks any verdict
+ *  here — see isStrictReasoningEcho. */
+export function resolveStrictReasoningEcho(
+    routes: ProviderRoutes,
+    upstreamUrl: string | undefined,
+    model?: string | undefined,
+): boolean | undefined {
+    const route = findRoute(routes, upstreamUrl);
+    if (!route) return undefined;
+    if (model && route.models) {
+        const m = resolveModelEntryOnModels(route.models, model).entry;
+        if (typeof m?.strictReasoningEcho === "boolean") return m.strictReasoningEcho;
+    }
+    return route.strictReasoningEcho;
 }
 
 /** #924: the operator-declared max OUTPUT of a model (ModelEntry.output,
@@ -3188,13 +3223,14 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; cacheKeepalive?: unknown; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; cacheKeepalive?: unknown; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown; strictReasoningEcho?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
         const declaredProtocol = parseDeclaredWireProtocol(obj.protocol);
         if (declaredProtocol !== undefined) route.protocol = declaredProtocol;
         if (obj.compress) route.compress = obj.compress;
+        if (obj.strictReasoningEcho === true || obj.strictReasoningEcho === false) route.strictReasoningEcho = obj.strictReasoningEcho;
         const cacheKeepalive = parseCacheKeepaliveSettings(obj.cacheKeepalive);
         if (cacheKeepalive) route.cacheKeepalive = cacheKeepalive;
         // Per-model keepalive blocks share the same strict parser (#1909

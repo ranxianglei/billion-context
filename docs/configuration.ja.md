@@ -373,6 +373,7 @@
 | `models.output` | number | unset | — | このモデル名に対して宣言された出力トークン上限。 |
 | `models.compress` | object | unset | — | このモデルのレベル3圧縮オーバーライド（グローバル→プロバイダー→モデルのマージの中で最も深い）。 |
 | `models.benefit` | boolean | false | — | エコノミクス台帳において、このモデルの無料クォータ課金をマークする。 |
+| `models.strictReasoningEcho` | boolean | unset (provider-level, then static detection) | — | モデルごとの strict-echo の opt in/out（#5257、最深层）: false はモデル ID が /deepseek/i に一致しても空の reasoning_content 注入を止めます（Mistral 系のゲートウェイは 422 で拒否）。true は強制。プロバイダ単位より優先、学習フラグには譲る。 |
 | `proxy` | string ("" = explicit direct) | unset | — | ルートごとのアウトバウンドプロキシURL。 |
 | `compressProtocol` | "tools" (default) \| "marker" | "tools" | — | このレーンが使用するACPインジェクションサーフェス。 |
 | `protocol` | "anthropic" \| "openai" \| "responses" \| "google" | inferred from the URL marker | — | このレーンのワイヤプロトコルを宣言する; クライアント側の /bili/<protocol>/ URLマーカーは宣言よりも優先される。 |
@@ -388,6 +389,7 @@
 | `credentialRef` | string (store name) | unset | — | プライベートなサマリー認証情報ストア経由のレーン認証情報オーバーライド（secret:NAME セマンティクス）。 |
 | `calibration` | { disabled?: boolean, max?: number } | unset (learned k̂ applies) | — | ルート単位の k̂ 較正ポリシー (#3211)：使用量レポートが膨張するルートに対するオプトアウトまたはクランプ；[Route-level k̂ calibration policy](#route-level-k-calibration-policy) を参照。 |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | 名前付きエントリのみ：非 http(s)-baseUrl のプロバイダーを compaction 所有権にオプトイン（pi/omp レーン）；環境変数 BILI_NON_HTTP_PROVIDERS と union します。 |
+| `strictReasoningEcho` | boolean | unset (static /deepseek/ detection + learned flag) | — | プロバイダ単位の strict-echo の opt in/out（#5257）: false はモデル ID が /deepseek/i に一致してもこのルートの空の reasoning_content 注入を止めます（422 で拒否する Mistral 系ゲートウェイ向け）。true は強制。モデル単位エントリと学習フラグには譲る。 |
 
 **環境変数のみ（設定ファイルキーなし）**
 

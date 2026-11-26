@@ -376,6 +376,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `models.output` | number | unset | — | Output token ceiling declared for this model name. |
 | `models.compress` | object | unset | — | Level-3 compression overrides for this model (deepest in the global→provider→model merge). |
 | `models.benefit` | boolean | false | — | Marks free-quota billing for this model in the economics ledger. |
+| `models.strictReasoningEcho` | boolean | unset (provider-level, then static detection) | — | Per-model strict-echo opt in/out (#5257, deepest tier): false stops bili from injecting the blank reasoning_content echo for THIS model even when its id matches /deepseek/i (gateways like Mistral reject the field with 422); true forces the echo. Wins over the provider-level entry, loses to the session's learned flag. |
 | `proxy` | string ("" = explicit direct) | unset | — | Per-route outbound proxy URL. |
 | `compressProtocol` | "tools" (default) \| "marker" | "tools" | — | Which ACP injection surface this lane speaks. |
 | `protocol` | "anthropic" \| "openai" \| "responses" \| "google" | inferred from the URL marker | — | Declare this lane's wire protocol; a client-side /bili/<protocol>/ URL marker outranks the declaration. |
@@ -391,6 +392,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `credentialRef` | string (store name) | unset | — | Lane credential override via the private summary-credential store (secret:NAME semantics). |
 | `calibration` | { disabled?: boolean, max?: number } | unset (learned k̂ applies) | — | Per-route k̂ calibration policy (#3211): opt-out or clamp for routes whose usage reports inflate; see [Route-level k̂ calibration policy](#route-level-k-calibration-policy). |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS. |
+| `strictReasoningEcho` | boolean | unset (static /deepseek/ detection + learned flag) | — | Per-provider strict-echo opt in/out (#5257): false stops bili from injecting the blank reasoning_content echo on this route even when the model id matches /deepseek/i (for gateways like Mistral whose schema rejects the field with 422); true forces the echo. Loses to a per-model entry and to the session's learned flag. |
 
 **Environment-only variables**
 

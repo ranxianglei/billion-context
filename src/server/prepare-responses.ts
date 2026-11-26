@@ -5,7 +5,7 @@ import { recordNudgeInject } from "../cache-ledger.js";
 import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
-import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
+import { effectivePromptCacheRouting, resolveCompressProtocol, resolveStrictReasoningEcho, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
 import { isSubagentPrompt } from "../session-title.js";
@@ -83,6 +83,12 @@ export async function prepareResponses(
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
     let reasoningPlan = new Set<string>();
+    // #5257: operator strict-echo verdict (providers.<url>.models.<m>
+    // .strictReasoningEcho / providers.<url>.strictReasoningEcho) — passed to
+    // every isStrictReasoningEcho below so a gateway whose schema rejects the
+    // injected reasoning echo (Mistral 422) can opt out on the Responses lane
+    // too; undefined = the static /deepseek/ detection applies unchanged.
+    const strictEchoConfigured = resolveStrictReasoningEcho(opts.routes, billingUpstream ?? upstreamOrigin, modelIdOf(parsed));
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
@@ -443,7 +449,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // #3222: BEFORE processTurn — its hide-compress-calls node removes
         // inactive call+result pairs inside, which would strip the anchors
         // this pass needs (the leak applies to the bare name too).
-        reasoningPlan = planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+        reasoningPlan = planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed), strictEchoConfigured));
         // #4528: processTurn is the largest single synchronous pass over the
         // resent history; yield before it so UI/API requests that queued during
         // this turn are served, not frozen behind the whole turn.
@@ -664,7 +670,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 // the side call's bytes match the main request's cache line.
                 const stableItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                     ? [{ type: "message", role: "user", content: rebuiltInput }]
-                    : normalizeStrictEchoResponsesInput([...rebuiltInput], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+                    : normalizeStrictEchoResponsesInput([...rebuiltInput], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed), strictEchoConfigured), log, sessionId);
                 const sideBody: Record<string, unknown> = { ...parsed, input: [...stableItems, { type: "message", role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut, stream: false, max_output_tokens: decide.maxTokens };
                 stripDecisionReasoningFields("responses", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "responses", sideBody, session, log });
@@ -762,7 +768,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // #1479: Responses-wire twin of the #762 repair — fold + kernel round-trip
     // can leave a tool-call run without its reasoning item. Repair BEFORE the
     // sentinel sees the array (a normalized body must not fire its own canary).
-    if (Array.isArray(rebuiltInput)) rebuiltInput = normalizeStrictEchoResponsesInput(rebuiltInput, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+    if (Array.isArray(rebuiltInput)) rebuiltInput = normalizeStrictEchoResponsesInput(rebuiltInput, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed), strictEchoConfigured), log, sessionId);
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {

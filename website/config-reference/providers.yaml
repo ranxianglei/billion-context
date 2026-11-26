@@ -41,6 +41,13 @@ entries:
     desc_en: "Marks free-quota billing for this model in the economics ledger."
     desc_zh: "在经济学账本中标记该模型为免费额度计费。"
     desc_ja: "エコノミクス台帳において、このモデルの無料クォータ課金をマークする。"
+  - key: models.strictReasoningEcho
+    type: boolean
+    default: "unset (provider-level, then static detection)"
+    group: providers
+    desc_en: "Per-model strict-echo opt in/out (#5257, deepest tier): false stops bili from injecting the blank reasoning_content echo for THIS model even when its id matches /deepseek/i (gateways like Mistral reject the field with 422); true forces the echo. Wins over the provider-level entry, loses to the session's learned flag."
+    desc_zh: "逐模型 strict-echo 开关（#5257，最深层）：false 表示即使该模型 id 匹配 /deepseek/i 也不注入空白 reasoning_content（Mistral 等网关会以 422 拒绝该字段）；true 强制注入。优先于 provider 级设置，但让位于会话学习到的标志。"
+    desc_ja: "モデルごとの strict-echo の opt in/out（#5257、最深层）: false はモデル ID が /deepseek/i に一致しても空の reasoning_content 注入を止めます（Mistral 系のゲートウェイは 422 で拒否）。true は強制。プロバイダ単位より優先、学習フラグには譲る。"
   - key: proxy
     type: "string (\"\" = explicit direct)"
     default: "unset"
@@ -207,3 +214,10 @@ entries:
     desc_ja: "名前付きエントリのみ：非 http(s)-baseUrl のプロバイダーを compaction 所有権にオプトイン（pi/omp レーン）；環境変数 BILI_NON_HTTP_PROVIDERS と union します。"
     site_en: "Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS."
     site_zh: "仅命名条目：把非 http(s) baseUrl 供应商纳入压缩所有权（pi/omp 车道）；与 env BILI_NON_HTTP_PROVIDERS 取并集。"
+  - key: strictReasoningEcho
+    type: boolean
+    default: "unset (static /deepseek/ detection + learned flag)"
+    group: providers
+    desc_en: "Per-provider strict-echo opt in/out (#5257): false stops bili from injecting the blank reasoning_content echo on this route even when the model id matches /deepseek/i (for gateways like Mistral whose schema rejects the field with 422); true forces the echo. Loses to a per-model entry and to the session's learned flag."
+    desc_zh: "逐 provider 的 strict-echo 开关（#5257）：false 表示即使模型 id 匹配 /deepseek/i 也不在该路由注入空白 reasoning_content（针对 Mistral 等以 422 拒绝该字段的网关）；true 强制注入。让位于逐模型条目与会话学习到的标志。"
+    desc_ja: "プロバイダ単位の strict-echo の opt in/out（#5257）: false はモデル ID が /deepseek/i に一致してもこのルートの空の reasoning_content 注入を止めます（422 で拒否する Mistral 系ゲートウェイ向け）。true は強制。モデル単位エントリと学習フラグには譲る。"

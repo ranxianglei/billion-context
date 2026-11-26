@@ -7,6 +7,7 @@ import { rewriteInboundThreadContinue } from "./thread-tracking.js";
 import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforgeEnabled } from "./threads-lane.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
+import { resolveStrictReasoningEcho } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, dedupeAdjacentOutputConfig, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
 import { isSubagentPrompt } from "../session-title.js";
@@ -418,7 +419,11 @@ export async function prepareAnthropic(
         // #3222: BEFORE processTurn — its hide-compress-calls node removes
         // inactive call+result pairs inside, which would strip the anchors
         // this pass needs (the leak applies to the bare name too).
-        reasoningPlan = planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+        // #5257: operator verdict (model > provider > static detection) — see
+        // resolveStrictReasoningEcho; the Anthropic lane has no separate
+        // billing upstream, so the target origin is the route identity.
+        const strictEchoConfigured = resolveStrictReasoningEcho(opts.routes, upstreamOrigin, resolvedModel ?? modelIdOf(parsed));
+        reasoningPlan = planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed), strictEchoConfigured));
         // #4528: processTurn is the largest single synchronous pass over the
         // resent history; yield before it so UI/API requests that queued during
         // this turn are served, not frozen behind the whole turn.
