@@ -1654,7 +1654,24 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // gate now run ABOVE the commit (before `ctx.session.state = res.state`)
         // so a zero/negative net fold is refused before it rewrites the prefix
         // cache; `const r` is defined there too.
-        const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
+        // #6855: the success headline must echo the EFFECTIVE (clamped) range,
+        // not the requested one — a clamped success that still prints the
+        // requested end makes the model's next call start at requestedEnd+1,
+        // above the highest allocated ref, which START anchors hard-refuse
+        // (#4521) — a guaranteed failure right after a success. The kernel's
+        // snapped warning carries both the requested ref and the clamped-to
+        // ref; parse it so the displayed detail shows what the kernel actually
+        // folded. Ranges that were refused per-range (no clamped warning) are
+        // still shown as requested — the map only covers clamped ends.
+        const clampedEnds = new Map<string, string>();
+        for (const w of r.warnings) {
+            const m = /endId="([^"]+)" is above this session's highest allocated ref \(([^)]+)\)/.exec(w);
+            if (m) clampedEnds.set(m[1].trim().toLowerCase(), m[2]);
+        }
+        const detail = ranges.map((rg) => {
+            const effEnd = clampedEnds.get(rg.endRef.trim().toLowerCase()) ?? rg.endRef;
+            return `${rg.startRef}–${effEnd}`;
+        }).join(", ");
         if (revs.length > 0) {
             ctx.log(`[acp-proxy: reversed range(s) in compress call: ${revs.map((rg) => `${rg.startRef}->${rg.endRef}`).join(", ")}`);
         }
