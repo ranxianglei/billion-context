@@ -4261,7 +4261,7 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFi
  *  health-probes each candidate in parallel. */
 async function probeLiveInstances(
     readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
-    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+    fetchHealthInfo: (origin: string, opts?: { noKeepAlive?: boolean }) => Promise<HealthInfo | undefined>,
     diag?: (msg: string) => void,
     isConnectable: (origin: string) => Promise<boolean> = tcpConnectable,
 ): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>> {
@@ -4272,7 +4272,16 @@ async function probeLiveInstances(
     const checked = await Promise.all(
         [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo | undefined } | undefined> => {
             if (!isPidAlive(c.pid)) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): owner process gone`); return undefined; }
-            const health = await fetchHealthInfo(c.origin);
+            // #6881: probe on a FRESH connection (Connection: close) — a
+            // draining instance has closed its listener but still answers its
+            // established keep-alive connections, so a pooled socket would
+            // report it "alive" and discovery would attach to a dead address
+            // (the incident: H2 attached to P1's draining tail). A fresh
+            // connect is refused once the listener is closed, so the instance
+            // is correctly dropped. A BUSY instance (accept queue still drains)
+            // still TCP-connects on a fresh socket, so the #3654/#4811 BUSY
+            // keep below is unaffected.
+            const health = await fetchHealthInfo(c.origin, { noKeepAlive: true });
             if (!health || !health.ok) {
                 // #3654: a refused connection and a saturated event loop both
                 // fail this probe — tell them apart in the log: connect-but-
@@ -5763,6 +5772,18 @@ export async function ensureProxyRunning(
         // e.g. into Pi's input draft after herdr session restore.
         attachDiag(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
         const reg = await registerOwner(inst);
+        // #6881: the watcher registration result was invisible in bili.log —
+        // success logged nothing and failure only hit console.error (a raw
+        // console.* on the attach path, #3404). Log it on the host-safe
+        // channel so a "failed" (watchdog not active) or "refused" (no
+        // watchdog) attach is visible right next to the attach line above.
+        if (reg === "ok") {
+            attachDiag(`bili: session-watcher registered at ${inst.origin} (pid ${inst.pid}) — lifecycle watchdog active`);
+        } else if (reg === "failed") {
+            attachDiag(`bili: session-watcher registration FAILED at ${inst.origin} (pid ${inst.pid}) — lifecycle watchdog NOT active; the proxy will outlive this session's cleanup until a heartbeat recovers it`);
+        } else {
+            attachDiag(`bili: session-watcher registration refused (409) at ${inst.origin} (pid ${inst.pid}) — proxy has no session-lifecycle watchdog (started without BILI_PARENT_PID)`);
+        }
         // #3544: keep re-asserting our liveness so the proxy's watchdog ages us
         // out by HEARTBEAT expiry, not just kill(pid,0) (identity-blind under
         // Windows pid reuse). No-op unless we own the pid.

@@ -793,6 +793,14 @@ export function discoverLiveInstances(): ProxyInstanceFile[] {
     const out: ProxyInstanceFile[] = [];
     for (const e of readAllRegistryEntries()) {
         if (!isPidAlive(e.pid)) continue;
+        // #6881: a draining instance stamped portReleasedAt when its listener
+        // closed (#4982) — its pid still lives but the socket no longer does,
+        // so it must not surface as a live attach candidate (mirrors
+        // classifySameLanePeer's skip: a stale "I hold port N" marker would
+        // otherwise let discovery attach to a dead address). The fresh-conn
+        // health probe (#6881) is the robust catch for the single-origin-file
+        // path that never stamps this; this is the cheap registry-path guard.
+        if (e.portReleasedAt !== undefined) continue;
         out.push({
             origin: e.origin,
             instanceId: e.instanceId,

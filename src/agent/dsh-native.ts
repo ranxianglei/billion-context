@@ -62,6 +62,7 @@ import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { decodeRequestBody } from "../content-encoding.js";
 import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "../knobs.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
+import { tcpConnectable } from "../liveness.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { bodyOverWindowDetail as sharedBodyOverWindowDetail, getDeclaredModelEndpoints, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, setDeclaredModelEndpoints, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { matchModelEndpoint, loadDeclaredModelEndpoints } from "../model-endpoints.js";
@@ -716,6 +717,12 @@ async function bootstrap(): Promise<string | undefined> {
         if (gen !== originGen) return handle.origin;
         state.origin = handle.origin;
         register.base = handle.origin;
+        // #6881: a fresh-spawn landing must clear the old base's backoff — a
+        // stale retryAt/failStreak from a dead base would gate the NEW base's
+        // first registration behind the old base's wall (the incident's
+        // backoff carried into the new world, delaying the first registration).
+        register.retryAt = 0;
+        register.failStreak = 0;
         // #983: do NOT write BILLION_CONTEXT_PROXY — dsh has no reader for it
         // here (tools use register.base, /acp uses it too), and a frozen env
         // turns a later same-process re-apply (cordis deactivate/reactivate)
@@ -878,6 +885,11 @@ async function spawnFallback(attachOrigin: string, note: string, gen: number): P
         if (landingOwnsRegister(attachOrigin)) {
             register.base = origin;
             state.origin = origin;
+            // #6881: a fresh-spawn landing clears the old base's backoff so the
+            // new base's first registration is not gated behind the dead base's
+            // wall (the incident's backoff carried into the new world).
+            register.retryAt = 0;
+            register.failStreak = 0;
         }
         return origin;
     });
@@ -1080,7 +1092,7 @@ async function registerTools(ctx: PluginContext): Promise<void> {
         register.failStreak = 0;
         register.lastRegistrationError = undefined;
     })()
-        .catch((err: unknown) => {
+        .catch(async (err: unknown) => {
             if (owner !== toolsOwner || owner.closed) return;
             register.toolsReady = false;
             // Cordis deactivates the plugin context while the host tears down
@@ -1100,6 +1112,23 @@ async function registerTools(ctx: PluginContext): Promise<void> {
             register.lastRegistrationError = errMessage(err);
             if (register.failStreak === REG_GIVE_UP_NOTICE_STREAK) {
                 persistClientEvent(`bili tools still unavailable after ${register.failStreak} failed registrations (last: ${register.lastRegistrationError}) — model requests ride bili WITHOUT identity headers (wire mode: no compression, anonymous sessions). Restart dsh to restore; retries continue in the background.`);
+            }
+            // #6881: a manifest failure against a base that no longer accepts
+            // connections is a DEAD base, not a transient fault — and backing
+            // off against it strands the register: maybeRetry's respawn branch
+            // only runs when register.base is undefined, so a dead-but-set base
+            // re-fetches the dead manifest on every tick and never respawns
+            // (the first model request then rides wire mode into an anonymous
+            // session). Probe the listening side directly: a refused connect
+            // (a draining instance closed its listener) clears the base so the
+            // respawn self-heal takes over; a BUSY instance (accept queue still
+            // drains while its loop is inside a large fold) stays put (#3654).
+            if (register.base === base && !(await tcpConnectable(base))) {
+                persistClientEvent(`manifest base ${base} stopped accepting connections — clearing the dead base so the respawn self-heal takes over (#6881)`);
+                register.base = undefined;
+                register.retryAt = 0;
+                armRecoveryTimer();
+                return;
             }
             // Scope the back-off to the base that actually failed: if the
             // register moved on while this manifest fetch was in flight (the
@@ -1196,6 +1225,12 @@ function maybeRetry(ctx: PluginContext): void {
                 if (gen !== originGen) return;
                 register.base = origin;
                 state.origin = origin;
+                // #6881: a fresh-spawn landing clears the old base's backoff so
+                // the new base's first registration is not gated behind the
+                // dead base's wall (the incident's backoff carried into the new
+                // world, delaying the first registration).
+                register.retryAt = 0;
+                register.failStreak = 0;
                 void registerTools(ctx).catch(() => {});
             })
             .catch(() => {});
