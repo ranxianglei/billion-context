@@ -296,9 +296,5 @@ test(`cache-seam fuzz: ${scenarios} randomized scenarios (seed ${baseSeed})`, { 
         let folds = foldsIn(bodies);
         for (let i = 1; i < bodies.length; i++) assertPairSeamStable(bodies[i - 1]!, bodies[i]!, `seed ${sc.seed} pair ${i}->${i + 1}`);
         assert.ok(folds >= 1, `scenario ${JSON.stringify(sc)}: no fold ever fired — rig degenerate after retries`);
-                    }
-                }
-            });
-        }
     }
 });
