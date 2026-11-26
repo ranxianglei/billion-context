@@ -317,20 +317,24 @@ function asPart(v: unknown): Part | undefined {
  *  this tool output match. The receipt line may ride any text part of the same
  *  output — typed on the Anthropic/Responses wires ({type:"text"} /
  *  {type:"input_text"}), untyped on the Google wire ({text}) — so the scan is
- *  shape-agnostic over string .text fields. Never search other messages or
- *  cache an exemption. */
-export function matchesOriginalImageReceipt(b64: string, parts: unknown[]): boolean {
-    const hashes = new Set<string>();
-    for (const part of parts) {
-        const p = asPart(part);
-        if (typeof p?.text !== "string") continue;
-        for (const line of p.text.split(/\r?\n/)) {
-            const match = /^Billion original image receipt v1 sha256=([a-f0-9]{64})$/.exec(line);
-            if (match) hashes.add(match[1]);
+ *  shape-agnostic over string .text fields. Parse lazily once per output;
+ *  never reuse the matcher across outputs or passes. */
+export function originalImageReceiptMatcher(parts: unknown[]): (b64: string) => boolean {
+    let hashes: Set<string> | undefined;
+    return (b64) => {
+        if (hashes === undefined) {
+            hashes = new Set<string>();
+            for (const part of parts) {
+                const p = asPart(part);
+                if (typeof p?.text !== "string") continue;
+                for (const line of p.text.split(/\r?\n/)) {
+                    const match = /^Billion original image receipt v1 sha256=([a-f0-9]{64})$/.exec(line);
+                    if (match) hashes.add(match[1]);
+                }
+            }
         }
-    }
-    if (hashes.size === 0) return false;
-    return hashes.has(createHash("sha256").update(Buffer.from(b64, "base64")).digest("hex"));
+        return hashes.size > 0 && hashes.has(createHash("sha256").update(Buffer.from(b64, "base64")).digest("hex"));
+    };
 }
 
 async function rescaleAnthropic(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessage[] | undefined> {
@@ -352,6 +356,7 @@ async function rescaleAnthropic(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMe
     }
     if (block.type === "tool_result" && Array.isArray(block.content)) {
         const content = block.content as unknown[];
+        const matchesReceipt = originalImageReceiptMatcher(content);
         const changed: unknown[] = [];
         let any = false;
         const ref = refFor(ctx.session, m.id);
@@ -359,7 +364,7 @@ async function rescaleAnthropic(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMe
             const p = asPart(part);
             if (p?.type === "image") {
                 const src = asPart(p.source);
-                if (src?.type === "base64" && typeof src.data === "string" && !matchesOriginalImageReceipt(src.data, content)) {
+                if (src?.type === "base64" && typeof src.data === "string" && !matchesReceipt(src.data)) {
                     const r = await rescaleImage(typeof src.media_type === "string" ? src.media_type : "image/png", src.data, ctx.maxDim);
                     if (r) {
                         any = true;
@@ -438,6 +443,7 @@ async function rescaleOpenaiParts(m: BiliMessage, ctx: RescaleCtx): Promise<Bili
 async function rescaleGoogle(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessage[] | undefined> {
     if (!Array.isArray(m.rawGoogleParts)) return undefined;
     const parts = m.rawGoogleParts as unknown[];
+    const matchesReceipt = originalImageReceiptMatcher(parts);
     const changed: unknown[] = [];
     let any = false;
     const notes: string[] = [];
@@ -445,7 +451,7 @@ async function rescaleGoogle(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessa
     for (const part of parts) {
         const p = asPart(part);
         const inline = p ? asPart(p.inlineData) : undefined;
-        if (inline && typeof inline.data === "string" && !matchesOriginalImageReceipt(inline.data, parts)) {
+        if (inline && typeof inline.data === "string" && !matchesReceipt(inline.data)) {
             const r = await rescaleImage(typeof inline.mimeType === "string" ? inline.mimeType : "image/png", inline.data, ctx.maxDim);
             if (r) {
                 any = true;
@@ -473,6 +479,7 @@ async function rescaleResponsesItem(m: BiliMessage, ctx: RescaleCtx): Promise<Bi
     const partsKey = toolOutput ? "output" : item.type === "message" ? "content" : undefined;
     if (partsKey === undefined || !Array.isArray(item[partsKey])) return undefined;
     const content = item[partsKey] as unknown[];
+    const matchesReceipt = originalImageReceiptMatcher(content);
     const changed: unknown[] = [];
     let first: RescaledImage | undefined;
     const ref = refFor(ctx.session, m.id);
@@ -480,7 +487,7 @@ async function rescaleResponsesItem(m: BiliMessage, ctx: RescaleCtx): Promise<Bi
         const p = asPart(part);
         if (p?.type === "input_image" && typeof p.image_url === "string" && p.image_url.startsWith("data:")) {
             const d = parseDataUrl(p.image_url);
-            if (d && !(toolOutput && matchesOriginalImageReceipt(d.base64, content))) {
+            if (d && !(toolOutput && matchesReceipt(d.base64))) {
                 const r = await rescaleImage(d.mediaType, d.base64, ctx.maxDim);
                 if (r) {
                     if (!first) first = r;
@@ -614,13 +621,14 @@ export async function applyImageRescaleItems(items: unknown[], ctx: RescaleCtx):
         const partsKey = i?.type === "message" ? "content" : i?.type === "function_call_output" || i?.type === "custom_tool_call_output" ? "output" : undefined;
         if (partsKey !== undefined && i !== undefined && Array.isArray(i[partsKey])) {
             const parts = i[partsKey] as unknown[];
+            const matchesReceipt = originalImageReceiptMatcher(parts);
             const changed: unknown[] = [];
             let any = false;
             for (const part of parts) {
                 const p = asPart(part);
                 if (p?.type === "input_image" && typeof p.image_url === "string" && p.image_url.startsWith("data:")) {
                     const d = parseDataUrl(p.image_url);
-                    if (d && !(partsKey === "output" && matchesOriginalImageReceipt(d.base64, parts))) {
+                    if (d && !(partsKey === "output" && matchesReceipt(d.base64))) {
                         const r = await rescaleImage(d.mediaType, d.base64, ctx.maxDim);
                         if (r) {
                             any = true;

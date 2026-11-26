@@ -21,7 +21,7 @@ import { currentFetchTransport, isWsLaneTransport } from "./fetch-transport.js";
 import { limitsHttpOutboundBytes, limitsWsOutboundBytes } from "./knobs.js";
 import { decodeImageDims } from "./image-tokens.js";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
-import { matchesOriginalImageReceipt, refForItemBytes, shedDownscaleImage } from "./image-rescale.js";
+import { originalImageReceiptMatcher, refForItemBytes, shedDownscaleImage } from "./image-rescale.js";
 import { ResponsesWsUpstreamError } from "./responses-ws.js";
 
 type Part = Record<string, unknown>;
@@ -253,6 +253,7 @@ function isExemptOutput(protocol: WireProtocol, item: Part, names: Map<string, s
 function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
     const occ: Occurrence[] = [];
     const addAnthropicImages = (parts: unknown[], entryIndex: number, toolOutput: boolean, exemptOutput = false): void => {
+        const matchesReceipt = originalImageReceiptMatcher(parts);
         parts.forEach((part, pos) => {
             if (!isObj(part) || part.type !== "image") return;
             const src = part.source;
@@ -262,7 +263,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                 entryIndex,
                 b64: src.data,
                 mediaType,
-                exempt: exemptOutput || (toolOutput && matchesOriginalImageReceipt(src.data, parts)),
+                exempt: exemptOutput || (toolOutput && matchesReceipt(src.data)),
                 protectedTail: false,
                 archived: false,
                 applyArchive: (note) => { parts[pos] = { type: "text", text: note }; },
@@ -276,6 +277,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
         contents.forEach((c, entryIndex) => {
             if (!isObj(c) || !Array.isArray(c.parts)) return;
             const parts = c.parts as unknown[];
+            const matchesReceipt = originalImageReceiptMatcher(parts);
             parts.forEach((part, pos) => {
                 if (!isObj(part)) return;
                 const inline = part.inlineData;
@@ -286,7 +288,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                     entryIndex,
                     b64: inline.data,
                     mediaType,
-                    exempt: matchesOriginalImageReceipt(inline.data, parts),
+                    exempt: matchesReceipt(inline.data),
                     protectedTail: false,
                     archived: false,
                     applyArchive: (note) => { parts[pos] = { text: note }; },
@@ -306,6 +308,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
             if (partsKey === undefined || !Array.isArray(item[partsKey])) return;
             const exemptOutput = partsKey === "output" && isExemptOutput(protocol, item, names);
             const parts = item[partsKey] as unknown[];
+            const matchesReceipt = originalImageReceiptMatcher(parts);
             parts.forEach((part, pos) => {
                 if (!isObj(part) || part.type !== "input_image" || typeof part.image_url !== "string") return;
                 const d = parseDataUrl(part.image_url);
@@ -314,7 +317,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                     entryIndex,
                     b64: d.base64,
                     mediaType: d.mediaType,
-                    exempt: exemptOutput || (partsKey === "output" && matchesOriginalImageReceipt(d.base64, parts)),
+                    exempt: exemptOutput || (partsKey === "output" && matchesReceipt(d.base64)),
                     protectedTail: false,
                     archived: false,
                     applyArchive: (note) => { parts[pos] = { type: "input_text", text: note }; },
