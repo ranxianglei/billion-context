@@ -129,14 +129,27 @@ async function runRm(store: SessionStore, target: string | undefined, json: bool
     let vacuumed = false;
     let vacuumNote: string | undefined;
     if (!noVacuum && unified) {
-        try {
-            store.unifiedVacuum("full");
-            vacuumed = true;
-        } catch (err) {
-            // VACUUM lost the SQLITE_BUSY race (another bili instance holds
-            // the db): the deletion itself is committed — say so, don't lose it.
-            const detail = /SQLITE_BUSY|database is locked/i.test(String(err)) ? "database busy" : String(err);
-            vacuumNote = `shrink skipped (${detail}) — deletion committed; freed pages return on the next gc/vacuum`;
+        // #7156/#7681: a full VACUUM holds the exclusive write lock across the
+        // whole O(db-size) rewrite (#4612 starvation shape) and its TRUNCATE
+        // checkpoint reclaims the WAL + -shm index under a live peer (#7156
+        // corruption shape). The #4612 guard covers gc full-vacuum but not this
+        // path. Skip the shrink when a live foreign writer is present — the
+        // deletion above is already committed; freed pages return on the next
+        // gc/vacuum after the peer exits. Same skip-with-note semantics as the
+        // SQLITE_BUSY catch below.
+        const foreignWriter = store.unifiedActiveWriter();
+        if (foreignWriter !== null) {
+            vacuumNote = `shrink skipped (live foreign writer pid ${foreignWriter}) — deletion committed; the full VACUUM would hold the exclusive write lock across the whole rewrite and starve the peer (#4612), and its TRUNCATE would reclaim the WAL under the live peer (#7156). Freed pages return on the next gc/vacuum after the peer exits`;
+        } else {
+            try {
+                store.unifiedVacuum("full");
+                vacuumed = true;
+            } catch (err) {
+                // VACUUM lost the SQLITE_BUSY race (another bili instance holds
+                // the db): the deletion itself is committed — say so, don't lose it.
+                const detail = /SQLITE_BUSY|database is locked/i.test(String(err)) ? "database busy" : String(err);
+                vacuumNote = `shrink skipped (${detail}) — deletion committed; freed pages return on the next gc/vacuum`;
+            }
         }
     }
     const dbAfter = indexDbSize(store.dir);

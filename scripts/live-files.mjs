@@ -165,6 +165,11 @@ export const LIVE_FILES = [
     // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
     // for the tripwire, like #5046/#4612.
     "tests/storage-backup-repair.test.ts",
+    // #7680: spawns one bare `node -e` dummy child purely as a live PID holder
+    // for the <db>.lock foreign-writer fixture — no ports, no servers,
+    // mkdtemp-isolated per test, SIGTERM'd in the finally block, so the zone
+    // band is irrelevant; the entry is for the tripwire, like #5046/#4612/#7156.
+    "tests/issue7680-wal-reclaim-guard.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
