@@ -23,6 +23,8 @@ Get every copy of bili on a machine to the newest version without bricking anyth
 
 **Ledger convergence.** The desktop dsh profile is the one copy bili owns outright; its self-heal swaps `node_modules/billion-context` directly, so `convergeDshLedger` (`src/dsh-ledger.ts`) also moves the profile manifest's declared spec AND the lockfile's recorded resolution in the same operation (#3496) — a writer that moves only the copy manufactures the drift #3224 detects. Pre-existing drift converges on explicit demand only: `bili doctor --fix`. `plugin-install.ts` only drives the host's own channel (`dsh plugin add`), never installs a second copy beside it (#966).
 
+**Maturity gate.** Before the desktop self-heal installs a new version, `release-maturity.ts` checks the host's pnpm `minimumReleaseAge` policy — resolved per key in pnpm's own precedence (env `pnpm_config_*` > project `pnpm-workspace.yaml`/`.npmrc` > user `~/.npmrc` > global config), with `minimumReleaseAgeExclude` matched by the pnpm version-policy grammar. An immature release is deferred to the next cycle (no strike); if the publish time or the policy cannot be established, the refresh fails closed (strike, copy/manifest/lockfile untouched) — the updater never bypasses the host's maturity policy (#7139).
+
 **Advisory & restart.** `advisory.ts` watches for critical defects and files an advisory (#1481 — a human acts, the machine never rolls back on its own); `update-notes.ts` carries tiered release notes (severe-only by default, #1870); `restart.ts` offers opt-in self-restart once newer code is on disk (#811).
 
 ## Hard rules
@@ -31,7 +33,7 @@ Human-review tier (§7.4) — no auto-merge; changing `update.ts` requires a NO-
 
 ## Key entries
 
-`src/update.ts` (updater — load-bearing) · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
+`src/update.ts` (updater — load-bearing) · `src/release-maturity.ts` (pnpm maturity gate for the desktop lane, #7139) · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
 
 ## Related
 
