@@ -52,6 +52,7 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
+import { applyFoldSummaryCcr } from "../fold-summary-ccr.js";
 import { recordEgressTurn, EgressAuthorityRejectError } from "../storage/egress-record.js";
 import type { EgressViewRow } from "../storage/egress-state.js";
 // Structural mirror of egress-record.ts's EgressSourceMsg (kept private
@@ -678,7 +679,14 @@ export async function prepareOpenai(
         }
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
-        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        let egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        // #6111 POC (from #6025): render proxy-mode fold summaries as CCR
+        // placeholders on the outbound view instead of inline prose — weak models
+        // misread a wall of summary text as the current question. Gated on the
+        // rollout feature AND CCR being armed (a placeholder must stay retrievable).
+        // Outbound copies only — session state / message records are untouched.
+        const foldCcr = applyFoldSummaryCcr(egressMessages, session);
+        if (foldCcr.applied) egressMessages = foldCcr.messages;
         // #4166: re-voice ONLY bili's own summary carriers (isRenderedSummaryMessage).
         // Client-origin mid system/developer messages (DSH tool_addition and
         // friends) are conversation data — they re-emit verbatim through the

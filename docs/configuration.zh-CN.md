@@ -105,6 +105,7 @@
 | `rollout.features.percent` | number | the version's baked-in plan | — | 看到该特性的安装占比(0–100,支持小数)。单调:上调比例不会把已入组的安装踢出;每台安装的桶值是前缀稳定的。 |
 | `rollout.features.salt` | string | the feature name | — | 分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。 |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | 嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。 |
+| `rollout.features.foldSummaryCcrPlaceholder` | boolean \| number | 0(关) | BILI_ROLLOUT_FOLD_SUMMARY_CCR_PLACEHOLDER | 折叠摘要 CCR 占位符 POC(#6111,源自 #6025):代理模式下,出站视图中的渲染折叠摘要被换成标准 CCR 占位符(256 字符有界 head + 保留段 [5M, 9.99M] 内的合成 mNNNNN ref);完整原文钉进会话内容存储,acp_retrieve 可取回;摘要里的字面量锚点(反引号引用、路径、hex、#issue)另入每会话倒排索引,关键词查询也能定位到折叠块。仅在 CCR 启用时生效(占位符必须保持可取回——绝不指向不存在的工具)。**实验性 POC,默认关**——owner 依据 A/B/C 实验数据(弱模型误读率、retrieve 调用次数/体积、缓存差)决定是否放量;放量前无行为变化。 |
 | `rollout.features.identityChannelHarvest` | boolean \| number | 0(关) | BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST | 身份信道采集的灰度门(#5825):当安装级开关(BILI_IDENTITY_HARVEST)未设置时,允许仅由本灰度键激活回环专属的转录/SQLite 采集(claude-code / codebuddy / mcode / goose / qwen 车道);两者都不设则永不读客户端存储。owner 裁定 2026-11-07:本灰度键与 rollout.features.pluginLaneServerHistory(它管已接纳 id 的行钉住)刻意分离——任一使能方可激活采集。默认 0%,小流量观察退化率后再抬。见 identity-channels.zh-CN.md。 |
 | `rollout.features.pluginLaneServerHistory` | boolean \| number | 100(开,已 GA) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 100%(GA,owner 裁定 2026-11-13);设 0 可把安装回滚到 GA 前状态。 |
 | `rollout.features.pluginMsgIdIncremental` | boolean \| number | 100(开,已 GA) | BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL | 增量 msgid pin 通道(#7064 §8,owner 裁定 2026-11-18/19):稳态插件轮用**尾形态**申报消息 id——有界的 `x-bili-pf-tail-ids` 头(锚点+新增,≤ 2048 个,`?` 占位槽)或短 body id 数组——替代全量清单;服务端从自己账本的 live 行重盖前缀 id(ingest 是 INSERT OR IGNORE on (session_id,seq)——位置上的 msg_id 只写一次,永不改写)。接受规则(2026-11-19 定型):声明的尾段 [T-L, T-1] 与账本重叠段逐行相等(任一行漂移⇒降级 full,永不 400);超长会话(>2048)截断的尾清单同样可 pin——重叠段更长、证明更强。只有快照轮(账本空/折叠后重锚)发全量形态;全量优先于尾形态同时到达。响应携带 `x-bili-msgid-mode: incremental\|full`(4xx 即清,与 x-bili-pf-seq 同一学习点)。任何失配一轮内自愈。默认 100%;设 0 回滚到全量清单 pin(与特性前字节一致)。需先开 pluginLaneServerHistory。见 session-identity-resolution.zh-CN.md。 |
@@ -2053,6 +2054,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
 | `BILI_ROLLOUT_EGRESS_PLANE` | `rollout.features.egressPlane` | 100 (on — ci:full verification branch) |
+| `BILI_ROLLOUT_FOLD_SUMMARY_CCR_PLACEHOLDER` | `rollout.features.foldSummaryCcrPlaceholder` | 0 (off) |
 | `BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST` | `rollout.features.identityChannelHarvest` | 0 (off) |
 | `BILI_ROLLOUT_PASS_DSH_EXTENSIONS` | `rollout.features.passDshExtensions` | 0 (off = intercept) |
 | `BILI_ROLLOUT_PLUGIN_DELTA_RESEND` | `rollout.features.pluginDeltaResend` | 0 (off) |

@@ -19,6 +19,7 @@ import { stateDir } from "./paths.js";
 import { getStore } from "./persist.js";
 import type { CompressSettings } from "./config.js";
 import { ccrRetrievalTtlMs as knobCcrRetrievalTtlMs } from "./knobs.js";
+import { featureEnabled } from "./rollout.js";
 import type { PendingRetrieval, Session } from "./session.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -204,6 +205,13 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         return toolFail(`[${retrieveToolName(session)} FAILED: ref (an mNNNNN id) is required]`);
     }
+    // #6111 POC hybrid: a non-mNNNNN arg is a KEYWORD — search the fold-summary
+    // inverted index (built on the egress seam) and return the matching block
+    // refs + heads so the model can then retrieve one in full. Gated on the
+    // rollout feature; when off, a non-ref arg is simply a miss (no index).
+    if (!/^m\d+$/.test(ref)) {
+        return executeFoldKeywordSearch(ref, session);
+    }
     const result = applyRetrieve({ store: contentStoreOf(session), ref, exportDir: retrievalExportDir() });
     if (!result.ok) {
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
@@ -224,6 +232,46 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
     session.stats.retrieveDelivered = (session.stats.retrieveDelivered ?? 0) + 1;
     loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars${result.export ? `, exported ${result.export.path}` : ""})`);
     return toolOk(result.toolResultText);
+}
+
+/** #6111 POC hybrid: keyword search over the fold-summary inverted index. The
+ *  index (anchor → synthetic refs) is built on the egress seam and persisted in
+ *  session.metadata; reading it here inline (not via fold-summary-ccr.ts) keeps
+ *  this module free of a circular import. Exact anchor match first, then a
+ *  substring fallback (anchors containing the keyword). Returns the matching
+ *  refs + a bounded head each, so the model localizes the block and then
+ *  retrieves it in full by ref. A miss is an honest "not folded / not indexed"
+ *  (the keyword may live in live context or in a prose block the index is blind
+ *  to — the bounded head is the fallback for those). */
+function executeFoldKeywordSearch(keyword: string, session: Session): ProxyToolResult {
+    if (!featureEnabled("foldSummaryCcrPlaceholder")) {
+        session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
+        return toolFail(`[${retrieveToolName(session)} FAILED: "${keyword}" is not an mNNNNN ref and no fold-block index is active]`);
+    }
+    const v = session.metadata.foldSummaryIndex;
+    const index = v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, string[]>) : {};
+    const kw = keyword.toLowerCase();
+    let refs = index[kw];
+    if (!refs || refs.length === 0) {
+        const matched = new Set<string>();
+        for (const [anchor, r] of Object.entries(index)) {
+            if (anchor.includes(kw)) for (const x of r) matched.add(x);
+        }
+        refs = [...matched];
+    }
+    if (!refs || refs.length === 0) {
+        session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
+        loggerLog("info", `[ccr] fold-keyword ${keyword}: no match (index ${Object.keys(index).length} anchors)`);
+        return toolFail(`[${retrieveToolName(session)}: no compressed-history block contains "${keyword}" — it may be in live context or in a prose block the index does not cover]`);
+    }
+    const store = contentStoreOf(session);
+    const name = retrieveToolName(session);
+    const lines = refs.slice(0, 5).map((r) => {
+        const e = store.byRef[r];
+        return `  ${r} · ${e?.tokens ?? "?"} tok · ${e?.head ?? ""}`;
+    });
+    loggerLog("info", `[ccr] fold-keyword ${keyword}: ${refs.length} match(es)`);
+    return toolOk(`[${name}: "${keyword}" matches ${refs.length} compressed-history block(s) — call ${name}("<ref>") to read one in full:\n${lines.join("\n")}]`);
 }
 
 /** Host side of the kernel RetrievalExport effect: exports land under
