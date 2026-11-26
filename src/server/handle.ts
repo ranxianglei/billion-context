@@ -63,7 +63,7 @@ import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandc
 import { ZED_PROVIDER_PROTOCOL, ZED_PROVIDERS, unwrapZedEnvelope, type ZedEnvelopeMeta, type ZedProvider } from "../zed-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
-import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, egressPlaneGateOn, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
@@ -2084,7 +2084,7 @@ async function handleRequest(
             // it (the 1.8 MB prefix-affinity kv blob stays out of an eg
             // database). Anonymous clients keep writing: they have no other
             // identity source and availability outranks retirement.
-            !(session.metadata?.["egressAuthority"] === true && featureEnabled("egressPlane"))) {
+            !(session.metadata?.["egressAuthority"] === true && egressPlaneGateOn())) {
             // #1486: track identified clients' chains too, so a resume that
             // forks a NEW client id (cc --resume) can be matched back to its
             // parent across requests and proxy restarts (the #499 snapshot

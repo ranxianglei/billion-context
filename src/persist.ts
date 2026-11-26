@@ -25,6 +25,7 @@ import {
     fileStorageWalJournalSizeLimit,
     fileStorageBackend,
     fileStorageMysqlDsn,
+    egressPlaneGateOn,
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
 import { recordRequestedMode } from "./storage/runtime-status.js";
@@ -39,7 +40,6 @@ import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
-import { featureEnabled } from "./rollout.js";
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
@@ -3412,7 +3412,7 @@ export class SessionStore {
      *  rollback resumes normal ingest at once. The JSON envelope (where
      *  active) keeps flowing — only the unified legs are skipped. */
     private egressProjectionFrozen(session: Session): boolean {
-        return session.metadata?.["egressAuthority"] === true && featureEnabled("egressPlane");
+        return session.metadata?.["egressAuthority"] === true && egressPlaneGateOn();
     }
 
     /** #3397 (PR #6326): durability-before-render — make a session's unified-index

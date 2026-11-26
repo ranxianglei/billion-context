@@ -77,7 +77,7 @@
 
 | 旗标 | 默认 | 在 egress 家族里的角色 |
 |---|---|---|
-| `rollout.features.egressPlane` | **0（关——2026-11-24 owner 裁定保持 opt-in；本系列曾提议默认 100，被否）** | 总开关。对合格会话 arm 平面。强制开：`true`/百分比 / `BILI_ROLLOUT_EGRESS_PLANE=1`。 |
+| `rollout.features.egressPlane` | **0（关——2026-11-24 owner 裁定保持 opt-in；本系列曾提议默认 100，被否）** | 总开关（单一门 `egressPlaneGateOn`，`src/knobs.ts`）。强制开：`true` / `BILI_ROLLOUT_EGRESS_PLANE=1`。该条目的 `percent` 刻意无效——分桶在 store-open 路径上不可用，两个不一致的门会制造混搭态；分阶段 GA 走 `enabled: true` / env 变量。 |
 | `storage.unified`（full/shadow） | — | **前置**。仅 SQLite 车道；op log 住在统一存储里。无统一存储 ⇒ 平面无处可写，静默空转。 |
 | `pluginLaneServerHistory` | 100 | **Pin**：服务端历史 + msgid 身份。没有 pin，`egressAuthority` 永不 arm——平面静默空转。 |
 | `pluginMsgIdIncremental` | 100 | pin 通道的稳态尾部形态（依赖 `pluginLaneServerHistory`）。 |
@@ -85,13 +85,13 @@
 | `snapshotRender`（D-lane） | 0 | **不是 egress**。服务未 arm 的插件会话；egress-on 轮按构造绕过它（`src/server/snapshot-render.ts`：`if (deps.pluginMode) return clientMsgs`）。退役触发条件见 [deprecations.zh-CN.md](./deprecations.zh-CN.md)。 |
 | `pluginIncrementalTurns` | 0 | 与 egress 无关——客户端 opt-in 的 wire 协议（#3248）。 |
 
-**Arm 规则**（`src/server/egress-lane-io.ts`）：`featureEnabled("egressPlane") && pluginMode && pinned && !sideRequest`——四条 wire 车道同一条规则；side 请求（标题生成、压缩调用、小预算）永不碰日志。
+**Arm 规则**（`src/server/egress-lane-io.ts`）：`egressPlaneGateOn() && pluginMode && pinned && !sideRequest`——四条 wire 车道同一条规则；side 请求（标题生成、压缩调用、小预算）永不碰日志。`egressPlaneGateOn()` 是该平面的**唯一门**——建表 DDL、kv256、affinity 退役与上面所有运行时行为读同一个谓词（PR #7738 统一；此前的双门结构会让 `{percent: 100}` 配置 arm 了路由而存储侧还停在 legacy）。
 
 **静默半状态是被写出来的，不是藏起来的**：`egressPlane` 开 + `pluginLaneServerHistory` 关 ⇒ 什么都不 arm，什么都不发生。三个 msgid 家族旗标默认都是 100（其 GA 早于本文档），所以这种情况只能由运维显式关掉造成。删开关（硬编码开）在退役登记里，以 egressPlane 全量稳定为前提。
 
 ## 8. 操作手册
 
-- **on/off 在哪读（解析序）**：env `BILI_ROLLOUT_EGRESS_PLANE`（`"0"`/`"false"` = 关，其他值 = 开）→ 配置文件 `$XDG_CONFIG_HOME/billion-context/billion-context.json`（默认 `~/.config/billion-context/billion-context.json`）键 `rollout.features.egressPlane`（`true`/`false` 或 `{"percent": n}`）→ 代码默认（`src/rollout.ts`）：**0（关）**。开启除旗标外不需要别的（`storage.unified` 标准安装已设）。
+- **on/off 在哪读（解析序）**：env `BILI_ROLLOUT_EGRESS_PLANE`（`"0"`/`"false"` = 关，其他值 = 开）→ 配置文件 `$XDG_CONFIG_HOME/billion-context/billion-context.json`（默认 `~/.config/billion-context/billion-context.json`）键 `rollout.features.egressPlane`（`true`/`false` 或 `{"enabled": true}`——裸 `percent` 不起作用，启动时会告警）→ 代码默认：**0（关）**。开启除旗标外不需要别的（`storage.unified` 标准安装已设）。
 - **整体退出**：`BILI_ROLLOUT_EGRESS_PLANE=0`（env 优先于 config）或 `"rollout": {"features": {"egressPlane": false}}`。新轮走 legacy；已有行保留（投影重建仍读它们）。
 - **降级（无需动作）**：任何不可建行 / 损坏点 / 探针失败 ⇒ **该轮**降级 legacy。完全没有健康点 ⇒ 响亮硬失败。
 - **点位 fork**：`POST /__bili/replicas`——201 点位 fork（任意水位；state 表重放到该点位物化，7773）/ 503 非驻留。Fork-to-now 四表逐字拷贝。
@@ -135,7 +135,7 @@
 
 **身份行。** #7591 假设 egress-on 会话的 sessions 行在 arm turn 由首次 ingest 落地——不成立：`egressAuthority` latch 在该次保存**之前**就已打入（`src/server/egress-lane-io.ts`），第一次 ingest 就被 `egressProjectionFrozen` 冻结，行**永远落不了**。线上后果：重启后会话丢失（无行⇒不可 load、不可见、不进 GC 视野），metadata（pluginAgent/lastModel/title）只活在内存，血缘列永未持久化。修复：arm（latch 行）时 seam 调 `UnifiedStore.ensureEgressIdentity()`——一次性、幂等的 **13 列身份 upsert**（session_id、parent_session_id、protocol、label、title、host_title、namespace、origin、status、created_at、updated_at、meta_json、metadata_json；parent 用 `COALESCE(存量,新)` 与 ingest 同语义，第一个父赢；fork_point_seq 与全部 payload 列不碰）。每个 armed turn 都执行，删行下一轮自愈。同一事务里还删掉该会话的 **arm-turn 死 l1_world 占位行**（`armed_at IS NULL AND r3_latched_at IS NULL AND witness_probe <> ''`）——arm turn 的 stage-0 仍走 legacy（故意不预 latch），以前每个会话永久留一行死行。**该行的 metadata_json 只写身份键白名单**（`EGRESS_IDENTITY_METADATA_KEYS`：egressAuthority、pluginAgent、derivedFromSessionId、egressFlowUnreadable、lastModel），绝不写整个运行时袋：#6947 的 turn-final 回复暂存（handoffReply/handoffResponse，各最多 1.5MB 聊天内容）与每请求状态（effectiveConfig/cacheLedger/publicSnapshot*）只活在内存/op log（owner 2026-11-26：sessions 表放身份，不放聊天内容）。
 
-**表创建门。** eg 模式**新建**库只建：`sessions` + `session_ext` + `kv_store`（核心三件套）+ 四张 egress 表 = **7 张表**；12 张 legacy 表**不创建**（probe-first 收敛保证 flag 日后关闭时任何一次打开都会补建）。已有库保留全部现有表——门只管不建、从不删。`session_ext` 按 owner 裁定豁免（fastpath `pf:state` 熔断记忆住在里面）。直接调 `UnifiedStore.open` 的调用方默认建全表；开关判定在 `UnifiedShadow.maybeOpen`（`src/knobs.ts` 的 `egressPlaneGateOn()`——无副作用读法，因为 `featureEnabled()` 会在 store open 中途触发 install-id 引导的 wx 文件竞态写）。load/fork 路径对缺失的 legacy 表按"无数据"处理（7 个读 getter 短路），eg 模式实例完整可用。`BILI_TEST_FORCE_FULL_DDL=1` 是**测试专用**逃生口：断言 legacy 表形状而 flag 又开的套件（模拟门禁前的库）用它，生产永不设。
+**表创建门。** eg 模式**新建**库只建：`sessions` + `session_ext` + `kv_store`（核心三件套）+ 四张 egress 表 = **7 张表**；12 张 legacy 表**不创建**（probe-first 收敛保证 flag 日后关闭时任何一次打开都会补建）。已有库保留全部现有表——门只管不建、从不删。`session_ext` 按 owner 裁定豁免（fastpath `pf:state` 熔断记忆住在里面）。直接调 `UnifiedStore.open` 的调用方默认建全表；开关判定在 `UnifiedShadow.maybeOpen`（`src/knobs.ts` 的 `egressPlaneGateOn()`——无副作用读法，现已是建表 DDL、kv256、affinity 退役与全部运行时行为的平面唯一门；`featureEnabled()` 在该平面任何位置都不可用，因为它的 install-id 引导会在 store open 中途做 wx 文件竞态写）。load/fork 路径对缺失的 legacy 表按"无数据"处理（7 个读 getter 短路），eg 模式实例完整可用。`BILI_TEST_FORCE_FULL_DDL=1` 是**测试专用**逃生口：断言 legacy 表形状而 flag 又开的套件（模拟门禁前的库）用它，生产永不设。
 
 **kv_store 策略。** `kv_store` 是小配置面（install id、notices、host flags），不是 blob 库：开启 `egressPlane` 时每个值 JSON 序列化后不得超过 **256 字符**（`KV_VALUE_MAX_CHARS`，sqlite/mysql 两后端 `setKv` 入口按调用时刻判定）。**legacy 模式保持原有 4MB 字节预算**——存量键可能已经存着非常大的值，上限不能把非 eg 部署炸掉（owner 裁定 2026-11-26）。冻结白名单（`KV_VALUE_WHITELIST`，加条目 = review 事件，须登记 [deprecations.zh-CN.md](./deprecations.zh-CN.md)）给两个已知会长大的键保留 4MB 上限：`prefix-affinity|v1`、`plugin-conversations|table`。eg 模式下大 blob 在写入侧退役：`session-order` 早已退役（写入模块已被上游移除——孤儿行不再触碰，新库干净）；`plugin-conversations` 不写（路由表纯内存；重启 miss 等下一个模型请求重建——既有 miss 语义）；`prefix-affinity` 持久化在 eg 下整体退役（owner 裁定 2026-11-26）：显式 ID 分支、file→kv 一次性迁移、kv/文件持久化路径全部加门——链表仍每轮计算、但 eg 模式下永不落盘（匿名客户端在 eg 下丢失跨重启链连续性，已接受），legacy JSON 文件降为只读 hydration 源，legacy 模式字节级不变。
 

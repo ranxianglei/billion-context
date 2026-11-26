@@ -1,5 +1,5 @@
 import { ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME, BLOCKED_REF, BLOCK_OP_TOOL_NAMES, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
-import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
+import { egressPlaneGateOn, imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
@@ -8,7 +8,6 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { rebuildCoreFromLog } from "./storage/egress-serve.js";
-import { featureEnabled } from "./rollout.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -394,7 +393,7 @@ function writeConversationsFile(): void {
     // self-binding clients (cid == sid, e.g. pi) re-resolve via their native
     // session id and the rest re-bind on their next model request
     // ("有问题再说" — owner ruling 2026-11-25).
-    if (featureEnabled("egressPlane")) return;
+    if (egressPlaneGateOn()) return;
     try {
         const obj: Record<string, ConversationEntry> = {};
         for (const [k, v] of conversations) obj[k] = v;
@@ -504,7 +503,7 @@ export async function hydratePluginConversationsUnified(): Promise<void> {
     // for the next model request to repopulate (its existing miss behavior).
     // Skipping the store entirely keeps the retired blob out of an eg
     // database (writeConversationsFile is gated the same way).
-    if (featureEnabled("egressPlane")) return;
+    if (egressPlaneGateOn()) return;
     try {
         let raw: unknown;
         try {

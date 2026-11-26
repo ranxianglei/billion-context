@@ -38,7 +38,7 @@ import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, countAnt
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
-import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { egressPlaneGateOn, imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { SessionStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { isAutoModeClassifier } from "../auto-mode-forge.js";
@@ -597,7 +597,7 @@ export async function prepareAnthropic(
         // pinned, not a title request). Every other main turn is only
         // recorded, and an unreadable log then means "not recorded", not a
         // failed request.
-        if (featureEnabled("egressPlane") && !anthropicTitleGen) {
+        if (egressPlaneGateOn() && !anthropicTitleGen) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinMode === "incremental", sideRequest: anthropicTitleGen });

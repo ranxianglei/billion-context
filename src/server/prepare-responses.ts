@@ -48,7 +48,7 @@ import type { ConversationIdentity } from "../session-id.js";
 import { pckKeyAbated } from "../pck-probe.js";
 import { reconcilePluginFoldCallIds } from "../plugin.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
-import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
+import { egressPlaneGateOn, imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
 import { SessionStore, getStore } from "../persist.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudgeArmed, emergencyNudgeForConfig, modelVisibleTools } from "./budget.js";
@@ -556,7 +556,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // (egressAuthorityArmed — same as the OpenAI lane). Every other main
         // turn is only recorded.
         const egressSide = isCompactionTrigger || egressTinyBudget(parsed);
-        if (!egressSide && featureEnabled("egressPlane")) {
+        if (!egressSide && egressPlaneGateOn()) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 // The single shared authority seam (egress-lane-io),

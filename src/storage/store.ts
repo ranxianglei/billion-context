@@ -37,7 +37,6 @@ import {
     type EgressOp,
     type EgressViewRow,
 } from "./egress-state.js";
-import { featureEnabled } from "../rollout.js";
 import { egressPlaneGateOn } from "../knobs.js";
 import {
     diffBlockSet,
@@ -1756,7 +1755,7 @@ export class UnifiedStore {
                     try {
                         // #7574: coordinates come from the op log only while
                         // the plane is ON (see snapPinLiveIds).
-                        egressPos = featureEnabled("egressPlane")
+                        egressPos = egressPlaneGateOn()
                             ? new Map(this.snapEgressPinLiveIds(s.sessionId).map((id, i) => [id, i] as const))
                             : new Map();
                     } catch {
@@ -2347,7 +2346,7 @@ export class UnifiedStore {
      *  from a view frozen at the switch. Off = the messages ledger, exactly
      *  as on an install that never ran the plane. */
     snapPinLiveIds(sid: string): string[] {
-        if (featureEnabled("egressPlane")) {
+        if (egressPlaneGateOn()) {
             try {
                 const view = egressStateRead(this.db, sid);
                 if (view.length > 0) {
@@ -2387,7 +2386,7 @@ export class UnifiedStore {
      *  Read / clear / list stay dual-carrier (a superset, always correct). */
     snapR3Latch(sid: string): void {
         try {
-            if (featureEnabled("egressPlane")) {
+            if (egressPlaneGateOn()) {
                 snapR3LatchWriteOnSession(this.db, sid, Date.now());
             } else {
                 // egressPlane off → legacy l1 carrier, byte-identical to

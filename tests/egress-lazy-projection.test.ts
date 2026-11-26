@@ -20,7 +20,7 @@ import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
 import { egressAppendTurn, egressFlowWalkBack, egressStateRead, egressStateView } from "../src/storage/egress-state.ts";
 import { recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
-import { featureEnabled } from "../src/rollout.ts";
+import { egressPlaneGateOn } from "../src/knobs.ts";
 
 // The pin read consults the op log only while the plane is on (#7574).
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
@@ -159,7 +159,7 @@ test("snapPinLiveIds: with the plane switched off the op log is not consulted, e
         // the session goes back to the messages ledger like any other.
         // GA (2026-11-24): "unset" resolves ON, so the rollback is forced "0".
         process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
-        assert.equal(featureEnabled("egressPlane"), false, "precondition: the plane is off");
+        assert.equal(egressPlaneGateOn(), false, "precondition: the plane is off");
         assert.deepEqual(H.store.snapPinLiveIds("s4"), H.store.snapMsgIdLiveIds("s4"), "plane off: messages ledger, the op log is ignored");
         // on again: the log is picked up where it was
         process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";

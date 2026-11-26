@@ -11,7 +11,7 @@
  *     view — there is no compaction step, no base row; the flow keeps its
  *     full history and its letter alphabet is I/D/U);
  *   - #3617 both directions: with the rollout key off the recorder is not
- *     called (zero rows) — asserted at the gate level (featureEnabled
+ *     called (zero rows) — asserted at the gate level (egressPlaneGateOn
  *     default) since the wiring sits behind it in prepare-openai.
  */
 
@@ -32,7 +32,7 @@ import {
     type EgressOp,
 } from "../src/storage/egress-state.ts";
 import { EGRESS_SYSTEM_MSGID, buildEgressViewRows, recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
-import { featureEnabled } from "../src/rollout.ts";
+import { egressPlaneGateOn } from "../src/knobs.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-egress-record-hermetic-"));
@@ -234,13 +234,14 @@ test("#3617 negative direction: the plane can be forced OFF → gate never opens
     const saved = process.env.BILI_ROLLOUT_EGRESS_PLANE;
     process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     try {
-        // this ci:full branch bakes egressPlane to 100 — the rollback path is
-        // the forced "0" (the env always wins over the baked-in percent):
-        // with the env at 0 the prepare-openai gate (featureEnabled) sees it OFF and
-        // records no rows. The documented force-on is env "1" or config true.
-        assert.equal(featureEnabled("egressPlane"), false, "forced 0 resolves OFF even against the branch default 100");
+        // this branch bakes egressPlane into the built-in plan at percent 0 —
+        // the rollback path is the forced "0" (the env always wins over the
+        // config tiers). With the env at 0 the single plane gate
+        // (egressPlaneGateOn) sees it OFF and records no rows. The documented
+        // force-on is env "1" or config `egressPlane: true`.
+        assert.equal(egressPlaneGateOn(), false, "forced 0 resolves OFF");
         process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
-        assert.equal(featureEnabled("egressPlane"), true, "explicit 1 (the documented force-on) opens the gate");
+        assert.equal(egressPlaneGateOn(), true, "explicit 1 (the documented force-on) opens the gate");
     } finally {
         if (saved === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
         else process.env.BILI_ROLLOUT_EGRESS_PLANE = saved;

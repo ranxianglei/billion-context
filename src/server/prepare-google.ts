@@ -36,7 +36,7 @@ import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generatio
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
-import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { egressPlaneGateOn, imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { SessionStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudgeArmed, emergencyNudgeForConfig } from "./budget.js";
@@ -396,7 +396,7 @@ export async function prepareGoogle(
         // #7574: the swap (server authority) is armed by the ONE shared rule
         // (egressAuthorityArmed — same as the OpenAI lane). Every other main
         // turn is only recorded.
-        if (!isTitleGen && featureEnabled("egressPlane")) {
+        if (!isTitleGen && egressPlaneGateOn()) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinned, sideRequest: isTitleGen });

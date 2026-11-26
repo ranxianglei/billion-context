@@ -47,7 +47,7 @@
 import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, sanitizeEgressIdentityMetadata, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
 import type { EgressBlockLedgerInput } from "../storage/egress-block.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
-import { featureEnabled } from "../rollout.js";
+import { egressPlaneGateOn } from "../knobs.js";
 import { outputBudgetField, readOutputBudget } from "./budget.js";
 import { rebuildCoreFromLog } from "../storage/egress-serve.js";
 import type { EgressViewRow } from "../storage/egress-state.js";
@@ -131,7 +131,7 @@ interface EgressAuthorityOutcome {
  * session could have its conversation replaced by the log. A turn that is
  * not armed is still recorded (the log doubles as the pin ledger). */
 export function egressAuthorityArmed(input: { pluginMode: boolean; pinned: boolean; sideRequest: boolean }): boolean {
-    return featureEnabled("egressPlane") && input.pluginMode && input.pinned && !input.sideRequest;
+    return egressPlaneGateOn() && input.pluginMode && input.pinned && !input.sideRequest;
 }
 
 /** The side-request signal the seam understands on every wire: an output
