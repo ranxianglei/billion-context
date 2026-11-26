@@ -346,4 +346,52 @@ describe("tool-pair integrity", () => {
     );
     assert.deepEqual(unansweredToolCalls(view.messages), []);
   });
+
+  // #5455 C': pin the pair-atomicity invariant at the SOURCE (apply side).
+  // The existing tests pin the "call without result" direction (a protected
+  // result refuses/withdraws the call). This pins the reverse: a block must
+  // never contain a tool-result lacking its adjacent tool-call. This is the
+  // invariant that keeps the #5455 "answered compress call whose result is
+  // covered" state UNREACHABLE — the apply side never emits such a block, so
+  // prune's compress orphan exemption (prune.ts:625) never sees it.
+  it("#5455 C': never folds a tool-result without its adjacent tool-call (pair atomicity at source)", () => {
+    const core = createCore();
+    const messages: CoreMessage[] = [
+      user("m1"),
+      toolCall("m2", "c-a", "read"),
+      toolResult("m3", "c-a", "read"),
+      user("m4"),
+      user("m5"),
+    ];
+    const out = core.processTurn({
+      messages,
+      state: createInitialState(),
+      config: config(),
+      tokenCount: (t) => Math.ceil(t.length / 4),
+    });
+    const refs = out.state.messageRefs.byRaw;
+    // Protect the CALL (m2), cover both call+result. The result must not fold
+    // without its call — that would be a "result lacking call" (#5455 state).
+    const res = core.applyCompression({
+      state: out.state,
+      messages,
+      config: config(),
+      protectedMessageIds: new Set([refs["m2"]!]),
+      ranges: [
+        { startRef: "m00002", endRef: "m00003", summary: "S".repeat(400) },
+      ],
+    });
+    // The pair is atomic: no block may contain the result without the call.
+    for (const b of res.state.blocks) {
+      const hasResult = b.effectiveMessageIds.includes("m3");
+      const hasCall = b.effectiveMessageIds.includes("m2");
+      assert.ok(
+        !(hasResult && !hasCall),
+        `a block must not contain a tool-result lacking its tool-call (#5455 C'): ${JSON.stringify(b.effectiveMessageIds)}`,
+      );
+    }
+    // The result must not fold on its own (the call is protected).
+    const foldedResult = res.state.blocks.some((b) => b.effectiveMessageIds.includes("m3"));
+    assert.ok(!foldedResult, "a protected call's result must not fold without it");
+  });
 });

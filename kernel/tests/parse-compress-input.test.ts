@@ -293,6 +293,98 @@ test("parseCompressArgs does not fabricate partial entries", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Truncated stringified content array (object input) — #6947
+//
+// The vLLM-style gateway stringifies the content array, so `content` arrives
+// as a JSON string of the array. When that string is cut mid-stream (the
+// model's call truncated in flight), the prefix is a clean JSON-array start
+// followed by EOF. Before this fix the line-form fallback misread the JSON
+// prefix as headerless prose and reported content-not-array / no-valid-ranges,
+// steering the model away from a format that was legal all along. The EOF
+// gate classifies it as truncated; salvage recovers the complete entries
+// (object or string).
+// ---------------------------------------------------------------------------
+
+test("case A: object content string cut in the first object → truncated, not content-not-array", () => {
+  const content =
+    '[{"startRef": "m00001", "endRef": "m00002", "summary": "a long summary that is cut off mid-sentence without ever closing the string or the array';
+  const { ranges, diagnostics } = parseCompressArgs({ content });
+  assert.equal(diagnostics.kind, "truncated");
+  assert.equal(diagnostics.ok, false);
+  assert.equal(ranges.length, 0);
+  // length recorded so the host argCorruption receipt (not the array-wrap
+  // hint) fires.
+  assert.equal(diagnostics.length, content.length);
+  assert.equal(diagnostics.rawPrefix, content);
+});
+
+test("case B: object content string cut in the second object → first range recovered, truncated", () => {
+  const content =
+    '[{"startRef": "m00001", "endRef": "m00002", "summary": "first complete"}, {"startRef": "m00003", "endRef": "m0';
+  const { ranges, diagnostics } = parseCompressArgs({ content });
+  assert.equal(diagnostics.kind, "truncated");
+  assert.equal(diagnostics.ok, true);
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0]?.summary, "first complete");
+  assert.equal(diagnostics.length, content.length);
+});
+
+test("case C: object content string cut in the second STRING entry → first line-form entry recovered (salvage)", () => {
+  const content =
+    '["m00001–m00002 topic one\\nsummary one", "m00003–m00004 topic two\\nsummary two that got cut';
+  const { ranges, diagnostics } = parseCompressArgs({ content });
+  assert.equal(diagnostics.kind, "truncated");
+  assert.equal(diagnostics.ok, true);
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0]?.startRef, "m00001");
+  assert.equal(ranges[0]?.endRef, "m00002");
+  assert.equal(ranges[0]?.summary, "summary one");
+  assert.equal(diagnostics.length, content.length);
+});
+
+test("case D: object content string cut in the first STRING entry → truncated, not no-valid-ranges", () => {
+  const content =
+    '["m00001–m00002 topic\\na long summary that is cut off mid-sentence without ever closing the string or the array';
+  const { ranges, diagnostics } = parseCompressArgs({ content });
+  assert.equal(diagnostics.kind, "truncated");
+  assert.equal(diagnostics.ok, false);
+  assert.equal(ranges.length, 0);
+  assert.equal(diagnostics.length, content.length);
+});
+
+test("case E: object content string with complete string entries → ok (no regression)", () => {
+  const content =
+    '["m00001–m00002 topic one\\nsummary one", "m00003–m00004 topic two\\nsummary two"]';
+  const { ranges, diagnostics } = parseCompressArgs({ content });
+  assert.equal(diagnostics.kind, "ok");
+  assert.equal(diagnostics.ok, true);
+  assert.equal(ranges.length, 2);
+  assert.equal(ranges[0]?.startRef, "m00001");
+  assert.equal(ranges[1]?.startRef, "m00003");
+  // Not truncated → no length recorded.
+  assert.equal(diagnostics.length, undefined);
+});
+
+test("no-regression: balanced empty array content keeps content-not-array, not truncated", () => {
+  const { ranges, diagnostics } = parseCompressArgs({ content: "[]" });
+  assert.equal(diagnostics.kind, "content-not-array");
+  assert.equal(diagnostics.ok, false);
+  assert.equal(ranges.length, 0);
+  // The EOF gate must not fire on balanced input → no length recorded.
+  assert.equal(diagnostics.length, undefined);
+});
+
+test("no-regression: non-array prose content keeps content-not-array, not truncated", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: "just some prose without any brackets",
+  });
+  assert.equal(diagnostics.kind, "content-not-array");
+  assert.equal(diagnostics.ok, false);
+  assert.equal(ranges.length, 0);
+  assert.equal(diagnostics.length, undefined);
+});
+
+// ---------------------------------------------------------------------------
 // Error classification
 // ---------------------------------------------------------------------------
 
