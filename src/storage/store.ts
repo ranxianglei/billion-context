@@ -23,7 +23,6 @@ import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import { identityOfStoredContent, splitMediaContent } from "./identity.js";
-import { hydrateSlimCcrStore } from "./slim.js";
 import {
     egressAppendTurn,
     egressStateAt,
@@ -66,7 +65,6 @@ import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome }
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
 import { listInstances, type RegistryEntry } from "../instance.js";
-import type { MessageContentStore } from "acp-kernel";
 
 /** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
  *  built-in autocheckpoint alone cannot guarantee reclamation in a long-lived
@@ -166,7 +164,7 @@ export interface SessionRow {
      *  pluginSnapshotSeqs?: number[]|null} (loadLegacyView's contract).
      *  Content itself lives in messages. */
     tailJson: string;
-    /** Verbatim CCR store JSON (dying subsystem, Phase 3 removes it). */
+    /** Verbatim content-store JSON (removed with CCR, #7755; column kept for backward compat). */
     ccrJson: string | null;
     /** #3133 ingest watermark: highest absolute message seq whose bytes this
      *  index has verified (NULL = no trusted prefix → next save ingests
@@ -259,23 +257,6 @@ export interface RefRow {
     /** Verbatim ref token ("m00123" or "BLOCKED"). */
     ref: string;
     refNum: number | null;
-}
-
-export interface CcrEntryRow {
-    ord: number;
-    key: string;
-    content: string;
-    /** #5744: sha256(content) from the planner — unchanged entries skip the
-     *  CAS bump/release round-trips entirely on steady-state ingests. */
-    contentHash: string;
-    /** #6785 step 6: the original text behind entry.hash (the byHash half
-     *  of the content store) — the slim ccr_json envelope has no bytes of
-     *  its own, the CAS behind these rows is the content home. */
-    origContent: string | null;
-    /** null with origContent null — the entry HAS a hash but its byHash
-     *  bytes are missing (the file lane stays authority); "" = hashless
-     *  entry (no original exists) or a legitimate empty original. */
-    origHash: string | null;
 }
 
 /** One checkpoint/replica row (Phase 2, #2671). `state_hash` never leaves
@@ -403,7 +384,6 @@ export interface IngestSessionInput {
     blocks: BlockRow[];
     deadRefs: { ord: number; ref: string; refNum: number; recordedAt: number }[];
     refs: RefRow[];
-    ccrEntries: CcrEntryRow[];
     /** Plan-space pointer sequences (indices into `messages`), if the caller
      *  has them. ingestSession rewrites both the rows and these pointers to
      *  absolute seqs before insert — see remapPlanSeqs. */
@@ -1485,9 +1465,14 @@ export class UnifiedStore {
                        END,
                        metadata_json = CASE WHEN metadata_json IS excluded.metadata_json THEN sessions.metadata_json ELSE excluded.metadata_json END,
                        kstate_json = CASE WHEN kstate_json IS excluded.kstate_json THEN sessions.kstate_json ELSE excluded.kstate_json END,
-                       tail_json = excluded.tail_json,
-                       ccr_json = CASE WHEN ccr_json IS excluded.ccr_json THEN sessions.ccr_json ELSE excluded.ccr_json END,
-                       last_ingested_seq = excluded.last_ingested_seq,
+                        tail_json = excluded.tail_json,
+                        -- #7755: CCR removed — the ingest no longer writes ccr_json
+                        -- (it is always NULL now). Never overwrite an existing value
+                        -- on update: pre-#7755 envelopes stay intact in the DB (owner
+                        -- ruling: existing data is neither migrated, read, nor
+                        -- destroyed). New sessions insert NULL (the INSERT leg).
+                        ccr_json = sessions.ccr_json,
+                        last_ingested_seq = excluded.last_ingested_seq,
                        -- #6780: no same-value skip here (or for the #6325 columns): an unchanged
                        -- OVERFLOW blob (a JSON column big enough to spill onto overflow pages) is
                        -- copied onto fresh pages whenever ANY column of this row changes, so a
@@ -1968,61 +1953,12 @@ export class UnifiedStore {
                 }
             }
 
-            // ccr_entries: the content store is a map whose keys can be
-            // dropped — the final state must be EXACTLY the incoming set.
-            // #5744: steady state no longer pays DELETE-all + re-INSERT-all
-            // (which also destroyed and recreated every CAS blob via
-            // release-to-zero each save). Unchanged entries (same key → same
-            // ord AND same content hash) are skipped entirely — no CAS
-            // round-trips. Changed/absent rows are deleted FIRST (frees their
-            // PK ords so renumbered swaps cannot collide), their old hashes
-            // released while nothing references them anymore (#4242
-            // redirect-then-release), then the changed+new entries are
-            // put+inserted.
-            const incomingCcr = new Map<string, CcrEntryRow>();
-            for (const e of input.ccrEntries) incomingCcr.set(e.key, e);
-            const storedCcr = this.db
-                .prepare("SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ?")
-                .all(s.sessionId) as Array<{ ord: number; ccr_key: string; content_hash: string; orig_hash: string | null }>;
-            const changedCcrKeys: string[] = [];
-            const unchangedCcrKeys = new Set<string>();
-            const releasedOldCcrHashes: string[] = [];
-            for (const row of storedCcr) {
-                const inc = incomingCcr.get(row.ccr_key);
-                if (!inc) {
-                    changedCcrKeys.push(row.ccr_key);
-                    releasedOldCcrHashes.push(row.content_hash);
-                    if (row.orig_hash !== null) releasedOldCcrHashes.push(row.orig_hash);
-                    continue;
-                }
-                // #6785 step 6: the orig half joins the unchanged test — a
-                // pre-step-6 row (orig NULL) or an archived-restore row
-                // re-puts its original on the next save and self-heals.
-                if (row.ord !== inc.ord || row.content_hash !== inc.contentHash || row.orig_hash !== inc.origHash) {
-                    changedCcrKeys.push(row.ccr_key);
-                    releasedOldCcrHashes.push(row.content_hash);
-                    if (row.orig_hash !== null) releasedOldCcrHashes.push(row.orig_hash);
-                } else {
-                    unchangedCcrKeys.add(row.ccr_key);
-                }
-            }
-            if (changedCcrKeys.length > 0) {
-                for (let i = 0; i < changedCcrKeys.length; i += SEQ_SPAN_QUERY_BATCH) {
-                    const keys = changedCcrKeys.slice(i, i + SEQ_SPAN_QUERY_BATCH);
-                    this.db
-                        .prepare(`DELETE FROM ccr_entries WHERE session_id = ? AND ccr_key IN (${keys.map(() => "?").join(", ")})`)
-                        .run(s.sessionId, ...keys);
-                }
-            }
-            for (const hash of releasedOldCcrHashes) this.releaseContent(hash);
-            for (const e of input.ccrEntries) {
-                if (unchangedCcrKeys.has(e.key)) continue;
-                const hash = this.putContent(e.content, e.contentHash);
-                const orig = e.origContent === null ? null : this.putContent(e.origContent, e.origHash ?? undefined);
-                this.db
-                    .prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash, orig_hash) VALUES (?, ?, ?, ?, ?)")
-                    .run(s.sessionId, e.ord, e.key, hash, orig);
-            }
+            // #7755: CCR removed — the ingest no longer touches ccr_entries.
+            // Pre-#7755 rows stay in the DB untouched (owner ruling: existing
+            // data is neither migrated, read, nor destroyed); new sessions
+            // simply have no ccr rows. The CAS blobs they reference are left
+            // in place (the archive/restore path and the session-delete path
+            // still manage their lifecycle).
             return true;
         });
         if (ok) this.maybeCheckpointWal();
@@ -4687,46 +4623,4 @@ export class UnifiedStore {
         }));
     }
 
-    getCcr(sessionId: string): MessageContentStore | null {
-        const row = this.db
-            .prepare("SELECT ccr_json FROM sessions WHERE session_id = ?")
-            .get(sessionId) as { ccr_json: string | null } | undefined;
-        if (!row || row.ccr_json === null) return null;
-        try {
-            const parsed = JSON.parse(row.ccr_json) as MessageContentStore & { ccrSlim?: number };
-            // #6785 step 6: slim envelope — the column keeps key→hash only;
-            // the bytes come back through the CAS via ccr_entries (same
-            // reconstruction as the view leg, one definition in slim.ts).
-            // A slim row with an empty ledger degrades to the file path.
-            if (parsed.ccrSlim === 1) {
-                const entries = this.getCcrEntries(sessionId);
-                return hydrateSlimCcrStore(parsed, entries);
-            }
-            if (parsed && typeof parsed === "object" && parsed.version === 1
-                && parsed.byHash && typeof parsed.byHash === "object"
-                && parsed.byRef && typeof parsed.byRef === "object") {
-                return parsed;
-            }
-        } catch {
-            // fall through: a corrupt mirror degrades to the file path
-        }
-        return null;
-    }
-
-    getCcrEntries(sessionId: string): CcrEntryRow[] {
-        const rows = this.db
-            .prepare("SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord")
-            .all(sessionId) as Record<string, unknown>[];
-        return rows.map((r) => ({
-            ord: r.ord as number,
-            key: r.ccr_key as string,
-            content: this.getContent(r.content_hash as string) ?? "",
-            contentHash: r.content_hash as string,
-            // #6785 step 6: null (not "") marks pre-step-6 rows — callers
-            // degrade to the full envelope / file lane instead of
-            // reconstructing an empty original.
-            origContent: r.orig_hash === null || r.orig_hash === undefined ? null : this.getContent(r.orig_hash as string) ?? null,
-            origHash: r.orig_hash === null || r.orig_hash === undefined ? null : (r.orig_hash as string),
-        }));
-    }
 }

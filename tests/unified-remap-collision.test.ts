@@ -51,7 +51,7 @@ function mkSessionRow(id: string): SessionRow {
         metadataJson: "{}",
         kstateJson: "{}",
         tailJson: "{}",
-        ccrJson: "null",
+        ccrJson: null,
     };
 }
 
@@ -72,7 +72,6 @@ function fullInput(id: string, content: string): IngestSessionInput {
         blocks: [],
         deadRefs: [],
         refs: [],
-        ccrEntries: [],
         pluginSnapshotSeqs: [],
         tailSeqs: [],
     };

@@ -40,8 +40,8 @@
  *    invariant above rejects any lossy result that drops an error line),
  *    deduped warnings, bounded stack traces (runtime frames collapsed to a
  *    marker), summary lines and ±3 context, caps the rest by score. LOSSY:
- *    noise lines are dropped, not retained. Upstream deviations: no CCR store
- *    — the omission footer carries honest counts instead of a retrieve hash;
+ *    noise lines are dropped, not retained. Upstream deviations: the omission
+ *    footer carries honest counts;
  *    the keep budget is the fixed 100-line cap instead of headroom's adaptive
  *    Kneedle sizing (the cap only bounds output; the absorb gate and model
  *    compression already bound cost downstream). Only attempted when the

@@ -75,9 +75,8 @@ import {
     type GoogleSystemInstruction,
     type GoogleTool,
 } from "acp-kernel/wire";
-import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAcpTagsOnlyPrompt } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, buildAcpTagsOnlyPrompt } from "./compress-tool.js";
 import { absorbEnabled, storeEffectiveAbsorb } from "./absorb.js";
-import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
@@ -2104,14 +2103,9 @@ export type Prepared = {
     systemNotes?: string[];
     /** [#1343] Plugin-lane retrievals snapshotted onto THIS request's body.
      *  Carried so forward() commits them on upstream success or drops them
-     *  (logged + corrective note) on failure — the ack is already out, so the
-     *  full text must never vanish silently. */
+     *  (logged) on failure — the ack is already out, so the full text must
+     *  never vanish silently. */
     attachedRetrievals?: PendingRetrieval[];
-    /** [#1457] ids of the corrective notes snapshotted onto THIS request's body.
-     *  Committed ONLY when upstream accepts (2xx); on any failure they stay
-     *  pending for the next request — a note must never be consumed before the
-     *  correction actually reaches the model. */
-    attachedRetrievalNoteIds?: string[];
     nudge?: NudgeDecision;
     /** #3004: post-gate delivery fact for this round's armed nudge — what
      * ACTUALLY reached the payload, not the pre-gate intent. The model-decided
@@ -3193,7 +3187,7 @@ export function prepareCountTokens(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         // Read-only preview: same policy as the google twin above.
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only" });
         const stripped = stripKernelSummaries(turn.messages as BiliMessage[], turn.state);
         const rebuiltMessages = coreToAnthropic(stripped, cacheControls);
         log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);

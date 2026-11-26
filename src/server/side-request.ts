@@ -3,7 +3,7 @@ import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
 import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
-import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, BLOCK_OP_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
+import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, BLOCK_OP_TOOL_NAMES, RULE_TOOL_NAME } from "acp-kernel";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
 import { dshCarrierRawMarkers } from "../durable-message-guards.js";
 import { outputBudgetField, readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./budget.js";
@@ -689,8 +689,8 @@ export function resolveSideLane(s: SideLaneSignals): SideLaneDecision {
 // pollution + ~4K of billed tool tokens per session start). Structural signal: a
 // request whose ENTIRE tools array is bili's own context-management set has no
 // action surface — it is a side request with leaked bili tools, not an agent turn
-// (an agent turn needs a world to act in). Renamed opt-in tools (absorb.toolName
-// / ccr.toolName) stay out of the set on purpose: only the kernel-fixed names are
+// (an agent turn needs a world to act in). Renamed opt-in tools (absorb.toolName)
+// stay out of the set on purpose: only the kernel-fixed names are
 // guaranteed bili-owned, and any host tool vetoes the demotion.
 export const BILI_TOOL_NAMES: ReadonlySet<string> = new Set([
     ...ACP_TOOL_NAMES,
@@ -700,7 +700,6 @@ export const BILI_TOOL_NAMES: ReadonlySet<string> = new Set([
     ...BLOCK_OP_TOOL_NAMES,
     ABSORB_TOOL_NAME,
     RULE_TOOL_NAME,
-    RETRIEVE_TOOL_NAME,
     READ_ORIGINAL_IMAGE_TOOL_NAME,
 ]);
 

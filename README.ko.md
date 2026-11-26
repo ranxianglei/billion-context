@@ -553,7 +553,7 @@ bili --bin /path/to/client   # launcher: spawn this exact client binary instead 
 
 - `providers` — 프로바이더별 라우팅 테이블: 업스트림 재정의, 모델 컨텍스트 윈도, 프로바이더/모델별 압축 튜닝, 와이어 프로토콜 선언, compaction 옵트인.
 - `compress` — 3단계 압축 튜닝(전역 → 프로바이더 → 모델): 임계값, 넛지 주기, 보존 규칙, 프롬프트, 계층.
-- 서버 수준 블록 — 프로세스 전체 동작. #2030 추가분 포함: `network`(타임아웃 / 재시도 / keep-alive / preflight 주기), `persist`(세션 영속화 형식 + tail), `sessions`(상한 + GC 정책), `update`(레지스트리 미러 + 확인 간격), `diagnostics`(덤프, 렌더 태그 모드, 주입 스위치), `fakeCompletion`, 그리고 스칼라 `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`, 확장 `mitm.handshakeTimeoutMs`, `compat.noCacheControl`, `compat.keepResponseId`.
+- 서버 수준 블록 — 프로세스 전체 동작. #2030 추가분 포함: `network`(타임아웃 / 재시도 / keep-alive / preflight 주기), `persist`(세션 영속화 형식 + tail), `sessions`(상한 + GC 정책), `update`(레지스트리 미러 + 확인 간격), `diagnostics`(덤프, 렌더 태그 모드, 주입 스위치), `fakeCompletion`, 그리고 스칼라 `codexCompact` / `decompressTmpCap`, 확장 `mitm.handshakeTimeoutMs`, `compat.noCacheControl`, `compat.keepResponseId`.
 
 최소 예시:
 
@@ -651,7 +651,7 @@ Responses/OpenAI/Anthropic 와이어에서 콘텐츠 지문 대체보다 우선 
   잠금이 제대로 동작하려면 절대 공유되지 않는 RWO 볼륨이 필요합니다. 두 인스턴스를
   같은 RWX/NFS 경로에 두면 공유 저장소가 생기는 것이 아니라 — 타임아웃 뒤에 숨은
   조용한 손상이 생깁니다. 인스턴스당 RWO 볼륨 하나, `storage.unified`도 마찬가지입니다:
-  "unified"는 *그 인스턴스의* 저장소 하나(세션 + CCR + CAS를 하나의 `index.db`에)를
+  "unified"는 *그 인스턴스의* 저장소 하나(세션 + CAS를 하나의 `index.db`에)를
   뜻하지, 전체 플릿의 저장소 하나를 뜻하지 않습니다.
 - **실제로 확장되는 워크로드**는 *서로 독립적인 수많은 단기 대화* — 클라이언트당
   또는 레인당 프록시 하나 — 이지, *여러 프록시에 부하 분산된 하나의 긴 대화*가
@@ -682,7 +682,7 @@ SQLite WAL은 로컬 파일 시스템에서 다중 프로세스에 안전합니�
 
 ### 세션 파일 정리 (#1082)
 
-수명이 짧은 세션은 다시 재개되지 않는 작은 상태 파일을 남깁니다. 정리는 **옵트인**입니다(`BILI_SESSION_GC=1`. 기본값 꺼짐 — 세션 파일은 사용자 데이터이므로 조용히 삭제하는 정책은 없습니다). 켜면 bili는 부팅 시와 매시간 세션 디렉터리를 훑어, 두 조건을 모두 만족할 때만 파일을 삭제합니다 — `BILI_SESSION_GC_MAX_AGE_DAYS`(기본값 7일)보다 오래되었고, 한 번도 압축되지 않았으며 최신 요청 본문이 `BILI_SESSION_GC_MAX_TOKENS` 토큰(기본값 1M) 이하일 것 — 그래서 삭제로 잃는 것은 바이트뿐입니다. CCR 콘텐츠 저장소는 세션 파일의 수명 주기를 따르고, 압축된 세션은 절대 삭제되지 않으며, 모든 삭제는 감사 로그로 남습니다. 전체 정책: [docs/configuration.md](docs/configuration.md#environment-variables).
+수명이 짧은 세션은 다시 재개되지 않는 작은 상태 파일을 남깁니다. 정리는 **옵트인**입니다(`BILI_SESSION_GC=1`. 기본값 꺼짐 — 세션 파일은 사용자 데이터이므로 조용히 삭제하는 정책은 없습니다). 켜면 bili는 부팅 시와 매시간 세션 디렉터리를 훑어, 두 조건을 모두 만족할 때만 파일을 삭제합니다 — `BILI_SESSION_GC_MAX_AGE_DAYS`(기본값 7일)보다 오래되었고, 한 번도 압축되지 않았으며 최신 요청 본문이 `BILI_SESSION_GC_MAX_TOKENS` 토큰(기본값 1M) 이하일 것 — 그래서 삭제로 잃는 것은 바이트뿐입니다. 압축된 세션은 절대 삭제되지 않으며, 모든 삭제는 감사 로그로 남습니다. 전체 정책: [docs/configuration.md](docs/configuration.md#environment-variables).
 
 ### 저장소 유지 관리 CLI (#3928)
 

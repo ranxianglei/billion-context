@@ -120,7 +120,7 @@
 | `autoModeForge.enabled` | boolean | true | BILI_AUTO_MODE_FORGE | Claude Code auto mode 安全分类器请求由 bili 在本地代答放行判定，不再转发上游（#2740）：该旁路零流出、零计费；每条代答写审计日志，会话带提示徽标。false / env 0 恢复纯透传（愿意付费要真判定的用户）。 |
 | `affinitySimhash` | boolean | true | BILI_AFFINITY_SIMHASH | 匿名客户端的 simhash 链对齐收养（#2265）：客户端侧大面积装饰性改写（如 Trae 切模型后给每条 assistant 消息重打模型标签）时，重新挂回既有会话并保留压缩状态，而不是每次新铸会话、从零重折。 |
 | `resumeInheritance` | boolean | true | BILI_RESUME_INHERITANCE | 以新会话 id 恢复的已识别客户端继承父会话的引用编号与完整存在的压缩块。 |
-| `chainContentDetection` | boolean | false | BILI_CHAIN_CONTENT | 按请求体内容识别 bili→bili 链（默认关：正文扫描会对 CCR/模型回声文本误报）；默认仅 x-bili-hop 驱动链识别。 |
+| `chainContentDetection` | boolean | false | BILI_CHAIN_CONTENT | 按请求体内容识别 bili→bili 链（默认关：正文扫描会对模型回声文本误报）；默认仅 x-bili-hop 驱动链识别。 |
 | `chainEgressStamp` | boolean | false | BILI_CHAIN_STAMP | 在出口消息上打模型可见的 <bili-chain/> 链完整性标记（默认关：模型会把它当幽灵输入而消耗 token）。 |
 | `stableSystemAnchor` | boolean | false | BILI_STABLE_SYSTEM_ANCHOR | 线路层尽力而为的前缀缓存锚点：客户端改动头部 system 时仍重发首次见到的字节（仅纯代理通道）。 |
 | `compat` | { roles?, dropFields?, streamErrorShape?, noCacheControl?, keepResponseId? } | {} (disabled) | — | 全局线上兼容块：角色映射、严格 schema 字段剔除、流式错误形态、缓存控制处理。 |
@@ -231,7 +231,7 @@
 | `storage.backend` | sqlite\|mysql | unset (sqlite) | BILI_STORAGE_BACKEND | 存储后端选择（#3388 / #3931）：统一存储消费操作级的异步 StorageBackend 契约。sqlite 为默认（现有 UnifiedStore 套一层 Promise 包装适配器）。mysql 已完整接线（第二+三步）：openBackend("mysql", dsn) 打开真正的 MysqlBackend,对接 MySQL 8.0 —— 完整契约面（带 CAS 引用计数的 ingest、读取、session_ext、收割台账、归档/恢复/GC、checkpoint、会话绑定）,mysql2 作为常规依赖打包并按需懒加载（从不选 mysql 的启动永不加载它）。代理热路径经异步影子 facade 接线：保存进串行后端队列（水位 delta、孤儿/收割台账、digest 采样 —— sqlite 保持零 await 同步快车道不变）,同步读走 JSON 信封（sidecar 经 ready() 异步挂载;viewFor/importRecord 同步面按设计 miss）,replicas/ext/GC/export/fork 走异步孪生（#4911：fork 车道经它们 await lastLiveSeq + 行克隆；fold-anchor 回填/快照渲染用的同步窗口读按设计仍走信封）。writerOff 仅 sqlite（信封就是 mysql 的同步读路径）。未知名字回退 sqlite 并提示。每个 lane 启动时解析一次。 |
 | `storage.mysql.dsn` | string | unset | BILI_MYSQL_DSN | storage.backend="mysql" 的 MySQL DSN（#3388 第二步，#3931）：mysql://user:pass@host:3306/db。由 StorageBackend 契约路径消费（含热路径 —— 异步影子队列）。环境变量 BILI_MYSQL_DSN 优先于文件键。空/未设置 = mysql 后端无法打开 —— 文档化错误会同时列出两个旋钮和可用的默认值。 |
 | `storage.sqliteAutoDownload` | boolean | true | BILI_SQLITE_AUTO_DOWNLOAD | SQLite 引擎一次性自下载的闸门（#2833）：进程内没有可用引擎（无内置 node:sqlite、宿主未装 better-sqlite3）且本平台希望启用统一边车时，bili 从 npm registry 一次性下载钉死的 better-sqlite3 预编译 tarball（约 11 MB，sha512 校验）到缓存目录，之后每次启动复用。引擎解析顺序：内置 node:sqlite（Node >= 22.5）-> 宿主机已装的 better-sqlite3 -> 缓存的自下载副本 -> 自下载（本开关控制）-> 无引擎（仅 legacy，即 #2825 降级契约）。开关只控制网络下载 —— 为 false 时缓存副本仍会使用；不支持的平台永不下载。 tarball 下载内置镜像列表兜底（#3338）：先试配置的 registry（BILI_UPDATE_REGISTRY / update.registry），再试 https://registry.npmjs.org、https://registry.npmmirror.com —— 第一个通过 sha512 校验的镜像生效；Node < 22.5 且无引擎时，降级原因会给出明确的 Node 升级提示（#3385）。引擎产物按运行时特性分别钉死，因为 binding 无法在包自身声明的范围之外加载：Node >= 22 且 N-API >= 10 用 better-sqlite3 v13（单个 tarball 自带 prebuilds），而 Node 20 与 Node 22.0–22.12（满足 v13 的大版本下限但只带 N-API 9）用 v12.9.0（纯 JS tarball 加与之 ABI 匹配的 prebuild，从二进制镜像获取并经 nativeBinding 注入）—— 低版本 Node 因此留在统一存储车道上，而不是降级到 legacy。任何钉死产物都不支持的运行时（低于所有下限，或 ABI 无对应 prebuild）会在加载之前被拒绝，下载与缓存副本注册都不进行 —— 在那里加载该 binding 会让进程崩溃，而不是优雅失败（#3341、#3894）。下载失败会置一个 6 小时的重试冷却，以标记文件形式持久化在缓存目录下（billion-context/sqlite/.bootstrap-failed.json）；storage 诊断块会显示该标记的绝对到期时间与路径 —— 删除该文件并重启 bili 即可强制立即重试，不必等完整个冷却窗口（#3788）。 |
-| `storage.jsonWriter` | on\|off | unset (off for the pure-sqlite selection — absent/unified=sqlite — and on for explicit full) | BILI_STORAGE_JSON_WRITER | Phase 3 信封开关（#2960）—— 本次发布翻转缺省：UNSET（未设置）现在对纯 SQLite 选择（storage.unified 未设置或 "sqlite"）缺省为 OFF —— SQLite 索引成为唯一持久副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。显式 full 保留 #3818 的历史双写缺省（除非本键另说，信封照写）。有效 full 模式下任一层的显式 on/off 总是生效：shadow/legacy（或加密激活）下请求的 off 会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层（"off"/"on"）。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。恢复双写：设 storage.jsonWriter=on（或 BILI_STORAGE_JSON_WRITER=1）—— 纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 CCR content-store 边车也不再写 —— full 模式下读取时先查索引里的 ccr 镜像，镜像才是持久副本。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。 |
+| `storage.jsonWriter` | on\|off | unset (off for the pure-sqlite selection — absent/unified=sqlite — and on for explicit full) | BILI_STORAGE_JSON_WRITER | Phase 3 信封开关（#2960）—— 本次发布翻转缺省：UNSET（未设置）现在对纯 SQLite 选择（storage.unified 未设置或 "sqlite"）缺省为 OFF —— SQLite 索引成为唯一持久副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。显式 full 保留 #3818 的历史双写缺省（除非本键另说，信封照写）。有效 full 模式下任一层的显式 on/off 总是生效：shadow/legacy（或加密激活）下请求的 off 会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层（"off"/"on"）。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。恢复双写：设 storage.jsonWriter=on（或 BILI_STORAGE_JSON_WRITER=1）—— 纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。 |
 | `storage.walJournalSizeLimitBytes` | number | 0 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | index.db-wal 的 WAL 回收上限（#3250），单位字节。0（默认，#7674）= 不限制 —— 引擎不在 checkpoint 后截断 WAL 文件；文件停留在历史高水位（现场 ~55 MiB 稳定），帧仍会在每次周期/收尾 checkpoint（PASSIVE —— 重放尾为零）收敛进 index.db。opencode 就是这么跑的（13 个并发写者、9.55 GB 库、零损坏）。#7674 之前的 8 MiB 默认让引擎在每次完成的 checkpoint 后内部截断 WAL —— 一条 JS 护栏都盖不住的隐式地板回收，把 WAL 从共享会话目录的活 peer 连接脚下抽走（#2671：5 个 daemon、kill-9 换代）—— 正是 #7156 的损伤形。正数 N：每次完成的 checkpoint 把 WAL 截回 N。不是每会话数据配额 —— 数据写入时就已落进 index.db。环境变量层（正整数）优先于配置文件层；env 值非法或非正数时静默落到文件/默认层，boot 不崩。lane 启动、store open 时生效 —— 热改动需重启。 |
 | `storage.archiveAfterDays` | integer | 365 | BILI_STORAGE_ARCHIVE_AFTER_DAYS | GC 年龄清扫窗口（天，#3463/#3901）：闲置超过该时长的会话被归档 —— 以单行 JSON 追加到单一归档日志（会话目录下的 archive/archive.jsonl——不撒每会话小文件），墓碑行保留标签与身份，释放内容/媒体引用，一条 POST 即可恢复。0 关闭年龄清扫；POST /__bili/storage/gc 始终可用并支持 ?vacuum=full 收缩存量 index.db（新写入始终 auto_vacuum=INCREMENTAL）。同一套操作另有 CLI 层（#3928）：bili storage gc [--days N] [--vacuum full\|incremental] [--dry-run]，以及 bili sessions ls/rm/archive/restore <id>（README「存储维护 CLI」一节）。环境变量优先于配置文件层。 |
 
@@ -278,7 +278,6 @@
 | `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | 被截断的末块完成可被重新请求的次数；0 禁用该重试环。 |
 | `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | 重试环累积流缓冲的大小上限。 |
 | `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | 在 bili 内处理 Codex 的压缩请求（intercept，默认）还是转给上游（pass）：覆盖显式形态（compaction_trigger + /responses/compact）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测，#3008）—— 用户自定义 compact_prompt 后锚点失配、按原样转发；bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。 |
-| `ccrRetrievalTtlMs` | number | 600000 (0 disables retrieval) | BILI_CCR_RETRIEVAL_TTL_MS | CCR 回取指针的有效期，过期后原文不再可通过 acp_retrieve 取回。 |
 | `decompressTmpCap` | number | 50 | BILI_DECOMPRESS_TMP_CAP | 会话内临时展开内容的大小上限（按块计）。 |
 
 **压缩（全局层级）**
@@ -322,7 +321,6 @@
 | `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。 |
 | `compress.degenerateRetry` | object | 1 attempt (built-in nudge) | — | 零可见输出回合（退化终端回合）的重试预算与 nudge 句配置。续接 nudge 只附在重试请求体上——不写入会话状态，客户端下一轮不重放。 |
 | `compress.blockOps` | object | off | — | 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，关闭时线上字节与 #5765 之前完全一致。 |
-| `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
 | `compress.search` | object | off | — | search_context 的检索行为设置；当前含 planAware 重排。 |
 | `compress.search.planAware` | boolean | false | — | 开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。 |
 | `compress.prompts` | Partial<Prompts> | unset (kernel doctrine) | — | 覆盖内核教条文本；对压缩质量承重要——受 acknowledgePromptsRisk 门控。 |
@@ -340,11 +338,6 @@
 | `compress.degenerateRetry.maxAttempts` | integer | 1 | — | 空回合重试预算（#7666）：回合以客户端零可见输出收尾时，把 agent 自己的原请求追加一条尾部 user nudge 后重发。0=关（空回合直接放行），1=一次（#7666 前的默认行为），上限 5；第 i 次发 nudges[i]（短了循环）。与断流重发（#2171）预算独立——同一回合各可花一次。 |
 | `compress.degenerateRetry.nudges` | string[] | 3 built-in | — | 自定义空回合重试 nudge 句（#7666）；第 i 次重试发第 i 句（短了循环）。不填 = 内置轮换，首句即默认续接 nudge。 |
 | `compress.blockOps.enabled` | boolean | false | — | 启用三个压缩块生命周期工具（注入 + prompt + manifest）。关闭 = 无工具、无 prompt 段、零每请求开销。 |
-| `compress.ccr.enabled` | boolean | true (proxy mode) | — | 启用内容缓存与回取块。 |
-| `compress.ccr.minToolTokens` | number | ≈4000 | — | 可进入 CCR 存储的工具结果的最小估算 token 大小。 |
-| `compress.ccr.excludeTools` | string[] | [] | — | 排除出 CCR 存储的工具名。 |
-| `compress.ccr.toolName` | string | "acp_retrieve" | — | 回取工具的注册名。 |
-| `compress.ccr.maxHeadChars` | number | 96 | — | 存储指针处内联首段摘录的最大长度。 |
 | `compress.prompts.compressPhilosophy` | string | unset (kernel text) | — | 覆盖压缩哲学教条文段。 |
 | `compress.prompts.howToCompressRules` | string | unset (kernel text) | — | 覆盖压缩操作规则。 |
 | `compress.prompts.tier2DistillRules` | string | unset (kernel text) | — | 覆盖二级蒸馏规则。 |
@@ -468,7 +461,6 @@
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | 派生通道：标记插件 agent 进程。 |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | 出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。 |
 | `BILI_PLUGIN_BYPASS` | string | auto (unset = the inbound header decides) | — | x-bili-plugin-bypass 透传判定的运维覆盖开关（#6220），逐请求读取（无需重启）。三态：未设置（或 auto）= 现状——由入站头逐请求决定（legacy opencode-acp 会话绕过，其余走完整管线）；1/on/true = 强制 bypass——所有入站请求原样透传（不注入工具、不注入 nudge、不绑定会话）；0/off/false = 永不 bypass——忽略任何入站 x-bili-plugin-bypass 头，即使 legacy opencode-acp 会话也走完整管线。无法识别的取值按 auto 处理（= 现状）。按 #6220 owner 拍板仅环境变量（该头是宿主盖戳的线路契约，覆盖是逐进程运维姿态，而非逐路由配置项）。 |
-| `BILI_SESSION_CONTENT_STORE_PIN` | 1/true | unset (fold after save) | — | 让每个会话的 CCR 内容存储（{byRef}/{byHash} 原文）常驻内存，而不是在落盘后折叠掉（#4788 二期，讨论 #3916-E）；存储会在首次触及时从统一 ccr 镜像或 .content-store.json 侧车重新物化。未设置、0/false 或其他值 = 折叠（默认）。设计上仅环境变量。 |
 
 <!-- /bili:gen -->
 
@@ -879,7 +871,7 @@
 - **类型：** `boolean`
 - **默认值：** `false`
 - **状态：** ACTIVE
-- **说明：** bili→bili 链感知的 body 内容检测（#1086/#1421/#1683 后续）：入站请求 body 里携带压缩产物（渲染标签 / 历史性 `acp_status`+`search_context` 工具调用）或带摘要的 `<bili-chain …/>` checkpoint，但既无 `x-bili-hop` 头也无该会话的本地压缩状态时，bili 记录告警观测和/或应用 first-processor-wins 直通。默认关，因为扫描请求 BODY 会对 CCR/文件引入的文本与形似真实标记的模型回声标签误报 —— 只在中间盒子剥掉 `x-bili-hop` 的多 bili 中继窄场景、且你接受该误报风险时启用。`x-bili-hop` 信号本身两种情况都不受影响。`BILI_CHAIN_CONTENT=1` 开启。
+- **说明：** bili→bili 链感知的 body 内容检测（#1086/#1421/#1683 后续）：入站请求 body 里携带压缩产物（渲染标签 / 历史性 `acp_status`+`search_context` 工具调用）或带摘要的 `<bili-chain …/>` checkpoint，但既无 `x-bili-hop` 头也无该会话的本地压缩状态时，bili 记录告警观测和/或应用 first-processor-wins 直通。默认关，因为扫描请求 BODY 会对文件引入的文本与形似真实标记的模型回声标签误报 —— 只在中间盒子剥掉 `x-bili-hop` 的多 bili 中继窄场景、且你接受该误报风险时启用。`x-bili-hop` 信号本身两种情况都不受影响。`BILI_CHAIN_CONTENT=1` 开启。
 
 ### `chainEgressStamp`
 
@@ -1025,7 +1017,6 @@
 
   // 标量
   "codexCompact": "intercept",            // 或 "pass"
-  "ccrRetrievalTtlMs": 600000,            // 排队 acp_retrieve 的过期时限；0 禁用
   "decompressTmpCap": 50                  // 并发 decompress 临时文件上限
 }
 ```
@@ -1122,12 +1113,12 @@
 - **说明：** 针对流中途被宿主掐断场景的 fake-completion 安全网（#371）—— **显式开启**，`retries: 0`（默认）即 #371 之前的透传行为。`bufCapBytes` 是缓冲响应的 OOM 护栏。对应 `BILI_FAKE_COMPLETION_RETRIES`、`BILI_FAKE_BUF_CAP`。
 - 响应超过 `bufCapBytes` 时，已读前缀和后续内容会继续进入正常流式处理。未完成的检查不会触发重试或改变会话的 fake-completion 连续计数；该上限不会截断回答。首次响应与附带纠正提示的重试响应都遵循此规则。
 
-### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
+### `codexCompact` / `decompressTmpCap`
 
 - **类型：** `string`（"intercept" | "pass"）/ `number` / `number`
 - **默认：** `"intercept"` / `600000` / `50`
 - **状态：** ACTIVE
-- **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。作用范围（#3008）：覆盖显式形态（`/compact` 触发的 `compaction_trigger` 与 `POST /responses/compact`）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测）；用户自定义 compact_prompt 后锚点失配、按原样转发。bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。`ccrRetrievalTtlMs`：排队未送达的 `acp_retrieve` 注入的过期时限，过期大声丢弃（对应 `BILI_CCR_RETRIEVAL_TTL_MS`；`0` 禁用）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。
+- **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。作用范围（#3008）：覆盖显式形态（`/compact` 触发的 `compaction_trigger` 与 `POST /responses/compact`）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测）；用户自定义 compact_prompt 后锚点失配、按原样转发。bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。
 
 另有三个 #2030 键扩展了既有块：[`mitm.handshakeTimeoutMs`](#客户端接入)（默认 `10000`，对应 `BILI_MITM_HANDSHAKE_TIMEOUT_MS`）、[`compat.noCacheControl`](#compat)、[`compat.keepResponseId`](#compat)。
 
@@ -1674,26 +1665,12 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   - `acp_rewrite` — 原地替换块摘要（保留一步回滚位 `previousSummary`；相同/空白摘要拒收；`compress` 对该块会拒收的摘要同样拒收：长度超出 `compress.minSummaryLength` / `compress.maxSummaryLength`，或不比该块折叠的内容小）。
   内核状态变更幂等、可批量（`blockId` 单块或 `ids` 数组）。**为何默认关：** 三个工具 schema 在启用期间是常驻面——每个会话每个请求约 +0.7k 估算 token——所以不显式开启时，线上表面（工具数组、prompt、manifest）与 #5765 之前逐字节一致。关闭时的误调会得到面向模型的「not enabled on this bili proxy (compress.blockOps.enabled is not true)」回执而非报错，且绝不改动状态。退场/改写状态跨重启持久化在会话状态中，导出台账（markdown handoff + JSONL）报告 `retired` 状态、消息 ref 区间与原文/摘要字符数。
 
-#### `ccr`
-
-- **类型：** `object`（`{ enabled?, minToolTokens?, excludeTools?, toolName?, maxHeadChars? }`）
-- **默认值：** *（全车道默认关闭（#1207 决策）— 未设置时保持关闭；在任意层级显式设置 `enabled: true` 方可启用（建议先本地验证）。插件通道同样需全局 `enabled: true` 才武装（#1271/#1273））*
-- **状态：** ACTIVE（v2 — 全车道 opt-in；插件通道限 anthropic + openai wire，显式开启后生效）
-- **说明：** **内容寻址消息存储**/内置 CCR（issue #1097/#1179，经 `acp-kernel` CCR API，需 acp-kernel >= 0.0.84）。超大工具结果不再被强制蒸馏（如 `absorb`）或永远挂在线上：kernel 在到达时将其 ID 引用（ccr-store 节点位于 `processTurn` 内 prune 与 absorb 之间 —— ID 引用优先于蒸馏），线上保留一个确定性、字节稳定的占位符（`📦 [acp-stored #m00423 · shell output · 4,213 tok] \`npm run build\`\n   → acp_retrieve("m00423") returns the full text`），原文进入该会话的内容存储。模型通过注入的 `acp_retrieve` 工具按需取回完整原文；retrieve 是临时的（走请求内工具结果通道，不进入折叠空间，不占用消息 ref）。默认无损：未执行的 retrieve 只花一次廉价工具调用；而被 absorb 蒸馏掉的细节则永久丢失。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
-   - `enabled: boolean` — 主开关。**全层级均未设置时默认为 `true`**（#1179）；任意层级显式 `false` 优先，特性完全关闭（无占位符、无工具）。插件模式武装还需全局显式 `true`（#1273）——插件清单只广播运维者显式开启的能力。
-  - `minToolTokens: number` — 仅达到此 token 数的工具结果被 ID 引用（kernel 默认 `4000`）；更小的结果保持原样。
-  - `excludeTools: string[]` — 从不存储的工具名模式（允许 glob 后缀；kernel 默认为空）。
-  - `toolName: string` — 重命名检索工具（默认 `"acp_retrieve"`）；声明、分发与占位符提示都跟随名称。必须与客户端自身工具名保持唯一。
-  - `maxHeadChars: number` — 占位符中头部/命令预览的长度（kernel 默认 `96`）。
-  **插件通道治理（#1345）：**插件模式下整个 `ccr` 块跟随**基础**配置——仅当基础层级显式 `enabled: true` 时武装，并以基础的 `toolName` 与阈值执行；因为插件清单（宿主声明 retrieve 能力的唯一出口）只从基础配置构建。provider/model 层级的 `ccr.*` 覆盖因此只对代理模式会话生效（代理按请求在合并块下自行声明并分发）。每个发生分歧的覆盖都会在配置加载时记录一条 `[acp-config] ccr override ignored in plugin sessions: …` 警告，指明层级、字段以及插件会话实际使用的值。
-  存储以单个信封文件（`.content-store.json`）持久化在会话 JSON 旁边，设置 `BILI_ENCRYPTION_KEY` 时使用与会话文件相同的静态加密编解码器；条目按内容哈希去重，按会话懒加载。只有 `tool` 结果*内部的内容*缩小——与 assistant `tool_calls` 的配对不受影响。范围门控：**全车道默认关闭（#1207 决策）— 任意层级显式 `compress.ccr.enabled: true` 方可启用**：代理模式开启即武装；anthropic + openai wire 上的插件模式需全局显式开启（插件清单才会声明 `acp_retrieve`，#1271）；responses marker/文本协议路由、`ACP_NO_INJECT_TOOL`、以及插件模式下的 responses/google wire 没有经过验证的请求内往返通道来执行 retrieve，因此存储在这些场景下自动解除武装，而不是丢失内容。v2 起（#1179），折叠同样无损：compress 折叠落定时，被覆盖的原文会持久化进存储（首次写入优先，跳过 reasoning），因此 `acp_retrieve("mNNNNN")` 对已折叠内容同样有效；`decompress` 接受可选的 `startId`/`endId` 消息 ref，只恢复块内的一个区间（临时注入，与 retrieve 同一通道）；`search_context` 命中条目携带覆盖的 ref 区间（`[m00044–m00097 · N msgs]`）；`acp_status` 列出块→ref 关联（`BLOCK SPANS`），并在 STORE 行单独计数 `range-restored`。设计定案（#1282）：**永不设上限、永不逐出**——信封随持有的唯一原文数量增长，与会话同生命周期；足迹在 `acp_status` 中可见。按会话统计（已存字节、当前线上节省字节、retrieve 率）在 `acp_status` 中展示；每次 retrieve 记录一条 `[ccr] retrieve …` 日志。
-
 #### `search`
 
 - **类型：** `object`（`{ planAware? }`）
 - **默认值：** *（关闭 —— 未设置即解析为 `planAware: false`；输出与纯词法搜索逐字节一致）*
-- **状态：** ACTIVE（CCR v3 规划感知检索，#1336 —— 默认关闭、实测后再启用；代理模式 + 插件模式）
-- **说明：** 面向 `search_context` 的可选**规划感知检索**（issue #1336）。启用后，当查询命中的块数超过 `limit` 时，候选块会按当前**规划状态**重排：规划状态从上下文内的消息视图提取——每个规划工具的**最后一次** tool-call（内置模式 `TodoWrite`、`todowrite`、`todo_list`、`update_plan`、`TaskCreate`、`TaskUpdate`，外加全部 `compress.protectedLatestTools` 模式——与内核快照保护的 latest-wins 语义相同）以及最近一条用户消息。候选块的 topic/summary 与该状态的词项做加权重叠打分：得分 >0 的块排前，同分保持原词法顺序。仅在此条件下发生两件事：返回子集可能不同于纯词法截断；结果末尾追加 `[plan-aware]` 引导段——(a) `top fetch targets:` 列出得分最高的返回块所覆盖的 ref 区间，(b) 对本会话内已 retrieve ≥2 次的覆盖 ref 给出提示，建议改用一次性 `decompress({blockId, startId, endId})` 区间恢复代替反复 `acp_retrieve`。标志关闭、上下文中无规划状态、或命中池本就在 `limit` 之内时，输出与功能引入前逐字节一致。重排只动候选顺序——不改存储/折叠/注入机制、不新增持久化、跨会话搜索（`conversation_id`）保持只读词法。每次重排记一条 `[acp-search-plan] …` 日志（含逐块得分）。配套统计：整块 decompress 计入 `acp_status` 的 `RETRIEVAL QUALITY` 行（总数 + 其中有多少次存在更便宜的精确路径可用——即该块带 ref 区间且 CCR 已武装），便于启用前后度量 retrieve 与 decompress 的取舍。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
+- **状态：** ACTIVE（规划感知检索，#1336 —— 默认关闭、实测后再启用；代理模式 + 插件模式）
+- **说明：** 面向 `search_context` 的可选**规划感知检索**（issue #1336）。启用后，当查询命中的块数超过 `limit` 时，候选块会按当前**规划状态**重排：规划状态从上下文内的消息视图提取——每个规划工具的**最后一次** tool-call（内置模式 `TodoWrite`、`todowrite`、`todo_list`、`update_plan`、`TaskCreate`、`TaskUpdate`，外加全部 `compress.protectedLatestTools` 模式——与内核快照保护的 latest-wins 语义相同）以及最近一条用户消息。候选块的 topic/summary 与该状态的词项做加权重叠打分：得分 >0 的块排前，同分保持原词法顺序。仅在此条件下发生两件事：返回子集可能不同于纯词法截断；结果末尾追加 `[plan-aware]` 引导段——(a) `top fetch targets:` 列出得分最高的返回块所覆盖的 ref 区间，(b) 对本会话内已 retrieve ≥2 次的覆盖 ref 给出提示，建议改用一次性 `decompress({blockId})` 整块恢复代替反复搜索。标志关闭、上下文中无规划状态、或命中池本就在 `limit` 之内时，输出与功能引入前逐字节一致。重排只动候选顺序——不改存储/折叠/注入机制、不新增持久化、跨会话搜索（`conversation_id`）保持只读词法。每次重排记一条 `[acp-search-plan] …` 日志（含逐块得分）。配套统计：整块 decompress 计入 `acp_status` 的 `RETRIEVAL QUALITY` 行（总数 + 其中有多少次存在更便宜的精确路径可用——即该块带 ref 区间），便于启用前后度量 retrieve 与 decompress 的取舍。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
   - `planAware: boolean` — 总开关；非 `true` 一律保持功能完全关闭。
 
 #### `rules`
@@ -1976,7 +1953,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CACHE_KEEPALIVE_MAX_PINGS` | `cacheKeepalive.maxConcurrentPings` | 4 |
 | `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | `cacheKeepalive.ttlFactor` | 0.9 |
 | `BILI_CA_FILE` | `network.caFile` | unset |
-| `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
 | `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |
 | `BILI_CLAUDE_NATIVE_PORT` | `claude.nativePort` | unset (lane sticky zone port) |
@@ -2167,7 +2143,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_STABLE_SYSTEM_ANCHOR` | 设为 `1` 开启稳定 system 锚定（#1085）—— **wire 层兜底（best-effort）**：根治在客户端（会话历史与指令变更的呈现方式由客户端决定），本开关只是阻止代理因头部变化而使整个已缓存前缀失效。**仅限 plain-proxy 模式**：plugin-mode agent（`x-bili-plugin`）自管上下文、永不参与锚定，避免对已自带 cache-friendly 更新注入的客户端（如 claude-code 的 system-reminder）做双重处理。开启后，bili 按会话记住客户端首次发送的头部 system/instructions 块并持续原样重发。**局部变更**（文件式编辑，与当前生效版本共享 ≥70% 行）追加末尾 `[System context update] …` user 注记，内含紧凑行级 diff（`-` 删除 / `+` 新增；每条注记顺序叠加在前一条之上）。**非局部变更**（结构性重排、tool 定义增删、带时间戳的 banner、超 400 行的头部）直接采用新文本 —— 一次有意的缓存失效好过追加会误导模型的噪声 diff。防抖保护：累积超过 8 条注记同样直接替换锚点为最新文本并清空日志。锚点与注记日志随会话持久化，不受压缩/compaction 影响（session metadata 而非 kernel state）。已知残留限制：客户端自放的 `cache_control` 断点在换头后仍可能错位。不参与锚定的请求：标题生成微请求（OpenAI/Google）、Responses compaction-trigger 请求、auto-mode classifier 请求。客户端自身已实现同类机制（稳定 prompt + 历史内更新）时零额外注入 —— 这类更新作为普通历史透传。默认关闭。配置文件中设 `"stableSystemAnchor": true` 效果相同；环境变量优先。 |
 | `BILI_ALLOW_DSH_COMPACTION` | **#3666 起移除**（取代 #2028）。原开关通过解除 wire 级拒绝（#1729）放行 dsh 内置自动压缩；由于落地的 dsh checkpoint 会永久覆盖原始会话历史——不可逆、摧毁代理的压缩基底——该逃生门已被整体删除：所有 bili 服务的线路上，dsh 原生压缩调用现在一律被无条件拦截，所有构建一致——默认拒绝（422），或在设置 `BILI_DSH_AUTHORED_COMPACTION`（下一行）时由 bili 本地应答。任何遗留取值——`"dsh": { "allowDshCompaction": true }`、旧文件里裸写在顶层的 `"allowDshCompaction"`、或旧环境变量——都会被忽略，并给出一条点名该键的一次性弃用警告。若要彻底避免 dsh 侧 checkpoint 落地，请改用宿主侧抑制：非 web profile 下随附 bundle patch（`auto: false`），web profile 下用 #3354 加载期 overlay 或 #2474 对 preset-standard 的完整快照覆盖。 |
 | `BILI_DSH_CONTEXT_TAB` | 设为 `0` **移除** DSH 顶栏「上下文」会话标签页（#4237）——同名标签页与同机安装的 dsh-context 冲突，且此前没有用户侧开关。隐藏只移除该标签页：压缩、设置页一节（会话子页）、插件 bundle 配置面、Web UI 与 /acp 命令全部不受影响——账本仍可从这些入口查看。其他取值（`1`、`true`、…）强制开启并覆盖文件层；缺省则按配置文件 `dsh.contextTab` 布尔值取值（默认 true = 现状不变）。设置经既有的快照 + `/bili/origin` 载体送达 DSH 页面并在页面加载时读取，因此下次页面加载 / dsh 重启即生效，无需重启代理。标签页的显示**名称**是另一个仅文件层的键：`dsh.contextTabLabel`。 |
-| `BILI_DSH_AUTHORED_COMPACTION` | 设为 `1` 让 bili **本地应答** dsh 的压缩摘要调用，而不是拒绝它们（#3733）。每次调用的前置条件：#1729 守卫触发（由标记决定；#3651 起无条件）、会话至少持有一个 ACTIVE 折叠块。应答零出口流量构造（autoModeForge #2740 纪律）：一行身份头 `<bili-snapshot v1 conv="…" seq="…" blocks="…" />` 加上每个活跃块的内核渲染格式摘要——与模型在上游已读到的字节完全一致，客户端显示、上游上下文与服务端状态首次吻合，dsh 的 checkpoint 文件随之缩小（终结 #3723 的无界增长环）。原始历史随时可经 CCR/导出恢复；落地的检查点在重放时经同一 #2432 rebase 识别（与外部 checkpoint 同路径），但记为 `dshAuthoredCheckpointLanded`（info 而非 warn）。灰度窗口期 env-only（无配置文件键）；每请求读取，无需重启。 |
+| `BILI_DSH_AUTHORED_COMPACTION` | 设为 `1` 让 bili **本地应答** dsh 的压缩摘要调用，而不是拒绝它们（#3733）。每次调用的前置条件：#1729 守卫触发（由标记决定；#3651 起无条件）、会话至少持有一个 ACTIVE 折叠块。应答零出口流量构造（autoModeForge #2740 纪律）：一行身份头 `<bili-snapshot v1 conv="…" seq="…" blocks="…" />` 加上每个活跃块的内核渲染格式摘要——与模型在上游已读到的字节完全一致，客户端显示、上游上下文与服务端状态首次吻合，dsh 的 checkpoint 文件随之缩小（终结 #3723 的无界增长环）。原始历史随时可经导出恢复；落地的检查点在重放时经同一 #2432 rebase 识别（与外部 checkpoint 同路径），但记为 `dshAuthoredCheckpointLanded`（info 而非 warn）。灰度窗口期 env-only（无配置文件键）；每请求读取，无需重启。 |
 | `BILI_NO_CACHE_CONTROL` | 设为 `1` 关闭 bili 在 Anthropic 通道上的 `cache_control` 断点标注(#1637,随 #1639 落地)。默认开启:Anthropic 系上游只缓存被显式打断点的内容(每请求最多 4 个,按 system + tools + 消息块合并计数),因此 bili 会标注 system 块加上至多 3 个累积消息断点——被标注的消息保持标注(前缀字节稳定),断点只随折叠消亡,最近 3 条稳定消息承载推进前沿。客户端自设的任何 `cache_control`(消息块、tools 条目)都会完全抑制 bili 的标注——客户端自管缓存优先。断点随会话持久化。本开关是逃生阀:用于拒绝该字段的上游或有自己断点策略的中继。仅限 plain-proxy Anthropic 通道;OpenAI/Responses 通道隐式缓存,从不标注。配置文件对应项:[`compat.noCacheControl`](#compat) —— 环境变量优先。 |
 | `BILI_CACHE_KEEPALIVE` | 设为 `1` 开启 Anthropic 线路的空闲期提示缓存保活(#3376)——完整机制、停止规则与成本说明见 [`cacheKeepalive`](#cachekeepalive)。配置文件对应项:`"cacheKeepalive": { "enabled": true }`;环境变量优先。默认关闭。 |
 | `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | 作用于检测/假定缓存 TTL 档位的节奏因子(默认 `0.9` → 5 分钟档约每 4.5 分钟一次,1 小时档约每 54 分钟一次)。取值须在 `(0, 1]`。配置文件对应项:`cacheKeepalive.ttlFactor`。 |
@@ -2176,7 +2152,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | `"5m"` 或 `"1h"`:跳过 body 断点检测,直接按该档位推导节奏——面向会在 bili 下游注入或改写 `cache_control` TTL、导致转发 body 无断点(或档位不对)的中继/代理。配置文件对应项:`cacheKeepalive.assumeTtl`。 |
 | `BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS` | 设为 `1` 让转发 body 无任何 `cache_control` 断点时也武装保活(默认关——没有断点就没有显式打断点的内容可刷新;断点由你的中继自管时配合 `assumeTtl`/`intervalMs` 使用)。配置文件对应项:`cacheKeepalive.armWithoutBreakpoints`。 |
 | `BILI_CACHE_KEEPALIVE_INTERVAL_MS` | 绝对 ping 间隔(毫秒);优先于 `ttlFactor`、`assumeTtl` 与检测档位。用于不随上游 TTL 策略变化的固定节奏。配置文件对应项:`cacheKeepalive.intervalMs`。 |
-| `BILI_CHAIN_CONTENT` | 设为 `1` 开启 bili→bili 链感知的 ACP 产物 / `<bili-chain …/>` 检查点**正文内容**检测（#1086/#1421）：当入站请求的正文携带压缩产物（渲染标签 / 历史 `acp_status`+`search_context` 工具调用）或带摘要的检查点，但既无 `x-bili-hop` 头、本实例也无该会话的压缩状态时，bili 记录一次告警性观察和/或应用「首个处理器优先」透传。**默认关闭**（#1683 后续）：默认下只有 `x-bili-hop` 头驱动链识别，因为扫描请求正文可能把 CCR/文件引入的文本和模型回声标签误判为真实标记。仅在中间盒子剥掉 `x-bili-hop`、且你接受该误判风险的狭窄多 bili 中继场景下才启用。配置文件中设 `"chainContentDetection": true` 效果相同；环境变量优先。`x-bili-hop` 信号本身不受此开关影响。 |
+| `BILI_CHAIN_CONTENT` | 设为 `1` 开启 bili→bili 链感知的 ACP 产物 / `<bili-chain …/>` 检查点**正文内容**检测（#1086/#1421）：当入站请求的正文携带压缩产物（渲染标签 / 历史 `acp_status`+`search_context` 工具调用）或带摘要的检查点，但既无 `x-bili-hop` 头、本实例也无该会话的压缩状态时，bili 记录一次告警性观察和/或应用「首个处理器优先」透传。**默认关闭**（#1683 后续）：默认下只有 `x-bili-hop` 头驱动链识别，因为扫描请求正文可能把文件引入的文本和模型回声标签误判为真实标记。仅在中间盒子剥掉 `x-bili-hop`、且你接受该误判风险的狭窄多 bili 中继场景下才启用。配置文件中设 `"chainContentDetection": true` 效果相同；环境变量优先。`x-bili-hop` 信号本身不受此开关影响。 |
 | `BILI_CHAIN_STAMP` | 设为 `1` 开启**模型可见**的 `<bili-chain …/>` 链完整性检查点载体的出站注入（#1683，默认关闭）：开启后，本实例实际处理的每个请求都携带一个带摘要的戳，使下游 bili 即使 `x-bili-hop` 头在传输中被剥离也能应用「首个处理器优先」（first-processor-wins）（#1421）。该载体落在终端模型同样会读取的位置（OpenAI/Responses 上是一条尾部 `user` 消息，Anthropic/Google 上是尾部文本 part），因此模型会把它当作幽灵用户输入并花 token 去评论它——这正是它默认关闭的原因。仅在多 bili 中继、且中间盒子剥掉 `x-bili-hop`、带摘要校验的 body-stamp 是防止双重处理的唯一手段这一狭窄场景下才启用。与 `BILI_CHAIN_CONTENT`（入站正文检测同样默认关闭）及 `x-bili-hop` 透传相互独立（后者无论如何都生效）。配置文件中设 `"chainEgressStamp": true` 效果相同；环境变量优先。 |
 | `BILI_CHAIN_MAX_FUTURE_SKEW_MS` | 校验链检查点 `issued-at` 时间戳时容忍的最大未来偏斜（毫秒）（#1395 step 2）：戳在比当前时间未来超过此值的检查点会被判为 `stale`（重放 / 时钟偏斜），即使其摘要校验通过。默认 `120000`（2 分钟）；非数字或非正值回退到默认值。Step 2 仅影子模式——这些旋钮只调判定日志，绝不影响转发。 |
 | `BILI_CHAIN_RECENT_WINDOW_MS` | 链检查点校验的近期窗口（毫秒）（#1395 step 2）：早于此窗口的检查点被判为 `stale`。默认 `600000`（10 分钟）；非数字或非正值回退到默认值。Step 2 仅影子模式——这些旋钮只调判定日志，绝不影响转发。 |
@@ -2203,7 +2179,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_SESSION_RESIDENT_MAX_BYTES` | 常驻会话估算字节的软目标（#2803；默认 `4294967296` = 4 GiB，#5779 从 512 MiB 提高）。活跃/in-flight 状态不受此限制（字节预算约束的是空闲缓存而非活跃负载）；超出目标时空闲状态随请求完成回落磁盘。文件侧对应：`sessions.residentMaxBytes`。 |
 | `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | 为公开 fork API 按插件会话保留的原始 wire 历史快照的大小上限（字节，#2017）。序列化快照超限的插件会话不再可 fork —— `GET /__bili/plugin/snapshot` 与 `POST /__bili/plugin/fork` 以 `409` fail-closed 并注明原因 —— 而不是永久保留无上限的原始历史副本。上限在每次插件模型请求时重新评估：会话缩回上限内（fork 裁剪后或宿主缩短历史）即恢复可 fork。默认 `104857600`（100 MiB）；`0` 完全停用留存（所有会话不可 fork，已有快照在下一次请求时丢弃）。文件孪生键：`plugin.snapshotCapBytes`。 |
 | `BILI_SESSIONS_DIR` | 会话持久化目录（默认 XDG data 目录）。文件键：`sessions.dir`。 |
-| `BILI_SESSION_GC` | 过期会话文件清理（#1082）为**可选开启**：设 `1`/`true`/`on` 启用 —— 默认关闭，因为会话文件是用户数据（可导出、可续聊），不应有静默删除策略。启用后，扫描（启动 + 每小时）只在**两个条件同时满足**时删除一个文件：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`，并且"小"到无损 —— 该会话**从未被压缩过**（零折叠块）且最近一次请求体 ≤ 下述 token 上限，这样继续对话只损失一次冷重建（用客户端自己的历史重建），别无其他。安全边界：被压缩过的会话永不删除（其摘要无法无损重建）；内存中仍持有的会话会被跳过，除非该会话自上次落盘后一直空闲；不可读/损坏的文件原地保留；每次删除逐条写审计日志（路径、大小、年龄），另有一次非空扫描的汇总日志；只触碰会话目录；清空后的协议子目录一并删除。注意 resident 守卫是进程内的：共享 `BILI_SESSIONS_DIR` 但不落盘的另一实例（如 `BILI_PERSIST=0`）不会刷新文件 mtime，其仍活跃的会话文件可能老化被扫 —— 代价同样是有限的一次冷重建，且有年龄门兜底。CCR 内容存储（#1097）与会话共享生命周期（#1180）：`<hash>.content-store.json` 伴随文件随其会话文件一起删除；孤儿伴随文件（会话文件已不存在）超过年龄门后被清扫；不可读的伴随文件会连同其会话文件一起保留（绝不猜测）。 |
+| `BILI_SESSION_GC` | 过期会话文件清理（#1082）为**可选开启**：设 `1`/`true`/`on` 启用 —— 默认关闭，因为会话文件是用户数据（可导出、可续聊），不应有静默删除策略。启用后，扫描（启动 + 每小时）只在**两个条件同时满足**时删除一个文件：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`，并且"小"到无损 —— 该会话**从未被压缩过**（零折叠块）且最近一次请求体 ≤ 下述 token 上限，这样继续对话只损失一次冷重建（用客户端自己的历史重建），别无其他。安全边界：被压缩过的会话永不删除（其摘要无法无损重建）；内存中仍持有的会话会被跳过，除非该会话自上次落盘后一直空闲；不可读/损坏的文件原地保留；每次删除逐条写审计日志（路径、大小、年龄），另有一次非空扫描的汇总日志；只触碰会话目录；清空后的协议子目录一并删除。注意 resident 守卫是进程内的：共享 `BILI_SESSIONS_DIR` 但不落盘的另一实例（如 `BILI_PERSIST=0`）不会刷新文件 mtime，其仍活跃的会话文件可能老化被扫 —— 代价同样是有限的一次冷重建，且有年龄门兜底。 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | 会话文件成为清理候选的最小年龄（天，默认 `7`）。必须远超任何合理续聊窗口：文件删除后同会话再续聊，消息编号会从 m00001 重新分配，而续聊 agent 的转录里可能还引用着旧编号（内核契约：编号永不复用）。 |
 | `BILI_SESSION_GC_MAX_TOKENS` | 清理资格的大小上限（token 数，默认 `1000000` = 1M，#1082 owner 拍板）。按**解码后**的上下文判断，绝不看文件字节数（加密/zstd 文件在盘上小得多）：记录了最近一次请求体 token 估算值（`rawInputTokens`，每轮记录）时以它为准；未记录的旧文件用 `stats.contextTokens`；伴随的内容存储占用（#1097：唯一内容经内核 CJK-aware `defaultCountTokens` 计数，与 `rawInputTokens` 同一估算器，#1180）叠加其上，防止小会话携带大存储钻过上限。仅适用于从未被压缩过的会话 —— 含折叠块的文件无论多大都保留，因为其摘要无法从重新发送中无损重建。 |
 | `BILI_SESSION_GC_INTERVAL_MS` | 后台清理扫描间隔（毫秒，默认 `3600000` = 1 小时）。启动时会先扫一次。 |

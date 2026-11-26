@@ -56,7 +56,7 @@ const CASE_META: Record<string, { protocol: string; id: string }> = {
     "fork-receipt": { protocol: "chat", id: "corpus-fork-receipt" },
     "fork-retained": { protocol: "chat", id: "corpus-fork-retained" },
     "image": { protocol: "anthropic", id: "corpus-image" },
-    "ccr": { protocol: "responses", id: "corpus-ccr" },
+    
     "twinfile": { protocol: "openai", id: "corpus-twin" },
     "zstd": { protocol: "anthropic", id: "corpus-folded" },
 };
@@ -73,7 +73,6 @@ function sessionDigest(loaded: Session): string {
         lastMessages: loaded.lastMessages,
         lastMessagesFolded: loaded.lastMessagesFolded,
         pluginSnapshot: loaded.pluginSnapshot,
-        contentStore: loaded.contentStore,
     })));
 }
 
@@ -143,16 +142,6 @@ test("storage corpus: deadrefs tombstones + ghost refs survive the round-trip", 
     assert.ok(s.state.messageRefs.byRef[ghostRef] !== undefined, "ghost ref must KEEP its raw-id mapping (Kernel Contract: refs never reassigned)");
 });
 
-test("storage corpus: fork contract — receipt keeps store, retained-only DROPS it (#2675 ② asymmetry)", () => {
-    const receipt = loadCase("fork-receipt");
-    assert.ok(Array.isArray(receipt.pluginSnapshot) && receipt.pluginSnapshot.length > 0, "receipt: pluginSnapshot must persist");
-    assert.ok(receipt.contentStore, "receipt: forkContentStore must persist into contentStore on load");
-    assert.ok(Array.isArray(receipt.metadata.publicSnapshotStoredRefs) && (receipt.metadata.publicSnapshotStoredRefs as unknown[]).length > 0, "receipt: publicSnapshotStoredRefs union must persist");
-
-    const retained = loadCase("fork-retained");
-    assert.ok(Array.isArray(retained.pluginSnapshot) && retained.pluginSnapshot.length > 0, "retained: pluginSnapshot must persist");
-    assert.equal(retained.contentStore, undefined, "retained-only: forkContentStore is DROPPED by buildRecord — this verbatim asymmetry is why #2675 ② exists");
-});
 
 test("storage corpus: image case carries base64 media; legacy image-compression keys land per the #3266 back-compat contract", () => {
     // Back-compat pin for the #3266 removal: the generator re-injects the
@@ -181,14 +170,6 @@ test("storage corpus: image case carries base64 media; legacy image-compression 
     );
 });
 
-test("storage corpus: ccr sibling file holds the two #1097 originals", () => {
-    const files = manifest["ccr"]!.files;
-    const sibling = files.find((f) => f.endsWith(".content-store.json"));
-    assert.ok(sibling, `ccr case must ship a content-store.json sibling (files: ${files.join(", ")})`);
-    const parsed = JSON.parse(fs.readFileSync(path.join(CORPUS_ROOT, "ccr", sibling), "utf8")) as { byRef?: Record<string, unknown>; byHash?: Record<string, string> };
-    assert.equal(Object.keys(parsed.byRef ?? {}).length, 2, "both CCR originals must be in the sibling store");
-    assert.equal(Object.keys(parsed.byHash ?? {}).length, 2);
-});
 
 test("storage corpus: twinfile — namespaced wins with meta, flat fallback without (#2671 ①)", () => {
     const notes = manifest["twinfile"]!.notes!;

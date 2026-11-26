@@ -84,7 +84,7 @@ test("view-latch discipline: quiet turns replay latched bytes verbatim (arbitrar
   // Domain constraints, each pinning a DELIBERATE unlatchable class:
   //  - ids/refs are non-empty (assignRefs never mints ""; the !m.id guard
   //    passes unidentified messages through post view);
-  //  - ids are not CCR retrieved placeholders (RETRIEVED_ID_PREFIX guard);
+  //  - ids are not retrieved placeholders (RETRIEVED_ID_PREFIX guard);
   //  - the latched ref is not BLOCKED (BLOCKED carriers render verbatim and
   //    never carry latch entries in reachable states).
   const INT1 = (ctx as unknown as { Int: { val: (n: number) => unknown } }).Int.val(1);

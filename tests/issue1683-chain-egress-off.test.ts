@@ -17,7 +17,7 @@ import { evaluateChain, stampOutbound } from "../src/chain-checkpoint.ts";
  *  egress stamping behind the `chainEgressStamp` opt-in (env BILI_CHAIN_STAMP)
  *  and inbound body-content detection behind `chainContentDetection` (env
  *  BILI_CHAIN_CONTENT); by default ONLY the x-bili-hop header drives chain
- *  recognition, since scanning the body can false-positive on CCR/file-introduced
+ *  recognition, since scanning the body can false-positive on file-introduced
  *  text and model-echoed tags. These tests pin the contract:
  *  - default opts → a processed outbound carries NO carrier (openai + google);
  *  - `chainEgressStamp: true` → the self-verifying stamp is restored;

@@ -1,4 +1,4 @@
-import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CoreMessage, type CcrConfig, type Pack, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CoreMessage, type Pack, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, resolveModelEntryOnRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
@@ -58,7 +58,6 @@ export function mergeCompress(
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
     const blockOpsLevels = [global?.blockOps, provider?.blockOps, model?.blockOps].filter(Boolean) as NonNullable<CompressSettings["blockOps"]>[];
-    const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
     const searchLevels = [global?.search, provider?.search, model?.search].filter(Boolean) as NonNullable<CompressSettings["search"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
@@ -100,7 +99,6 @@ export function mergeCompress(
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
         blockOps: blockOpsLevels.length > 0 ? Object.assign({}, ...blockOpsLevels) : undefined,
-        ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
         search: searchLevels.length > 0 ? Object.assign({}, ...searchLevels) : undefined,
         rules: pick("rules"),
 
@@ -289,14 +287,6 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    Absent `s.blockOps` leaves `base.blockOps` untouched — off by default.
   *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
   *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched.
-  *  - `ccr` → `ccr` (kernel CcrConfig, acp-kernel >= 0.0.84; the kernel runs
-  *    the ccr-store node inside processTurn between prune and absorb).
-  *    Unset fields inherit DEFAULT_CCR_CONFIG. CCR is opt-in on every lane
-  *    (#1207 owner decision): absent `s.ccr` leaves `base.ccr` untouched —
-  *    the feature stays off until some level sets `enabled: true` and it has
-  *    been verified locally. Host arming (server.ts) further gates it behind
-  *    the retrieve tool channel, so plugin mode / no-channel wires stay
-  *    inert regardless.
  */
 // Config as resolved for the kernel, plus preserveRecentTools — the knob
 // lands in acp-kernel 0.0.93 (acp-kernel#428) but the resolved object is
@@ -387,23 +377,6 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     const tiers = { ...base.tiers };
     if (s.tiers !== undefined) tiers.enabled = s.tiers;
     const absorb = resolveAbsorbSettings(s.absorb);
-    // #1207 owner decision: CCR is opt-in on every lane — no default-on
-    // else-branch; an unset `s.ccr` leaves `base.ccr` untouched (off).
-    let ccr: CcrConfig | undefined;
-    if (s.ccr !== undefined) {
-        const d = DEFAULT_CCR_CONFIG;
-        // Spread the kernel defaults first so new kernel-side keys (e.g.
-        // retrieveInlineTokens, GHSA jc6g v2) carry through without a bili-side
-        // edit every time the kernel grows one.
-        ccr = {
-            ...d,
-            enabled: s.ccr.enabled === true,
-            toolName: s.ccr.toolName ?? d.toolName,
-            minToolTokens: s.ccr.minToolTokens ?? d.minToolTokens,
-            excludeTools: s.ccr.excludeTools ?? [...d.excludeTools],
-            maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
-        };
-    }
     // Host-marked current-task prompts: the kernel already hard-excludes any
     // message for which Config.isMessageProtected returns true. Map the literal
     // substrings here so a long-lived session can keep its live task prompt out
@@ -450,7 +423,6 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         // #5765: one-switch opt-in — absent `s.blockOps` leaves base untouched
         // (off); a present block normalizes enabled (absent/false = off).
         ...(s.blockOps !== undefined ? { blockOps: { enabled: s.blockOps.enabled === true } } : {}),
-        ...(ccr !== undefined ? { ccr } : {}),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
     return resolved;
@@ -469,7 +441,7 @@ function parsePercent(v: number | string): number {
  *  context window (the caller handles the async registry lookup), this merges
  *  global → provider → model compress settings and applies them onto `base`,
  *  returning the tuned Config (or `base` unchanged when nothing is configured
- *  and the limit is unchanged — CCR is opt-in, so an unset `ccr` never forces
+ *  and the limit is unchanged — the store is opt-in, so an unset store key never forces
  *  a fresh config). This is the exact function the proxy calls for every
  *  request, extracted so the three-level cascade is testable end-to-end
  *  without spinning up the HTTP server. */

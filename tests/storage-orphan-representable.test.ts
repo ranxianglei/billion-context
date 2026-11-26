@@ -84,7 +84,7 @@ test("#4216: post-reap saves keep advancing (no freeze) and cold loads are fresh
             blocks: store.getBlocks("sess"),
             deadRefs: store.getDeadRefs("sess"),
             refs: store.getRefs("sess"),
-        }, undefined, store.getStateFields("sess"), store.getOrphanViews("sess") ?? {});
+        }, store.getStateFields("sess"), store.getOrphanViews("sess") ?? {});
         const viewState = view.state as unknown as { blocks: { blockId: string }[] };
         assert.equal(viewState.blocks.length, 2, "reaped block does NOT resurrect");
         assert.ok(view.blockContents.has("b3"), "orphan original survives for decompress");
@@ -100,7 +100,7 @@ test("#4216: post-reap saves keep advancing (no freeze) and cold loads are fresh
             blocks: store.getBlocks("sess"),
             deadRefs: store.getDeadRefs("sess"),
             refs: store.getRefs("sess"),
-        }, undefined, store.getStateFields("sess"), store.getOrphanViews("sess") ?? {});
+        }, store.getStateFields("sess"), store.getOrphanViews("sess") ?? {});
         assert.ok(view2.blockContents.has("b3"), "trimmed-away journal entry survives the merge");
 
         store.close();

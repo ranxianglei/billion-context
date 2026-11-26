@@ -22,7 +22,7 @@ import { rmrf } from "./tmp-rm.ts";
  *
  * The store is built for real (engines forced unavailable) so the recording
  * seams fire exactly as they do in production; _setStoreForTest then keeps
- * handleAcpStatus's ccrLoopConfig from rebuilding a healthy store mid-call
+ * handleAcpStatus from rebuilding a healthy store mid-call
  * and clobbering the degraded state (that clobber is also why the store is
  * constructed BEFORE handleAcpStatus here).
  */
@@ -66,7 +66,7 @@ test("#3385: acp_status STORAGE section surfaces the degrade reason so the model
         // can only see a failed open post-boot via the runtime breaker; this
         // facet pins the SURFACE by driving the same recording seam shadow.ts
         // calls before its rethrow. A real (healthy) store keeps
-        // ccrLoopConfig from rebuilding over the recorded state.
+        // from rebuilding over the recorded state.
         store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
         _setStoreForTest(store);
         recordSidecarOpenFailure("no SQLite engine available");

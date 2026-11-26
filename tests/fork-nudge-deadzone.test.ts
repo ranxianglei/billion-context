@@ -29,7 +29,6 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
-import { contentStoreOf } from "../src/store.ts";
 import { effectiveTokenCount } from "../src/server.ts";
 
 process.env.NODE_ENV = "test";
@@ -154,7 +153,7 @@ test("mid-history fork seeds the nudge sizing baseline (dsh fork dead-zone repro
         // compressible mass and suppress the nudge for a different reason).
         const core = createCore();
         const base = defaultConfig(SMALL_WINDOW);
-        const turn = core.processTurn({ messages: child.pluginSnapshot!, state: child.state, config: { ...base, preserveRecentMessages: 1, preserveRecentTokens: 0 }, tokenCount: eff.tokens, renderTags: "none", contentStore: contentStoreOf(child) });
+        const turn = core.processTurn({ messages: child.pluginSnapshot!, state: child.state, config: { ...base, preserveRecentMessages: 1, preserveRecentTokens: 0 }, tokenCount: eff.tokens, renderTags: "none" });
         assert.equal(turn.nudge?.shouldInject, true, `nudge must fire at ${Math.round((eff.tokens / SMALL_WINDOW) * 100)}% usage (reason: ${turn.nudge?.reason})`);
         assert.match(turn.nudge?.reason ?? "", /OVER-LIMIT|EMERGENCY/);
     } finally { await h.close(); }

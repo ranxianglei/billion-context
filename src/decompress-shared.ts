@@ -4,8 +4,6 @@ import {
     markBlockRestoredInline,
     matchToolMessagePattern,
     parseBoundary,
-    retrieveByRef,
-    retrievedMessageId,
     searchBlocks,
     toolPathOf,
     type CompressionBlock,
@@ -24,7 +22,6 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { blockContentSnapshot, markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
 import { getStore } from "./persist.js";
-import { ccrEnabled, contentStoreOf } from "./store.js";
 import { safePrefix } from "./text-safe.js";
 import { decompressTmpCap as knobDecompressTmpCap } from "./knobs.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
@@ -214,7 +211,9 @@ export function resolveDecompress(
     // emit "" for optional fields, and treating that as a range request produced
     // an unsatisfiable retry loop (fill in a real range → refused in plugin mode).
     if (hasRangeArgs(args)) {
-        return resolveDecompressRange(args, ctx, block);
+        // #7755: range restore (startId/endId) depended on the content
+        // store and was removed with it — whole-block restore still works.
+        return toolFail(`[decompress FAILED: range restore (startId/endId) was removed (#7755) — restore the whole block: {"blockId":"${blockId}"}]`);
     }
 
     const full = args.full === true || args.full === "true";
@@ -236,13 +235,9 @@ export function resolveDecompress(
         count = collected.count;
     }
     // #1336: retrieve-quality proxy — a whole-block restore where a precise
-    // path existed (per-message coverage recorded AND CCR armed ⇒ range-restore
-    // or targeted acp_retrieve would have sufficed) is the failure shape plan-
-    // aware search steering exists to prevent.
+    // path existed is the failure shape plan-aware search steering exists to
+    // prevent.
     ctx.session.stats.wholeBlockRestores = (ctx.session.stats.wholeBlockRestores ?? 0) + 1;
-    if (coveredRefSpan(ctx.session.state, block) !== null && ccrEnabled(ctx.session)) {
-        ctx.session.stats.wholeBlockRestoresPreciseAvailable = (ctx.session.stats.wholeBlockRestoresPreciseAvailable ?? 0) + 1;
-    }
 
     const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""}]`;
     const toFileOut = toFilePointer(args, ctx, header, body);
@@ -364,7 +359,7 @@ function coveredMessages(state: CompressionState, block: CompressionBlock): Cove
     return { raws, text: head.map(fmtRun).join(", ") + (rest > 0 ? ` …+${rest} more` : "") };
 }
 
-/** #1179 CCR v2: the message refs a block covers, as compact span text
+/** #1179: the message refs a block covers, as compact span text
  *  ("m00044–m00097") plus count — or null when no individual refs are
  *  resolvable (older blocks whose raw ids left the map). */
 export function coveredRefSpan(state: CompressionState, block: CompressionBlock): { text: string; count: number } | null {
@@ -372,114 +367,7 @@ export function coveredRefSpan(state: CompressionState, block: CompressionBlock)
     return cov ? { text: cov.text, count: cov.raws.length } : null;
 }
 
-// #1179 CCR v2: range-level restore — return ONLY the block's messages whose
-// refs fall within [startId, endId]. The content rides the ephemeral retrieval
-// channel: ack now, full text queued as a request-only injection (same id/role
-// shape as acp_retrieve injections, structurally excluded from fold space),
-// never cached in blockContents. Gated on CCR being armed for the session.
-function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx, block: CompressionBlock): ProxyToolResult {
-    const startRaw = typeof args.startId === "string" ? args.startId.trim() : "";
-    const endRaw = typeof args.endId === "string" ? args.endId.trim() : "";
-    if (!startRaw || !endRaw) return toolFail("[decompress FAILED: startId and endId must be given together — pass both mNNNNN refs, or omit both to restore the whole block]");
-    if (!ccrEnabled(ctx.session)) {
-        // Range restore needs the CCR content store; a CCR-off session has none.
-        // In plugin mode the model cannot enable CCR itself (it lives in the
-        // proxy's base config — plugin policy is the base block verbatim,
-        // #1345), so pointing it at the setting sends it chasing a config it
-        // cannot change (#1207 review F3). Give it the working call instead:
-        // whole-block restore with just blockId (#1712).
-        if (typeof ctx.session.metadata.pluginAgent === "string") {
-            return toolFail(`[decompress FAILED: range restore (startId/endId) requires CCR, which this plugin-mode session does not have — omit startId/endId and restore the whole block: {"blockId":"${block.blockId}"}]`);
-        }
-        return toolFail("[decompress FAILED: range restore (startId/endId) requires CCR — enable compress.ccr.enabled]");
-    }
-    const sb = parseBoundary(startRaw);
-    const eb = parseBoundary(endRaw);
-    if (!sb || sb.kind !== "message" || !eb || eb.kind !== "message") {
-        return toolFail(`[decompress FAILED: startId/endId must be mNNNNN message refs (got "${startRaw}", "${endRaw}") — block ids (bN) are not valid here]`);
-    }
-    if (sb.numericId > eb.numericId) return toolFail(`[decompress FAILED: startId ${startRaw} is after endId ${endRaw} — swap them]`);
-    const state = ctx.session.state;
-    const cov = coveredMessages(state, block);
-    if (!cov) return toolFail(`[decompress FAILED: ${block.blockId} has no per-message coverage recorded (older block) — use plain decompress {blockId} for the whole block]`);
-    const pickedSet = new Set(cov.raws.filter(({ num }) => num >= sb.numericId && num <= eb.numericId).map(({ raw }) => raw));
-    if (pickedSet.size === 0) return toolFail(`[decompress FAILED: ${block.blockId} covers no messages in ${startRaw}–${endRaw} (its coverage is ${cov.text})]`);
-    const parts: string[] = [];
-    let restoredFromStore = 0;
-    // [#1283] Per-ref source selection supersedes the all-or-nothing fallback
-    // ([#1207 review F1]): store entries are immutable originals (append-only,
-    // first write wins, refs never reissued), so the store wins whenever it has
-    // the ref and the exec-time view is only the fallback (pre-CCR folds have
-    // no entries). The old zero-items gate assumed view/store mutual exclusion
-    // per ref that nothing enforces — a covered ref left visible in the view
-    // contributed its view text, which for arrival-stored refs is the 📦
-    // placeholder, not the original, and a partially visible span silently
-    // dropped the missing refs. Iterating coverage in num order keeps the span
-    // deterministic across both sources.
-    const store = contentStoreOf(ctx.session);
-    const viewById = new Map<string, CoreMessage>();
-    for (const m of ctx.compressMessages ?? ctx.messages) {
-        if (pickedSet.has(m.id)) viewById.set(m.id, m);
-    }
-    for (const { raw, num } of cov.raws) {
-        if (!pickedSet.has(raw)) continue;
-        const r = retrieveByRef(store, `m${String(num).padStart(5, "0")}`);
-        // #4733: a ref whose stored entry belongs to a DIFFERENT raw id is a
-        // post-restamp frozen alias — serving it here would silently restore
-        // another message's original under this one's citation. Treat as
-        // not-found and fall through to the view text.
-        if (r.ok && r.entry.rawId === raw) {
-            parts.push(r.entry.toolName ? `[${r.entry.toolName} • stored]\n${r.text}` : `[${r.entry.kind} • stored]\n${r.text}`);
-            restoredFromStore++;
-            continue;
-        }
-        const m = viewById.get(raw);
-        if (!m) continue;
-        parts.push(m.toolName && m.contentType !== "text" ? `[${m.role} • ${m.toolName}]\n${m.text ?? ""}` : `[${m.role}]\n${m.text ?? ""}`);
-    }
-    if (parts.length === 0) {
-        return toolFail(`[decompress FAILED: originals for ${startRaw}–${endRaw} are neither in this request's view nor in the content store (pre-CCR fold) — whole-block decompress may still work from cache]`);
-    }
-    const header = `[Block ${block.blockId} content — ${startRaw}–${endRaw} — ${parts.length} item(s)]`;
-    let injText: string;
-    const body = parts.join("\n\n");
-    const toFileOut = toFilePointer(args, ctx, header, body);
-    if (toFileOut !== null) {
-        // #2204: a refused or unwritable export is a hard failure — return the
-        // receipt directly. Nothing reached the channel, so no injection is
-        // queued and no restore is counted; the block stays untouched.
-        if (toFileOut.outcome === "failure") return toFileOut;
-        injText = toFileOut.text;
-    } else if (body.length > 10000) {
-        const safeBlockId = block.blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
-        // [#1207 review F4] Span in the filename; each spill owns its path even when sessions
-        // reuse block and span ids in the same millisecond (#6191). 0600: folded conversation
-        // content is not world-readable on multi-user hosts.
-        const outPath = join(tmpdir(), `acp-decompress-${safeBlockId}-${startRaw}-${endRaw}-${randomUUID()}.txt`);
-        try {
-            mkdirSync(dirname(outPath), { recursive: true });
-            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600, flag: "wx" });
-            trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
-            reapTempFiles();
-            injText = `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
-        } catch (e) {
-            return exportFailureReceipt(outPath, e, body);
-        }
-    } else {
-        injText = `${header}\n${body}`;
-    }
-    // [#1207 review F5] A client retry re-executes this path; the injection id
-    // is deterministic, so dedupe on it — retries re-ack without queueing a
-    // duplicate full-text message or inflating rangeRestores.
-    const injId = retrievedMessageId(`range_${block.blockId}_${startRaw}-${endRaw}`);
-    if (!ctx.session.pendingRetrievals.some((p) => p.ref === injId)) {
-        ctx.session.pendingRetrievals.push({ ref: injId, tokens: 0, chars: body.length, queuedAt: Date.now(), ccr: false, injection: { id: injId, role: "user", contentType: "text", text: injText } });
-        ctx.session.stats.rangeRestores = (ctx.session.stats.rangeRestores ?? 0) + 1;
-    }
-    markDirty(ctx.session);
-    ctx.log(`[acp-decompress-range] ${block.blockId} ${startRaw}–${endRaw}: restored ${parts.length} item(s)${restoredFromStore ? ` (${restoredFromStore} from content store)` : ""} via ephemeral injection`);
-    return toolOk(`[decompress ${block.blockId} ${startRaw}–${endRaw}: restored ${parts.length} item(s) — full content follows]`);
-}
+
 
 
 
@@ -521,7 +409,7 @@ export function derivedAncestorSessions(session: Session): Session[] {
 const EFFECTIVE_SEARCH_PLAN_KEY = "searchPlanAware";
 
 /** Stamp the last-resolved plan-aware flag onto the session (per-request,
- *  latest wins — same pattern as storeEffectiveCcr/storeEffectiveConfig). */
+ *  latest wins — same pattern as storeEffectiveConfig). */
 export function storeEffectiveSearchPlanAware(session: Session, on: boolean): void {
     session.metadata[EFFECTIVE_SEARCH_PLAN_KEY] = on;
 }
@@ -537,8 +425,6 @@ const PLANNING_TOOL_PATTERNS = ["TodoWrite", "todowrite", "todo_list", "update_p
 // dominate ranking (risk mitigation from the issue).
 const PLAN_WINDOW_MESSAGES = 40;
 const PLAN_TEXT_CHAR_CAP = 4000;
-// A ref retrieved this many times earns a range-restore hint in steering.
-const REPEAT_RETRIEVE_HINT_THRESHOLD = 2;
 
 const PLAN_STOPWORDS = new Set([
     "the", "and", "for", "with", "this", "that", "from", "have", "has", "had",
@@ -669,25 +555,6 @@ function buildSteering(
             const span = coveredRefSpan(state, s.block);
             return span ? `${s.block.blockId} [${span.text} · ${span.count} msgs]` : s.block.blockId;
         }).join(", ")}`);
-    }
-    const counts = session.retrieveCountsByRef;
-    if (counts && counts.size > 0) {
-        const seen = new Set<string>();
-        const hints: string[] = [];
-        outer: for (const s of scored.slice(0, 5)) {
-            const cov = coveredMessages(state, s.block);
-            if (!cov) continue;
-            for (const { num } of cov.raws) {
-                const ref = `m${String(num).padStart(5, "0")}`;
-                const n = counts.get(ref);
-                if ((n ?? 0) >= REPEAT_RETRIEVE_HINT_THRESHOLD && !seen.has(ref)) {
-                    seen.add(ref);
-                    hints.push(`${ref} retrieved ${n} times this session — decompress({blockId:"${s.block.blockId}",startId:"${ref}",endId:"${ref}"}) may be cheaper than repeat acp_retrieve`);
-                    if (hints.length >= 2) break outer;
-                }
-            }
-        }
-        if (hints.length > 0) parts.push(hints.join("; "));
     }
     return parts.length > 0 ? `\n\n[plan-aware] ${parts.join("\n")}` : "";
 }
@@ -925,8 +792,8 @@ export function executeSearchContext(
     const lines = blocks.map((b) => {
         const topic = b.topic ?? "(no topic)";
         const preview = evidenceSnippet(b.summary, terms, freq);
-        // #1179 CCR v2: covered message-ref span(s) — connect block space to
-        // store space so the model can target acp_retrieve / range decompress
+        // #1179: covered message-ref span(s) — connect block space to
+        // store space so the model can target range decompress
         // at individual messages instead of whole blocks.
         const span = coveredRefSpan(state, b);
         const spanNote = span ? ` [${span.text} · ${span.count} msgs]` : "";

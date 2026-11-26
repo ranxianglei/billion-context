@@ -34,7 +34,7 @@ function fixture(requests = 1): IngestSessionInput {
             { ord: 1, rawId: "b", ref: "m00001", refNum: 1 },
             { ord: 2, rawId: "c", ref: "BLOCKED", refNum: null },
         ],
-        deadRefs: [], ccrEntries: [],
+        deadRefs: [],
         orphansJson: JSON.stringify({ orphan: { one: null, full: { text: "orphan", count: 1 } } }),
     };
 }

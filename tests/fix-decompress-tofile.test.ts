@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { createCore, defaultConfig, type Config, type CoreMessage } from "acp-kernel";
 import { applyCompressSettings } from "../src/compress-settings.ts";
-import { drainPendingRetrievals, storeEffectiveCcr } from "../src/store.ts";
+import { drainPendingRetrievals } from "../src/store.ts";
 import { getSession } from "../src/session.ts";
 import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
@@ -128,54 +128,6 @@ test("#1691 relative toFile resolves against the proxy cwd", () => {
     }
 });
 
-/** CCR-armed fold mirroring tests/ccr-v2.test.ts so range restore is available. */
-function foldCcr() {
-    const core = createCore();
-    const config = applyCompressSettings(
-        defaultConfig(200_000),
-        200_000,
-        { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: true, minToolTokens: 50 } },
-    ) as Config;
-    const session = getSession(`tfrange-${Math.random().toString(36).slice(2)}`);
-    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
-    const raw: CoreMessage[] = [];
-    for (let i = 0; i < 20; i++) {
-        raw.push({
-            id: `h_${i}`,
-            role: i % 2 === 0 ? "user" : "assistant",
-            contentType: "text",
-            text: `\x3cacp tokens="2K" type="text"\x3em${pad(i + 1)}\x3c/acp\x3e\nHistorical detail ${i}. ${"x".repeat(2000)}`,
-        });
-    }
-    const turn = core.processTurn({ messages: raw, state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
-    session.state = turn.state;
-    const ctx = { core, config, messages: turn.messages, session, log: () => {} };
-    applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00007", summary: "Early history: messages 1-7 covered initial setup.", topic: "Early history" }] }), ctx);
-    const block = [...session.state.blocks].find((b) => b.active)!;
-    return { core, config, session, msgs: turn.messages, blockId: block.blockId };
-}
-
-test("#1691 range toFile: writes the span to the caller path and queues only a lean pointer", () => {
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bili-tofile-range-"));
-    try {
-        const f = foldCcr();
-        const ctx = { core: f.core, config: f.config, messages: f.msgs, session: f.session, log: () => {} };
-        const target = path.join(scratch, "span.txt");
-        const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004", toFile: target }, ctx).text;
-        assert.match(ack, /restored 3 item\(s\)/);
-        assert.ok(fs.existsSync(target), "span written to the caller path");
-        const disk = fs.readFileSync(target, "utf8");
-        assert.match(disk, /Historical detail 1\./);
-        assert.match(disk, /Historical detail 3\./);
-        assert.doesNotMatch(disk, /Historical detail 4\./, "span upper bound excluded");
-        const injs = drainPendingRetrievals(f.session);
-        assert.equal(injs.length, 1, "one ephemeral injection queued");
-        assert.ok(injs[0]!.text!.includes(target), "queued injection points at the file");
-        assert.doesNotMatch(injs[0]!.text!, /Historical detail 1\./, "full body NOT injected (lean pointer keeps context flat)");
-    } finally {
-        rmrf(scratch);
-    }
-});
 
 test("automatic whole-block spills keep different views written in one millisecond", (t) => {
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bili-tofile-unique-"));
@@ -203,25 +155,3 @@ test("automatic whole-block spills keep different views written in one milliseco
     }
 });
 
-test("automatic range spills do not register the same path twice in one millisecond", (t) => {
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bili-tofile-range-unique-"));
-    const tempKey = process.platform === "win32" ? "TEMP" : "TMPDIR";
-    const previousTmp = process.env[tempKey];
-    process.env[tempKey] = scratch;
-    try {
-        const f = foldCcr();
-        const ctx = { core: f.core, config: f.config, messages: f.msgs, session: f.session, log: () => {} };
-        const now = Date.now();
-        t.mock.method(Date, "now", () => now);
-        for (let i = 0; i < 2; i++) {
-            assert.equal(resolveDecompress({ blockId: f.blockId, startId: "m00001", endId: "m00007" }, ctx).outcome, "success");
-        }
-        const files = fs.readdirSync(scratch).filter((name) => name.startsWith("acp-decompress-"));
-        assert.equal(files.length, 2, "each retention entry refers to a distinct file");
-        for (const file of files) assert.match(fs.readFileSync(path.join(scratch, file), "utf8"), /Historical detail 0\./);
-    } finally {
-        if (previousTmp === undefined) delete process.env[tempKey];
-        else process.env[tempKey] = previousTmp;
-        rmrf(scratch);
-    }
-});

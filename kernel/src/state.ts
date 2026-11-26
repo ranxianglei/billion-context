@@ -20,8 +20,6 @@ export function createInitialState(): CompressionState {
       tokensCompressed: 0,
       compressionCount: 0,
       absorbedTokens: 0,
-      storedCount: 0,
-      retrievalCount: 0,
     },
     absorbed: [],
     rules: [],

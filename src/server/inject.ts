@@ -93,20 +93,20 @@ function mergeOwnedTools<T>(tools: readonly T[] | undefined, acp: readonly T[], 
     return [...kept, ...acp, ...extras];
 }
 
-export function injectTool(tools: unknown[] | undefined, extras?: readonly { name: string }[], toolPrompts?: ToolPrompts, ccrOn = false, externalOn = false): unknown[] {
-    // #1712: decompress's startId/endId execute only on CCR-armed sessions
-    // (#1179), so serve the no-range schema when CCR is off.
+export function injectTool(tools: unknown[] | undefined, extras?: readonly { name: string }[], toolPrompts?: ToolPrompts, externalOn = false): unknown[] {
+    // #1712: decompress's startId/endId execute only on sessions with the relevant store state
+    // (#1179), so serve the no-range schema when the store is off.
     // #3252: when the client's own tools are code-mode-shaped (run_code
     // present), the ACP entries get the exempt note — see compress-tool.ts.
     const mode = ptcNoteMode((tools ?? []).map((t) => (t as { name?: string })?.name));
-    const acp = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalOn), mode, packOwnsDescription(toolPrompts));
+    const acp = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_ANTHROPIC, toolPrompts), externalOn), mode, packOwnsDescription(toolPrompts));
     return mergeOwnedTools<unknown>(tools, acp, extras ?? [], (t) => (t as { name?: string })?.name);
 }
 
-export function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: readonly OpenAITool[], toolPrompts?: ToolPrompts, ccrOn = false, externalOn = false): OpenAITool[] {
+export function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: readonly OpenAITool[], toolPrompts?: ToolPrompts, externalOn = false): OpenAITool[] {
     // #3252: exempt note when the client tools are run_code-shaped.
     const mode = ptcNoteMode((tools ?? []).map((t) => t?.function?.name));
-    const acp = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalOn) as OpenAITool[], mode, packOwnsDescription(toolPrompts));
+    const acp = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_OPENAI, toolPrompts), externalOn) as OpenAITool[], mode, packOwnsDescription(toolPrompts));
     return mergeOwnedTools<OpenAITool>(tools, acp, extras ?? [], (t) => t?.function?.name);
 }
 
@@ -114,12 +114,12 @@ export function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: reado
  *  nests declarations one level deeper than the OpenAI shape
  *  (`tools[].functionDeclarations[]`), so presence is collected across every
  *  entry and the missing declarations are appended as one new entry. */
-export function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name: string }[], toolPrompts?: ToolPrompts, ccrOn = false, externalOn = false): GoogleTool[] {
+export function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name: string }[], toolPrompts?: ToolPrompts, externalOn = false): GoogleTool[] {
     // #3252: exempt note when the client tools are run_code-shaped.
     const clientNames: (string | undefined)[] = [];
     for (const tool of tools ?? []) for (const decl of tool?.functionDeclarations ?? []) clientNames.push(decl?.name);
     const mode = ptcNoteMode(clientNames);
-    const acp = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_GOOGLE : BILI_ACP_TOOLS_GOOGLE_NO_RANGE, toolPrompts), externalOn) as GoogleFunctionDeclaration[], mode, packOwnsDescription(toolPrompts));
+    const acp = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_GOOGLE, toolPrompts), externalOn) as GoogleFunctionDeclaration[], mode, packOwnsDescription(toolPrompts));
     const wanted: { name: string }[] = extra ? [...acp, ...extra] : [...acp];
     if (!Array.isArray(tools)) return [{ functionDeclarations: wanted as GoogleFunctionDeclaration[] }];
     const present = new Set<string>();

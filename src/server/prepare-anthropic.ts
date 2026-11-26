@@ -19,14 +19,14 @@ import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { absorbAbortedTurnGrowth, nudgeStampsOf, restoreNudgeStamps, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, nudgeStampsOf, restoreNudgeStamps, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
-import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, blockOpsTools, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, blockOpsTools, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { storeEffectiveBlockOps } from "../acp-block-ops.js";
-import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
+import { imageRescaleToolArmed } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
@@ -177,8 +177,6 @@ export async function prepareAnthropic(
     rewriteInboundThreadContinue(parsed as unknown as { thread?: unknown }, session, log, sessionId);
 
     let processedMessages: CoreMessage[] = [];
-    let attachedRetrievals: PendingRetrieval[] = [];
-    let attachedRetrievalNoteIds: string[] = [];
     let originalMessages: CoreMessage[] = [];
     let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
@@ -356,11 +354,7 @@ export async function prepareAnthropic(
         // ever injected into messages), so unlike absorb it needs no loop-
         // config stripping — only tool availability matters.
         const rulesActive = rulesEnabled(config) && modelSurfaceOn;
-        // [#1097] the kernel ccr-store node ID-references oversized tool results
-        // BEFORE absorb (ID-reference wins over distill); armed policy is
-        // stamped per-request — strip `ccr` from the loop config when disarmed
-        // (plugin mode / no tool channel) so placeholders never hit the wire.
-        const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        const loopConfig = { ...config, absorb: absorbActive ? absorbBlock : undefined };
         // #2432/#2658: dsh desktop's native compaction can LAND without ever
         // transiting bili — its summarizer calls ctx.llm.stream() directly and
         // manual /compact / idle-session paths have no ALS attribution, so the
@@ -426,11 +420,10 @@ export async function prepareAnthropic(
         // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
         absorbAbortedTurnGrowth(session, tokenCount);
         nudgeStampsBefore = nudgeStampsOf(session);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy });
         session.state = turn.state;
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
-        adoptContentStore(session, turn.contentStore);
         // In-request ledger flush: the transcript up to THIS user message is
         // durable before the model call (#3397 durability-before-render) and
         // the stage-0 envelope / M2 evidence read a current ledger.
@@ -535,15 +528,6 @@ export async function prepareAnthropic(
         }
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphansLogged(session, msgs, log, sessionId);
-        // [#1271/#1343] plugin mode: acp_retrieve already acked via the tool API; snapshot
-        // the queued full text onto THIS forward (stays in the queue until commit/drop, so an
-        // upstream failure drops-and-logs it instead of vanishing it).
-        if (pluginMode && ccrEnabled(session)) {
-            reconcileReloadedRetrievals(session);
-            pruneExpiredRetrievals(session);
-            attachedRetrievals = snapshotPendingRetrievals(session);
-            if (attachedRetrievals.length > 0) processedMessages = [...processedMessages, ...attachedRetrievals.map((i) => i.injection)];
-        }
         // #1637: cumulative cache_control marks applied through the kernel's own
         // applier (same machine the round-2 adapter uses); marks ride the last
         // STABLE message — ephemeral tails (retrievals/sysNotes/nudge/id note)
@@ -551,7 +535,7 @@ export async function prepareAnthropic(
         // tools entries — WC-010's combined budget) pass through untouched.
         anthropicCacheMarks = cacheControls.size > 0 || anthropicToolsCarryCacheControl(parsed.tools)
             ? undefined
-            : computeAnthropicMessageMarks(processedMessages as { id?: string }[], attachedRetrievals.length, session);
+            : computeAnthropicMessageMarks(processedMessages as { id?: string }[], 0, session);
         // #6861: a client-managed session's moving breakpoints are pinned
         // cumulatively (same discipline as our own marks) so the outbound
         // history stays append-stable: without pinning, the client's last-
@@ -615,7 +599,7 @@ export async function prepareAnthropic(
         // the compress prompt on round-2, the exact F2 seam the matrix pins).
         systemOut = stampAnthropicSystemCacheControl(systemOut, anthropicCacheMarks !== undefined);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL] : []), ...(blockOpsActive ? blockOps.anthropic : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
+            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL] : []), ...(blockOpsActive ? blockOps.anthropic : [])], surface?.toolPrompts, externalSummaryEnabled(config));
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -699,20 +683,8 @@ export async function prepareAnthropic(
         } else if (emergencyPressureHeld) {
             nudgeOutcome = "gated";
         }
-        // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
-        // trailing user note (after every stable message; only a client trailing
-        // system run may follow it — #5432).
-        // Snapshot WITHOUT consuming: forward() commits the ids only once
-        // upstream accepts this request; on failure they ride the next one.
-        const retrNotes = snapshotRetrievalNotes(session);
-        const retrNote = renderRetrievalNotes(retrNotes);
-        if (retrNote) {
-            rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: retrNote }]);
-            attachedRetrievalNoteIds = retrNotes.map((n) => n.id);
-        }
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
-        if (attachedRetrievals.length > 0) dropRetrievals(session, attachedRetrievals.map((i) => i.ref), "prepare failed; forwarded unprocessed");
         processedMessages = [];
     }
     // #532: measure the outbound system+tools overhead for the status panel's
@@ -793,7 +765,7 @@ export async function prepareAnthropic(
     probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", responseExtraHeaders: msgidModeHeaders, stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", responseExtraHeaders: msgidModeHeaders, stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 export const TRAILING_ASSISTANT_NUDGE = "[bili] Earlier context was compressed above. Continue the task.";

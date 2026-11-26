@@ -9,7 +9,7 @@
  *   T2 all nine fields round-trip through planIngest → state_fields rows →
  *      loadLegacyView with their values byte-intact;
  *   T3 steady state: an unchanged re-ingest rewrites zero state_fields rows
- *      (applyStateFields compares value_json per row, like the ccr slim skip).
+ *      (applyStateFields compares value_json per row, like the store slim skip).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -112,7 +112,7 @@ test("T2: all nine row-backed fields round-trip through planIngest → state_fie
             deadRefs: store.getDeadRefs("sf-pin"),
             refs: store.getRefs("sf-pin"),
         };
-        const view = loadLegacyView(rows, undefined, store.getStateFields("sf-pin"));
+        const view = loadLegacyView(rows, store.getStateFields("sf-pin"));
         const st = view.state as Record<string, unknown>;
         for (const f of ROW_BACKED_KSTATE_FIELDS) {
             assert.deepEqual(st[f], fullState()[f], `view.state["${f}"] lost in hydration`);

@@ -319,46 +319,10 @@ test("PR-D closure: a REAL mid-history rewrite still flags through the echo norm
   assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
 });
 
-// --- #4186 G2/G3: CCR placeholder substitution + emergency-truncation twins --
-
-const ccrPlaceholder = (ref: string, kind: string, tokens: string, title?: string): string =>
-  `\u{1F4E6} [acp-stored #${ref} · ${kind} · ${tokens} tok]${title !== undefined ? ` \`${title}\`` : ""}\n   → acp_retrieve("${ref}") returns the full text`;
+// --- #4186 G3: emergency-truncation twins --
 
 const truncatedTwin = (orig: string, keepPrefixChars = 40, keepSuffixChars = 40): string =>
   `${orig.slice(0, keepPrefixChars)}\n\n...[truncated for context space] — original ~999 tokens]...\n\n${orig.slice(orig.length - keepSuffixChars)}`;
-
-test("I1 CCR-stored tool result: canonical placeholder on exit matches the client's full-text twin (#4186 G2)", () => {
-  const fullText = "total 8\n" + "Fuzz 4-0: pipeline clean, suite green, regions stable, deltas recorded. ".repeat(50);
-  const entry = [
-    mk("user", "text", "run"),
-    mk("tool", "tool-result", fullText, { toolName: "shell", toolCallId: "call_t4" }),
-    mk("assistant", "text", "done"),
-  ];
-  const exit = [
-    entry[0]!,
-    mk("tool", "tool-result", ccrPlaceholder("m00010", "shell output", "4,581", "ls mod-4"), { toolName: "shell", toolCallId: "call_t4" }),
-    entry[2]!,
-  ];
-  const v = judgeInboundOutbound(entry, exit);
-  assert.equal(v.ok, true, JSON.stringify(v.violations));
-  assert.equal(v.exempt?.ccr, 1);
-});
-
-test("NEG CCR: prose merely MENTIONING the placeholder shape is not a sanctioned substitution (#1456 strict-parser gate)", () => {
-  const ph = ccrPlaceholder("m00010", "shell output", "4,581", "ls mod-4");
-  const entry = [mk("user", "text", "run"), mk("tool", "tool-result", "real shell bytes here", { toolCallId: "call_t4" }), mk("assistant", "text", "done")];
-  const exit = [entry[0]!, mk("tool", "tool-result", `example: ${ph}`, { toolCallId: "call_t4" }), entry[2]!];
-  const v = judgeInboundOutbound(entry, exit);
-  assert.equal(v.ok, false);
-  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
-});
-
-test("NEG CCR: placeholder-shaped body under a changed role/contentType is not exempt", () => {
-  const ph = ccrPlaceholder("m00010", "shell output", "4,581");
-  const entry = [mk("user", "text", "hello"), mk("tool", "tool-result", "real bytes", { toolCallId: "call_t4" }), mk("assistant", "text", "hi")];
-  const exit = [entry[0]!, mk("user", "text", ph), entry[2]!];
-  assert.equal(judgeInboundOutbound(entry, exit).ok, false);
-});
 
 test("I1 emergency-truncation twin: prefix+marker+suffix clip of the same message passes (#4186 G3)", () => {
   const orig = "Turn 1: analyze module 1. " + "pipeline clean, suite green, regions stable, deltas recorded. ".repeat(80);

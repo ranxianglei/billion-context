@@ -1,5 +1,4 @@
 import type { SqliteEngineName } from "./driver.ts";
-import type { MessageContentStore } from "acp-kernel";
 import type { Mysql2Module } from "./mysql.js";
 import { UnifiedStore } from "./store.ts";
 
@@ -28,7 +27,6 @@ export type {
     MessageRow,
     BlockRow,
     RefRow,
-    CcrEntryRow,
     CheckpointRow,
     SessionSummaryRow,
     WebSummaryRow,
@@ -39,7 +37,6 @@ import type {
     MessageRow,
     BlockRow,
     RefRow,
-    CcrEntryRow,
     CheckpointRow,
     SessionSummaryRow,
     WebSummaryRow,
@@ -84,8 +81,6 @@ export interface StorageBackend {
     getRefs(sessionId: string): Promise<RefRow[]>;
     /** All reads, including CAS hydration, use one short read-only snapshot. */
     readSnapshot<T>(read: (reader: StorageReadView) => Promise<T>): Promise<T>;
-    getCcr(sessionId: string): Promise<MessageContentStore | null>;
-    getCcrEntries(sessionId: string): Promise<CcrEntryRow[]>;
     /** #6785 step 7: the merged reaped-block journal (table rows ∪ legacy
      *  column). null = none. */
     getOrphanViews(sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null>;
@@ -153,7 +148,7 @@ export interface StorageBackend {
     init?(): Promise<void>;
 }
 
-export type StorageReadView = Pick<StorageBackend, "getSessionRow" | "getMessages" | "getBlocks" | "getDeadRefs" | "getRefs" | "getCcrEntries" | "getOrphanViews" | "getStateFields">;
+export type StorageReadView = Pick<StorageBackend, "getSessionRow" | "getMessages" | "getBlocks" | "getDeadRefs" | "getRefs" | "getOrphanViews" | "getStateFields">;
 
 /** The sqlite backend: the existing UnifiedStore behind the async contract.
  *  Synchronous under the hood; `Promise.resolve` wrapping only. */
@@ -223,16 +218,9 @@ export class SqliteBackend implements StorageBackend {
             getBlocks: async (id, opts) => store.getBlocks(id, opts),
             getDeadRefs: async (id) => store.getDeadRefs(id),
             getRefs: async (id) => store.getRefs(id),
-            getCcrEntries: async (id) => store.getCcrEntries(id),
             getOrphanViews: async (id) => store.getOrphanViews(id),
             getStateFields: async (id) => store.getStateFields(id),
         }));
-    }
-    getCcr(sessionId: string): Promise<MessageContentStore | null> {
-        return Promise.resolve(this.store.getCcr(sessionId));
-    }
-    getCcrEntries(sessionId: string): Promise<CcrEntryRow[]> {
-        return Promise.resolve(this.store.getCcrEntries(sessionId));
     }
     getOrphanViews(sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null> {
         return Promise.resolve(this.store.getOrphanViews(sessionId));

@@ -415,17 +415,6 @@ entries:
     desc_ja: "圧縮ブロック管理用のブロックライフサイクルツール（acp_retire / acp_restore / acp_rewrite）のオプトイン；デフォルト無効により、#5765 以前のワイヤーとバイト単位で同一を維持する。"
     site_en: "<code>blockOps</code> — opt-in compressed-block lifecycle tools (acp_retire / acp_restore / acp_rewrite); off by default so the wire surface stays byte-identical to pre-#5765 (<span class='mech'>enabled</span>)."
     site_zh: "<code>blockOps</code> —— 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，线上表面与 #5765 之前逐字节一致（<span class='mech'>enabled</span>）。"
-  - key: compress.ccr
-    type: object
-    default: "enabled in proxy mode since v2"
-    group: compress
-    id: co.ccr
-    render: obj-item
-    desc_en: "Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction."
-    desc_zh: "内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。"
-    desc_ja: "コンテンツキャッシュと取得：大きな出力はセッションの隣接にロスカレスで保存され、先頭抜粋とポインタに置き換えられ、acp_retrieve 経由で取得される；上限や退避は行われない。"
-    site_en: "<code>ccr</code> — content cache &amp; retrieve: large outputs are stored losslessly beside the session and replaced by a head excerpt plus pointer; the model fetches originals back via <code>acp_retrieve</code>. No cap or eviction; on by default in proxy mode since v2 (<span class='mech'>enabled, minToolTokens (~4000), excludeTools, toolName \"acp_retrieve\", maxHeadChars</span>)."
-    site_zh: "<code>ccr</code> —— 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 <code>acp_retrieve</code> 取回原文；无上限、永不清除；自 v2 起代理模式默认开（<span class='mech'>enabled, minToolTokens(~4000), excludeTools, toolName \"acp_retrieve\", maxHeadChars</span>）。"
   - key: compress.search
     type: object
     default: "off"
@@ -577,41 +566,6 @@ entries:
     desc_en: "Enable the three block-lifecycle tools (injection + prompt + manifest). Off = no tools, no prompt section, zero per-request cost."
     desc_zh: "启用三个压缩块生命周期工具（注入 + prompt + manifest）。关闭 = 无工具、无 prompt 段、零每请求开销。"
     desc_ja: "3 つのブロックライフサイクルツール（インジェクション + プロンプト + マニフェスト）を有効にする。Off = ツールなし、プロンプトセクションなし、リクエストごとのコストゼロ。"
-  - key: compress.ccr.enabled
-    type: boolean
-    default: "true (proxy mode)"
-    group: compress
-    desc_en: "Enable the content-cache-and-retrieve block."
-    desc_zh: "启用内容缓存与回取块。"
-    desc_ja: "コンテンツキャッシュおよび取得ブロックを有効にする。"
-  - key: compress.ccr.minToolTokens
-    type: number
-    default: "≈4000"
-    group: compress
-    desc_en: "Minimum estimated token size of a tool result eligible for CCR storage."
-    desc_zh: "可进入 CCR 存储的工具结果的最小估算 token 大小。"
-    desc_ja: "CCR ストレージの対象となるツール結果の最小推定トークンサイズ。"
-  - key: compress.ccr.excludeTools
-    type: "string[]"
-    default: "[]"
-    group: compress
-    desc_en: "Tool names excluded from CCR storage."
-    desc_zh: "排除出 CCR 存储的工具名。"
-    desc_ja: "CCR ストレージから除外されるツール名。"
-  - key: compress.ccr.toolName
-    type: string
-    default: "\"acp_retrieve\""
-    group: compress
-    desc_en: "Registered name of the retrieval tool."
-    desc_zh: "回取工具的注册名。"
-    desc_ja: "取得ツールの登録名。"
-  - key: compress.ccr.maxHeadChars
-    type: number
-    default: "96"
-    group: compress
-    desc_en: "Maximum head-excerpt length left inline at the storage pointer."
-    desc_zh: "存储指针处内联首段摘录的最大长度。"
-    desc_ja: "ストレージポインタにインラインで残される最大ヘッド抜粋の長さ。"
   - key: compress.prompts.compressPhilosophy
     type: string
     default: "unset (kernel text)"

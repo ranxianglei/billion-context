@@ -64,7 +64,6 @@ export function viewDigest(view: ReturnType<typeof loadLegacyView>): string {
         lastMessages: view.lastMessages,
         lastMessagesFolded: view.lastMessagesFolded,
         pluginSnapshot: view.pluginSnapshot,
-        contentStore: view.contentStore,
     })));
 }
 
@@ -81,7 +80,6 @@ export function viewStateDigest(view: ReturnType<typeof loadLegacyView>): string
         state: view.state,
         blockContents: [...view.blockContents.entries()],
         pluginSnapshot: view.pluginSnapshot,
-        contentStore: view.contentStore,
     })));
 }
 

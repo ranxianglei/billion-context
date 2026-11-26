@@ -276,8 +276,8 @@ test("loadAll skips declared foreign co-residents before reading them (#2298)", 
       foreignFile: (file) => path.basename(file).endsWith(".content-store.json"),
     });
     await s.writeNow("good-1", () => ({ label: "good", count: 1 }));
-    // A co-resident foreign file with a NON-envelope payload (the shape of
-    // billion-context's CCR content stores): if the store READ it,
+    // A co-resident foreign file with a NON-envelope payload (e.g. a host-side
+    // per-session sidecar store): if the store READ it,
     // readEnvelope would log "skipping invalid record".
     const ns = path.join(dir, "openai");
     mkdirSync(ns, { recursive: true });
@@ -498,8 +498,6 @@ test("mergeCompressionState keeps parsed values over defaults", () => {
     tokensCompressed: 1234,
     compressionCount: 7,
     absorbedTokens: 0,
-    storedCount: 0,
-    retrievalCount: 0,
   });
 });
 

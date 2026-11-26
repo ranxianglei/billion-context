@@ -105,10 +105,10 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: 12_000 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        // CCR is opt-in on every lane (#1207 owner decision): off unless a
-        // config level sets enabled=true, so the acp_retrieve tool schema does
+        // the store is opt-in on every lane: off unless a
+        // config level sets enabled=true, so the tool schema does
         // not load here. If this exact-budget boundary shifts again, someone
-        // re-enabled a default — treat that as a regression tripwire. CCR-on
+        // re-enabled a default — treat that as a regression tripwire. store-on
         // interplay with the cascade is covered by e2e-compress-cascade.test.ts.
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
@@ -226,10 +226,10 @@ test("e2e: no preflight when the context fits the (small) model window", async (
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: 260_000 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        // CCR is opt-in on every lane (#1207 owner decision): off unless a
-        // config level sets enabled=true, so the acp_retrieve tool schema does
+        // the store is opt-in on every lane: off unless a
+        // config level sets enabled=true, so the tool schema does
         // not load here. If this exact-budget boundary shifts again, someone
-        // re-enabled a default — treat that as a regression tripwire. CCR-on
+        // re-enabled a default — treat that as a regression tripwire. store-on
         // interplay with the cascade is covered by e2e-compress-cascade.test.ts.
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
@@ -318,10 +318,10 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: 12_000 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        // CCR is opt-in on every lane (#1207 owner decision): off unless a
-        // config level sets enabled=true, so the acp_retrieve tool schema does
+        // the store is opt-in on every lane: off unless a
+        // config level sets enabled=true, so the tool schema does
         // not load here. If this exact-budget boundary shifts again, someone
-        // re-enabled a default — treat that as a regression tripwire. CCR-on
+        // re-enabled a default — treat that as a regression tripwire. store-on
         // interplay with the cascade is covered by e2e-compress-cascade.test.ts.
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
@@ -464,10 +464,10 @@ test("e2e: CJK stable session switch → preflight compresses (CJK-aware token a
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: WINDOW } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        // CCR is opt-in on every lane (#1207 owner decision): off unless a
-        // config level sets enabled=true, so the acp_retrieve tool schema does
+        // the store is opt-in on every lane: off unless a
+        // config level sets enabled=true, so the tool schema does
         // not load here. If this exact-budget boundary shifts again, someone
-        // re-enabled a default — treat that as a regression tripwire. CCR-on
+        // re-enabled a default — treat that as a regression tripwire. store-on
         // interplay with the cascade is covered by e2e-compress-cascade.test.ts.
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },

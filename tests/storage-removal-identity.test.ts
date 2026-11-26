@@ -20,7 +20,7 @@ function session(id: string, protocol?: Session["meta"]["protocol"], origin?: st
         id, meta: { protocol, upstreamOrigin: origin },
         stats: { requests: 1, tokensSaved: 0, inputTokens: 100, cachedTokens: 0, outputTokens: 50,
             cacheSamples: 1, lastInputTokens: 100, contextTokens: 100, compressCreditTokens: 0,
-            retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+            rangeRestores: 0 },
         metadata: {}, createdAt: 1_700_000_000_000, lastSeen: 1_700_000_001_000,
         state: createInitialState(), pendingRetrievals: [], blockContents: new Map(),
         inFlight: 0, persisted: false,

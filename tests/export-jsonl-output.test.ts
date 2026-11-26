@@ -13,7 +13,7 @@ function session(): Session {
         id: "jsonl-output", meta: { title: "Export output", protocol: "responses" },
         stats: { requests: 1, tokensSaved: 0, inputTokens: 10, cachedTokens: 0, outputTokens: 0,
             cacheSamples: 0, lastInputTokens: 10, contextTokens: 10, compressCreditTokens: 0,
-            retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+            rangeRestores: 0 },
         metadata: {}, createdAt: 1, lastSeen: 2, state: createInitialState(), pendingRetrievals: [],
         blockContents: new Map(), inFlight: 0, persisted: false, lastMessagesFolded: false,
         lastMessages: [{ id: "message", role: "user", contentType: "text", text: "original prompt" }],

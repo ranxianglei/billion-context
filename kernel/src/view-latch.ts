@@ -1,7 +1,5 @@
 import { BLOCKED_REF } from "./refs.js";
-import { RETRIEVED_ID_PREFIX } from "./ccr.js";
 import { resolveAbsorbConfig } from "./absorb.js";
-import { resolveCcrConfig } from "./ccr.js";
 import { resolveCrushConfig } from "./crush.js";
 import type { CompressionState, CoreMessage, ViewLatchEntry } from "./types.js";
 import type { NodeIO, PipelineNode, PipelineContext } from "./pipeline.js";
@@ -22,7 +20,7 @@ export const preTransformSnapshotNode: PipelineNode = {
 
 /** Fold-gated view latch (#3939 ⑤/#3805): replay post-transform bytes
  *  verbatim on quiet turns; refresh latches only at fold boundaries. Runs
- *  after every opt-in transform node (ccr-store, absorb-hide, crush,
+ *  after every opt-in transform node (absorb-hide, crush,
  *  absorb-prompt, filter) and after hide-compress-calls (its own #3784 fold
  *  gate stays authoritative — the latch only records its output), before
  *  recommend/nudge/emergency-truncate/render so downstream nodes judge the
@@ -55,12 +53,6 @@ export function viewLatchConfigDigest(ctx: PipelineContext): string {
   return JSON.stringify({
     absorb: resolveAbsorbConfig(ctx.config),
     crush: resolveCrushConfig(ctx.config),
-    // CCR rides the same boundary: a session that disarms CCR must never
-    // keep projecting latched [acp-stored] placeholders — the retrieve
-    // channel they advertise would be gone (dangling placeholder = silent
-    // loss, the #1273 plugin-governance contract). A digest change releases
-    // the latch and re-judges every message under the CURRENT config.
-    ccr: resolveCcrConfig(ctx.config),
     filters: {
       enabled: ctx.config.messageFilters?.enabled ?? false,
       filters: ctx.config.messageFilters?.filters ?? null,
@@ -86,7 +78,7 @@ export function applyViewLatch(io: NodeIO, ctx?: PipelineContext): NodeIO {
   let latchedTransform = false;
 
   for (const m of pre) {
-    if (!m.id || m.id.startsWith(RETRIEVED_ID_PREFIX)) {
+    if (!m.id) {
       const t = post.get(m.id!);
       if (t) out.push(t);
       continue;

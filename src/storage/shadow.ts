@@ -33,7 +33,6 @@
 import { log as loggerLog } from "../logger.js";
 import { featureEnabled } from "../rollout.js";
 import { planIngest, planIngestDelta, planIngestReanchor, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
-import type { CcrLedgerRow } from "./slim.ts";
 import { splitMediaContent } from "./identity.js";
 import { rebuildEgressKstateOverlay, type EgressBlockSnapshot } from "./egress-block.ts";
 import type { BlockView } from "../session.js";
@@ -46,7 +45,7 @@ import { sqliteCorruptionDetail } from "./sqlite-errors.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow, MessageIdContentRow } from "./store.js";
-import type { CoreMessage, MessageContentStore } from "acp-kernel";
+import type { CoreMessage } from "acp-kernel";
 
 // True once quick_check proved this process's index corrupt. such a boot is
 // alarm-only by design (files stay put; the operator repairs/moves them by
@@ -617,13 +616,13 @@ export class UnifiedShadow {
      *  message log authoritatively, so the ingest uses the raw tail whenever
      *  available; both digest legs go through the same override, so parity
      *  accounting stays honest. */
-    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
-        // #3931 step 3: network backend — the ingest runs on the serial
-        // queue (fire-and-forget; failures are logged once per distinct message — never disabled).
-        if (this.sync === null) {
-            this.enqueueAsyncRecord(record, rawTail, liveCcr);
-            return;
-        }
+     record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }): void {
+         // #3931 step 3: network backend — the ingest runs on the serial
+         // queue (fire-and-forget; failures are logged once per distinct message — never disabled).
+         if (this.sync === null) {
+             this.enqueueAsyncRecord(record, rawTail);
+             return;
+         }
         // #5627: which stage is running — the failure forensics must name
         // the operation that died, not just the engine's one-line verdict.
         let phase = "legacy-load";
@@ -645,12 +644,6 @@ export class UnifiedShadow {
                 hasRawTail = true;
                 legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
             }
-            // #2960 ③: the live kernel content store when the caller has one
-            // materialized — the envelope only serializes it for fork-receipt
-            // sessions, so without this override the unified ccr mirror would
-            // stay empty for every plain compressed session. Both digest legs
-            // flow through the same override.
-            if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
             // #3133 watermark: pay the full O(log) ingest only when the
             // trusted-prefix probe cannot vouch for the stored prefix —
             // steady-state saves stringify+hash+INSERT just the NEW tail.
@@ -744,7 +737,7 @@ export class UnifiedShadow {
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
                 if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getCcrEntries(legacy.id), this.sync.getStateFields(legacy.id), this.sync.getOrphanViews(legacy.id) ?? {});
+                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getStateFields(legacy.id), this.sync.getOrphanViews(legacy.id) ?? {});
                 for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                     const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                     verifier.addBlocks(rows);
@@ -922,9 +915,6 @@ export class UnifiedShadow {
                 for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
                     builder.addMessages(store.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                 }
-                // #6785 step 6: slim ccr envelopes hydrate from the CAS-backed
-                // ledger; full legacy envelopes ignore these rows.
-                builder.addCcrEntries(store.getCcrEntries(id));
                 // #6785 step 7: the orphan journal now lives in orphan_blocks;
                 // getOrphanViews also unions any legacy column entries.
                 builder.addOrphanViews(store.getOrphanViews(id) ?? {});
@@ -1384,15 +1374,9 @@ export class UnifiedShadow {
         return this.sync.sessionSummaries();
     }
 
-    /** #2960 ③: whole-store CCR read from the sessions row's ccr mirror. */
-    getCcr(sessionId: string): MessageContentStore | null {
-        if (this.sync === null) return null;
-        return this.sync.getCcr(sessionId);
-    }
-
     /** #4316 PR3/3: raw id → canonical seq (single-row ids only) for the
      *  one-time ledger re-stamp. Shadow mode's index may lag files it has
-     *  not re-recorded, so like getCcr this is full-trust only: sync store
+     *  not re-recorded, so this is full-trust only: sync store
      *  or nothing — a stale map would re-bind citations wrongly. */
     seqByRaw(sessionId: string): Map<string, number> | null {
         if (this.sync === null) return null;
@@ -1495,7 +1479,7 @@ export class UnifiedShadow {
      *  above (orphan guard + #3841 reap journal, #3133 watermark delta,
      *  full ingest, #3133 sampled verify + drift latch). Serialized by the
      *  shadow queue; failures feed the same per-message warn — nothing disables (#2432-era breaker removed 2026-10-30). */
-    private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
+    private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }): void {
         void this.enqueue(async () => {
             // #5627: same failing-stage forensics as the sync record() above.
             let phase = "legacy-load";
@@ -1511,7 +1495,6 @@ export class UnifiedShadow {
                     hasRawTail = true;
                     legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
                 }
-                if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
                 // #4216/#4242: orphan shape rides the plan journal — normal
                 // ingest (the async twin of the sync fix); no freeze.
                 // #3133 watermark delta.
@@ -1576,7 +1559,7 @@ export class UnifiedShadow {
                     this.stats.verifySamples++;
                     const sessionRow = await backend.getSessionRow(legacy.id);
                     if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id), await backend.getCcrEntries(legacy.id), await backend.getStateFields(legacy.id), (await backend.getOrphanViews(legacy.id)) ?? {});
+                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id), await backend.getStateFields(legacy.id), (await backend.getOrphanViews(legacy.id)) ?? {});
                     for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                         const rows = await backend.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                         verifier.addBlocks(rows);
@@ -1625,9 +1608,6 @@ export class UnifiedShadow {
                     for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
                         builder.addMessages(await reader.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                     }
-                    // #6785 step 6: same slim-envelope hydration on the async
-                    // (MySQL seam) leg — one source, both legs.
-                    builder.addCcrEntries(await reader.getCcrEntries(id));
                     // #6785 step 7: same orphan-journal union on the async leg.
                     builder.addOrphanViews(await reader.getOrphanViews(id) ?? {});
                     builder.addStateFields(await reader.getStateFields(id) ?? {});
@@ -1786,10 +1766,6 @@ export class UnifiedShadow {
         });
     }
 
-    getCcrAsync(sessionId: string): Promise<MessageContentStore | null> {
-        return this.viaAsync(null, () => this.getCcr(sessionId), () => this.backend!.getCcr(sessionId));
-    }
-
     setSessionExtAsync(sessionId: string, key: string, value: unknown): Promise<void> {
         return this.viaAsync(undefined, () => this.setSessionExt(sessionId, key, value), () => this.enqueue(() => this.backend!.setSessionExt(sessionId, key, value)).then(() => undefined));
     }
@@ -1898,8 +1874,8 @@ class BatchedViewVerification {
     private tailGaps = 0;
     private tailSlot: DriftDiagnostics["tailSlot"];
 
-    constructor(private readonly legacy: LegacySessionLike, session: SessionRow, refs: RefRow[], deadRefs: { ord: number; ref: string }[], ccrRows: readonly CcrLedgerRow[] = [], stateFieldsRows: Record<string, string> | null = null, orphanViews: Record<string, { one: unknown; full: unknown }> | null = null, private readonly skipLastMessages = false) {
-        const header = loadLegacyView({ session, refs, deadRefs, messages: [], blocks: [] }, ccrRows, stateFieldsRows, orphanViews ?? undefined);
+    constructor(private readonly legacy: LegacySessionLike, session: SessionRow, refs: RefRow[], deadRefs: { ord: number; ref: string }[], stateFieldsRows: Record<string, string> | null = null, orphanViews: Record<string, { one: unknown; full: unknown }> | null = null, private readonly skipLastMessages = false) {
+        const header = loadLegacyView({ session, refs, deadRefs, messages: [], blocks: [] }, stateFieldsRows, orphanViews ?? undefined);
         this.orphans = header.blockContents;
         this.remainingContents = new Map(completeBlockContents(legacy.blockContents, legacy.state.blocks));
         this.tail = JSON.parse(session.tailJson);

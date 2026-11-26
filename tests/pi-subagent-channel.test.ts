@@ -126,7 +126,7 @@ test("detectPiSubagentChildSignal: unparseable or non-object bodies fail closed 
 // — exposure walker —
 
 test("exposesBiliInjectableTool: every injectable name in every wire shape", () => {
-    const names = ["compress", "decompress", "search_context", "acp_status", "acp_rule", "acp_retrieve", "absorb"];
+    const names = ["compress", "decompress", "search_context", "acp_status", "acp_rule", "absorb"];
     for (const n of names) {
         assert.equal(exposesBiliInjectableTool([{ name: n }]), true, `top-level ${n}`);
         assert.equal(exposesBiliInjectableTool([{ type: "function", function: { name: n } }]), true, `openai ${n}`);

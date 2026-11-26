@@ -39,7 +39,7 @@ function makeSession(id: string): Session {
     return {
         id,
         meta: { protocol: "responses", upstreamOrigin: "https://api.openai.com/v1", title: "block ops" },
-        stats: { requests: 1, tokensSaved: 0, inputTokens: 100, cachedTokens: 0, outputTokens: 50, cacheSamples: 1, lastInputTokens: 100, contextTokens: 99000, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        stats: { requests: 1, tokensSaved: 0, inputTokens: 100, cachedTokens: 0, outputTokens: 50, cacheSamples: 1, lastInputTokens: 100, contextTokens: 99000, compressCreditTokens: 0, rangeRestores: 0 },
         metadata: {},
         createdAt: Date.now() - 1000,
         lastSeen: Date.now(),
@@ -222,7 +222,7 @@ test("export JSONL: block records carry retired/rewrittenAt/originalChars/summar
     addBlock(s, "b1", { summary: "alpha" });
     addBlock(s, "b2", { retired: true, summary: "beta" });
     s.state.blocks[0].rewrittenAt = 1234567890;
-    const out = renderSessionJsonlFromSession(s, false);
+    const out = renderSessionJsonlFromSession(s);
     const rows = out.split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>).filter((o) => o.type === "block");
     assert.equal(rows.length, 2);
     const [r1, r2] = rows;

@@ -46,7 +46,7 @@ Attach discovery is lane-aware across **all** live instances (#1232): the launch
 
 Every bili instance on a host reads and writes the **same** per-host
 storage: the XDG data dir (`~/.local/share/billion-context/` — session
-records, CCR content-store, prefix-affinity) plus the state dir
+records, prefix-affinity) plus the state dir
 (`~/.local/state/billion-context/` — log, instance registry). The control
 plane is lane-aware (#1232:
 attach discovery and the #394 coexistence warning both respect declared
@@ -56,7 +56,7 @@ owner and no per-lane isolation on disk. Two consequences follow:
 - **Cross-instance session visibility.** Each instance's Web UI
   (`__bili/sessions` list / detail / logs) re-scans the whole shared store, so
   any instance reachable over loopback can enumerate and read *any* session —
-  raw messages, content-store payloads, compressed blocks — created by any
+  raw messages, compressed blocks — created by any
   other instance/lane on that host.
 - **Restart drain race.** On a restart the new process hydrates the store
   before the old one finishes flushing, so last-writer-wins can drop the old
@@ -362,7 +362,7 @@ bypass and side lanes never earn credit):
   header, declared **no** bili tools on the wire, and produced **no**
   compression reduction. Remedy: **degrade to proxy mode** — the single
   `pluginMode` flip (`pluginAgent !== undefined && !pluginLaneDegraded(session)`)
-  re-injects the ACP tools wire-side, re-arms the compress rewriter, CCR
+  re-injects the ACP tools wire-side, re-arms the compress rewriter
   stamping and absorb, and **keeps the nudge** (the tools are back). When wire
   injection is unavailable (`compress.injectTool=false` → `degradeAvailable`
   false) the remedy falls back to **suppress-nudge**. Recovery: the live

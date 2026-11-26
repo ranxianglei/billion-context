@@ -345,9 +345,9 @@ entries:
     group: behavior
     id: tt.chain
     site_group: beh
-    desc_en: "Body-content detection of bili→bili chains (off: body scanning can false-positive on CCR/model-echoed text); by default only x-bili-hop drives chain recognition."
-    desc_zh: "按请求体内容识别 bili→bili 链（默认关：正文扫描会对 CCR/模型回声文本误报）；默认仅 x-bili-hop 驱动链识别。"
-    desc_ja: "bili→bili チェーンのボディコンテンツ検出（オフ：ボディスキャンは CCR/モデルエコーテキストで誤検出する可能性がある）；デフォルトでは x-bili-hop のみでチェーン認識を駆動します。"
+    desc_en: "Body-content detection of bili→bili chains (off: body scanning can false-positive on model-echoed text); by default only x-bili-hop drives chain recognition."
+    desc_zh: "按请求体内容识别 bili→bili 链（默认关：正文扫描会对模型回声文本误报）；默认仅 x-bili-hop 驱动链识别。"
+    desc_ja: "bili→bili チェーンのボディコンテンツ検出（オフ：ボディスキャンは モデルエコーテキストで誤検出する可能性がある）；デフォルトでは x-bili-hop のみでチェーン認識を駆動します。"
     site_en: "<code>chainContentDetection</code> — recognize bili-owned traffic by body content (off; false-positive risk)."
     site_zh: "<code>chainContentDetection</code> —— 按请求体内容识别 bili 自有流量（默认关；有误报风险）。"
   - key: chainEgressStamp

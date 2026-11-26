@@ -22,7 +22,7 @@ import path from "node:path";
 
 import { createCore, defaultConfig, type Config, type CoreMessage } from "acp-kernel";
 import { applyCompressSettings } from "../src/compress-settings.ts";
-import { drainPendingRetrievals, storeEffectiveCcr } from "../src/store.ts";
+import { drainPendingRetrievals } from "../src/store.ts";
 import { getSession } from "../src/session.ts";
 import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
@@ -60,33 +60,6 @@ function foldBlock(tag: string, endRef: number, msgChars: number = 2000, log?: (
     applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: `m${pad(endRef)}`, summary: `Folded span ${tag}: initial setup, baseline notes, and configuration details for messages 0-${endRef - 1} of the compression pipeline.` }] }), ctx);
     const blockId = [...session.state.blocks].slice(-1)[0]?.blockId!;
     return { ctx, session, blockId };
-}
-
-/** CCR-armed fold mirroring tests/ccr-v2.test.ts so range restore is available. */
-function foldCcr() {
-    const core = createCore();
-    const config = applyCompressSettings(
-        defaultConfig(200_000),
-        200_000,
-        { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: true, minToolTokens: 50 } },
-    ) as Config;
-    const session = getSession(`tfr2204-${Math.random().toString(36).slice(2)}`);
-    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
-    const raw: CoreMessage[] = [];
-    for (let i = 0; i < 20; i++) {
-        raw.push({
-            id: `h_${i}`,
-            role: i % 2 === 0 ? "user" : "assistant",
-            contentType: "text",
-            text: `\x3cacp tokens="2K" type="text"\x3em${pad(i + 1)}\x3c/acp\x3e\nHistorical detail ${i}. ${"x".repeat(2000)}`,
-        });
-    }
-    const turn = core.processTurn({ messages: raw, state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
-    session.state = turn.state;
-    const ctx = { core, config, messages: turn.messages, session, log: () => {} };
-    applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00007", summary: "Early history: messages 1-7 covered initial setup.", topic: "Early history" }] }), ctx);
-    const block = [...session.state.blocks].find((b) => b.active)!;
-    return { core, config, session, msgs: turn.messages, blockId: block.blockId };
 }
 
 test("#2204 whole-block toFile: an unsupported virtual URI is refused BEFORE any file operation", () => {
@@ -175,25 +148,6 @@ test("#2204 whole-block toFile write failure → outcome:failure, labeled partia
     }
 });
 
-test("#2204 range toFile write failure with a small span labels the preview as FULL, not partial", () => {
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bili-2204-rwfs-"));
-    try {
-        const blocker = path.join(scratch, "blocker");
-        fs.writeFileSync(blocker, "x");
-        // Whole-block bodies always clear the kernel's 5000-char min-compress
-        // threshold, so only a sub-block RANGE span can land under the 4000
-        // preview cap. One message ≈ 2K chars → "full content follows".
-        const f = foldCcr();
-        const ctx = { core: f.core, config: f.config, messages: f.msgs, session: f.session, log: () => {} };
-        const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00002", toFile: path.join(blocker, "span.txt") }, ctx);
-        assert.equal(out.outcome, "failure");
-        assert.match(out.text, /full content follows/, "span under the preview cap is not called partial");
-        assert.doesNotMatch(out.text, /partial content follows/);
-    } finally {
-        rmrf(scratch);
-    }
-});
-
 test("#2204 default unchanged: an over-length restore without toFile still spills to a tracked tmp file (pointer only)", () => {
     const prevTmp = process.env.TMPDIR;
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bili-2204-spill-"));
@@ -211,42 +165,6 @@ test("#2204 default unchanged: an over-length restore without toFile still spill
     } finally {
         if (prevTmp === undefined) delete process.env.TMPDIR;
         else process.env.TMPDIR = prevTmp;
-        rmrf(scratch);
-    }
-});
-
-test("#2204 range toFile: an unsupported virtual URI fails without queueing an injection or counting a restore", () => {
-    const f = foldCcr();
-    const ctx = { core: f.core, config: f.config, messages: f.msgs, session: f.session, log: () => {} };
-    const before = f.session.stats.rangeRestores ?? 0;
-    const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004", toFile: "local://span.txt" }, ctx);
-    assert.equal(out.outcome, "failure");
-    assert.match(out.text, /unsupported virtual URI scheme "local"/);
-    assert.equal(drainPendingRetrievals(f.session).length, 0, "a failed export queues NO ephemeral injection");
-    assert.equal(f.session.stats.rangeRestores ?? 0, before, "no restore counted for a failed export");
-    // Retry without toFile restores normally — the block/span is undamaged.
-    const ok = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctx);
-    assert.equal(ok.outcome, "success");
-    assert.match(ok.text, /restored 3 item\(s\)/);
-    assert.equal(drainPendingRetrievals(f.session).length, 1);
-});
-
-test("#2204 range toFile write failure → outcome:failure, no injection, block undamaged", () => {
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bili-2204-rwf-"));
-    try {
-        const blocker = path.join(scratch, "blocker");
-        fs.writeFileSync(blocker, "x");
-        const f = foldCcr();
-        const ctx = { core: f.core, config: f.config, messages: f.msgs, session: f.session, log: () => {} };
-        const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004", toFile: path.join(blocker, "span.txt") }, ctx);
-        assert.equal(out.outcome, "failure");
-        assert.match(out.text, /could not write export to/);
-        assert.match(out.text, /did NOT complete/);
-        assert.equal(drainPendingRetrievals(f.session).length, 0, "no fake user-role injection for content that was never delivered");
-        const ok = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctx);
-        assert.equal(ok.outcome, "success");
-        assert.match(ok.text, /restored 3 item\(s\)/);
-    } finally {
         rmrf(scratch);
     }
 });

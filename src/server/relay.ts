@@ -53,7 +53,7 @@ import { describeCoreTextDuplication, formatForwardFieldSizes, estimateCoreMessa
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
-import { adoptContentStore, ccrLoopConfig, commitRetrievalNotes, commitRetrievals, contentStoreOf, dropRetrievals } from "../store.js";
+import { commitRetrievals, dropRetrievals } from "../store.js";
 import { emitStreamError } from "../stream-error.js";
 import { rewriteGoogleJsonResponseAsync } from "../stream-google.js";
 import { v1UnwrapStream, wrapV1Internal, wrapV1ResponseJson, wrapV1SseFrame } from "../v1internal.js";
@@ -2052,13 +2052,6 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         if (upstream.ok) commitRetrievals(prepared.session, aRefs);
         else dropRetrievals(prepared.session, aRefs, `upstream HTTP ${upstream.status}`);
     }
-    // [#1457] corrective notes settle on the SAME boundary but are never DROPPED:
-    // committed only when upstream accepted (the model actually saw them); on any
-    // failure they stay pending and ride the next request. Not gated on
-    // attachedRetrievals — a request may carry a note without any full text.
-    if (prepared && prepared.attachedRetrievalNoteIds && prepared.attachedRetrievalNoteIds.length > 0 && upstream.ok) {
-        commitRetrievalNotes(prepared.session, prepared.attachedRetrievalNoteIds);
-    }
     const respHeaders: Record<string, string> = {};
     const respConnNamed = connectionNamedHeaders(upstream.headers.get("connection") ?? undefined);
     upstream.headers.forEach((v, k) => {
@@ -2778,7 +2771,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // rebuild exactly like the steady prepare* paths (hybrid lane on
             // text protocol — it is a function tool there).
             const blockOpsActive = effectiveBlockOpsEnabled(prepared.pluginMode === true, config, opts.compress.blockOps) && opts.compress.injectTool;
-            const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+            const loopConfig = { ...config, absorb: absorbActive ? absorbBlock : undefined };
             // Cache-seam: the compress<->absorb join must be byte-identical to
             // the steady prepare* paths. The Responses wire joins its system
             // sections with the "---" divider (see joinResponsesSystemSections,
@@ -2853,10 +2846,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         // as 0 ("unknown") and leaves the bands dark.
                         tokenCount: usageGradeInputBaseline(prepared.session),
                         renderTags: prepared.renderTags ?? "text-only",
-                        contentStore: contentStoreOf(prepared.session),
                     });
                     prepared.session.state = turn.state;
-                    adoptContentStore(prepared.session, turn.contentStore);
                     // #1592-family seam: the absorb view must be fed by the SAME
                     // token-count source the steady prepare* paths use. Feeding
                     // raw lastInputTokens here made round-2 and the neighboring

@@ -12,7 +12,7 @@
 //                     source as the steady paths or prompts flicker
 //                     mid-history across every fold while the session
 //                     straddles the threshold (#1592 family).
-//   P3 CCR armed    — with compress.ccr.enabled the oversized tool result
+//   P3 store armed    — with the store enabled the oversized tool result
 //                     rides the wire as a placeholder; the placeholder element
 //                     must stay byte-identical across folds (round-2 and the
 //                     next client turn).
@@ -35,7 +35,7 @@ type Msg = Record<string, unknown>;
 
 const THRESHOLD = 60 * 1024;
 const ABSORB_PROMPT_FRAGMENT = "[ACP absorb]";
-const CCR_PLACEHOLDER_FRAGMENT = "[acp-stored";
+const STORE_PLACEHOLDER_FRAGMENT = "[acp-stored";
 
 const FILLER = (seed: number, kb: number): string => {
     const para = `Paragraph ${seed}: pipeline clean, suite green, four regions stable, metrics recorded. `;
@@ -115,7 +115,6 @@ function startUpstream(captured: string[], plan: Array<number | undefined>): htt
 
 interface RigOpts {
     absorbThresholdPct?: number;
-    ccr?: boolean;
     turns?: number;
     bigToolFrom?: number;
 }
@@ -144,7 +143,7 @@ async function driveChat(sessionId: string, opts: RigOpts): Promise<string[]> {
                 injectTool: true,
                 injectNudge: true,
                 absorb: { enabled: true, contextThresholdPct: opts.absorbThresholdPct ?? 0 },
-                ...(opts.ccr === true ? { ccr: { enabled: true, minToolTokens: 50 } } : {}),
+                
             },
             promptCache: { routing: "auto" },
             sessionHeader: "x-acp-session",
@@ -236,7 +235,7 @@ function assertPairSeamStable(prev: string, cur: string, label: string): void {
     const emergencyTrunc = JSON.stringify(mb[k] ?? "").includes("[truncated for context space]");
     assert.ok(
         k >= solidA || summaryNew || emergencyTrunc,
-        `${label}: mid-history divergence at message[${k}] of ${ma.length} (round2=${isRound2(b)}) — absorb/CCR view flipped between adjacent requests`,
+        `${label}: mid-history divergence at message[${k}] of ${ma.length} (round2=${isRound2(b)}) — absorb/store view flipped between adjacent requests`,
     );
 }
 
@@ -251,33 +250,3 @@ test("probe P1+P2: tools stable and absorb prompts do not flicker across folds (
     assert.ok(folds >= 2, `expected >= 2 folds, got ${folds}`);
 });
 
-test("probe P3: CCR placeholder element byte-stable across folds", { timeout: 180_000 }, async () => {
-    const bodies = await driveChat("seam-p3", { ccr: true });
-    assert.ok(bodies.length >= 10, `expected >= 10 requests, got ${bodies.length}`);
-    // The big tool result must have been parked as a placeholder on the wire.
-    assert.ok(bodies.some((b) => b.includes(CCR_PLACEHOLDER_FRAGMENT)), "no CCR placeholder ever hit the wire — rig misconfiguration");
-    for (let i = 1; i < bodies.length; i++) assertPairSeamStable(bodies[i - 1]!, bodies[i]!, `pair ${i}->${i + 1}`);
-    // Placeholder element identity BY REF: each stored message's placeholder
-    // (identified by its #mNNNNN) must render byte-identically in every body
-    // that carries it — folds shift positions and multiple placeholders
-    // coexist, so index-based comparison would compare different elements.
-    const refRe = /\[acp-stored #(m\d+) /g;
-    const firstSeen = new Map<string, { body: number; el: string }>();
-    for (let i = 0; i < bodies.length; i++) {
-        const msgs = msgsOf(JSON.parse(bodies[i]!) as Item);
-        msgs.forEach((m, idx) => {
-            const j = JSON.stringify(m);
-            if (!j.includes(CCR_PLACEHOLDER_FRAGMENT)) return;
-            let mm: RegExpExecArray | null; refRe.lastIndex = 0;
-            while ((mm = refRe.exec(j)) !== null) {
-                const ref = mm[1]!;
-                const prev = firstSeen.get(ref);
-                if (prev === undefined) firstSeen.set(ref, { body: i, el: j });
-                else assert.equal(j, prev.el, `placeholder ${ref} mutated between body ${prev.body} and ${i}`);
-            }
-        });
-    }
-    assert.ok(firstSeen.size >= 2, `expected >= 2 distinct stored placeholders, got ${firstSeen.size}`);
-    const appearing = [...firstSeen.values()].filter((v) => v.body >= 2).length;
-    assert.ok(appearing >= 1, "no placeholder survived past the early turns — rig too short for a cross-fold comparison");
-});

@@ -26,7 +26,7 @@ import {
 } from "../compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { effectiveRulesEnabled, executeRule } from "../rules-feature.js";
-import { ccrEnabled, drainPendingRetrievals, executeRetrieve, imageRescaleToolArmed, retrieveToolName } from "../store.js";
+import { imageRescaleToolArmed } from "../store.js";
 import { applyImageRescalePass, executeReadOriginalImage } from "../image-rescale.js";
 import { recordThreadTail } from "../server/thread-tracking.js";
 import { applyRanges } from "../stream.js";
@@ -506,9 +506,6 @@ export function executeProxyTool(
     }
     if (effectiveRulesEnabled(ctx.session, ctx.config) && toolName === RULE_TOOL_NAME) {
         return executeRule(args, ctx);
-    }
-    if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
-        return executeRetrieve(args, ctx.session);
     }
     return toolFail(`[Unknown proxy tool: ${toolName}]`);
 }
@@ -1639,16 +1636,6 @@ export async function* runCompressLoop(
                         // kept OUT of the thread delta — a server-side thread is
                         // append-only and would carry them forever.
                     }
-                }
-                // #1097: retrieval injections ride the same re-request channel
-                // as the ack pairs above — ack first, full text second. Their
-                // ids (acp_retrieved_*) are structurally excluded from ref
-                // assignment, so they never consume message numbers.
-                for (const injection of drainPendingRetrievals(ctx.session)) {
-                    coreMessages.push(injection);
-                    // #2701: retrieval injections carry full retrieved text the
-                    // model must see — deliverable on a threads turn via the delta.
-                    if (threadContinue) threadDelta.push(injection);
                 }
                 const anyCompressFailed = proxyResults.some(
                     (pr) => (pr.name === "compress" || pr.name === "decompress") && proxyToolResultFailed(pr.result),

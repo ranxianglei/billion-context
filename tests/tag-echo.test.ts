@@ -34,7 +34,7 @@ function makeCtx(id: string): {
         session: {
             id,
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0,             rangeRestores: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0,             rangeRestores: 0 },
             pendingRetrievals: [],
             metadata: {},
             state: createInitialState(),
@@ -853,7 +853,7 @@ test("empty-name close is NOT swallowed by the widened close class (#2348 §4 co
 
 test("bili's own retrieval pointer marker survives both modes untouched (#2348 negative sample)", () => {
     // The v1 census probe over-counted self-closing tags because \\b holds at
-    // the p/- boundary and swept in bili's own CCR export pointer — this is the
+    // the p/- boundary and swept in bili's own export pointer — this is the
     // family that must stay a permanent false negative.
     const marker = `${LT}acp-retrieved-file ref="m0123" path="/tmp/x.txt" lines="42"/>`;
     const s = `pointer ${marker} note`;

@@ -20,7 +20,6 @@ import {
     DECOMPRESS_TOOL_NAME,
     DECOMPRESS_TOOL_OPENAI,
     DECOMPRESS_TOOL_RESPONSES,
-    RETRIEVE_TOOL_NAME,
     RULE_TOOL_NAME,
     SEARCH_CONTEXT_TOOL,
     SEARCH_CONTEXT_TOOL_GOOGLE,
@@ -193,57 +192,30 @@ export const BILI_SEARCH_CONTEXT_TOOL_GOOGLE = {
     parameters: SEARCH_CONTEXT_TOOL_GOOGLE.parameters as JsonSchemaObject,
 };
 
-// #1179 CCR v2: host-side range-restore extension of decompress. Optional
-// startId/endId (mNNNNN refs) restore only the block's messages inside that
-// span instead of the whole block. Execution is gated on CCR being armed for
-// the session (resolveDecompressRange fails explicitly when it is not), so
-// the params are advertised ONLY where they can work (#1712): proxy-lane wire
-// injection serves the *_NO_RANGE variant while the session is unarmed, and
-// the plugin manifest serves them only when the base config enables CCR
-// (plugin policy is the base block verbatim, #1345) — same conservative rule
-// as acp_retrieve/absorb/rule in handlePluginManifest (#1192/#1271). Blank or
-// whitespace values are treated as omitted at execution (whole-block restore).
-const DECOMPRESS_RANGE_PARAM_START = {
-    type: "string",
-    description: "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled). Omit both to restore the whole block; empty values count as omitted.",
-};
-const DECOMPRESS_RANGE_PARAM_END = {
-    type: "string",
-    description: "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block.",
-};
-
-function withRangeParams(schema: JsonSchemaObject): JsonSchemaObject {
-    return { ...schema, properties: { ...schema.properties, startId: DECOMPRESS_RANGE_PARAM_START, endId: DECOMPRESS_RANGE_PARAM_END } };
-}
-
 // #1995: image-recovery extension of decompress. An optional imageRef (an mNNNNN
 // ref, or "list") restores a stripped/folded image's original pixels to a
-// host-readable file. It is independent of blockId/range AND of CCR, so — unlike
-// startId/endId (#1712, which are advertised only where CCR can arm them) — it is
-// offered in EVERY decompress variant, range and no-range alike.
+// host-readable file. It is independent of blockId/range AND of CCR, it is offered in EVERY decompress variant.
 const DECOMPRESS_IMAGE_PARAM = {
     type: "string",
-    description: "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR.",
+    description: "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId.",
 };
 const DECOMPRESS_IMAGE_NOTE = " Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.";
 function withImageRestoreParam(schema: JsonSchemaObject): JsonSchemaObject {
     return { ...schema, properties: { ...schema.properties, imageRef: DECOMPRESS_IMAGE_PARAM } };
 }
 
-export const BILI_DECOMPRESS_TOOL = { name: DECOMPRESS_TOOL.name, description: DECOMPRESS_TOOL.description + DECOMPRESS_IMAGE_NOTE, input_schema: withImageRestoreParam(withRangeParams(DECOMPRESS_TOOL.input_schema)) };
-export const BILI_DECOMPRESS_TOOL_OPENAI = { type: "function" as const, function: { name: DECOMPRESS_TOOL_OPENAI.function.name, description: DECOMPRESS_TOOL_OPENAI.function.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(withRangeParams(DECOMPRESS_TOOL_OPENAI.function.parameters)) } };
-export const BILI_DECOMPRESS_TOOL_RESPONSES = { type: "function" as const, name: DECOMPRESS_TOOL_RESPONSES.name, description: DECOMPRESS_TOOL_RESPONSES.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(withRangeParams(DECOMPRESS_TOOL_RESPONSES.parameters)) };
-export const BILI_DECOMPRESS_TOOL_GOOGLE = { name: DECOMPRESS_TOOL_GOOGLE.name, description: DECOMPRESS_TOOL_GOOGLE.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(withRangeParams(DECOMPRESS_TOOL_GOOGLE.parameters)) };
+export const BILI_DECOMPRESS_TOOL = { name: DECOMPRESS_TOOL.name, description: DECOMPRESS_TOOL.description + DECOMPRESS_IMAGE_NOTE, input_schema: withImageRestoreParam(DECOMPRESS_TOOL.input_schema) };
+export const BILI_DECOMPRESS_TOOL_OPENAI = { type: "function" as const, function: { name: DECOMPRESS_TOOL_OPENAI.function.name, description: DECOMPRESS_TOOL_OPENAI.function.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(DECOMPRESS_TOOL_OPENAI.function.parameters) } };
+export const BILI_DECOMPRESS_TOOL_RESPONSES = { type: "function" as const, name: DECOMPRESS_TOOL_RESPONSES.name, description: DECOMPRESS_TOOL_RESPONSES.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(DECOMPRESS_TOOL_RESPONSES.parameters) };
+export const BILI_DECOMPRESS_TOOL_GOOGLE = { name: DECOMPRESS_TOOL_GOOGLE.name, description: DECOMPRESS_TOOL_GOOGLE.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(DECOMPRESS_TOOL_GOOGLE.parameters) };
 
 export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL : t));
 export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t.function.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_OPENAI : t));
 export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
 export const BILI_ACP_TOOLS_GOOGLE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_GOOGLE : t));
 
-// #1712: no-range variants — identical except decompress lacks startId/endId.
-// Served where range restore cannot be armed so the advertised schema never
-// offers what execution will refuse (see the #1179 note above). Image recovery
-// still applies here (it does not require CCR), so these keep imageRef.
+// #1712/#7755: no-range variants — kept as aliases (the range-restore params
+// were removed with CCR); identical to the with-range constants above.
 const BILI_DECOMPRESS_IMG_ANTHROPIC = { name: DECOMPRESS_TOOL.name, description: DECOMPRESS_TOOL.description + DECOMPRESS_IMAGE_NOTE, input_schema: withImageRestoreParam(DECOMPRESS_TOOL.input_schema) };
 const BILI_DECOMPRESS_IMG_OPENAI = { type: "function" as const, function: { name: DECOMPRESS_TOOL_OPENAI.function.name, description: DECOMPRESS_TOOL_OPENAI.function.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(DECOMPRESS_TOOL_OPENAI.function.parameters) } };
 const BILI_DECOMPRESS_IMG_RESPONSES = { type: "function" as const, name: DECOMPRESS_TOOL_RESPONSES.name, description: DECOMPRESS_TOOL_RESPONSES.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(DECOMPRESS_TOOL_RESPONSES.parameters) };
@@ -470,33 +442,6 @@ export const READ_ORIGINAL_IMAGE_TOOL = { name: READ_ORIGINAL_IMAGE_TOOL_NAME, d
 export const READ_ORIGINAL_IMAGE_TOOL_OPENAI = { type: "function" as const, function: { name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA } };
 export const READ_ORIGINAL_IMAGE_TOOL_RESPONSES = { type: "function" as const, name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
 export const READ_ORIGINAL_IMAGE_TOOL_GOOGLE = { name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
-
-// #1097: acp_retrieve — resolve a stored ID-referenced message back to its full
-// original. Kernel-owned tool (RETRIEVE_TOOL_NAME); synthesized in all four
-// wire shapes here so every injection point (wire helpers, plugin manifest)
-// serves one definition. Takes a single `ref` (the mNNNNN id printed in the
-// [acp-stored] placeholder). Read-only with respect to context: the fetched content
-// rides the ephemeral tool-result channel and consumes no message ref.
-const RETRIEVE_TOOL_DESCRIPTION = "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.";
-const RETRIEVE_PARAM_SCHEMA = {
-    type: "object" as const,
-    properties: {
-        ref: { type: "string", description: "The stored message id to retrieve (an mNNNNN ref from an [acp-stored] placeholder)." },
-    },
-    required: ["ref"],
-};
-export { RETRIEVE_TOOL_NAME };
-/** Wire tool shapes for the retrieve tool; name follows the session's resolved
- *  `ccr.toolName` (default acp_retrieve) so registration, dispatch, and the
- *  kernel placeholder hint all agree. */
-export function retrieveToolsFor(name: string) {
-    return {
-        anthropic: { name, description: RETRIEVE_TOOL_DESCRIPTION, input_schema: RETRIEVE_PARAM_SCHEMA },
-        openai: { type: "function" as const, function: { name, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA } },
-        responses: { type: "function" as const, name, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA },
-        google: { name, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA },
-    };
-}
 
 // #1494: models drift off the advertised {content: [...]} schema when they
 // retry a single range: `content` becomes the single entry OBJECT instead of a

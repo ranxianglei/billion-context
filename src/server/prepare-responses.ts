@@ -29,10 +29,10 @@ import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds,
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
-import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, blockOpsTools, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, blockOpsTools, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { blockOpsEnabled, storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
-import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, imageRescaleToolArmed, retrieveToolName } from "../store.js";
+import { imageRescaleToolArmed } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
@@ -366,7 +366,7 @@ export async function prepareResponses(
         const blockOps = blockOpsTools();
         const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && shouldInject && !isCompactionTrigger;
         const rulesActive = rulesEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
-        const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        const loopConfig = { ...config, absorb: absorbActive ? absorbBlock : undefined };
         // #2372/#2432: LOCAL auto-compaction — the client compacts on its own
         // and the call never transits the proxy; the first the proxy hears of
         // it is this request replaying [compaction summary, retained tail…].
@@ -454,11 +454,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // nudge-carrying request rolls the cadence back to pre-turn (lane
         // mirror of the anthropic-lane fix).
         nudgeStampsBefore = nudgeStampsOf(session);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags, contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags });
         session.state = turn.state;
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
-        adoptContentStore(session, turn.contentStore);
         // In-request ledger flush: the transcript up to THIS user message is
         // durable before the model call (#3397 durability-before-render) and
         // the stage-0 envelope / M2 evidence read a current ledger.
@@ -604,13 +603,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
             if (!knobNoInjectTool() && injectTools) {
-                // #1712: decompress's startId/endId execute only on CCR-armed
-                // sessions (#1179) — serve the no-range schema otherwise.
-                const ccrOn = ccrEnabled(session);
-                const respExtra = [...(absorbActive ? [absorbTools.responses] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(ccrOn ? [retrieveToolsFor(retrieveToolName(session)).responses] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : []), ...(blockOpsActive ? blockOps.responses : [])];
+                const respExtra = [...(absorbActive ? [absorbTools.responses] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : []), ...(blockOpsActive ? blockOps.responses : [])];
                 toolsOut = responsesTextProtocol
-                    ? injectResponsesTool(parsed.tools, [...(ccrOn ? BILI_ACP_READONLY_TOOLS_RESPONSES : BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE), ...(blockOpsActive ? blockOps.responses : [])], surface?.toolPrompts, externalSummaryEnabled(config))
-                    : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...(ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), ...respExtra] : (ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), surface?.toolPrompts, externalSummaryEnabled(config));
+                    ? injectResponsesTool(parsed.tools, [...BILI_ACP_READONLY_TOOLS_RESPONSES, ...(blockOpsActive ? blockOps.responses : [])], surface?.toolPrompts, externalSummaryEnabled(config))
+                    : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...BILI_ACP_TOOLS_RESPONSES, ...respExtra] : BILI_ACP_TOOLS_RESPONSES, surface?.toolPrompts, externalSummaryEnabled(config));
             }
         } else if (tagsOnlyPrompt !== "" || projection.systemParts.length > 0 || forgedSummaries.length > 0) {
             const devContent = joinResponsesSystemSections([...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])]);
@@ -948,8 +944,6 @@ export function prepareResponsesCompact(
     // half-applied fold (the upstream's own compaction boundary is handled by
     // markNativeCompactionBoundary + rebase instead).
     const prevState = session.state;
-    const prevStore = session.contentStore;
-    const prevStoreDirty = session.contentStoreDirty === true;
     // E2 endpoint form: /responses/compact. When the gate passes, run the same
     // fold pipeline as a normal turn and forge the compacted history as
     // {"output": [...]} — a deterministic handoff to the ACP state instead of a
@@ -960,15 +954,12 @@ export function prepareResponsesCompact(
         // The forged handoff is one-shot with no tool channel: strip absorb so
         // no [ACP absorb] instruction bakes into the forged history, and run
         // the absorb view so absorbed pairs stay hidden in it (wire parity).
-        const compactConfig = ccrLoopConfig(session, { ...config, absorb: undefined });
-        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config: compactConfig, tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const compactConfig = { ...config, absorb: undefined };
+        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config: compactConfig, tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only" });
         session.state = turn.state;
-        adoptContentStore(session, turn.contentStore);
         transformOk = true;
         if (!codexCompactGate(session, config.modelContextLimit, transformOk)) {
             session.state = prevState;
-            session.contentStore = prevStore;
-            session.contentStoreDirty = prevStoreDirty;
             return base;
         }
         const viewed = applyAbsorbView(turn.messages, turn.state, compactConfig, usageGradeInputBaseline(session));
@@ -976,8 +967,6 @@ export function prepareResponsesCompact(
         let output = patchResponsesInput(projection, processed);
         if (typeof output === "string") {
             session.state = prevState;
-            session.contentStore = prevStore;
-            session.contentStoreDirty = prevStoreDirty;
             return base;
         }
         output = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(output));
@@ -987,8 +976,6 @@ export function prepareResponsesCompact(
         return { ...base, codexForge: { kind: "endpoint", body: JSON.stringify({ output }), contentType: "application/json" } };
     } catch (err) {
         session.state = prevState;
-        session.contentStore = prevStore;
-        session.contentStoreDirty = prevStoreDirty;
         log("warn", `[${session.id}] codex compact forge failed (${String(err)}); passing through to upstream`);
         return base;
     }

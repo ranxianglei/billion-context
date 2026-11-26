@@ -41,7 +41,6 @@ function session(id: string, tail: CoreMessage[], derivedFrom?: string): LegacyS
         lastMessages: tail,
         lastMessagesFolded: false,
         pluginSnapshot: undefined,
-        contentStore: undefined,
     };
 }
 

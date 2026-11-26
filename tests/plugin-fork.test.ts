@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { applyAbsorb, buildStoredPlaceholder, createContentStore, defaultConfig, DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, storeOriginal } from "acp-kernel";
+import { applyAbsorb, defaultConfig, DEFAULT_ABSORB_CONFIG } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -17,7 +17,6 @@ import { _resetPluginStateForTest, forkParentRevisionLegacy, publicForkInputChec
 import { _resetSessionsForTest, getSession, markDirty } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
-import { contentStoreOf } from "../src/store.ts";
 import { closeServers } from "./server-close-guard.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 
@@ -909,125 +908,6 @@ test("HTTP storage failures: broken dir refuses to start; corrupt index serves f
     }
 });
 
-test("HTTP CCR deleted index fails closed in memory after persistence", { timeout: 60_000 }, async () => {
-    const h = await harness(true);
-    try {
-        const parent = resolveConversation("parent").session!;
-        parent.metadata.effectiveCcr = { ...DEFAULT_CCR_CONFIG, enabled: true };
-        parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "retained CCR original", kind: "original", tokens: 10, head: "retained" });
-        parent.contentStoreDirty = true;
-        assert(h.store.flushSync(parent));
-        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
-        delete parent.contentStore.byRef.m00001;
-        const before = JSON.stringify({ state: parent.state, messages: parent.pluginSnapshot, store: parent.contentStore });
-        const unavailable = await h.request("/__bili/plugin/snapshot?conversationId=parent");
-        assert.equal(unavailable.status, 409);
-        assert.equal(unavailable.body.code, "SNAPSHOT_UNAVAILABLE");
-        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot));
-        assert.equal(fork.status, 409);
-        assert.equal(fork.body.status, "unavailable");
-        assert.equal(resolveConversation("child").session, undefined);
-        assert.equal(h.store.loadSync("child"), null);
-        assert.equal(JSON.stringify({ state: parent.state, messages: parent.pluginSnapshot, store: parent.contentStore }), before);
-    } finally { await h.close(); }
-});
-
-test("HTTP CCR shared payload deletion fails closed before persistence", { timeout: 60_000 }, async () => {
-    const h = await harness();
-    try {
-        const parent = resolveConversation("parent").session!;
-        let store = createContentStore();
-        for (const [i, message] of parent.pluginSnapshot!.slice(0, 2).entries()) {
-            store = storeOriginal(store, { ref: `m0000${i + 1}`, rawId: message.id, text: "shared payload", kind: "original", tokens: 10, head: "shared" });
-        }
-        parent.contentStore = store;
-        rememberPluginMessages(parent.id, parent.pluginSnapshot!, parent.pluginSnapshot!);
-        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
-        delete store.byRef.m00001;
-        const before = JSON.stringify(parent);
-        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 409);
-        assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).status, 409);
-        assert.equal(resolveConversation("child").session, undefined);
-        assert.equal(JSON.stringify(parent), before);
-    } finally { await h.close(); }
-});
-
-for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "wrong-raw-alias", "changed-payload"] as const) {
-    test(`HTTP CCR ${corruption} fails closed after cold disk restore`, async () => {
-        // Pure-SQLite is the default storage writer now (2026-11-13): these
-        // corruption tests corrupt and re-read a .content-store.json envelope,
-        // which never exists on disk under the default writer (ENOENT on
-        // sessions/<protocol> — red in the e2e-dsh-plugin-lane). Pin dual-write
-        // like the other e2e lanes (d252543a/74a925db); the test still removes
-        // index.db below, so the fail-closed 409 contract is unchanged, and
-        // pure-sqlite-only semantics stay covered by the storage unit tests.
-        const previousWriter = process.env.BILI_STORAGE_JSON_WRITER;
-        process.env.BILI_STORAGE_JSON_WRITER = "1";
-        const h = await harness(true);
-        try {
-            const parent = resolveConversation("parent").session!;
-            let store = createContentStore();
-            for (const [i, message] of parent.pluginSnapshot!.slice(0, 2).entries()) {
-                store = storeOriginal(store, { ref: `m0000${i + 1}`, rawId: message.id, text: "shared payload", kind: "original", tokens: 10, head: "shared" });
-            }
-            parent.contentStore = store;
-            parent.contentStoreDirty = true;
-            // #2077 lazy persistence: the raw snapshot only lands in the record
-            // once it is an external contract — pin that contract here so this
-            // test still exercises the corrupted-store detection path.
-            parent.metadata.publicSnapshotRetained = true;
-            assert(h.store.flushSync(parent));
-            const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
-            const namespace = join(h.dir, "sessions", parent.meta.protocol!);
-            const filename = readdirSync(namespace).find((name) => name.endsWith(".content-store.json"));
-            assert(filename);
-            const path = join(namespace, filename);
-            const disk = JSON.parse(readFileSync(path, "utf8")) as typeof store;
-            const payloadHash = disk.byRef.m00001!.hash;
-            switch (corruption) {
-                case "missing-ref": delete disk.byRef.m00001; break;
-                case "missing-payload": delete disk.byHash[payloadHash]; break;
-                case "orphan-payload": disk.byHash[createHash("sha256").update("orphan").digest("hex")] = "orphan"; break;
-                case "wrong-raw-alias": disk.byRef.m00001!.rawId = parent.pluginSnapshot![1].id; break;
-                case "changed-payload": disk.byHash[payloadHash] = "corrupted original"; break;
-            }
-            writeFileSync(path, JSON.stringify(disk));
-            // True cold disk restore: close the unified sidecar and remove its
-            // index so the corrupted content-store file is the ONLY surviving
-            // copy. Under the #3818 full-mode default an intact index.db
-            // legitimately serves the pre-corruption CCR mirror (#2960 ③) and
-            // the snapshot would answer 200 — not because fail-closed broke,
-            // but because nothing was lost. Deleting the sidecar (after
-            // closeQuietly — Windows cannot unlink an open index.db) makes the
-            // 409 contract hold identically in full and legacy modes.
-            h.store.closeQuietly();
-            const sidecar = join(h.dir, "sessions", "index.db");
-            for (const f of [sidecar, `${sidecar}-wal`, `${sidecar}-shm`]) rmSync(f, { force: true });
-            _resetSessionsForTest();
-            _resetPluginStateForTest();
-            const store2 = new SessionStore({ dir: join(h.dir, "sessions"), enabled: true, debounceMs: 60_000 });
-            _setStoreForTest(store2);
-            const restored = getSession("parent");
-            contentStoreOf(restored);
-            const parentState = () => JSON.stringify({ state: restored.state, messages: restored.pluginSnapshot, metadata: restored.metadata, store: restored.contentStore });
-            const before = parentState();
-            assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 409);
-            const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot));
-            assert.equal(fork.status, 409);
-            assert.equal(fork.body.status, "unavailable");
-            assert.equal(resolveConversation("child").session, undefined);
-            assert.equal(store2.loadSync("child"), null);
-            assert.equal(parentState(), before);
-            assert.equal(readFileSync(path, "utf8"), JSON.stringify(disk));
-            store2.closeQuietly();
-        } finally {
-            if (previousWriter === undefined) delete process.env.BILI_STORAGE_JSON_WRITER;
-            else process.env.BILI_STORAGE_JSON_WRITER = previousWriter;
-            await h.close();
-        }
-    });
-}
-
 for (const storageMode of ["legacy", "full"] as const) {
     test(`HTTP fork revision and originals survive a new proxy process (${storageMode})`, { timeout: 60_000 }, async () => {
         const previousMode = process.env.BILI_STORAGE_UNIFIED;
@@ -1045,9 +925,6 @@ for (const storageMode of ["legacy", "full"] as const) {
                 await new Promise((r) => setTimeout(r, 50));
             }
             const parent = resolveConversation("parent").session!;
-            parent.metadata.effectiveCcr = { ...DEFAULT_CCR_CONFIG, enabled: true };
-            parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
-            parent.contentStoreDirty = true;
             assert(h.store.flushSync(parent));
             // #4316 PR3/3 + #5608-D: cold load NO LONGER runs the one-time
             // ledger alignment — it must preserve the persisted state
@@ -1099,9 +976,6 @@ for (const storageMode of ["legacy", "full"] as const) {
             const replay = await call("/__bili/plugin/fork", req);
             assert.equal(replay.status, 200);
             assert.equal(replay.body.replayed, true);
-            const retrieved = await call("/__bili/plugin/tool", { conversationId: "child", tool: "acp_retrieve", args: { ref: "m00001" } });
-            assert.equal(retrieved.status, 200);
-            assert.match(retrieved.body.result, /CCR original retained independently after restart/);
             const original = await call("/__bili/plugin/tool", { conversationId: "child", tool: "decompress", args: { blockId: "b1", full: true } });
             assert.match(original.body.result, /first original/);
             assert.match(original.body.result, /second original/);
@@ -1218,7 +1092,7 @@ test("HTTP manual compress rejects a stale expectedRevision under the session lo
     } finally { await h.close(); }
 });
 
-test("HTTP missing nested originals and CCR payloads fail closed without publishing a child", { timeout: 60_000 }, async () => {
+test("HTTP missing nested originals fail closed without publishing a child", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await compress(h);
@@ -1230,11 +1104,6 @@ test("HTTP missing nested originals and CCR payloads fail closed without publish
         assert.equal(result.body.status, "unavailable");
         assert.equal(result.body.code, "PARENT_STATE_INCOMPLETE");
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=child")).status, 404);
-        parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "missing CCR fixture", kind: "original", tokens: 10, head: "missing CCR" });
-        delete parent.contentStore.byHash[parent.contentStore.byRef.m00001.hash];
-        const missingCcr = await h.request("/__bili/plugin/snapshot?conversationId=parent");
-        assert.equal(missingCcr.status, 409);
-        assert.equal(missingCcr.body.code, "SNAPSHOT_UNAVAILABLE");
         assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).body.status, "unavailable");
     } finally { await h.close(); }
 });
@@ -1260,29 +1129,6 @@ test("HTTP multimodal snapshots are explicitly unavailable, not text-only matche
     } finally { await h.close(); }
 });
 
-test("HTTP CCR foreign placeholder ref cannot publish an exact empty-store child", { timeout: 60_000 }, async () => {
-    const h = await harness(true);
-    try {
-        const baseline = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
-        const placeholder = buildStoredPlaceholder({ ref: "m00077", kind: "original", tokens: 100, head: "missing original", retrieveToolName: "acp_retrieve" });
-        await sendModel(h, "foreign-placeholder", [{ role: "user", content: placeholder }, { role: "assistant", content: "retained tail" }]);
-        const parent = resolveConversation("foreign-placeholder").session!;
-        assert.equal(parent.state.messageRefs.byRaw[parent.pluginSnapshot![0].id], "m00001");
-        assert.deepEqual(contentStoreOf(parent).byRef, {});
-        const state = () => JSON.stringify({ state: parent.state, messages: parent.pluginSnapshot, metadata: parent.metadata, store: parent.contentStore });
-        const before = state();
-        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=foreign-placeholder");
-        assert.equal(snapshot.status, 409, JSON.stringify(snapshot.body));
-        assert.equal(snapshot.body.code, "SNAPSHOT_UNAVAILABLE");
-        const fork = await h.request("/__bili/plugin/fork", { ...forkRequest(baseline), parentConversationId: "foreign-placeholder" });
-        assert.equal(fork.status, 409, JSON.stringify(fork.body));
-        assert.equal(fork.body.status, "unavailable");
-        assert.equal(resolveConversation("child").session, undefined);
-        assert.equal(h.store.loadSync("child"), null);
-        assert.equal(state(), before);
-    } finally { await h.close(); }
-});
-
 for (const content of [null, "audio transcript"] as const) {
     test(`HTTP OpenAI assistant audio with ${content === null ? "null" : "text"} content is unavailable`, async () => {
         const h = await harness(true);
@@ -1292,8 +1138,7 @@ for (const content of [null, "audio transcript"] as const) {
             const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": "audio-parent" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
             assert.equal(response.status, 200, await response.text());
             const parent = resolveConversation("audio-parent").session!;
-            contentStoreOf(parent);
-            const state = () => JSON.stringify({ state: parent.state, messages: parent.pluginSnapshot, metadata: parent.metadata, store: parent.contentStore });
+            const state = () => JSON.stringify({ state: parent.state, messages: parent.pluginSnapshot, metadata: parent.metadata });
             const before = state();
             const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=audio-parent");
             assert.equal(snapshot.status, 409, JSON.stringify(snapshot.body));

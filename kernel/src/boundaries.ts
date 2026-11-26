@@ -1,6 +1,5 @@
 import { activeBlocks, blockById } from "./state.js";
 import { isRenderedSummaryMessage, summaryMessageId } from "./prune.js";
-import { isRetrievedMessage } from "./ccr.js";
 import { BLOCKED_REF, highestUsedIndex, refToIndex } from "./refs.js";
 import type {
   CompressionBlock,
@@ -154,13 +153,12 @@ export function resolveBoundaries(
   const messageIds: string[] = [];
   for (let index = startIndex; index <= endIndex; index++) {
     const message = input.messages[index];
-    // Synthetic summary and retrieval-injection messages are transient view
-    // representations, not compressible content: exclude them so they never
+    // Synthetic summary messages are transient view representations, not
+    // compressible content: exclude them so they never
     // leak into a new block's effectiveMessageIds/directMessageIds.
     if (
       message &&
-      !isRenderedSummaryMessage(message) &&
-      !isRetrievedMessage(message)
+      !isRenderedSummaryMessage(message)
     )
       messageIds.push(message.id);
   }

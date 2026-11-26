@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { indexToRef, matchSession as matchSessionKernel, parseStoredPlaceholder, refForRaw, renderHandoff as renderHandoffKernel, renderMessage, type CompressionBlock, type MessageContentStore, type CoreMessage } from "acp-kernel";
+import { indexToRef, matchSession as matchSessionKernel, refForRaw, renderHandoff as renderHandoffKernel, renderMessage, type CompressionBlock, type CoreMessage } from "acp-kernel";
 import { blockContentSnapshot, type Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 import { SqliteBackend, backendSelectionNotice, listBackendNames, openBackend, resolveBackendName, resolveMysqlDsn, selectedBackendRaw, type StorageBackend } from "./storage/backend.js";
@@ -275,17 +275,8 @@ function safeJson(raw: string | null | undefined): unknown {
     }
 }
 
-function ccrOriginals(store: MessageContentStore | null): Map<string, string> {
-    const originals = new Map<string, string>();
-    if (store) for (const [ref, entry] of Object.entries(store.byRef)) {
-        const payload = typeof entry?.hash === "string" ? store.byHash[entry.hash] : undefined;
-        if (typeof payload === "string") originals.set(ref, payload);
-    }
-    return originals;
-}
-
 /** JSONL dump rendered from the unified tables (#2671 Phase 2c). One JSON
- * record per line: a session header, then messages ordered by seq (CCR
+ * record per line: a session header, then messages ordered by seq
  * placeholders dereferenced to their stored originals when `full`; retired
  * rows included carrying `retiredAt`, live rows omit it — #4390/#4664), then
  * blocks ordered by ord, then dead refs. Deterministic for a given store
@@ -293,7 +284,7 @@ function ccrOriginals(store: MessageContentStore | null): Map<string, string> {
 // #3931: consumes the StorageBackend contract (not UnifiedStore) — the
 // jsonl renderer is the step-1 seam proof: it runs unchanged against the
 // mysql backend once that lands.
-export async function renderSessionJsonlFromTables(backend: StorageBackend, sessionId: string, full: boolean, extraCcr?: ReadonlyMap<string, string>): Promise<string> {
+export async function renderSessionJsonlFromTables(backend: StorageBackend, sessionId: string): Promise<string> {
     const row = await backend.getSessionRow(sessionId);
     if (!row) throw new Error(`session ${sessionId} is not in the unified index`);
     const lines: string[] = [];
@@ -316,10 +307,6 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
             tail: safeJson(row.tailJson),
         }),
     );
-    // CCR entries contain reference metadata; originals live in byHash.
-    // The on-disk store fills gaps in the indexed mirror.
-    const ccr = ccrOriginals(full ? await backend.getCcr(sessionId) : null);
-    if (extraCcr) for (const [k, v] of extraCcr) if (!ccr.has(k)) ccr.set(k, v);
     // #4664: historian read — include retired (tombstoned) rows so a rewound
     // session exports its full history; live rows omit `retiredAt`.
     for (const m of await backend.getMessages(sessionId, { includeRetired: true })) {
@@ -328,11 +315,6 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
             message = JSON.parse(m.content);
         } catch {
             message = { raw: m.content };
-        }
-        if (full && message !== null && typeof message === "object" && "text" in message && typeof message.text === "string") {
-            const ph = parseStoredPlaceholder(message.text);
-            const payload = ph ? ccr.get(ph.ref) : undefined;
-            if (payload !== undefined) message = { ...message, text: payload, dereferencedFrom: ph!.ref };
         }
         lines.push(JSON.stringify({ type: "message", seq: m.seq, rawId: m.msgId, ref: m.ref, refNum: m.refNum ?? undefined, role: m.role, kind: m.kind ?? undefined, ...(m.retiredAt != null ? { retiredAt: m.retiredAt } : {}), message }));
     }
@@ -367,8 +349,8 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
 }
 
 /** JSONL fallback when no unified index exists: the legacy record's tail
- * snapshot + block summaries + CCR store. The header says so. */
-export function renderSessionJsonlFromSession(s: Session, full: boolean, contentStore?: MessageContentStore | null): string {
+ * snapshot + block summaries + store. The header says so. */
+export function renderSessionJsonlFromSession(s: Session): string {
     const lines: string[] = [];
     lines.push(
         JSON.stringify({
@@ -384,20 +366,9 @@ export function renderSessionJsonlFromSession(s: Session, full: boolean, content
             stats: { requests: s.stats.requests, contextTokens: s.stats.contextTokens },
         }),
     );
-    const store = contentStore ?? s.contentStore;
-    const entryFor = (ref: string): string | undefined => {
-        const entry = store?.byRef[ref];
-        if (!entry) return undefined;
-        return store.byHash[entry.hash];
-    };
     for (const [i, m] of (s.lastMessages ?? []).entries()) {
         const message = m as unknown as Record<string, unknown>;
         let out = message;
-        if (full && typeof message.text === "string") {
-            const ph = parseStoredPlaceholder(message.text);
-            const payload = ph ? entryFor(ph.ref) : undefined;
-            if (payload !== undefined) out = { ...message, text: payload, dereferencedFrom: ph!.ref };
-        }
         lines.push(JSON.stringify({ type: "message", seq: i, rawId: m.id, role: m.role, message: out }));
     }
     for (const [i, b] of s.state.blocks.entries()) {
@@ -439,7 +410,7 @@ async function renderSelectedSessionJsonl(store: SessionStore, session: Session,
                 try {
                     await backend.init?.();
                     if (await backend.getSessionRow(session.id)) {
-                        return await renderSessionJsonlFromTables(backend, session.id, full);
+                        return await renderSessionJsonlFromTables(backend, session.id);
                     }
                 } finally {
                     await backend.close();
@@ -486,9 +457,7 @@ async function renderSelectedSessionJsonl(store: SessionStore, session: Session,
             const backend = await openBackend("sqlite", index);
             try {
                 if (await backend.getSessionRow(session.id)) {
-                    const disk = store.loadContentStore(session);
-                    const extra = disk ? ccrOriginals(disk) : undefined;
-                    return await renderSessionJsonlFromTables(backend, session.id, full, extra);
+                    return await renderSessionJsonlFromTables(backend, session.id);
                 }
             } finally {
                 await backend.close();
@@ -497,7 +466,7 @@ async function renderSelectedSessionJsonl(store: SessionStore, session: Session,
             process.stderr.write(`[export] unified index unreadable (${String(err)}) — falling back to the legacy-tail renderer\n`);
         }
     }
-    return renderSessionJsonlFromSession(session, full, store.loadContentStore(session));
+    return renderSessionJsonlFromSession(session);
 }
 
 export async function exportSession(selector: string | undefined, opts: ExportOptions = {}): Promise<string> {

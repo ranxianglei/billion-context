@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, formatTagTime, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CompressionBlock, type CompressibleRange, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
+import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, formatTagTime, hideConsumedCompressCalls, indexToRef, parseBoundary, viableRanges, type CompressionCore, type Config, type CompressionBlock, type CompressibleRange, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
 import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
@@ -9,7 +9,7 @@ import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.j
 import { recordCompressCommit } from "./context-analysis.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { ONE_CALL_HINT } from "acp-kernel";
-import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
+import { drainPendingRetrievals } from "./store.js";
 import { recordThreadTail } from "./server/thread-tracking.js";
 import { peekStoredTailView } from "./persist.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
@@ -54,9 +54,9 @@ export function executeAnthropicProxyTool(toolName: string, args: Record<string,
     }
     if (toolName === "decompress") {
         const ack = resolveDecompress(args, ctx);
-        // #1179 CCR v2: range-restore rides the same ephemeral channel as
-        // acp_retrieve; this non-stream rewrite has no separate re-request, so
-        // drained injections ride inline right after the ack. Whole-block
+        // #1207 range-restore: a ranged decompress queues the restored text as a
+        // pending injection; this non-stream rewrite has no separate re-request,
+        // so drained injections ride inline right after the ack. Whole-block
         // decompress queues nothing — behavior unchanged.
         const injections = drainPendingRetrievals(ctx.session);
         if (injections.length === 0) return ack;
@@ -74,14 +74,6 @@ export function executeAnthropicProxyTool(toolName: string, args: Record<string,
     const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
         return executeAbsorb(args, undefined, absorb, ctx);
-    }
-    if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
-        // Non-stream rewrite has no re-request to ride, so the full text rides
-        // inline right after the ack inside the converted text block.
-        const ack = executeRetrieve(args, ctx.session);
-        const injections = drainPendingRetrievals(ctx.session);
-        if (injections.length === 0) return ack;
-        return { ...ack, text: injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack.text) };
     }
     return toolFail(`[Unknown proxy tool: ${toolName}]`);
 }
@@ -769,10 +761,9 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
                 // markers must not endpoint ranges screened against the apply view.
                 messages: withoutTurnSeparators(ctx.messages),
                 state: ctx.session.state,
-                config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
+                config: ctx.config,
                 tokenCount: statusInputBaseline(ctx.session),
                 renderTags: "none",
-                contentStore: contentStoreOf(ctx.session),
                 // #3236: screen advertised tail ranges on the apply class.
                 applyView: ctx.compressMessages,
             });
@@ -834,9 +825,8 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
             core: ctx.core,
             messages: ctx.messages,
             state: ctx.session.state,
-            config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
+            config: ctx.config,
             tokenCount: statusInputBaseline(ctx.session),
-            contentStore: contentStoreOf(ctx.session),
             applyView: ctx.compressMessages,
             actionableSpans: remaining,
         });
@@ -1606,8 +1596,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // #2627 backstop: no committed state may carry outbound-only turn-
         // separator ids in coverage (a polluted child would otherwise re-
         // poison higher folds via effectiveMessageIds inheritance). Runs
-        // before CCR/storeCoveredOriginals and subagent mirroring below so
-        // they see clean coverage.
+        // before subagent mirroring below so it sees clean coverage.
         {
             const scrubbed = scrubTurnSeparatorIds(ctx.session.state.blocks);
             if (scrubbed > 0) ctx.log(`[acp-proxy: scrubbed ${scrubbed} turn-separator id(s) from fold coverage (#2627)]`);
@@ -1635,19 +1624,6 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                     one: sameView ? null : { text: one.text, count: one.count },
                     full: { text: full.text, count: full.count },
                 });
-            }
-        }
-        // #1179 CCR v2 (fold-time storing): the moment a fold lands, its covered
-        // originals are still in hand — persist them into the content store so
-        // retrieve-by-ref / range-restore work for FOLDED content, not just
-        // oversized tool results stored at arrival. First-write-wins keeps
-        // arrival-time entries authoritative; reasoning is skipped. Proxy mode
-        // only: plugin-mode agents own their folds, so bili never sees those
-        // originals.
-        if (ccrEnabled(ctx.session)) {
-            const newBlocks = res.state.blocks.filter((b) => !beforeIds.has(b.blockId));
-            if (newBlocks.length > 0) {
-                adoptContentStore(ctx.session, storeCoveredOriginals(contentStoreOf(ctx.session), ctx.compressMessages ?? ctx.messages, res.state, newBlocks.map((b) => b.blockId), defaultCountTokens));
             }
         }
         // #1995 review ④ host-side image-note footer + the #2748 net-benefit

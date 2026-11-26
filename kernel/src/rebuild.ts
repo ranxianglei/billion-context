@@ -1,7 +1,6 @@
 import { createCore } from "./compress.js";
 import { parseCompressArgs } from "./parse-compress-input.js";
 import { assignRefs, highestUsedIndex } from "./refs.js";
-import { RETRIEVED_ID_PREFIX } from "./ccr.js";
 import { defaultCountTokens } from "./tokenize.js";
 import type { CompressionState, CoreMessage } from "./types.js";
 
@@ -36,7 +35,6 @@ export function rebuildCompressionState(
   const refResult = assignRefs(messages, {
     existing: state.messageRefs,
     nextIndex: highestUsedIndex(state.messageRefs) + 1,
-    shouldSkip: (m) => m.id.startsWith(RETRIEVED_ID_PREFIX),
   });
   let working: CompressionState = { ...state, messageRefs: refResult.map };
 

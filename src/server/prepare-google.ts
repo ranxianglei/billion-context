@@ -24,11 +24,11 @@ import { getStore } from "../persist.js";
 import { recordConflict } from "../conflict-watch.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
-import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, blockOpsTools, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, blockOpsTools, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { buildBlockOpsSystemPrompt } from "acp-kernel";
-import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, imageRescaleToolArmed, retrieveToolName } from "../store.js";
+import { imageRescaleToolArmed } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
@@ -206,7 +206,7 @@ export async function prepareGoogle(
         // ever injected into messages), so unlike absorb it needs no loop-
         // config stripping — only tool availability matters.
         const rulesActive = rulesEnabled(config) && shouldInject;
-        const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        const loopConfig = { ...config, absorb: absorbActive ? absorbBlock : undefined };
         // #2432/#2658: same post-landing recovery as the openai/responses/
         // anthropic lanes — dsh desktop's native compaction can land without
         // transiting bili (direct-bypass / future gate mismatch); first notice =
@@ -254,11 +254,10 @@ export async function prepareGoogle(
         // nudge-carrying request rolls the cadence back to pre-turn (lane
         // mirror of the anthropic-lane fix).
         nudgeStampsBefore = nudgeStampsOf(session);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy });
         session.state = turn.state;
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
-        adoptContentStore(session, turn.contentStore);
         // In-request ledger flush: the transcript up to THIS user message is
         // durable before the model call (#3397 durability-before-render) and
         // the stage-0 envelope / M2 evidence read a current ledger.
@@ -408,7 +407,7 @@ export async function prepareGoogle(
             }
         }
         if (injectTools) {
-            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_GOOGLE] : []), ...(blockOpsActive ? blockOps.google : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
+            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_GOOGLE] : []), ...(blockOpsActive ? blockOps.google : [])], surface?.toolPrompts, externalSummaryEnabled(config));
         }
         if (sysNotes.length > 0) {
             rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"), model);
@@ -518,7 +517,7 @@ export function prepareGoogleCountTokens(
         const { msgs } = googleToCore(parsed);
         // Read-only preview: the store rides in so placeholder substitution is
         // counted, but nothing is adopted (state is discarded here too).
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only" });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
         const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[], { model }) };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);

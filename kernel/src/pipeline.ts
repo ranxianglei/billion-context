@@ -9,9 +9,6 @@ export interface PipelineContext {
    */
   readonly tokenCountSource?: "usage" | "estimate";
   readonly countTokens: (text: string) => number;
-  /** Per-session CCR content store for this turn (ccr-store node updates it
-   *  via effects.ccr; processTurn echoes it back in the result). */
-  readonly contentStore: import("./content-store.js").MessageContentStore;
 }
 
 export interface NodeEffects {

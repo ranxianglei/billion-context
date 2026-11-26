@@ -1,4 +1,4 @@
-import { defaultConfig, DEFAULT_CCR_CONFIG, type Config, type Prompts } from "acp-kernel";
+import { defaultConfig, type Config, type Prompts } from "acp-kernel";
 import { parse as parseJsonc, printParseErrorCode, type ParseError } from "jsonc-parser";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -592,32 +592,6 @@ export type CompressSettings = {
         /** Enable the block-lifecycle tools for this scope. Absent/false = off. */
         enabled?: boolean;
     };
-    /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
-     *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
-     *  ID-referenced at arrival by the kernel's ccr-store node (prune →
-     *  ccr-store → absorb): the wire keeps a deterministic `[acp-stored` …
-     *  placeholder and the original goes into the session's kernel
-     *  `MessageContentStore`, retrievable via the injected retrieve tool.
-     *  Lossless by default — a retrieve not made costs one cheap tool call,
-     *  whereas a distilled-away detail is gone for good. ID-reference wins
-     *  over absorb (kernel ordering). Off unless explicitly enabled at some
-     *  level. Merged sub-field-wise across the three levels like `absorb`. */
-    ccr?: {
-        /** Enable CCR for this scope. Absent/false = off (kernel semantics). */
-        enabled?: boolean;
-        /** Tool results smaller than this many tokens stay verbatim
-         *  (kernel default 4000). */
-        minToolTokens?: number;
-        /** Tool-name patterns (glob suffix allowed) never CCR-stored
-         *  (kernel default: none). */
-        excludeTools?: string[];
-        /** Rename the retrieve tool (default "acp_retrieve"). Must stay unique
-         *  against the client's own tool names. */
-        toolName?: string;
-        /** Max characters for the placeholder head/command preview (kernel
-         *  default 96). */
-        maxHeadChars?: number;
-    };
     /** [#1336] Planning-aware retrieval: when `planAware` is true,
      *  search_context re-ranks its candidate blocks against the session's
      *  current todo/task state (the latest protectedLatestTools snapshot in
@@ -627,7 +601,7 @@ export type CompressSettings = {
      *  are all reused unchanged. Disabled or no plan state in context ⇒
      *  byte-identical output to the plain lexical ranking. Off by default;
      *  measure before enabling in shared configs. Merged sub-field-wise across
-     *  the three levels like `absorb`/`ccr`. See src/decompress-shared.ts. */
+     *  the three levels like `absorb`. See src/decompress-shared.ts. */
     search?: {
         /** Enable plan-aware re-ranking + steering for search_context.
          *  Absent/false = off (byte-identical output). */
@@ -1187,7 +1161,7 @@ export type ProxyOptions = {
      *  request carries ACP artifacts / a `<bili-chain …/>` checkpoint in the
      *  BODY but no x-bili-hop header, record an advisory observation and/or apply
      *  first-processor-wins passthrough (#1086/#1421). OFF by default (#1683
-     *  follow-up): scanning the body can false-positive on CCR/file-introduced
+     *  follow-up): scanning the body can false-positive on file-introduced
      *  text and model-echoed tags, so by default ONLY the x-bili-hop header drives
      *  chain recognition. Re-enable via env BILI_CHAIN_CONTENT=1 or
      *  `chainContentDetection: true` in the config file (env wins). The
@@ -1644,62 +1618,6 @@ function warnAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: Compre
 }
 
 
-/** [#1345] A provider/model-level `ccr` field that diverges from what plugin
- *  sessions actually execute. In plugin mode the static manifest is the ONLY
- *  declaration of the retrieve surface, so the whole ccr block follows the base
- *  config; such overrides only take effect on proxy-mode sessions. */
-interface CcrOverrideDivergence {
-    /** Where the override lives, e.g. "provider https://api.x.com" or "provider https://api.x.com model gpt-4". */
-    level: string;
-    field: "enabled" | "toolName" | "minToolTokens" | "excludeTools" | "maxHeadChars";
-    value: unknown;
-    effective: unknown;
-}
-
-const CCR_FIELDS = ["enabled", "toolName", "minToolTokens", "excludeTools", "maxHeadChars"] as const;
-
-/** Pure: list every provider/model ccr field that would be ignored in plugin
- *  sessions (base config governs there). Empty when base ccr is not enabled —
- *  no plugin session can arm then, so nothing diverges (#1273 keeps
- *  route-scoped-only enablement proxy-mode-only by design). */
-export function findCcrPluginDivergences(routes: ProviderRoutes, globalCompress?: CompressSettings): CcrOverrideDivergence[] {
-    const base = globalCompress?.ccr;
-    if (base?.enabled !== true) return [];
-    const out: CcrOverrideDivergence[] = [];
-    const report = (level: string, ccr?: CompressSettings["ccr"]): void => {
-        if (!ccr) return;
-        for (const f of CCR_FIELDS) {
-            if (!(f in ccr)) continue;
-            const value = ccr[f];
-            const effective = base[f] ?? DEFAULT_CCR_CONFIG[f];
-            const differs = Array.isArray(value) && Array.isArray(effective)
-                ? JSON.stringify(value) !== JSON.stringify(effective)
-                : value !== effective;
-            if (differs) out.push({ level, field: f, value, effective });
-        }
-    };
-    for (const [url, route] of Object.entries(routes)) {
-        report(`provider ${url}`, route.compress?.ccr);
-        for (const [model, entry] of Object.entries(route.models ?? {})) {
-            report(`provider ${url} model ${model}`, entry.compress?.ccr);
-        }
-    }
-    return out;
-}
-
-function formatCcrValue(v: unknown): string {
-    return typeof v === "string" ? `"${v}"` : JSON.stringify(v);
-}
-
-/** Log every #1345 divergence once per config load (called from loadOptions;
- *  hot-reload funnels through it too — see handleConfigReload). */
-function warnCcrPluginDivergences(routes: ProviderRoutes, globalCompress?: CompressSettings): void {
-    for (const dv of findCcrPluginDivergences(routes, globalCompress)) {
-        loggerLog("warn", `[acp-config] ccr override ignored in plugin sessions: ${dv.level} ccr.${dv.field}=${formatCcrValue(dv.value)} — plugin sessions use ${formatCcrValue(dv.effective)} (base config governs the plugin manifest surface, #1345); proxy-mode sessions honor the override`);
-    }
-
-}
-
 // #2578: MCP-lane hosts (Kimi Code, Claude Code, zcode) expose bili tools
 // under mcp__bili__<name> — "bili" is the fixed shim server name (mcp.ts).
 // The kernel's hard protection matches bare names only (ALWAYS_PROTECTED_TOOLS
@@ -1764,7 +1682,6 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const routes = loadRoutes(env);
     const namedProviders = loadNamedProviders(env);
     warnAbsorbPluginDivergences(routes, fileConfig.compress?.absorb);
-    warnCcrPluginDivergences(routes, fileConfig.compress);
     const modelEndpoints = parseModelEndpointPatterns(fileConfig.modelEndpointPatterns);
     const passthrough = passthroughState(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
@@ -2174,7 +2091,7 @@ type FileConfig = {
     resumeInheritance?: boolean;
     /** Set `true` to enable body-content detection of the bili→bili chain
      *  awareness (#1086/#1421); OFF by default — by default only x-bili-hop drives
-     *  chain recognition, since body scanning can false-positive on CCR/file-
+     *  chain recognition, since body scanning can false-positive on file-
      *  introduced text and model-echoed tags (#1683). Env BILI_CHAIN_CONTENT=1
      *  wins over the file. */
     chainContentDetection?: boolean;
@@ -2350,7 +2267,7 @@ type FileConfig = {
         mysql?: { dsn?: string };
         /** Phase 3 (#2960): "off" stops writing the legacy JSON envelope AND
          *  the per-session CCR content-store sidecar while storage.unified is
-         *  "full" — the SQLite index (session row + ccr mirror) becomes the
+         *  "full" — the SQLite index (session row) becomes the
          *  only persistent copy (reads were already unified-first; boot
          *  enumerates the index union). Ignored with a one-time warning under
          *  shadow/legacy, where the JSON file remains the sole source of
@@ -2594,8 +2511,6 @@ type FileConfig = {
         repetition?: boolean | { enabled?: boolean; warn?: number; abort?: number; recovery?: boolean };
         textRunThreshold?: number;
     };
-    /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
-    ccrRetrievalTtlMs?: number;
     /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
     decompressTmpCap?: number;
     /** Image rescale egress pass on/off (#3400) — env BILI_IMAGE_RESCALE (default: on). */
@@ -2657,7 +2572,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "billing",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
-    "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
+    "fakeCompletion", "codexCompact", "decompressTmpCap",
     "autoModeForge", "imageRescale", "guardrails",
     // #3376:
     "cacheKeepalive",
@@ -2677,7 +2592,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "messageTimestamps", "rules", "injectTool", "injectNudge",
-    "acknowledgePromptsRisk", "absorb", "blockOps", "ccr", "search",
+    "acknowledgePromptsRisk", "absorb", "blockOps", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary", "externalSummary",
     // #3635: summary-length caps — previously accepted nowhere, silently dropped.
@@ -3604,33 +3519,6 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 cleaned.enabled = v;
             }
             if (ok) out.blockOps = cleaned;
-        }
-    }
-    if ("ccr" in obj && obj.ccr !== undefined) {
-        const c = obj.ccr;
-        if (!c || typeof c !== "object" || Array.isArray(c)) {
-            ok = false;
-        } else {
-            const co = c as Record<string, unknown>;
-            const cleaned: NonNullable<CompressSettings["ccr"]> = {};
-            for (const key of ["enabled", "minToolTokens", "excludeTools", "toolName", "maxHeadChars"] as const) {
-                if (!(key in co)) continue;
-                const v = co[key];
-                if (key === "enabled") {
-                    if (typeof v !== "boolean") { ok = false; continue; }
-                    cleaned.enabled = v;
-                } else if (key === "minToolTokens" || key === "maxHeadChars") {
-                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
-                    cleaned[key] = v;
-                } else if (key === "excludeTools") {
-                    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) { ok = false; continue; }
-                    cleaned.excludeTools = [...v] as string[];
-                } else {
-                    if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
-                    cleaned.toolName = v.trim();
-                }
-            }
-            if (ok) out.ccr = cleaned;
         }
     }
     if ("search" in obj && obj.search !== undefined) {

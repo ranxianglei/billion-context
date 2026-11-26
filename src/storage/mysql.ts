@@ -41,14 +41,12 @@ import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { sha256Hex, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
-import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
 import type {
     SessionRow,
     MessageRow,
     BlockRow,
     RefRow,
-    CcrEntryRow,
     CheckpointRow,
     SessionSummaryRow,
     WebSummaryRow,
@@ -817,10 +815,14 @@ export class MysqlBackend implements StorageBackend {
                    meta_json = VALUES(meta_json),
                    stats_json = VALUES(stats_json),
                    metadata_json = VALUES(metadata_json),
-                   kstate_json = VALUES(kstate_json),
-                   tail_json = VALUES(tail_json),
-                   ccr_json = VALUES(ccr_json),
-                   last_ingested_seq = VALUES(last_ingested_seq)`,
+                    kstate_json = VALUES(kstate_json),
+                    tail_json = VALUES(tail_json),
+                    -- #7755: CCR removed — the ingest no longer writes ccr_json (it is
+                    -- always NULL now). Never overwrite an existing value on update:
+                    -- pre-#7755 envelopes stay intact (owner ruling: existing data is
+                    -- neither migrated, read, nor destroyed). New sessions insert NULL.
+                    ccr_json = sessions.ccr_json,
+                    last_ingested_seq = VALUES(last_ingested_seq)`,
                 [
                     s.sessionId,
                     s.parentSessionId ?? null,
@@ -1115,57 +1117,10 @@ export class MysqlBackend implements StorageBackend {
                     );
                 }
             }
-            // #5744 (mirror of store.ts): diff instead of DELETE-all +
-            // re-INSERT-all; unchanged entries skip the CAS round-trips.
-            const incomingCcr = new Map<string, CcrEntryRow>();
-            for (const e of input.ccrEntries) incomingCcr.set(e.key, e);
-            const storedCcrRows = (await c.query(
-                "SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ?",
-                [s.sessionId],
-            )) as unknown as Row[][];
-            const changedCcrKeys: string[] = [];
-            const unchangedCcrKeys = new Set<string>();
-            const releasedOldCcrHashes: string[] = [];
-            for (const row of storedCcrRows[0]) {
-                const key = str(row.ccr_key);
-                const storedOrig = row.orig_hash === null || row.orig_hash === undefined ? null : str(row.orig_hash);
-                const inc = incomingCcr.get(key);
-                if (!inc) {
-                    changedCcrKeys.push(key);
-                    releasedOldCcrHashes.push(str(row.content_hash));
-                    if (storedOrig !== null) releasedOldCcrHashes.push(storedOrig);
-                    continue;
-                }
-                // #6785 step 6 (mirror of store.ts): orig joins the unchanged
-                // test — pre-step-6 rows re-put their original and self-heal.
-                const incOrig = inc.origContent === null ? null : inc.origHash;
-                if (num(row.ord) !== inc.ord || str(row.content_hash) !== inc.contentHash || storedOrig !== incOrig) {
-                    changedCcrKeys.push(key);
-                    releasedOldCcrHashes.push(str(row.content_hash));
-                    if (storedOrig !== null) releasedOldCcrHashes.push(storedOrig);
-                } else {
-                    unchangedCcrKeys.add(key);
-                }
-            }
-            if (changedCcrKeys.length > 0) {
-                for (let i = 0; i < changedCcrKeys.length; i += SEQ_SPAN_QUERY_BATCH) {
-                    const keys = changedCcrKeys.slice(i, i + SEQ_SPAN_QUERY_BATCH);
-                    await c.query(
-                        "DELETE FROM ccr_entries WHERE session_id = ? AND ccr_key IN (" + keys.map(() => "?").join(", ") + ")",
-                        [s.sessionId, ...keys],
-                    );
-                }
-            }
-            for (const hash of releasedOldCcrHashes) await this.releaseContent(c, hash);
-            for (const e of input.ccrEntries) {
-                if (unchangedCcrKeys.has(e.key)) continue;
-                const hash = await this.putContent(c, e.content, e.contentHash);
-                const orig = e.origContent === null ? null : await this.putContent(c, e.origContent, e.origHash ?? undefined);
-                await c.query(
-                    "INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash, orig_hash) VALUES (?, ?, ?, ?, ?)",
-                    [s.sessionId, e.ord, e.key, hash, orig],
-                );
-            }
+            // #7755: CCR removed — the ingest no longer touches ccr_entries.
+            // Pre-#7755 rows stay in the DB untouched (owner ruling: existing
+            // data is neither migrated, read, nor destroyed); new sessions
+            // simply have no ccr rows. (mirror of store.ts)
             return true;
         };
         return connection ? ingest(connection) : this.tx(ingest);
@@ -1747,7 +1702,6 @@ export class MysqlBackend implements StorageBackend {
                 getBlocks: (id, opts) => this.getBlocksOn(conn, id, opts),
                 getDeadRefs: (id) => this.getDeadRefsOn(conn, id),
                 getRefs: (id) => this.getRefsOn(conn, id),
-                getCcrEntries: (id) => this.getCcrEntriesOn(conn, id),
                 getOrphanViews: (id) => this.getOrphanViewsOn(conn, id),
                 getStateFields: (id) => this.getStateFieldsOn(conn, id),
             });
@@ -1949,51 +1903,6 @@ export class MysqlBackend implements StorageBackend {
             ref: str(r.ref),
             refNum: nullableNum(r.ref_num),
         }));
-    }
-
-    async getCcr(sessionId: string): Promise<MessageContentStore | null> {
-        const [rows] = (await this.pool.query(
-            "SELECT ccr_json FROM sessions WHERE session_id = ?",
-            [sessionId],
-        )) as unknown as Row[][];
-        if (rows.length === 0 || rows[0].ccr_json === null || rows[0].ccr_json === undefined) return null;
-        try {
-            const parsed = JSON.parse(str(rows[0].ccr_json)) as MessageContentStore;
-            if (parsed && typeof parsed === "object" && parsed.version === 1
-                && parsed.byHash && typeof parsed.byHash === "object"
-                && parsed.byRef && typeof parsed.byRef === "object") {
-                return parsed;
-            }
-        } catch {
-            /* corrupt mirror → null */
-        }
-        return null;
-    }
-
-    async getCcrEntries(sessionId: string): Promise<CcrEntryRow[]> {
-        return this.getCcrEntriesOn(this.pool, sessionId);
-    }
-
-    private async getCcrEntriesOn(conn: Pool | PoolConnection, sessionId: string): Promise<CcrEntryRow[]> {
-        const [rows] = (await conn.query(
-            "SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord",
-            [sessionId],
-        )) as unknown as Row[][];
-        const out: CcrEntryRow[] = [];
-        for (const r of rows) {
-            // #6785 step 6: null marks pre-step-6 rows (the full ccr_json
-            // envelope is the read authority for those stores).
-            const origHash = r.orig_hash === null || r.orig_hash === undefined ? null : str(r.orig_hash);
-            out.push({
-                ord: num(r.ord),
-                key: str(r.ccr_key),
-                content: (await this.getContent(conn, str(r.content_hash))) ?? "",
-                contentHash: str(r.content_hash),
-                origContent: origHash === null ? null : ((await this.getContent(conn, origHash)) ?? null),
-                origHash,
-            });
-        }
-        return out;
     }
 
     // --- archive / GC ------------------------------------------------------

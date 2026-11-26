@@ -151,34 +151,3 @@ test("pin: config enable of crush applies on the edit turn (config boundary), to
   const t3 = core.processTurn({ messages: m1, state: t2.state, config: onCfg, tokenCount: 99_000, renderTags: "none" });
   assert.equal(t3.messages.find((m) => m.id === "r1")!.text, t2.messages.find((m) => m.id === "r1")!.text, "pressure does not re-derive latched bytes");
 });
-
-test("pin: CCR disarm releases the latch — a disarmed session never re-projects a dangling placeholder", () => {
-  // #1273 governance, restated for the latch: placeholders are legal only
-  // while the retrieve channel they advertise exists. CCR rides the config
-  // digest, so arming/disarming mid-session is a user-action boundary that
-  // releases the latch and re-judges under the CURRENT config.
-  const big = "line of build output ".repeat(400);
-  const m1 = [
-    { id: "u1", role: "user", contentType: "text" as const, text: "run a big build" },
-    { id: "c1", role: "assistant", contentType: "tool-call" as const, toolName: "bash", toolCallId: "call1", text: JSON.stringify({ command: "npm run build" }) },
-    { id: "r1", role: "tool", contentType: "tool-result" as const, toolName: "bash", toolCallId: "call1", text: big },
-  ];
-  const armed = { ...cfg(), ccr: { enabled: true, toolName: "acp_retrieve", minToolTokens: 50, excludeTools: [], maxHeadChars: 96 } };
-  const core = createCore(cfg());
-  const t1 = core.processTurn({ messages: m1, state: createInitialState(), config: armed, tokenCount: 0, renderTags: "none" });
-  const t1r = t1.messages.find((m) => m.id === "r1")!.text!;
-  assert.ok(t1r.includes("[acp-stored"), "armed CCR substitutes at arrival");
-  assert.ok(!t1r.includes("line of build output"), "raw bytes leave the wire while armed");
-
-  // Same session, next turn, CCR still armed: the placeholder replays
-  // byte-stable (the latch holds; #1460 reprojection agrees with it).
-  const t2 = core.processTurn({ messages: m1, state: t1.state, config: armed, contentStore: t1.contentStore, tokenCount: 0, renderTags: "none" });
-  assert.equal(t2.messages.find((m) => m.id === "r1")!.text, t1r, "latched placeholder replays verbatim while armed");
-
-  // Disarm (route/base governance flip): the digest changes → the latch
-  // releases → the raw bytes return. No dangling placeholder, no silent loss.
-  const t3 = core.processTurn({ messages: m1, state: t2.state, config: cfg(), contentStore: t2.contentStore, tokenCount: 0, renderTags: "none" });
-  const t3r = t3.messages.find((m) => m.id === "r1")!.text!;
-  assert.ok(t3r.includes("line of build output"), "disarmed CCR returns the raw bytes");
-  assert.ok(!t3r.includes("[acp-stored"), "no dangling placeholder after disarm");
-});

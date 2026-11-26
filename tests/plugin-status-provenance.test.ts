@@ -5,7 +5,7 @@ import test from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultConfig, DEFAULT_CCR_CONFIG } from "acp-kernel";
+import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -223,27 +223,6 @@ test("HTTP a real usage report with outstanding fold credit is still an effectiv
     } finally { await h.close(); }
 });
 
-test("HTTP CCR range decompress accounts for queued restored content without changing the usage baseline", async () => {
-    const h = await harness();
-    try {
-        const session = resolveConversation("provenance").session!;
-        session.metadata.effectiveCcr = { ...DEFAULT_CCR_CONFIG, enabled: true };
-        await h.tool("compress", h.compressArgs);
-        const folded = await h.status();
-        const baseline = session.stats.lastUsageGradeTokens;
-        assert(typeof folded.contextTokens === "number");
-        const restored = await h.tool("decompress", { blockId: "b1", startId: "m00001", endId: "m00001" });
-        assert.match(restored.result, /restored 1 item/);
-        assert.equal(session.pendingRetrievals.length, 1);
-        const current = await h.status();
-        assert.equal(current.contextTokensSource, "estimate");
-        assert(typeof current.contextTokens === "number");
-        assert(current.contextTokens > folded.contextTokens);
-        assert.notEqual(current.contextGeneration, folded.contextGeneration);
-        assert.equal(session.stats.lastUsageGradeTokens, baseline);
-        assert.deepEqual([current.inputTokens, current.cachedTokens], [folded.inputTokens, folded.cachedTokens]);
-    } finally { await h.close(); }
-});
 test("HTTP status sessionRevision is cache-stable while unchanged and moves after a mutation (#2017 item E)", async () => {
     const h = await harness();
     try {

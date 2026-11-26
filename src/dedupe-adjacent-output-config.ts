@@ -5,7 +5,7 @@
  *  insertThinkingLevelMessages: one before every leveled assistant message +
  *  one trailing) are healthy on their own — every directive is separated by
  *  its assistant message. But bili's fold reconstruction can remove the
- *  message BETWEEN two directives (reasoning hygiene, CCR excerpting, range
+ *  message BETWEEN two directives (reasoning hygiene, range
  *  trimming, empty-message pruning), leaving them adjacent and the session
  *  deterministically 400s on every retry.
  *

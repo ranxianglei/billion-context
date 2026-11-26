@@ -170,7 +170,7 @@ function unifiedRows(store: UnifiedStore, id: string): ReturnType<typeof loadLeg
         refs: store.getRefs(id),
     };
     assert.ok(rows.session, `session row missing: ${id}`);
-    return loadLegacyView(rows, undefined, store.getStateFields(id), store.getOrphanViews(id) ?? {});
+    return loadLegacyView(rows, store.getStateFields(id), store.getOrphanViews(id) ?? {});
 }
 
 // ---------------------------------------------------------------------------
@@ -488,7 +488,6 @@ test("storage engine: CAS refcounts conserve shared content across deleteSession
                 lastMessages: [],
                 lastMessagesFolded: false,
                 pluginSnapshot: undefined,
-                contentStore: undefined,
             });
             store.ingestSession(planIngest(mkSession("sess-one")));
             store.ingestSession(planIngest(mkSession("sess-two")));

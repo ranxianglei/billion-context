@@ -14,7 +14,6 @@ import type {
     MessageRow,
     BlockRow,
     RefRow,
-    CcrEntryRow,
     SessionSummaryRow,
     StorageReadView,
 } from "../src/storage/backend.ts";
@@ -52,7 +51,6 @@ interface StubRows {
     blocks: BlockRow[];
     deadRefs: IngestSessionInput["deadRefs"];
     refs: RefRow[];
-    ccrEntries: CcrEntryRow[];
 }
 
 /** Map-shaped stand-in for MysqlBackend: stores exactly what ingestSession
@@ -69,7 +67,6 @@ class StubMysqlBackend implements StorageBackend {
             blocks: input.blocks,
             deadRefs: input.deadRefs,
             refs: input.refs,
-            ccrEntries: input.ccrEntries,
         });
         return Promise.resolve(true);
     }
@@ -110,7 +107,6 @@ class StubMysqlBackend implements StorageBackend {
             getBlocks: async (id, _opts) => (row(id)?.blocks ?? []).map((b) => ({ ...b, summaryHash: sha256(b.summary), oneHash: b.one === null ? null : sha256(b.one) })),
             getDeadRefs: async (id) => row(id)?.deadRefs ?? [],
             getRefs: async (id) => row(id)?.refs ?? [],
-            getCcrEntries: async () => [],
             getOrphanViews: async () => null,
             getStateFields: async () => null,
         };
@@ -148,12 +144,6 @@ class StubMysqlBackend implements StorageBackend {
     }
     getRefs(sessionId: string): Promise<RefRow[]> {
         return Promise.resolve(this.rows.get(sessionId)?.refs ?? []);
-    }
-    getCcr(): Promise<null> {
-        return Promise.resolve(null);
-    }
-    getCcrEntries(sessionId: string): Promise<CcrEntryRow[]> {
-        return Promise.resolve(this.rows.get(sessionId)?.ccrEntries ?? []);
     }
     getOrphanViews(sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null> {
         return Promise.resolve(null);

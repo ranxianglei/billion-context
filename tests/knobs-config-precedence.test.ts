@@ -101,7 +101,6 @@ test("defaults: no env, no file", () => {
     assert.equal(gc.intervalMs, 3_600_000);
     assert.equal(knobs.updateRegistryBase(), undefined);
     assert.equal(knobs.updateCheckIntervalMs(), 180_000);
-    assert.equal(knobs.ccrRetrievalTtlMs(), 10 * 60 * 1000);
     assert.equal(knobs.publicSnapshotCapBytes(), 104_857_600);
     assert.equal(knobs.codexCompactMode(), "intercept");
     assert.equal(knobs.decompressTmpCap(), 50);
@@ -140,7 +139,6 @@ test("file tier: every migrated block resolves from the config file", () => {
         fakeCompletion: { retries: 2, bufCapBytes: 1048576 },
         plugin: { snapshotCapBytes: 999 },
         codexCompact: "pass",
-        ccrRetrievalTtlMs: 300000,
         decompressTmpCap: 7,
         mitm: { handshakeTimeoutMs: 1234 },
         compat: { noCacheControl: true, keepResponseId: true },
@@ -174,7 +172,6 @@ test("file tier: every migrated block resolves from the config file", () => {
     assert.equal(gc.intervalMs, 60000);
     assert.equal(knobs.updateRegistryBase(), "https://registry.example.invalid");
     assert.equal(knobs.updateCheckIntervalMs(), 2500);
-    assert.equal(knobs.ccrRetrievalTtlMs(), 300000);
     assert.equal(knobs.codexCompactMode(), "pass");
     assert.equal(knobs.decompressTmpCap(), 7);
     assert.equal(knobs.bodyDumpEnabled(), true);
@@ -263,11 +260,10 @@ test("post-response linger: strict parseInt tier — set-but-empty/garbage env n
 });
 
 test("garbage file values fall back to defaults, never throw", () => {
-    setConfig({ network: { upstreamTimeoutMs: "fast", replayRetryMax: -3 }, persist: { tailTokens: null }, ccrRetrievalTtlMs: "whenever", plugin: { snapshotCapBytes: "huge" } });
+    setConfig({ network: { upstreamTimeoutMs: "fast", replayRetryMax: -3 }, persist: { tailTokens: null }, plugin: { snapshotCapBytes: "huge" } });
     assert.equal(knobs.upstreamTimeoutMs(), UPSTREAM_TIMEOUT_MS);
     assert.equal(knobs.replayMaxAttempts(), REPLAY_MAX_ATTEMPTS);
     assert.equal(knobs.persistTailTokens(), 16384);
-    assert.equal(knobs.ccrRetrievalTtlMs(), 10 * 60 * 1000);
 });
 
 test("historical parsing quirks survive migration", () => {

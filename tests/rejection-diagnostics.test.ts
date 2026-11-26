@@ -126,7 +126,7 @@ test("the suffix never echoes the outer narrative or the raw payload", () => {
     assert.ok(!suffix.includes("{"), "no JSON structure may leak into the log");
 });
 
-test("reads the terminal provider cause from CCR's nested error envelope", () => {
+test("reads the terminal provider cause from the nested error envelope", () => {
     const body = JSON.stringify({
         error: {
             message: "All target providers failed.",

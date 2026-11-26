@@ -18,7 +18,6 @@ import { dshLedgerFloorTokens } from "./server/budget.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { pckAblations } from "./pck-probe.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
-import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { describeUncoveredRuns, formatProtectedMass, shortTokenCount, uncoveredAudit } from "./uncovered.js";
 import { withoutTurnSeparators } from "./turn-separator.js";
@@ -83,10 +82,9 @@ export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision
         // their whole units vanish from the offer silently.
         messages: withoutTurnSeparators(ctx.messages),
         state: ctx.session.state,
-        config: ccrLoopConfig(ctx.session, ctx.config),
+        config: ctx.config,
         tokenCount: statusInputBaseline(ctx.session),
         renderTags: "none",
-        contentStore: contentStoreOf(ctx.session),
         applyView: ctx.compressMessages,
     });
     if (!turn.nudge) return undefined;
@@ -190,7 +188,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         limit,
         // #3236: screen uncompressed rows through the same projection apply
         // executes — on the exact array class this lane applies on.
-        config: ccrLoopConfig(ctx.session, ctx.config),
+        config: ctx.config,
         originalMessages: ctx.compressMessages ?? ctx.messages,
         meta: {
             pack: ctx.session.meta.activePack ?? "default",
@@ -203,9 +201,8 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
                 core: ctx.core,
                 messages: ctx.messages,
                 state: ctx.session.state,
-                config: ccrLoopConfig(ctx.session, ctx.config),
+                config: ctx.config,
                 tokenCount: statusInputBaseline(ctx.session),
-                contentStore: contentStoreOf(ctx.session),
                 applyView: ctx.compressMessages,
             });
             const line = formatProtectedMass(audit.mass);
@@ -350,9 +347,8 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             core: ctx.core,
             messages: ctx.messages,
             state: ctx.session.state,
-            config: ccrLoopConfig(ctx.session, ctx.config),
+            config: ctx.config,
             tokenCount: billed,
-            contentStore: contentStoreOf(ctx.session),
             applyView: ctx.compressMessages,
             actionableSpans: offeredSpans ?? [],
             normalRanges: offeredSpans,
@@ -458,45 +454,11 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push("");
         extra.push(`OUTPUT BUDGET CLAMP —${lastClamp !== undefined ? ` last: max_tokens ${lastClamp.raw} -> ${lastClamp.capped} (window ${lastClamp.window}, input~${Math.round(lastClamp.planningInput)}) @ ${new Date(lastClamp.at).toISOString()}` : ""} · planning floor ${ledgerFloor} tok from the refused dsh compaction replay (#2490, sticky for the session lifetime). Only compression can recover the input; this clamp guarantees native-window fit.`);
     }
-    // #1097: the processTurn above already resolved the envelope when armed
-    // (contentStoreOf is idempotent); when disarmed skip the disk read.
-    const ccrArmed = ccrEnabled(ctx.session);
-    const storeCount = ccrArmed ? Object.keys(contentStoreOf(ctx.session).byRef).length : 0;
-    if (ccrArmed && (storeCount > 0 || (ctx.session.stats.retrieveCalls ?? 0) > 0)) {
-        const st = ctx.session.stats;
-        const calls = st.retrieveCalls ?? 0;
-        const hits = st.retrieveHits ?? 0;
-        const rate = calls > 0 ? Math.round((hits / calls) * 100) : 0;
-        extra.push("");
-        const rangeRestores = st.rangeRestores ?? 0;
-        const delivered = st.retrieveDelivered ?? 0;
-        const dropped = st.retrieveDropped ?? 0;
-        extra.push(`STORE (CCR) — ${storeCount} item(s) · ${fmtBytes(st.storedBytes ?? 0)} stored · ${fmtBytes(st.storeBytesSaved ?? 0)} saved on wire · retrieved ${hits}/${calls}${calls > 0 ? ` (${rate}%)` : ""}${delivered > 0 ? ` · delivered ${delivered}` : ""}${dropped > 0 ? ` · dropped ${dropped}` : ""}${rangeRestores > 0 ? ` · range-restored ${rangeRestores}` : ""}`);
-    }
-    // #1336: retrieve-quality proxy — whole-block restores where a cheaper
-    // precise path existed at restore time. Independent of CCR arming (the
-    // whole-block restore path works with or without the content store).
+    // #1336: whole-block restore count (advisory ledger).
     const wbRestores = ctx.session.stats.wholeBlockRestores ?? 0;
     if (wbRestores > 0) {
-        const precise = ctx.session.stats.wholeBlockRestoresPreciseAvailable ?? 0;
         extra.push("");
-        extra.push(`RETRIEVAL QUALITY — whole-block restores: ${wbRestores} total${precise > 0 ? `, ${precise} had a cheaper precise path available (${Math.round((precise / wbRestores) * 100)}%)` : ""}`);
-    }
-    // #1179 CCR v2: block → covered message-ref linkage, so the model can
-    // target acp_retrieve / range decompress at individual messages. Gated on
-    // arming (#1207 review): with CCR off those refs are unretrievable, so
-    // listing them would advertise a capability that doesn't exist.
-    if (ccrArmed) {
-        const spans: string[] = [];
-        for (const b of ctx.session.state.blocks) {
-            if (!b.active) continue;
-            const s = coveredRefSpan(ctx.session.state, b);
-            if (s) spans.push(`${b.blockId}=${s.text}${isExternalSummaryBlock(b) ? " ⚡ext" : ""}`);
-        }
-        if (spans.length > 0) {
-            extra.push("");
-            extra.push(`BLOCK SPANS — ${spans.slice(0, 12).join(" · ")}${spans.length > 12 ? ` (+${spans.length - 12} more)` : ""}`);
-        }
+        extra.push(`DECOMPRESS — whole-block restores: ${wbRestores} total`);
     }
     // #2671: effective storage mode right in the tool output, so "which mode
     // am I on" never requires shell access to the lane log.

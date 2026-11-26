@@ -33,7 +33,7 @@ import {
 
 test("ACP tool sets classify every ACP tool by mutation semantics", () => {
   // #5765 block ops are opt-in (config.blockOps.enabled, default off) — like
-  // absorb/acp_retrieve they stay OUT of the always-on name set so the default
+  // absorb they stay OUT of the always-on name set so the default
   // manifest/surface never advertises them.
   assert.deepEqual([...ACP_TOOL_NAMES].sort(), [
     "acp_cache",

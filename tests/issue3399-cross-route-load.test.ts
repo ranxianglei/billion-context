@@ -252,28 +252,6 @@ test("#3399 cross-protocol isolation: the same id under another protocol dir is 
     }
 });
 
-test("#3399 CCR sidecar follows the restored source file (originals survive the route switch)", async () => {
-    const root = mkdtempSync(path.join(tmpdir(), "bili-3399-ccr-"));
-    const dir = path.join(root, "sessions");
-    let store: SessionStore | null = null;
-    try {
-        await seedOnce(dir, { origin: ORIGIN_A, requests: 3697, blockText: "intact A-era folded originals" });
-        const relA = relPathFor(ID, PROTO, ORIGIN_A);
-        const sidecar = { version: 1, byHash: { h1: { text: "original bytes", count: 1 } }, byRef: { m00001: "h1" } };
-        writeFileSync(path.join(dir, relA.slice(0, -".json".length) + ".content-store.json"), JSON.stringify(sidecar));
-
-        store = bootStore(dir);
-        await store.boot(BOOT_LIMITS);
-        const reloaded = store.loadSync(ID, { protocol: PROTO, upstreamOrigin: ORIGIN_B });
-        assert.ok(reloaded);
-        const cs = store.loadContentStore(reloaded);
-        assert.ok(cs, "content store must resolve through the restored source file");
-        assert.deepEqual(cs?.byRef, { m00001: "h1" });
-    } finally {
-        teardown(store, root);
-    }
-});
-
 test("#3399 legacy storage mode: same recovery on the explicit legacy lane", async () => {
     const prevUnified = process.env.BILI_STORAGE_UNIFIED;
     const prevCfg = process.env.BILI_CONFIG_FILE;
@@ -299,66 +277,3 @@ test("#3399 legacy storage mode: same recovery on the explicit legacy lane", asy
     }
 });
 
-// #3765 review (@darkness-A): the sidecar must follow the WINNING source, not
-// the request's current route — adoption rewrites meta.upstreamOrigin before
-// the lazy CCR load, so a degraded current-route twin with a valid-but-
-// incomplete CCR must not shadow the richer ledger's originals.
-test("#3765 CCR: degraded current-route twin's sidecar must not shadow the winning ledger's originals", async () => {
-    const root = mkdtempSync(path.join(tmpdir(), "bili-3765-ccr-shadow-"));
-    const dir = path.join(root, "sessions");
-    let store: SessionStore | null = null;
-    try {
-        await seedOnce(dir, { origin: ORIGIN_A, requests: 3697, blockText: "intact A-era folded originals" });
-        await seedOnce(dir, { origin: ORIGIN_B, requests: 2, blockText: "fresh B-era rebuild" });
-        const ccrA = { version: 1, byHash: { hA: { text: "A original bytes", count: 2 } }, byRef: { m00001: "hA", m00002: "hA" } };
-        const ccrB = { version: 1, byHash: { hB: { text: "B partial bytes", count: 1 } }, byRef: { m00001: "hB" } };
-        const relA = relPathFor(ID, PROTO, ORIGIN_A);
-        const relB = relPathFor(ID, PROTO, ORIGIN_B);
-        writeFileSync(path.join(dir, relA.slice(0, -".json".length) + ".content-store.json"), JSON.stringify(ccrA));
-        writeFileSync(path.join(dir, relB.slice(0, -".json".length) + ".content-store.json"), JSON.stringify(ccrB));
-
-        store = bootStore(dir);
-        await store.boot(BOOT_LIMITS);
-        const reloaded = store.loadSync(ID, { protocol: PROTO, upstreamOrigin: ORIGIN_B });
-        assert.ok(reloaded, "cross-route cold load must recover the richer ledger");
-        assert.equal(reloaded.stats.requests, 3697, "richer old-route ledger must win");
-        const cs = store.loadContentStore(reloaded);
-        assert.ok(cs, "content store must resolve");
-        assert.deepEqual(cs?.byRef, ccrA.byRef, "originals must come from the winning source, not the degraded current-route twin");
-        assert.notDeepEqual(cs?.byRef, ccrB.byRef, "must not be shadowed by the new-route sidecar");
-    } finally {
-        teardown(store, root);
-    }
-});
-
-// #3765 review (@darkness-A): a .fb.json fallback source keeps its canonical
-// <base>.content-store.json name — deriving *.fb.content-store.json would miss.
-test("#3765 CCR: a .fb.json fallback source resolves its canonical content-store, not *.fb.content-store.json", async () => {
-    const root = mkdtempSync(path.join(tmpdir(), "bili-3765-ccr-fb-"));
-    const dir = path.join(root, "sessions");
-    let store: SessionStore | null = null;
-    try {
-        await seedOnce(dir, { origin: ORIGIN_A, requests: 3697, blockText: "intact A-era folded originals" });
-        await seedOnce(dir, { origin: ORIGIN_B, requests: 2, blockText: "fresh B-era rebuild" });
-        // Demote A's ledger to its .fb.json fallback name; its CCR stays canonical.
-        const relA = relPathFor(ID, PROTO, ORIGIN_A);
-        const absA = path.join(dir, relA);
-        renameSync(absA, absA.slice(0, -".json".length) + ".fb.json");
-        const ccrA = { version: 1, byHash: { hA: { text: "A original bytes", count: 2 } }, byRef: { m00001: "hA", m00002: "hA" } };
-        const ccrB = { version: 1, byHash: { hB: { text: "B partial bytes", count: 1 } }, byRef: { m00001: "hB" } };
-        writeFileSync(path.join(dir, relA.slice(0, -".json".length) + ".content-store.json"), JSON.stringify(ccrA));
-        const relB = relPathFor(ID, PROTO, ORIGIN_B);
-        writeFileSync(path.join(dir, relB.slice(0, -".json".length) + ".content-store.json"), JSON.stringify(ccrB));
-
-        store = bootStore(dir);
-        await store.boot(BOOT_LIMITS);
-        const reloaded = store.loadSync(ID, { protocol: PROTO, upstreamOrigin: ORIGIN_B });
-        assert.ok(reloaded, "fallback-name ledger must still recover");
-        assert.equal(reloaded.stats.requests, 3697);
-        const cs = store.loadContentStore(reloaded);
-        assert.ok(cs, "content store must resolve through the .fb.json source's canonical sidecar");
-        assert.deepEqual(cs?.byRef, ccrA.byRef, "must read the canonical <base>.content-store.json, not a *.fb.content-store.json");
-    } finally {
-        teardown(store, root);
-    }
-});

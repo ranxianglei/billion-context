@@ -1,4 +1,4 @@
-import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
+import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, type CompressionState, type Config, type CoreMessage, type NudgeDecision } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore, effectiveFileStorageMode } from "./persist.js";
@@ -216,72 +216,6 @@ export function lazyMetadata(
     return proxy;
 }
 
-/** #4788 phase 2: proxies for CCR content stores currently folded away. */
-const droppedContentStoreProxies = new WeakSet<object>();
-
-/** True when the record is a lazy content-store proxy currently folded away. */
-export function isDroppedContentStore(value: unknown): boolean {
-    return typeof value === "object" && value !== null && droppedContentStoreProxies.has(value);
-}
-
-/** #4788 phase 2 (owner decision 2026-10-31, discussion #3916-E): a session's
- *  MessageContentStore that folded away after its save landed and re-materializes
- *  on first touch — the exact shape contentStoreOf restores on a cold load.
- *  Transparent Proxy over the plain-store shape ({version, byHash, byRef}): no
- *  call-site changes; saveContentStore / ingest ccr_json+ccr_entries / fork /
- *  publicSnapshotStoredRefs all walk it like any store and pay ONE narrow read
- *  per burst. An unrecoverable drop throws on access instead of ever letting a
- *  save write an EMPTY record where a non-empty one was proven durable (#2674
- *  payload-first discipline, applied to discharge). */
-export function lazyContentStore(
-    sessionId: string,
-    loader: (id: string) => MessageContentStore | null,
-): MessageContentStore {
-    const target: Record<string, unknown> = {};
-    let dropped = true;
-    const ensure = (): void => {
-        if (!dropped) return;
-        const record = loader(sessionId);
-        if (!record || typeof record !== "object" || !("byRef" in record) || Object.keys(record.byRef as Record<string, unknown>).length === 0) {
-            throw new Error(`[persist] resident content store for ${sessionId} could not be re-materialized from the store — refusing the thinned view`);
-        }
-        Object.assign(target, record);
-        dropped = false;
-        droppedContentStoreProxies.delete(proxy);
-    };
-    const proxy = new Proxy(target, {
-        get(t, prop, receiver) {
-            ensure();
-            return Reflect.get(t, prop, receiver);
-        },
-        has(t, prop) {
-            ensure();
-            return Reflect.has(t, prop);
-        },
-        ownKeys(t) {
-            ensure();
-            return Reflect.ownKeys(t);
-        },
-        getOwnPropertyDescriptor(t, prop) {
-            ensure();
-            return Reflect.getOwnPropertyDescriptor(t, prop);
-        },
-        set(t, prop, value, receiver) {
-            ensure();
-            return Reflect.set(t, prop, value, receiver);
-        },
-        deleteProperty(t, prop) {
-            ensure();
-            return Reflect.deleteProperty(t, prop);
-        },
-        defineProperty(t, prop, desc) {
-            ensure();
-            return Reflect.defineProperty(t, prop, desc);
-        },
-    });
-    droppedContentStoreProxies.add(proxy);
-    return proxy as unknown as MessageContentStore;
-}
 
 /** One successful compress, recorded for #189 observability: correlating a
  *  downstream transient upstream rejection (e.g. GLM 3007 captcha) with the
@@ -317,8 +251,6 @@ export type PendingRetrieval = {
     chars: number;
     queuedAt: number;
     injection: CoreMessage;
-    /** CCR acp_retrieve riders carry the delivery ledger/TTL/counters; other ephemeral carriers (e.g. range restore #1207) only ride along and are removed at the delivery outcome. */
-    ccr?: boolean;
 };
 
 export type Session = {
@@ -667,30 +599,15 @@ export type Session = {
          *  request, so persisting it would be stale by definition. */
         lastCalibrationPolicy?: { disabled?: boolean; max?: number };
         lastCalibrationPolicyOrigin?: string;
-        /** #1097 content store: total acp_retrieve calls issued this session. */
-        retrieveCalls: number;
-        /** #1097: acp_retrieve calls that resolved to stored content. */
-        retrieveHits: number;
-        /** #1097: acp_retrieve calls that missed (unknown/hallucinated ref). */
-        retrieveMisses: number;
-        /** #1343: acked retrieves whose full text was DROPPED undelivered
-         *  (post-drain upstream failure, disarm, TTL expiry, proxy restart). */
-        retrieveDropped?: number;
-        /** #1343: acked retrieves whose full text was confirmed delivered upstream. */
-        retrieveDelivered?: number;
-        /** #1097: cumulative bytes of unique originals held in the store. */
-        storedBytes: number;
-        /** #1097: cumulative wire bytes saved by placeholder substitution. */
-        storeBytesSaved: number;
-        /** #1179 CCR v2: range-level decompress restores served (ephemeral channel). */
+        /** Range-level decompress restores served (ephemeral channel). */
         rangeRestores: number;
         /** #1336: whole-block decompress restores served. Optional — absent in
          *  pre-#1336 records. */
         wholeBlockRestores?: number;
         /** #1336: of those, how many had a cheaper precise path available at
-         *  restore time (the block carried covered refs AND CCR was armed, so
-         *  a range-restore / targeted retrieve would have sufficed). The
-         *  ratio is the retrieve-quality proxy for plan-aware retrieval. */
+         *  restore time (the block carried covered refs and a range-restore /
+         *  targeted decompress would have sufficed). The ratio measures the
+         *  precision of whole-block restores. */
         wholeBlockRestoresPreciseAvailable?: number;
     };
     /** Free-form escape hatch for future fields not yet promoted to typed
@@ -758,20 +675,6 @@ export type Session = {
      *  the current revisionEpoch — forkSnapshot() is a pure function of the
      *  session content, so same epoch ⇒ same hash. */
     pluginRevisionCache?: { epoch: number; revision: string };
-    /** Kernel CCR envelope (#1097): originals of ID-referenced tool results,
-    *  owned and mutated only by kernel processTurn (ccr-store node) via
-    *  adoptContentStore. Lazily loaded from the session's content-store.json;
-    *  NOT part of session.state (separate file, separate lifecycle — reset on
-    *  full-state rebase). In-memory only here; buildRecord omits it. */
-    contentStore?: MessageContentStore;
-    /** In-memory only (NOT persisted): content-store.json is rewritten only
-     *  while this is set (adopt grew entries / reset cleared the store). */
-    contentStoreDirty?: boolean;
-    /** #1336 in-memory only (NOT persisted — buildRecord omits it): acp_retrieve
-     *  hit count per ref, used by plan-aware search steering to flag refs the
-     *  model keeps re-fetching. Bounded by trimRetrieveCounts; lost on restart
-     *  (advisory signal only). */
-    retrieveCountsByRef?: Map<string, number>;
     /** #6522 in-memory only (NOT persisted): the "Uncovered history remains"
      *  receipt note has already fired in the current nudge-injection cycle.
      *  The note fires once per cycle — repeating it after every successful
@@ -785,11 +688,7 @@ export type Session = {
      *  never fires and the latch is inert. */
     uncoveredReceiptNoted?: boolean;
     /** In-memory only (NOT persisted): request-only injections riding the
-     *  nudge channel. Since the GHSA jc6g v2 rework, acp_retrieve delivers its
-     *  full text in the tool result itself — this carrier now only serves
-     *  non-CCR riders (#1207 range restore, ccr:false). Legacy sessions from
-     *  before the rework may still carry ccr:true entries; the reconcile/
-     *  commit/drop machinery below handles them (they are never re-created). */
+     *  nudge channel (#1207 range restore). Ephemeral — never persisted. */
     pendingRetrievals: PendingRetrieval[];
     /** #1995 in-memory only (NOT persisted — buildRecord omits it): ref → images
      *  index built per request from the INBOUND body (default media folding
@@ -821,12 +720,6 @@ export type Session = {
      *  activity; fallback=latest skips restored sessions rather than guessing
      *  among a readdir-order tie. Cleared on the first real request touch. */
     restored?: boolean;
-    /** In-memory only (NOT persisted): one-shot set by persist's load (#1343).
-     *  getSession() clears `restored` on the first request touch, but
-     *  reconcileReloadedRetrievals runs LATER in that same request — so it
-     *  keys off this flag, which survives until the reconcile (or a full
-     *  reset) has actually run. */
-    ccrReconcilePending?: boolean;
     /** In-memory only (NOT persisted — buildRecord omits it): timestamp of the
      *  last full re-materialization from disk in THIS process (#5782), stamped
      *  by adoptOrCreate's memory-miss reload branch — the path that pays the
@@ -1392,7 +1285,6 @@ export interface ResidentFieldBreakdown {
     lastMessages: number;
     pluginSnapshot: number;
     blockContents: number;
-    contentStore: number;
     state: number;
     metadata: number;
     other: number;
@@ -1404,11 +1296,10 @@ export function residentBreakdown(session: Session): ResidentFieldBreakdown {
     const lastMessages = session.lastMessages ? deepSizeOf(session.lastMessages) : 0;
     const pluginSnapshot = session.pluginSnapshot ? deepSizeOf(session.pluginSnapshot) : 0;
     const blockContents = deepSizeOf(session.blockContents);
-    const contentStore = session.contentStore ? deepSizeOf(session.contentStore) : 0;
     const state = deepSizeOf(session.state);
     const metadata = deepSizeOf(session.metadata);
-    const other = Math.max(0, total - lastMessages - pluginSnapshot - blockContents - contentStore - state - metadata);
-    return { lastMessages, pluginSnapshot, blockContents, contentStore, state, metadata, other, total };
+    const other = Math.max(0, total - lastMessages - pluginSnapshot - blockContents - state - metadata);
+    return { lastMessages, pluginSnapshot, blockContents, state, metadata, other, total };
 }
 
 /** Whole-pool memory report for the /__bili/memory diagnostics endpoint:
@@ -1422,14 +1313,13 @@ export interface MemoryReport {
 
 export function memoryReport(): MemoryReport {
     const rows: MemoryReport["sessions"] = [];
-    const sums: ResidentFieldBreakdown = { lastMessages: 0, pluginSnapshot: 0, blockContents: 0, contentStore: 0, state: 0, metadata: 0, other: 0, total: 0 };
+    const sums: ResidentFieldBreakdown = { lastMessages: 0, pluginSnapshot: 0, blockContents: 0, state: 0, metadata: 0, other: 0, total: 0 };
     for (const session of sessions.values()) {
         const fields = residentBreakdown(session);
         sums.lastMessages += fields.lastMessages;
         sums.pluginSnapshot += fields.pluginSnapshot;
         sums.blockContents += fields.blockContents;
         sums.metadata += fields.metadata;
-        sums.contentStore += fields.contentStore;
         sums.state += fields.state;
         sums.other += fields.other;
         sums.total += fields.total;
@@ -1527,7 +1417,7 @@ export async function initSessions(): Promise<void> {
 /** Zero-valued stats for a fresh session (#1991) — exported so test fixtures
  *  can build sessions without retyping every field. */
 export function zeroStats(): Session["stats"] {
-    return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, retrieveDropped: 0, retrieveDelivered: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 };
+    return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, rangeRestores: 0 };
 }
 
 type SessionMeta = { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string };
@@ -1853,20 +1743,9 @@ export function cacheBlockContent(session: Session, blockId: string, content: Bl
 export function resetSessionCompression(session: Session): void {
     session.state = createInitialState();
     session.blockContents.clear();
-    // The kernel contract ties the store to the state ('host resets the store
-    // with the state'): a full rebase restarts refs at m00001, so old entries
-    // would misattribute under reused numbers. contentStoreDirty + markDirty
-    // deletes the on-disk envelope on the next save.
-    session.contentStore = undefined;
-    session.contentStoreDirty = true;
-    // #1343: rebase wipes both the queued injections and their acks (context
-    // rebuilt), so clear the durable ledger too — otherwise a later
-    // reconcileReloadedRetrievals would misattribute this expected loss as a
-    // proxy-restart drop.
+    // #1343: rebase wipes the queued injections (context rebuilt), so clear
+    // the carrier too.
     session.pendingRetrievals.length = 0;
-    delete session.metadata.ccrUndelivered;
-    delete session.metadata.ccrDropNotes;
-    session.ccrReconcilePending = false;
     session.stats.lastInputTokens = 0;
     // #857: a zeroed baseline carries no provenance — drop any stale flag.
     delete session.stats.lastInputTokensSource;
@@ -2270,7 +2149,7 @@ function evictOldest(opts?: { overrideGrace?: boolean }): boolean {
     const ok = getStore().flushSync(s);
     if (!ok) {
         // A prior save does not contain the latest mutations. Keep newer
-        // state resident whenever its flush fails, including CCR failures.
+        // state resident whenever its flush fails, including store failures.
         return false;
     }
     sessions.delete(oldestId);

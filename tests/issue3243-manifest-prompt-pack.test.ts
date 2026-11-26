@@ -116,7 +116,7 @@ test("#3243: global promptPack reaches plugin-manifest tool descriptions on all 
                     assert.ok(descriptionOf(tool)?.startsWith(overrides.description), `${wire}.${name} description from lean pack`);
                 }
             }
-            // CCR is off in this rig, so decompress here is the NO_RANGE variant —
+            // decompress here is the NO_RANGE variant —
             // the pack override must land on it too (matched by tool name).
             const compress = findTool(tools[wire], "compress");
             const kernelDefault = (defaults as readonly Record<string, any>[]).find((d) => d.name === "compress" || d.function?.name === "compress")!;

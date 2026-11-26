@@ -22,16 +22,16 @@ import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { absorbAbortedTurnGrowth, nudgeStampsOf, restoreNudgeStamps, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, nudgeStampsOf, restoreNudgeStamps, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { carriesCodexLocalCompactionSummary, CODEX_LOCAL_COMPACTION_MIN_MISSING, isCodexHost } from "../codex-compact.js";
-import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, blockOpsTools, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, blockOpsTools, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { buildBlockOpsSystemPrompt } from "acp-kernel";
-import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
+import { imageRescaleToolArmed } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
@@ -162,8 +162,6 @@ export async function prepareOpenai(
     // core.processTurn — see planReasoningDrop for why the post-turn view is
     // too late (the kernel hides consumed call+result pairs inside it).
     let reasoningPlan = new Set<string>();
-    let attachedRetrievals: PendingRetrieval[] = [];
-    let attachedRetrievalNoteIds: string[] = [];
     let originalMessages: CoreMessage[] = [];
     let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
@@ -180,7 +178,7 @@ export async function prepareOpenai(
     let egressBootstrap = false;
     let egressArmed = false;
     let egressServedFromLog = false;
-    // The EXACT array fed to the outbound chain (post reasoning-drop / ccr /
+    // The EXACT array fed to the outbound chain (post reasoning-drop /
     // image-rescale) — segment 3 records this, not processedMessages, so the
     // log view is position-for-position what outbound saw.
     let egressRecordSource: readonly EgressRecordSourceMsg[] | undefined;
@@ -422,7 +420,7 @@ export async function prepareOpenai(
         const blockOps = blockOpsTools();
         const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && shouldInject;
         const rulesActive = rulesEnabled(config) && shouldInject;
-        const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        const loopConfig = { ...config, absorb: absorbActive ? absorbBlock : undefined };
         // #2432: dsh desktop's native compaction can LAND without ever
         // transiting bili — its summarizer calls ctx.llm.stream() directly,
         // and manual /compact / idle-session paths have no ALS attribution so
@@ -520,11 +518,10 @@ export async function prepareOpenai(
         // nudge-carrying request rolls the cadence back to pre-turn (lane
         // mirror of the anthropic-lane fix).
         nudgeStampsBefore = nudgeStampsOf(session);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy });
         session.state = turn.state;
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
-        adoptContentStore(session, turn.contentStore);
         // In-request ledger flush: the transcript up to THIS user message is
         // durable before the model call (#3397 durability-before-render) and
         // the stage-0 envelope / M2 evidence read a current ledger.
@@ -667,15 +664,6 @@ export async function prepareOpenai(
         }
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphansLogged(session, msgs, log, sessionId);
-        // [#1271/#1343] plugin mode: acp_retrieve already acked via the tool API; snapshot
-        // the queued full text onto THIS forward (stays in the queue until commit/drop, so an
-        // upstream failure drops-and-logs it instead of vanishing it).
-        if (pluginMode && ccrEnabled(session)) {
-            reconcileReloadedRetrievals(session);
-            pruneExpiredRetrievals(session);
-            attachedRetrievals = snapshotPendingRetrievals(session);
-            if (attachedRetrievals.length > 0) processedMessages = [...processedMessages, ...attachedRetrievals.map((i) => i.injection)];
-        }
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
@@ -749,7 +737,7 @@ export async function prepareOpenai(
         // #532: openaiOutboundSystem was captured above (seg 4b moved it up so
         // the op-log recording stores the outbound system text).
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOpsActive ? blockOps.openai : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
+            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOpsActive ? blockOps.openai : [])], surface?.toolPrompts, externalSummaryEnabled(config));
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
@@ -833,12 +821,6 @@ export async function prepareOpenai(
         // trailing user note (kept last so it never reorders cached messages).
         // Snapshot WITHOUT consuming: forward() commits the ids only once
         // upstream accepts this request; on failure they ride the next one.
-        const retrNotes = snapshotRetrievalNotes(session);
-        const retrNote = renderRetrievalNotes(retrNotes);
-        if (retrNote) {
-            rebuiltMessages = [...rebuiltMessages, { role: "user", content: retrNote }];
-            attachedRetrievalNoteIds = retrNotes.map((n) => n.id);
-        }
     } catch (err) {
         // #6181 B1: the R3 identity fault is a HARD reject, not a degrade —
         // rethrow it to the server funnel (400 + x-bili-snapshot:identity)
@@ -850,7 +832,6 @@ export async function prepareOpenai(
         // below would send the CLIENT'S bytes, which the ruling forbids.
         if (err instanceof EgressAuthorityRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
-        if (attachedRetrievals.length > 0) dropRetrievals(session, attachedRetrievals.map((i) => i.ref), "prepare failed; forwarded unprocessed");
         processedMessages = [];
     }
 
@@ -1009,7 +990,7 @@ export async function prepareOpenai(
             log("warn", `[${sessionId}] egress-serve shadow comparison failed: ${String(err)}`);
         }
     }
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

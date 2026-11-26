@@ -1440,8 +1440,8 @@ test("e2e: google-lane dsh side request resolves verbatim — no kernel state, n
 // config-gated tools (absorb/rule/retrieve custom names) stay out.
 test("#5765: BILI_TOOL_NAMES covers the kernel-fixed ACP names + block ops", async () => {
     const { BILI_TOOL_NAMES } = await import("../src/server/side-request.ts");
-    const { ACP_TOOL_NAMES, BLOCK_OP_TOOL_NAMES, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME } = await import("acp-kernel");
-    for (const name of [...ACP_TOOL_NAMES, ...BLOCK_OP_TOOL_NAMES, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME]) {
+    const { ACP_TOOL_NAMES, BLOCK_OP_TOOL_NAMES, ABSORB_TOOL_NAME, RULE_TOOL_NAME } = await import("acp-kernel");
+    for (const name of [...ACP_TOOL_NAMES, ...BLOCK_OP_TOOL_NAMES, ABSORB_TOOL_NAME, RULE_TOOL_NAME]) {
         assert.ok(BILI_TOOL_NAMES.has(name), `${name} must be bili-owned`);
     }
 });

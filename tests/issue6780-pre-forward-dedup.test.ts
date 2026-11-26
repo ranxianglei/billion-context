@@ -174,7 +174,7 @@ test("#6780 P0 (F1): a fold-turn ledger align consumed during scheduleSave force
 
         // A fold commit between the previous save and this prepare set the
         // align flag. ingestRowsNow does NOT consume it — scheduleSave's
-        // entry does, and the restamp mutates state (ref renumbering + CCR
+        // entry does, and the restamp mutates state (ref renumbering + store
         // re-key) AFTER the arm was set.
         session.pendingLedgerAlign = true;
         markDirty();

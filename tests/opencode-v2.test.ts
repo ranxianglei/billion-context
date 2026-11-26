@@ -9,7 +9,7 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import biliOpencodePlugin from "../src/agent/opencode.ts";
-import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI, RETRIEVE_TOOL_NAME, retrieveToolsFor } from "../src/compress-tool.ts";
+import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
 import { fetchManifest, fitNoticeDescription } from "../src/agent/shared.ts";
 
 const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_TOOL_OPENAI.function.name];
@@ -849,43 +849,6 @@ test("fetchManifest openai format parses nested (served) and flat entries", asyn
         assert.ok(anthropic instanceof Error, "fake serves no anthropic tools — format must not cross-contaminate");
     } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
-});
-
-test("#2443: a manifest-advertised conditional tool (acp_retrieve) is registered on first routed request", async () => {
-    const rt = retrieveToolsFor(RETRIEVE_TOOL_NAME).openai.function;
-    // Serve the REAL proxy shape — nested {type:"function", function:{…}} — not a
-    // hand-flattened copy. The old flat fixture masked #2656 (fetchManifest dropped
-    // every nested entry), so a faithful fixture is what makes this test bite.
-    const proxy = await startFakeProxyV2([retrieveToolsFor(RETRIEVE_TOOL_NAME).openai]);
-    try {
-        const fake = makeFakeCtx();
-        const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
-        try {
-            // Before any traffic: only the static base set is registered (unchanged parity).
-            assert.deepEqual(fake.addedTools.map((t) => t.name), EXPECTED_TOOLS);
-            assert.ok(!fake.addedTools.some((t) => t.name === "acp_retrieve"), "no retrieve tool before first request");
-            // First routed request discovers the proxy base and triggers the manifest delta.
-            await fake.fireModelRequest({ sessionID: "ses_ccr", baseURL: `${proxy.origin}/bili/http://upstream.example/v1` });
-            await until(() => fake.addedTools.some((t) => t.name === "acp_retrieve"));
-            const names = fake.addedTools.map((t) => t.name);
-            // Base set intact, each present exactly once; retrieve added exactly once (no duplicate).
-            for (const expected of EXPECTED_TOOLS) {
-                assert.equal(names.filter((n) => n === expected).length, 1, `${expected} present exactly once`);
-            }
-            assert.equal(names.filter((n) => n === "acp_retrieve").length, 1, "acp_retrieve present exactly once");
-            const retrieve = fake.addedTools.find((t) => t.name === "acp_retrieve")!;
-            assert.deepEqual(retrieve.input, rt.parameters);
-            assert.equal(retrieve.options?.["codemode"], false);
-            assert.equal(retrieve.options?.["permission"], "allow");
-            // The registered executor forwards to the live proxy dispatcher (reachable, not a dead pointer).
-            const out = await retrieve.execute({ ref: "m00001" }, { sessionID: "ses_ccr" });
-            assert.ok(typeof out.content === "string" && out.content.length > 0, "retrieve executes against the proxy");
-        } finally {
-            await cleanup();
-        }
-    } finally {
-        await proxy.close();
     }
 });
 

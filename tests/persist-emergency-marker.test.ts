@@ -18,7 +18,7 @@ for(const mode of ['legacy','full']){
    const session:Session={id:'synthetic-shrink-marker',meta:{protocol:'anthropic',upstreamOrigin:'http://synthetic.invalid'},
     stats:{requests:1,tokensSaved:0,inputTokens:1000,cachedTokens:0,outputTokens:5,cacheSamples:0,
      lastInputTokens:10000,lastInputTokensSource:armed?'estimate':'usage',contextTokens:10000,compressCreditTokens:0,
-     retrieveCalls:0,retrieveHits:0,retrieveMisses:0,storedBytes:0,storeBytesSaved:0,rangeRestores:0,
+     rangeRestores:0,
      ...(armed?{emergencyShrinkAt:1700000000000,emergencyShrinkEstimate:10000}:{})},metadata:{},
     createdAt:1700000000000,lastSeen:1700000001000,state:createInitialState(),blockContents:new Map(),
     inFlight:0,persisted:false,pendingRetrievals:[]};

@@ -108,7 +108,7 @@ const REWRITE_MARKER = "HOST-REWRITTEN";
 // Declared trailing-note carriers (carrier contract): a dedicated trailing
 // user element is volatile iff its ENTIRE payload carries one of these.
 const NOTE_MARKERS: string[] = [
-    "[billion-context] Earlier acp_retrieve result(s)",
+    "[billion-context] Earlier retrieval result(s)",
     "[Downscaled screenshots:",
     "If you compress, fold the ranges you keep in ONE call",
     "Only use IDs from visible messages above",

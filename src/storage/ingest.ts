@@ -28,9 +28,8 @@
 import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
-import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
-import { CcrLedgerRow, hydrateSlimCcrStore, isEmptyStateValue, slimCcrEnvelope, splitKstate } from "./slim.js";
-import { log as loggerLog } from "../logger.js";
+import { sha256Hex, type BlockRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
+import { isEmptyStateValue, splitKstate } from "./slim.js";
 import { splitMediaContent, identityOfStoredContent } from "./identity.js";
 
 /**
@@ -69,8 +68,7 @@ export interface LegacySessionLike {
      *  lowest seqs (they are the oldest evidence). Consumed by the full
      *  ingest only; the delta planner falls back to the full path while it is
      *  present (its rows would otherwise be skipped as "trusted prefix"). */
-    decompositionLog?: CoreMessage[];
-    contentStore?: { version: 1; byHash: Record<string, string>; byRef: Record<string, unknown> };
+     decompositionLog?: CoreMessage[];
 }
 
 interface IngestPlan extends IngestSessionInput {
@@ -138,7 +136,6 @@ export function toLegacyLike(s: {
     lastMessagesFolded?: boolean;
     pluginSnapshot?: LegacySessionLike["pluginSnapshot"];
     decompositionLog?: LegacySessionLike["decompositionLog"];
-    contentStore?: LegacySessionLike["contentStore"];
 }): LegacySessionLike {
     return {
         id: s.id,
@@ -153,7 +150,6 @@ export function toLegacyLike(s: {
         lastMessagesFolded: s.lastMessagesFolded,
         pluginSnapshot: s.pluginSnapshot,
         decompositionLog: s.decompositionLog,
-        contentStore: s.contentStore,
     };
 }
 
@@ -560,33 +556,6 @@ function finishPlan(
         recordedAt: session.lastSeen,
     }));
 
-    const ccrEntries: CcrEntryRow[] = session.contentStore
-        ? Object.entries(session.contentStore.byRef).map(([key, value], ord): CcrEntryRow => {
-              const content = JSON.stringify(value);
-              // #6785 step 6: the orig half — the kernel invariant
-              // (content-store.ts storeOriginal) pins byHash[entry.hash]
-              // as the original text behind each entry; the slim column
-              // keeps no bytes, so the CAS row must carry them.
-              const entry = value as { hash?: unknown } | null;
-              const origKey = entry !== null && typeof entry === "object" && typeof entry.hash === "string" ? entry.hash : null;
-              if (origKey === null) {
-                  // Hashless/null entry (fork-receipt stubs): no original
-                  // exists, so the row is complete as-is — "" keeps it
-                  // slim-hydratable (null would mark the WHOLE store
-                  // file-lane-authoritative and drop the orphan byHash half).
-                  return { ord, key, content, contentHash: sha256Hex(content), origContent: "", origHash: sha256Hex("") };
-              }
-              const stored = session.contentStore!.byHash[origKey];
-              // A missing byHash entry (bytes absent from memory/sidecar)
-              // must land as null, not "": "" would look like a legitimate
-              // empty original and the slim store would reconstruct an
-              // empty original instead of degrading to the file lane
-              // (getCcrEntries null contract, store.ts).
-              const orig = stored === undefined ? null : stored;
-              return { ord, key, content, contentHash: sha256Hex(content), origContent: orig, origHash: orig === null ? null : sha256Hex(orig) };
-          })
-        : [];
-
     // #7577 D4: egress-on sessions do not persist tsStamps/tokenSnapshot/
     // lastPassIds in the kstate column: tsStamps is derived on load from the
     // egress view (the I rows carry the kernel raw msgid + first-observed
@@ -652,13 +621,14 @@ function finishPlan(
         metadataJson: JSON.stringify(session.metadata),
         kstateJson: JSON.stringify(kstateColumn),
         tailJson: JSON.stringify({ pluginSnapshotSeqs, tailSeqs, tailFolded: session.lastMessagesFolded === true }),
-        // #6785 step 6: slim envelope — the column keeps key→hash only; the
-        // original bytes live in the CAS behind ccr_entries and are re-fetched
-        // on read (byte-identical by construction).
-        ccrJson: session.contentStore ? JSON.stringify(slimCcrEnvelope(session.contentStore)) : null,
+        // #7755: CCR removed — the ccr_json column is no longer written. The
+        // ingest upsert never overwrites an existing value (see store.ts), so
+        // pre-#7755 envelopes stay intact in the DB (owner ruling: existing
+        // data is neither migrated, read, nor destroyed).
+        ccrJson: null,
     };
 
-    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, stateFields, pluginSnapshotSeqs, tailSeqs };
+    return { session: sessionRow, messages, blocks, deadRefs, refs, stateFields, pluginSnapshotSeqs, tailSeqs };
 }
 
 /** Rebuilds the legacy load view from unified rows alone. */
@@ -693,7 +663,6 @@ interface LegacyViewRows {
         metadataJson: string;
         kstateJson: string;
         tailJson: string;
-        ccrJson: string | null;
         orphansJson?: string | null;
     };
     messages: { seq: number; msgId: string; ref: string | null; content: string }[];
@@ -714,7 +683,6 @@ interface LegacyView {
     lastMessages?: CoreMessage[];
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
-    contentStore?: LegacySessionLike["contentStore"];
     /** #4390: tail/pluginSnapshot pointers whose backing row is missing. */
     tailGaps?: number;
 }
@@ -757,7 +725,6 @@ export class LegacyViewBuilder {
     private readonly blocks: unknown[] = [];
     private readonly blockContents: BlockContents = new Map();
     private readonly messagesBySeq = new Map<number, CoreMessage>();
-    private ccrRows: readonly CcrLedgerRow[] = [];
     private orphanViews?: Record<string, { one: unknown; full: unknown }>;
     private stateFieldsRows: Record<string, string> | null = null;
     /** The kstate column as stored — needed by applyStateFieldsRows to
@@ -859,12 +826,6 @@ export class LegacyViewBuilder {
         for (const m of rows) this.messagesBySeq.set(m.seq, JSON.parse(m.content) as CoreMessage);
     }
 
-    /** #6785 step 6: the ccr_entries ledger (CAS content) that backs a slim
-     *  ccr_json envelope — finish() hydrates the store from these rows. */
-    addCcrEntries(rows: readonly CcrLedgerRow[]): void {
-        this.ccrRows = rows;
-    }
-
     /** #6785 step 7: the merged orphan journal (orphan_blocks table ∪
      *  legacy column, pre-merged by the caller). finish() merges these into
      *  blockContents INSTEAD of sessions.orphans_json once provided.
@@ -915,58 +876,15 @@ export class LegacyViewBuilder {
             lastMessagesFolded: tail.tailFolded,
         };
         if (pluginSnapshot) out.pluginSnapshot = pluginSnapshot;
-        out.contentStore = resolveCcrContentStore(s.ccrJson, this.ccrRows, s.sessionId);
         return out;
     }
 }
 
-/**
- * #6785 step 6: the ONE definition of "what does a sessions.ccr_json column
- * mean" — shared by the builder (finish), the verifier header and
- * loadLegacyView, so the slim/full/legacy degradation rule cannot drift
- * between legs. Slim envelope → hydrate from the CAS-backed ledger; a slim
- * row whose ledger is empty or still carries legacy NULL-orig rows is an
- * inconsistency: no store (the file lane still has it), never a partial one.
- * Full (pre-step-6) envelopes parse verbatim. Corrupt JSON → undefined.
- *
- * #7574: no longer a SILENT degradation. The one way this shape arises in
- * practice is a rollback: an older build (everything before the unified
- * storage) parses the slim column as if it were the old full envelope, so
- * its save rewrites the ledger rows to the bare `{ hash }` stubs it saw and
- * drops the link to the original text. Those texts cannot be linked back —
- * the session loads without its content store and the log says why (the
- * nine row-backed state fields DO come back, see applyStateFieldsRows).
- */
-export function resolveCcrContentStore(
-    ccrJson: string | null,
-    ccrRows: readonly CcrLedgerRow[],
-    sessionId = "?",
-): LegacyView["contentStore"] {
-    if (ccrJson === null) return undefined;
-    try {
-        const head = JSON.parse(ccrJson) as { ccrSlim?: number };
-        if (head.ccrSlim === 1) {
-            const store = hydrateSlimCcrStore(JSON.parse(ccrJson) as Parameters<typeof hydrateSlimCcrStore>[0], ccrRows);
-            if (store === null && ccrRows.length > 0) {
-                const linkDropped = ccrRows.some((r) => r.origContent === null);
-                loggerLog("warn", `[storage] session=${sessionId}: the content store could not be rebuilt from its ${ccrRows.length} ledger row(s) (${linkDropped
-                    ? "the rows carry no original text — this is what an older build leaves behind after it saved this session; those tool-output and file-read texts cannot be restored"
-                    : "a body the content table no longer has, or a key the ledger no longer lists"}) — the session is loaded without it`);
-            }
-            return store ?? undefined;
-        }
-        return JSON.parse(ccrJson) as LegacyView["contentStore"];
-    } catch {
-        return undefined;
-    }
-}
-
 /** Compatibility wrapper for callers that already hold all rows. */
-export function loadLegacyView(rows: LegacyViewRows, ccrRows?: readonly CcrLedgerRow[], stateFieldsRows?: Record<string, string> | null, orphanViews?: Record<string, { one: unknown; full: unknown }>): LegacyView {
+export function loadLegacyView(rows: LegacyViewRows, stateFieldsRows?: Record<string, string> | null, orphanViews?: Record<string, { one: unknown; full: unknown }>): LegacyView {
     const builder = new LegacyViewBuilder(rows.session, rows.refs, rows.deadRefs);
     builder.addBlocks(rows.blocks);
     builder.addMessages(rows.messages);
-    if (ccrRows) builder.addCcrEntries(ccrRows);
     if (stateFieldsRows) builder.addStateFields(stateFieldsRows);
     if (orphanViews !== undefined) builder.addOrphanViews(orphanViews);
     return builder.finish();

@@ -16,7 +16,6 @@ import {
     effectiveJsonWriterOff as knobEffectiveJsonWriterOff,
     jsonWriterOffRequested as knobJsonWriterOffRequested,
     resolveJsonWriterChoice,
-    contentStorePinned,
     sessionResidentHardMaxBytes,
     resolveArchiveAfterDays,
     fileStorageUnified,
@@ -31,12 +30,12 @@ import { recordRequestedMode } from "./storage/runtime-status.js";
 import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
-import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage } from "acp-kernel";
 import { markDirty } from "./session.js";
 import { validCostUsd } from "./billing.js";
 import { mergeState } from "./state-hydration.js";
-import { restampRefsToLedger, restampContentStore } from "acp-kernel";
-import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
+import { restampRefsToLedger } from "acp-kernel";
+import { LazyBlockContents, isDroppedMetadata, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
 import { featureEnabled } from "./rollout.js";
@@ -44,7 +43,6 @@ import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow, type MessageRefContentRow, type MessageIdContentRow } from "./storage/store.js";
-import { contentStoreOf } from "./store.js";
 import { CALIBRATION_PROVENANCE_TEXT_ONLY, type WireProtocol } from "./util.js";
 import { currentContextObservation, canonicalJson, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
@@ -232,13 +230,6 @@ interface PersistedSession {
         pendingFoldUsage?: boolean;
         lastLocalTextEstimate?: number;
         lastLocalTextEstimateOrigin?: string;
-        retrieveCalls?: number;
-        retrieveHits?: number;
-        retrieveMisses?: number;
-        retrieveDropped?: number;
-        retrieveDelivered?: number;
-        storedBytes?: number;
-        storeBytesSaved?: number;
         rangeRestores?: number;
         wholeBlockRestores?: number;
         wholeBlockRestoresPreciseAvailable?: number;
@@ -282,7 +273,6 @@ interface PersistedSession {
     /** #3301: external-converter import payload (see Session.decompositionLog) —
      *  accepted on read; buildRecord deliberately does not emit it. */
     decompositionLog?: CoreMessage[];
-    forkContentStore?: MessageContentStore;
 }
 
 type Logger = (level: "info" | "warn" | "error", msg: string) => void;
@@ -337,17 +327,6 @@ function durableWriteFile(file: string, data: Buffer | string, mode?: number): v
         closeSync(fd);
     }
 }
-
-/** #1097: the kernel CCR content-store envelope lives in ONE dedicated file
- *  per session, next to the session JSON (same namespace, same codec): the
- *  originals are payload bytes, not state — keeping them out of the session
- *  record preserves whole-file encryption, .json discovery, and the bounded
- *  in-memory session cache (the envelope is lazily loaded per session). */
-export function contentStoreRelPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
-    const base = relPathFor(id, protocol, upstreamOrigin);
-    return base.slice(0, -".json".length) + ".content-store.json";
-}
-
 /** #1937: true when a walked FILENAME is the canonical (or legacy flat /
  *  .fb fallback) name for record `id` — mirrors the kernel StateStore.loadAll
  *  owner check so independent directory walkers agree with loadSync about
@@ -769,155 +748,7 @@ export class SessionStore {
      *  path first, then the _unknown/ fallback — same probe order as
      *  loadEnvelope). Bounded server startup refuses corrupt originals;
      *  legacy direct callers retain their warned fresh-store fallback. */
-    loadContentStore(session: Session): MessageContentStore | null {
-        return this.readContentStoreRels(session.id, [
-            contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
-            contentStoreRelPathFor(session.id),
-        ]);
-    }
-
-    /** Id+meta variant for replica freeze/restore (#2671 review 6): the
-     *  checkpoint path has no live Session object, only the frozen record's
-     *  meta — same rel-path candidates, same parse-and-degrade semantics. */
-    private contentStoreById(id: string, meta?: { protocol?: string; upstreamOrigin?: string } | null): MessageContentStore | null {
-        return this.readContentStoreRels(id, [
-            contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin),
-            contentStoreRelPathFor(id),
-        ]);
-    }
-
-    /** #4788 phase 2: candidate on-disk locations of id's content-store
-     *  envelope, in probe order — the winning source's canonical sidecar
-     *  (#3399/#3765: first, because adoption rewrites meta.upstreamOrigin to
-     *  the requesting route during loadSync, so rels[0] targets that route's
-     *  sidecar and a degraded current-route twin with a valid-but-incomplete
-     *  CCR would otherwise shadow the winning ledger's originals → DIGEST
-     *  DRIFT; a .fb.json fallback source keeps its <base>.content-store.json
-     *  name), then the rel-path candidates, then every .json file on disk
-     *  whose name matches the id. BOTH consumers must go through this —
-     *  readContentStoreRels (parse) and contentStoreLanded (existence proof)
-     *  — so the drop gate can never go positive on a path the reader would
-     *  not consult. */
-    private candidateContentStorePaths(id: string, rels: string[]): string[] {
-        const source = this.sourceFiles.get(id);
-        const sourceCcr = source
-            ? (source.endsWith(".fb.json")
-                ? `${source.slice(0, -".fb.json".length)}.content-store.json`
-                : `${source.slice(0, -".json".length)}.content-store.json`)
-            : null;
-        return [...new Set([
-            ...(sourceCcr ? [sourceCcr] : []),
-            ...rels.map(rel => path.join(this.sessionsDir, rel)),
-            ...this.diskFiles.filter(file => fileNameMatchesId(path.basename(file), id))
-                .map(file => file.replace(/\.json$/, ".content-store.json"))])];
-    }
-
-    private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
-        if (!this.enabled) return null;
-        for (const file of this.candidateContentStorePaths(id, rels)) {
-            let buf: Buffer;
-            try {
-                buf = readFileSync(file);
-            } catch (err) {
-                if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
-                if (!this.boundedReads) {
-                    this.log("warn", `[persist] content store for ${id} unreadable, starting fresh: ${String(err)}`);
-                    return null;
-                }
-                throw new Error(`Content store for ${id} cannot be read; refusing to replace its originals`, { cause: err });
-            }
-            try {
-                const text = this.readCodec.decode(buf);
-                const parsed = JSON.parse(text) as MessageContentStore;
-                if (parsed && typeof parsed === "object" && parsed.version === 1
-                    && parsed.byHash && typeof parsed.byHash === "object"
-                    && parsed.byRef && typeof parsed.byRef === "object") {
-                    return parsed;
-                }
-                throw new Error(`Content store for ${id} is malformed; refusing to replace its originals`);
-            } catch (err) {
-                if (!this.boundedReads) {
-                    this.log("warn", `[persist] content store for ${id} unreadable, starting fresh: ${String(err)}`);
-                    return null;
-                }
-                throw new Error(`Content store for ${id} unreadable; refusing to replace its originals`, { cause: err });
-            }
-        }
-        return null;
-    }
-
-    /** Writes a content-store envelope by id+meta with the same atomic
-     *  tmp+rename discipline as saveContentStore — used by restoreReplica,
-     *  which has no live Session to mark dirty (#2671 review 6). */
-    private writeContentStoreSidecar(id: string, meta: { protocol?: string; upstreamOrigin?: string } | undefined, store: MessageContentStore): void {
-        const rel = contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin);
-        const abs = path.join(this.sessionsDir, rel);
-        const tmp = path.join(path.dirname(abs), `.tmp-${path.basename(abs, ".json")}-${process.pid}-${this.tmpSeq++}`);
-        try {
-            mkdirSync(path.dirname(abs), { recursive: true });
-            const text = JSON.stringify(store);
-            durableWriteFile(tmp, this.codec ? this.codec.encode(text) : text);
-            renameSync(tmp, abs);
-        } catch (err) {
-            try { rmSync(tmp, { force: true }); } catch { /* best-effort */ }
-            this.log("warn", `[persist] content-store restore write failed for ${id}: ${err instanceof Error ? err.message : String(err)}`);
-        }
-    }
-
-    /** #1097: persist the content-store envelope when dirty; an emptied store
-     *  (rebase reset) deletes the file. Payload-first: runs BEFORE the session
-     *  state write so a crash mid-save leaves at worst a retrieve miss, never
-     *  a placeholder whose original is gone.
-     *
-     *  Atomic (#2674): the envelope goes to a unique .tmp-* sibling in the SAME
-     *  directory (same volume ⇒ rename is atomic) and is renamed onto the
-     *  destination — mirroring the kernel StateStore.writeInner discipline. A
-     *  crash mid-write orphans the temp (swept at next boot, #2674) instead of
-     *  truncating the live envelope, which loadContentStore would treat as
-     *  "malformed, starting fresh" and silently drop every stored original. On
-     *  any failure the temp is unlinked and contentStoreDirty re-set so the next
-     *  save retries; the previous envelope stays byte-identical. */
-    private saveContentStore(session: Session): boolean {
-        if (!this.enabled || !session.contentStoreDirty) return true;
-        const rel = contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin);
-        const abs = path.join(this.sessionsDir, rel);
-        const tmp = path.join(path.dirname(abs), `.tmp-${path.basename(abs, ".json")}-${process.pid}-${this.tmpSeq++}`);
-        try {
-            if (!session.contentStore || Object.keys(session.contentStore.byRef).length === 0) {
-                rmSync(abs, { force: true });
-                session.contentStoreDirty = false;
-                return true;
-            }
-            if (this.writerOffActive()) {
-                // #2960 Phase 3 extension: the off switch covers the CCR
-                // content-store sidecar as well — in effective-full mode
-                // the unified ccr mirror (ingested by this same save's
-                // builder, which runs right after this gate returns) is the
-                // durable copy, and contentStoreOf() reads it first, so the
-                // file is never consulted. contentStoreDirty is cleared for
-                // the same reason: this save drops the resident store right
-                // after the ingest (dropResidentContentStore), and a stale
-                // dirty=true with contentStore=null would make a later
-                // writer-resume save hit the emptied-store branch and
-                // DELETE the sidecar file while the table may be dead.
-                // Convergence after a writer-resume comes from the kernel
-                // re-adopting its in-memory store on the next turn.
-                session.contentStoreDirty = false;
-                return true;
-            }
-            mkdirSync(path.dirname(abs), { recursive: true });
-            const text = JSON.stringify(session.contentStore);
-            durableWriteFile(tmp, this.codec ? this.codec.encode(text) : text, 0o600);
-            renameSync(tmp, abs);
-            session.contentStoreDirty = false;
-            return true;
-        } catch (err) {
-            try { rmSync(tmp, { force: true }); } catch { /* best-effort: a stuck temp is swept at next boot */ }
-            session.contentStoreDirty = true;
-            this.log("warn", `[persist] content-store write failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
-            return false;
-        }
-    }
+    
 
     /** Bulk-load every persisted session from disk into a map keyed by the
      *  REAL session id (read from the file body, not the filename). Called once
@@ -2036,7 +1867,7 @@ export class SessionStore {
      *  alignment, now invoked NOT at cold load but from scheduleSave after
      *  the session's next successful fold (session.pendingLedgerAlign
      *  marker). The body is unchanged in intent: aligns refs onto store-row
-     *  seq+1 in one atomic pass, re-keys the CCR store and token snapshot in
+     *  seq+1 in one atomic pass, re-keys the token snapshot in
      *  the SAME pass (#4733/#4599), publishes the superseded map so stale
      *  citations are refused rather than misattributed. Guards:
      *  state already aligned, no ref map, unified store unavailable, or no
@@ -2050,21 +1881,6 @@ export class SessionStore {
             const seqByRawId = this.unifiedSeqByRaw(session.id);
             if (seqByRawId === null || seqByRawId.size === 0) return;
             const outcome = restampRefsToLedger(state, seqByRawId);
-            // #4733: the ref restamp alone leaves the CCR content store keyed by
-            // store-time refs — a stored original would sit under a number the
-            // ref map now vends to a DIFFERENT message (misattribution on
-            // retrieve) and consistency gates (plugin fork snapshot) reject the
-            // session. Re-key the store onto the same map, same pass.
-            // #4599: guarded — contentStoreOf MATERIALIZES an empty envelope
-            // for storeless sessions; touching it speculatively here changed
-            // the persisted shape of every full-mode cold load (legacy keeps
-            // undefined) and broke the storage-unified parity pin. Storeless
-            // sessions have nothing to re-key.
-            if (session.contentStore) {
-                const store = contentStoreOf(session);
-                const restampedStore = restampContentStore(store, state.messageRefs.byRaw);
-                if (restampedStore !== store) session.contentStore = restampedStore;
-            }
             if (outcome.superseded.size > 0) {
                 session.restampSuperseded = outcome.superseded;
             } else {
@@ -2112,17 +1928,17 @@ export class SessionStore {
      *  first SAVE boundary after a fold commit. Every write entry point
      *  (scheduleSave / flushSync / writeNow) calls this BEFORE
      *  saveContentStore / guardedBuild, so the aligned state and the
-     *  re-keyed CCR store land in the SAME serialized record (the invariant
+     *  re-keyed state land in the SAME serialized record (the invariant
      *  #4733 exists for). No fold ⇒ marker never set ⇒ pure legacy no-op. */
     private consumePendingLedgerAlign(session: Session): void {
         if (!session.pendingLedgerAlign) return;
         delete session.pendingLedgerAlign;
         // #6780 P0 (review F1): the restamp below mutates state that this tick's
         // pre-forward durability ingest (ingestRowsNow) already made durable —
-        // it renumbers refs and re-keys the CCR store AFTER that ingest. Consuming
+        // it renumbers refs AFTER that ingest. Consuming
         // the arm here forces the restamp turn's coalesced build to run in full
         // (once per session lifetime — maybeRestampToLedger no-ops once aligned),
-        // keeping the #4733 invariant: aligned state and re-keyed CCR land in the
+        // keeping the #4733 invariant: aligned state land in the
         // SAME serialized record. Without this, pendingLedgerAlign is already
         // deleted by the time the writer-off gate reads it, so the gate's own
         // align check would be a dead signal and the restamped bytes would ride
@@ -2208,19 +2024,6 @@ export class SessionStore {
      *  half-completed replica must surface, not log-and-degrade. Requires the
      *  unified sidecar (shadow or full mode); legacy mode fails fast with a
      *  clear message so the HTTP layer can 501. */
-    /** #2960 ③: unified-first CCR read. Full mode only — under shadow the
-     *  index may lag files it has not re-recorded, so the sidecar stays the
-     *  read of record there. Never throws: a missing/unreadable row simply
-     *  falls back to the file path. */
-    unifiedCcrFor(id: string): MessageContentStore | null {
-        if (!this.shadow?.readsUnified) return null;
-        try {
-            return this.shadow.getCcr(id);
-        } catch {
-            return null;
-        }
-    }
-
     /** #3301: stored message decompositions (+ seq±1 neighbors) for
      *  fold-anchor backfill after a wire-shape flip (consumed by
      *  fold-decomposition-lookup → reconcileFoldCoverage.storedMessages).
@@ -2862,13 +2665,6 @@ export class SessionStore {
         if (record.metadata?.["egressAuthority"] === true) {
             throw new Error(`[storage] createReplica: session ${sessionId} is egress-on — use the point-fork path instead`);
         }
-        // CCR originals must survive the rollback the replica exists for:
-        // the live content-store sidecar (not just what the unified index
-        // captured) is the authoritative envelope — stamp it into the frozen
-        // record (#2690 review blocking 6: "restore without the content-store
-        // envelope → CCR cannot fetch originals").
-        const ccr = this.contentStoreById(sessionId, record.meta as { protocol?: string; upstreamOrigin?: string } | undefined);
-        if (ccr) record.forkContentStore = ccr;
         const cpId = `cp-${randomUUID()}`;
         const activeBlockIds = record.state.blocks
             .filter((b) => (b as { active?: boolean }).active !== false)
@@ -2916,9 +2712,6 @@ export class SessionStore {
         // (fork-base receipt, tail fold, resident drops), so the child must
         // not alias the parent's state/metadata/lock chain. `transient` is
         // in-flight request state — never carried into a fork child. The
-        // contentStore is shared by design: saveContentStore snapshots it to
-        // disk under the child's id, and dropResidentContentStore reassigns
-        // the CHILD's field only (the parent keeps its own handle).
         const child: Session = {
             ...parent,
             id: cid,
@@ -2994,13 +2787,6 @@ export class SessionStore {
             nextBlockId: record.state?.nextBlockId ?? 0,
             builtAtMs: Date.now(),
         });
-        // Materialize the content-store sidecar for the restored id too:
-        // buildRecord drops forkContentStore on the next live save (no fork
-        // receipt), so the record alone is not durable — the sidecar is what
-        // survives every later save/restart cycle.
-        if (record.forkContentStore) {
-            this.writeContentStoreSidecar(newId, record.meta as { protocol?: string; upstreamOrigin?: string } | undefined, record.forkContentStore);
-        }
         return { sessionId: newId, restoredFrom: cp.session_id, seqAt: cp.seq_at };
     }
 
@@ -3260,7 +3046,7 @@ export class SessionStore {
                     this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
                         tail && tail.length > 0
                             ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                            : undefined, session.contentStore ?? undefined);
+                            : undefined);
                 }
                 this.noteOwnCommit(session.id, record);
                 return record;
@@ -3369,8 +3155,6 @@ export class SessionStore {
         // the way a full rebase does (#1343 rationale) instead of misattributing
         // the expected loss as a proxy-restart drop later.
         session.pendingRetrievals.length = 0;
-        delete session.metadata.ccrUndelivered;
-        delete session.metadata.ccrDropNotes;
         if (droppedRetrievals > 0) {
             this.log("warn", `[persist] ${session.id}: dropped ${droppedRetrievals} queued retrieval(s) during state convergence to the newer disk record (#2401)`);
         }
@@ -3424,7 +3208,7 @@ export class SessionStore {
      *  that made long sessions cite refs the gate rejects as "above the highest
      *  allocated ref"). The large JSON envelope stays debounced — only the small
      *  row ingest moves ahead of it. Mirrors the debounced path's ingest legs
-     *  (stale-disk guard + rawTail + live CCR + noteOwnCommit), minus the
+     *  (stale-disk guard + rawTail + noteOwnCommit), minus the
      *  envelope write and its landing stamp. */
     ingestRowsNow(session: Session): void {
         if (!this.shadow) return; // legacy-only (no unified index) — nothing to back
@@ -3460,7 +3244,7 @@ export class SessionStore {
             this.shadow.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
                 tail && tail.length > 0
                     ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                    : undefined, session.contentStore ?? undefined);
+                    : undefined);
             this.noteOwnCommit(session.id, record);
             this.armDurabilitySkip(session, record); // #6780 P0: arm the same-tick dedup for prepare's markDirty
         } catch (err) {
@@ -3489,22 +3273,14 @@ export class SessionStore {
     scheduleSave(session: Session): void {
         // #5608-D: a committed fold IS the session's next legitimate
         // cache-breaking boundary — run the deferred #4316 citation-space
-        // alignment HERE, before saveContentStore/guardedBuild serialize
-        // anything (the content-store re-key happens inside and must land in
-        // the same write). Cold-load alignment retired: see loadSync note.
+        // alignment HERE, before guardedBuild serializes anything.
+        // Cold-load alignment retired: see loadSync note.
         this.consumePendingLedgerAlign(session);
-        if (!this.saveContentStore(session)) {
-            // #6793-review: this save will not run — drop the #6780 arm so it
-            // cannot pin this session's lastMessages + metadata fingerprint
-            // in memory forever (leak on eviction).
-            this.durabilityArms.delete(session.id);
-            return;
-        }
         const frozen = this.envelopeFrozen(session.id);
         if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
             if (frozen) this.noteFrozenSkip(session.id, "scheduled");
             // Phase 3 (#2960): index-only persistence — the builder closure
-            // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
+            // runs the sidecar ingest (raw tail) and the stale-disk
             // guard; no envelope write is armed, so no debounce is needed.
             // #3133: coalesce same-tick markDirty storms into ONE build — the
             // builder reads session state at run time, so the batched run
@@ -3523,7 +3299,7 @@ export class SessionStore {
                 // state. If nothing changed since — the epoch moved by exactly
                 // prepare's own markDirty (markDirty is the mutation chokepoint),
                 // the same lastMessages array is live (a re-snapshot does not
-                // bump the epoch), no new decomposition payload, no CCR re-key,
+                // bump the epoch), no new decomposition payload,
                 // no pending ledger align, and the metadata bytes are untouched —
                 // the full rebuild + full delta-ingest below is a pure no-op
                 // that still pays the three-table full reads, the whole-record
@@ -3536,7 +3312,6 @@ export class SessionStore {
                     (session.revisionEpoch ?? 0) === armed.epoch + 1 &&
                     session.lastMessages === armed.messagesRef &&
                     session.decompositionLog === undefined &&
-                    !session.contentStoreDirty &&
                     session.pendingLedgerAlign === undefined &&
                     JSON.stringify(session.metadata) === armed.metadataFp;
                 // #6780 P0 (review F2): single-shot arm — this run made the
@@ -3720,8 +3495,7 @@ export class SessionStore {
      *  this same discharge even for sessions exempt from pool eviction and
      *  warns once per 60 s. The non-droppable remainder (state/transient) is
      *  out of scope here — state is hot every turn; transient is a separate
-     *  TODO(owner). The content store became droppable in phase 2
-     *  (dropResidentContentStore). Errors are swallowed by design: this is idle
+     *  TODO(owner). Errors are swallowed by design: this is idle
      *  upkeep at a request boundary, never caller-critical. */
     async spillBetweenTurns(session: Session): Promise<void> {
         if (session.inFlight > 0) return;
@@ -3768,7 +3542,6 @@ export class SessionStore {
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
-        this.dropResidentContentStore(session);
     }
 
     /** #4788 D2/D1-A: stamp that the disk copy of id now covers the given
@@ -3797,12 +3570,6 @@ export class SessionStore {
      *  either. Do NOT regress this by eager-snapshotting the record here. */
     async writeNow(session: Session): Promise<void> {
         this.consumePendingLedgerAlign(session); // #5608-D: before any serialization
-        if (!this.saveContentStore(session)) {
-            // #6793-review: see scheduleSave — the arm is useless without a
-            // writer-off coalesced run; clear it before propagating.
-            this.durabilityArms.delete(session.id);
-            throw new Error(`Originals were not saved for ${session.id}`);
-        }
         const frozen = this.envelopeFrozen(session.id);
         if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
             if (frozen) this.noteFrozenSkip(session.id, "writeNow");
@@ -3819,7 +3586,6 @@ export class SessionStore {
                 this.foldResidentTail(session);
                 this.dropResidentBlockContents(session);
                 this.dropResidentMetadata(session);
-                this.dropResidentContentStore(session);
             } else {
                 // #7474 P2 (ruling 7439): the build above deliberately did NOT
                 // land in the unified store (the op log is the transcript
@@ -3853,7 +3619,6 @@ export class SessionStore {
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
-        this.dropResidentContentStore(session);
         this.drainFlushWaiters(session.id, true);
     }
 
@@ -4018,61 +3783,6 @@ export class SessionStore {
         session.blockContents = lazy;
     }
 
-    /** #4788 phase 2 (owner decision 2026-10-31, discussion #3916-E): the CCR
-     *  content store folds away too — by the time this runs its last growth has
-     *  provably landed (durableRevision gate above + contentStoreDirty veto,
-     *  because adoptContentStore marks dirty exactly when refs appear), so the
-     *  non-empty originals live in the unified ccr mirror and/or the
-     *  .content-store.json sidecar (payload-first write order, #2674). The proxy
-     *  is never undefined while held: saveContentStore, the ingest's ccr_json /
-     *  ccr_entries, fork records and publicSnapshotStoredRefs all see the full
-     *  set transparently — only RAM goes quiet, one narrow read per burst.
-     *  BILI_SESSION_CONTENT_STORE_PIN restores the previous always-resident
-     *  behavior for operators who want it. */
-    private dropResidentContentStore(session: Session): void {
-        // #5805: index-only saves leave the envelope stale; the lazy CCR
-        // loader would restore from the unified mirror at a full read cost
-        // while the resident set is already the freshest copy.
-        if (this.writerOffActive() || session.inFlight > 0 || !this.enabled) return;
-        if (isDroppedContentStore(session.contentStore)) return;
-        if (session.contentStoreDirty) return; // unsaved growth stays resident until its own save settles
-        if (contentStorePinned()) return;     // owner escape hatch
-        const store = session.contentStore;
-        if (!store || Object.keys(store.byRef).length === 0) return; // nothing to fold
-        const meta = session.meta ?? undefined;
-        if (!this.contentStoreLanded(session.id, meta)) {
-            // No provably-landed copy on disk — folding would make the next
-            // touch throw where a resident set still exists. Fork children are
-            // the canonical case: their store rides in the ENVELOPE's
-            // forkContentStore with no sidecar of their own; staying resident
-            // costs a few KB at fork time. The lazy loader below has exactly
-            // these two sources, so prove one of them before dropping RAM.
-            return;
-        }
-        session.contentStore = lazyContentStore(session.id, (id) =>
-            this.unifiedCcrFor(id)
-            ?? this.contentStoreById(id, { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin }));
-    }
-
-    /** #4788 phase 2, landing proof for dropResidentContentStore: mirrors the
-     *  lazy loader's candidate set (unified ccr mirror first, then the same
-     *  sidecar paths readContentStoreRels probes) and answers "will the next
-     *  touch find data?" WITHOUT parsing — the mirror read is one narrow index
-     *  fetch, the rest is pure existence checks. Conservative by design: any
-     *  uncertainty keeps the store resident. */
-    private contentStoreLanded(id: string, meta?: { protocol?: string; upstreamOrigin?: string } | null): boolean {
-        if (this.unifiedCcrFor(id) !== null) return true;
-        // Same candidate set the lazy loader probes (candidateContentStorePaths);
-        // existence checks only, no parsing.
-        for (const p of this.candidateContentStorePaths(id, [
-            contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin),
-            contentStoreRelPathFor(id),
-        ])) {
-            try { if (existsSync(p)) return true; } catch { /* probe only */ }
-        }
-        return false;
-    }
-
     /** #5188: recover a sidecar whose FIRST synchronous open died on a
      *  transient OS error (fd exhaustion under test/CI load, momentary
      *  disk-full, a spike of EBUSY). Before this, one failure at
@@ -4122,7 +3832,6 @@ export class SessionStore {
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
         this.consumePendingLedgerAlign(session); // #5608-D: before any serialization
-        if (!this.saveContentStore(session)) return false;
         this.tryRecoverSidecar(); // #5188: eviction-time flushes are also a recovery opportunity
         const frozen = this.envelopeFrozen(session.id);
         if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
@@ -4149,7 +3858,6 @@ export class SessionStore {
                 this.foldResidentTail(session);
                 this.dropResidentBlockContents(session);
                 this.dropResidentMetadata(session);
-                this.dropResidentContentStore(session);
             } else {
                 // #7474 P2 (ruling 7439): build did not land in the unified
                 // store — do not stamp it durable and do not thin resident
@@ -4180,7 +3888,6 @@ export class SessionStore {
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
             this.dropResidentMetadata(session);
-            this.dropResidentContentStore(session);
         }
         return ok;
     }
@@ -4198,7 +3905,6 @@ export class SessionStore {
         await this.maybeCutForkBaseAsync(session);
         // A failure here leaves a COMPLETE durable fork receipt in the DB.
         // The exact retry repairs its envelope; never delete an uncertain commit.
-        if (!this.saveContentStore(session)) throw new Error("fork content persistence failed; retry the same request");
         this.noteOwnCommit(session.id, record);
         if (!this.writerOffActive()) {
             if (!this.withPreoomSnapshot<boolean>(session.id, session.meta, () => this.store.flushSync(session.id, () => record))) throw new Error("fork envelope persistence failed; retry the same request");
@@ -4209,7 +3915,6 @@ export class SessionStore {
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
-        this.dropResidentContentStore(session);
     }
 
     async recoverCompletedFork(id: string): Promise<void> {
@@ -4221,7 +3926,6 @@ export class SessionStore {
         const receipt = record.metadata?.publicForkReceipt as { requestHash?: unknown; response?: { ok?: unknown; sessionId?: unknown; childConversationId?: unknown } } | undefined;
         if (typeof receipt?.requestHash !== "string" || receipt.response?.ok !== true || receipt.response.sessionId !== id || receipt.response.childConversationId !== id) return;
         const session = buildSession(record);
-        if (!this.saveContentStore(session)) throw new Error("fork content recovery failed");
         this.noteOwnCommit(id, record);
         if (!this.writerOffActive()) {
             if (!this.withPreoomSnapshot<boolean>(id, session.meta, () => this.store.flushSync(id, () => record))) throw new Error("fork envelope recovery failed");
@@ -4232,16 +3936,13 @@ export class SessionStore {
         await this.maybeCutForkBaseAsync(session);
     }
 
-    /** Flush all dirty content stores, then pending session writes. Called on
-     *  SIGTERM/SIGINT for graceful shutdown. Content stores live outside the
-     *  kernel StateStore, so retry them from the resident session list before
-     *  the kernel drains its pending writes and in-flight chains. */
+    /** Flush pending session writes. Called on SIGTERM/SIGINT for graceful
+     *  shutdown. */
     async flushAll(sessions: Iterable<Session> = []): Promise<void> {
         // #3133: run armed writerOff builds BEFORE the sidecar closes below —
         // a stray microtask would build against a closed store and burn a
         // 3-strike disable for no reason.
         this.drainWriterOffPending();
-        for (const session of sessions) this.saveContentStore(session);
         await this.flushScheduledSaves();
         await this.store.flushAll();
         this.shadow?.close();
@@ -4370,16 +4071,6 @@ export function effectiveFileStorageMode(): "legacy" | "shadow" | "full" {
 function buildRecord(session: Session, storageMode: "legacy" | "shadow" | "full" = effectiveFileStorageMode()): PersistedSession {
     const snapshot = boundedFoldedSnapshot(session);
     const observation = currentContextObservation(session);
-    if (session.pluginSnapshot && session.contentStore) {
-        const previous = session.metadata.publicSnapshotStoredRefs;
-        session.metadata.publicSnapshotStoredRefs = [...new Set([
-            ...(Array.isArray(previous) ? previous : []),
-            ...session.pluginSnapshot.flatMap((m) => {
-                const ref = session.state.messageRefs.byRaw[m.id];
-                return ref && session.contentStore!.byRef[ref] ? [ref] : [];
-            }),
-        ])];
-    }
     return {
         version: PERSIST_VERSION,
         savedAt: Date.now(),
@@ -4395,7 +4086,6 @@ function buildRecord(session: Session, storageMode: "legacy" | "shadow" | "full"
         // sessions pay no disk cost; the in-memory copy self-heals on the next
         // model request because plugin agents resend their full history.
         pluginSnapshot: session.metadata.publicForkReceipt !== undefined || session.metadata.publicSnapshotRetained === true ? session.pluginSnapshot : undefined,
-        forkContentStore: session.metadata.publicForkReceipt ? session.contentStore : undefined,
         // Per-session provenance: record the bili build that wrote this file so the
         // web UI can show which version last touched the session; pre-stamp files
         // load without the key and render an honest dash.
@@ -4551,13 +4241,6 @@ function buildSession(parsed: PersistedSession): Session {
             // unrelated post-reload report, and losing it costs one log suffix.
             // lastLocalTextEstimate(+Origin) is the pending k̂ pairing input whose
             // session.ts doc already says "a restart simply loses one pending pair".
-            retrieveCalls: stats.retrieveCalls ?? 0,
-            retrieveHits: stats.retrieveHits ?? 0,
-            retrieveMisses: stats.retrieveMisses ?? 0,
-            retrieveDropped: stats.retrieveDropped ?? 0,
-            retrieveDelivered: stats.retrieveDelivered ?? 0,
-            storedBytes: stats.storedBytes ?? 0,
-            storeBytesSaved: stats.storeBytesSaved ?? 0,
             rangeRestores: stats.rangeRestores ?? 0,
             // #1336: retrieval-quality counters (whole-block restores vs cheaper
             // precise path available) — round-trip so the long-run ratio in
@@ -4584,13 +4267,11 @@ function buildSession(parsed: PersistedSession): Session {
         // #1343: arm the reload reconcile for the first request of THIS
         // process — getSession() clears `restored` before prepare runs, so
         // the reconcile needs its own one-shot marker to fire exactly once.
-        ccrReconcilePending: true,
         blockContents,
         lastMessages: Array.isArray(parsed.messages) ? parsed.messages : undefined,
         lastMessagesFolded: parsed.messagesFolded === true,
         pluginSnapshot: Array.isArray(parsed.pluginSnapshot) ? parsed.pluginSnapshot : undefined,
         decompositionLog: Array.isArray(parsed.decompositionLog) ? parsed.decompositionLog : undefined,
-        contentStore: parsed.forkContentStore,
         inFlight: 0,
         persisted: true,
         pendingRetrievals: [],
@@ -4646,7 +4327,6 @@ function viewToRecord(view: LegacySessionLike): PersistedSession {
         record.messagesFolded = view.lastMessagesFolded === true;
     }
     if (view.pluginSnapshot !== undefined) record.pluginSnapshot = view.pluginSnapshot;
-    if (view.contentStore !== undefined) record.forkContentStore = view.contentStore as unknown as NonNullable<PersistedSession["forkContentStore"]>;
     return record;
 }
 

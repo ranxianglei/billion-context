@@ -99,7 +99,7 @@ test("envelope import: stored block lineage is preserved; new messages still lan
                 session: sessionRow("imp-lineage", T0, 100),
                 messages: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(msgRow),
                 blocks: [blockRow("b1", 0, "fine summary one", ids(0, 4), T0), blockRow("b2", 1, "fine summary two", ids(5, 9), T0)],
-                deadRefs: [], refs: [], ccrEntries: [],
+                deadRefs: [], refs: [],
             });
             assert.equal(store.getBlocks("imp-lineage").length, 2);
 
@@ -111,7 +111,7 @@ test("envelope import: stored block lineage is preserved; new messages still lan
                 session: sessionRow("imp-lineage", T0 + 5_000, 2),
                 messages: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(msgRow),
                 blocks: [blockRow("b1", 0, "COARSE summary of everything", ids(0, 12), T0 + 5_000)],
-                deadRefs: [], refs: [], ccrEntries: [],
+                deadRefs: [], refs: [],
             }, undefined, { envelopeImport: true });
 
             const blocks = store.getBlocks("imp-lineage");
@@ -144,7 +144,7 @@ test("envelope import: stats may advance, never regress", () => {
                 session: sessionRow("imp-stats", T0, 100),
                 messages: [0, 1, 2].map(msgRow),
                 blocks: [blockRow("b1", 0, "s", ids(0, 2), T0)],
-                deadRefs: [], refs: [], ccrEntries: [],
+                deadRefs: [], refs: [],
             });
             // Same envelope, but its counter is AHEAD — a same-lineage
             // continuation: the update applies.
@@ -152,7 +152,7 @@ test("envelope import: stats may advance, never regress", () => {
                 session: sessionRow("imp-stats", T0 + 1_000, 150),
                 messages: [0, 1, 2].map(msgRow),
                 blocks: [blockRow("b1", 0, "s", ids(0, 2), T0)],
-                deadRefs: [], refs: [], ccrEntries: [],
+                deadRefs: [], refs: [],
             }, undefined, { envelopeImport: true });
             assert.equal(store.getSessionRow("imp-stats")!.statsJson, JSON.stringify({ requests: 150 }), "advancing counters must apply");
 
@@ -161,7 +161,7 @@ test("envelope import: stats may advance, never regress", () => {
                 session: sessionRow("imp-stats", T0 + 2_000, 3),
                 messages: [0, 1, 2].map(msgRow),
                 blocks: [blockRow("b1", 0, "s", ids(0, 2), T0)],
-                deadRefs: [], refs: [], ccrEntries: [],
+                deadRefs: [], refs: [],
             }, undefined, { envelopeImport: true });
             assert.equal(store.getSessionRow("imp-stats")!.statsJson, JSON.stringify({ requests: 150 }), "a smaller incoming total must not regress the stored counters");
         } finally {
@@ -181,7 +181,7 @@ test("envelope import: a session with no stored blocks adopts the envelope struc
                 session: sessionRow("imp-first", T0, 5),
                 messages: [0, 1, 2, 3, 4].map(msgRow),
                 blocks: [blockRow("b1", 0, "e", ids(0, 4), T0)],
-                deadRefs: [], refs: [], ccrEntries: [],
+                deadRefs: [], refs: [],
             }, undefined, { envelopeImport: true });
             assert.equal(store.getBlocks("imp-first").length, 1, "true first import must adopt the envelope's blocks");
         } finally {
@@ -201,7 +201,7 @@ test("organic save (flag off): the writer's block set stays authoritative", () =
                 session: sessionRow("imp-organic", T0, 1),
                 messages: [0, 1, 2, 3].map(msgRow),
                 blocks: [blockRow("b1", 0, "fine one", ids(0, 1), T0), blockRow("b2", 1, "fine two", ids(2, 3), T0)],
-                deadRefs: [], refs: [], ccrEntries: [],
+                deadRefs: [], refs: [],
             });
             // A live-writer save whose state genuinely has one coarse block:
             // the old authoritative-set discipline must keep applying.
@@ -209,7 +209,7 @@ test("organic save (flag off): the writer's block set stays authoritative", () =
                 session: sessionRow("imp-organic", T0 + 1_000, 2),
                 messages: [0, 1, 2, 3].map(msgRow),
                 blocks: [blockRow("b1", 0, "coarse all", ids(0, 3), T0 + 1_000)],
-                deadRefs: [], refs: [], ccrEntries: [],
+                deadRefs: [], refs: [],
             });
             const blocks = store.getBlocks("imp-organic");
             assert.equal(blocks.length, 1, "organic saves must still sweep absent blocks");

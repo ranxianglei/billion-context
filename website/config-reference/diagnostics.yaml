@@ -180,18 +180,6 @@ entries:
     desc_ja: "bili 内で Codex のコンパクト化要求を処理する (intercept, デフォルト) または上流へ転送する (pass): 明示的な形式 (compaction_trigger + /responses/compact) と、通常のターンとして通過するインライン自動コンパクト化 (SUMMARIZATION_PROMPT テンプレート (#3008) によって検出) — ユーザーが上書きした compact_prompt は検出から外れ、そのまま通過する; bili が観察のみ (pass/gate) したコンパクト化は事後にリベースされる (#2372)。"
     site_en: "<code>codexCompact</code> — intercept | pass (default intercept): handle Codex's compaction requests in bili or forward upstream — explicit forms plus the inline auto-compact transiting as an ordinary turn (prompt-form detection, #3008; overridden compact_prompt transits verbatim)."
     site_zh: "<code>codexCompact</code> —— intercept | pass（默认 intercept）：在 bili 内处理 Codex 压缩请求或转给上游 —— 显式形态 + 以普通请求形态过线的内联自动压缩（prompt 文本检测，#3008；自定义 compact_prompt 按原样转发）。"
-  - key: ccrRetrievalTtlMs
-    type: number
-    default: "600000 (0 disables retrieval)"
-    env: BILI_CCR_RETRIEVAL_TTL_MS
-    group: diagnostics
-    id: ttl.ttl
-    site_group: adv
-    desc_en: "Lifetime of CCR retrieval pointers before originals stop being fetchable via acp_retrieve."
-    desc_zh: "CCR 回取指针的有效期，过期后原文不再可通过 acp_retrieve 取回。"
-    desc_ja: "acp_retrieve 経由でオリジナルを取得できなくなるまでの CCR 検索ポインタの生存期間。"
-    site_en: "<code>ccrRetrievalTtlMs</code> — lifetime of CCR retrieval pointers (default 600000; 0 disables retrieval)."
-    site_zh: "<code>ccrRetrievalTtlMs</code> —— CCR 回取指针有效期（默认 600000；0 禁用回取）。"
   - key: decompressTmpCap
     type: number
     default: "50"
