@@ -2242,6 +2242,10 @@ interface InvalidationTokenBreakdown {
     wire: number;
     upstream: number;
     restart: number;
+    /** #7687: stable-prefix re-bill on samples whose outbound body diverged
+     *  mid-history (body-stability `mid`) with no fold/switch/restart attribution —
+     *  client/proxy-side rewrite, not upstream TTL/eviction. */
+    seam: number;
     /** Residual stable-prefix miss NOT charged to any named cause — the true
      *  upstream TTL/eviction/wire-rewrite remainder (kernel cannot name it). */
     remaining: number;
@@ -2407,7 +2411,8 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         wire: a.wireSwitchMissed,
         upstream: a.upstreamSwitchMissed,
         restart: a.restartDropMissed,
-        remaining: Math.max(0, a.tr - a.attributedMissed),
+        seam: a.seamMissed,
+        remaining: Math.max(0, a.tr - a.attributedMissed - a.seamMissed),
     };
     // #2131: per-call body-stability proof + hit-rate context checks (size
     // stratification, gap split) — computed from the stored line flags.
@@ -2810,7 +2815,7 @@ function formatSeam(r: BiliCacheReport): string {
 
 function formatInvalidation(r: BiliCacheReport): string {
     const b = r.invalidation;
-    const named = b.model + b.effort + b.key + b.prompt + b.projection + b.wire + b.upstream + b.restart;
+    const named = b.model + b.effort + b.key + b.prompt + b.projection + b.wire + b.upstream + b.restart + b.seam;
     const total = named + b.remaining;
     const out: string[] = ["CACHE INVALIDATION"];
     out.push(`  stable-prefix re-bill by cause (mutually exclusive, sums to total): ${fmtTok(named)} tok charged · ${fmtTok(b.remaining)} tok unattributed (upstream TTL/eviction/wire rewrite)`);
@@ -2822,11 +2827,12 @@ function formatInvalidation(r: BiliCacheReport): string {
     out.push(`    wire switch:     ${fmtTok(b.wire)} (${r.wireSwitches.count})`);
     out.push(`    upstream switch: ${fmtTok(b.upstream)} (${r.upstreamSwitches.count})`);
     out.push(`    restart/refork:  ${fmtTok(b.restart)} (${r.restartDrops.count})`);
+    out.push(`    seam (mid-history rewrite): ${fmtTok(b.seam)} (${r.seam.suspects}) — outbound body diverged mid-history with no fold/switch/restart attribution; client/proxy-side rewrite, not upstream TTL/eviction (#7687)`);
     // #1847: a dominant unattributed residual with NO observed cause is the misleading case — the README
     // triage order would steer users to "③ bili bug". Name it explicitly as expected provider-side behavior.
     if (b.remaining > 0 && total > 0 && b.remaining / total >= 0.5) {
         const pct = Math.round((b.remaining / total) * 100);
-        const noCauseEver = r.modelSwitches.count === 0 && r.effSwitches.count === 0 && r.keySwitches.count === 0 && r.promptSwitches.count === 0 && r.projSwitches.count === 0 && r.wireSwitches.count === 0 && r.upstreamSwitches.count === 0 && r.restartDrops.count === 0;
+        const noCauseEver = r.modelSwitches.count === 0 && r.effSwitches.count === 0 && r.keySwitches.count === 0 && r.promptSwitches.count === 0 && r.projSwitches.count === 0 && r.wireSwitches.count === 0 && r.upstreamSwitches.count === 0 && r.restartDrops.count === 0 && r.seam.suspects === 0;
         out.push(noCauseEver
             ? `  ⚠ ${pct}% of your stable-prefix re-bill has no observable cause (no model/wire/upstream switch or restart seen) — expected provider-side behavior (cache TTL expiry / eviction / relay rotation), NOT a bili bug; if reproducible see #1195 coverage-mismatch`
             : `  ⚠ ${pct}% of your stable-prefix re-bill is unnameable provider-side behavior (cache TTL expiry / eviction / relay rotation) beyond the causes listed above`);

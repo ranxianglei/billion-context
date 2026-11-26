@@ -835,3 +835,16 @@ test("canonicalSysFpForSettle is gated to the responses wire only (#2973)", () =
     assert.equal(canonicalSysFpForSettle(empty, "responses"), undefined);
     assert.equal(canonicalSysFpForSettle(makeSession(), "responses"), undefined);
 });
+
+test("InvalidationTokenBreakdown includes seam field and excludes it from remaining (#7687)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 40000, cached: 40000 });
+    const r = buildSessionCacheReport(session);
+    assert.ok("seam" in r.invalidation, "InvalidationTokenBreakdown has a seam field");
+    assert.equal(typeof r.invalidation.seam, "number", "seam field is a number");
+    assert.equal(r.invalidation.seam, 0, "no seam suspects in this session");
+    const a = (session.metadata as Record<string, { agg: Record<string, number> }>)["cacheLedger"]!.agg;
+    const expectedRemaining = Math.max(0, a.tr - a.attributedMissed - (a.seamMissed ?? 0));
+    assert.equal(r.invalidation.remaining, expectedRemaining, "remaining excludes seam re-pays");
+});
