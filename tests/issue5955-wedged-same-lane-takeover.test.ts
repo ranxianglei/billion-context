@@ -279,7 +279,7 @@ async function assertRejectsSecondWriter(w: World, holder: ProxyInstanceFile, ov
     } catch (e) {
         err = e;
     }
-    assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second same-lane writer"),
+    assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second"),
         `expected the #7156 second-writer refusal, got: ${err instanceof Error ? err.message : String(err)}`);
     w.gateRefusals += 1;
 }
@@ -669,6 +669,30 @@ test("#5955 negative: BUSY holder on a different port untouched", async () => {
     const handle = await runCycle(w, holder);
 
     assert.equal(w.spawnCalls, 1);
+    assert.equal(w.shutdownCalls.length, 0);
+    assert.equal(w.killCalls.length, 0);
+    assert.equal(handle.port, PORT, "the spawn still binds the canonical port");
+    assert.equal(watchingLines(w).length, 0);
+});
+
+test("#7676: no-lane (manual bili start) on the target port refuses the spawn", async () => {
+    const w = makeWorld({ gracefulShutdown: true, killReleases: false });
+    const holder = { ...wedgedHolder(), lane: undefined, launchToken: undefined };
+    await assertRejectsSecondWriter(w, holder);
+
+    assert.equal(w.spawnCalls, 0, "the gate refuses instead of laddering to +1");
+    assert.equal(w.shutdownCalls.length, 0, "no automatic kills on the user's own process");
+    assert.equal(w.signalCalls.length, 0);
+    assert.equal(w.killCalls.length, 0);
+    assert.equal(watchingLines(w).length, 0, "no wedge-takeover watch for a no-lane holder");
+});
+
+test("#7676 negative: no-lane (manual bili start) on a DIFFERENT port is untouched", async () => {
+    const w = makeWorld({ gracefulShutdown: true, killReleases: false });
+    const holder = { ...wedgedHolder(), lane: undefined, launchToken: undefined, port: 18799, origin: `http://${HOST}:18799` };
+    const handle = await runCycle(w, holder);
+
+    assert.equal(w.spawnCalls, 1, "a no-lane holder off the target port is not a predecessor");
     assert.equal(w.shutdownCalls.length, 0);
     assert.equal(w.killCalls.length, 0);
     assert.equal(handle.port, PORT, "the spawn still binds the canonical port");
