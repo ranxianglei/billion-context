@@ -45,6 +45,7 @@ for (const writer of writers) {
         writer.clear();
         await store.deleteKvAsync(writer.name, "v1");
         fs.rmSync(legacyFile(writer.name), { force: true });
+        fs.rmSync(`${legacyFile(writer.name)}.journal`, { recursive: true, force: true });
     }
 
     test(`${writer.name}: failed hydration read preserves the durable peer snapshot`, async (t) => {
@@ -104,10 +105,15 @@ for (const writer of writers) {
             assert.deepEqual(await read(writer.name, "v1"), peer, "a failed merge read must leave the stored snapshot unchanged");
             t.mock.restoreAll();
             await writer.flush();
-            assert.ok(fs.existsSync(legacyFile(writer.name)), "the next flush uses the documented legacy fallback");
-            assert.deepEqual(await read(writer.name, "v1"), peer);
-            const fallback = JSON.parse(fs.readFileSync(legacyFile(writer.name), "utf8")) as { entries: unknown[] };
-            assert.equal(fallback.entries.length, 1, "the local update survives in the fallback carrier");
+            assert.deepEqual(await read(writer.name, "v1"), peer, "the demoted write leaves the unified row unchanged");
+            // #5480: the demoted write publishes an immutable journal leaf (the
+            // legacy baseline is never rewritten), so the local update survives
+            // in the journal, not in the legacy file.
+            const journalDir = `${legacyFile(writer.name)}.journal`;
+            const leaves = fs.readdirSync(journalDir).filter((n) => n.startsWith("pub-"));
+            assert.equal(leaves.length, 1, "the demoted flush publishes exactly one journal leaf");
+            const fallback = JSON.parse(fs.readFileSync(path.join(journalDir, leaves[0], "snapshot.json"), "utf8")) as { entries: unknown[] };
+            assert.equal(fallback.entries.length, 1, "the local update survives in the journal fallback carrier");
             await writer.hydrate();
             const recovered = await read(writer.name, "v1") as { entries: unknown[] };
             assert.equal(recovered.entries.length, 2, "successful retry reunites peer and local state");
