@@ -107,15 +107,34 @@ const OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT = 0.25;
 // nudge each turn once usage reaches this — kept under the default 0.75
 // over-limit line so it fills the pre-limit silent climb seen in #453/#14. Pure
 // host-side: renderNudgeText does not depend on shouldInject.
-const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
+export const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
+const DEFAULT_MAX_CONTEXT_LIMIT_PCT = 0.75;
+
+/** Resolve the effective host-side emergency escalation line (#453). Under the
+ *  default over-limit line (0.75), the escalation line sits 5 percentage points
+ *  below it (0.70) to cover the pre-limit silent zone. When an operator raises
+ *  maxContextLimitPct above the default (e.g. 0.78 or 0.85), shift the
+ *  escalation line proportionally (maxContextLimitPct - 0.05) so it never fires
+ *  at hardcoded 0.70 inside the operator's intended quiet band. */
+export function resolveEmergencyEscalationPct(maxContextLimitPct?: number): number {
+    if (typeof maxContextLimitPct === "number" && Number.isFinite(maxContextLimitPct) && maxContextLimitPct > DEFAULT_MAX_CONTEXT_LIMIT_PCT) {
+        return Math.max(EMERGENCY_NUDGE_ESCALATION_PCT, maxContextLimitPct - (DEFAULT_MAX_CONTEXT_LIMIT_PCT - EMERGENCY_NUDGE_ESCALATION_PCT));
+    }
+    return EMERGENCY_NUDGE_ESCALATION_PCT;
+}
 
 // #5230: resolve the host-side escalation line off a resolved kernel config.
 // The value rides the ResolvedKernelConfig rail (host-only, never sent to the
-// kernel); an absent or non-positive value keeps the 0.7 default, so behavior
-// is byte-identical to pre-#5230 unless a level sets compress.nudgeEscalationPct.
+// kernel). An explicit positive compress.nudgeEscalationPct wins; an absent or
+// non-positive value falls back to the #7605 auto-track
+// (resolveEmergencyEscalationPct), which keeps the 0.70 default and tracks
+// maxContextLimitPct - 0.05 once an operator raises the over-limit line — so
+// behavior is byte-identical to pre-#5230 unless a level sets the field.
 export function resolveNudgeEscalationPct(config: unknown): number {
-    const v = (config as { nudgeEscalationPct?: unknown } | null | undefined)?.nudgeEscalationPct;
-    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : EMERGENCY_NUDGE_ESCALATION_PCT;
+    const c = config as { nudgeEscalationPct?: unknown; nudge?: { maxContextLimitPct?: number } } | null | undefined;
+    const v = c?.nudgeEscalationPct;
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
+    return resolveEmergencyEscalationPct(c?.nudge?.maxContextLimitPct);
 }
 
 /** #2391: a budget view only; never forward this projection. OpenAI tool search
@@ -223,6 +242,13 @@ export interface ThinkingMassInput {
      *  the inbound body because it captures the proxy-injected ACP content that
      *  was actually billed last turn. Ignored when not a positive finite number. */
     storedOverhead?: number;
+    /** Active per-route estimator scale k̂ (currentCalibrationFactor) + provenance
+     *  so the visible text+overhead baseline is compared against providerInputTokens
+     *  in billed units and the residual is stored back in local-estimate units,
+     *  preventing double multiplication when preflight/output-clamp apply k̂. */
+    calibrationFactor?: number;
+    calibrationOrigin?: string;
+    currentOrigin?: string;
 }
 
 /** Project the hidden thinking mass onto signature-only reasoning messages.
@@ -244,7 +270,11 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
     const overhead = typeof input.storedOverhead === "number" && Number.isFinite(input.storedOverhead) && input.storedOverhead > 0
         ? input.storedOverhead
         : countSystemAndToolsTokens(input.systemText, input.tools);
-    const gap = Math.max(0, input.providerInputTokens - estimateCoreMessages(msgs) - overhead - Math.max(0, input.imageTokens));
+    const effK = applyEstimateCalibration(1, input.calibrationFactor, input.calibrationOrigin, input.currentOrigin);
+    const localBase = estimateCoreMessages(msgs) + overhead;
+    const billedGap = Math.max(0, input.providerInputTokens - localBase * effK - Math.max(0, input.imageTokens));
+    if (billedGap <= 0) return 0;
+    const gap = Math.round(billedGap / effK);
     if (gap <= 0) return 0;
     const totalSig = targets.reduce((s, t) => s + t.sig, 0);
     let assigned = 0;
@@ -460,6 +490,17 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
     return !(typeof minBenefit === "number" && Number.isFinite(minBenefit) && minBenefit > 0 && (b.maxPending ?? 0) < minBenefit);
 }
 
+export function emergencyNudgeForConfig(
+    nudge: NudgeDecision | null | undefined,
+    loopConfig: { compress: { minCompressRange: number }; nudge: { maxContextLimitPct?: number }; nudgeEscalationPct?: number },
+): boolean {
+    return emergencyNudge(
+        nudge,
+        resolveNudgeEscalationPct(loopConfig),
+        loopConfig.compress.minCompressRange,
+    );
+}
+
 /** #3461 problem 2: backoff for the EMERGENCY override. The pure check above
  * has no cadence of its own — once usage sits over the escalation line it
  * re-arms on EVERY request, so a headless client retrying a doomed request
@@ -481,16 +522,21 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
  * Kernel-driven injections (nudge.shouldInject=true) never pass through here —
  * call sites OR them in BEFORE the emergency arm, so normal cadence is
  * untouched. State lives in session.metadata.emergencyNudgeGate (survives
- * restarts with the snapshot, visible on /__bili/sessions like selfHeal). */
-export function emergencyNudgeArmed(
+ * restarts with the snapshot, visible on /__bili/sessions like selfHeal).
+  * The escalation line is config-aware: an explicit compress.nudgeEscalationPct
+  * (#5230) wins when set; otherwise resolveEmergencyEscalationPct (#7605) keeps
+  * the default 0.70 and tracks maxContextLimitPct - 0.05 once an operator raises
+  * the over-limit line above the 0.75 default. Call sites pass the resolved
+  * loop config; resolution goes through resolveNudgeEscalationPct. */
+ export function emergencyNudgeArmed(
     session: Session,
     nudge: NudgeDecision | null | undefined,
     minCompressRange: number,
     tokenCount: number,
     growthStep?: number,
-    escalationPct?: number,
+    loopConfig?: { nudge?: { maxContextLimitPct?: number }; nudgeEscalationPct?: number },
 ): boolean {
-    if (!emergencyNudge(nudge, escalationPct, minCompressRange)) return false;
+    if (!emergencyNudge(nudge, resolveNudgeEscalationPct(loopConfig), minCompressRange)) return false;
     const now = Date.now();
     const key = reductionKeyOf(session);
     const raw = session.metadata["emergencyNudgeGate"];

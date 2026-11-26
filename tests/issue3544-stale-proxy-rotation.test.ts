@@ -148,6 +148,11 @@ async function runBringUp(t: BringUpCase) {
                 staleDead = true;
                 return true;
             },
+            // #7156: the mock resident "dies" with the graceful release — the
+            // pre-spawn second-writer gate's safety condition is process
+            // death, and process.pid (the mock's pid) can never really exit.
+            isConnectable: async (origin) => origin === staleOrigin ? !staleDead : true,
+            isPidAlive: (pid) => (pid === process.pid ? !staleDead : false),
         },
     );
     return { shutdownCalls, spawnCalls, handle, clock };
@@ -171,9 +176,20 @@ test("#3544 equal-version resident is never rotated (no churn on equal builds)",
 });
 
 test("#3544 user-zone daemons are never touched by rotation", async () => {
-    const r = await runBringUp({ healthVersion: "0.0.1", userZone: true });
-    assert.equal(r.shutdownCalls.length, 0);
-    assert.equal(r.spawnCalls, 1);
+    // #7675 behavior change: a live lane-less (user-zone) daemon on the
+    // target port is still NEVER rotated or killed — but it is now counted
+    // by the second-writer gate, so the launch refuses instead of spawning
+    // a silent second writer behind it (spawnCalls 1 -> 0).
+    let err: unknown;
+    let r: Awaited<ReturnType<typeof runBringUp>> | undefined;
+    try {
+        r = await runBringUp({ healthVersion: "0.0.1", userZone: true });
+    } catch (e) {
+        err = e;
+    }
+    assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second writer"), `refusal: ${err instanceof Error ? err.message : String(err)}`);
+    assert.ok(err instanceof Error && err.message.includes("no lane declared"), "the refusal says what the holder is");
+    assert.equal(r, undefined, "no handle — the user's daemon is untouched and no second writer spawned");
 });
 
 test("#3544 unarmed-watchdog residents are never rotated", async () => {
@@ -341,7 +357,7 @@ interface Resident {
     close: () => Promise<void>;
 }
 
-function startResident(version: string, exitOnShutdown: boolean): Promise<Resident> {
+function startResident(version: string, exitOnShutdown: boolean, commit?: string): Promise<Resident> {
     let shutdowns = 0;
     let down = false;
     const server = http.createServer((req, res) => {
@@ -355,7 +371,7 @@ function startResident(version: string, exitOnShutdown: boolean): Promise<Reside
         if (req.url === "/__bili/plugin/manifest") {
             if (down && exitOnShutdown) { res.writeHead(503); res.end(); return; }
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ version }));
+            res.end(JSON.stringify(commit === undefined ? { version } : { version, commit }));
             return;
         }
         res.writeHead(404);
@@ -404,6 +420,39 @@ test("#3544/#3617-E② pinned attach: a strictly older resident is rotated out a
         await withPinnedEnv({ DSH_HOME: home, XDG_STATE_HOME: stateHome, BILLION_CONTEXT_PROXY: resident.origin }, async () => {
             const landed = await verifyAttachAndRecover(resident.origin);
             assert.equal(landed, "http://127.0.0.1:2", "rotated out: the spawned origin wins");
+            assert.equal(spawnCalls, 1, "spawn fallback ran exactly once");
+            assert.equal(resident.shutdowns, 1, "graceful shutdown requested exactly once");
+            assert.equal(_registerStateForTest().base, "http://127.0.0.1:2", "register re-based onto the fresh spawn");
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, undefined, "preset unfrozen");
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        await resident.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(stateHome, { recursive: true, force: true });
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#6899 pinned attach: a strictly older resident is rotated even when its manifest version carries the ` (commit)` suffix", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-6899pin-home-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-6899pin-state-"));
+    // Every normal build serves `version (commit)` from the manifest (#6899):
+    // the display suffix must not make the strictly-older resident look
+    // incomparable — the rotation decision compares the clean semver.
+    const resident = await startResident("0.0.1", true, "4d2382bd5");
+    let spawnCalls = 0;
+    try {
+        _resetRoutedForTest();
+        _resetRegisterForTest(resident.origin);
+        _setSpawnForTest(async () => {
+            spawnCalls += 1;
+            return "http://127.0.0.1:2";
+        });
+        await withPinnedEnv({ DSH_HOME: home, XDG_STATE_HOME: stateHome, BILLION_CONTEXT_PROXY: resident.origin }, async () => {
+            const landed = await verifyAttachAndRecover(resident.origin);
+            assert.equal(landed, "http://127.0.0.1:2", "rotated out: the suffixed older version still compares older");
             assert.equal(spawnCalls, 1, "spawn fallback ran exactly once");
             assert.equal(resident.shutdowns, 1, "graceful shutdown requested exactly once");
             assert.equal(_registerStateForTest().base, "http://127.0.0.1:2", "register re-based onto the fresh spawn");

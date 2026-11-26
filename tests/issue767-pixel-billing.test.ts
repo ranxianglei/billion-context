@@ -428,6 +428,15 @@ test("e2e #767 control: explicit bytes route still fails fast — relay protecti
         const s = listSessions().find((x) => x.meta.label === "img-byt-sess");
         assert.ok(s);
         s!.stats.lastInputTokens = STALE_BASELINE;
+        // Identity-fast-path guard: the seed settles a genuine same-origin usage
+        // baseline, which alone would open the trusted fast path and the #496
+        // image hatch (a usage-grade bill ≥ window is now tolerance evidence).
+        // This pin targets the evidence-judged 413 contract, so declare the
+        // overflow wall — source + statedWall keep the hatch closed and demote
+        // the fast path; the wall equals the configured window, so the judge's
+        // limit is unchanged.
+        s!.stats.lastInputTokensSource = "overflow-arm";
+        s!.stats.overflowArmTokens = WINDOW;
 
         const r2 = await fetch(url, { method: "POST", headers, body: imageTurn("img-byt-sess") });
         // #3461: structurally doomed (byte-billed images can't fold enough) → 413.
@@ -507,10 +516,15 @@ test("e2e #767: learned-limit-only variant also closes forward-once (explicit by
         const s = listSessions().find((x) => x.meta.label === "img-lrn-sess");
         assert.ok(s);
         assert.ok(s!.stats.lastInputTokens < WINDOW, "baseline is fresh here");
-        // #987 removed the window learner; the equivalent usage-grounded
+        // #987 removed the window learner; the equivalent overflow-grounded
         // evidence (what an overflow 400's arm leaves behind) closes the gate.
+        // Identity-fast-path update: a usage-grade bill is now tolerance
+        // evidence (#496 hatch open), so stamp the real overflow-arm provenance
+        // (source + stated wall) — the overflow evidence this pin targets —
+        // which also demotes the trusted fast path.
         (s!.stats as { lastInputTokens: number }).lastInputTokens = WINDOW;
-        (s!.stats as { lastInputTokensSource: string }).lastInputTokensSource = "usage";
+        (s!.stats as { lastInputTokensSource: string }).lastInputTokensSource = "overflow-arm";
+        (s!.stats as { overflowArmTokens: number }).overflowArmTokens = WINDOW;
 
         const r2 = await fetch(url, { method: "POST", headers, body: imageTurn("img-lrn-sess") });
         // #3461: structurally doomed (byte-billed images can't fold enough) → 413.
@@ -547,6 +561,11 @@ test("e2e #767: env BILI_IMAGE_BILLING beats per-provider route config", async (
         const s = listSessions().find((x) => x.meta.label === "img-env-sess");
         assert.ok(s);
         s!.stats.lastInputTokens = STALE_BASELINE;
+        // Identity-fast-path guard: same as the explicit-bytes control above —
+        // the seed's usage baseline would open the trusted fast path and the
+        // #496 image hatch; declare the overflow wall to keep the 413 contract.
+        s!.stats.lastInputTokensSource = "overflow-arm";
+        s!.stats.overflowArmTokens = WINDOW;
 
         process.env.BILI_IMAGE_BILLING = "bytes";
         let r2: Response;

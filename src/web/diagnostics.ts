@@ -47,7 +47,7 @@ import { resolveDshHome } from "../client-config.js";
 import { safeReadJson } from "../config.js";
 import { recentClientUas } from "../client-ua-registry.js";
 import { redactForPublish } from "../log-mask.js";
-import { readLogLines } from "../log-file-lines.js";
+import { readLogFileLines } from "../log-file-lines.js";
 import { getLogPath } from "../logger.js";
 import { logGenerations } from "../log-retention.js";
 import { configFile, defaultLogFile } from "../paths.js";
@@ -96,22 +96,17 @@ function baseLines(): string[] {
     ];
 }
 
-// #3813: count full-pair scans so tests pin the single-read-per-report
-// contract (a regression to per-tail reads would re-double the cost).
+// #3813: keep tail collection shared if a topic needs both kinds of evidence.
 let candidateLogReads = 0;
 
-/** All non-empty lines across every retained generation (sealed history oldest-
- *  first, then the active file); [] on any fs failure. ONE enumeration shared
- *  with the other default readers, read once per report (#3813).
- *  Streaming: the retention set is a byte budget of many generations, so this
- *  keeps only the two bounded tails the report publishes instead of every line
- *  of every generation. */
+/** Collect bounded chronological tails, starting with the newest generation.
+ *  Once a requested tail is full, older files cannot contribute to it. Each
+ *  needed file is still streamed to its end to select its newest matches. */
 async function candidateLogTails(needStorage: boolean, needConflict: boolean): Promise<{
     storage: string[];
     conflict: string[];
-    /** Files that could not be read — the tails are then INCOMPLETE and the
-     *  report must say so rather than present a partial scan as the whole
-     *  retained history. */
+    /** Needed files that could not be read — the tails are then INCOMPLETE
+     *  even if older readable generations fill the remaining slots. */
     unreadable: string[];
 }> {
     candidateLogReads += 1;
@@ -123,12 +118,21 @@ async function candidateLogTails(needStorage: boolean, needConflict: boolean): P
         if (into.length > cap) into.shift();
     };
     try {
-        const files = logGenerations(getLogPath() ?? defaultLogFile()).map((g) => g.path);
-        for await (const line of readLogLines(files, { onError: (f) => unreadable.push(f) })) {
-            if (needStorage && line.includes("[storage]")) pushBounded(storage, line, STORAGE_LOG_TAIL_LINES);
-            if (needConflict && CONFLICT_LOG_PATTERNS.some((p) => line.includes(p))) {
-                pushBounded(conflict, line, CONFLICT_LOG_TAIL_LINES);
+        const files = logGenerations(getLogPath() ?? defaultLogFile());
+        for (let i = files.length - 1; i >= 0; i--) {
+            const storageRemaining = needStorage ? STORAGE_LOG_TAIL_LINES - storage.length : 0;
+            const conflictRemaining = needConflict ? CONFLICT_LOG_TAIL_LINES - conflict.length : 0;
+            if (storageRemaining === 0 && conflictRemaining === 0) break;
+            const fileStorage: string[] = [];
+            const fileConflict: string[] = [];
+            for await (const line of readLogFileLines(files[i]!.path, { onError: (f) => unreadable.push(f) })) {
+                if (storageRemaining > 0 && line.includes("[storage]")) pushBounded(fileStorage, line, storageRemaining);
+                if (conflictRemaining > 0 && CONFLICT_LOG_PATTERNS.some((p) => line.includes(p))) {
+                    pushBounded(fileConflict, line, conflictRemaining);
+                }
             }
+            storage.unshift(...fileStorage);
+            conflict.unshift(...fileConflict);
         }
     } catch {
         // Enumeration or iteration blew up: report nothing rather than a
@@ -138,8 +142,7 @@ async function candidateLogTails(needStorage: boolean, needConflict: boolean): P
     return { storage, conflict, unreadable };
 }
 
-/** Last N `[storage]` lines from the pre-fetched candidate set ([] when none
- * match). The caller reads the rotated pair once per report (#3813). #4427:
+/** Last N `[storage]` lines collected for this report ([] when none match). #4427:
  * these are VERBATIM on-disk bytes (written under whatever BILI_LOG_MASK_HOSTS
  * was in effect), so each line gets the same publish-boundary redaction +
  * length bound as conflictLogTail — a [storage] line can carry a URL with
@@ -466,13 +469,7 @@ function attributionDiagnosticsLines(): string[] {
 export async function buildDiagnostics(topic?: string): Promise<DiagnosticsReport> {
     const t = safePrefix(topic?.trim() ?? "", 64);
     const def = t ? TOPICS[t] : undefined;
-    // #3813: read the rotated log pair at most ONCE per report — the storage
-    // tail and the conflict banner filter the SAME candidate lines, so a
-    // conflict-banner request used to read the whole pair twice (hundreds of MB
-    // possible), stalling the event loop synchronously. Both tails are now
-    // collected in the same streaming pass, which retains only their bounded
-    // buffers instead of every line of every generation.
-    const needStorage = Boolean(def);
+    const needStorage = t === "storage-legacy-only";
     const needConflict = t === "conflict-banner";
     const tails = needStorage || needConflict
         ? await candidateLogTails(needStorage, needConflict)
@@ -480,7 +477,7 @@ export async function buildDiagnostics(topic?: string): Promise<DiagnosticsRepor
     const ctx: TopicContext = {
         sessions: safeSessionCount(),
         storageLogLines: needStorage ? storageLogTail(tails.storage) : [],
-        conflicts: needStorage ? safeConflictSummary() : null,
+        conflicts: needConflict ? safeConflictSummary() : null,
         conflictLogLines: needConflict ? conflictLogTail(tails.conflict) : [],
         unreadableLogs: tails.unreadable,
     };
