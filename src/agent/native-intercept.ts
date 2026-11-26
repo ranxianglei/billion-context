@@ -14,6 +14,7 @@ import { envMillis } from "./native-bootstrap.js";
 import { matchModelEndpoint, type ModelEndpointPattern } from "../model-endpoints.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import { promptMassOfWireBody } from "./prompt-mass.js";
+import { BODY_DECODE_CAP_BYTES, bodyContentEncodingOf, decodeBodyBytes, restoredBodyText, type BodyContentEncoding } from "./body-encoding.js";
 import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, CALIBRATED_TEXT_TOKEN_RATIO, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
@@ -32,7 +33,7 @@ export type GateVerdict = boolean | "refuse-oversized" | "refuse-oversized-unatt
  *  upstream (see the state field). */
 export type DirectSendPrep =
     | { outcome: "as-is" }
-    | { outcome: "restored"; body: string }
+    | { outcome: "restored"; body: string | Uint8Array }
     | { outcome: "unrestorable" };
 
 /** #3654: why createLiveOriginResolver found nothing to route to — the
@@ -458,7 +459,7 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
  *  overrides), normalized to a lowercase-name record so response-time
  *  consumers can look up their per-request correlation id without re-deriving
  *  the merge rules. undefined when no headers exist or none can be read. */
-function outgoingHeadersOf(input: string | URL | Request, init?: RequestInit): Record<string, string> | undefined {
+export function outgoingHeadersOf(input: string | URL | Request, init?: RequestInit): Record<string, string> | undefined {
     try {
         const src = init?.headers !== undefined ? init.headers : input instanceof Request ? input.headers : undefined;
         if (src === undefined) return undefined;
@@ -1093,9 +1094,16 @@ function captureStampedWindow(headers: Record<string, string> | undefined): void
  *  FormData) → undefined → the size arm stays disarmed; never a false
  *  refusal from missing data. */
 async function directSendBodyMeasure(input: string | URL | Request, init: RequestInit | undefined): Promise<{ bytes: number; raw?: string } | undefined> {
+    const encoding = bodyContentEncodingOf(outgoingHeadersOf(input, init));
     const size = bodyByteSizeOf(init);
     if (size !== undefined) {
         const body: unknown = init?.body;
+        // #7698: a content-encoded wire body (omp sends gzip) must be measured
+        // on its DECODED bytes — the compressed size undercounts tokens ~2.7×,
+        // so a 1.88M-token body measured ~557K and sailed past the 1M window.
+        if (encoding !== undefined && (body instanceof Uint8Array || body instanceof ArrayBuffer)) {
+            return measureDecodedWireBody(body instanceof Uint8Array ? body : new Uint8Array(body), encoding, size.bytes);
+        }
         let raw: string | undefined;
         try {
             if (typeof body === "string") raw = body;
@@ -1114,12 +1122,31 @@ async function directSendBodyMeasure(input: string | URL | Request, init: Reques
     if (input instanceof Request) {
         try {
             const buf = await input.clone().arrayBuffer();
+            if (encoding !== undefined) {
+                return measureDecodedWireBody(new Uint8Array(buf), encoding, buf.byteLength);
+            }
             return { bytes: buf.byteLength, raw: new TextDecoder().decode(buf) };
         } catch {
             return undefined;
         }
     }
     return undefined;
+}
+
+/** #7698: measure a content-encoded wire body on its DECODED bytes.
+ *  `wireSize` is the compressed size, the fail-open fallback when the stream
+ *  is corrupt (undecodable → the #4912/#2496 discipline: unknown data never
+ *  triggers a refusal). too-large (decoded past the cap) → the cap is a lower
+ *  bound that still trips the refusal for any real window. */
+function measureDecodedWireBody(wire: Uint8Array, encoding: BodyContentEncoding | undefined, wireSize: number): { bytes: number; raw?: string } {
+    const decoded = decodeBodyBytes(wire, encoding);
+    if (decoded.status === "decoded") {
+        return { bytes: decoded.bytes.byteLength, raw: new TextDecoder().decode(decoded.bytes) };
+    }
+    if (decoded.status === "too-large") {
+        return { bytes: BODY_DECODE_CAP_BYTES, raw: undefined };
+    }
+    return { bytes: wireSize, raw: undefined };
 }
 
 /** #4516: local refusal for a DEGRADED direct send the lane proved cannot
@@ -1523,24 +1550,47 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
     }
 }
 
+/** #7698: a swapped-in body changes the wire size, so any declared
+ *  content-length is stale — an explicit one makes undici throw
+ *  UND_ERR_REQ_CONTENT_LENGTH_MISMATCH (fetch only recomputes when the header
+ *  is absent). Drop it and let fetch measure the new body; the content-encoding
+ *  header stays valid. */
+function withoutContentLength(headers: string[][] | Record<string, string | ReadonlyArray<string>> | Headers | undefined): Headers | undefined {
+    if (headers === undefined) return undefined;
+    try {
+        const h = new Headers(headers);
+        h.delete("content-length");
+        return h;
+    } catch {
+        return undefined; // unparseable headers — leave them as-is (fail open)
+    }
+}
+
 /** #3304: rebuild a fall-back dispatch carrying `body` INSTEAD of whatever
  *  `init`/the Request carried. The restored body rides INIT so fetch-spec
  *  precedence (init over Request fields) stays exactly what the original
- *  dispatch had; a string body needs no duplex. */
-export function withRestoredBody(input: string | URL | Request, init: RequestInit | undefined, body: string): { input: string | URL | Request; init: RequestInit | undefined } {
+ *  dispatch had; a string body needs no duplex. #7698: `body` may be a
+ *  Uint8Array (a content-encoded body the guard re-encoded to its original
+ *  coding) — the re-encoded size differs from the original, so the stale
+ *  content-length is dropped (see withoutContentLength) and fetch measures the
+ *  new body itself; the content-encoding header stays valid. */
+export function withRestoredBody(input: string | URL | Request, init: RequestInit | undefined, body: string | Uint8Array): { input: string | URL | Request; init: RequestInit | undefined } {
+    const initHeaders = withoutContentLength(init?.headers);
+    const initOut: RequestInit = { ...(init ?? {}), body };
+    if (initHeaders !== undefined) initOut.headers = initHeaders;
     if (input instanceof Request) {
         try {
-            const plain = new Request(input.url, { method: input.method, headers: input.headers, signal: input.signal });
-            return { input: plain, init: { ...(init ?? {}), body } };
+            const plain = new Request(input.url, { method: input.method, headers: withoutContentLength(input.headers) ?? input.headers, signal: input.signal });
+            return { input: plain, init: initOut };
         } catch {
             const headers: Record<string, string> = {};
             try {
-                for (const [k, v] of input.headers) headers[k] = v;
+                for (const [k, v] of input.headers) if (k.toLowerCase() !== "content-length") headers[k] = v;
             } catch {}
-            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body, signal: init?.signal !== undefined ? init.signal : input.signal } };
+            return { input: input.url, init: { ...initOut, method: input.method, headers, signal: init?.signal !== undefined ? init.signal : input.signal } };
         }
     }
-    return { input, init: { ...(init ?? {}), body } };
+    return { input, init: initOut };
 }
 
 /** Re-point the process-level live-state slot at the activating instance and
@@ -1835,7 +1885,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 fetchMethodOf(defaultInput, init) === "POST" &&
                 isModelApiUrl(dispatchUrl)
             ) {
-                const bodyText = prep.outcome === "restored" ? prep.body : await readableModelBodyText(defaultInput, init);
+                const bodyText = prep.outcome === "restored"
+                    ? restoredBodyText(prep.body, bodyContentEncodingOf(outgoingHeadersOf(defaultInput, init)))
+                    : await readableModelBodyText(defaultInput, init);
                 if (bodyText !== undefined && bodyText.includes(DSH_COMPACTION_MARKER_SNIFF)) {
                     const hint = modelProtocolHintFromUrl(dispatchUrl);
                     if (hint !== null) {
@@ -1874,7 +1926,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             const measured = declaredWindow === undefined
                 ? undefined
                 : prep.outcome === "restored"
-                  ? { bytes: Buffer.byteLength(prep.body), raw: prep.body }
+                  ? (typeof prep.body === "string"
+                    ? { bytes: Buffer.byteLength(prep.body), raw: prep.body }
+                    : measureDecodedWireBody(prep.body, bodyContentEncodingOf(outgoingHeadersOf(defaultInput, init)), prep.body.byteLength))
                   : await directSendBodyMeasure(defaultInput, init);
             const doom = measured !== undefined ? bodyOverWindowDetail(measured.bytes, measured.raw, declaredWindow) : undefined;
             if (doom !== undefined) {
@@ -1894,7 +1948,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             if (degradeLog === undefined && fetchMethodOf(defaultInput, init) === "POST") {
                 const cap = silentDirectBodyCapBytes();
                 const silentBytes = prep.outcome === "restored"
-                    ? Buffer.byteLength(prep.body)
+                    ? (typeof prep.body === "string" ? Buffer.byteLength(prep.body) : prep.body.byteLength)
                     : measured !== undefined
                       ? measured.bytes
                       : await outgoingBodyBytesCapped(defaultInput, init, cap);
@@ -1906,7 +1960,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     // log say whether any folding could ever bring this body
                     // under the cap.
                     const silentRaw = prep.outcome === "restored"
-                        ? prep.body
+                        ? (typeof prep.body === "string"
+                          ? prep.body
+                          : restoredBodyText(prep.body, bodyContentEncodingOf(outgoingHeadersOf(defaultInput, init))))
                         : measured?.raw ?? (typeof init?.body === "string" ? init.body : undefined);
                     const silentMediaBytes = silentRaw !== undefined ? mediaBytesOfWireBody(silentRaw) : undefined;
                     logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B${silentMediaBytes !== undefined && silentMediaBytes > 0 ? `; ${silentMediaBytes.toLocaleString("en-US")} B inline media, incompressible` : ""}); would be sent uncompressed (#5405/#5408)`);

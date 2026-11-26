@@ -220,6 +220,7 @@ billion-context/
 │   ├── agent/                    # Thin agent-side plugins (per-host, each with a -native variant)
 │   │   ├── shared.ts             #   Host plan/bootstrap shared helpers (BILLION_CONTEXT_PLUGIN gate)
 │   │   ├── media-bytes.ts        #   Shared inline-media byte accounting for native direct-send refusal gates
+│   │   ├── body-encoding.ts      #   Content-encoding decode/re-encode for the degraded direct-send path (#7698)
 │   │   ├── native-bootstrap.ts   #   dist/agent/<entry>.js → dist/index.js resolution
 │   │   ├── native-intercept.ts   #   Model-API fetch routing, attribution and proxy recovery
 │   │   ├── prompt-mass.ts   #   Protocol-shaped prompt-mass pricing for the client-local doom gate (#7106)
