@@ -300,3 +300,50 @@ test("#1387: tail recompute still advertises ranges under real pressure (shouldI
     assert.ok(out.includes("m00005"), "the unfolded over-limit range must be listed:\n" + out);
     assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not fire while over-limit ranges remain:\n" + out);
 });
+
+test("#6809: folding only the head of an offered range advertises the residual tail (span subtraction, not boolean drop)", () => {
+    // Defect B: the old spansOverlap filter dropped the ENTIRE offered range on
+    // ANY overlap with a submitted span, so folding the head of a range silently
+    // hid its tail from the receipt. The fix subtracts the folded span and
+    // advertises the residual. Offer one range m00001–m00008, fold only
+    // m00001–m00003 → the residual m00004–m00008 must be advertised. A regression
+    // to the boolean drop makes the whole range vanish and the stop signal fire.
+    const msgs = Array.from({ length: 10 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
+    ctx.session.stats.lastInputTokens = 100000;
+    setOffer(ctx, [offerRange("m00001", "m00008", 8)]);
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00003", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    assert.ok(out.includes(RANGES_HEADER), "the residual tail must be advertised (not dropped wholesale):\n" + out);
+    assert.ok(out.includes("m00004"), "the residual head (just after the fold) must be listed:\n" + out);
+    assert.ok(out.includes("m00008"), "the offered range's tail must be listed:\n" + out);
+    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not fire while a residual remains:\n" + out);
+});
+
+test("#6809: a no-offer (plugin-style) ctx must not claim 'all offered ranges are folded'", () => {
+    // Defect C: the post-compress tail's uncovered-history branch used to say
+    // "all offered ranges are folded" even when NO offer existed (ctx.lastNudge
+    // undefined — the plugin lane before the #6809 backfill, or any recompute
+    // fallback). That is a false statement: nothing was offered, so nothing was
+    // "folded from the offer". The honest clause is "no ranges were offered in
+    // this call".
+    //
+    // Construction: a session UNDER the nudge threshold (shouldInject=false →
+    // base=[] → remaining=[]) with a large block of raw, compressible history.
+    // Folding a small head succeeds (cleanSuccess, tier=null), remaining is
+    // empty, and the uncovered audit finds the large tail (>= 10K tok) → the
+    // uncovered-history branch fires. Old wording emitted the false "all offered
+    // ranges are folded"; the fix emits "no ranges were offered in this call".
+    const msgs = Array.from({ length: 20 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
+    ctx.session.stats.lastInputTokens = 50000; // well under the 200K window → no nudge pressure
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    // THE assertion: the false offer-exhaustion claim must never appear on a
+    // no-offer lane.
+    assert.ok(!out.includes("all offered ranges are folded"), "a no-offer lane must not claim the offer was exhausted:\n" + out);
+    // When the uncovered audit fires it must use the honest clause.
+    if (out.includes("Uncovered history remains")) {
+        assert.ok(out.includes("no ranges were offered in this call"), "the uncovered branch must state no offer existed:\n" + out);
+    }
+});

@@ -730,19 +730,50 @@ const UNCOVERED_RECEIPT_FLOOR_TOKENS = 10_000;
 // is kernel-owned) — this is pure bili-side gating.
 type CompressibleRangeItem = NonNullable<NudgeDecision["compressibleRanges"]>[number];
 
-// Refs are zero-padded mNNNNN, stable across folds (kernel id-never-reused
-// contract); compare numeric parts. Two [start,end] spans overlap iff neither
-// ends before the other starts.
-function spanNum(ref: string): number {
-    const n = Number(ref.replace(/\D/g, ""));
-    return Number.isFinite(n) ? n : 0;
+// Refs are zero-padded mNNNNN message indices, stable across folds (kernel
+// id-never-reused contract). refToIndex resolves them to a number and returns
+// null for any other shape — block refs (bN) live in a different numbering
+// space and must never be read as message indices.
+//
+// #6809: subtract the spans this call just folded from an offered [lo,hi]
+// range, returning the residual sub-ranges that were NOT folded. The old
+// boolean intersection (spansOverlap) dropped the ENTIRE offered range on any
+// overlap, so folding the head of a range silently hid its tail from the
+// receipt. Cuts are clipped to [lo,hi] and merged before the gaps are taken.
+function subtractSpans(lo: number, hi: number, cuts: Array<[number, number]>): Array<[number, number]> {
+    const clipped: Array<[number, number]> = [];
+    for (const [cLo, cHi] of cuts) {
+        const a = Math.max(cLo, lo);
+        const b = Math.min(cHi, hi);
+        if (a <= b) clipped.push([a, b]);
+    }
+    const merged = mergeIntervals(clipped);
+    const gaps: Array<[number, number]> = [];
+    let cursor = lo;
+    for (const [a, b] of merged) {
+        if (cursor <= a - 1) gaps.push([cursor, a - 1]);
+        cursor = Math.max(cursor, b + 1);
+    }
+    if (cursor <= hi) gaps.push([cursor, hi]);
+    return gaps;
 }
-function spansOverlap(aStart: string, aEnd: string, bStart: string, bEnd: string): boolean {
-    const aLo = Math.min(spanNum(aStart), spanNum(aEnd));
-    const aHi = Math.max(spanNum(aStart), spanNum(aEnd));
-    const bLo = Math.min(spanNum(bStart), spanNum(bEnd));
-    const bHi = Math.max(spanNum(bStart), spanNum(bEnd));
-    return aLo <= bHi && bLo <= aHi;
+
+// Scale an offered range's estimates to a residual sub-range by index fraction
+// so the receipt's token/char/count numbers are honest about the sub-range.
+// The residual is a strict subset of a viable range; the caller re-runs the
+// viability floor + submit gate (a shrunken residual can fall below them).
+function makeResidual(orig: CompressibleRangeItem, lo: number, hi: number, aLo: number, aHi: number): CompressibleRangeItem {
+    const aSpan = aHi - aLo + 1;
+    const frac = aSpan > 0 ? (hi - lo + 1) / aSpan : 0;
+    return {
+        ...orig,
+        startRef: indexToRef(lo),
+        endRef: indexToRef(hi),
+        count: Math.max(1, Math.round(orig.count * frac)),
+        tokens: Math.max(1, Math.round(orig.tokens * frac)),
+        chars: orig.chars !== undefined ? Math.max(1, Math.round(orig.chars * frac)) : undefined,
+        userMsgs: orig.userMsgs !== undefined ? Math.max(0, Math.round(orig.userMsgs * frac)) : undefined,
+    };
 }
 
 function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Array<{ startRef: string; endRef: string }>): string {
@@ -795,12 +826,47 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
         }
         tier = nudge.tier ?? null;
     }
-    // Drop the offers this call just folded; everything else stays advertised
-    // ("compressed 2 of 3 -> show the 1"). Only when ALL offered folded does the
-    // stop signal fire below. Ranges not in the pre-fold offer never appear here.
-    const remaining = ctx.lastNudge
-        ? base.filter((r) => !submitted.some((s) => spansOverlap(r.startRef, r.endRef, s.startRef, s.endRef)))
-        : base;
+    // Subtract the spans this call just folded from the offers; the residuals
+    // (the parts NOT folded) stay advertised ("folded the head of a range ->
+    // show its tail"). Only when nothing remains does the stop signal fire
+    // below. Ranges not in the pre-fold offer never appear here. Without a
+    // pinned offer (ctx.lastNudge undefined) there is nothing to subtract from,
+    // so base passes through untouched.
+    let remaining: CompressibleRangeItem[];
+    if (!ctx.lastNudge) {
+        remaining = base;
+    } else {
+        // Only message-ref submitted spans (refToIndex !== null) are valid cuts
+        // on the message-ref offer; block refs (bN) live in a different
+        // numbering space and are skipped.
+        const cuts: Array<[number, number]> = [];
+        for (const s of submitted) {
+            const sLo = refToIndex(s.startRef);
+            const sHi = refToIndex(s.endRef);
+            if (sLo === null || sHi === null) continue;
+            cuts.push([Math.min(sLo, sHi), Math.max(sLo, sHi)]);
+        }
+        remaining = [];
+        for (const r of base) {
+            const aLo = refToIndex(r.startRef);
+            const aHi = refToIndex(r.endRef);
+            if (aLo === null || aHi === null) {
+                // Offer ref is not a clean message index — can't subtract; keep
+                // the whole range (the downstream gates own that receipt).
+                remaining.push(r);
+                continue;
+            }
+            const lo = Math.min(aLo, aHi);
+            const hi = Math.max(aLo, aHi);
+            for (const [gLo, gHi] of subtractSpans(lo, hi, cuts)) {
+                remaining.push(makeResidual(r, gLo, gHi, lo, hi));
+            }
+        }
+        // Residuals are strict sub-ranges; re-apply the viability floor + submit
+        // gate so a shrunken residual that falls below them is not advertised
+        // (the kernel would reject it, #847).
+        remaining = viableRanges(remaining).filter(submitGate);
+    }
     // #7318: the receipt's "fold more" recommendation — the remaining-offer
     // range list AND the uncovered-history note — is opt-in via
     // compress.postComPressTail (default OFF, stamped per round on
@@ -870,13 +936,21 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
                 // resets the latch (in-memory field) — at most one extra note.
                 if (!ctx.session.uncoveredReceiptNoted) {
                     ctx.session.uncoveredReceiptNoted = true;
+                    // #6809: "all offered ranges are folded" is only true when an
+                    // offer actually existed (ctx.lastNudge set). On a lane without a
+                    // pinned offer the recompute found nothing actionable, so the
+                    // honest clause is "no ranges were offered in this call" — the
+                    // old wording falsely claimed an offer was exhausted.
+                    const offerClause = ctx.lastNudge
+                        ? "all offered ranges are folded"
+                        : "no ranges were offered in this call";
                     // #7463: name the protected mass in the same note — before
                     // this, the meter-vs-offer gap (usage bills it, no offer
                     // carries it, no surface names it) was unexplainable from
                     // the model's side after a drained-fold receipt. Rides the
                     // same #6522 latch: at most one note per nudge cycle.
                     const protectedNote = formatProtectedMassCompact(audit.mass);
-                    return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions);${protectedNote} inspect with acp_status(scope:"uncompressed").`;
+                    return `\n\nUncovered history remains — ${offerClause}, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions);${protectedNote} inspect with acp_status(scope:"uncompressed").`;
                 }
                 // Latch already fired this cycle but material mass still sits
                 // uncovered (totalTok >= floor): stay silent, do NOT fall

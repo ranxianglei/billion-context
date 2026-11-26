@@ -2635,6 +2635,12 @@ export async function handlePluginTool(
                 // permanent drift against the client's unchanged history
                 // (same split as the relay loop ctx).
                 compressMessages: mem && mem.original.length > 0 ? mem.original : undefined,
+                // #6809: backfill the prepare-time nudge so postCompressTail
+                // bases "remaining ranges" on the pre-fold offer (minus the
+                // just-folded spans) instead of a post-fold recompute that would
+                // report shouldInject=false and falsely claim every offered range
+                // is folded. mem holds it from rememberPluginMessages.
+                lastNudge: mem?.nudge,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
