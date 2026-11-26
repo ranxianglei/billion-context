@@ -43,7 +43,12 @@ test("#7791: inline lane routes kernel diagnostics to bili.log with zero termina
     }
 });
 
-test("#7791: server lane hands kernel diagnostics to the tee logger, not the console", () => {
+test("#7791: server lane hands kernel diagnostics to the tee logger, not the console", async () => {
+    // Isolated state dir: the tee logger would otherwise append this line to the
+    // operator's real bili.log.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kernel-warn-server-"));
+    const previous = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = dir;
     const realWarn = console.warn;
     const consoleCalls: string[] = [];
     console.warn = (...args: unknown[]) => { consoleCalls.push(args.map(String).join(" ")); };
@@ -54,6 +59,8 @@ test("#7791: server lane hands kernel diagnostics to the tee logger, not the con
         assert.deepEqual(consoleCalls, [], "console.warn is not the server lane's output");
     } finally {
         console.warn = realWarn;
+        if (previous === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previous;
+        await rmrf(dir);
     }
 });
 
