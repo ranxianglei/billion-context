@@ -6,6 +6,11 @@
 // the dsh loader id (`auto-review`) appears as a top-level, NOT-disabled entry in
 // cordis.patch.yml (#3838) — mere presence in package.json deps must NOT trigger
 // it (installed-but-off / bundled), and neither must an explicitly disabled entry.
+// And the id match must be confirmed by PACKAGE IDENTITY (#7068, the second
+// false positive — a community plugin whose id collides): the entry's `name`
+// line must name the official package (full or unscoped), or — for entries
+// predating the name convention — the package must be installed in a profile
+// bundle. A present-but-different name is a verdict: no advisory.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -35,7 +40,10 @@ function assertTestOwned(file: string, root: string): void {
         `refusing to write outside test-owned root ${root}: ${file}`);
 }
 function writeProfilePatch(root: string, profile: string, ids: string[]): void {
-    writeProfilePatchLines(root, profile, ids.map((id) => `- id: ${id}`));
+    // The official plugin's entry carries its package name (#7068 identity
+    // rule) — model the real shape for the auto-review id.
+    writeProfilePatchLines(root, profile, ids.flatMap((id) =>
+        id === PATCH_ID ? [`- id: ${id}`, `  name: ${PLUGIN}`] : [`- id: ${id}`]));
 }
 function writeProfilePatchLines(root: string, profile: string, lines: string[]): void {
     const file = path.join(root, "dsh", "profiles", profile, "cordis.patch.yml");
@@ -48,6 +56,12 @@ function writeProfilePkg(root: string, pkg: Record<string, unknown>): void {
     assertTestOwned(file, root);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(pkg));
+}
+function writeProfilePluginPkg(root: string, profile: string, pkg: string): void {
+    const file = path.join(root, "dsh", "profiles", profile, "node_modules", ...pkg.split("/"), "package.json");
+    assertTestOwned(file, root);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ name: pkg, version: "0.2.0-rc.2" }));
 }
 
 test("#2462: enabling auto-review in cordis.patch.yml yields exactly one cost advisory", () => {
@@ -101,7 +115,7 @@ test("#2462: quoted and commented patch ids are recognised", () => {
     const file = path.join(root, "dsh", "profiles", "main", "cordis.patch.yml");
     assertTestOwned(file, root);
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, '- id: "auto-review"   # turned on\n');
+    fs.writeFileSync(file, '- id: "auto-review"   # turned on\n  name: @deepseek-ai/dsh-experimental-auto-review\n');
     const res = detectCostAdvisories(hermeticEnv(root));
     assert.equal(res.length, 1);
     assert.equal(res[0]?.id, PLUGIN);
@@ -125,14 +139,14 @@ test("#3838: entry present but disabled:true yields NO advisory (explicitly off 
 test("#3838: disabled:false is NOT disabling — explicitly enabled still reports", () => {
     _clearCostAdvisoryCache();
     const root = tmp("bili-3838-enabled-flag-");
-    writeProfilePatchLines(root, "main", [`- id: ${PATCH_ID}`, "  disabled: false"]);
+    writeProfilePatchLines(root, "main", [`- id: ${PATCH_ID}`, "  disabled: false", `  name: ${PLUGIN}`]);
     assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1);
 });
 
 test("#3838: disabled:true on an UNRELATED entry does not silence the advisory", () => {
     _clearCostAdvisoryCache();
     const root = tmp("bili-3838-other-disabled-");
-    writeProfilePatchLines(root, "main", ["- id: other-plugin", "  disabled: true", `- id: ${PATCH_ID}`]);
+    writeProfilePatchLines(root, "main", ["- id: other-plugin", "  disabled: true", `- id: ${PATCH_ID}`, `  name: ${PLUGIN}`]);
     assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1);
 });
 
@@ -141,6 +155,43 @@ test("#3838: disabled in one profile but enabled in another still reports once",
     const root = tmp("bili-3838-cross-profile-");
     writeProfilePatchLines(root, "a", [`- id: ${PATCH_ID}`, "  disabled: true"]);
     writeProfilePatch(root, "b", [PATCH_ID]);
+    assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1);
+});
+
+test("#7068: community plugin with the same loader id but a different name yields NO advisory (the id-collision false positive)", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-7068-community-");
+    writeProfilePatchLines(root, "main", [`- id: ${PATCH_ID}`, "  name: dsh-auto-review"]);
+    assert.deepEqual(detectCostAdvisories(hermeticEnv(root)), []);
+});
+
+test("#7068: a different name is a verdict — even with the official package installed on disk, NO advisory", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-7068-name-verdict-");
+    writeProfilePatchLines(root, "main", [`- id: ${PATCH_ID}`, "  name: dsh-auto-review"]);
+    writeProfilePluginPkg(root, "main", PLUGIN);
+    assert.deepEqual(detectCostAdvisories(hermeticEnv(root)), []);
+});
+
+test("#7068: nameless enabled entry + official package installed in a profile bundle reports (old-format fallback)", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-7068-noname-disk-");
+    writeProfilePatchLines(root, "main", [`- id: ${PATCH_ID}`]);
+    writeProfilePluginPkg(root, "main", PLUGIN);
+    assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1);
+});
+
+test("#7068: nameless enabled entry + official package NOT installed yields NO advisory", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-7068-noname-nodisk-");
+    writeProfilePatchLines(root, "main", [`- id: ${PATCH_ID}`]);
+    assert.deepEqual(detectCostAdvisories(hermeticEnv(root)), []);
+});
+
+test("#7068: unscoped official name (without the @scope/ prefix) still reports", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-7068-unscoped-");
+    writeProfilePatchLines(root, "main", [`- id: ${PATCH_ID}`, "  name: dsh-experimental-auto-review"]);
     assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1);
 });
 

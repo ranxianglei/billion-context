@@ -57,6 +57,46 @@ test("parseDshPatchEntries: duplicate ids kept per occurrence", () => {
     ]);
 });
 
+test("parseDshPatchEntries: indented `name:` captured as package identity (#7068)", () => {
+    const text = [
+        "- id: auto-review",
+        "  name: dsh-auto-review",
+        "  config:",
+        "    x: 1",
+        "- id: other",
+    ].join("\n");
+    assert.deepEqual(parseDshPatchEntries(text), [
+        { id: "auto-review", disabled: false, name: "dsh-auto-review" },
+        { id: "other", disabled: false },
+    ]);
+});
+
+test("parseDshPatchEntries: quoted name stripped; a name belongs to its own block only", () => {
+    const text = [
+        '- id: a',
+        '  name: "@deepseek-ai/dsh-experimental-auto-review"',
+        "- id: b",
+        "  name: other-pkg",
+    ].join("\n");
+    assert.deepEqual(parseDshPatchEntries(text), [
+        { id: "a", disabled: false, name: "@deepseek-ai/dsh-experimental-auto-review" },
+        { id: "b", disabled: false, name: "other-pkg" },
+    ]);
+});
+
+test("parseDshPatchEntries: a column-0 `name:` belongs to no entry; first name line of a block wins", () => {
+    const text = ["name: stray", "- id: a", "  name: real", "  name: second"].join("\n");
+    assert.deepEqual(parseDshPatchEntries(text), [{ id: "a", disabled: false, name: "real" }]);
+});
+
+test("parseDshPatchEntries: a name after a nested list item does not leak into the closed entry", () => {
+    const text = ["- id: a", "  config:", "    list:", "      - item", "  name: too-late", "- id: b"].join("\n");
+    assert.deepEqual(parseDshPatchEntries(text), [
+        { id: "a", disabled: false },
+        { id: "b", disabled: false },
+    ]);
+});
+
 test("parseDshPatchEntries: `disabled` is read by value, not by the literal `true`", () => {
     // The patch layer accepts more than a lowercase boolean: YAML 1.1 spellings,
     // quoted forms, and dsh's `!!js` extension (a stock web-profile dump carries
