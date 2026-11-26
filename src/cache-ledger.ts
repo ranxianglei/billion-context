@@ -20,7 +20,7 @@ import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPON
 import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
 import { isForeignMembership } from "./request-membership.js";
 import { billInputUsage } from "./billing.js";
-import { normalizeUpstreamOrigin } from "./util.js";
+import { CALIBRATION_PROVENANCE_TEXT_ONLY, normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
@@ -82,6 +82,19 @@ interface LedgerFold {
      *  quo booking, byte-identical to pre-#2202 behavior). */
     bid?: string;
 }
+
+// #6729: nudge-vs-fold recovery ledger (#6720 ratchet). A nudge lists the
+// recommended compressible ranges (pendingT1 = their token sum); the model
+// often folds only part of it, so the post-fold floor climbs turn over turn.
+// Nothing visualized the recommended-vs-actually-folded gap until now, so the
+// session panel and the downloadable report render both per event.
+const RECOVERY_BURST_MS = 10 * 60_000;
+const RECOVERY_STALE_MS = 30 * 60_000;
+const RECOVERY_CAP = 500;
+
+type RecoveryEvent =
+    | { kind: "n"; at: number; p: number; tier: number | null }
+    | { kind: "f"; at: number; S: number; seq: number; p: number; mode: "n" | "a"; pct?: number };
 
 interface LedgerLine {
     captureId?: string;
@@ -212,6 +225,9 @@ interface LedgerLine {
 interface CacheLedger {
     v: 1;
     lastBlockId: number;
+    /** #6729: nudge-injection / fold recovery events (sqlite-persisted with
+     *  the rest of the ledger; sparse — absent on pre-#6729 ledgers). */
+    recovery?: RecoveryEvent[];
     /** #3769: high-water of session.state.sweptOrphanCallIds length — detects a
      *  proactive failed-compress cleanup between samples so detectSeam can
      *  attribute a mid-history break to the cleanup instead of "unexplained". */
@@ -513,6 +529,11 @@ type Capture = {
     sentBody?: SeamSlot;
     inBody?: InboundSlot;
     imageFacts?: ForwardedImageFacts;
+    // #5952: the calibration pair for THIS send — final wire text estimate
+    // (no image reserve) + the image reserve of the same body, noted at the
+    // relay main-lane send chokepoint. The settle that bills this body
+    // consumes exactly this entry instead of the shared prepare slot.
+    calibration?: { estimate: number; imageTokens: number; origin?: string; model?: string };
 };
 const captures = new AsyncLocalStorage<Capture>();
 let captureOrder = 0;
@@ -530,6 +551,7 @@ export async function withCacheCapture<T>(session: Session | undefined, fn: () =
                 delete capture.sentBody;
                 delete capture.inBody;
                 delete capture.imageFacts;
+                delete capture.calibration;
             }
         }
     });
@@ -754,10 +776,19 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
     // sharing a 512 KiB prefix apart. Re-noting a byte-identical payload (the
     // non-streaming settle path) reuses the prior slot's count/full instead of
     // re-deriving them.
+    // #7149 batch3-1 (delta anchoring): the byte-identical re-note inherits the
+    // prior digest via a pure byte compare — ZERO hashing on the common path.
+    // Changed/new bodies keep the full-body digest: `bd` is the ground-truth
+    // equality proof (#2131) and the ONLY equality proof once the payload
+    // exceeds BODY_FULL_CAP (nothing is retained), so a delta descriptor cannot
+    // replace it without breaking settle's be decision. View-ID anchoring is
+    // not available here — the send chokepoints hold the wire string, not the
+    // stored canonical views (those live in the storage layer).
     const buf = Buffer.from(body, "utf8");
-    const digest = createHash("sha256").update(buf).digest("hex");
     const transient = pendingCapture(session);
     const prior = transient.sentBody;
+    const sameBytes = prior !== undefined && prior.bytes === buf.byteLength && prior.full !== null && prior.full.equals(buf);
+    const digest = sameBytes ? prior.digest : createHash("sha256").update(buf).digest("hex");
     const samePayload = prior !== undefined && prior.digest === digest;
     transient.sentBody = {
         order: ++captureOrder,
@@ -834,6 +865,22 @@ export function noteForwardedImageFacts(session: Session, facts: ForwardedImageF
     const capture = captures.getStore();
     if (capture?.session === session) { capture.imageFacts = facts; return; }
     imageFactsLastSent.set(session, facts);
+}
+
+/** #5952: the per-request calibration pair for THIS send — the final wire
+ *  text estimate (textOverhead, no image reserve) + the image reserve of
+ *  the same body, noted at the relay main-lane send chokepoint next to
+ *  noteOutboundContextEstimates. The next settleUsageReport /
+ *  settleOverflowCalibration consumes exactly this entry (same pairing
+ *  guarantee as the seam forensics): a concurrent request's prepare can no
+ *  longer overwrite the estimate a settle reads, and an image-bearing
+ *  sample can no longer train the text multiplier. Outside a capture there
+ *  is no per-request owner for the pair, so it is dropped, never parked on
+ *  the session where a later settle could misread it as this request's —
+ *  lanes outside the capture (loop/plugin) keep the legacy shared slot. */
+export function noteCalibrationPair(session: Session, pair: { estimate: number; imageTokens: number; origin?: string; model?: string }): void {
+    const capture = captures.getStore();
+    if (capture?.session === session) { capture.calibration = pair; return; }
 }
 
 function settleImageLearning(session: Session, billedTotal: number): void {
@@ -1024,14 +1071,9 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
                 i++;
                 continue;
             }
-            // String content: hop to the next quote or backslash (native
-            // scans) instead of branching per byte — the bulk of any body.
-            let m = n;
-            const q = body.indexOf(34, i + 1);
-            if (q !== -1 && q < m) m = q;
-            const b = body.indexOf(92, i + 1);
-            if (b !== -1 && b < m) m = b;
-            i = m;
+            // Advance once per byte. Separate delimiter searches would each
+            // rescan the whole remaining body when a delimiter is absent.
+            i++;
             continue;
         }
         if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; i++; continue; }
@@ -1042,14 +1084,8 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
             i++;
             continue;
         }
-        // Inter-token filler (whitespace/commas/colons/literals): hop to the
-        // next structural byte, again natively.
-        let m = n;
-        for (const code of [34, 123, 125, 91, 93]) {
-            const p = body.indexOf(code, i + 1);
-            if (p !== -1 && p < m) m = p;
-        }
-        i = m;
+        // Whitespace, commas, colons and literals need no separate search.
+        i++;
     }
     return null;
 }
@@ -1275,6 +1311,58 @@ function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "
     }
     led.foldSeqCounter += 1;
     led.folds.push({ ...f, seq: led.foldSeqCounter, T: 0, hPct: null, requestsAfter: 0, k: null });
+    recordFoldRecovery(led, f.at, f.S, led.foldSeqCounter);
+}
+
+/** #6729: book a nudge that ACTUALLY reached the upstream payload (call from
+ *  the prepare return when nudgeOutcome === "injected" — vetoed/skipped/armed-
+ *  suppressed arms never landed, so they never arm attribution). p is the
+ *  recommended token sum (pendingT1, T1 only); higher tiers pass 0. */
+export function recordNudgeInject(session: Session, nudge: { tier?: number | null; breakdown?: Record<string, number> } | null | undefined): void {
+    if (!nudge) return;
+    const led = getCacheLedger(session);
+    const evs = led.recovery ?? (led.recovery = []);
+    if (evs.length === 0) {
+        // First real injection: backfill the folds that already happened —
+        // they all predate any injection, so every one of them is an active
+        // compression. (Backfilling here instead of at fold time keeps the
+        // persisted metadata byte-identical for sessions that never get a
+        // nudge — the storage-render goldens hash metadata_json.)
+        for (const f of led.folds) {
+            evs.push({ kind: "f", at: f.at, S: f.S, seq: f.seq, p: 0, mode: "a" });
+        }
+    }
+    evs.push({ kind: "n", at: Date.now(), p: nudge.breakdown?.["pendingT1"] ?? 0, tier: typeof nudge.tier === "number" ? nudge.tier : null });
+    if (evs.length > RECOVERY_CAP) evs.splice(0, evs.length - RECOVERY_CAP);
+    markDirty(session);
+}
+
+/** #6729: pair a fold with the nudge that armed it. Owner attribution ruling
+ *  (2026-11-14): a fold in the same or next round after an injection, plus the
+ *  consecutive burst that follows it (≤ RECOVERY_BURST_MS between folds), all
+ *  belong to that nudge; a fold whose preceding message carried no injection
+ *  (and is not in a burst chain) is an ACTIVE (model-initiated) compression. */
+function recordFoldRecovery(led: CacheLedger, at: number, S: number, seq: number): void {
+    // The field is only ever created by the FIRST real nudge injection (which
+    // backfills every earlier fold as active) — otherwise no-injection sessions
+    // would grow an empty field and drift the persisted metadata byte-for-byte.
+    if (led.recovery === undefined) return;
+    const evs = led.recovery;
+    let lastF: RecoveryEvent | undefined;
+    let lastN: RecoveryEvent | undefined;
+    for (const ev of evs) {
+        if (ev.kind === "f") lastF = ev;
+        else if (ev.at <= at) lastN = ev;
+    }
+    const gapArmed = lastN !== undefined && lastN.at > (lastF?.at ?? 0);
+    const chainArmed = lastF !== undefined && at - lastF.at <= RECOVERY_BURST_MS;
+    const nudgeFresh = lastN !== undefined && at - lastN.at <= RECOVERY_STALE_MS;
+    const mode = lastN && nudgeFresh && (gapArmed || chainArmed) ? ("n" as const) : ("a" as const);
+    // A stale nudge's pending must not label a newer fold — the report would
+    // compare this fold against a recommendation the fold predates nothing of.
+    const p = lastN && nudgeFresh ? lastN.p : 0;
+    evs.push({ kind: "f", at, S, seq, p, mode, pct: mode === "n" && p > 0 ? Math.round((S / p) * 1000) / 10 : undefined });
+    if (evs.length > RECOVERY_CAP) evs.splice(0, evs.length - RECOVERY_CAP);
 }
 
 /** Record compression folds materialized as new kernel blocks. Proxy mode
@@ -1765,10 +1853,25 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
     const settleOrigin = normalizeUpstreamOrigin(upstream);
     const pendingCalibOrigin = session.stats.lastCalibrationPolicyOrigin !== undefined ? normalizeUpstreamOrigin(session.stats.lastCalibrationPolicyOrigin) : undefined;
     const calibPolicy = pendingCalibOrigin === settleOrigin ? session.stats.lastCalibrationPolicy : undefined;
-    const pendingEst = session.stats.lastLocalTextEstimate;
-    const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
+    // #5952: the per-request capture pair wins over the shared prepare slot —
+    // it is the final wire estimate of the request THIS report bills, noted
+    // at the send chokepoint. Consumed once: the settle that reads it owns
+    // it, so a concurrent settle can never re-read it as its own.
+    const capture = captures.getStore();
+    const capturePair = capture?.session === session ? capture.calibration : undefined;
+    if (capture?.session === session) delete capture.calibration;
+    // An image-bearing sample carries no text-only signal: it must not train
+    // the text multiplier at all — not even through the legacy slot, which a
+    // concurrent prepare may have left holding another request's estimate.
+    if (capturePair !== undefined && capturePair.imageTokens > 0) return;
+    const pendingEst = capturePair !== undefined ? capturePair.estimate : session.stats.lastLocalTextEstimate;
+    const pendingOrigin = capturePair !== undefined ? normalizeUpstreamOrigin(capturePair.origin) : normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
     if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
         const rawSample = billed / pendingEst;
+        // #5952: provenance of THIS sample — text-only only when it arrived
+        // on a capture pair. A legacy shared-slot sample carries none, so a
+        // ring holding one stays mixed until the window flushes it out.
+        const sampleProvenance = capturePair !== undefined ? CALIBRATION_PROVENANCE_TEXT_ONLY : undefined;
         // #2117 B: the ring is keyed by route AND model — tokenizers bill
         // differently across models, so a mid-session model switch starts a
         // FRESH ring instead of blending two models' billing scales into one
@@ -1778,8 +1881,10 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
         // whose load whitelist drops the model fields (#2141) — continues
         // and ADOPTS the first known model. Discarding it would clear a
         // provenance-matched published k̂ on the first post-restart settle
-        // (the #2129 regression class).
-        const settleModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
+        // (the #2129 regression class). The capture pair's model, when
+        // known, is this request's own — it outranks the session's
+        // last-known model (#5952).
+        const settleModel = capturePair?.model !== undefined ? capturePair.model : (typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined);
         let ring = session.stats.calibrationRing;
         if (!ring || ring.origin !== settleOrigin || (ring.model !== undefined && settleModel !== undefined && ring.model !== settleModel)) {
             ring = { origin: settleOrigin, model: settleModel, values: [] };
@@ -1788,7 +1893,16 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
         }
         if (rawSample >= CALIBRATION_SAMPLE_MIN && rawSample <= CALIBRATION_SAMPLE_MAX) {
             ring.values.push(rawSample);
-            if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) ring.values.shift();
+            // #5952: provenances ride in lockstep with values — a legacy
+            // ring restored without the array pads with undefined, so the
+            // publish verdict below stays aligned with the window.
+            if (ring.provenances === undefined) ring.provenances = [];
+            while (ring.provenances.length < ring.values.length - 1) ring.provenances.push(undefined);
+            ring.provenances.push(sampleProvenance);
+            if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) {
+                ring.values.shift();
+                ring.provenances.shift();
+            }
             const spread = Math.max(...ring.values) / Math.min(...ring.values);
             if (ring.values.length >= 2 && spread <= CALIBRATION_CONSISTENCY_RATIO) {
                 const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
@@ -1798,6 +1912,7 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
                     delete session.stats.calibratedEstimate;
                     delete session.stats.calibratedEstimateOrigin;
                     delete session.stats.calibratedEstimateModel;
+                    delete session.stats.calibratedEstimateProvenance;
                 } else {
                     const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
                     session.stats.calibratedEstimate = calibPolicy?.max !== undefined ? Math.min(clamped, calibPolicy.max) : clamped;
@@ -1805,14 +1920,22 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
                     // Provenance is the ring's model key, not this sample's stamp —
                     // an unknown-model settle continues a model-keyed ring without
                     // blanking the established provenance. Stays inside the publish
-                    // branch: the disabled path above clears all three fields and
+                    // branch: the disabled path above clears all four fields and
                     // must not re-stamp one of them (#3211 review).
                     session.stats.calibratedEstimateModel = ring.model;
+                    // #5952: the published factor's provenance is the ring's —
+                    // "text-only-v1" only when every value in the window
+                    // carries it. A single legacy sample in the window keeps
+                    // the factor inert until the window flushes it out.
+                    const ringProvenance = ring.provenances !== undefined && ring.provenances.length === ring.values.length && ring.provenances.every((p) => p === CALIBRATION_PROVENANCE_TEXT_ONLY) ? CALIBRATION_PROVENANCE_TEXT_ONLY : undefined;
+                    if (ringProvenance !== undefined) session.stats.calibratedEstimateProvenance = ringProvenance;
+                    else delete session.stats.calibratedEstimateProvenance;
                 }
             } else {
                 delete session.stats.calibratedEstimate;
                 delete session.stats.calibratedEstimateOrigin;
                 delete session.stats.calibratedEstimateModel;
+                delete session.stats.calibratedEstimateProvenance;
             }
         }
         session.stats.calibrationRing = ring;
@@ -1866,7 +1989,7 @@ export function noteOutboundContextEstimates(
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number; model?: string; context?: number },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
@@ -1894,7 +2017,9 @@ export function settleUsageReport(
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
         // context the NEXT request will actually carry (see stream.ts applyRanges).
-        session.stats.lastInputTokens = Math.max(0, s.total - (session.stats.compressCreditTokens ?? 0));
+        // An advisor reply bills several model calls; the context is what its last one read.
+        const contextTotal = s.context !== undefined && s.context > 0 ? s.context : s.total;
+        session.stats.lastInputTokens = Math.max(0, contextTotal - (session.stats.compressCreditTokens ?? 0));
         // #1569: calibration anchor for estimate-grade turns — written ONLY by
         // real upstream usage reports (all three response shapes funnel here),
         // never by estimate-grade samples or arming paths; dropped at native-
@@ -1914,6 +2039,17 @@ export function settleUsageReport(
         // it to demote the baseline when the current request routes elsewhere.
         const settleOrigin = normalizeUpstreamOrigin(s.upstream);
         if (settleOrigin !== undefined) session.stats.lastInputTokensOrigin = settleOrigin;
+        // Identity-fast-path: stamp which MODEL measured this baseline — the
+        // gate refuses to trust acceptance evidence across a model switch.
+        // Lanes that settle without an explicit model (streamed plugin pipes)
+        // fall back to metadata.lastModel: prepare re-covers it with the
+        // CURRENT request's model on every request, so in the normal case it
+        // is exactly this request's model (a concurrent interleaving can only
+        // produce one conservative demotion — the safe direction).
+        const stampedModel = typeof s.model === "string" && s.model !== "" ? s.model
+            : typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel
+            : undefined;
+        if (stampedModel !== undefined) session.stats.lastInputTokensModel = stampedModel;
         // #1933 F1: consume the pending pair — the local text estimate of the
         // payload THIS report bills, recorded at prepare time. Same route
         // required. Admitted samples (plausibility band) accumulate in a
@@ -1926,7 +2062,7 @@ export function settleUsageReport(
         // only ever overflows never settles a usage report, so without this the
         // local estimator's calibre never self-corrects and the same "fits"
         // verdict re-forwards the same doomed body forever.
-        ingestCalibrationPair(session, s.total, s.upstream);
+        ingestCalibrationPair(session, contextTotal, s.upstream);
         // #1820: a real usage-grade sample supersedes the post-rebuild meter
         // anchor immediately — no need to wait out its prepare budget.
         clearPostRebuildAnchor(session);
@@ -2014,12 +2150,16 @@ export function settleUsageReport(
                         // side would misread the pair as mid. No array locatable
                         // (unparseable body) keeps the conservative pre-fix class.
                         const shorterFull = prevSlot.full.length <= curSlot.full.length ? prevSlot.full : curSlot.full;
-                        const arrClose = messagesArrayCloseOffset(shorterFull);
-                        // #3476: a growing logical unit (single giant message whose interior
-                        // container extends in place) is byte-wise a mid-body insertion but
-                        // semantically an append — recognize it in the would-be-mid slot.
-                        const midInsert = isMidInsertionAppend(prevSlot.full, curSlot.full, lcp);
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : midInsert ? "append" : "mid";
+                        if (lcp >= shorterFull.length - 64) curLine.bs = "append";
+                        else if (lcp < 1024) curLine.bs = "head";
+                        else {
+                            const arrClose = messagesArrayCloseOffset(shorterFull);
+                            // #3476: a growing logical unit (single giant message whose interior
+                            // container extends in place) is byte-wise a mid-body insertion but
+                            // semantically an append — recognize it in the would-be-mid slot.
+                            curLine.bs = arrClose !== null && lcp >= arrClose ? "tail"
+                                : isMidInsertionAppend(prevSlot.full, curSlot.full, lcp) ? "append" : "mid";
+                        }
                     } else {
                         curLine.bs = "unknown";
                     }
@@ -2134,7 +2274,24 @@ interface BodyStability {
     gapSplit: { lowHitMedGapMs: number | null; highHitMedGapMs: number | null };
 }
 
+/** #6729: nudge-recommended vs actually-folded per event, plus the session
+ *  average recovery rate (Σ folded / Σ recommended over all nudge arms, a
+ *  never-folded arm counting as 0 recovered). */
+interface RecoveryReport {
+    events: Array<{ at: number; kind: "n" | "f"; tier?: number | null; pending: number; folded: number | null; foldSeq: number | null; mode: "n" | "a" | null; pct: number | null; paired: boolean }>;
+    summary: { nudges: number; folds: number; nudgeFolds: number; activeFolds: number; totalPending: number; totalFolded: number; pct: number | null };
+    /** #6729 follow-up: one point PER NUDGE ROUND for the recovery line
+     *  chart — a round is the nudge plus every fold until the next nudge,
+     *  so several partial folds in one round sum up (the demo's 4×25% folds
+     *  are ONE 100% point, the ratchet's single-folds stay low). pct is null
+     *  when the nudge carried no measurable pending (non-T1 tiers). */
+    episodes: Array<{ at: number; tier: number | null; pending: number; folded: number; pct: number | null; credited: number; extra: number; activeFolds: number }>;
+}
+
 interface BiliCacheReport extends CacheReport {
+    /** #6729: recommended-vs-folded recovery (absent when the session has no
+     *  recovery events yet — pre-upgrade ledgers or no injections so far). */
+    recovery?: RecoveryReport;
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
     lines: Array<CacheReportLine & { captureId?: string; captureRound?: number; evidence?: "out-of-order"; bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; efp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep" }>;
@@ -2307,6 +2464,108 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         sizeBuckets,
         gapSplit: { lowHitMedGapMs: median(lowGaps), highHitMedGapMs: median(highGaps) },
     };
+    // #6729: pair each nudge arm with the NEXT nudge-attributed fold it armed
+    // (one fold can answer only one arm); an arm with no follow-on fold is the
+    // ratchet's direct signal. totalFolded counts EVERY nudge-attributed fold
+    // (burst folds included) — pairing is per-arm bookkeeping, not a filter.
+    let recovery: RecoveryReport | undefined;
+    // No injection ever landed → the persisted field stays absent (metadata
+    // golden parity), but the report still lists every fold as an active
+    // compression — that view exists independently of the nudge stream.
+    const recSource: RecoveryEvent[] = (led.recovery && led.recovery.length > 0)
+        ? led.recovery
+        : led.folds.map((f) => ({ kind: "f" as const, at: f.at, S: f.S, seq: f.seq, p: 0, mode: "a" as const }));
+    if (recSource.length > 0) {
+        const paired = new Set<number>();
+        const recEvents = recSource.map((ev, i) => ({
+            at: ev.at,
+            kind: ev.kind,
+            ...(ev.kind === "n" ? { tier: ev.tier } : {}),
+            pending: ev.p,
+            folded: ev.kind === "f" ? ev.S : null,
+            foldSeq: ev.kind === "f" ? ev.seq : null,
+            mode: (ev.kind === "f" ? ev.mode : null) as "n" | "a" | null,
+            pct: ev.kind === "f" ? (ev.pct ?? null) : null,
+            paired: false,
+            i,
+        }));
+        for (let i = 0; i < recEvents.length; i++) {
+            if (recEvents[i].kind !== "n") continue;
+            for (let j = i + 1; j < recEvents.length; j++) {
+                const f = recEvents[j];
+                if (f.kind === "n") break;
+                // A model-active fold (mode "a") is NOT the answer to a nudge
+                // arm — pairing is nudge-attributed by design (#6729), else the
+                // "not folded" ratchet flag is silently lost when the model
+                // happens to self-compress after a nudge.
+                if (f.mode !== "n") continue;
+                if (paired.has(j)) continue;
+                paired.add(j);
+                recEvents[i].paired = true;
+                break;
+            }
+        }
+        let nudges = 0;
+        let folds = 0;
+        let nudgeFolds = 0;
+        let activeFolds = 0;
+        let totalPending = 0;
+        let totalFolded = 0;
+        for (const [j, f] of recEvents.entries()) {
+            if (f.kind === "n") {
+                nudges += 1;
+                totalPending += f.pending;
+            } else {
+                folds += 1;
+                if (f.mode === "n") {
+                    nudgeFolds += 1;
+                    totalFolded += f.folded ?? 0;
+                } else {
+                    activeFolds += 1;
+                }
+            }
+        }
+        // Round aggregation: nudge i owns every fold until nudge i+1 (or the
+        // end). Active folds inside the window ride along as a marker count —
+        // they never count toward the round's recovery. credited/extra split
+        // the round's folded mass against the OUTSTANDING recommended pool
+        // (the client re-derives the same split per zoom window):
+        // what came from recommended stock vs older stock the model cleaned
+        // on its own — so a 370% round reads as "list + 182K old stock",
+        // not 370K of phantom recovery.
+        const episodes: RecoveryReport["episodes"] = [];
+        let recPool = 0;
+        for (let j = 0; j < recEvents.length; j++) {
+            const ev = recEvents[j];
+            if (ev.kind === "n") {
+                recPool += ev.pending;
+                let epFolded = 0;
+                let epActive = 0;
+                for (let k = j + 1; k < recEvents.length && recEvents[k].kind !== "n"; k++) {
+                    const f = recEvents[k];
+                    if (f.mode === "n") epFolded += f.folded ?? 0;
+                    else epActive += 1;
+                }
+                const credited = Math.min(epFolded, recPool);
+                recPool = Math.max(0, recPool - epFolded);
+                episodes.push({
+                    at: ev.at,
+                    tier: ev.tier ?? null,
+                    pending: ev.pending,
+                    folded: epFolded,
+                    pct: ev.pending > 0 ? Math.round((epFolded / ev.pending) * 1000) / 10 : null,
+                    credited,
+                    extra: epFolded - credited,
+                    activeFolds: epActive,
+                });
+            }
+        }
+        recovery = {
+            events: recEvents.map(({ i: _i, ...ev }) => ev),
+            summary: { nudges, folds, nudgeFolds, activeFolds, totalPending, totalFolded, pct: totalPending > 0 ? Math.round((totalFolded / totalPending) * 1000) / 10 : null },
+            episodes,
+        };
+    }
     return {
         generatedAt: Date.now(),
         profile: effective,
@@ -2351,6 +2610,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         stability,
+        recovery,
         seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed }, orphanSweep: { count: a.orphanSweepSeams, missed: a.orphanSweepMissed } },
     };
 }

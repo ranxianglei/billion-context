@@ -93,6 +93,14 @@ export interface UnitProjectionInput {
 export interface UnitProjectionFatal {
   kind: "zone" | "split";
   error: Error;
+  /** #7596: set only by the fresh-fold path where the integrity withdrawal
+   *  left the range with NOTHING foldable (not a merge). applySingleRange
+   *  treats this as a no-op success with a warning instead of throwing —
+   *  killing the whole batch over one doomed range made the model re-pay
+   *  full-context reads on every retry until the breaker fired. The merge
+   *  split fatals (excluded-merge / actionable split) do NOT set it and stay
+   *  hard errors. */
+  degradable?: boolean;
 }
 
 export interface UnitProjection {
@@ -165,10 +173,30 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       }
     }
   }
-  const adjustedIds = applyPairBoundaryAdjustments(
+  // #1592: the clamp discriminates a RE-FOLD (requested span already overlaps
+  // an active block → contain it so the old summary is replaceable) from a
+  // DRAG-IN (disjoint block → keep it out, the mega-turn killer). Shared
+  // passes carry the spans prebuilt; the single-shot apply path builds them
+  // inline like its other fallbacks, and only when coverage exists at all.
+  const clampIndexById =
+    byId ??
+    (input.preExistingCoverage.size > 0 ? buildIndexByMessageId(input.messages) : undefined);
+  const clampBlockSpans =
+    input.preExistingCoverage.size > 0
+      ? (shared?.blockSpans ?? buildBlockIndexSpans(input.state, clampIndexById!))
+      : undefined;
+  const adjustedIds = clampAdjustmentAtCoverage(
+    applyPairBoundaryAdjustments(resolved, input.messages, shared),
     resolved,
     input.messages,
-    shared,
+    // Fresh folds pass the active coverage; hand-built inputs without it
+    // (unit tests) keep the legacy unclamped adjustment behavior.
+    input.preExistingCoverage,
+    // #5337 discipline: reuse the shared index map — the clamp runs on every
+    // screened unit, and a per-call map rebuild would resurface the O(units×n)
+    // quadratic the shared context exists to prevent.
+    clampIndexById,
+    clampBlockSpans,
   );
   const skippedCarrierIds = adjustedIds.filter((id) => liveCarrierIds.has(id));
   if (skippedCarrierIds.length > 0) {
@@ -379,9 +407,13 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       ? shared.anchorMessage
       : lastUserAnchor(input.messages, coveredMessageIds(input.state), input.config);
     const anchorRef = anchorMsg ? input.state.messageRefs.byRaw[anchorMsg.id] : undefined;
+    // 2026-11-18 (owner): the anchor QUOTES user speech inside a system
+    // receipt that carries no <acp> time tag on the wire — weak models have
+    // read the quote as the user's LATEST message (ti_an incident 2026-11-17).
+    // Label the quote's origin so it cannot pass for a fresh instruction.
     const anchorNote =
       anchorRef && anchorRef !== "BLOCKED"
-        ? ` Last-user anchor: ${anchorRef} "${(anchorMsg!.text ?? "").replace(/\s+/g, " ").slice(0, 40)}".`
+        ? ` Last-user anchor (historical quote, NOT a new user message): ${anchorRef} "${(anchorMsg!.text ?? "").replace(/\s+/g, " ").slice(0, 40)}".`
         : "";
     warnings.push(
       `Excluded ${hitProtectedRaw.length} protected message(s) ${hitRefs.join(
@@ -472,6 +504,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
           return finish({
             fatal: {
               kind: "split",
+              degradable: true,
               error: new Error(
                 `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
               ),
@@ -850,6 +883,11 @@ export interface ProjectionShared {
   anchorMessage: CoreMessage | undefined;
   /** Per-message inputs of computeIntegrityWithdrawals (#684 gate). */
   integrityPre: IntegrityPre;
+  /** Index spans [start..end] of every active block's effectiveMessageIds
+   *  over `messages`, sorted by start — the clampAdjustmentAtCoverage
+   *  refold-vs-drag discriminator. Rebuilding per unit is the #5337
+   *  quadratic class; one build serves the whole pass. Immutable. */
+  blockSpans: BlockIndexSpan[];
 }
 
 /** One-pass build of {@link ProjectionShared}; see that interface for what
@@ -878,8 +916,9 @@ export function buildProjectionShared(
       baseProtectedCallIds.add(msg.toolCallId);
     }
   }
+  const byId = buildIndexByMessageId(messages);
   return {
-    byId: buildIndexByMessageId(messages),
+    byId,
     liveCarrierIds,
     failedCompressCallIds,
     latestProtected,
@@ -889,7 +928,39 @@ export function buildProjectionShared(
     toolPairExtremes: buildToolPairExtremes(messages),
     anchorMessage: lastUserAnchor(messages, coveredMessageIds(state), config),
     integrityPre: buildIntegrityPre(messages),
+    blockSpans: buildBlockIndexSpans(state, byId),
   };
+}
+
+/** Contiguous index span [start..end] one active block covers over the
+ *  message array being projected. */
+export interface BlockIndexSpan {
+  start: number;
+  end: number;
+}
+
+/** Index intervals of every active block's effectiveMessageIds, sorted by
+ *  start. A block folds a contiguous history region, so min/max over its
+ *  covered ids is the region. Built once per pass (shared) or per apply
+ *  call (single-shot fallback) — never per screened unit. */
+function buildBlockIndexSpans(
+  state: CompressionState,
+  byId: Map<string, number>,
+): BlockIndexSpan[] {
+  const spans: BlockIndexSpan[] = [];
+  for (const block of activeBlocks(state)) {
+    let start: number | undefined;
+    let end: number | undefined;
+    for (const id of block.effectiveMessageIds ?? []) {
+      const idx = byId.get(id);
+      if (idx === undefined) continue;
+      if (start === undefined || idx < start) start = idx;
+      if (end === undefined || idx > end) end = idx;
+    }
+    if (start !== undefined && end !== undefined) spans.push({ start, end });
+  }
+  spans.sort((a, b) => a.start - b.start);
+  return spans;
 }
 
 /** tool-call/tool-result pairing map over a whole message array (a side may
@@ -962,6 +1033,148 @@ function applyPairBoundaryAdjustments(
   }
   const ids: string[] = [];
   for (let i = startIndex; i <= endIndex; i++) {
+    const msg = messages[i];
+    if (msg) ids.push(msg.id);
+  }
+  return ids;
+}
+
+/**
+ * Clamp the pair-boundary ADJUSTMENT's widened head/tail at active-coverage
+ * boundaries (production 2026-11-09 mega-turn incident).
+ *
+ * When a range ends (or starts) right where a block was cut mid-group — a
+ * spine-cut/fold boundary slicing between a round's reasoning and its
+ * tool-call — the pair/reasoning adjustment widens the range ACROSS the
+ * boundary to close the pair, pulling in already-covered members. The drag
+ * makes the block visible in range → nestedBlock/consumed machinery engages
+ * → the merge-integrity path resolves the unit to fold-nothing (fatal=null,
+ * filteredIds=0) or a split fatal: every range ending adjacent to a mid-group
+ * block cut dies at screening. This predates the merge-gate bridging fix —
+ * bridging only exposed it, by finally letting units reach the screen with
+ * that geometry.
+ *
+ * Clamping is safe precisely because the partner half is COVERED: #5531 makes
+ * covered halves invisible to the integrity judge (a covered call cannot
+ * strand its turn's reasoning; a covered result leaves no unanswered
+ * tool_call_id), so folding the visible part while the covered partner stays
+ * covered is the allowed reverse-split shape. The requested span itself is
+ * NEVER clamped — only the adjustment's widening — so hand-built ranges that
+ * deliberately target covered spans (refold candidates) keep resolving.
+ *
+ * #1592 refines the cut into a discriminator on the active block's span
+ * (blockSpans): a widened boundary that runs into a block the REQUESTED span
+ * already overlaps is a re-fold — the boundary must CONTAIN the block's span
+ * (push through to its far edge, or keep the deeper widening) so the old
+ * block is wholly re-folded and its summary replaced; cutting back would
+ * strand a partial overlap that renders as two stacked summaries. A block
+ * the requested span never touched is a pure drag-in — keep-out, exactly the
+ * pre-#1592 cut.
+ */
+function clampAdjustmentAtCoverage(
+  adjustedIds: string[],
+  resolved: { startIndex: number; endIndex: number; messageIds: string[] },
+  messages: CoreMessage[],
+  coverage?: ReadonlySet<string>,
+  /** Shared id→index map (#5337): reuse the caller's O(n) derivation instead
+   *  of rebuilding it per call on the screening hot path. */
+  indexById?: Map<string, number>,
+  /** Index spans of the active blocks (#1592 discriminator): a widened
+   *  boundary that runs into a block the REQUESTED span already overlaps is
+   *  a re-fold and must CONTAIN the block; a block the requested span never
+   *  touched is a drag-in and stays out. Undefined (hand-built inputs,
+   *  coverage-free spans) keeps the pure keep-out behavior. */
+  blockSpans?: ReadonlyArray<BlockIndexSpan>,
+): string[] {
+  if (!coverage || coverage.size === 0 || adjustedIds.length === 0) {
+    return adjustedIds;
+  }
+  // Recover the adjusted span's index bounds (ids are contiguous by index —
+  // applyPairBoundaryAdjustments pushes by loop index).
+  let startIdx: number | undefined;
+  let endIdx: number | undefined;
+  if (indexById) {
+    startIdx = indexById.get(adjustedIds[0]!);
+    endIdx = indexById.get(adjustedIds[adjustedIds.length - 1]!);
+  } else {
+    const built = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) {
+      const id = messages[i]?.id;
+      if (id !== undefined) built.set(id, i);
+    }
+    startIdx = built.get(adjustedIds[0]!);
+    endIdx = built.get(adjustedIds[adjustedIds.length - 1]!);
+  }
+  if (startIdx === undefined || endIdx === undefined) return adjustedIds;
+  const isCovered = (i: number): boolean => {
+    const id = messages[i]?.id;
+    return id !== undefined && coverage.has(id);
+  };
+  const spanAt = (i: number): BlockIndexSpan | undefined => {
+    if (!blockSpans) return undefined;
+    for (const span of blockSpans) {
+      if (i >= span.start && i <= span.end) return span;
+    }
+    return undefined;
+  };
+  // A partial overlap between the new fold's span and an active block's span
+  // cannot render: the block's own summary stays visible while the new fold
+  // emits a second one next to it (the #1592 round-2 stacked-shape break).
+  // The requested span is never clamped, so the resolution runs through the
+  // adjustment's widening, with the block spans as the discriminator:
+  //  - requested span overlaps the block → CONTAIN: push the widened
+  //    boundary to the block's far edge (or keep the deeper widening the
+  //    adjustment already produced) so the old block is wholly re-folded and
+  //    its summary replaced — the merge/refold semantics.
+  //  - requested span disjoint from the block → KEEP-OUT: pull the widened
+  //    boundary back before the block's near edge — the mega-turn killer
+  //    (nested/consumed machinery resolves the drag to fold-nothing).
+  const intersectsRequested = (span: BlockIndexSpan): boolean =>
+    resolved.startIndex <= span.end && resolved.endIndex >= span.start;
+  // Pull the widened TAIL back to just before the first covered member of a
+  // disjoint block, contain a re-folded one, and the widened HEAD likewise.
+  // Only the WIDENED portion is clamped — covered ids inside the requested
+  // span stay (refold/consumed semantics).
+  let clamped = false;
+  for (let i = resolved.endIndex + 1; i <= endIdx; ) {
+    if (!isCovered(i)) {
+      i++;
+      continue;
+    }
+    const span = spanAt(i);
+    if (span && intersectsRequested(span)) {
+      if (endIdx < span.end) {
+        endIdx = span.end;
+        clamped = true;
+      }
+      i = span.end + 1;
+      continue;
+    }
+    endIdx = i - 1;
+    clamped = true;
+    break;
+  }
+  for (let i = resolved.startIndex - 1; i >= startIdx; ) {
+    if (!isCovered(i)) {
+      i--;
+      continue;
+    }
+    const span = spanAt(i);
+    if (span && intersectsRequested(span)) {
+      if (startIdx > span.start) {
+        startIdx = span.start;
+        clamped = true;
+      }
+      i = span.start - 1;
+      continue;
+    }
+    startIdx = i + 1;
+    clamped = true;
+    break;
+  }
+  if (!clamped) return adjustedIds;
+  const ids: string[] = [];
+  for (let i = startIdx; i <= endIdx; i++) {
     const msg = messages[i];
     if (msg) ids.push(msg.id);
   }
