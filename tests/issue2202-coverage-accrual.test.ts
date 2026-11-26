@@ -149,14 +149,17 @@ test("sanctioned reasoning drop books at the text fraction — no freeze, no ful
             reconcileFoldCoverage(session, dropSwitchedPass(), { mode: "repair", sessionId: session.id });
             recordCacheSample(session, { at: T0 + 3000 + i * 1000, input: 10000, cached: 9000 });
         }
-        assert.deepEqual(covOf()?.b1, { p: 4, r: 0, t: 7, e: 1, z: 0 }, "fractional coverage, zombie streak stays 0 (#2732 hardIds)");
-        assert.equal(led.folds[0].requestsAfter.toPrecision(10), (1 + 3 * (4 / 7)).toPrecision(10), "accrues exactly the text fraction per sample");
+        // #3849: "no full credit" guards the UNPROVEN drop — once the third
+        // evidence-less pass retires the dead cores, the denominator converges
+        // to the surviving text substrate and later samples book against it.
+        assert.deepEqual(covOf()?.b1, { p: 4, r: 0, t: 4, e: 1, z: 0 }, "zombie streak stays 0 (#2732 hardIds); retired cores leave the denominator (#3849)");
+        assert.equal(led.folds[0].requestsAfter.toPrecision(10), (1 + 2 * (4 / 7) + 1).toPrecision(10), "text fraction until the drop proves permanent, then full accrual on the survivor");
         assert.equal(session.state.blocks.length, 1, "majority-present fold is not reaped");
         assert.equal(logs.filter((l) => l.msg.includes("coverage-lost")).length, 0, "partial absence never reads as loss");
 
-        // And the ledger never regresses: one more text-fraction sample only adds.
+        // And the ledger never regresses: one more sample only adds.
         recordCacheSample(session, { at: T0 + 6000, input: 10000, cached: 9000 });
-        assert.ok(led.folds[0].requestsAfter > 1 + 3 * (4 / 7), "monotone accrual");
+        assert.ok(led.folds[0].requestsAfter > 1 + 2 * (4 / 7) + 1, "monotone accrual");
     } finally {
         setLogCapture(null);
     }
