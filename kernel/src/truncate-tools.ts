@@ -12,6 +12,11 @@ export interface TruncateOptions {
    *  applied only after tool-result truncation fails to reach the target
    *  (#300). Rendered block summaries are never touched. */
   includeTextMessages?: boolean;
+  /** Protection predicate: candidates for which this returns true are NEVER
+   *  clipped (Kernel Boundary rule 6 — protected-tool hard exclusion). The
+   *  emergency-truncate node passes the same predicate the fold path uses so
+   *  both paths interpret config.protectedTools identically (#7771). */
+  isProtected?: (m: CoreMessage) => boolean;
 }
 
 export interface TruncateResult {
@@ -24,11 +29,15 @@ export interface TruncateResult {
   /** Ids of the messages actually clipped this pass (#3939 ③ latch). Empty
    *  when truncatedCount is 0. */
   truncatedIds?: string[];
+  /** Size-qualified candidates excluded because they are protected
+   *  (isProtected returned true). Explains a no-op when the only oversized
+   *  content is protected and therefore never clipped (#7771). */
+  protectedExcluded?: number;
 }
 
 const TRUNCATION_MARKER = "[truncated for context space]";
 
-const DEFAULTS: Required<Omit<TruncateOptions, "includeTextMessages">> = {
+const DEFAULTS: Required<Omit<TruncateOptions, "includeTextMessages" | "isProtected">> = {
   minOutputTokens: 1000,
   keepPrefixChars: 2000,
   keepSuffixChars: 2000,
@@ -49,6 +58,11 @@ export function truncateLargeToolOutputs(
   }
 
   const protectedIndex = messages.length - opts.protectRecentMessages;
+  const isProtected = options.isProtected;
+  // #7771: size-qualified candidates the protection predicate claims are
+  // counted but NEVER clipped — the fold path hard-excludes them, and the
+  // emergency path must not be the one lane that destroys them.
+  let protectedExcluded = 0;
 
   const findCandidates = (
     predicate: (message: CoreMessage) => boolean,
@@ -60,6 +74,10 @@ export function truncateLargeToolOutputs(
       const text = message.text ?? "";
       if (text.length === 0 || text.includes(TRUNCATION_MARKER)) continue;
       if (countTokens(text) < opts.minOutputTokens) continue;
+      if (isProtected?.(message)) {
+        protectedExcluded++;
+        continue;
+      }
       found.push(message);
     }
     return found.sort(
@@ -135,7 +153,7 @@ export function truncateLargeToolOutputs(
   applyTo(textMessages);
 
   if (replacements.size === 0) {
-    return { messages, truncatedCount: 0, savedTokens: 0, candidatesFound, truncatedIds: [] };
+    return { messages, truncatedCount: 0, savedTokens: 0, candidatesFound, truncatedIds: [], protectedExcluded };
   }
   return {
     messages: messages.map((m) =>
@@ -145,5 +163,6 @@ export function truncateLargeToolOutputs(
     savedTokens,
     candidatesFound,
     truncatedIds,
+    protectedExcluded,
   };
 }

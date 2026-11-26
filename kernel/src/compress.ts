@@ -1695,6 +1695,41 @@ const emergencyTruncateNode: PipelineNode = {
         },
       };
     }
+    // #7771: the fold path hard-excludes protected content (Kernel Boundary
+    // rule 6); the emergency path must not be the one lane that clips it.
+    // Build the SAME predicate assignRefsNode uses (compress.ts protectedFn)
+    // so both paths interpret config.protectedTools / isToolProtected /
+    // isMessageProtected / protectedLatestTools identically.
+    const hasProtection =
+      ctx.config.protectedTools.length > 0 ||
+      !!ctx.config.isToolProtected ||
+      !!ctx.config.isMessageProtected ||
+      (ctx.config.protectedLatestTools?.length ?? 0) > 0;
+    const failedCompressCallIds = collectFailedCompressCallIds(
+      messages,
+      ctx.config,
+    );
+    const protectedCallIds = hasProtection
+      ? collectProtectedToolCallIds(messages, ctx.config)
+      : undefined;
+    const latestProtected = hasProtection
+      ? collectLatestProtected(messages, ctx.config)
+      : undefined;
+    const isProtected = (m: CoreMessage) =>
+      hasUnrecoverableMediaPayload(m) ||
+      (hasProtection
+        ? (protectedCallIds
+            ? isMessageProtectedWithPairing(
+                m,
+                ctx.config,
+                protectedCallIds,
+                failedCompressCallIds,
+              )
+            : isMessageProtected(m, ctx.config, failedCompressCallIds)) ||
+          (latestProtected
+            ? isMessageLatestProtected(m, latestProtected)
+            : false)
+        : false);
     const trunc = truncateLargeToolOutputs(
       messages,
       // Account for replayed clips: they already shrank the real request;
@@ -1705,6 +1740,7 @@ const emergencyTruncateNode: PipelineNode = {
       {
         protectRecentMessages: ctx.config.preserveRecentMessages,
         includeTextMessages: true,
+        isProtected,
       },
     );
 
@@ -1730,10 +1766,16 @@ const emergencyTruncateNode: PipelineNode = {
       truncatedCount: trunc.truncatedCount,
     };
     if (trunc.savedTokens <= 0) {
+      // #7771: a no-op caused by protection is NOT "no truncatable content" —
+      // the content exists but is protected and never clipped. Say so.
+      const protectedNote =
+        trunc.protectedExcluded && trunc.protectedExcluded > 0
+          ? `; ${trunc.protectedExcluded} protected message(s) excluded (never clipped)`
+          : "";
       effects.truncationSkipped =
         trunc.candidatesFound === 0
-          ? `emergency-truncate ran at ${Math.round(usage * 100)}% usage but found no truncatable content (no oversized tool-result or text message outside the last ${ctx.config.preserveRecentMessages} messages)`
-          : `emergency-truncate found ${trunc.candidatesFound} candidate(s) at ${Math.round(usage * 100)}% usage but none were large enough to save tokens`;
+          ? `emergency-truncate ran at ${Math.round(usage * 100)}% usage but found no truncatable content (no oversized tool-result or text message outside the last ${ctx.config.preserveRecentMessages} messages${protectedNote})`
+          : `emergency-truncate found ${trunc.candidatesFound} candidate(s) at ${Math.round(usage * 100)}% usage but none were large enough to save tokens${protectedNote}`;
     }
     if (triggered) {
       effects.terminalEscape = {
