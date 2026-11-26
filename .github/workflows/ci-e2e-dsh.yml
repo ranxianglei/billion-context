@@ -40,6 +40,7 @@ jobs:
   # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
   # or on the 30-min cron when master moved since the last green scheduled run.
   gate:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -59,7 +60,7 @@ jobs:
           run=true
           if [ "$EVENT" = "pull_request" ]; then
             # only the ci:full label itself may trigger; other label events skip
-            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then run=false
+            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ] && [ "$LABEL_EVENT" != "ci:force" ]; then run=false
             elif ! grep -qw ci:full <<<"$PR_LABELS"; then run=false; fi
           elif [ "$EVENT" = "schedule" ]; then
             LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci-e2e-dsh.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
@@ -69,7 +70,7 @@ jobs:
           echo "run=$run" >> "$GITHUB_OUTPUT"
   e2e-dsh-plugin-lane:
     needs: [gate]
-    if: needs.gate.outputs.run == 'true'
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (needs.gate.outputs.run == 'true') }}
     name: dsh plugin lane (fork adoption + side-request isolation + lane truth tables)
     runs-on: ubuntu-latest
     timeout-minutes: 15

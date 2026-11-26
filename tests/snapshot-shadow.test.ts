@@ -48,6 +48,12 @@ import { resolveSnapshotShadow } from "../src/knobs.ts";
 import { classifyShadowForTest } from "../src/server/snapshot-render.ts";
 import { rmrf } from "./tmp-rm.ts";
 
+// #4313: tags carry an immutable `time=` wall-clock stamp minted from Date.now()
+// on turn processing; this file asserts byte-identical upstream bodies between
+// shadow-off/shadow-on legs, so both legs must observe one clock. node --test
+// gives this file its own process, so the module-scope pin cannot leak out.
+Date.now = () => Date.parse("2026-01-02T03:04:05Z");
+
 const SUMMARY = "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FOR-KERNEL-MIN-LENGTH-CHECK";
 
 function sse(obj: unknown): string {

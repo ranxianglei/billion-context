@@ -333,7 +333,7 @@ test("pin: unknown-ref sibling errors do not poison valid ranges (classification
   );
 });
 
-test("pin: a range that dies DURING application rejects the whole batch all-or-nothing (#3939 ④, closes the #3003 double-seam)", () => {
+test("pin: a range that dies DURING application folds its siblings and no-ops the dead range (#4521 supersedes #3939 ④ for the zone class)", () => {
   const core = createCore();
   const state = createInitialState();
   const messages: CoreMessage[] = [
@@ -357,11 +357,19 @@ test("pin: a range that dies DURING application rejects the whole batch all-or-n
     protectedMessageIds: new Set(["m00003"]),
   });
 
-  assert.equal(result.result.blocksCreated, 0);
-  assert.equal(result.state.blocks.length, 0);
-  assert.equal(result.state.stats.compressionCount, 0);
+  // #3939 ④ pinned all-or-nothing here because a mid-batch death used to
+  // leave a seam the model would re-enter (retry the dead range → covered /
+  // protected rejection → livelock). #4521 removes the seam's teeth: the
+  // dead range is an idempotent no-op (resubmitting it later returns the
+  // same no-op receipt, never a failure), so the healthy sibling folds
+  // instead of being held hostage.
+  assert.equal(result.result.blocksCreated, 1, "the healthy sibling folds");
+  assert.equal(result.state.blocks.length, 1);
+  assert.equal(result.state.stats.compressionCount, 1);
+  assert.equal(result.result.errors.length, 0, "the zone death is not an error");
   assert.match(
-    result.result.errors[0]!,
-    /Batch rejected before folding any range.*entirely within the protected zone/s,
+    result.result.warnings.join(" "),
+    /m00003\.\.m00003 folded nothing.*protected zone/s,
+    "the dead range is reported as the zone no-op",
   );
 });

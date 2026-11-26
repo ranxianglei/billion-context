@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // lifecycle-ledger-guard.mjs — #3249: every BILI_* env var read from src/ must be
-// registered in LIFECYCLE.md (§1 transition ledger or §2 permanent registry).
+// registered in docs/lifecycle.md (§1 transition ledger or §2 permanent registry).
 //
 //   node scripts/lifecycle-ledger-guard.mjs          # CI mode: exit 1 on unregistered vars
 //   node scripts/lifecycle-ledger-guard.mjs report   # always exit 0, print findings
 //
 // POSTURE (same as config-surface-guard.mjs): an env var read in src/ but ABSENT from
-// LIFECYCLE.md is a FAILURE — a new switch without a lifecycle entry is exactly the
+// docs/lifecycle.md is a FAILURE — a new switch without a lifecycle entry is exactly the
 // rot this ledger exists to stop. A ledger entry with no live reader is a NOTICE
 // only: dynamic names (BILI_ROLLOUT_<feature>), branches not yet on master
 // (BILI_ANTHROPIC_THREADS_INJECT lives in open PR #2888) and retired-but-still-warned
@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
 const SRC_DIR = join(repoRoot, "src");
-const LEDGER = join(repoRoot, "LIFECYCLE.md");
+const LEDGER = join(repoRoot, "docs/lifecycle.md");
 
 const DIRECT = /process\.env\.([A-Z][A-Z0-9_]*)/g;
 const BRACKET = /process\.env\[\s*["']([A-Z][A-Z0-9_]*)["']\s*\]/g;
@@ -113,12 +113,12 @@ function main() {
     console.log(`notice: ${stale.length} ledger entr${stale.length === 1 ? "y has" : "ies have"} no live reader in src/ (expected for dynamic/unmerged/retired names): ${stale.join(", ")}`);
   }
   if (missing.length === 0) {
-    console.log("OK: every BILI_* env var read from src/ is registered in LIFECYCLE.md");
+    console.log("OK: every BILI_* env var read from src/ is registered in docs/lifecycle.md");
     return;
   }
-  console.error(`FAIL: ${missing.length} BILI_* env var(s) read from src/ but NOT in LIFECYCLE.md:`);
+  console.error(`FAIL: ${missing.length} BILI_* env var(s) read from src/ but NOT in docs/lifecycle.md:`);
   for (const n of missing) console.error(`  - ${n}`);
-  console.error("Add them to §1 (transition, with release condition) or §2 (permanent) of LIFECYCLE.md.");
+  console.error("Add them to §1 (transition, with release condition) or §2 (permanent) of docs/lifecycle.md.");
   if (mode !== "report") process.exitCode = 1;
 }
 

@@ -169,8 +169,9 @@ test("selector never advertises spans the apply side structurally rejects (#2638
     }
   }
 
-  // Negative control: the OLD advertised dead spans still fail on apply —
-  // proving they were dead, so screening them out changes behavior.
+  // Negative control: the OLD advertised dead spans still fold nothing on
+  // apply — #4521 renders them as the covered no-op (0 blocks, 0 errors,
+  // warning naming the covering block), proving they were dead just the same.
   const deadSpan = core.applyCompression({
     ranges: [{ startRef: "m00017", endRef: "m00022", summary: "dead span" }],
     messages,
@@ -178,9 +179,12 @@ test("selector never advertises spans the apply side structurally rejects (#2638
     config: cfg,
   });
   assert.equal(deadSpan.result.blocksCreated, 0);
-  assert.ok(
-    deadSpan.result.errors.some((e) => /contains no (new )?compressible messages/.test(e)),
-    deadSpan.result.errors.join("; "),
+  assert.equal(deadSpan.result.errors.length, 0);
+  assert.equal(deadSpan.result.noop, true);
+  assert.match(
+    deadSpan.result.warnings.join(" "),
+    /already covered by active block\(s\)|protected or filtered/,
+    deadSpan.result.warnings.join("; "),
   );
   const loneCarrier = core.applyCompression({
     ranges: [{ startRef: "m00007", endRef: "m00007", summary: "lone carrier" }],
@@ -189,10 +193,8 @@ test("selector never advertises spans the apply side structurally rejects (#2638
     config: cfg,
   });
   assert.equal(loneCarrier.result.blocksCreated, 0);
-  assert.ok(
-    loneCarrier.result.errors.some((e) => /contains no compressible messages/.test(e)),
-    loneCarrier.result.errors.join("; "),
-  );
+  assert.equal(loneCarrier.result.errors.length, 0);
+  assert.equal(loneCarrier.result.noop, true, "lone carrier folds nothing, as the no-op class");
 });
 
 test("buildCompressibleRanges treats a live carrier as a boundary; stale carriers fold", () => {
@@ -253,25 +255,30 @@ test("buildCompressibleRanges treats a live carrier as a boundary; stale carrier
 // exemption, enforced by filterProtectedToolMessages. Pin both directions so
 // neither regresses — this PR's original blanket carve was dropped on rebase
 // because it would have re-pinned archivable media against #2607.
-test("archivable media folds like text; unrecoverable payloads stay pinned (#2607)", () => {
+test("archivable and ref-based media fold like text; only refless payloads stay pinned (#2607/#5620)", () => {
   const core = createCore();
   const cfg = config();
   const state = createInitialState();
   const archivable = { ...msg("MA", "see image"), imageBase64: "aGVsbG8=" };
-  const unrecoverable = {
-    ...msg("MU", "remote shot"),
+  const refBased = {
+    ...msg("RB", "remote shot"),
     rawOpenaiContent: { type: "image_url", image_url: { url: "https://example.com/shot.png" } },
   };
-  const messages = [msg("x1", "text one", "assistant"), archivable, unrecoverable, msg("x2", "text two", "assistant")];
+  const refless = {
+    ...msg("MU", "opaque blob"),
+    rawOpenaiContentParts: [{ type: "mystery", blob: "zzz" }],
+  };
+  const messages = [msg("x1", "text one", "assistant"), archivable, refBased, refless, msg("x2", "text two", "assistant")];
   state.messageRefs = assignRefs(messages, {
     existing: state.messageRefs,
     nextIndex: 1,
     isProtected: (m) => hasUnrecoverableMediaPayload(m),
   }).map;
   assert.equal(state.messageRefs.byRaw["MA"], "m00002");
+  assert.equal(state.messageRefs.byRaw["RB"], "m00003", "#5620: ref-based media is citable");
   assert.equal(state.messageRefs.byRaw["MU"], "BLOCKED");
   const folded = core.applyCompression({
-    ranges: [{ startRef: "m00001", endRef: "m00003", summary: "with media" }],
+    ranges: [{ startRef: "m00001", endRef: "m00004", summary: "with media" }],
     messages,
     state,
     config: cfg,
@@ -282,8 +289,13 @@ test("archivable media folds like text; unrecoverable payloads stay pinned (#260
   const block = folded.state.blocks.find((b) => b.active)!;
   assert.ok(block.effectiveMessageIds.includes("x1"));
   assert.ok(block.effectiveMessageIds.includes("MA"), "archivable media folds like text");
+  assert.ok(block.effectiveMessageIds.includes("RB"), "#5620: ref-based media folds");
+  assert.ok(
+    block.summary.includes("- https://example.com/shot.png"),
+    "the re-access handle rides the stored summary (#5620)",
+  );
   assert.ok(block.effectiveMessageIds.includes("x2"));
-  assert.ok(!block.effectiveMessageIds.includes("MU"), "unrecoverable payload stays pinned");
+  assert.ok(!block.effectiveMessageIds.includes("MU"), "refless payload stays pinned");
 });
 
 // Partial-pair visibility (call visible, result covered) is UNREACHABLE

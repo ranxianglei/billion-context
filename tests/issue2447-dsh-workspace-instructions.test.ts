@@ -24,7 +24,6 @@ import { dshWorkspaceInstructionsPath, durableMessageToolPaths } from "../src/du
 // #2989: rig hygiene resets the LIVE session-order registry (the persona-
 // anchor ladder is off the production path on every lane since #3134 —
 // v2 order resolution everywhere, google included).
-import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -69,7 +68,6 @@ async function startRig(): Promise<Rig> {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetSessionOrderForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
@@ -135,12 +133,44 @@ test("dshWorkspaceInstructionsPath: projects the baseline label to durable/agent
     const msg = (contentType: string, text: unknown) => ({ id: "id-1", createdAt: 0, contentType, text }) as never;
     assert.equal(dshWorkspaceInstructionsPath(msg("text", INSTR_MSG)), "durable/agents-md", "the merged global+project baseline projects");
     assert.equal(dshWorkspaceInstructionsPath(msg("text", "plain prose about workspace setup")), undefined);
-    assert.equal(dshWorkspaceInstructionsPath(msg("text", CHANGE_MSG)), undefined, "lowercase reconciliation variants stay consumable history");
+    assert.equal(dshWorkspaceInstructionsPath(msg("tool-call", "\x3csystem-reminder\x3e\nInstructions from: AGENTS.md\n\x3c/system-reminder\x3e")), undefined, "non-text content types never match");
+    // Revisions are the SAME durable carrier, not consumable history: the
+    // baseline is re-emitted only when baselineIdentity changes (projectRoot +
+    // discovery/budget config, NOT file contents), so a mid-session edit rides
+    // this message ALONE. Identity is per path so a revision cannot demote the
+    // (multi-file) baseline under the default latest-per-identity policy.
+    assert.equal(dshWorkspaceInstructionsPath(msg("text", CHANGE_MSG)), "durable/agents-md-update/AGENTS.md", "an Updated revision projects to its own per-path identity");
+    assert.equal(
+        dshWorkspaceInstructionsPath(msg("text", `\x3csystem-reminder\x3e\nAdditional instructions from: neighbor-help-frontend/AGENTS.md\n\nThese instructions apply to work under \x60neighbor-help-frontend\x60.\n\nmost-specific rules first\n\x3c/system-reminder\x3e`)),
+        "durable/agents-md-update/neighbor-help-frontend/AGENTS.md",
+        "an Additional revision (a file the baseline never carried) projects too",
+    );
+    assert.equal(
+        dshWorkspaceInstructionsPath(msg("text", `\x3csystem-reminder\x3e\nInstructions removed: AGENTS.md\n\nThe previously loaded instructions from this file no longer apply.\n\x3c/system-reminder\x3e`)),
+        "durable/agents-md-update/AGENTS.md",
+        "a removal notice projects (folding it would keep applying deleted rules)",
+    );
+    // The baseline's BODY may quote the uppercase label (documenting this very
+    // matcher is a realistic AGENTS.md line). Guards against a silent no-op:
+    // if the injection ever stops landing, the assertion below would pass
+    // vacuously on an unmodified fixture.
+    const baselineQuotingLabel = INSTR_MSG.replace("## \u89c4\u5219", "## \u89c4\u5219\n(see bili's `Instructions from:` matcher)");
+    assert.notEqual(baselineQuotingLabel, INSTR_MSG, "fixture injection must actually land");
+    assert.equal(
+        dshWorkspaceInstructionsPath(msg("text", baselineQuotingLabel)),
+        "durable/agents-md",
+        "a baseline whose BODY quotes the uppercase label is still a baseline",
+    );
+    assert.equal(
+        dshWorkspaceInstructionsPath(msg("text", `\x3csystem-reminder\x3e\nUpdated instructions from: AGENTS.md\n\nThe old copy said \x60Instructions from: AGENTS.md\x60.\n\x3c/system-reminder\x3e`)),
+        "durable/agents-md-update/AGENTS.md",
+        "the revision shape wins even when its body quotes the uppercase baseline label",
+    );
     assert.equal(dshWorkspaceInstructionsPath(msg("tool-call", "Instructions from: AGENTS.md")), undefined, "non-text content types never match");
     assert.equal(dshWorkspaceInstructionsPath(msg("text", undefined)), undefined, "missing text is safe");
     const dshClassifier = durableMessageToolPaths["dsh"];
     assert.ok(dshClassifier, "dsh lane is registered");
-    assert.equal(dshClassifier!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
+    assert.equal(dshClassifier!(msg("text", "\x3csystem-reminder\x3e\n\x3cavailable_skills\x3e\n- name: x\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
     assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
 });
 
@@ -148,7 +178,7 @@ test("dshWorkspaceInstructionsPath: projects the baseline label to durable/agent
  *  instructions baseline (it sits mid-history between two tagged fillers),
  *  execute a real compress through /__bili/plugin/tool, and return the next
  *  turn's upstream body. */
-async function runFoldScenario(agent: string, conv: string): Promise<{ postFoldBody: string; toolJson: Record<string, unknown> }> {
+async function runFoldScenario(agent: string, conv: string, revision?: string): Promise<{ postFoldBody: string; toolJson: Record<string, unknown> }> {
     const rig = await startRig();
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
@@ -165,6 +195,13 @@ async function runFoldScenario(agent: string, conv: string): Promise<{ postFoldB
         msgs.push({ role: "user", content: INSTR_MSG });
         await (await post(msgs)).text();
         msgs.push({ role: "assistant", content: filler("A2") });
+        // …optionally a mid-session REVISION of the same carrier (same shape as
+        // dsh's changedSectionText when the file is edited after load)…
+        if (revision !== undefined) {
+            msgs.push({ role: "user", content: revision });
+            await (await post(msgs)).text();
+            msgs.push({ role: "assistant", content: filler("A2b") });
+        }
         // …and turns 3–8 grow past it.
         for (let i = 3; i <= 8; i++) {
             msgs.push({ role: "user", content: filler(`F${i}`) });
@@ -216,6 +253,21 @@ test("dsh lane (#2447): the workspace-instructions baseline survives a fold that
     assert.ok(!postFoldBody.includes("F5-"), "folded filler after the baseline must be gone");
 });
 
+test("dsh lane: a mid-session REVISION of the instructions survives a fold that covers it", async () => {
+    // The baseline above proves the FIRST copy of the rules is pinned. This one
+    // pins the SECOND half of the contract: dsh never re-emits a baseline when
+    // file CONTENTS change (baselineIdentity excludes content), so this
+    // `Updated instructions from:` message is the only carrier of the new
+    // rules. Before the revision identity landed, the fold dropped it and left
+    // the model with the superseded baseline alone.
+    const { postFoldBody } = await runFoldScenario("dsh", "i2447-dsh-revision", CHANGE_MSG);
+    assert.ok(postFoldBody.includes("[Compressed conversation section]"), "the fold must have happened (protection may not veto the whole range)");
+    assert.ok(postFoldBody.includes("always run lint AND typecheck before committing"), "the revised rule text must survive the fold (it exists nowhere else)");
+    assert.ok(postFoldBody.includes(RULE_MARKER), "the baseline survives alongside it (separate per-path identity)");
+    assert.ok(!postFoldBody.includes("A1-"), "folded filler before the carrier must be gone (the fold really consumed its range)");
+    assert.ok(!postFoldBody.includes("F5-"), "folded filler after the carrier must be gone");
+});
+
 test("unregistered lane: without the guard the baseline folds away (pins lane scoping)", async () => {
     const { postFoldBody } = await runFoldScenario("test-agent", "i2447-plain");
     assert.ok(postFoldBody.includes("[Compressed conversation section]"), "the fold must have happened");
@@ -226,21 +278,27 @@ test("session-level: the dsh lane stamps the guard onto the effective config", a
     const rig = await startRig();
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
-        const r = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "i2447-stamp" },
-            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: INSTR_MSG }] }),
-        });
-        assert.equal(r.status, 200);
-        await r.text();
-        const s = peekSession("i2447-stamp");
-        assert.ok(s, "dsh session exists");
+        const headers = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "i2447-stamp" };
+        // Turn 1 is a tool-less single-shot shape: the #5656 generic dsh
+        // single-shot sidecar gate diverts it onto the verbatim side lane
+        // (kernel no-touch — the declared residual), so no refs are assigned
+        // yet. No fold can happen before turn 2 (nothing compressible, no
+        // action surface), so protection landing on the first full-pipeline
+        // turn keeps the baseline safe against every possible fold.
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: INSTR_MSG }] }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.ok(peekSession("i2447-stamp"), "dsh session exists");
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: INSTR_MSG }, { role: "assistant", content: "ok" }, { role: "user", content: "Second turn after the baseline." }] }) });
+        assert.equal(r2.status, 200);
+        await r2.text();
         // The stamped effective config (read by /__bili/plugin/tool) carries the
         // guard — proven indirectly: the baseline got a BLOCKED ref, i.e. it was
-        // recognized as protected AT ASSIGNMENT TIME on the very first turn.
+        // recognized as protected AT ASSIGNMENT TIME on the first full-pipeline
+        // turn (turn 2 — turn 1 rides the #5656 side lane).
         const sFull = getSession("i2447-stamp");
         const baselineBlocked = Object.entries(sFull.state.messageRefs.byRaw).some(([, ref]) => ref === "BLOCKED");
-        assert.ok(baselineBlocked, "the baseline message must carry a BLOCKED ref (never advertised, never foldable)");
+        assert.ok(baselineBlocked, "the baseline message must carry a BLOCKED ref by the first full-pipeline turn (never advertised, never foldable)");
     } finally {
         await closeRig(rig);
     }

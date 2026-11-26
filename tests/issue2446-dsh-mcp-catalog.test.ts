@@ -24,7 +24,6 @@ import { dshMcpCatalogPath, durableMessageToolPaths } from "../src/durable-messa
 // #2989: rig hygiene resets the LIVE session-order registry (the persona-
 // anchor ladder is off the production path on every lane since #3134 —
 // v2 order resolution everywhere, google included).
-import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -79,7 +78,6 @@ async function startRig(): Promise<Rig> {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetSessionOrderForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
@@ -147,14 +145,14 @@ test("dshMcpCatalogPath: projects the catalog marker to durable/mcp-catalog on t
     assert.equal(dshMcpCatalogPath(msg("text", "bare \x3cmcp_catalog\x3e without wrapper")), "durable/mcp-catalog", "the bare block projects too — a wrapper rewording cannot disarm the classifier");
     // Deliberately foldable neighbors stay consumable:
     assert.equal(dshMcpCatalogPath(msg("text", "plain prose mentioning an mcp catalog in lowercase")), undefined, "plain prose without the exact XML marker stays foldable");
-    assert.equal(dshMcpCatalogPath(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), undefined, "the #2419 skill catalog is a DIFFERENT carrier (own identity)");
+    assert.equal(dshMcpCatalogPath(msg("text", "\x3csystem-reminder\x3e\n\x3cavailable_skills\x3e\n- name: x\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e")), undefined, "the #2419 skill catalog is a DIFFERENT carrier (own identity)");
     assert.equal(dshMcpCatalogPath(msg("tool-call", MCP_MSG)), undefined, "non-text content types never match");
     assert.equal(dshMcpCatalogPath(msg("text", undefined)), undefined, "missing text is safe");
     const dshClassifier = durableMessageToolPaths["dsh"];
     assert.ok(dshClassifier, "dsh lane is registered");
     assert.equal(dshClassifier!(msg("text", MCP_MSG)), "durable/mcp-catalog", "lane entry covers the #2446 catalog shape");
-    assert.equal(dshClassifier!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
-    assert.equal(dshClassifier!(msg("text", "Instructions from: AGENTS.md")), "durable/agents-md", "lane entry still covers the #2447 baseline shape");
+    assert.equal(dshClassifier!(msg("text", "\x3csystem-reminder\x3e\n\x3cavailable_skills\x3e\n- name: x\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
+    assert.equal(dshClassifier!(msg("text", "\x3csystem-reminder\x3e\nInstructions from: AGENTS.md\n\x3c/system-reminder\x3e")), "durable/agents-md", "lane entry still covers the #2447 baseline shape");
     assert.equal(dshClassifier!(msg("text", "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.")), "durable/runtime-context", "lane entry still covers the #2481 snapshot shape");
     assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
 });
@@ -241,21 +239,27 @@ test("session-level: the dsh lane stamps the guard onto the effective config", a
     const rig = await startRig();
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
-        const r = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "i2446-stamp" },
-            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: MCP_MSG }] }),
-        });
-        assert.equal(r.status, 200);
-        await r.text();
-        const s = peekSession("i2446-stamp");
-        assert.ok(s, "dsh session exists");
+        const headers = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "i2446-stamp" };
+        // Turn 1 is a tool-less single-shot shape: the #5656 generic dsh
+        // single-shot sidecar gate diverts it onto the verbatim side lane
+        // (kernel no-touch — the declared residual), so no refs are assigned
+        // yet. No fold can happen before turn 2 (nothing compressible, no
+        // action surface), so protection landing on the first full-pipeline
+        // turn keeps the catalog safe against every possible fold.
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: MCP_MSG }] }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.ok(peekSession("i2446-stamp"), "dsh session exists");
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: MCP_MSG }, { role: "assistant", content: "ok" }, { role: "user", content: "Second turn after the catalog." }] }) });
+        assert.equal(r2.status, 200);
+        await r2.text();
         // The stamped effective config (read by /__bili/plugin/tool) carries the
         // guard — proven indirectly: the catalog got a BLOCKED ref, i.e. it was
-        // recognized as protected AT ASSIGNMENT TIME on the very first turn.
+        // recognized as protected AT ASSIGNMENT TIME on the first full-pipeline
+        // turn (turn 2 — turn 1 rides the #5656 side lane).
         const sFull = getSession("i2446-stamp");
         const blockedRefs = Object.entries(sFull.state.messageRefs.byRaw).filter(([, ref]) => ref === "BLOCKED").length;
-        assert.ok(blockedRefs >= 1, "the catalog message must carry a BLOCKED ref (never advertised, never foldable)");
+        assert.ok(blockedRefs >= 1, "the catalog message must carry a BLOCKED ref by the first full-pipeline turn (never advertised, never foldable)");
     } finally {
         await closeRig(rig);
     }

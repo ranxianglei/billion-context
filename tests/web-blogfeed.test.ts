@@ -212,6 +212,23 @@ test("CRLF frontmatter (Windows autocrlf checkout) still yields title/excerpt/da
     assert.equal(crlf.date, "2026-10-08");
 });
 
+test("manifest entry over a flat posts-dir file collapses to ONE row — manifest wins", () => {
+    // The shipped articles.json lists the very same files that live flat in
+    // website/blog/posts/ (that overlap is the normal state); without the id
+    // dedupe every such post would render twice in the list.
+    writeFileSync(join(pkgRoot, "website", "articles.json"), JSON.stringify({ articles: [
+        { file: "paper/a.md", zh_file: "paper/b.md", slug: "alpha" },
+        { file: "website/blog/posts/2026-10-09_new.md", slug: "new" },
+    ] }));
+    _setBlogRootForTest(pkgRoot);
+    const feed = getBlogFeed();
+    const rows = feed.items.filter((i) => i.id === "new");
+    assert.equal(rows.length, 1, "overlapping id renders exactly once");
+    assert.equal(rows[0].kind, "article", "the manifest entry wins the tie");
+    assert.equal(feed.items.filter((i) => i.id === "alpha").length, 1, "non-overlapping article unaffected");
+    assert.equal(feed.items.filter((i) => i.id === "demo").length, 1, "manifest-unlisted posts untouched");
+});
+
 test("default probing finds the repository tree from the TS source layout", () => {
     _setBlogRootForTest(null);
     const data = getBlogFeed();

@@ -255,9 +255,9 @@ test("inline WS: planNativePi accepts the widened truthy/falsy BILI_PI_INLINE se
     // file config still honored when env unset, overridden when env off
     assert.equal(planNativePi({}, true).mode, "inline");
     assert.equal(planNativePi({ BILI_PI_INLINE: "false" }, true).mode, "spawn");
-    // #4687: no signals at all = the spawned server (default flip reverted;
-    // inline is opt-in only); explicit file opt-out also plans the server
-    assert.equal(planNativePi({}).mode, "spawn");
-    assert.equal(planNativePi({}, undefined).mode, "spawn");
+    // #5428: no signals at all = the in-process inline lane (default flipped
+    // back on); explicit file opt-out still plans the server
+    assert.equal(planNativePi({}).mode, "inline");
+    assert.equal(planNativePi({}, undefined).mode, "inline");
     assert.equal(planNativePi({}, false).mode, "spawn");
 });

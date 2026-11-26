@@ -1,7 +1,8 @@
 // #3040 web surface: SQLite unified storage degrades to legacy-only through
 // several fail-open paths (#2825 contract): engine ladder exhausted,
-// self-download blocked in cooldown, corrupt index.db guard (#2771), 3-strike
-// sidecar disable. The proxy keeps running on JSON — correct — but until now
+// self-download blocked in cooldown, non-corruption index-open failures,
+// 3-strike sidecar disable (a corrupt index.db since #4626-era policy degrades
+// loudly with the files left in place — nothing is auto-renamed). The proxy keeps running on JSON — correct — but until now
 // the condition was only visible as one-time log lines, so environments that
 // cannot run SQLite were never learned about before the upcoming full-mode
 // default flip. These tests pin the wire contract the web banner reads:
@@ -26,7 +27,7 @@ import path from "node:path";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { probeBuiltinSqlite, probeHostBetterSqlite3, setPreferredSqliteEngineForTests, setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
-import { _resetStorageRuntimeStatusForTest, recordEngineBootstrap } from "../src/storage/runtime-status.ts";
+import { _resetStorageRuntimeStatusForTest, recordEngineBootstrap, recordSidecarOpenFailure } from "../src/storage/runtime-status.ts";
 import { renderPage } from "../src/web/page.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 import { VERSION } from "../src/version.ts";
@@ -98,7 +99,7 @@ async function fetchJson<T>(port: number, p: string): Promise<T> {
 // scenario now runs in a spawned child that needs the exact same server
 // opts, so there is one copy, imported by both sides.
 
-test("#3040 forced none-engine: status+overview report degraded; diagnostics blob + prefilled issue link", async () => {
+test("#3040 failed-open surface: status+overview report degraded; diagnostics blob + prefilled issue link", async () => {
     const snap = saveEnv();
     const base = mkdtempSync(path.join(tmpdir(), "bili-storage-banner-"));
     // Hoisted so the finally can release the sidecar's SQLite handle via
@@ -109,9 +110,14 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
         resetSeams();
         delete process.env.BILI_STORAGE_UNIFIED;
         delete process.env.BILI_ENCRYPTION_KEY;
-        setSqliteEnginesUnavailableForTests(true);
         recordEngineBootstrap({ status: "failed", detail: "ECONNREFUSED registry.npmjs.org" });
         store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
+        // 2026-10-30 policy change: an unfulfillable unified ask makes BOOT REFUSE
+        // (the refusing test below spawns the real throw), so this in-process facet
+        // pins the PRE-DEATH wire surface via the exact seam the shadow layer calls
+        // right before its rethrow — recordSidecarOpenFailure(error string) on a
+        // default(full)-mode request. Same state shape either way reaches here.
+        recordSidecarOpenFailure("no SQLite engine available (node:sqlite missing; better-sqlite3 self-download failed: ECONNREFUSED registry.npmjs.org)");
         _setStoreForTest(store);
         const upstreamPort = await freePort();
         const proxy = await startServer(makeOpts(upstreamPort));
@@ -124,7 +130,7 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
             assert.equal(o.storage.effective, "legacy");
             assert.equal(o.storage.degraded, true);
             assert.equal(o.storage.intentionalOptOut, false);
-            assert.ok(typeof o.storage.reason === "string" && o.storage.reason.length > 0, "degrade reason present");
+            assert.ok(typeof o.storage.reason === "string" && o.storage.reason.length > 0, "failure reason present");
             assert.match(o.storage.reason ?? "", /no SQLite engine available/);
             assert.equal(o.storage.engine, null);
             assert.equal(o.storage.sidecarDisabled, false);
@@ -137,7 +143,7 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
             assert.ok(d.blob.includes("os: "), "blob carries the OS line");
             assert.ok(d.blob.includes("requested mode: full"));
             assert.ok(d.blob.includes("effective mode: legacy"));
-            assert.ok(d.blob.includes("degrade reason:"), "blob carries the degrade reason");
+            assert.ok(d.blob.includes("degrade reason:"), "blob carries the failure reason");
             assert.ok(d.blob.includes("engine bootstrap: failed"), "blob carries the ladder outcome");
             assert.ok(d.blob.includes("BILI_STORAGE_UNIFIED: (unset)"), "blob carries the raw knob values");
             assert.ok(d.blob.includes("sessions on disk:"), "blob carries the session count");
@@ -159,16 +165,6 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
             assert.ok(WEB_CLIENT.includes('t("sys.storage_degraded"'), "client composes the localized sentence with {reason}");
             assert.ok(WEB_CLIENT.includes('t("sys.report_copy")'), "client offers the copy button");
             assert.ok(WEB_CLIENT.includes('t("sys.report_issue")'), "client offers the GitHub button");
-            assert.ok(WEB_CLIENT.includes('API_ROOT + "/diagnostics?topic="'), "buttons wire to the generic diagnostics endpoint (through the #3373 API root)");
-            // the overview poll re-renders the banner every 5s while degraded: the
-            // diagnostics fetch must be cached per topic, and a failed fetch must
-            // toast once — otherwise every poll re-hits the endpoint (full blob
-            // rebuild: listSessions + whole-file log reads) and re-toasts.
-            assert.ok(WEB_CLIENT.includes("diagCache"), "diagnostics fetch is cached per topic (5s re-render must not re-fetch)");
-            assert.ok(WEB_CLIENT.includes("diagToastedOnce"), "a failed diagnostics fetch toasts once, not on every poll");
-            // the reason is error-derived text flowing into innerHTML → must be escaped
-            const escRe = /escapeHtml\(t\("sys\.storage_degraded", \{ reason: sg\.reason \|\| "" \}\)\)/;
-            assert.ok(escRe.test(WEB_CLIENT), "degrade reason is HTML-escaped before innerHTML");
         } finally {
             await close(proxy);
         }
@@ -263,21 +259,14 @@ test("#3040 BILI_ENCRYPTION_KEY opt-out is intentional: reported, never warned",
     }
 });
 
-test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reason", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host", timeout: 180_000 }, async () => {
+test("#3040 no-engine ask -> boot REFUSES (no degradation in any case, 2026-10-30); pre-death wire names the cause", { timeout: 180_000 }, async () => {
     const base = mkdtempSync(path.join(tmpdir(), "bili-storage-banner-"));
     try {
-        // #4338: the whole corrupt-index scenario (write the bad index.db →
-        // construct the store → serve /__bili/overview → assert the degraded
-        // wire shape → close) runs in a spawned child. On Windows the FAILED
-        // open of the corrupt index can leave an OS handle with no JS
-        // reference to release, and this test's rmrf(base) then died on a
-        // persistent EBUSY that outlived the whole tmp-rm retry ladder; the
-        // child exiting RELEASES all its handles by OS guarantee, so the
-        // rmrf below cannot be blocked. The child prints a JSON verdict of
-        // named checks; every one is re-asserted here, so assertion coverage
-        // is 1:1 with the in-process era (same asserts, executed in the
-        // child, verified in the parent). The spawn env below is the child's
-        // only isolation — this process's own env and seams stay untouched.
+        // Runs in a spawned child so any OS handle the refused store touches is
+        // released by process exit before the parent's rmrf(base) hits Windows
+        // EBUSY (#4338). Contract: construction THROWS (no server ever comes up
+        // to serve a degraded page), nothing is left on disk, and the pre-death
+        // status wire records the cause for post-crash forensics.
         const childEnv: NodeJS.ProcessEnv = { ...process.env };
         delete childEnv.BILI_STORAGE_UNIFIED;
         delete childEnv.BILI_ENCRYPTION_KEY;

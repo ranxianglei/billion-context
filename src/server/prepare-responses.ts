@@ -1,12 +1,16 @@
 import http from "node:http";
 import type { AbsorbConfig, CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
-import { defaultCountTokens, renderNudgeText, viableRanges } from "acp-kernel";
+import { defaultCountTokens, buildBlockOpsSystemPrompt, renderNudgeText, viableRanges } from "acp-kernel";
+import { recordNudgeInject } from "../cache-ledger.js";
 import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, repairResponsesAssistantOrdering, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
+import { isSubagentPrompt } from "../session-title.js";
+import { collectSeparatorManifest, repairResponsesAssistantOrdering, type SeparatorSlot } from "./responses-ordering.js";
+import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -14,36 +18,44 @@ import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAnchorFallbackError, wsAnchoredPayload } from "./snapshot-render.js";
-import { storedMessagesFor } from "../fold-decomposition-lookup.js";
+import { FoundationRejectError } from "../snapshot/plane.js";
+import { runStage0 } from "../snapshot/stage0.js";
+import { featureEnabled } from "../rollout.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
+import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, nudgeStampsOf, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, restoreNudgeStamps, snapshotMessages, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
-import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, blockOpsTools, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { blockOpsEnabled, storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, imageRescaleToolArmed, retrieveToolName } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
+import { joinResponsesSystemSections } from "../responses-system-sections.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
+import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, nativeCompactionKey, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { pckKeyAbated } from "../pck-probe.js";
 import { reconcilePluginFoldCallIds } from "../plugin.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore, getStore } from "../persist.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
-import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
+import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudgeArmed, emergencyNudgeForConfig, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { pluginAgentHeader } from "../plugin.js";
+import { egressAuthorityArmed, egressBlockLedgerFor, egressTinyBudget, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -75,6 +87,12 @@ export async function prepareResponses(
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
 
+    // Unlike the legacy text-template heuristic, an opaque native checkpoint
+    // explicitly announces a replacement history even after old blocks were
+    // reaped. Persist its identity so replay/restart cannot reset newer folds.
+    const checkpoint = isCodexHost(req.headers) && !hasCompactionTrigger(parsed.input)
+        ? nativeCompactionKey(parsed.input) : undefined;
+
     // A codex client echoes our forged compaction item back in the next
     // request; replace it with a plain summary-carrying user message so the
     // handoff rides the replayable history (kernel-compressible, retained by
@@ -94,10 +112,23 @@ export async function prepareResponses(
     }
 
     let processedMessages: CoreMessage[] = [];
+    // #6181 2×2: the msgid + ledger-seq dual-channel the plugin host rides
+    // on the body (src/msgid-pin.ts) — read and STRIPPED before any
+    // projection so the real upstream never sees a field it does not know.
+    // (Same discipline as the openai twin.)
+    const incomingMsgIds = (parsed as unknown as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    const incomingSeqsRaw = incomingSeqsOf(parsed);
+    delete (parsed as unknown as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
+    delete (parsed as unknown as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    // #564/#2627: the ordering separators THIS turn's repair actually inserted,
+    // recorded by the producer so provenance never has to be inferred from item
+    // text later. Empty on the overwhelming majority of turns.
+    let separatorSlots: SeparatorSlot[] = [];
     let originalMessages: CoreMessage[] = [];
     let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
     let nudgeOutcome: Prepared["nudgeOutcome"];
+    let nudgeStampsBefore: Prepared["nudgeStampsBefore"];
     let responsesProjection: ResponsesProjection | undefined;
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
@@ -129,7 +160,11 @@ export async function prepareResponses(
     const markerCounts = stripRawStage(parsed, "responses");
     logRawStripCounts(markerCounts, log, sessionId);
 
-    const shouldInject = opts.compress.injectTool;
+    // zed cloud wire: the response is NDJSON byte-passthrough, so an in-stream
+    // acp loop is structurally unreachable (same reasoning as DSH #3177) — the
+    // model-side compress surface (tools + standing prompt + nudge) is off.
+    const zedLane = req.headers["x-bili-zed-lane"] !== undefined;
+    const shouldInject = opts.compress.injectTool && !zedLane;
     const injectTools = shouldInject && !pluginMode;
     // #3417: surface gating lives in lane-decisions (observed reachability
     // overrides the dsh default, #3401).
@@ -159,6 +194,11 @@ export async function prepareResponses(
         resolveCompressProtocol(opts.routes, upstreamOrigin) === "marker";
     const renderTags: "text-only" | "none" = knobRenderNone() || isCompactionTrigger ? "none" : "text-only";
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
+    // #7064 §8 phase 2: x-bili-msgid-mode signal (set after stage 0 below).
+    let msgidModeHeaders: Record<string, string> | undefined;
     try {
         // [#1638] Position-preserve mid-history system/developer items for
         // plugin agents and native Codex. Both append developer
@@ -200,21 +240,89 @@ export async function prepareResponses(
         // client, not just plugin/codex; the head prefix still hoists into
         // systemParts for strict single-system upstreams (#377).
         const projection = responsesToCore(parsed);
+        if (checkpoint && checkpoint !== session.metadata.codexNativeCompactionKey) {
+            const covered = coveredRealHistoryIds(session.state.blocks);
+            const gap = foldCoverage(covered, projection.msgs.map(message => message.id));
+            // A checkpoint may predate this process's first observation (for
+            // example after an upgrade). Keep folds whose entire source still
+            // exists; only missing coverage or an empty substrate needs rebasing.
+            const rebase = covered.size === 0 || gap !== null;
+            if (rebase) {
+                markNativeCompactionBoundary(session);
+                reconcileNativeCompactionBoundary(session);
+            }
+            session.metadata.codexNativeCompactionKey = checkpoint;
+            markDirty(session);
+            log("info", `[${sessionId}] native opaque Responses checkpoint observed; ACP state ${rebase ? "rebased" : "retained (coverage intact)"}`);
+        }
         responsesProjection = projection;
         // Client's own system text captured BEFORE the anchor reconciliation
         // below can replace systemParts — fingerprinting the post-anchor value
         // would track bili's managed text and hide client-side drift (#1930-3).
-        const responsesClientSystem = projection.systemParts.join("\n\n---\n\n");
+        const responsesClientSystem = joinResponsesSystemSections(projection.systemParts);
         // Compaction-trigger requests are the compression mechanism itself —
         // their payload shape must not gain anchor state or note items.
         if (opts.stableSystemAnchor && !pluginMode && !isCompactionTrigger) {
-            const fresh = projection.systemParts.join("\n\n---\n\n");
+            const fresh = joinResponsesSystemSections(projection.systemParts);
             const outcome = reconcileSystemAnchor(session, "responses", fresh, sessionId, log);
             sysNotes = outcome.notes;
             if (outcome.outbound !== fresh) projection.systemParts = outcome.outbound ? [outcome.outbound] : [];
         }
-        const { msgs } = projection;
+        let { msgs } = projection;
         originalMessages = msgs;
+        // #6181 2×2: stamp the M2 seqs carrier onto the converted array
+        // (parallel to input; malformed/absent → null → the M2 fast path is
+        // disabled, the full-resend world-match path still works).
+        const incomingSeqs: number[] | null =
+            incomingSeqsRaw !== undefined && incomingSeqsRaw.length === msgs.length && validateMsgSeqs(incomingSeqsRaw, msgs.length).ok
+                ? incomingSeqsRaw
+                : null;
+        if (incomingSeqs !== null) applyMsgSeqStamps(msgs, incomingSeqs);
+        // #6181 2×2 stage 0 (brief 19544722): the SHARED pin + world-match
+        // + kernel-input assembly (src/snapshot/stage0.ts — the SAME helper
+        // as the openai lane, same red gate). Before processTurn, so an R3
+        // FoundationRejectError carries zero kernel side effects.
+        // #6564 note: the responses-wire pin that #6564 added inline here is
+        // SUBSUMED by runStage0 (same validateMsgIds+applyMsgIdPin under the
+        // pluginLaneServerHistory gate); the pinned `msgs` flows through the
+        // render below to the kernel/store. No double-pin.
+        const s0 = runStage0({
+            sessionId,
+            lane: "responses",
+            msgs,
+            incomingMsgIds,
+            incomingSeqs,
+            pluginMode,
+            // Identity consolidation (discussions/7591): egress-on sessions
+            // carry no conversations row — the in-memory metadata field is
+            // the row's source of truth, use it instead of the store lookup.
+            // Predicate mirrors the row write verbatim (ingest.ts namespace =
+            // the pluginAgent when a non-empty string, else "proxy") so the
+            // two cannot drift apart.
+            convBound: session.metadata["egressAuthority"] === true ? (typeof session.metadata["pluginAgent"] === "string" && session.metadata["pluginAgent"] !== "") : undefined,
+            log,
+        });
+        if (s0.pinned !== null) {
+            msgs = s0.pinned;
+            originalMessages = msgs;
+        }
+        // #7064 D3 (尾锚常活): the stage-0 cursor may have advanced BEFORE
+        // processTurn — bump the session revision so the per-turn snapshot
+        // flush below (snapFlush epoch proof) observes the advance. A fork
+        // taken between the cursor write and the flush otherwise reads a
+        // STALE parent revision and lands the child on the wrong lane.
+        if (s0.anchorAdvanced) markDirty(session);
+        // #7064 §8: the pin-mode signal (what the client may send NEXT
+        // turn) rides this lane's response headers — the responses lane
+        // has no watermark plane, so it is stamped independently of
+        // x-bili-pf-seq (the client's pfIdTailForm reads mode only).
+        // #6785 review fix: "incremental" is gated on the flag (the upgrade
+        // never travels while it is off); the "full" DOWNGRADE travels even
+        // when the flag is off — the rollback self-heal (an already
+        // upgraded client must be told to send the full form again).
+        if (s0.pinMode === "full" || (featureEnabled("pluginMsgIdIncremental") && s0.pinMode !== null)) {
+            msgidModeHeaders = { [MSGID_MODE_HEADER]: s0.pinMode };
+        }
         // #3756 snapshot render: outbound prefix from the unified transcript
         // (fold-time ids, immune to identity re-mints); live tail keeps the
         // client's bytes. No-op when the lane is inactive/degraded; the
@@ -253,6 +361,10 @@ export async function prepareResponses(
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
         const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
         const absorbActive = absorbBlock?.enabled === true && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
+        // #5765: block ops ride the hybrid function lane too (text protocol
+        // included — unlike absorb they ARE function tools there).
+        const blockOps = blockOpsTools();
+        const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && shouldInject && !isCompactionTrigger;
         const rulesActive = rulesEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
         // #2372/#2432: LOCAL auto-compaction — the client compacts on its own
@@ -264,7 +376,7 @@ export async function prepareResponses(
         // drift without recovering (the #2193 escalation is observe-only).
         // TWO producers replay that shape on this wire: codex (rollout event
         // type:"compacted", #2372) and dsh desktop's compaction-basic
-        // checkpoint (#2432) — CONFIGURATION.md names responses "the lane dsh
+        // checkpoint (#2432) — docs/configuration.md names responses "the lane dsh
         // desktop's compaction actually rides" (#2360), yet before the #2451
         // review this slot covered codex only and the dsh desktop scenario
         // fell back into the pre-#2432 death spiral. Detect (client identity
@@ -316,7 +428,7 @@ export async function prepareResponses(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
 const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
-reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs) });
+reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
         if (!isCompactionTrigger) {
             noteSystemPromptFingerprint(session, responsesClientSystem, { sessionId, log });
             // #2867: the mode-independent twin — lets the ledger classify a
@@ -336,9 +448,25 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // resent history; yield before it so UI/API requests that queued during
         // this turn are served, not frozen behind the whole turn.
         await yieldToEventLoop();
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags, contentStore: contentStoreOf(session) });
+        // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
+        absorbAbortedTurnGrowth(session, tokenCount);
+        // #6531: snapshot before the kernel pass so a 4xx reject of the
+        // nudge-carrying request rolls the cadence back to pre-turn (lane
+        // mirror of the anthropic-lane fix).
+        nudgeStampsBefore = nudgeStampsOf(session);
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
+        const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
+        if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
         adoptContentStore(session, turn.contentStore);
+        // In-request ledger flush: the transcript up to THIS user message is
+        // durable before the model call (#3397 durability-before-render) and
+        // the stage-0 envelope / M2 evidence read a current ledger.
+        // snapshotMessages first: the persist build reads session.lastMessages
+        // — and it stays the RAW client resend (never the D-lane view: its
+        // synthetic acp_summary anchor is not a transcript message).
+        snapshotMessages(session, originalMessages);
+        snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -350,6 +478,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
         }
         storeEffectiveAbsorb(session, loopConfig);
+        storeEffectiveBlockOps(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         turn.messages = attachSubagentSessions(turn.messages, session);
@@ -367,7 +496,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title) || isSubagentPrompt(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
@@ -385,12 +514,12 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
-        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange);
+        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudgeForConfig(turn.nudge, loopConfig);
         // #3482 Step 2.5: the ONE nudge gate (lane-decisions). The responses lane's
         // two DELIBERATE differences are explicit inputs: the compaction
         // trigger (#2155/#2432 — a trigger request never carries the nudge)
         // and the codex-intercept health window (#2774).
-        const willInjectNudge = nudgeOn({
+        const willInjectNudge = !nudgeHeldAfterReject && nudgeOn({
             injectNudge: opts.compress.injectNudge,
             hasNudgePlan: !!turn.nudge,
             compressSurfaceOn: laneDecisions.compressSurfaceOn,
@@ -399,10 +528,14 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             breakerArmed: compressBreakerArmed(session),
             autoFoldEngaged: autoFoldEngaged(loopConfig, session),
             growthFoldingArmed: growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined, autoFoldFloor(session)),
-            modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
+            modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor, loopConfig.nudge.maxContextLimitPct)),
         });
+        const caLine = recordNudgeObservation(sessionId, turn, tokenCount, config.modelContextLimit, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool));
+        if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
-        processedMessages = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
+        const ordered = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
+        processedMessages = ordered.messages;
+        separatorSlots = ordered.slots;
         // #3477: consume the announced native-compaction boundary (pi session_compact
         // → /__bili/plugin/compact → markCompactionBoundary) exactly once, after the
         // post-compaction history was processed: archives the deactivated blocks,
@@ -413,7 +546,32 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         }
         reapOrphansLogged(session, msgs, log, sessionId);
-        rebuiltInput = patchResponsesInput(projection, processedMessages);
+        // #7398 all-lanes (ruling 7439-4): serve this turn's outbound core
+        // from the egress op-log before the item rebuild — the recorded bytes
+        // are this session's server truth. Compaction-generation turns
+        // (trigger/prompt form) are transient, like title-gen, and are not
+        // recorded nor served.
+        let laneCore = processedMessages;
+        // #7574: the swap (server authority) is armed by the ONE shared rule
+        // (egressAuthorityArmed — same as the OpenAI lane). Every other main
+        // turn is only recorded.
+        const egressSide = isCompactionTrigger || egressTinyBudget(parsed);
+        if (!egressSide && featureEnabled("egressPlane")) {
+            const st = getStore().egressOpLogStore();
+            if (st) {
+                // The single shared authority seam (egress-lane-io),
+                // POST-kernel: the swapped core becomes the outbound items
+                // and the recorded bytes. System text is the lane's stable
+                // parts (the developer block is injected below and rebuilt
+                // live every turn — recording it would churn the system
+                // row). Unreadable flow → hard fail.
+                const armed = egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: egressSide });
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCore, log, armed });
+                const served = recordAuthorityTurn(st, sessionId, auth, projection.systemParts.join("\n\n"), log, egressBlockLedgerFor(session), session.state.messageRefs);
+                if (served !== null) laneCore = served;
+            }
+        }
+        rebuiltInput = patchResponsesInput(projection, laneCore);
         if (Array.isArray(rebuiltInput)) rebuiltInput = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(rebuiltInput));
         // #3400: the Responses steady path rebuilds items from the RAW parsed
         // input (patchOriginalItem), so BiliMessage-level modifications never
@@ -430,34 +588,35 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
         const tagsOnlyPrompt = !compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt() && !knobRenderNone()
-            ? buildAcpTagsOnlyPrompt(responsesTextProtocol ? "hybrid" : "function", prompts, surface?.promptSections)
+            ? buildAcpTagsOnlyPrompt(responsesTextProtocol ? "hybrid" : "function", prompts, messageTimestampSections(surface?.promptSections, responsesTextProtocol ? "hybrid" : "function"))
             : "";
         // #4305: standing generation-boundary note — byte-stable once detected;
         // never on a compaction-trigger passthrough (renderTags="none" there).
         const genBoundaryActive = detectGenerationBoundary(session, processedMessages, log);
         if (compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt()) {
-            const prompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))) : buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect));
+            const prompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect, blockOpsActive));
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (genBoundaryActive) devParts.push(GENERATION_BOUNDARY_NOTE);
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
-            const devContent = devParts.join("\n\n---\n\n");
+            if (blockOpsActive) devParts.push(buildBlockOpsSystemPrompt(responsesTextProtocol ? "hybrid" : "function"));
+            const devContent = joinResponsesSystemSections(devParts);
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
-            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
+            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
             if (!knobNoInjectTool() && injectTools) {
                 // #1712: decompress's startId/endId execute only on CCR-armed
                 // sessions (#1179) — serve the no-range schema otherwise.
                 const ccrOn = ccrEnabled(session);
-                const respExtra = [...(absorbActive ? [absorbTools.responses] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(ccrOn ? [retrieveToolsFor(retrieveToolName(session)).responses] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : [])];
+                const respExtra = [...(absorbActive ? [absorbTools.responses] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(ccrOn ? [retrieveToolsFor(retrieveToolName(session)).responses] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : []), ...(blockOpsActive ? blockOps.responses : [])];
                 toolsOut = responsesTextProtocol
-                    ? injectResponsesTool(parsed.tools, ccrOn ? BILI_ACP_READONLY_TOOLS_RESPONSES : BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, surface?.toolPrompts, externalSummaryEnabled(config))
+                    ? injectResponsesTool(parsed.tools, [...(ccrOn ? BILI_ACP_READONLY_TOOLS_RESPONSES : BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE), ...(blockOpsActive ? blockOps.responses : [])], surface?.toolPrompts, externalSummaryEnabled(config))
                     : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...(ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), ...respExtra] : (ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), surface?.toolPrompts, externalSummaryEnabled(config));
             }
         } else if (tagsOnlyPrompt !== "" || projection.systemParts.length > 0 || forgedSummaries.length > 0) {
-            const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])].join("\n\n---\n\n");
+            const devContent = joinResponsesSystemSections([...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])]);
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
-            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
+            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
         }
         if (sysNotes.length > 0) {
             const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
@@ -552,6 +711,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         }
         transformOk = true;
     } catch (err) {
+        // #6181 B1: the R3 identity fault is a HARD reject, not a degrade —
+        // rethrow it to the server funnel (400 + x-bili-snapshot:identity)
+        // BEFORE the generic 503; zero kernel side effects by construction
+        // (it throws before processTurn).
+        if (err instanceof FoundationRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
     }
@@ -671,10 +835,12 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // Compaction-trigger requests are the compression mechanism itself — no
     // incremental decision hangs off them, so don't leave a stale reading.
     if (!isCompactionTrigger) {
+        // One tree walk shared by both calibers (see the anthropic lane).
+        const imageReserve = imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
             + loadedToolTokens
-            + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+            + imageReserve;
         // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
         // see the anthropic-lane counterpart above. #4166: mid-history sys/dev
         // items are cores now, so both estimators see the same wire set the
@@ -682,19 +848,36 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
             + loadedToolTokens
-            + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+            + imageReserve;
         const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
-    snapshotMessages(session, originalMessages);
-    markDirty(session);
+    // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
+    getStore().ingestRowsNow(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
+    // #564/#2627: ONE serialization of the outbound body. The same string is
+    // both what we send and what the separator manifest binds to, so the claims
+    // can never be attributed to a body that differs by even one byte.
+    const sentBodyStr = JSON.stringify(rebuilt);
+    const separatorManifest = collectSeparatorManifest(
+        Array.isArray(rebuiltInput) ? rebuiltInput : undefined,
+        separatorSlots,
+        sentBodyStr,
+    );
+    if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
     return {
-        body: JSON.stringify(rebuilt),
+        body: sentBodyStr,
+        parsedBody: rebuilt,
         session,
         processedMessages,
         originalMessages,
         judgeBaseline,
+        ...(separatorManifest !== undefined ? { separatorManifest } : {}),
         responsesProjection,
+        responseExtraHeaders: msgidModeHeaders,
         systemNotes: sysNotes,
         protocol: "responses",
         stream,
@@ -704,6 +887,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         responsesTextProtocol,
         nudge,
         nudgeOutcome,
+        nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined,
         prompts,
         surface,
         renderTags,
@@ -724,11 +908,22 @@ export function prepareResponsesCompact(
     log: (level: string, msg: string) => void,
 ): Prepared {
     ++session.stats.requests;
+    // #6539 KDD #17: the msgid carriers ride the body on the PLUGIN-lane
+    // chained rounds that take THIS verbatim path (the main /responses
+    // pipeline strips them in prepareResponses; this function bypasses it,
+    // so the strip must live here too). Mutate `parsed` (same as the main
+    // pipeline) and force a rebuilt body whenever a field was present —
+    // the raw-buffer fallback would otherwise forward the carrier verbatim.
+    const hadMsgIdFields =
+        Object.prototype.hasOwnProperty.call(parsed, MSG_IDS_BODY_FIELD) ||
+        Object.prototype.hasOwnProperty.call(parsed, MSG_SEQS_BODY_FIELD);
+    delete (parsed as unknown as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as unknown as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
     // A bili-forged compaction item is never for the upstream (it carries our
     // sentinel blob) — strip it on every forwarding path, same as the normal
     // /responses pipeline does.
     const cleaned = Array.isArray(parsed.input) ? stripBiliCompactionItems(parsed.input) : parsed.input;
-    const stripped = Array.isArray(parsed.input) && cleaned.length !== parsed.input.length;
+    const stripped = hadMsgIdFields || (Array.isArray(parsed.input) && cleaned.length !== parsed.input.length);
     const forgeBody: ResponsesRequestBody = { ...parsed, input: cleaned };
     const base: Prepared = {
         body: stripped ? Buffer.from(JSON.stringify(forgeBody)) : body,
@@ -777,7 +972,7 @@ export function prepareResponsesCompact(
             return base;
         }
         const viewed = applyAbsorbView(turn.messages, turn.state, compactConfig, usageGradeInputBaseline(session));
-        const processed = repairResponsesAssistantOrdering(stripKernelSummaries(viewed, turn.state), projection.msgs);
+        const processed = repairResponsesAssistantOrdering(stripKernelSummaries(viewed, turn.state), projection.msgs).messages;
         let output = patchResponsesInput(projection, processed);
         if (typeof output === "string") {
             session.state = prevState;
@@ -855,6 +1050,14 @@ export function resolvePromptCacheKey(
 // name always agree — provider/model absorb.* overrides are proxy-lane-only.
 export function effectiveAbsorbBlock(pluginMode: boolean, config: Config, baseAbsorb?: CompressSettings["absorb"]): AbsorbConfig | undefined {
     return pluginMode ? resolveAbsorbSettings(baseAbsorb) : config.absorb;
+}
+
+// #5765: plugin-mode twin of effectiveAbsorbBlock — in plugin mode the
+// per-request kernel Config does not carry the host-resolved blockOps block
+// (the plugin manifest resolves it from the raw host settings), so fall back
+// to the raw setting; proxy mode reads the resolved per-request Config.
+export function effectiveBlockOpsEnabled(pluginMode: boolean, config: Config, baseBlockOps?: CompressSettings["blockOps"]): boolean {
+    return pluginMode ? baseBlockOps?.enabled === true : blockOpsEnabled(config);
 }
 
 // #2867: canonical incoming system/developer view of a Responses body — the

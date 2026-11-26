@@ -28,11 +28,10 @@ import { defaultConfig, type Config } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import type { CompressSettings } from "../src/config.ts";
-import { withDurableProtection, durableMessageToolPaths, dshSkillCatalogPath } from "../src/durable-message-guards.ts";
+import { withDurableProtection, durableMessageToolPaths, dshSkillCatalogPath, dshTimeContextPath } from "../src/durable-message-guards.ts";
 // #2989: rig hygiene resets the LIVE session-order registry (the persona-
 // anchor ladder is off the production path on every lane since #3134 —
 // v2 order resolution everywhere, google included).
-import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -45,7 +44,7 @@ const MODEL = "gpt-test";
 const MAIN_SYSTEM = "You are DeepSeek Harness, the main coding agent.";
 const CATALOG_V1 = `\x3csystem-reminder\x3e\nThe following skills are available in this workspace.\n\x3cavailable_skills\x3e\n- name: git-helper\n  description: commit conventions and rebase safety\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e`;
 const CATALOG_V2 = `\x3csystem-reminder\x3e\nThe following skills are available in this workspace.\n\x3cavailable_skills\x3e\n- name: doc-writer\n  description: draft documentation from merged PRs\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e`;
-const AGENTS_MD = "Instructions from: AGENTS.md\nrepo policy: always run tests before pushing (marker X7Q).";
+const AGENTS_MD = "\x3csystem-reminder\x3e\nInstructions from: AGENTS.md\nrepo policy: always run tests before pushing (marker X7Q).\n\x3c/system-reminder\x3e";
 
 function filler(tag: string): string {
     return `${tag}-` + "z".repeat(900);
@@ -78,6 +77,27 @@ test("withDurableProtection: a durable pattern in protectedLatestTools = takeove
     assert.deepEqual(out.protectedTools, [], "protectedTools not extended when latest takes over");
     assert.deepEqual(out.protectedLatestTools, ["durable/*"]);
     assert.equal(out.messagePathOf, cl);
+});
+
+test("dshTimeContextPath: clock readings get a path OUTSIDE durable/* — anchor-skippable but foldable (#5109)", () => {
+    const reading = { id: "t1", role: "user", contentType: "text", text: "Time sampled while preparing turn 3, step 2: 2026-10-29T12:00:00.000Z\nElapsed since the preceding turn: 45s" } as never;
+    const echo = { id: "t2", role: "assistant", contentType: "text", text: "Time sampled while preparing turn 3, step 2: ..." } as never;
+    const unrelated = { id: "t3", role: "user", contentType: "text", text: "What time is it?" } as never;
+    // A real human request that merely QUOTES the phrase mid-sentence must stay
+    // unclassified (prefix-anchored match) — otherwise Rule 3 would strand it.
+    const quote = { id: "t4", role: "user", contentType: "text", text: "Why does the log say \"Time sampled while preparing turn 3\" even though I asked nothing yet?" } as never;
+    assert.equal(dshTimeContextPath(reading), "oneshot/time-context");
+    assert.equal(dshTimeContextPath(echo), undefined, "assistant echo is never a carrier (#2766)");
+    assert.equal(dshTimeContextPath(unrelated), undefined);
+    assert.equal(dshTimeContextPath(quote), undefined, "a real request quoting the phrase mid-sentence stays unclassified");
+    // The dsh lane classifier resolves it end-to-end...
+    const cl = durableMessageToolPaths["dsh"]!;
+    assert.equal(cl(reading), "oneshot/time-context");
+    // ...and the default durable policy pins nothing in the injected/
+    // namespace (stays foldable; the path exists for the Rule-3 anchor skip).
+    const out = withDurableProtection(defaultConfig(200_000), cl);
+    assert.deepEqual(out.protectedLatestTools, ["durable/*"], "latest-pin default covers durable/* only");
+    assert.ok(!(out.protectedTools ?? []).some((p) => p.includes("injected")), "no all-instance protection for injected/*");
 });
 
 test("withDurableProtection: idempotent — no duplicate durable/* on re-apply", () => {
@@ -115,7 +135,6 @@ async function startRig(compress?: CompressSettings): Promise<Rig> {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetSessionOrderForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",

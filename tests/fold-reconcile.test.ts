@@ -8,6 +8,7 @@ import {
     reconcileFoldCoverage,
     resolveFoldReconcileMode,
     noteSystemPromptFingerprint,
+    noteCanonicalSystemFingerprint,
     METADATA_FOLD_COVERAGE,
     resetNormalizedIdentityWork,
     turnContexts,
@@ -291,6 +292,77 @@ describe("reconcileFoldCoverage (#1921)", () => {
         assert.equal(logs.length, 1);
         assert.match(logs[0], /system prompt changed/);
         assert.match(logs[0], /fold state unaffected/);
+        // #7149 batch2: dropping the prompt to null is an observable projection
+        // change too (prev "…" → "-"), so it logs — "absence does not" only
+        // covers the first-ever null, not a withdrawal.
+        noteSystemPromptFingerprint(session, null, logOpts);
+        assert.equal(logs.length, 2);
+        assert.match(logs[1], /system prompt changed/);
+    });
+
+    test("system-fingerprint change probe (#7149 batch2): unchanged reuses, changed recomputes, legacy shape full-hashes", () => {
+        const logs: string[] = [];
+        const logOpts = { sessionId: "s1", log: (_l: string, m: string) => logs.push(m) };
+
+        // (a) unchanged input → stable fp, probe head stored, no log. NOTE: the
+        // probe sees the JSON.stringify'd text (a string input gains quotes), so
+        // head/size compare against the stringified form.
+        const session = fakeSession([]);
+        const longPrompt = "P".repeat(300); // > 256 so the head is a true prefix slice
+        const stringifiedLong = JSON.stringify(longPrompt);
+        noteSystemPromptFingerprint(session, longPrompt, logOpts);
+        const first = session.metadata.systemFp as { fp: string; size: number; head: string };
+        assert.ok(first.fp !== "-");
+        assert.equal(first.head, stringifiedLong.slice(0, 256));
+        assert.equal(first.size, stringifiedLong.length);
+        noteSystemPromptFingerprint(session, longPrompt, logOpts);
+        const second = session.metadata.systemFp as { fp: string };
+        assert.equal(second.fp, first.fp, "probe hit keeps the stored fp");
+        assert.equal(logs.length, 0, "unchanged prompt logs nothing");
+
+        // (b) change beyond byte 256 with SAME length+head: documented tradeoff —
+        // the probe is a detection signal, not a boundary; fp stays the last true hash.
+        const tailTweaked = longPrompt.slice(0, 256) + longPrompt.slice(257) + "X";
+        noteSystemPromptFingerprint(session, tailTweaked, logOpts);
+        assert.equal((session.metadata.systemFp as { fp: string }).fp, first.fp, "tail-only same-size edit stays unobserved (documented probe contract)");
+        assert.equal(logs.length, 0);
+
+        // (c) observable change (size differs) → recompute + log
+        noteSystemPromptFingerprint(session, "shorter now", logOpts);
+        const third = session.metadata.systemFp as { fp: string };
+        assert.notEqual(third.fp, first.fp);
+        assert.equal(logs.length, 1);
+        assert.match(logs[0], /system prompt changed/);
+
+        // (d) legacy stored shape { fp, size } without head → full-hash path (compat)
+        const legacy = fakeSession([]);
+        legacy.metadata.systemFp = { fp: first.fp, size: longPrompt.length };
+        noteSystemPromptFingerprint(legacy, longPrompt, logOpts);
+        assert.equal((legacy.metadata.systemFp as { fp: string }).fp, first.fp, "full hash reproduces the stored fp");
+        assert.equal((legacy.metadata.systemFp as { head?: string }).head !== undefined, true, "head backfilled for the next probe");
+
+        // (e) null/undefined → "-" sentinel, probe inert. (c) already logged one
+        // change into the shared array, so compare against a captured baseline.
+        const logsBeforeE = logs.length;
+        noteSystemPromptFingerprint(legacy, null, logOpts);
+        assert.equal((legacy.metadata.systemFp as { fp: string }).fp, "-");
+        assert.equal(logs.length, logsBeforeE + 1, "prompt→null withdrawal logs once");
+        noteSystemPromptFingerprint(legacy, null, logOpts);
+        assert.equal(logs.length, logsBeforeE + 1, "null→null logs nothing");
+    });
+
+    test("canonical system fingerprint probe (#7149 batch2): silent twin, same contract", () => {
+        const session = fakeSession([]);
+        const longPrompt = "C".repeat(400);
+        noteCanonicalSystemFingerprint(session, longPrompt);
+        const first = session.metadata.canonicalSysFp as { fp: string; head: string };
+        assert.ok(first.fp !== "-");
+        noteCanonicalSystemFingerprint(session, longPrompt);
+        assert.equal((session.metadata.canonicalSysFp as { fp: string }).fp, first.fp);
+        noteCanonicalSystemFingerprint(session, "rewritten");
+        assert.notEqual((session.metadata.canonicalSysFp as { fp: string }).fp, first.fp, "changed canonical recomputes");
+        noteCanonicalSystemFingerprint(session, undefined);
+        assert.equal((session.metadata.canonicalSysFp as { fp: string }).fp, "-");
     });
 });
 
@@ -1070,7 +1142,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");

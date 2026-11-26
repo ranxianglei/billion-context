@@ -6,6 +6,7 @@ import { parseCompressInput } from "../src/compress-tool.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { getSession, reapDestroyedSubstrate } from "../src/session.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
 import { recordProbeFailures } from "../src/loop/core.ts";
 
 _setStoreForTest(new SessionStore({ enabled: false }));
@@ -21,6 +22,8 @@ function makeCtx(count: number, preserveRecentMessages = 5): RewriteCtx & { mess
     }));
     const session = getSession(`issue3302-${randomUUID()}`);
     session.state.messageRefs = assignRefs(messages, { existing: emptyRefMap(), nextIndex: 0 }).map;
+    // #7318: legacy recommendation tail (default is now OFF).
+    storeUnpromptedGate(session, { nudgeInjected: false, requireNudge: false, requireRecommendation: false, postComPressTail: true });
     return {
         core: createCore(),
         config: defaultConfig(200000, { preserveRecentMessages, preserveRecentTokens: 0 }),
@@ -107,7 +110,10 @@ test("failure receipt falls back to the last nudge's compressible table when no 
     };
 
     request(ctx, "m00001", "m00002");
-    const rejected = request(ctx, "m00001", "m00002");
+    // #4521 flip: re-requesting an already-covered range is now an idempotent no-op SUCCESS,
+    // so the refusal trigger moves to refs unknown to the session (stale generation) — the
+    // fallback-to-last-nudge-table behavior under test is unchanged.
+    const rejected = request(ctx, "m00099", "m00100");
     assert.equal(rejected.outcome, "refused");
     assert.match(rejected.text, /Current compressible ranges from the last compression check/);
     assert.doesNotMatch(rejected.text, /Call acp_status before retrying/);

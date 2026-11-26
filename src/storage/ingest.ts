@@ -29,6 +29,8 @@ import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
+import { CcrLedgerRow, hydrateSlimCcrStore, isEmptyStateValue, slimCcrEnvelope, splitKstate } from "./slim.js";
+import { log as loggerLog } from "../logger.js";
 import { splitMediaContent, identityOfStoredContent } from "./identity.js";
 
 /**
@@ -37,6 +39,8 @@ import { splitMediaContent, identityOfStoredContent } from "./identity.js";
  * (#4192). The loader rebuilds the state object in exactly this order.
  */
 import { COMPRESSION_STATE_FIELDS as MERGE_STATE_FIELDS } from "../state-hydration.js";
+import { KSTATE_RESIDUAL_FIELDS } from "./egress-block.js";
+import { featureEnabled } from "../rollout.js";
 
 /** Fields owned by dedicated tables/columns — never inside kstate_json. */
 const TABLE_OWNED_FIELDS = new Set(["blocks", "messageRefs", "deadRefs", "nextBlockId", "nextRunId"]);
@@ -73,6 +77,13 @@ interface IngestPlan extends IngestSessionInput {
     /** Resolved log seqs for pluginSnapshot entries (null when absent). */
     pluginSnapshotSeqs: number[] | null;
     tailSeqs: number[] | null;
+    /** Window re-anchor (#7474): every plan row is RESOLVED by indexed
+     *  identity point lookup inside the ingest transaction (existing row
+     *  keeps its seq, new rows continue after max(seq)) instead of the
+     *  full path's O(all rows) identity-map scan. A plan with zero
+     *  resolvable rows (nothing anchored yet) refuses in-txn and falls to
+     *  the full ingest. */
+    reanchor?: boolean;
 }
 
 /** #3133 test instrumentation: per-message JSON serializations performed by
@@ -104,6 +115,11 @@ interface LogEntry {
     kind: string;
     ref: string | null;
     media?: { hash: string; bytes: string }[];
+    /** #4313: first-sight wall-clock stamp carried by the message object
+     *  (absent for pre-feature / imported payloads). Stored into the
+     *  messages.ts column verbatim; the value is NEVER part of content
+     *  (see serializeForStore). */
+    ts?: number;
 }
 
 /** Adapts any Session-shaped object (persist loadSync output) to the
@@ -141,6 +157,77 @@ export function toLegacyLike(s: {
     };
 }
 
+/** #4313: storage serialization of a message — ts rides the dedicated
+ *  column, NEVER the content bytes: stored content stays byte-identical to
+ *  what a pre-feature save wrote for the same logical message, so content
+ *  hash / identity / boundary probes cannot churn when stamps attach.
+ *  ts is appended last by its producers (stamper node, row hydration), so
+ *  deleting it restores the pre-feature key order exactly. */
+function serializeForStore(m: CoreMessage): string {
+    if (m.ts === undefined) return stringifyForStore(m);
+    const copy = { ...m };
+    delete copy.ts;
+    return stringifyForStore(copy);
+}
+
+/** #5627: V8's serializer recurses into arbitrarily nested data, so a
+ *  pathologically nested message dies as the generic "Maximum call stack
+ *  size exceeded" naming nothing. Re-throw naming the OFFENDING MESSAGE so
+ *  the failure forensics point at the exact row to remove or flatten. */
+function stringifyForStore(m: CoreMessage): string {
+    try {
+        return JSON.stringify(m);
+    } catch (err) {
+        if (err instanceof RangeError) {
+            throw new RangeError(`message ${m.id}: nesting too deep for JSON serialization (engine call-stack overflow) — remove or flatten this message to unblock the unified store`);
+        }
+        throw err;
+    }
+}
+
+/** A persisted turn-final reply row. Stored under the session's
+ *  `metadata.handoffReply` (see src/server/handoff-response.ts) — OUTSIDE the
+ *  messages table on purpose: the table's seq space is the ref-ledger
+ *  substrate (persist.maybeRestampToLedger aligns live refs onto row seq+1,
+ *  #4316), so non-view rows would desync every post-fold ref. metadata_json
+ *  is persisted in both the legacy file and the unified DB (identical in
+ *  both views ⇒ digest-equal), so the reply still lands durably in the DB —
+ *  #6947 — without touching the view, the ledger, or any wire. */
+export interface HandoffReplyStashRow {
+    msgId: string;
+    content: string;
+    hash: string;
+    identity: string;
+    role: string;
+    kind: string;
+    media?: { hash: string; bytes: string }[];
+    ts?: number;
+}
+
+/** Plan-ready representation of a core the store has never seen through a
+ *  request — the turn-final handoff reply. Runs the EXACT serialization
+ *  chain the planners use (serializeForStore → splitMediaContent →
+ *  identityOfStoredContent), so the row's identity equals the one a client
+ *  re-send of the same reply would derive — DB readers can dedup the stash
+ *  against view rows by (msgId, identity) if they ever join. Exported so the
+ *  host capture (handoff-response.ts) and this module cannot drift apart. */
+export function planStoredMessageRow(m: CoreMessage): HandoffReplyStashRow {
+    const raw = serializeForStore(m);
+    ingestSerializations.count++;
+    const parsed = JSON.parse(raw) as { role?: unknown; contentType?: unknown };
+    const split = splitMediaContent(raw);
+    return {
+        msgId: m.id,
+        content: split.content,
+        hash: split.hash,
+        identity: identityOfStoredContent(split.content),
+        role: typeof parsed.role === "string" ? parsed.role : "assistant",
+        kind: typeof parsed.contentType === "string" ? parsed.contentType : "message",
+        ...(split.media.length > 0 ? { media: split.media } : {}),
+        ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
+    };
+}
+
 /** Builds rows + pointer sequences. Pure: no database touched, so tests can
  *  assert the mapping itself. seq assignment: first-seen over the ordered
  *  union (pluginSnapshot first — frozen raw prefix — then fresh tail ids). */
@@ -155,7 +242,7 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const log: LogEntry[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
-        const raw = JSON.stringify(m);
+        const raw = serializeForStore(m);
         ingestSerializations.count++;
         const parsed = JSON.parse(raw) as { role: string; contentType?: string };
         const split = splitMediaContent(raw);
@@ -169,7 +256,7 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}) });
+        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}), ...(typeof m.ts === "number" ? { ts: m.ts } : {}) });
         return seq;
     };
     // #3301: import payload first — its rows must sit below the snapshot/tail
@@ -269,7 +356,7 @@ export function planIngestDelta(
     // at the trusted prefix's end. Identities are content-derived and
     // unique within one conversion pass, so a match proves this tail slot
     // IS the message the watermark was set from.
-    const probe = JSON.stringify(tail[trustedLen - 1]);
+    const probe = serializeForStore(tail[trustedLen - 1]);
     ingestSerializations.count++;
     // #3762: the stored boundary hash covers the MEDIA-SPLIT serialization;
     // split the probe the same way so image messages verify identically.
@@ -289,7 +376,7 @@ export function planIngestDelta(
     const appended: number[] = [];
     for (let i = trustedLen; i < tail.length; i++) {
         const m = tail[i];
-        const raw = JSON.stringify(m);
+        const raw = serializeForStore(m);
         ingestSerializations.count++;
         const parsed = JSON.parse(raw) as { role: string; contentType?: string };
         const split = splitMediaContent(raw);
@@ -308,6 +395,7 @@ export function planIngestDelta(
             kind: parsed.contentType ?? "message",
             ref: byRawRef[m.id] ?? null,
             ...(split.media.length > 0 ? { media: split.media } : {}),
+            ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
         });
     }
     // planIngest's snapshot ternary replicated on the ORIGINAL value: an
@@ -319,6 +407,54 @@ export function planIngestDelta(
     // delta path skips remapPlanToAbsolute by construction.
     const tailSeqs = [...trustedTailSeqs, ...appended];
     return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
+}
+
+/** #7474 window re-anchor planner: the pf-window lane persists only the
+ *  tail window (~56 rows), so planIngestDelta's strict-append assumption
+ *  (the tail EXTENDS the trusted prefix) is structurally false — equal /
+ *  sliding / shrinking windows refuse at the gate, and the full ingest
+ *  pays O(all session rows) per HIT turn to re-derive what one indexed
+ *  point lookup per window row can answer (idx_messages_identity):
+ *  existing rows keep their seq, new rows continue after max(seq). Every
+ *  window row is identity-probed inside the transaction — no positional
+ *  assumption rides below the window (the same trust model the full path
+ *  gives window plans; the sampled digest stays the backstop). Any doubt
+ *  (all rows new, a tombstone, changed bytes at a stable identity) refuses
+ *  to the exact full path. */
+export function planIngestReanchor(session: LegacySessionLike): IngestPlan | null {
+    if (session.pluginSnapshot && session.pluginSnapshot.length > 0) return null;
+    // #3301: import payloads need the full path (sweep + lowest-seq rows).
+    if (session.decompositionLog && session.decompositionLog.length > 0) return null;
+    const tail = session.lastMessages;
+    if (!tail || tail.length === 0) return null;
+    const byRawRef = session.state.messageRefs.byRaw;
+    const log: LogEntry[] = [];
+    for (let i = 0; i < tail.length; i++) {
+        const m = tail[i];
+        const raw = serializeForStore(m);
+        ingestSerializations.count++;
+        const parsed = JSON.parse(raw) as { role: string; contentType?: string };
+        const split = splitMediaContent(raw);
+        // Placeholder seqs in WINDOW ORDER (1..n); the transaction resolves
+        // each to its absolute seq (existing row's seq or max(seq)+k) and
+        // remaps tailSeqs + block bounds through the same map.
+        log.push({
+            seq: i + 1,
+            msgId: m.id,
+            content: split.content,
+            hash: split.hash,
+            identity: identityOfStoredContent(split.content),
+            role: parsed.role,
+            kind: parsed.contentType ?? "message",
+            ref: byRawRef[m.id] ?? null,
+            ...(split.media.length > 0 ? { media: split.media } : {}),
+            ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
+        });
+    }
+    const pluginSnapshotSeqs = session.pluginSnapshot ? [] : null;
+    const plan = finishPlan(session, byRawRef, log, pluginSnapshotSeqs, log.map((e) => e.seq));
+    plan.reanchor = true;
+    return plan;
 }
 
 /** Shared plan tail (everything except the messages log): given the same
@@ -353,6 +489,7 @@ function finishPlan(
         contentHash: e.hash,
         identity: e.identity,
         ...(e.media && e.media.length > 0 ? { media: e.media } : {}),
+        ...(typeof e.ts === "number" ? { ts: e.ts } : {}),
     }));
 
     // #4316 layer 3: the ledger positions of a block's covered messages —
@@ -364,10 +501,13 @@ function finishPlan(
     const seqById = new Map<string, number>();
     for (const e of log) if (!seqById.has(e.msgId)) seqById.set(e.msgId, e.seq);
 
+    const completedViews = completeBlockContents(session.blockContents, session.state.blocks);
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
-        const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
+        const views = completedViews.get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
+        const summaryJson = JSON.stringify(full);
+        const oneJson = one === null ? null : JSON.stringify(one);
         const covered = { effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds };
         let startSeq = -1;
         let endSeq = -1;
@@ -385,8 +525,13 @@ function finishPlan(
             startRef: b.startRef !== undefined ? refToIndex(b.startRef) : null,
             endRef: b.endRef !== undefined ? refToIndex(b.endRef) : null,
             tier: b.tier,
-            summary: JSON.stringify(full),
-            one: one === null ? null : JSON.stringify(one),
+            summary: summaryJson,
+            one: oneJson,
+            // #5744: carry the digests so ingestSession can compare against the
+            // stored row BEFORE any CAS op (putContent with a precomputed hash
+            // recomputes nothing — same bytes, same utf8, same sha256).
+            summaryHash: sha256Hex(summaryJson),
+            oneHash: oneJson === null ? null : sha256Hex(oneJson),
             supersedesBlockId: null,
             active: b.active,
             createdAt: b.createdAt,
@@ -416,19 +561,65 @@ function finishPlan(
     }));
 
     const ccrEntries: CcrEntryRow[] = session.contentStore
-        ? Object.entries(session.contentStore.byRef).map(([key, value], ord) => ({
-              ord,
-              key,
-              content: JSON.stringify(value),
-          }))
+        ? Object.entries(session.contentStore.byRef).map(([key, value], ord): CcrEntryRow => {
+              const content = JSON.stringify(value);
+              // #6785 step 6: the orig half — the kernel invariant
+              // (content-store.ts storeOriginal) pins byHash[entry.hash]
+              // as the original text behind each entry; the slim column
+              // keeps no bytes, so the CAS row must carry them.
+              const entry = value as { hash?: unknown } | null;
+              const origKey = entry !== null && typeof entry === "object" && typeof entry.hash === "string" ? entry.hash : null;
+              if (origKey === null) {
+                  // Hashless/null entry (fork-receipt stubs): no original
+                  // exists, so the row is complete as-is — "" keeps it
+                  // slim-hydratable (null would mark the WHOLE store
+                  // file-lane-authoritative and drop the orphan byHash half).
+                  return { ord, key, content, contentHash: sha256Hex(content), origContent: "", origHash: sha256Hex("") };
+              }
+              const stored = session.contentStore!.byHash[origKey];
+              // A missing byHash entry (bytes absent from memory/sidecar)
+              // must land as null, not "": "" would look like a legitimate
+              // empty original and the slim store would reconstruct an
+              // empty original instead of degrading to the file lane
+              // (getCcrEntries null contract, store.ts).
+              const orig = stored === undefined ? null : stored;
+              return { ord, key, content, contentHash: sha256Hex(content), origContent: orig, origHash: orig === null ? null : sha256Hex(orig) };
+          })
         : [];
 
-    const kstate: Record<string, unknown> = {};
+    // #7577 D4: egress-on sessions do not persist tsStamps/tokenSnapshot/
+    // lastPassIds in the kstate column: tsStamps is derived on load from the
+    // egress view (the I rows carry the kernel raw msgid + first-observed
+    // wall-clock ts), tokenSnapshot is recomputed by the kernel's render
+    // pass, and lastPassIds self-heals after the first compress pass.
+    // Excluding them keeps the column bounded (<2KB residual sidecar).
+    const egressOn = session.metadata["egressAuthority"] === true;
+    const KSTATE_TRIM_FIELDS = new Set(["tsStamps", "tokenSnapshot", "lastPassIds"]);
+    // #7658 PR-B: the write-side half of the kstate retirement. When an
+    // egress-on session DOES get a unified write (the arm point, or the first
+    // legacy ingest after the plane rolls back with a stale in-memory state),
+    // the column carries ONLY the bounded residual — the same field set the
+    // block-ledger sidecar carries. Everything else (blocks, messageRefs,
+    // tsStamps, tokenSnapshot, lastPassIds) is rebuildable from the op log at
+    // load (rebuildEgressKstateOverlay); storing it would only grow the
+    // column and create a second, stale authority. 0 = legacy double-write.
+    // NOTE: an armed egress-on session's unified legs are frozen anyway
+    // (egressProjectionFrozen) — this gate covers the arm-point and
+    // rollback-window writes.
+    const retireWrites = egressOn && featureEnabled("egressKstateRetireWrites");
+    const KSTATE_RESIDUAL_SET = new Set<string>(KSTATE_RESIDUAL_FIELDS);
+    const kstateRaw: Record<string, unknown> = {};
     for (const field of MERGE_STATE_FIELDS) {
         if (TABLE_OWNED_FIELDS.has(field)) continue;
+        if (egressOn && KSTATE_TRIM_FIELDS.has(field)) continue;
+        if (retireWrites && !KSTATE_RESIDUAL_SET.has(field)) continue;
         const v = (session.state as Record<string, unknown>)[field];
-        if (v !== undefined) kstate[field] = v;
+        if (v !== undefined) kstateRaw[field] = v;
     }
+    // #6785 step 8: the kstate slim split — bounded fields stay in the
+    // column (order preserved), unbounded record/array fields ride one row
+    // each in state_fields (see splitKstate).
+    const { column: kstateColumn, rows: stateFields } = splitKstate(MERGE_STATE_FIELDS, kstateRaw);
 
     const sessionRow: SessionRow = {
         sessionId: session.id,
@@ -459,12 +650,15 @@ function finishPlan(
         metaJson: JSON.stringify(session.meta),
         statsJson: JSON.stringify(session.stats),
         metadataJson: JSON.stringify(session.metadata),
-        kstateJson: JSON.stringify(kstate),
+        kstateJson: JSON.stringify(kstateColumn),
         tailJson: JSON.stringify({ pluginSnapshotSeqs, tailSeqs, tailFolded: session.lastMessagesFolded === true }),
-        ccrJson: session.contentStore ? JSON.stringify(session.contentStore) : null,
+        // #6785 step 6: slim envelope — the column keeps key→hash only; the
+        // original bytes live in the CAS behind ccr_entries and are re-fetched
+        // on read (byte-identical by construction).
+        ccrJson: session.contentStore ? JSON.stringify(slimCcrEnvelope(session.contentStore)) : null,
     };
 
-    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs };
+    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, stateFields, pluginSnapshotSeqs, tailSeqs };
 }
 
 /** Rebuilds the legacy load view from unified rows alone. */
@@ -563,6 +757,13 @@ export class LegacyViewBuilder {
     private readonly blocks: unknown[] = [];
     private readonly blockContents: BlockContents = new Map();
     private readonly messagesBySeq = new Map<number, CoreMessage>();
+    private ccrRows: readonly CcrLedgerRow[] = [];
+    private orphanViews?: Record<string, { one: unknown; full: unknown }>;
+    private stateFieldsRows: Record<string, string> | null = null;
+    /** The kstate column as stored — needed by applyStateFieldsRows to
+     *  tell an older build's default from a value written after the rows
+     *  (#7574 rollback). */
+    private columnKstate: Record<string, unknown> = {};
 
     constructor(
         private readonly session: LegacyViewRows["session"],
@@ -570,6 +771,7 @@ export class LegacyViewBuilder {
         deadRefs: LegacyViewRows["deadRefs"],
     ) {
         const kstate = JSON.parse(session.kstateJson) as Record<string, unknown>;
+        this.columnKstate = kstate;
         this.tail = JSON.parse(session.tailJson);
         this.messageSeqs = [...new Set([...(this.tail.tailSeqs ?? []), ...(this.tail.pluginSnapshotSeqs ?? [])])];
 
@@ -606,9 +808,45 @@ export class LegacyViewBuilder {
                     state.nextRunId = session.nextRunId;
                     break;
                 default:
+                    // #6785 step 8: row-backed fields ride state_fields and
+                    // are overlaid at finish() (addStateFields); the legacy
+                    // column (pre-upgrade rows) still carries them, so the
+                    // column value is the base either way.
                     if (kstate[field] !== undefined) state[field] = kstate[field];
                     break;
             }
+        }
+    }
+
+    /** #6785 step 8: the unbounded CompressionState field rows (state_fields
+     *  table). Call AFTER constructing, BEFORE finish(); rows overlay the
+     *  column values (legacy sessions have no rows → column serves). */
+    addStateFields(fields: Record<string, string>): void {
+        this.stateFieldsRows = fields;
+    }
+
+    /** #6785 step 8: apply the row-backed state fields OVER the column
+     *  values (rows win; corrupt row → column value, if any, stays).
+     *  #7574 (rollback): a build that predates the rows does not know the
+     *  nine fields moved out of the column — it loads a session WITHOUT
+     *  them and writes the column back. When this build returns, a column
+     *  that carries one of the fields means "written by the older build
+     *  after the rows": a NON-EMPTY column value is newer than the row
+     *  (something was added while the older build ran) and stays; an EMPTY
+     *  one (the older build's default) gives way to the row, which still
+     *  holds the value from before. Every row used to win unconditionally,
+     *  so a rule or a token-snapshot entry added while the older build ran
+     *  silently vanished on the next load. */
+    private applyStateFieldsRows(): void {
+        if (this.stateFieldsRows === null) return;
+        for (const [field, valueJson] of Object.entries(this.stateFieldsRows)) {
+            let value: unknown;
+            try {
+                value = JSON.parse(valueJson);
+            } catch { continue; /* corrupt row → column value (if any) stays */ }
+            const column = this.columnKstate[field];
+            if (column !== undefined && !isEmptyStateValue(column)) continue;
+            this.state[field] = value;
         }
     }
 
@@ -621,10 +859,32 @@ export class LegacyViewBuilder {
         for (const m of rows) this.messagesBySeq.set(m.seq, JSON.parse(m.content) as CoreMessage);
     }
 
+    /** #6785 step 6: the ccr_entries ledger (CAS content) that backs a slim
+     *  ccr_json envelope — finish() hydrates the store from these rows. */
+    addCcrEntries(rows: readonly CcrLedgerRow[]): void {
+        this.ccrRows = rows;
+    }
+
+    /** #6785 step 7: the merged orphan journal (orphan_blocks table ∪
+     *  legacy column, pre-merged by the caller). finish() merges these into
+     *  blockContents INSTEAD of sessions.orphans_json once provided.
+     *  undefined = not provided (callers without table access fall back to
+     *  the column). */
+    addOrphanViews(views: Record<string, { one: unknown; full: unknown }>): void {
+        this.orphanViews = views;
+    }
+
     finish(): LegacyView {
         const s = this.session;
         const tail = this.tail;
-        mergeOrphanBlockContents(this.blockContents, s.orphansJson);
+        this.applyStateFieldsRows();
+        // #6785 step 7: the table-backed journal (addOrphanViews) wins over
+        // the legacy orphans_json column; no views fed ⇒ column fallback.
+        if (this.orphanViews !== undefined) {
+            if (Object.keys(this.orphanViews).length > 0) mergeOrphanBlockContents(this.blockContents, JSON.stringify(this.orphanViews));
+        } else {
+            mergeOrphanBlockContents(this.blockContents, s.orphansJson);
+        }
         // #4390: a tail pointer whose row is gone used to be silently filtered
         // out — the view shrank with no trace. Count the gaps so callers can
         // warn (persist logs them); the surviving members still load.
@@ -655,15 +915,59 @@ export class LegacyViewBuilder {
             lastMessagesFolded: tail.tailFolded,
         };
         if (pluginSnapshot) out.pluginSnapshot = pluginSnapshot;
-        if (s.ccrJson !== null) out.contentStore = JSON.parse(s.ccrJson);
+        out.contentStore = resolveCcrContentStore(s.ccrJson, this.ccrRows, s.sessionId);
         return out;
     }
 }
 
+/**
+ * #6785 step 6: the ONE definition of "what does a sessions.ccr_json column
+ * mean" — shared by the builder (finish), the verifier header and
+ * loadLegacyView, so the slim/full/legacy degradation rule cannot drift
+ * between legs. Slim envelope → hydrate from the CAS-backed ledger; a slim
+ * row whose ledger is empty or still carries legacy NULL-orig rows is an
+ * inconsistency: no store (the file lane still has it), never a partial one.
+ * Full (pre-step-6) envelopes parse verbatim. Corrupt JSON → undefined.
+ *
+ * #7574: no longer a SILENT degradation. The one way this shape arises in
+ * practice is a rollback: an older build (everything before the unified
+ * storage) parses the slim column as if it were the old full envelope, so
+ * its save rewrites the ledger rows to the bare `{ hash }` stubs it saw and
+ * drops the link to the original text. Those texts cannot be linked back —
+ * the session loads without its content store and the log says why (the
+ * nine row-backed state fields DO come back, see applyStateFieldsRows).
+ */
+export function resolveCcrContentStore(
+    ccrJson: string | null,
+    ccrRows: readonly CcrLedgerRow[],
+    sessionId = "?",
+): LegacyView["contentStore"] {
+    if (ccrJson === null) return undefined;
+    try {
+        const head = JSON.parse(ccrJson) as { ccrSlim?: number };
+        if (head.ccrSlim === 1) {
+            const store = hydrateSlimCcrStore(JSON.parse(ccrJson) as Parameters<typeof hydrateSlimCcrStore>[0], ccrRows);
+            if (store === null && ccrRows.length > 0) {
+                const linkDropped = ccrRows.some((r) => r.origContent === null);
+                loggerLog("warn", `[storage] session=${sessionId}: the content store could not be rebuilt from its ${ccrRows.length} ledger row(s) (${linkDropped
+                    ? "the rows carry no original text — this is what an older build leaves behind after it saved this session; those tool-output and file-read texts cannot be restored"
+                    : "a body the content table no longer has, or a key the ledger no longer lists"}) — the session is loaded without it`);
+            }
+            return store ?? undefined;
+        }
+        return JSON.parse(ccrJson) as LegacyView["contentStore"];
+    } catch {
+        return undefined;
+    }
+}
+
 /** Compatibility wrapper for callers that already hold all rows. */
-export function loadLegacyView(rows: LegacyViewRows): LegacyView {
+export function loadLegacyView(rows: LegacyViewRows, ccrRows?: readonly CcrLedgerRow[], stateFieldsRows?: Record<string, string> | null, orphanViews?: Record<string, { one: unknown; full: unknown }>): LegacyView {
     const builder = new LegacyViewBuilder(rows.session, rows.refs, rows.deadRefs);
     builder.addBlocks(rows.blocks);
     builder.addMessages(rows.messages);
+    if (ccrRows) builder.addCcrEntries(ccrRows);
+    if (stateFieldsRows) builder.addStateFields(stateFieldsRows);
+    if (orphanViews !== undefined) builder.addOrphanViews(orphanViews);
     return builder.finish();
 }

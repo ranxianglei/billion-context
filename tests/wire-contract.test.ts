@@ -21,6 +21,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
+import { emitStreamError } from "../src/stream-error.ts";
+import { validateResponsesContentIndex } from "./wire-contract-fakes.ts";
 
 process.env.NODE_ENV = "test";
 
@@ -53,9 +55,28 @@ import {
     RULE_TOOL_GOOGLE,
     retrieveToolsFor,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
+import { verifySdkHmac, WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
+
+test("WC-026 Responses content-part indices are explicit, including legacy error completions", () => {
+    for (const type of ["response.content_part.added", "response.output_text.delta", "response.output_text.done", "response.content_part.done"]) {
+        for (const content_index of [0, 2]) assert.deepEqual(validateResponsesContentIndex({ type, content_index }), []);
+        for (const content_index of [undefined, null, "0", -1, 0.5]) assert.match(validateResponsesContentIndex({ type, content_index })[0], /WC-026/);
+    }
+    assert.deepEqual(validateResponsesContentIndex({ type: "response.output_item.done" }), []);
+    const frames: Record<string, unknown>[] = [];
+    const res = {
+        write(chunk: string) {
+            for (const line of chunk.split("\n")) if (line.startsWith("data: ")) frames.push(JSON.parse(line.slice(6)));
+            return true;
+        },
+        end() { return this; },
+    } as unknown as http.ServerResponse;
+    emitStreamError(res, "responses", "fixture failure", undefined, "completion");
+    assert.equal(frames.length, 7);
+    assert.deepEqual(frames.flatMap(validateResponsesContentIndex), []);
+});
 
 test("WC-013: WebSocket transport envelopes omit HTTP-only fields", () => {
     assert.deepEqual(validateResponsesWsCreate({ type: "response.create", input: [] }), []);
@@ -92,6 +113,138 @@ test("WC-022 tool_addition/tool_removal blocks are only valid inside role:system
     assert.match(VALIDATORS.anthropic({
         messages: [{ role: "user", content: [{ type: "tool_removal", tool_name: "t" }] }],
     })[0], /WC-022/);
+});
+
+test("WC-023 mid-conversation system messages satisfy the two-sided positional contract", () => {
+    const sysDelta = { role: "system", content: [{ type: "text", text: "delta" }] };
+    // Legal: follows a user, precedes an assistant.
+    assert.deepEqual(VALIDATORS.anthropic({
+        messages: [
+            { role: "user", content: [{ type: "text", text: "u" }] },
+            sysDelta,
+            { role: "assistant", content: [{ type: "text", text: "a" }] },
+        ],
+    }), []);
+    // Legal: follows an assistant ending in a SERVER tool result — the real
+    // wire shape is the <name>_tool_result family riding inside the assistant
+    // message (plain tool_result is user-role only).
+    assert.deepEqual(VALIDATORS.anthropic({
+        messages: [
+            { role: "assistant", content: [{ type: "text", text: "call" }, { type: "web_search_tool_result", tool_use_id: "s1", content: [{ type: "text", text: "hits" }] }] },
+            sysDelta,
+            { role: "assistant", content: [{ type: "text", text: "found" }] },
+        ],
+    }), []);
+    // Legal: trailing run at array end after a user turn (the pi/dsh tail shape).
+    assert.deepEqual(VALIDATORS.anthropic({
+        messages: [
+            { role: "user", content: [{ type: "text", text: "u" }] },
+            sysDelta,
+            { role: "system", content: [{ type: "text", text: "tail" }] },
+        ],
+    }), []);
+    // Legal: directive-only form anywhere (empty content + output_config).
+    assert.deepEqual(VALIDATORS.anthropic({
+        messages: [
+            { role: "assistant", content: [{ type: "text", text: "done" }] },
+            { role: "system", content: [], output_config: { effort: "high" } },
+        ],
+    }), []);
+    // Illegal (follow side): #5432 case-1 — system directly behind a plain assistant.
+    assert.match(VALIDATORS.anthropic({
+        messages: [
+            { role: "assistant", content: [{ type: "text", text: "reply" }] },
+            sysDelta,
+            { role: "assistant", content: [{ type: "text", text: "next" }] },
+        ],
+    })[0], /WC-023.*follow/);
+    // Illegal (precede side): #4457 half — run's first non-system follower is a user.
+    assert.match(VALIDATORS.anthropic({
+        messages: [
+            { role: "user", content: [{ type: "text", text: "u" }] },
+            sysDelta,
+            { role: "user", content: [{ type: "text", text: "v" }] },
+        ],
+    })[0], /WC-023.*precede/);
+});
+
+test("WC-024 thinking blocks must carry a signature (#5998)", () => {
+    // Legal: signed thinking replayed verbatim.
+    assert.deepEqual(VALIDATORS.anthropic({
+        messages: [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "sig_A" }, { type: "text", text: "a" }] },
+        ],
+    }), []);
+    // Illegal: unsigned thinking — the DSH transcript shape (reasoning stored as {type, text}).
+    assert.match(VALIDATORS.anthropic({
+        messages: [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+        ],
+    })[0], /WC-024/);
+    // Illegal: an empty-string signature counts as missing.
+    assert.match(VALIDATORS.anthropic({
+        messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "" }] }],
+    })[0], /WC-024/);
+});
+
+test("WC-025 TTS-shaped requests must not carry a leading system message (#6636)", () => {
+    // Illegal: the #6636 shape — audio output + a leading system message is
+    // what bili injected (ACP tags prompt) and what the TTS upstream 400s.
+    assert.match(VALIDATORS["openai-chat"]({
+        model: "mimo-v2.5-tts",
+        messages: [
+            { role: "system", content: "ACP TAGS\n\nAddressable messages…" },
+            { role: "user", content: "read this aloud" },
+            { role: "assistant", content: "the text to speak." },
+        ],
+        audio: { format: "mp3", voice: "mimo_default" },
+        stream: false,
+    })[0], /WC-025/);
+    // Legal: the same TTS call without the leading system (the issue's
+    // control experiment — returns 200).
+    assert.deepEqual(VALIDATORS["openai-chat"]({
+        model: "mimo-v2.5-tts",
+        messages: [
+            { role: "user", content: "read this aloud" },
+            { role: "assistant", content: "the text to speak." },
+        ],
+        audio: { format: "mp3", voice: "mimo_default" },
+        stream: false,
+    }), []);
+    // Legal: a leading system message with no audio object is a plain chat
+    // turn, not a TTS request — the rule keys on the audio shape.
+    assert.deepEqual(VALIDATORS["openai-chat"]({
+        model: "fake-a",
+        messages: [
+            { role: "system", content: "ACP TAGS\n\nAddressable messages…" },
+            { role: "user", content: "hello" },
+        ],
+        stream: false,
+    }), []);
+    // Legal: an empty audio object carries no media request.
+    assert.deepEqual(VALIDATORS["openai-chat"]({
+        model: "mimo-v2.5-tts",
+        messages: [
+            { role: "system", content: "ACP TAGS" },
+            { role: "user", content: "hello" },
+        ],
+        audio: {},
+        stream: false,
+    }), []);
+    // Legal: a tool-carrying audio request is a main turn, not a TTS call —
+    // its model has an action surface and accepts a leading system message,
+    // so bili's ACP decoration there is legal (no-tools veto, mirrors
+    // isAudioOutputCall).
+    assert.deepEqual(VALIDATORS["openai-chat"]({
+        model: "voice-chat",
+        messages: [
+            { role: "system", content: "ACP TAGS" },
+            { role: "user", content: "hello" },
+        ],
+        audio: { format: "wav", voice: "alloy" },
+        tools: [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: {} } } }],
+        stream: false,
+    }), []);
 });
 
 test("WC-016 validates global-scope breakpoint ordering (render order: tools → system → messages)", () => {
@@ -190,11 +343,20 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             },
             // WC-022: a pi mid-conversation system message re-emitted as user.
             { messages: [{ role: "user", content: [{ type: "tool_removal", tool_name: "t" }] }] },
+            // WC-023: #5432 case-1 shape — sidecar system directly behind an assistant.
+            { messages: [
+                { role: "assistant", content: [{ type: "text", text: "a" }] },
+                { role: "system", content: [{ type: "text", text: "s" }] },
+            ] },
+            // WC-024: the DSH transcript shape (#5998) — assistant thinking without a signature.
+            { messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "t" }] }] },
         ],
         "openai-chat": [
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },
             { tools: [{ type: "function", function: { name: "x".repeat(65), parameters: { type: "object", properties: {} } } }] },
             { tools: [{ type: "function", function: { name: "ok", parameters: { anyOf: [] } } }] },
+            // WC-025: the #6636 shape — TTS audio object + a leading system message.
+            { model: "mimo-v2.5-tts", messages: [{ role: "system", content: "ACP TAGS" }, { role: "user", content: "hi" }], audio: { format: "mp3", voice: "mimo_default" } },
         ],
         responses: [
             { type: "response.create", input: [], stream: true },
@@ -228,6 +390,7 @@ test("wire-contract ledger: every lane-scoped rule has a live enforcement clause
     // Lane-scoped constraints hold on ONE client's lane only — the shared wire validator
     // cannot enforce them (WC-013 forbids exactly what WC-017 requires, same frame shape).
     const laneProbes: Array<{ ruleId: string; validate: (body: unknown) => string[]; body: unknown }> = [
+        { ruleId: "WC-026", validate: validateResponsesContentIndex, body: { type: "response.output_text.delta", output_index: 0, delta: "x" } },
         { ruleId: "WC-017", validate: validateCodexResponsesWsCreate, body: { type: "response.create", input: [] } },
         // WC-019/020/021 are the Vertex Anthropic lane (lane: "vertex-anthropic") — the wire rules that
         // hold only on that lane, so the shared anthropic validator must not carry them. WC-019 is
@@ -255,8 +418,10 @@ test("wire-contract ledger: every lane-scoped rule has a live enforcement clause
 });
 
 test("wire-contract ledger: every header rule has a live enforcement clause", () => {
+    const apig = verifySdkHmac({ method: "POST", url: "https://api.example.com/v1/chat/completions", headers: {}, body: Buffer.alloc(0), sk: "fixture-key" });
+    const violations = [...validateGoSessionHeaders({}), ...(apig.reason ? [apig.reason] : [])];
     for (const rule of WIRE_HEADER_RULES) {
-        const enforced = validateGoSessionHeaders({}).some((v) => v.startsWith(rule.id));
+        const enforced = violations.some((v) => v.startsWith(rule.id));
         assert.ok(enforced, `header rule ${rule.id} (${rule.summary}) has no live enforcement clause in the fakes`);
     }
 });

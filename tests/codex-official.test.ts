@@ -118,7 +118,7 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         };
         assert.deepEqual(forwarded.input.map((item) => item.type), ["additional_tools", "message", "reasoning", "message"]);
         assert.match(String(forwarded.input[1].content), /Compression Philosophy/);
-        assert.match(String(forwarded.input[1].content), /five context-management tools/);
+        assert.match(String(forwarded.input[1].content), /four context-management tools/);
         assert.match(String(forwarded.input[1].content), /keep native Codex instructions/);
         assert.equal(forwarded.input[2].encrypted_content, "ciphertext");
         assert.equal((forwarded.input[3].content as Array<Record<string, unknown>>)[1].type, "input_image");

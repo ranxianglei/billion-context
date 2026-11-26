@@ -2,10 +2,10 @@ import type { CoreMessage } from "acp-kernel";
 import { coreToGoogle } from "acp-kernel/wire";
 import type { GooglePart } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "./core.js";
-import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
+import { ACP_NAME_ALT, composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
+import { createSseFramer, sseEventData } from "../sse-util.js";
 
 import type {
     CompressLoopAdapter,
@@ -16,6 +16,11 @@ import type {
 
 const PROXY_TOOL_SET = new Set([
     "compress", "decompress", "search_context", "acp_status",
+    // #5765: function-only tools added after the original four must be listed
+    // here or their chunks raw-replay to the client as "real" calls. acp_cache
+    // had the same gap before this change.
+    "acp_retire", "acp_restore", "acp_rewrite", "acp_cache",
+    "acp_retrieve", "acp_rule", "acp_read_original_image",
     "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
 ]);
 
@@ -97,42 +102,57 @@ interface FunctionCallBuffer {
 }
 
 // A decision per buffered chunk that carried functionCall parts: "keep" = every
-// call in it is real (replay verbatim, preserving signatures/ids/order), null =
-// only proxy calls (drop — the proxy executes them server-side), or a rewritten
-// copy keeping the chunk's other parts plus its real calls.
+// call in it is real and needs no signature promotion (replay verbatim,
+// preserving signatures/ids/order), null = only proxy calls (drop — the proxy
+// executes them server-side), or a rewritten copy keeping the chunk's other
+// parts plus its real calls (promoting a stripped proxy call's thoughtSignature
+// onto the first surviving real functionCall part when Gemini placed the turn
+// signature on the leading proxy call).
 function filterRealCallChunk(
     parsed: Record<string, unknown>,
     realIndexes: Set<number>,
     callIndexes: number[],
+    promoteSig?: { callIndex: number; signature: string },
 ): "keep" | null | Record<string, unknown> {
     const candidates = parsed.candidates as Array<Record<string, unknown>> | undefined;
     const parts = (candidates?.[0]?.content as { parts?: GooglePart[] } | undefined)?.parts;
     if (!Array.isArray(parts)) return "keep";
     let anyReal = false;
     let anyProxy = false;
-    const keep: boolean[] = [];
+    let sigPromoted = false;
+    const outParts: GooglePart[] = [];
     let call = 0;
     for (const part of parts) {
         if (part && typeof part === "object" && part.functionCall) {
-            const real = realIndexes.has(callIndexes[call] ?? -1);
+            const callIdx = callIndexes[call] ?? -1;
+            const real = realIndexes.has(callIdx);
             call += 1;
-            keep.push(real);
-            if (real) anyReal = true;
-            else anyProxy = true;
+            if (real) {
+                anyReal = true;
+                if (
+                    promoteSig &&
+                    callIdx === promoteSig.callIndex &&
+                    (typeof part.thoughtSignature !== "string" || part.thoughtSignature.length === 0)
+                ) {
+                    outParts.push({ ...part, thoughtSignature: promoteSig.signature });
+                    sigPromoted = true;
+                } else {
+                    outParts.push(part);
+                }
+            } else {
+                anyProxy = true;
+            }
         } else {
-            keep.push(true);
+            outParts.push(part);
         }
     }
-    if (!anyProxy) return "keep";
+    if (!anyProxy && !sigPromoted) return "keep";
     if (!anyReal) return null;
-    return cloneChunk(parsed, { parts: parts.filter((_, i) => keep[i]) });
+    return cloneChunk(parsed, { parts: outParts });
 }
 
 function dataLine(frame: string): string | null {
-    for (const line of frame.split("\n")) {
-        if (line.startsWith("data:")) return line.slice(5).trim();
-    }
-    return null;
+    return sseEventData(frame)?.trim() ?? null;
 }
 
 interface GoogleChunk {
@@ -149,6 +169,7 @@ interface GoogleChunk {
 async function* iterGoogleChunks(stream: ReadableStream<Uint8Array>): AsyncGenerator<GoogleChunk> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
+    const framer = createSseFramer();
     let buf = "";
     let mode: "unknown" | "sse" | "array" = "unknown";
     let cursor = 0;
@@ -180,14 +201,11 @@ async function* iterGoogleChunks(stream: ReadableStream<Uint8Array>): AsyncGener
                 }
             }
             if (mode === "sse") {
-                buf = normalizeSseLineEndings(buf);
-                let idx: number;
-                while ((idx = buf.indexOf("\n\n")) >= 0) {
-                    const raw = buf.slice(0, idx);
-                    buf = buf.slice(idx + 2);
+                for (const raw of framer.push(buf)) {
                     const json = dataLine(raw);
                     if (json !== null) yield { frame: raw, json };
                 }
+                buf = "";
                 continue;
             }
             for (; cursor < buf.length && !arrayDone; cursor++) {
@@ -215,28 +233,233 @@ async function* iterGoogleChunks(stream: ReadableStream<Uint8Array>): AsyncGener
                         const json = buf.slice(elementStart, cursor + 1);
                         started = false;
                         elementStart = -1;
-                        yield { frame: `data: ${json}`, json };
+                        yield { frame: `data: ${json.replace(/\r\n|\r|\n/g, "\ndata: ")}`, json };
                     }
+                }
+            }
+            // Keep only the unfinished element across reads. Retaining completed
+            // prefixes can repeatedly copy the history during concatenation/indexing.
+            if (arrayDone) {
+                buf = "";
+                cursor = 0;
+            } else {
+                const consumed = started ? elementStart : cursor;
+                if (consumed > 0) {
+                    buf = buf.slice(consumed);
+                    cursor -= consumed;
+                    if (started) elementStart = 0;
                 }
             }
         }
         if (mode === "sse") {
-            buf = finalizeSseLineEndings(buf);
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) >= 0) {
-                const raw = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
+            for (const raw of framer.finish()) {
                 const json = dataLine(raw);
                 if (json !== null) yield { frame: raw, json };
-            }
-            if (buf.trim().length > 0) {
-                const json = dataLine(buf);
-                if (json !== null) yield { frame: buf, json };
             }
         }
     } finally {
         reader.releaseLock();
     }
+}
+
+// ─── #7416: hallucinated turn-bleed circuit breaker ────────────────────────
+// Long Google sessions condition the model on the per-message render tags, so
+// it occasionally misses its native turn stop and emits plain-text "\nuser\n"
+// followed by a second synthetic render tag and a hallucinated user-turn
+// envelope, then continues into a hallucinated next assistant turn that emits
+// real functionCall parts in the same response. The tag-echo filter strips the
+// echoed tags but cannot see the turn boundary: the fake user prose and the
+// post-bleed calls would both pass through, and the loop would execute the
+// calls as unauthorized tool calls. This breaker watches the VISIBLE text
+// channel only (part.thought !== true, unsigned parts — the same channel the
+// tag-echo filter owns; signed text is signature-bound per KDD #10 and is
+// never truncated, only fence-synced). Outside fenced code blocks, a "user"
+// line followed by a render tag or a client user-turn envelope ends the
+// assistant turn: everything from the "\n" before "user" on is dropped, the
+// stream is cancelled early, and the round settles with finishReason STOP.
+// Tool-call arguments are never touched here (#1039): only prose is cut, and
+// only calls buffered AFTER the bleed are suppressed — a genuine call from
+// the real turn, buffered before the bleed, still settles normally.
+const BLEED_ACP_FOLLOWER = new RegExp("^\\x3c" + ACP_NAME_ALT + "(?=[\\s/>=])");
+const BLEED_ENVELOPE_FOLLOWER = new RegExp("^\\x3c(?:USER_REQUEST|ADDITIONAL_METADATA|SYSTEM_MESSAGE)(?=[\\s>])", "i");
+const BLEED_SENTENCE_FOLLOWER = new RegExp("^The following is a \\x3cSYSTEM_MESSAGE\\x3e", "i");
+const BLEED_ENVELOPE_LITERALS = ["\x3cUSER_REQUEST", "\x3cADDITIONAL_METADATA", "\x3cSYSTEM_MESSAGE"];
+const BLEED_SENTENCE_LITERAL = "The following is a \x3cSYSTEM_MESSAGE\x3e";
+
+type BleedFollower = "match" | "ambiguous" | "no";
+
+/** What the text after a "user" line (leading whitespace skipped) proves:
+ *  a follower opener starts it ("match"), it is still a strict prefix of a
+ *  follower opener so the next chunk must decide ("ambiguous"), or it rules
+ *  every follower out ("no" — the "user" line was ordinary prose). */
+function bleedFollowerStatus(rest: string): BleedFollower {
+    if (rest.length === 0) return "ambiguous";
+    if (BLEED_ACP_FOLLOWER.test(rest) || BLEED_ENVELOPE_FOLLOWER.test(rest) || BLEED_SENTENCE_FOLLOWER.test(rest)) return "match";
+    const upper = rest.toUpperCase();
+    for (const lit of BLEED_ENVELOPE_LITERALS) {
+        if (lit.startsWith(upper)) return "ambiguous";
+    }
+    if (BLEED_SENTENCE_LITERAL.toUpperCase().startsWith(upper)) return "ambiguous";
+    // "\x3c" plus a still-growing tag name: an acp-style name or an envelope
+    // name may still complete in the next chunk.
+    if (/^\x3c[A-Za-z]{0,7}$/.test(rest)) return "ambiguous";
+    return "no";
+}
+
+interface TurnBleedFence {
+    inFence: boolean;
+    char: string;
+    len: number;
+}
+
+/** CommonMark fenced-code delimiter on one complete line, or null. A closing
+ *  fence needs the same char, at least the opening length, and nothing but
+ *  whitespace after it; a backtick opening's info string must hold no
+ *  backtick. */
+function bleedFenceDelimiter(line: string, st: TurnBleedFence): TurnBleedFence | null {
+    const m = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (m === null) return null;
+    const run = m[1];
+    const ch = run[0];
+    const rest = line.slice(m[0].length);
+    if (st.inFence) {
+        if (ch !== st.char || run.length < st.len) return null;
+        if (rest.trim() !== "") return null;
+        return { inFence: false, char: "", len: 0 };
+    }
+    if (ch === "`" && rest.includes("`")) return null;
+    return { inFence: true, char: ch, len: run.length };
+}
+
+/** Whether an incomplete line could still grow into the "user" line
+ *  (a strict prefix of it, or the full word plus trailing spaces/tabs). */
+function bleedCouldBeUserLine(s: string): boolean {
+    return /^(?:[Uu]|[Uu][Ss]|[Uu][Ss][Ee]|[Uu][Ss][Ee][Rr][ \t]*)$/.test(s);
+}
+
+/** Whether an incomplete line could still grow into a fence delimiter:
+ *  a fence run is already there (its verdict needs the completed line), or
+ *  only spaces plus at most two fence chars have arrived so far. */
+function bleedCouldBeFenceLine(s: string, inFence: boolean): boolean {
+    const m = /^ {0,3}(`{3,}|~{3,})/.exec(s);
+    if (m !== null) {
+        const rest = s.slice(m[0].length);
+        if (m[1][0] === "`" && rest.includes("`")) return false;
+        if (inFence && rest.trim() !== "") return false;
+        return true;
+    }
+    return /^ {0,3}[`~]{0,2}$/.test(s);
+}
+
+interface TurnBleedScan {
+    /** Index of the "\n" before the "user" line (0 when the bleed starts the
+     *  buffer), once a follower proves the bleed. */
+    cutAt: number | null;
+    /** Index from which bytes must be held: the undecided tail. */
+    holdFrom: number;
+    /** Fence state at holdFrom. */
+    stateAtHold: TurnBleedFence;
+}
+
+function scanTurnBleed(buf: string, start: TurnBleedFence): TurnBleedScan {
+    let st: TurnBleedFence = { ...start };
+    let pos = 0;
+    for (;;) {
+        const nl = buf.indexOf("\n", pos);
+        if (nl === -1) {
+            const tail = buf.slice(pos);
+            const mustHold = bleedCouldBeUserLine(tail) || bleedCouldBeFenceLine(tail, st.inFence);
+            return { cutAt: null, holdFrom: mustHold ? pos : buf.length, stateAtHold: st };
+        }
+        const rawLine = buf.slice(pos, nl);
+        const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+        const lineState: TurnBleedFence = { ...st };
+        const next = bleedFenceDelimiter(line, st);
+        if (next !== null) {
+            st = next;
+            pos = nl + 1;
+            continue;
+        }
+        if (!st.inFence && line.replace(/[ \t]+$/, "").toLowerCase() === "user") {
+            let cut = pos === 0 ? 0 : pos - 1;
+            if (cut > 0 && buf[cut - 1] === "\r") cut -= 1;
+            const after = buf.slice(nl + 1).replace(/^[ \t\r\n]*/, "");
+            const status = bleedFollowerStatus(after);
+            if (status === "match") return { cutAt: cut, holdFrom: buf.length, stateAtHold: st };
+            if (status === "ambiguous") return { cutAt: null, holdFrom: cut, stateAtHold: lineState };
+        }
+        pos = nl + 1;
+    }
+}
+
+interface TurnBleedFeed {
+    /** Decided-safe prefix: push it through the tag-echo filter. */
+    emit: string;
+    bled: boolean;
+}
+
+/** Streaming turn-bleed breaker over the visible text channel. feed() holds
+ *  back only the undecided tail — a line that could still become "user", a
+ *  fence delimiter still forming, or a "user" line whose follower has not
+ *  arrived yet — so a bleed split across SSE chunk boundaries is still cut
+ *  whole, and ordinary prose streams with no added delay. flush() releases
+ *  the held tail at stream end, when no follower can still arrive; once the
+ *  bleed is proven, feed() keeps returning empty and flush() discards the
+ *  held tail. */
+function createTurnBleedBreaker(): {
+    feed(text: string): TurnBleedFeed;
+    flush(): string;
+    fenceSync(text: string): void;
+} {
+    let buf = "";
+    let fence: TurnBleedFence = { inFence: false, char: "", len: 0 };
+    let bled = false;
+    return {
+        feed(text: string): TurnBleedFeed {
+            if (bled) return { emit: "", bled: true };
+            buf += text;
+            const scan = scanTurnBleed(buf, fence);
+            if (scan.cutAt !== null) {
+                bled = true;
+                const emit = buf.slice(0, scan.cutAt);
+                buf = "";
+                return { emit, bled: true };
+            }
+            const emit = buf.slice(0, scan.holdFrom);
+            buf = buf.slice(scan.holdFrom);
+            fence = scan.stateAtHold;
+            return { emit, bled: false };
+        },
+        flush(): string {
+            if (bled) {
+                buf = "";
+                return "";
+            }
+            const out = buf;
+            buf = "";
+            return out;
+        },
+        // Signature-bound text rides verbatim (KDD #10), so it cannot pass
+        // through feed() — but its fence lines still move the stream's fence
+        // state. Best-effort sync over its complete lines only; a fence line
+        // split across the signed/unsigned boundary is a known blind spot
+        // (it can only misjudge a later bleed, never truncate real text on
+        // its own — the cut still needs a proven follower).
+        fenceSync(text: string): void {
+            let st: TurnBleedFence = { ...fence };
+            let pos = 0;
+            for (;;) {
+                const nl = text.indexOf("\n", pos);
+                if (nl === -1) break;
+                const rawLine = text.slice(pos, nl);
+                const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+                const next = bleedFenceDelimiter(line, st);
+                if (next !== null) st = next;
+                pos = nl + 1;
+            }
+            fence = st;
+        },
+    };
 }
 
 export function createGoogleAdapter(
@@ -273,7 +496,7 @@ export function createGoogleAdapter(
 
     return {
         buildRequest(coreMessages, systemPrompt, body) {
-            const contents = coreToGoogle(coreMessages);
+            const contents = coreToGoogle(coreMessages, { model: modelVersion });
             if (notes && notes.length > 0) {
                 for (const text of notes) contents.push({ role: "user", parts: [{ text }] });
             }
@@ -314,8 +537,9 @@ export function createGoogleAdapter(
             const requestText = JSON.stringify(requestBody);
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
-                    createTagEchoFilter((snippet) => {
-                        loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    createTagEchoFilter((snippet, duringDrain) => {
+                        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag";
+                        loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }, (snippet) => {
                         // #2190: residue audit — log-only, see plugin.ts twins.
                         loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
@@ -333,6 +557,20 @@ export function createGoogleAdapter(
                 const tail = tagFilter.flush();
                 if (tail.length > 0) {
                     yield { kind: "text", delta: tail, raw: buildChunk([{ text: tail }]) } as ParsedStreamEvent;
+                }
+            };
+            // #7416: the turn-bleed breaker watches the visible text channel
+            // ahead of the tag-echo filter (it needs the raw follower bytes
+            // the filter strips). turnBled ends the round once proven.
+            const bleed = createTurnBleedBreaker();
+            let turnBled = false;
+            const flushBleed = function* (): Generator<ParsedStreamEvent> {
+                const tail = bleed.flush();
+                if (tail.length > 0) {
+                    const clean = tagFilter.push(tail);
+                    if (clean.length > 0) {
+                        yield { kind: "text", delta: clean, raw: buildChunk([{ text: clean }]) } as ParsedStreamEvent;
+                    }
                 }
             };
             let callIndex = 0;
@@ -386,19 +624,21 @@ export function createGoogleAdapter(
                 }
                 pending.clear();
             };
-            // #1881: a call chunk's prose parts. Such a chunk was withheld from
+            // #1881: a call chunk's non-call parts. Such a chunk was withheld from
             // immediate forwarding on the assumption it would be replayed whole
             // at settle; when settle decides nothing replays, the prose still
             // has to reach the client (master lost even UNEDITED sibling text
             // in all-proxy chunks through this same path). #3158: standalone
             // thoughtSignature parts count too — a resynthesized chunk must not
-            // strip them either.
-            const prosePartsOf = (obj: Record<string, unknown>): GooglePart[] => {
+            // strip them either. Opaque output (media/code/results) also belongs
+            // to the complete frame and must survive proxy-call removal.
+            const nonCallPartsOf = (obj: Record<string, unknown>): GooglePart[] => {
                 const cands = obj.candidates as Array<Record<string, unknown>> | undefined;
                 const ps = (cands?.[0]?.content as { parts?: GooglePart[] } | undefined)?.parts;
                 if (!Array.isArray(ps)) return [];
                 return ps.filter((p): p is GooglePart => !!p && typeof p === "object" && p.functionCall === undefined
-                    && ((typeof p.text === "string" && p.text.length > 0) || (typeof p.thoughtSignature === "string" && p.thoughtSignature.length > 0)));
+                    && (typeof p.text !== "string" || p.text.length > 0 || p.thought === true
+                        || (typeof p.thoughtSignature === "string" && p.thoughtSignature.length > 0)));
             };
             // #3158: parts whose only payload is a thoughtSignature — no text,
             // no functionCall. They model no structured event and were silently
@@ -428,38 +668,60 @@ export function createGoogleAdapter(
                 if (!sawRealToolCall) {
                     yield* flushPendingAsStructured();
                     for (const { parsed } of rawCallChunks) {
-                        const prose = prosePartsOf(parsed);
-                        if (prose.length > 0) yield { kind: "meta", chunk: buildChunk(prose) } as ParsedStreamEvent;
+                        const parts = nonCallPartsOf(parsed);
+                        if (parts.length > 0) yield { kind: "meta", chunk: sseFrame(cloneChunk(parsed, { parts, dropFinishReason: true })) } as ParsedStreamEvent;
                         for (const sp of standaloneSigParts(parsed)) {
                             yield { kind: "standalone_signature", signature: sp.thoughtSignature } as ParsedStreamEvent;
                         }
                     }
                     return;
                 }
+                // Gemini attaches thoughtSignature only to the FIRST functionCall
+                // part in a parallel-call turn. When a stripped proxy call (e.g.
+                // compress) led the turn and carried that signature, the first
+                // surviving real functionCall part becomes the turn's leading call
+                // on client replay and must inherit the signature or Gemini 3/4
+                // rejects the next turn with 400 INVALID_ARGUMENT (missing
+                // thought_signature).
+                let firstRealIdx: number | undefined;
+                let firstProxySig = "";
+                for (const [idx, tc] of pending) {
+                    if (realIndexes.has(idx)) {
+                        if (firstRealIdx === undefined && tc.name.length > 0) firstRealIdx = idx;
+                    } else if (firstProxySig.length === 0 && tc.signature.length > 0) {
+                        firstProxySig = tc.signature;
+                    }
+                }
+                const firstRealTc = firstRealIdx !== undefined ? pending.get(firstRealIdx) : undefined;
+                const promoteSig =
+                    firstRealIdx !== undefined && firstRealTc && firstRealTc.signature.length === 0 && firstProxySig.length > 0
+                        ? { callIndex: firstRealIdx, signature: firstProxySig }
+                        : undefined;
                 for (const [idx, tc] of pending) {
                     if (realIndexes.has(idx) && tc.name.length > 0) {
                         toolCallsEmitted++;
+                        const sig = tc.signature || (promoteSig?.callIndex === idx ? promoteSig.signature : "");
                         yield {
                             kind: "tool_call",
                             name: tc.name,
                             callId: tc.id,
                             arguments: tc.args,
                             passthrough: true,
-                            ...(tc.signature ? { signature: tc.signature } : {}),
+                            ...(sig ? { signature: sig } : {}),
                         } as ParsedStreamEvent;
                     }
                 }
                 for (const { json, parsed, callIndexes } of rawCallChunks) {
-                    const filtered = filterRealCallChunk(parsed, realIndexes, callIndexes);
+                    const filtered = filterRealCallChunk(parsed, realIndexes, callIndexes, promoteSig);
                     if (filtered === "keep") {
-                        yield { kind: "meta", chunk: Buffer.from(`data: ${json}\n\n`, "utf8") } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: Buffer.from(`data: ${json.replace(/\r\n|\r|\n/g, "\ndata: ")}\n\n`, "utf8") } as ParsedStreamEvent;
                     } else if (filtered !== null) {
                         yield { kind: "meta", chunk: sseFrame(filtered) } as ParsedStreamEvent;
                     } else {
                         // #1881: proxy-only chunk — its frame is dropped, but
                         // its withheld prose still has to reach the client.
-                        const prose = prosePartsOf(parsed);
-                        if (prose.length > 0) yield { kind: "meta", chunk: buildChunk(prose) } as ParsedStreamEvent;
+                        const parts = nonCallPartsOf(parsed);
+                        if (parts.length > 0) yield { kind: "meta", chunk: sseFrame(cloneChunk(parsed, { parts, dropFinishReason: true })) } as ParsedStreamEvent;
                     }
                     // #3158: every classification above keeps this chunk's
                     // standalone signature parts on the wire; record them once
@@ -501,9 +763,33 @@ export function createGoogleAdapter(
                 const usageMetadata = parsed.usageMetadata as Record<string, unknown> | undefined;
                 if (usageMetadata) lastUsage = readUsageMetadata(usageMetadata);
 
+                const streamError = parsed.error;
+                if (streamError !== undefined && streamError !== null) {
+                    yield* flushBleed();
+                    yield* flushFilter();
+                    if (lastUsage && !usageEmitted) {
+                        usageEmitted = true;
+                        yield usageEvent();
+                    }
+                    let message: string;
+                    if (typeof streamError === "object") {
+                        const error = streamError as Record<string, unknown>;
+                        const detail = typeof error.message === "string" ? error.message : JSON.stringify(streamError);
+                        const status = typeof error.status === "string" ? error.status : undefined;
+                        const code = typeof error.code === "number" || typeof error.code === "string" ? String(error.code) : undefined;
+                        const prefix = [status, code ? `(${code})` : undefined].filter(Boolean).join(" ");
+                        message = prefix ? `${prefix}: ${detail}` : detail;
+                    } else {
+                        message = String(streamError);
+                    }
+                    yield { kind: "error", message } as ParsedStreamEvent;
+                    return;
+                }
+
                 // A prompt the safety filter refused up front carries no
                 // candidate at all; the client needs the reason as a terminal.
                 if (blockReason && !candidate && !sawDone) {
+                    yield* flushBleed();
                     yield* flushFilter();
                     sawDone = true;
                     yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
@@ -528,7 +814,7 @@ export function createGoogleAdapter(
                 // ride along in an edited copy (a proxy call would leak there
                 // even when settle drops the chunk).
                 const hasCallPart = parts.some((p) => p && typeof p === "object" && p.functionCall !== undefined);
-                let emitted = false;
+                const partEvents: Array<Extract<ParsedStreamEvent, { kind: "text" | "reasoning" }>> = [];
                 // #1881: cleaned copies of the prose parts this chunk carried.
                 // When a call chunk's sibling prose was filtered, the settle-time
                 // replay must carry the CLEANED bytes (the stored entry is
@@ -538,6 +824,10 @@ export function createGoogleAdapter(
                 for (let i = 0; i < parts.length; i++) {
                     const part = parts[i];
                     if (!part || typeof part !== "object") continue;
+                    // #7416: after a proven bleed the whole tail — prose and
+                    // functionCall parts alike — belongs to a turn that never
+                    // happened. Drop every later part in this chunk.
+                    if (turnBled) continue;
                     const fc = part.functionCall as { name?: unknown; args?: unknown; id?: unknown } | undefined;
                     if (fc) {
                         const idx = callIndex++;
@@ -557,79 +847,74 @@ export function createGoogleAdapter(
                         // #1960: thought parts replay VERBATIM — never filtered
                         // (thoughtSignature is verified byte-for-byte; see the
                         // makeFilter note above).
-                        emitted = true;
-                        let raw: Buffer | undefined;
-                        // A chunk that also carries functionCall parts is replayed
-                        // whole at settle, so its text must not be forwarded twice.
-                        if (!hasCallPart) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
-                        yield {
+                        partEvents.push({
                             kind: "reasoning",
                             delta: part.text,
-                            ...(raw ? { raw } : {}),
+                            rawHandled: true,
                             ...(typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0
                                 ? { signature: part.thoughtSignature }
                                 : {}),
-                        } as ParsedStreamEvent;
+                        });
                         continue;
                     }
-                    const clean = tagFilter.push(part.text);
-                    if (clean.length === 0) continue;
-                    emitted = true;
-                    let raw: Buffer | undefined;
-                    if (clean === part.text) {
-                        // A chunk that also carries functionCall parts is replayed
-                        // whole at settle, so its text must not be forwarded twice.
-                        if (!hasCallPart) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
+                    // A signature may belong to ordinary text, without thought:true.
+                    // Preserve its bytes and part boundary on both replay paths.
+                    const signed = typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0;
+                    let clean: string;
+                    if (signed) {
+                        // #1960: signature-bound text is forwarded verbatim —
+                        // it cannot be truncated without desyncing the
+                        // signature. Only its fence lines are tracked.
+                        bleed.fenceSync(part.text);
+                        clean = part.text;
                     } else {
-                        editedParts = (editedParts ?? [...parts]).map((p, j) => (j === i ? { ...p, text: clean } : p));
-                        if (!hasCallPart) {
-                            raw = sseFrame(cloneChunk(parsed, {
-                                parts: parts
-                                    .map((p, j) => (j === i ? { ...p, text: clean } : p))
-                                    .filter((p) => !p || typeof p !== "object" || p.functionCall === undefined),
-                                dropFinishReason: true,
-                            }));
-                        }
+                        const fed = bleed.feed(part.text);
+                        if (fed.bled) turnBled = true;
+                        clean = tagFilter.push(fed.emit);
                     }
-                    yield { kind: "text", delta: clean, ...(raw ? { raw } : {}) } as ParsedStreamEvent;
+                    if (clean !== part.text) {
+                        editedParts ??= [...parts];
+                        editedParts[i] = { ...part, text: clean };
+                    }
+                    if (clean.length === 0) continue;
+                    partEvents.push({ kind: "text", delta: clean, rawHandled: true, ...(signed ? { rawGooglePart: part } : {}) });
                 }
+                // Decide wire output only after every prose sibling has been
+                // cleaned. Each complete frame belongs to one event, regardless
+                // of how many structured deltas it supplies to the loop.
+                const storedParsed = editedParts || finishReason
+                    ? cloneChunk(parsed, { ...(editedParts ? { parts: editedParts } : {}), dropFinishReason: true })
+                    : parsed;
                 if (callIndexes.length > 0) {
-                    const storedParsed = editedParts ? cloneChunk(parsed, { parts: editedParts }) : parsed;
-                    rawCallChunks.push({ json: editedParts ? JSON.stringify(storedParsed) : json, parsed: storedParsed, callIndexes });
+                    rawCallChunks.push({ json: storedParsed === parsed ? json : JSON.stringify(storedParsed), parsed: storedParsed, callIndexes });
+                } else if (!hasCallPart && nonCallPartsOf(storedParsed).length > 0) {
+                    if (partEvents.length === 0 && standaloneSigParts(parsed).length > 0) yield* flushFilter();
+                    const raw = storedParsed === parsed ? rawBuf : sseFrame(storedParsed);
+                    // A frame carrying prose is visible for the loop's retry
+                    // gate even when its first part is a signed thought.
+                    const carrier = partEvents.find(event => event.kind === "text") ?? partEvents[0];
+                    if (carrier) carrier.raw = raw;
+                    else yield { kind: "meta", chunk: raw } as ParsedStreamEvent;
                 }
+                yield* partEvents;
                 // #3158: standalone thoughtSignature parts modeled no event above
-                // and vanished from the client's stream. When nothing else in the
-                // chunk was forwarded, hand them to the client verbatim: the
-                // whole frame when nothing was held by the filter and it carries
-                // no finish to leak, otherwise a wrapper carrying just those
-                // parts (it must not smuggle filter-held text bytes; an early
-                // finishReason is dropped so the loop's synthetic completion
-                // stays the sole terminal). Record them whenever the chunk
-                // carries them — even when a sibling text/thought part already
-                // took the whole frame to the client: the signature is then
-                // client-visible but absent from the proxy-tool rebuild unless
-                // recorded here.
+                // and vanished from the client's stream. The complete frame
+                // above now owns their wire bytes; record the signatures once
+                // for the proxy-tool rebuild as well.
                 if (callIndexes.length === 0) {
                     const sigParts = standaloneSigParts(parsed);
                     if (sigParts.length > 0) {
-                        if (!emitted) {
-                            yield* flushFilter();
-                            const hasTextPart = parts.some((p) => p && typeof p === "object" && typeof p.text === "string" && p.text.length > 0);
-                            const chunk = !hasTextPart && !finishReason
-                                ? rawBuf
-                                : sseFrame(cloneChunk(parsed, { parts: sigParts, ...(finishReason ? { dropFinishReason: true } : {}) }));
-                            yield { kind: "meta", chunk } as ParsedStreamEvent;
-                        }
                         for (const sp of sigParts) {
                             yield { kind: "standalone_signature", signature: sp.thoughtSignature } as ParsedStreamEvent;
                         }
                     }
                 }
-                if (!emitted && callIndexes.length === 0 && !finishReason && parts.length === 0) {
+                if (callIndexes.length === 0 && !finishReason && parts.length === 0) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
 
                 if (finishReason && !sawDone) {
+                    yield* flushBleed();
                     yield* flushFilter();
                     yield* settleToolCalls();
                     if (lastUsage && !usageEmitted) {
@@ -650,18 +935,38 @@ export function createGoogleAdapter(
                         // a dropped proxy-only chunk delivers its withheld prose),
                         // so the stub carries NO parts — resending them duplicates
                         // the prose on the wire.
-                        const finishHasCall = parts.some((p) => p && typeof p === "object" && p.functionCall !== undefined);
-                        const finishChunk = finishHasCall ? sseFrame(cloneChunk(parsed, { parts: [] })) : rawBuf;
+                        const finishChunk = parts.length > 0 ? sseFrame(cloneChunk(parsed, { parts: [] })) : rawBuf;
                         yield { kind: "meta", chunk: finishChunk } as ParsedStreamEvent;
                         yield { kind: "done", finishReason, suppressCompletion: true, ...(truncated ? { truncated: true } : {}) } as ParsedStreamEvent;
                     } else {
                         yield { kind: "done", finishReason, ...(truncated ? { truncated: true } : {}) } as ParsedStreamEvent;
                     }
                 }
+                // #7416: the turn bled — stop reading the upstream here; the
+                // post-loop block settles the round with STOP.
+                if (turnBled) break;
             }
 
+            // #7416: a hallucinated turn bleed ends the round here. The
+            // post-bleed parts never entered pending, so settle only sees
+            // the real turn's calls; the held bleed tail is discarded.
+            if (turnBled && !sawDone) {
+                void upstream.cancel().catch(() => {});
+                yield* flushFilter();
+                yield* settleToolCalls();
+                if (lastUsage && !usageEmitted) {
+                    usageEmitted = true;
+                    yield usageEvent();
+                }
+                sawDone = true;
+                maybeWarnDegenerate("STOP");
+                maybeSummarizeStrips();
+                loggerLog("warn", "[tag-echo] turn-bleed: truncated response at hallucinated user turn");
+                yield { kind: "done", finishReason: "STOP" } as ParsedStreamEvent;
+            }
             // A stream that died mid-flight still has to hand the client the
             // usage it reported, and a held-back filter tail must not be lost.
+            yield* flushBleed();
             yield* flushFilter();
             if (!sawDone && lastUsage && !usageEmitted) {
                 usageEmitted = true;

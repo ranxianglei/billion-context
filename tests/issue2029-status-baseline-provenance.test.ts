@@ -134,11 +134,12 @@ function mockRes(): { res: http.ServerResponse; status: number; body: string } {
     return out;
 }
 
-test("#2029: plugin status nudge + panel feed the provenance-aware baseline", () => {
+test("#2029: plugin status nudge + panel feed the provenance-aware baseline", async () => {
     _resetSessionsForTest();
     _resetPluginStateForTest();
     try {
-        SCENARIOS.forEach((sc, i) => {
+        for (let i = 0; i < SCENARIOS.length; i++) {
+            const sc = SCENARIOS[i];
             const session = getSession(`issue2029-plugin-${i}`, { protocol: "anthropic" });
             session.metadata.effectiveContextLimit = WINDOW;
             session.stats = { ...zeroStats(), ...sc.stats } as Session["stats"];
@@ -150,9 +151,16 @@ test("#2029: plugin status nudge + panel feed the provenance-aware baseline", ()
             const deps = { core: createCore(), config: defaultConfig(WINDOW), log: () => {} };
             const seen = captureTokenCounts(deps.core);
             const r = mockRes();
-            handlePluginStatus(session.id, r.res, deps);
+            await handlePluginStatus(session.id, r.res, deps);
             assert.equal(r.status, 200, `${sc.name}: status answered`);
-            assert.deepStrictEqual(seen, [sc.expected], `${sc.name}: nudge recompute tokenCount`);
+            // #7463's protected-mass audit adds one relaxed offer pass on
+            // this surface (normalRanges reuses the nudge call's offer) —
+            // the contract is that EVERY kernel call on a status reader
+            // feeds the provenance-aware baseline, not that there is
+            // exactly one call (same contract as the acp_status surface
+            // above, #4331).
+            assert.ok(seen.length >= 1 && seen.every((v) => v === sc.expected),
+                `${sc.name}: every kernel call fed the provenance-aware baseline (got ${JSON.stringify(seen)})`);
             const panel = JSON.parse(r.body).panel as string | undefined;
             assert.ok(panel, `${sc.name}: panel rendered`);
             if (sc.panelPct !== undefined) {
@@ -168,7 +176,7 @@ test("#2029: plugin status nudge + panel feed the provenance-aware baseline", ()
                 assert.ok(!nudgeLine.includes("EMERGENCY") && !nudgeLine.includes("OVER-LIMIT"),
                     `${sc.name}: no phantom pressure (got: ${nudgeLine})`);
             }
-        });
+        }
     } finally {
         _resetSessionsForTest();
         _resetPluginStateForTest();

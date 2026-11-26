@@ -364,10 +364,15 @@ function rebuildSystemMessage(
 }
 
 // #4292 hardening, kept for #4457's backstop: a directive-only system
-// (empty content + output_config) is accepted at ANY position by
-// Anthropic's mid-conversation-system rule, so it is never healed; demoting
-// it would mint an empty-content user message that 400s on its own
-// (mirrors the reporter's isAnthropicDirectiveOnlySystem).
+// (empty content + output_config) carries effort/tool-control semantics that
+// a user re-voice would destroy (demoting mints an empty-content user message
+// that 400s on its own). #7270: the "accepted at ANY position" assumption does
+// NOT hold on every upstream — a real Anthropic endpoint rejected
+// `system(content:[]+output_config) → user` adjacency with the same
+// 'must precede an assistant' 400 as content-bearing systems. healIllegalSystemPositions
+// therefore no longer skips these unconditionally: it moves a directive-only
+// system to the trailing run when its PRECEDE side is illegal, preserving the
+// directive semantics while landing it in a legal position.
 function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
   return (
     e.role === "system" &&
@@ -377,45 +382,96 @@ function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
   );
 }
 
-// #4457: Anthropic accepts a mid-conversation system only immediately
-// before an assistant message or at the end of the array — any other
-// position 400s the whole request, permanently killing the session (a run
-// of consecutive systems is judged by the run's first non-system follower:
-// Pi's trailing tool-delta + effort-marker runs are legal at array end).
+// #4457/#5438: Anthropic accepts a mid-conversation system only in BOTH of
+// these positions at once — it must FOLLOW a user message (or an assistant
+// message ending in a server tool_result), AND PRECEDE an assistant message
+// or end the array — any violation 400s the whole request, permanently
+// killing the session (a run of consecutive systems is judged by the run's
+// first non-system follower: Pi's trailing tool-delta + effort-marker runs
+// are legal at array end; the follow side is judged per entry against the
+// nearest non-system predecessor, and an earlier demotion in the same pass
+// re-legitimizes a later member of the run).
 // The fold layer keeps sidecar systems OUT of folds (kernel/src/protected.ts
 // never-fold carve): their tool deltas are FUNCTIONAL under Anthropic's
 // mid-conversation-tool-changes contract — tools[] stays static for cache
 // stability and the deltas control which tools are offered (defer_loading
 // surfacing, by-value definitions, removals, MCP toolsets) — so folding them
 // would silently alter the effective tool set. Orphans still arise when a
-// fold covers the assistant that legitimized one; this position-based
+// fold covers the turn that legitimized one on either side (#4457: the
+// preceding assistant disappears → 'must precede an assistant'; #5438: the
+// preceding USER disappears → 'must follow a user'); this position-based
 // backstop heals whatever still arrives illegal: sessions folded by older
-// builds and positionally-illegal client input. Demotion re-voices to user
-// with tool_addition/tool_removal blocks stripped first (WC-022 forbids them
-// outside system) and drops the entry when nothing remains; a
-// directive-only system (empty content + output_config) is accepted at ANY
-// position, so it is never healed. Fresh objects only — sidecars stay
-// intact for future verbatim emission once re-legitimized.
+// builds and positionally-illegal client input. A system with NO non-system
+// predecessor (array start) follows the existing contract and is untouched.
+// Demotion re-voices to user with tool_addition/tool_removal blocks stripped
+// first (WC-022 forbids them outside system) and drops the entry when
+// nothing remains. A directive-only system (empty content + output_config) is
+// never re-voiced — a demotion would mint an empty-content user message that
+// 400s on its own — but per #7270 it is no longer exempt at illegal PRECEDE
+// positions: it is moved to the trailing run there instead (see
+// isDirectiveOnlySystem above). Fresh objects only — sidecars stay intact for
+// future verbatim emission once re-legitimized.
 function isToolUpdateBlock(b: { type?: unknown }): boolean {
   return b.type === "tool_addition" || b.type === "tool_removal";
 }
 
+/** #5438: does this wire message legitimize a following mid-conversation
+ *  system? Per Anthropic's error wording ("an 'assistant' message ending in
+ *  a server tool result"): a user message always does; an assistant message
+ *  does when its LAST content block ends a tool result. On the real wire
+ *  those results ride INSIDE assistant messages as the <name>_tool_result
+ *  family (web_search_tool_result, code_execution_tool_result, … — plain
+ *  tool_result is user-role only, paired with tool_use), so the check takes
+ *  the whole family by suffix: every member shares the convention, future
+ *  server tools inherit it, and no non-result block type ends in
+ *  "tool_result". */
+function legitimatesFollowSide(m: AnthropicWireMessage | undefined): boolean {
+  if (!m) return true;
+  if (m.role === "user") return true;
+  if (m.role !== "assistant" || !Array.isArray(m.content) || m.content.length === 0)
+    return false;
+  const lastType = m.content[m.content.length - 1]!.type;
+  return typeof lastType === "string" && lastType.endsWith("tool_result");
+}
+
 function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {
+  let prevNonSystem = -1;
+  // #7270: directive-only systems in an illegal PRECEDE position are moved to
+  // the trailing run (preserving effort/tool-control semantics) instead of
+  // being skipped unconditionally.
+  const movedDirectives: AnthropicWireMessage[] = [];
   for (let j = 0; j < out.length; j++) {
     const e = out[j];
-    if (!e || e.role !== "system" || isDirectiveOnlySystem(e)) continue;
+    if (!e) continue;
+    if (e.role !== "system") {
+      prevNonSystem = j;
+      continue;
+    }
+    if (isDirectiveOnlySystem(e)) {
+      let k = j + 1;
+      while (k < out.length && out[k]!.role === "system") k++;
+      const next = out[k];
+      const badPrecede = !!next && next.role !== "assistant";
+      if (badPrecede) {
+        out.splice(j, 1);
+        movedDirectives.push(e);
+        j--;
+      }
+      continue;
+    }
     let k = j + 1;
     while (k < out.length && out[k]!.role === "system") k++;
     const next = out[k];
-    if (!next || next.role === "assistant") continue;
+    const badPrecede = !!next && next.role !== "assistant";
+    const badFollow = !legitimatesFollowSide(out[prevNonSystem]);
+    if (!badPrecede && !badFollow) continue;
     if (typeof e.content === "string") {
-      // An empty string demoted to user would mint an empty-content user
-      // message, which 400s on its own — drop instead.
       if (e.content === "") {
         out.splice(j, 1);
         j--;
       } else {
         out[j] = { role: "user", content: e.content };
+        prevNonSystem = j;
       }
       continue;
     }
@@ -428,7 +484,123 @@ function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {
       continue;
     }
     out[j] = { role: "user", content: kept };
+    prevNonSystem = j;
   }
+  for (const d of movedDirectives) {
+    out.push(d);
+  }
+}
+
+/** #5438/#5432 kernel-side insertion helper (single source of truth for the
+ *  rule; the host's ephemeral-tail injection routes through it — the host's
+ *  interim copy lands in #5441 and is deleted in the small follow-up PR
+ *  after both merge). Insert ephemeral tail additions BEFORE any trailing
+ *  run of system messages instead of after it: appending after a trailing
+ *  run puts users behind systems Anthropic only allows before an assistant
+ *  or at the array end ('messages.N: role 'system' must precede an 'assistant'
+ *  message or end the array'). Without a trailing run the
+ *  result is byte-identical to a plain append (guard for legal shapes);
+ *  empty additions return the SAME array reference — zero allocation, zero
+ *  prefix-cache churn on requests that need no repair. */
+export function insertBeforeTrailingSystemRun(
+  messages: AnthropicWireMessage[],
+  additions: readonly AnthropicWireMessage[],
+): AnthropicWireMessage[] {
+  if (additions.length === 0) return messages;
+  let i = messages.length;
+  while (i > 0 && messages[i - 1]!.role === "system") i--;
+  return [...messages.slice(0, i), ...additions, ...messages.slice(i)];
+}
+
+/** #4570: the position backstop as a standalone pass over a FINAL Anthropic
+ *  messages array — hosts that append messages after coreToAnthropic (notes,
+ *  nudges, side-call prompts) run it on the array they actually send. Same
+ *  heal as coreToAnthropic's internal pass (#5438); fresh objects only. */
+export function healAnthropicSystemPositions(
+  messages: readonly AnthropicWireMessage[],
+): AnthropicWireMessage[] {
+  const out = [...messages];
+  healIllegalSystemPositions(out);
+  return out;
+}
+
+/** Server-tool pairing backstop. Server-side tools (advisor, web_search,
+ *  code_execution, …) put BOTH halves of an exchange inside one assistant
+ *  message: a `server_tool_use` block and its `<name>_tool_result` block
+ *  (paired by `tool_use_id` → `id`). anthropicToCore splits every block into
+ *  its own BiliMessage (unknown types ride the rawAnthropicBlock sidecar), so
+ *  a fold can cover one half and leave the other. Anthropic then rejects the
+ *  WHOLE request, permanently, e.g.
+ *  'messages.5.content.0: unexpected tool_use_id found in advisor_tool_result
+ *  blocks: srvtoolu_… Each advisor_tool_result block must have a
+ *  corresponding server_tool_use block in the same message'.
+ *  Field repro: claude-code + advisor tool, bili v0.1.213 / acp-kernel 0.0.195.
+ *
+ *  Heal: per assistant message, drop a `*_tool_result` whose `tool_use_id`
+ *  has no `server_tool_use` in the same message, and a `server_tool_use`
+ *  without its result — except in the LAST message, where an open server
+ *  call is legal client state. Plain `tool_use`/`tool_result` are never
+ *  touched (their pairing spans user/assistant and has its own contract).
+ *  A message emptied by the heal gets a placeholder text block so roles stay
+ *  alternating. Legal messages are left as the same object (no churn for the
+ *  prefix cache); only messages that would 400 anyway are rewritten, so the
+ *  thinking-signature rule (KDD #10) never loses a request that would have
+ *  succeeded. Returns the number of dropped blocks. */
+function isServerToolResultBlock(b: { type?: unknown }): boolean {
+  return (
+    typeof b.type === "string" &&
+    b.type !== "tool_result" &&
+    b.type.endsWith("_tool_result")
+  );
+}
+
+const SERVER_TOOL_FOLDED_PLACEHOLDER = "(server tool exchange folded)";
+
+function healUnpairedServerToolBlocks(out: AnthropicWireMessage[]): number {
+  let dropped = 0;
+  for (let mi = 0; mi < out.length; mi++) {
+    const msg = out[mi]!;
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+    const blocks = msg.content as unknown as Array<Record<string, unknown>>;
+    const uses = new Set<string>();
+    const results = new Set<string>();
+    for (const b of blocks) {
+      if (!b || typeof b !== "object") continue;
+      if (b.type === "server_tool_use" && typeof b.id === "string")
+        uses.add(b.id);
+      else if (isServerToolResultBlock(b) && typeof b.tool_use_id === "string")
+        results.add(b.tool_use_id);
+    }
+    if (uses.size === 0 && results.size === 0) continue;
+    const isLast = mi === out.length - 1;
+    const kept = blocks.filter((b) => {
+      if (!b || typeof b !== "object") return true;
+      if (
+        b.type === "server_tool_use" &&
+        typeof b.id === "string" &&
+        !results.has(b.id) &&
+        !isLast
+      )
+        return false;
+      if (
+        isServerToolResultBlock(b) &&
+        typeof b.tool_use_id === "string" &&
+        !uses.has(b.tool_use_id)
+      )
+        return false;
+      return true;
+    });
+    if (kept.length === blocks.length) continue;
+    dropped += blocks.length - kept.length;
+    out[mi] = {
+      role: "assistant",
+      content:
+        kept.length > 0
+          ? (kept as unknown as AnthropicBlock[])
+          : [{ type: "text", text: SERVER_TOOL_FOLDED_PLACEHOLDER }],
+    };
+  }
+  return dropped;
 }
 
 export function coreToAnthropic(
@@ -504,6 +676,7 @@ export function coreToAnthropic(
     }
   }
   flush();
+  healUnpairedServerToolBlocks(out);
   healIllegalSystemPositions(out);
   return out;
 }

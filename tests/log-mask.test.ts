@@ -13,6 +13,8 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { closeLogger, configureLogger, log as loggerLog, setLogCapture } from "../src/logger.ts";
 import { formatUpstreamError } from "../src/upstream-proxy.ts";
+import { logHostEvent } from "../src/agent/host-log.js";
+import { defaultLogFile } from "../src/paths.js";
 import {
     isMaskHostsEnabled,
     isPublicApiHost,
@@ -140,6 +142,43 @@ test("maskUrlsForDiagnostics: text-level twin — loopback URLs kept, others mas
     assert.equal(maskUrlsForDiagnostics("junk http:// trailing stays"), "junk http:// trailing stays");
 });
 
+for (const origin of ["http://localhost:9090", "ws://127.0.0.1:9000", "socks5://[::1]:1080"]) {
+    test(`loopback URL visibility never exposes credentials: ${origin}`, () => {
+        const u = new URL(origin);
+        const sensitive = `${u.protocol}//alice:local-secret@${u.host}/proxy?q=private-query#private-fragment`;
+        const safe = `${u.protocol}//${u.host}/proxy`;
+        assert.equal(maskUrlForDiagnostics(sensitive), safe);
+        assert.equal(maskUrlsForDiagnostics(`dial ${sensitive} failed`), `dial ${safe} failed`);
+        assert.equal(maskUrlForDiagnostics(origin), origin, "clean pathless local origins remain byte-identical");
+        const prev = isMaskHostsEnabled();
+        try {
+            setMaskHostsEnabled(false);
+            assert.equal(maskUrlForDiagnostics(sensitive), safe, "host visibility cannot disable credential masking");
+        } finally {
+            setMaskHostsEnabled(prev);
+        }
+    });
+}
+
+test("host-event file output drops loopback URL secrets while retaining the local endpoint", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-loopback-log-"));
+    const prev = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = dir;
+    try {
+        logHostEvent("info", "[test-host]", "dial http://alice:local-secret@localhost:9090/proxy?q=private-query#private-fragment failed");
+        logHostEvent("info", "[test-host]", "healthy http://localhost:9090");
+        const output = fs.readFileSync(defaultLogFile(), "utf8");
+        assert.match(output, /dial http:\/\/localhost:9090\/proxy failed/);
+        assert.match(output, /healthy http:\/\/localhost:9090\n/);
+        for (const secret of ["alice", "local-secret", "private-query", "private-fragment"]) {
+            assert.ok(!output.includes(secret), `${secret} must not reach the paste-able log`);
+        }
+    } finally {
+        if (prev === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = prev;
+        await rmrf(dir);
+    }
+});
+
 test("maskHostPortForLog: CONNECT targets", () => {
     assert.equal(maskHostPortForLog("relay.internal:8443"), "<private-host>:8443");
     assert.equal(maskHostPortForLog("api.anthropic.com:443"), "api.anthropic.com:443");
@@ -241,6 +280,13 @@ function close(server: http.Server): Promise<void> {
 interface Captured {
     level: string;
     msg: string;
+}
+
+/** Failure diagnostics for a capture seam: index, level and message, so a
+ *  missing/extra/mistimed emission is readable without rerunning the suite. */
+function describeCapture(captured: readonly Captured[]): string {
+    if (captured.length === 0) return "(capture empty)";
+    return captured.map((c, i) => `  [${i}] ${c.level}: ${c.msg}`).join("\n");
 }
 
 test("proxy debug logs: no credentials, no non-public host in ANY log line (#255)", async () => {
@@ -702,6 +748,39 @@ test("redactSecretsInText: scrubs credential-shaped tokens from free-form text (
     for (const s of negatives) assert.equal(redactSecretsInText(s), s, `must stay verbatim: ${s}`);
 });
 
+test("redactSecretsInText: JSON-quoted credential keys and Groq/Hugging Face keys are scrubbed", () => {
+    // A quote between the key name and the colon ("api_key": "…") used to stop the key=value
+    // rule, so a value without a known key prefix reached the log and the diagnostics blob.
+    assert.equal(
+        redactSecretsInText('{"error":{"message":"invalid","api_key":"0123456789abcdef0123"}}'),
+        '{"error":{"message":"invalid","api_key":"<masked 20 chars>"}}',
+    );
+    assert.equal(
+        redactSecretsInText('{"user":"alice","password":"hunter2hunter2"}'),
+        '{"user":"alice","password":"<masked 14 chars>"}',
+    );
+    assert.equal(
+        redactSecretsInText("{'access_token': 'ya29.a0AfH6SMBx3kL9ZqWv'}"),
+        "{'access_token': '<masked 23 chars>'}",
+    );
+    assert.equal(
+        redactSecretsInText("Invalid API Key: gsk_8fJ2kLmN4pQrS7tUvW9xYz1aBcDeFgHiJkLmNoPqRsTuVwXyZ012"),
+        "Invalid API Key: <masked key>",
+    );
+    assert.equal(redactSecretsInText("auth failed for hf_AbCdEfGhIjKlMnOpQrStUvWxYz12345678"), "auth failed for <masked key>");
+    const negatives = [
+        '{"prompt_tokens":1234,"completion_tokens":5678}',
+        '{"tokens": 1234}',
+        '{"token":"abc"}',
+        '{"max_tokens":4096}',
+        "hf_hub_download failed",
+        "gsk_short",
+    ];
+    for (const s of negatives) assert.equal(redactSecretsInText(s), s, `must stay verbatim: ${s}`);
+    const once = redactSecretsInText('{"api_key":"0123456789abcdef0123"}');
+    assert.equal(redactSecretsInText(once), once, "a second pass is a no-op");
+});
+
 test("maskIpsInText: non-loopback IP literals scrubbed from free-form text (#1718)", () => {
     assert.equal(maskIpsInText("connect ETIMEDOUT 203.0.113.5:8443"), "connect ETIMEDOUT <private-host>:8443");
     assert.equal(maskIpsInText("upstream refused 192.168.1.50:443 after 3 retries"), "upstream refused <private-host>:443 after 3 retries");
@@ -729,17 +808,35 @@ test("maskIpsInText: non-loopback IP literals scrubbed from free-form text (#171
 test("logger sink: file lines scrubbed, capture hook stays raw (#1718)", async () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-log-sink-"));
     const file = path.join(tmpRoot, "sink.log");
-    const captured: string[] = [];
-    setLogCapture((_level, msg) => captured.push(msg));
+    const captured: Captured[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
     try {
         configureLogger(file);
+        // A fresh log's coverage is short of the 48h target, so startup emits a
+        // retention diagnostic through this very seam BEFORE the line under
+        // test. Positional capture[0] therefore asserts on that diagnostic, not
+        // on the warning — the CI red on both platforms. Assert exact membership
+        // and account for the diagnostic explicitly instead of dropping it.
+        const startupDiagnostic = captured.find((c) => c.msg.startsWith("log retention:"));
+        assert.ok(startupDiagnostic, `startup must keep the retention diagnostic:\n${describeCapture(captured)}`);
+        assert.match(startupDiagnostic.msg, /incomplete window|no dated log history retained yet|retained history unavailable/, startupDiagnostic.msg);
+
         const secret = "sk-test-leak-1234567890";
-        loggerLog("warn", `upstream 401 body: {"error":{"code":"invalid_api_key","api_key":"${secret}"}}`);
+        const rawMessage = `upstream 401 body: {"error":{"code":"invalid_api_key","api_key":"${secret}"}}`;
+        loggerLog("warn", rawMessage);
         await closeLogger();
+
         const onDisk = fs.readFileSync(file, "utf8");
         assert.ok(!onDisk.includes(secret), `secret leaked into log file:\n${onDisk}`);
         assert.ok(onDisk.includes("<masked"), onDisk);
-        assert.ok(captured[0]?.includes(secret), "capture hook must receive the raw message (in-process seam)");
+
+        // The in-process seam is not a log surface: it receives the message
+        // BEFORE redaction, verbatim. Exact membership (not "some capture") is
+        // the property: a partial or pre-masked delivery must fail here.
+        const raws = captured.filter((c) => c.msg === rawMessage);
+        assert.equal(raws.length, 1, `capture hook must receive the raw message exactly once, got ${raws.length}:\n${describeCapture(captured)}`);
+        assert.equal(raws[0]!.level, "warn", "the raw warning keeps its level through the seam");
+        assert.ok(!captured.some((c) => c.msg.includes("<masked")), `the seam must never see the redacted text:\n${describeCapture(captured)}`);
     } finally {
         configureLogger(undefined);
         setLogCapture(null);

@@ -5,9 +5,11 @@
  * diagnostic blob (environment facts + host client versions + sanitized bili
  * config + one topic-specific section) plus a prefilled GitHub issue link, so
  * any future warning can offer "copy diagnostics / report on GitHub" without
- * inventing its own plumbing. Consumers: the SQLite legacy-only degradation
- * banner (topic `storage-legacy-only`) and the compression-conflict banner
- * (topic `conflict-banner`, #3235).
+ * inventing its own plumbing. Consumers (one topic each): the SQLite legacy-only
+ * degradation banner (`storage-legacy-only`), the snapshot-render shadow banner
+ * (`snapshot-shadow`, #3756 follow-up), the compression-conflict banner
+ * (`conflict-banner`, #3235), and the takeover-attribution banner
+ * (`attribution`, #3581/#3651).
  *
  * #3611 enrichment: the first field reports showed the blob was not
  * diagnosable as-is — no client version, no config, no log evidence. Every
@@ -38,15 +40,19 @@ import { readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import * as path from "node:path";
 import { summarizeConflicts } from "../conflict-watch.js";
+import { attributionStatusWire } from "../server/attribution-status.js";
 import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { dshProfileDirs } from "../dsh-channel.js";
 import { resolveDshHome } from "../client-config.js";
 import { safeReadJson } from "../config.js";
+import { recentClientUas } from "../client-ua-registry.js";
 import { redactForPublish } from "../log-mask.js";
+import { readLogFileLines } from "../log-file-lines.js";
 import { getLogPath } from "../logger.js";
+import { logGenerations } from "../log-retention.js";
 import { configFile, defaultLogFile } from "../paths.js";
 import { listSessions } from "../session.js";
-import { safeSuffix } from "../text-safe.js";
+import { safePrefix, safeSuffix } from "../text-safe.js";
 import { storageDiagnosticsLines } from "../storage/runtime-status.js";
 import { BUILD_COMMIT, PACKAGE_NAME, VERSION } from "../version.js";
 
@@ -59,7 +65,14 @@ const STORAGE_LOG_TAIL_LINES = 12;
 const CONFIG_SECTION_MAX_CHARS = 1600;
 const CONFLICT_LOG_TAIL_LINES = 20;
 const LOG_LINE_MAX_CHARS = 240;
+// #3581: the attribution error is a single host-supplied error message (the
+// primary diagnostic evidence for a `threw` episode); bound it so a pathological
+// message cannot outgrow the pasteable blob budget.
+const ATTRIBUTION_ERROR_MAX_CHARS = 500;
 const DSH_PROFILE_CAP = 8;
+// #4649: display budget for the observed-UA lines (the registry itself is
+// bounded tighter — 24 families × 8 UAs — so the blob stays pasteable).
+const OBSERVED_UA_LINES = 12;
 const DSH_REPORT_PACKAGES = ["@deepseek-ai/dsh", "@deepseek-ai/dsh-compaction-basic", "@deepseek-ai/dsh-web-app"] as const;
 
 function humanUptime(seconds: number): string {
@@ -83,44 +96,62 @@ function baseLines(): string[] {
     ];
 }
 
-// #3813: count full-pair scans so tests pin the single-read-per-report
-// contract (a regression to per-tail reads would re-double the cost).
+// #3813: keep tail collection shared if a topic needs both kinds of evidence.
 let candidateLogReads = 0;
 
-/** All non-empty lines across the rotated log pair; [] on any fs failure. */
-function candidateLogLines(): string[] {
+/** Collect bounded chronological tails, starting with the newest generation.
+ *  Once a requested tail is full, older files cannot contribute to it. Each
+ *  needed file is still streamed to its end to select its newest matches. */
+async function candidateLogTails(needStorage: boolean, needConflict: boolean): Promise<{
+    storage: string[];
+    conflict: string[];
+    /** Needed files that could not be read — the tails are then INCOMPLETE
+     *  even if older readable generations fill the remaining slots. */
+    unreadable: string[];
+}> {
     candidateLogReads += 1;
+    const storage: string[] = [];
+    const conflict: string[] = [];
+    const unreadable: string[] = [];
+    const pushBounded = (into: string[], line: string, cap: number): void => {
+        into.push(line);
+        if (into.length > cap) into.shift();
+    };
     try {
-        const logFile = getLogPath() ?? defaultLogFile();
-        const dir = logFile ? path.dirname(logFile) + path.sep : "";
-        const candidates = [dir + "bili.log.old", dir + "bili.log"];
-        let lines: string[] = [];
-        for (const f of candidates) {
-            try { if (!statSync(f).isFile()) continue; } catch { continue; }
-            try {
-                lines = lines.concat(readFileSync(f, "utf8").split("\n").filter((l) => l.length > 0));
-            } catch { continue; }
+        const files = logGenerations(getLogPath() ?? defaultLogFile());
+        for (let i = files.length - 1; i >= 0; i--) {
+            const storageRemaining = needStorage ? STORAGE_LOG_TAIL_LINES - storage.length : 0;
+            const conflictRemaining = needConflict ? CONFLICT_LOG_TAIL_LINES - conflict.length : 0;
+            if (storageRemaining === 0 && conflictRemaining === 0) break;
+            const fileStorage: string[] = [];
+            const fileConflict: string[] = [];
+            for await (const line of readLogFileLines(files[i]!.path, { onError: (f) => unreadable.push(f) })) {
+                if (storageRemaining > 0 && line.includes("[storage]")) pushBounded(fileStorage, line, storageRemaining);
+                if (conflictRemaining > 0 && CONFLICT_LOG_PATTERNS.some((p) => line.includes(p))) {
+                    pushBounded(fileConflict, line, conflictRemaining);
+                }
+            }
+            storage.unshift(...fileStorage);
+            conflict.unshift(...fileConflict);
         }
-        return lines;
     } catch {
-        return [];
+        // Enumeration or iteration blew up: report nothing rather than a
+        // half-scan dressed as the full retained history.
+        return { storage: [], conflict: [], unreadable: ["*"] };
     }
+    return { storage, conflict, unreadable };
 }
 
-/** Last N `[storage]` lines from the pre-fetched candidate set ([] when none
- * match). The caller reads the rotated pair once per report (#3813). #4427:
+/** Last N `[storage]` lines collected for this report ([] when none match). #4427:
  * these are VERBATIM on-disk bytes (written under whatever BILI_LOG_MASK_HOSTS
  * was in effect), so each line gets the same publish-boundary redaction +
  * length bound as conflictLogTail — a [storage] line can carry a URL with
  * credentials, a private host, or an absolute path. */
 function storageLogTail(lines: string[]): string[] {
-    return lines
-        .filter((l) => l.includes("[storage]"))
-        .slice(-STORAGE_LOG_TAIL_LINES)
-        .map((l) => {
-            const masked = redactForPublish(l);
-            return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
-        });
+    return lines.map((l) => {
+        const masked = redactForPublish(l);
+        return masked.length > LOG_LINE_MAX_CHARS ? safePrefix(masked, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+    });
 }
 
 // #3611: the evidence chain of a dsh native-compaction episode, exactly what a
@@ -128,25 +159,34 @@ function storageLogTail(lines: string[]): string[] {
 // routed-call refusals (#1729), the destruction verdict (#2193), successful
 // rebases (#2432), and the web-app preset notice that says whether the #3354
 // load-time overlay applies to this machine's profiles.
+// #4649: the same evidence chain for the codex lane — before these entries a
+// codex conflict report matched ZERO lines and could not be adjudicated
+// without a manual log round-trip (#4648). One entry per distinct message
+// shape (a shape may fire on more than one site): the not-intercepted forward
+// (src/server/handle.ts), the inline auto-compact detection + rebase
+// (#3008/#2372, both openai and responses wires), the intercepted forge
+// (trigger form AND endpoint form share the prefix), and the forge failure
+// that passes through (src/server/prepare-responses.ts).
 const CONFLICT_LOG_PATTERNS = [
     "takeover gate refused",
     "dsh native compaction call identified",
     "compression substrate appears destroyed",
     "native compaction boundary",
     "profile bundles include @deepseek-ai/dsh-web-app",
+    "codex compaction_trigger request not intercepted",
+    "codex local auto-compaction detected",
+    "codex compact intercepted",
+    "codex compact forge failed",
 ];
 
 function conflictLogTail(lines: string[]): string[] {
-    return lines
-        .filter((l) => CONFLICT_LOG_PATTERNS.some((p) => l.includes(p)))
-        .slice(-CONFLICT_LOG_TAIL_LINES)
-        .map((l) => {
-            // #3811: redactForPublish scrubs credential shapes AND masks URL hosts
-            // unconditionally, so under BILI_LOG_MASK_HOSTS=0 (real hosts in the
-            // on-disk log) the published tail still cannot leak them.
-            const masked = redactForPublish(l);
-            return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
-        });
+    return lines.map((l) => {
+        // #3811: redactForPublish scrubs credential shapes AND masks URL hosts
+        // unconditionally, so under BILI_LOG_MASK_HOSTS=0 (real hosts in the
+        // on-disk log) the published tail still cannot leak them.
+        const masked = redactForPublish(l);
+        return masked.length > LOG_LINE_MAX_CHARS ? safePrefix(masked, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+    });
 }
 
 function safeSessionCount(): number {
@@ -179,7 +219,7 @@ function conflictDiagnosticsLines(summary: ReturnType<typeof summarizeConflicts>
         lines.push("newest event per session:");
         for (const e of summary.latest.slice(0, 8)) {
             const sid = e.sessionId.length > 12 ? "…" + safeSuffix(e.sessionId, 8) : e.sessionId;
-            lines.push(`  [${new Date(e.at).toISOString()}] ${sid} ${e.kind}: ${e.detail.slice(0, 160)}`);
+            lines.push(`  [${new Date(e.at).toISOString()}] ${sid} ${e.kind}: ${safePrefix(e.detail, 160)}`);
         }
     }
     lines.push("banner policy (#3235): only landed-unrecovered evidence alarms — recovered (intercepted+rebased) and");
@@ -201,19 +241,49 @@ function dshPackageVersion(profileDir: string, pkg: string): string | undefined 
     }
 }
 
+// #4649: the dsh profile bundles only carry the version truth for the dsh lane;
+// every OTHER client's version lives in its User-Agent, which bili sees on each
+// request. The registry (src/client-ua-registry.ts) keeps a bounded recent
+// sample; publish this so a non-dsh conflict report carries its own client
+// version instead of forcing `codex --version` round-trips (#4648). The values
+// are raw header bytes — the sink-level redactForPublish in buildDiagnostics
+// (#4427) is what makes them publish-safe, same as every other section here.
+function observedUaLines(): string[] {
+    const obs = recentClientUas();
+    if (obs.length === 0) return ["observed client user-agents: (none recorded by this process yet)"];
+    const shown = obs.slice(0, OBSERVED_UA_LINES);
+    const lines = shown.map((o) => `observed client user-agents: ${o.family}: ${o.ua}`);
+    if (obs.length > OBSERVED_UA_LINES) lines.push(`observed client user-agents: … ${obs.length - OBSERVED_UA_LINES} more observation(s)`);
+    return lines;
+}
+
 function hostClientVersionLines(): string[] {
     const lines: string[] = ["--- host client versions ---"];
     let dirs: string[] = [];
     try { dirs = dshProfileDirs(process.env); } catch { dirs = []; }
     if (dirs.length === 0) {
         lines.push(`dsh: no profiles under DSH_HOME (${path.basename(resolveDshHome(process.env)) || "?"}/profiles missing — dsh has never run here, or DSH_HOME points elsewhere)`);
-        return lines;
+    } else {
+        for (const dir of dirs.slice(0, DSH_PROFILE_CAP)) {
+            const versions = DSH_REPORT_PACKAGES.map((p) => dshPackageVersion(dir, p));
+            if (versions.every((v) => v === undefined)) {
+                // #5146: three bare "?"s told triage nothing about WHERE the version
+                // truth lives — on DSH Desktop bundle installs the @deepseek-ai core
+                // ships inside the app, not under the profile's node_modules (which
+                // holds third-party plugins like billion-context alone), so every
+                // lookup missed and reports lost the host-version dimension entirely.
+                lines.push(`dsh profile ${path.basename(dir)}: (no @deepseek-ai packages under this profile bundle — on desktop installs the core ships inside the app; include the app version)`);
+            } else {
+                const vers = DSH_REPORT_PACKAGES.map((p, i) => `${p.split("/")[1]} ${versions[i] ?? "?"}`).join(", ");
+                lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
+            }
+        }
+        if (dirs.length > DSH_PROFILE_CAP) lines.push(`… ${dirs.length - DSH_PROFILE_CAP} more profile(s)`);
     }
-    for (const dir of dirs.slice(0, DSH_PROFILE_CAP)) {
-        const vers = DSH_REPORT_PACKAGES.map((p) => `${p.split("/")[1]} ${dshPackageVersion(dir, p) ?? "?"}`).join(", ");
-        lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
-    }
-    if (dirs.length > DSH_PROFILE_CAP) lines.push(`… ${dirs.length - DSH_PROFILE_CAP} more profile(s)`);
+    // #4649: appended AFTER the dsh part and outside the early-return path — a
+    // machine with no dsh profiles at all (the #4648 codex case) must still get
+    // its observed client versions.
+    lines.push(...observedUaLines());
     return lines;
 }
 
@@ -267,7 +337,7 @@ function configSectionLines(): string[] {
         return lines;
     }
     if (text.length > CONFIG_SECTION_MAX_CHARS) {
-        text = text.slice(0, CONFIG_SECTION_MAX_CHARS - 1) + `… (truncated, ${text.length} chars total)`;
+        text = safePrefix(text, CONFIG_SECTION_MAX_CHARS - 1) + `… (truncated, ${text.length} chars total)`;
     }
     lines.push(text);
     return lines;
@@ -278,6 +348,8 @@ interface TopicContext {
     storageLogLines: string[];
     conflicts: ReturnType<typeof summarizeConflicts> | null;
     conflictLogLines: string[];
+    /** Generations that could not be read; both tails are partial when set. */
+    unreadableLogs: string[];
 }
 
 interface TopicDef {
@@ -288,7 +360,12 @@ interface TopicDef {
 const TOPICS: Record<string, TopicDef> = {
     "storage-legacy-only": {
         title: () => `SQLite unified storage degraded to legacy-only (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
-        section: (ctx) => storageDiagnosticsLines(ctx),
+        section: (ctx) => [
+            ...(ctx.unreadableLogs.length > 0
+                ? [`(INCOMPLETE: ${ctx.unreadableLogs.length} log generation(s) could not be read — the storage tail below covers only the readable ones)`]
+                : []),
+            ...storageDiagnosticsLines(ctx),
+        ],
     },
     // #3235: the compression-conflict banner rides the same #3040 facility —
     // "copy diagnostics / report on GitHub" buttons straight on the banner.
@@ -298,11 +375,25 @@ const TOPICS: Record<string, TopicDef> = {
         title: () => `Snapshot-render shadow mismatch (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
         section: () => snapshotShadowDiagnosticsLines(),
     },
+    // #3581/#3651: the takeover-attribution banner ships "copy diagnostics /
+    // report on GitHub" buttons wired to topic=attribution, but the topic was
+    // never registered — the blob fell back to the generic title and printed
+    // "no topic-specific section registered", so the report carried NONE of the
+    // attribution evidence (which agent degraded, state, refusals, error,
+    // endpoint) that a maintainer needs to adjudicate a takeover-broken episode.
+    // Register it so the banner's report is diagnosable on its own.
+    "attribution": {
+        title: () => `Takeover attribution failure (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
+        section: () => attributionDiagnosticsLines(),
+    },
     "conflict-banner": {
         title: () => `Compression conflict banner (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
         section: (ctx) => [
             ...conflictDiagnosticsLines(ctx.conflicts),
             "--- recent conflict-related log lines ---",
+            ...(ctx.unreadableLogs.length > 0
+                ? [`(INCOMPLETE: ${ctx.unreadableLogs.length} log generation(s) could not be read — the tails below cover only the readable ones)`]
+                : []),
             ...(ctx.conflictLogLines.length > 0
                 ? ctx.conflictLogLines
                 : ["(no matching lines in the current log pair)"]),
@@ -343,19 +434,52 @@ function snapshotShadowDiagnosticsLines(): string[] {
     return lines;
 }
 
-export function buildDiagnostics(topic?: string): DiagnosticsReport {
-    const t = topic?.trim().slice(0, 64) ?? "";
+// #3581/#3651: the takeover-attribution banner's diagnostic section. The
+// evidence lives in the HOST process (the proxy only learns of a refusal when a
+// plugin reports it), so this renders the latest per-agent report the proxy has
+// kept. Under the #3651 diagnosable-failure contract only DIAGNOSABLE failures
+// reach this surface: `threw` episodes carry the error text + masked endpoint,
+// while a by-design agentless lane never reports — so an EMPTY map means "no
+// diagnosable failure observed since process start", not "no plugins". The
+// error/endpoint bytes are host-supplied free text; the sink-level
+// redactForPublish in buildDiagnostics is what makes them publish-safe (same as
+// every other section here), so no per-field scrubbing is needed upstream.
+function attributionDiagnosticsLines(): string[] {
+    const lines = ["--- takeover attribution ---"];
+    const reports = attributionStatusWire();
+    const agents = Object.entries(reports);
+    if (agents.length === 0) {
+        lines.push("(no attribution reports received by this process — a healthy or by-design-agentless lane never reports, so this means no diagnosable failure was observed since process start)");
+        return lines;
+    }
+    for (const [agent, r] of agents) {
+        const sinceText = r.since > 0 ? new Date(r.since).toISOString() : "?";
+        lines.push(`${agent}: state=${r.state} refusals=${r.refusals} since=${sinceText}`);
+        if (r.error !== undefined) {
+            const err = redactForPublish(r.error);
+            lines.push(`  error: ${err.length > ATTRIBUTION_ERROR_MAX_CHARS ? safePrefix(err, ATTRIBUTION_ERROR_MAX_CHARS - 1) + "…" : err}`);
+        }
+        if (r.endpoint !== undefined) lines.push(`  endpoint: ${r.endpoint}`);
+    }
+    lines.push("banner policy (#3581/#3651): only DIAGNOSABLE failures reach this surface (threw episodes report error text + masked endpoint; by-design agentless lanes never report).");
+    lines.push("remedy: restart the host process to restore takeover; if it persists after restart, the error line above is the first thing to look at.");
+    return lines;
+}
+
+export async function buildDiagnostics(topic?: string): Promise<DiagnosticsReport> {
+    const t = safePrefix(topic?.trim() ?? "", 64);
     const def = t ? TOPICS[t] : undefined;
-    // #3813: read the rotated log pair at most ONCE per report — the storage
-    // tail and the conflict banner filter the SAME candidate lines, so a
-    // conflict-banner request used to read the whole pair twice (hundreds of MB
-    // possible), stalling the event loop synchronously.
-    const logLines = def || t === "conflict-banner" ? candidateLogLines() : [];
+    const needStorage = t === "storage-legacy-only";
+    const needConflict = t === "conflict-banner";
+    const tails = needStorage || needConflict
+        ? await candidateLogTails(needStorage, needConflict)
+        : { storage: [], conflict: [], unreadable: [] };
     const ctx: TopicContext = {
         sessions: safeSessionCount(),
-        storageLogLines: def ? storageLogTail(logLines) : [],
-        conflicts: def ? safeConflictSummary() : null,
-        conflictLogLines: t === "conflict-banner" ? conflictLogTail(logLines) : [],
+        storageLogLines: needStorage ? storageLogTail(tails.storage) : [],
+        conflicts: needConflict ? safeConflictSummary() : null,
+        conflictLogLines: needConflict ? conflictLogTail(tails.conflict) : [],
+        unreadableLogs: tails.unreadable,
     };
     const lines = baseLines();
     if (t && !def) lines.push(`topic: ${t} (no topic-specific section registered)`);

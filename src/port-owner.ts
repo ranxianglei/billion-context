@@ -1,4 +1,5 @@
 import { isProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
+import { nextListenPort } from "./listen-policy.js";
 
 /** #2941: post-bind port-ownership verification + pointer-clobber guard for
  *  same-lane double-spawn residuals (#707 follow-ups). Conservative by
@@ -7,6 +8,10 @@ import { isProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
 interface OwnerProbeInfo {
     pid?: number;
     instanceId?: string;
+    /** #4125: build version reported by /__bili/health — lets a challenger
+     *  identify a STRICTLY NEWER same-lane holder from a live health answer
+     *  (upward adoption); a busy/silent holder reports nothing. */
+    version?: string;
     /** Negative attribution: responder is up but pre-registration (#2941
      *  readiness gate) — see findForeignOwner for the handling. */
     reason?: string;
@@ -57,11 +62,12 @@ export async function probeOwnerInfo(
             if (neg.ok === false && typeof neg.reason === "string") return { reason: neg.reason };
             return undefined;
         }
-        const data = (await res.json()) as { ok?: unknown; pid?: unknown; instanceId?: unknown };
+        const data = (await res.json()) as { ok?: unknown; pid?: unknown; instanceId?: unknown; version?: unknown };
         if (data.ok !== true) return undefined;
         const info: OwnerProbeInfo = {};
         if (typeof data.pid === "number" && Number.isInteger(data.pid) && data.pid > 0) info.pid = data.pid;
         if (typeof data.instanceId === "string" && data.instanceId !== "") info.instanceId = data.instanceId;
+        if (typeof data.version === "string" && data.version !== "") info.version = data.version;
         return info;
     } catch {
         return undefined;
@@ -165,7 +171,7 @@ export async function resolvePortClaim(params: {
         return { kind: "die", message: `port ${portOf(params.origin)} is shared with ${who} — refusing to serve a contested port (#2941)` };
     }
     const attempts = params.listenAttempts + 1;
-    const nextPort = attempts >= params.maxListenAttempts ? 0 : portOf(params.origin) + 1;
+    const nextPort = nextListenPort(portOf(params.origin), attempts, params.maxListenAttempts);
     return { kind: "ladder", nextPort, foreign };
 }
 
@@ -221,14 +227,21 @@ export const HOLDER_PROBE_TIMEOUT_MS = 2_000;
 /** Wildcard bind hosts are probed through loopback instead. */
 export function holderProbeOrigin(host: string, port: number): string {
     const h = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-    return `http://${h}:${port}`;
+    const authority = h.includes(":") && !h.startsWith("[") ? `[${h}]` : h;
+    return `http://${authority}:${port}`;
 }
 
 /** Pure hint composition for the terminal EADDRINUSE log line — the probe
  *  result is already resolved, so tests need no live socket. */
 export function holderHintFragment(serving: boolean, holderPid?: number): string {
     if (serving) {
-        return `existing listener answered /__bili/health${holderPid !== undefined ? ` (pid ${holderPid})` : ""} — it IS serving; this process exits as the duplicate and the spawner should attach to it`;
+        // #5907: a host relaunch racing the still-up previous instance lands
+        // this line ~40ms beside the loser's EADDRINUSE (and often a
+        // [split-brain] notice from the startup-overlap writes), which reads
+        // like a fatal error although the loser exits cleanly. Name the
+        // expectedness + the split-brain cross-reference so the pair reads as
+        // routine churn, without softening the wedged/dead branch below.
+        return `existing listener answered /__bili/health${holderPid !== undefined ? ` (pid ${holderPid})` : ""} — it IS serving; this process exits as the duplicate and the spawner should attach to it. This is the expected duplicate-instance outcome when a host relaunches while the previous instance is still up: the serving instance keeps its sessions and no action is needed; if a [split-brain] notice near these timestamps names this exiting pid, it is the same duplicate start settling, not data corruption in progress (#4762/#5907)`;
     }
     const remedy = holderPid !== undefined
         ? `kill it to free the port (Windows: taskkill /PID ${holderPid}; Linux/macOS: kill ${holderPid})`

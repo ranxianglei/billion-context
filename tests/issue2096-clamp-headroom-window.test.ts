@@ -37,12 +37,19 @@ function runClamp(raw: number, inputTokens: number, nativeWindow: number, headro
     return { body, log };
 }
 
+// #5278: the cap is sized on the safety-inflated estimate; keep the derivation
+// here so the native-vs-headroom focus of this file stays testable.
+const expectedCap = (input: number, window: number): number => {
+    const safeEst = Math.ceil(input * 1.12);
+    const margin = Math.max(2048, Math.ceil(safeEst * 0.05));
+    return Math.floor(window - safeEst - margin);
+};
+
 test("#2096 unit: incident-band clamp caps against the native window and says compression is the backstop", () => {
     // Incident numbers: W=1048576, out_raw=393216 (>25% of W), input~807837 —
     // above the headroom target 786432, below the native window.
     const { body, log } = runClamp(393216, 807_837, 1_048_576, 786_432);
-    const margin = Math.max(2048, Math.ceil(807_837 * 0.05));
-    assert.equal(body.max_tokens, Math.floor(1_048_576 - 807_837 - margin), "cap must be computed against the NATIVE window");
+    assert.equal(body.max_tokens, expectedCap(807_837, 1_048_576), "cap must be computed against the NATIVE window");
     assert.match(log, /output budget clamped 393216 -> \d+ \(input~807837, window=1048576\)/);
     assert.ok(log.includes("only compression can recover it"), `band log must name compression as the operative backstop, got: ${log}`);
 });
@@ -54,16 +61,14 @@ test("#2096 unit: below-target input keeps the #453 guarantee the issue's sugges
     // hard 400. Capping against the native window keeps the post-compression
     // turn alive.
     const { body, log } = runClamp(393216, 780_000, 1_048_576, 786_432);
-    const margin = Math.max(2048, Math.ceil(780_000 * 0.05));
-    assert.equal(body.max_tokens, Math.floor(1_048_576 - 780_000 - margin), "post-fold turn must keep a usable output budget");
+    assert.equal(body.max_tokens, expectedCap(780_000, 1_048_576), "post-fold turn must keep a usable output budget");
     assert.ok(!log.includes("only compression can recover it"), `below-target log must not claim the band, got: ${log}`);
     assert.match(log, /prevents input\+output overflow \(#453\)$/);
 });
 
 test("#2096 unit: without headroom info the legacy message is unchanged", () => {
     const { body, log } = runClamp(393216, 807_837, 1_048_576);
-    const margin = Math.max(2048, Math.ceil(807_837 * 0.05));
-    assert.equal(body.max_tokens, Math.floor(1_048_576 - 807_837 - margin));
+    assert.equal(body.max_tokens, expectedCap(807_837, 1_048_576));
     assert.ok(!log.includes("#2096"), `legacy message must stay intact, got: ${log}`);
 });
 

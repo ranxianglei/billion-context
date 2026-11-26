@@ -201,7 +201,7 @@ test("isMessageProtected: legacy refs assigned before protection still cannot be
   assert.ok(block.effectiveMessageIds.includes("d"), "msg 'd' folded");
 });
 
-test("isMessageProtected: range consisting solely of protected messages fails with a clear error", () => {
+test("isMessageProtected: range consisting solely of protected messages is a clean no-op", () => {
   const core = createCore();
   const messages = [msg("catalog", catalogText)];
   const state = setupRefs(messages);
@@ -215,10 +215,14 @@ test("isMessageProtected: range consisting solely of protected messages fails wi
   });
 
   assert.equal(result.result.blocksCreated, 0, "nothing may be created");
-  assert.equal(result.result.errors.length, 1);
+  // #4521: entirely-protected range is the idempotent no-op class — loud
+  // enough (warning names the cause) without poisoning a mixed batch or
+  // feeding the retry loops a FAILED receipt for a legal request.
+  assert.equal(result.result.errors.length, 0);
+  assert.equal(result.result.noop, true);
   assert.match(
-    result.result.errors[0]!,
-    /no compressible messages/,
-    "an entirely-protected range must fail loudly, not fake-compress",
+    result.result.warnings.join(" "),
+    /protected or filtered/,
+    "the warning must say everything in the range is protected",
   );
 });

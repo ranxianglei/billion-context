@@ -31,12 +31,17 @@ import {
   isMessageLatestProtected,
   isMessageProtectedWithPairing,
   isNeverPreserveRecent,
+  lastUserAnchor,
 } from "./protected.js";
 import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { evaluateRefold } from "./refold.js";
 import { segmentGroups } from "./segment.js";
-import { projectUnit, collectCoverage } from "./unit-projection.js";
+import {
+  projectUnit,
+  collectCoverage,
+  buildProjectionShared,
+} from "./unit-projection.js";
 import { BoundaryNotFoundError } from "./boundaries.js";
 import type { UnitProjection } from "./unit-projection.js";
 
@@ -143,12 +148,10 @@ export function computeProtectedRefs(
   // skipped above — user intent is always protected regardless of recent
   // tool results.
   if (preserveN > 0) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]!;
-      if (msg.role !== "user" || isSyntheticOrPruned(msg, covered)) continue;
-      const ref = state.messageRefs.byRaw[msg.id];
+    const anchor = lastUserAnchor(messages, covered, config);
+    if (anchor) {
+      const ref = state.messageRefs.byRaw[anchor.id];
       if (ref && ref !== "BLOCKED") result.add(ref);
-      break;
     }
   }
 
@@ -275,6 +278,11 @@ export function buildCompressibleRanges(
     id: string;
     ref: string;
     gapBefore: boolean;
+    /** True when this message's preceding gap is HARD (contains at least one
+     *  skip the apply side cannot tolerate inside a spanning fold — see
+     *  hardGapSinceCompressible). False = the gap is span-safe (protected-tool
+     *  exchanges and/or integrity-withdrawn members only) or absent. */
+    gapHard: boolean;
     tokens: number;
     chars: number;
     isTool: boolean;
@@ -313,6 +321,20 @@ export function buildCompressibleRanges(
   // two rules coincide, so ranges are byte-identical to the old behavior.
   let skipSinceCompressible = false;
   let skipSinceProtected = false;
+  // Span-safety classification (production 2026-11-09 mega-turn incident): a
+  // gap the apply side tolerates INSIDE a spanning fold — protected-tool
+  // exchanges (filterProtectedToolMessages carves them, "Bug 39") and
+  // integrity-withdrawn members (the fold gate withdraws them again at apply,
+  // they stay visible; #564 reverse-split semantics) — is SPAN-SAFE, and
+  // mergeRangesToThreshold may bridge across it so sub-gate islands can
+  // accumulate to minCompressRange. Every OTHER skip (block coverage, live
+  // checkpoint carrier, unrecoverable media, soft zone — whose interior hits
+  // TRUNCATE the fold at the first protected message (#3953) — dead-ref
+  // holes, BLOCKED/unrefed) is hard: no bridge, ever. Set on any skip other
+  // than the protected-exchange branch; cleared when a compressible message
+  // is pushed. The protected branch leaves it untouched, so a gap that mixes
+  // protected + hard skips stays hard in either order.
+  let hardGapSinceCompressible = false;
   let msgIndex = -1;
   // #3192/#3205: numeric set of recorded-dead refs. A dropped message leaves a
   // hole in the ref map that array-adjacency segmentation bridges, so we break
@@ -327,10 +349,17 @@ export function buildCompressibleRanges(
   for (const msg of messages) {
     msgIndex++;
     const ref = state.messageRefs.byRaw[msg.id];
-    if (!ref || ref === "BLOCKED") continue;
+    if (!ref || ref === "BLOCKED") {
+      // No ref = no slot in the ref map: mergeRangesToThreshold sees an index
+      // hole here even though no skip flag fires. Record it as a hard gap so
+      // bridging never spans an unrefed message (its foldability is untested).
+      hardGapSinceCompressible = true;
+      continue;
+    }
     if (isSyntheticOrPruned(msg, covered)) {
       skipSinceCompressible = true;
       skipSinceProtected = true;
+      hardGapSinceCompressible = true;
       continue;
     }
 
@@ -346,16 +375,20 @@ export function buildCompressibleRanges(
     if (isLiveCheckpointCarrier(msg, state)) {
       skipSinceCompressible = true;
       skipSinceProtected = true;
+      hardGapSinceCompressible = true;
       continue;
     }
 
-    // Unrecoverable media (no stored bytes — remote URL / file refs) is
-    // destroyed by folding with no restore behind it (#1188/#2609): never
-    // advertised as compressible, and a gap so no range spans it. Archivable
-    // inline images are compressible like text (#2607).
+    // Unrecoverable media (no stored bytes AND no re-access handle — since
+    // #5620 ref-based media like remote URLs / file ids is foldable, its
+    // handle riding the summary) is destroyed by folding with no restore
+    // behind it (#1188/#2609): never advertised as compressible, and a gap
+    // so no range spans it. Archivable inline images are compressible like
+    // text (#2607).
     if (hasUnrecoverableMediaPayload(msg)) {
       skipSinceCompressible = true;
       skipSinceProtected = true;
+      hardGapSinceCompressible = true;
       continue;
     }
 
@@ -377,12 +410,16 @@ export function buildCompressibleRanges(
       });
       skipSinceProtected = false;
       skipSinceCompressible = true;
+      // Protected-exchange skip: the ONLY bridge-able skip class (see the
+      // hardGapSinceCompressible doc). Leave hardGapSinceCompressible
+      // untouched — a protected gap following a hard gap stays hard.
       continue;
     }
 
     if (protectedZoneRefs?.has(ref)) {
       skipSinceCompressible = true;
       skipSinceProtected = true;
+      hardGapSinceCompressible = true;
       continue;
     }
 
@@ -399,12 +436,14 @@ export function buildCompressibleRanges(
       const hi = Math.max(curRefNum, lastCompressibleRefNum);
       if (hi - lo > 1 && hasDeadRefBetween(deadRefNums, lo, hi)) {
         skipSinceCompressible = true;
+        hardGapSinceCompressible = true;
       }
     }
     compressibleMsgs.push({
       id: msg.id,
       ref,
       gapBefore: skipSinceCompressible,
+      gapHard: hardGapSinceCompressible,
       tokens: countMessageTokens(msg, countTokens),
       chars: (msg.text ?? "").length,
       isTool: isToolMessage(msg),
@@ -414,6 +453,7 @@ export function buildCompressibleRanges(
     if (curRefNum !== null) lastCompressibleRefNum = curRefNum;
     skipSinceCompressible = false;
     skipSinceProtected = true;
+    hardGapSinceCompressible = false;
   }
 
   // Foldability: the fold gate (src/compress.ts) withdraws every message whose
@@ -426,20 +466,44 @@ export function buildCompressibleRanges(
   // each removed message as a gap so no range spans it.
   // #2663: judge foldability on the same array class apply does (see the
   // `integritySource` parameter) — grouping/pairing are array-dependent.
+  // #5531: ids already covered by an active block are INVISIBLE, not kept —
+  // a covered call cannot strand its turn's reasoning. Without this, every
+  // #564 reverse split (call+result folded into a block, reasoning+text left
+  // visible) manufactures residue that no later fold may ever take: it is
+  // withdrawn here AND rejected at apply, so each growth fold reclaims only
+  // the non-residue and the session grows without bound (billion-context#5531).
   const unfoldedIds = computeIntegrityWithdrawals(
     integritySource ?? messages,
     new Set(compressibleMsgs.map((info) => info.id)),
+    undefined,
+    covered,
   ).withdrawn;
   if (unfoldedIds.size > 0) {
+    // Withdrawn members are SPAN-SAFE (apply withdraws them again, they stay
+    // visible — see the hardGapSinceCompressible doc): removing one merges the
+    // gap before it with the gap after it, and the merged gap stays span-safe
+    // iff both were. Chain the hardness across consecutive withdrawals; the
+    // surviving record inherits the combined classification.
     let gapPending = false;
+    let pendingHard = false;
     const kept: typeof compressibleMsgs = [];
     for (const info of compressibleMsgs) {
       if (unfoldedIds.has(info.id)) {
         gapPending = true;
+        pendingHard = pendingHard || info.gapHard;
         continue;
       }
-      kept.push(gapPending ? { ...info, gapBefore: true } : info);
+      kept.push(
+        gapPending
+          ? {
+              ...info,
+              gapBefore: true,
+              gapHard: pendingHard || info.gapHard,
+            }
+          : info,
+      );
       gapPending = false;
+      pendingHard = false;
     }
     compressibleMsgs = kept;
   }
@@ -461,6 +525,9 @@ export function buildCompressibleRanges(
       toolPct: first.isTool ? 100 : 0,
       textPct: first.isTool ? 0 : 100,
       userMsgs: first.isUser ? 1 : 0,
+      ...(first.gapBefore && !first.gapHard
+        ? { bridgeableGapBefore: true }
+        : {}),
     };
     for (let i = 1; i < group.length; i++) {
       const info = group[i]!;
@@ -553,6 +620,10 @@ function mergeBatch(batch: CompressibleRange[]): CompressibleRange {
   // position-based merging (formatRanges) still sees it after this batch is
   // re-emitted as a single range.
   if (first.noMergeBefore === true) merged.noMergeBefore = true;
+  // Bridge flag propagates the same way: a batch that BRIDGED into this
+  // range keeps the marker so any later re-merge sees the span crosses
+  // span-safe gaps (and only those — hard gaps never set it).
+  if (first.bridgeableGapBefore === true) merged.bridgeableGapBefore = true;
   return merged;
 }
 
@@ -573,7 +644,22 @@ function rangeChars(r: CompressibleRange): number {
  *  `minChars`. A sub-threshold tail is folded into the preceding batch
  *  (overshoot allowed); if no batch precedes it, nothing is emitted — the
  *  whole remainder is below the gate, so no selection of it can pass and
- *  offering it only yields guaranteed-rejected calls (billion-context #847). */
+ *  offering it only yields guaranteed-rejected calls (billion-context #847).
+ *
+ *  Exception — span-safe gap bridging (production 2026-11-09 mega-turn):
+ *  batches accumulate ACROSS a gap the apply side tolerates inside a spanning
+ *  fold (`bridgeableGapBefore`: gaps made exclusively of protected-tool
+ *  exchanges — carved at apply, filterProtectedToolMessages "Bug 39" — and/or
+ *  integrity-withdrawn members — withdrawn again at apply, they stay visible)
+ *  instead of closing at it. The per-CALL #847 gate sums chars over every
+ *  range in the request, so a bridged span clears the gate that each island
+ *  individually missed. Hard gaps (blocks, carriers, media, dead-ref holes,
+ *  unrefed messages, soft zone — whose interior hits truncate the fold at the
+ *  first protected message, #3953) still close the batch — their spans are
+ *  doomed or carve-to-nothing (#498 / #2663). Sub-threshold remnants STILL
+ *  emit nothing: the apply gate is per-call, but a lone island below it has
+ *  no legal partner to ride with, and advertising it only yields the
+ *  guaranteed-rejected call #847 exists to prevent. */
 export function mergeRangesToThreshold(
   ranges: CompressibleRange[],
   minChars: number,
@@ -583,10 +669,11 @@ export function mergeRangesToThreshold(
   let batch: CompressibleRange[] = [];
   let batchChars = 0;
   // Close the running batch at a boundary: emit it only when it alone clears
-  // the gate. A sub-threshold segment bounded by a gap cannot be offered (it
-  // fails the apply-side #847 gate) and must not be stretched across the gap
-  // to reach the threshold, or the emitted span covers non-compressible
-  // content (#498).
+  // the gate. A sub-threshold segment bounded by a hard gap cannot be offered
+  // (it fails the apply-side #847 gate) and must not be stretched across the
+  // gap to reach the threshold, or the emitted span covers non-compressible
+  // content (#498). A span-safe gap does NOT close the batch — the span
+  // bridges it and apply carves/withdraws the interior (see the header doc).
   const closeBatch = () => {
     if (batch.length > 0) {
       if (batchChars >= minChars) result.push(mergeBatch(batch));
@@ -597,17 +684,22 @@ export function mergeRangesToThreshold(
   for (const r of ranges) {
     // #3192/#3205: hard boundary at a dead-ref hole — never bridge across it,
     // even though the hole carries no array-index gap (see noMergeBefore).
+    // (A dead-ref gap is a hard gap, so bridgeableGapBefore is unset on
+    // ranges following one; the explicit check keeps that invariant
+    // authoritative even on hand-built ranges that set both.)
     if (r.noMergeBefore) closeBatch();
     const prev = batch[batch.length - 1];
-    // A physical array-index gap between the previous range and this one marks
-    // a block / protected / pruned boundary (buildCompressibleRanges leaves a
-    // slot hole there; user-turn splits stay contiguous). Without index data we
-    // keep the legacy accumulate-across-everything behavior.
+    // A physical array-index gap between the previous range and this one
+    // marks a block / covered / carrier / pruned boundary (buildCompressibleRanges
+    // leaves a slot hole there; user-turn splits stay contiguous). Without
+    // index data we keep the legacy accumulate-across-everything behavior —
+    // EXCEPT that a span-safe gap does not close the batch (bridge).
     if (
       prev &&
       prev.endIndex !== undefined &&
       r.startIndex !== undefined &&
-      r.startIndex > prev.endIndex + 1
+      r.startIndex > prev.endIndex + 1 &&
+      !r.bridgeableGapBefore
     ) {
       closeBatch();
     }
@@ -621,7 +713,8 @@ export function mergeRangesToThreshold(
       !batch[0]!.noMergeBefore &&
       (prev.endIndex === undefined ||
         batch[0]!.startIndex === undefined ||
-        batch[0]!.startIndex <= prev.endIndex + 1);
+        batch[0]!.startIndex <= prev.endIndex + 1 ||
+        batch[0]!.bridgeableGapBefore === true);
     if (contiguous) {
       result[result.length - 1] = mergeBatch([prev, ...batch]);
     } else if (batchChars >= minChars) {
@@ -652,6 +745,12 @@ export function screenRecommendedUnits(
 ): CompressibleRange[] {
   if (units.length === 0) return units;
   const coverage = collectCoverage(state);
+  // #5337 option A: the O(n) per-pass derivations (index map, carrier scan,
+  // protected/latest/aged collectors, pair map, anchor, integrity pre) used
+  // to be rebuilt INSIDE projectUnit for every screened unit — O(units x n).
+  // Build them once here and share across all units in this pass; the
+  // judgment itself is unchanged.
+  const shared = buildProjectionShared(source, state, config);
   return units.filter((unit) => {
     let projection: UnitProjection | undefined;
     try {
@@ -663,6 +762,7 @@ export function screenRecommendedUnits(
         endRef: unit.endRef,
         preExistingCoverage: coverage,
         protectedMessageIds: protectedRefs,
+        shared,
       });
     } catch (err) {
       // Endpoints that cannot resolve on this array class (dead/consumed)
@@ -674,19 +774,34 @@ export function screenRecommendedUnits(
       // config-validation warn in processTurn); behavior is unchanged —
       // still return false, the unit is never advertised.
       if (!(err instanceof BoundaryNotFoundError)) {
-        console.warn(
-          `[acp-kernel] screenRecommendedUnits dropped unit ${unit.startRef}..${unit.endRef} after projection error: ${
+        warnScreenDrop(
+          `dropped unit ${unit.startRef}..${unit.endRef} after projection error: ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
       }
       return false;
     }
-    if (!projection || projection.fatal !== null) return false;
+    if (!projection || projection.fatal !== null) {
+      // Production 2026-11-09 mega-turn incident: whole-funnel zeroing is
+      // undiagnosable when units vanish here with no trace — the host only
+      // sees "kernel ranges=0" while its own message-level diagnostic still
+      // counts collectible material. Warn (budgeted, same channel as the
+      // projection-error warn above) so a total screen wipe is attributable.
+      if (projection?.fatal) {
+        warnScreenDrop(
+          `dropped unit ${unit.startRef}..${unit.endRef}: ${projection.fatal.error.message}`,
+        );
+      }
+      return false;
+    }
     if (
       projection.filteredIds.length === 0 &&
       projection.consumedBlockIds.length === 0
     ) {
+      warnScreenDrop(
+        `dropped unit ${unit.startRef}..${unit.endRef}: nothing foldable in span (filteredIds=0, consumedBlocks=0)`,
+      );
       return false;
     }
     // #3371: the apply lane's livelock guard (compress.ts, pi#199) throws on
@@ -705,8 +820,30 @@ export function screenRecommendedUnits(
       !projection.isBlockBoundary &&
       evaluateRefold(state, unit).kind !== "refold"
     ) {
+      warnScreenDrop(
+        `dropped unit ${unit.startRef}..${unit.endRef}: consumes only active block(s), not a refold`,
+      );
       return false;
     }
     return true;
   });
+}
+
+// Budgeted warn channel for screen-stage drops: the first SCREEN_DROP_WARN_BUDGET
+// drops in the process are logged verbatim, afterwards only every Nth (a run of
+// doomed units over a long session must stay observable without flooding the
+// host log — the production incident produced 28 no-range events/day). Exported
+// for the recommend pipeline node's funnel-zero warn (same channel, same budget).
+const SCREEN_DROP_WARN_BUDGET = 40;
+const SCREEN_DROP_WARN_STRIDE = 100;
+let screenDropWarnCount = 0;
+export function warnScreenDrop(detail: string): void {
+  screenDropWarnCount += 1;
+  if (
+    screenDropWarnCount > SCREEN_DROP_WARN_BUDGET &&
+    screenDropWarnCount % SCREEN_DROP_WARN_STRIDE !== 0
+  ) {
+    return;
+  }
+  console.warn(`[acp-kernel] screenRecommendedUnits ${detail}`);
 }

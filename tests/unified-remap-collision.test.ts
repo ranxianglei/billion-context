@@ -99,7 +99,9 @@ function openFixture(sessionId: string): Fixture {
     seed.close();
 
     const handles: { close?: () => void }[] = [];
-    const openedRaw = openSqliteDatabase(dbPath, "node:sqlite");
+    // Engine unpinned on purpose: the seeded store used auto-detect, and bun has
+    // no node:sqlite to pin.
+    const openedRaw = openSqliteDatabase(dbPath);
     const raw = openedRaw.db as unknown as { prepare(sql: string): { run(...args: unknown[]): unknown; get(...args: unknown[]): unknown }; close?(): void };
     handles.push(raw);
     return {

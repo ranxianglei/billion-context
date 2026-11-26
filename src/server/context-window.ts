@@ -65,6 +65,36 @@ export function launcherContextWindow(model: string): number | undefined {
 
 export const windowSourceLogged = new Set<string>();
 
+// #5490: a model that resolves to NOTHING — no tier evidence, plugin/launcher
+// report, operator declaration, registry entry, or built-in-table match — rides
+// the anonymous default window (base.modelContextLimit) in every session until
+// someone declares it. Host-resolved aliases (WorkBuddy's "fast-model") are the
+// standing case: the name exists only inside the host, so no source can ever
+// find it, and the source=default/fallback=true resolution reads in the log
+// like a healthy one. First sight already logs once per process; recurrence
+// across distinct sessions means the operator should act — surface it once,
+// with the declaration that fixes it spelled out.
+export const UNRESOLVED_MODEL_SESSION_THRESHOLD = 2;
+const unresolvedModelSessions = new Map<string, { sessions: number; lastSession: string }>();
+
+/** Count distinct sessions seen for an unresolved model; returns true exactly
+ *  once per process, when the count first reaches the threshold. */
+export function noteUnresolvedModelSession(model: string, sessionId: string): boolean {
+    const rec = unresolvedModelSessions.get(model);
+    if (rec === undefined) {
+        unresolvedModelSessions.set(model, { sessions: 1, lastSession: sessionId });
+        return false;
+    }
+    if (rec.lastSession === sessionId) return false;
+    rec.lastSession = sessionId;
+    rec.sessions += 1;
+    return rec.sessions === UNRESOLVED_MODEL_SESSION_THRESHOLD;
+}
+
+export function _resetUnresolvedModelSessionsForTest(): void {
+    unresolvedModelSessions.clear();
+}
+
 // Security cap on the beta-negotiated window: unbounded, a hostile
 // `context-<N>m` header would drive the effective window (and thus every
 // compression threshold) toward infinity, disabling all triggers until a real
@@ -97,6 +127,17 @@ export function anthropicBetaContextWindow(headers: Record<string, string | stri
         if (best === undefined || w > best) best = w;
     }
     return best;
+}
+
+/** #6088: true when an `anthropic-beta` header negotiates Anthropic message
+ *  threads (e.g. `message-threads-2026-08-12`). Such requests carry only the
+ *  newest message(s) — the upstream holds the history — so bili cannot see or
+ *  compress the conversation. */
+export function anthropicBetaMessageThreads(headers: Record<string, string | string[] | undefined>): boolean {
+    const raw = headers["anthropic-beta"];
+    if (raw === undefined) return false;
+    const list = Array.isArray(raw) ? raw.join(",") : raw;
+    return list.split(",").some((part) => part.trim().toLowerCase().startsWith("message-threads"));
 }
 
 // #1321: an [Nm]-suffixed model name (e.g. "claude-opus-5-5[1m]") is the

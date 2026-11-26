@@ -331,6 +331,34 @@ test("e2e: authored compaction answers locally — zero egress, tagged checkpoin
     });
 });
 
+test("e2e: forged usage tracks the checkpoint size, not the replayed envelope (#5811)", async () => {
+    await withHarness(async (h) => {
+        await armBlock(h, "s-usage");
+        process.env.BILI_DSH_AUTHORED_COMPACTION = "1";
+        const call = (filler: string) => turn(h, "s-usage", [
+            { role: "system", content: "sys" },
+            { role: "user", content: filler },
+            { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense the conversation above.` },
+        ]);
+        const promptTokensOf = (body: string): number => {
+            const finish = parseSseFrames(body).find((f) => (f.data as { choices?: { finish_reason?: string }[] })?.choices?.[0]?.finish_reason === "stop");
+            assert.ok(finish, "finish_reason stop frame");
+            return (finish!.data as { usage: { prompt_tokens: number } }).usage.prompt_tokens;
+        };
+        // Same session + same active block in both calls → identical forged
+        // checkpoint; only the replayed envelope differs by ~600 KB.
+        const small = await call("short replay");
+        assert.equal(small.status, 200, small.body);
+        const big = await call("y".repeat(600_000));
+        assert.equal(big.status, 200, big.body);
+        const smallTokens = promptTokensOf(small.body);
+        const bigTokens = promptTokensOf(big.body);
+        assert.ok(smallTokens > 0, "usage present on the forged answer");
+        assert.equal(bigTokens, smallTokens, "usage derives from the checkpoint, not the replayed envelope");
+        assert.ok(bigTokens < 15_000, `prompt_tokens ${bigTokens} must stay under the 15k model window (pre-fix it was inboundBytes/4)`);
+    });
+});
+
 test("e2e: stream:false honored — JSON body with the checkpoint text", async () => {
     await withHarness(async (h) => {
         await armBlock(h, "s-json");

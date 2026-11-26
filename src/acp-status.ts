@@ -20,12 +20,13 @@ import { pckAblations } from "./pck-probe.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
-import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
+import { describeUncoveredRuns, formatProtectedMass, shortTokenCount, uncoveredAudit } from "./uncovered.js";
 import { withoutTurnSeparators } from "./turn-separator.js";
 import { forkAdoptionSkippedOf } from "./fork-adoption.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
+import { getResolverWedgeState } from "./resolver-wedge.js";
 import { getUpdateVisibility, updateBannerPayload } from "./update-notes.js";
 import { loadOptions } from "./config.js";
 import { pckNoticeActive } from "./pck-notice.js";
@@ -34,6 +35,7 @@ import { isExternalSummaryBlock } from "./external-summary-marker.js";
 import { storageStatusLabel } from "./persist.js";
 import { storageStatusWire } from "./storage/runtime-status.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
+import { formatContextAnalysis } from "./context-analysis.js";
 
 interface AcpStatusCtx {
     core: CompressionCore;
@@ -171,8 +173,16 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const view = typeof args.view === "string" ? (args.view as "ranges" | "messages") : undefined;
     const tool = typeof args.tool === "string" ? args.tool : undefined;
     const sort = typeof args.sort === "string" ? (args.sort as "size" | "time" | "tool" | "age") : undefined;
-    const limit = typeof args.limit === "number" ? args.limit : undefined;
-    const base = buildStatusReport(ctx.session.state, ctx.messages, defaultCountTokens, {
+        const limit = typeof args.limit === "number" ? args.limit : undefined;
+    // #7463 (re-scoped by owner ruling 2026-11-21): the protected-mass ledger
+    // is OPT-IN on this surface. acp_status is the model's everyday read and
+    // the mass — metered into usage, reachable by no compress offer — is an
+    // explanation, not an action; defaulting it on would ship "uncompressible
+    // garbage" on every call. Attribution rides the log + /acp panel + the
+    // structured context view by default; pass protectedMass:true for the
+    // on-demand ledger here.
+    const wantProtectedMass = args.protectedMass === true;
+    let base = buildStatusReport(ctx.session.state, ctx.messages, defaultCountTokens, {
         scope,
         view,
         tool,
@@ -187,6 +197,23 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             host: `billion-context ${VERSION} (${BUILD_COMMIT})`,
         },
     });
+    if (wantProtectedMass) {
+        try {
+            const audit = uncoveredAudit({
+                core: ctx.core,
+                messages: ctx.messages,
+                state: ctx.session.state,
+                config: ccrLoopConfig(ctx.session, ctx.config),
+                tokenCount: statusInputBaseline(ctx.session),
+                contentStore: contentStoreOf(ctx.session),
+                applyView: ctx.compressMessages,
+            });
+            const line = formatProtectedMass(audit.mass);
+            if (line) base = `${base}\n\n${line}`;
+        } catch {
+            // Advisory ledger; never break the status report.
+        }
+    }
     if (scope) return toolOk(base);
     const extra: string[] = [];
     // #3925 → #3011 C9: a fork that started with zero inherited blocks used to
@@ -244,6 +271,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push("");
         extra.push(kaLine);
     }
+    // Context analysis: init size, nudge cadence, harvest (acceptance) rate and
+    // the plain-language verdict — the question that used to take hours of
+    // manual log forensics (session-aedc188c investigation, 2026-11-08).
+    const caLines = formatContextAnalysis(ctx.session.id);
+    if (caLines && caLines.length > 0) {
+        extra.push("");
+        extra.push("CONTEXT ANALYSIS (this process's lifetime):");
+        extra.push(...caLines);
+    }
     // #2432: while the compress circuit breaker is armed, advertising ranges
     // here contradicts the breaker receipt ("STOP calling compress now") and
     // feeds the exact retry loop the breaker exists to kill — every model that
@@ -293,6 +329,14 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
                 extra.push("");
                 extra.push(formatRanges(ranges, protectedRanges));
             }
+        } else {
+            // False-advertising fix: the tool advertises "compressible ranges"
+            // unconditionally, but the live table only exists while
+            // processTurn arms a nudge (growth >= floor). Say so instead of
+            // going silent — silence reads as "no refs exist at all" and
+            // sends first-call models into retry loops.
+            extra.push("");
+            extra.push("Compressible ranges: none offered right now — context growth has not reached the compression-nudge threshold, so nothing is worth folding yet. Continue the task; the live table appears once growth arms the nudge.");
         }
     } catch {
         // Base-only report; never fall back to a stale snapshot.
@@ -302,7 +346,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     // They keep going upstream raw while no surface names them; additive
     // section, rendered only when non-trivial. Advisory: any failure skips it.
     try {
-        const runs = uncoveredHistoryRuns({
+        const audit = uncoveredAudit({
             core: ctx.core,
             messages: ctx.messages,
             state: ctx.session.state,
@@ -313,6 +357,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             actionableSpans: offeredSpans ?? [],
             normalRanges: offeredSpans,
         });
+        const runs = audit.runs;
         if (runs.length > 0) {
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
             const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
@@ -354,9 +399,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     }
     if (breaker) {
         extra.push("");
-        extra.push(`COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: ${breaker.n} / ${breaker.threshold}. Disarms on one successful compress or ${breaker.decayMinutes} min without further failures.`);
+        extra.push(`COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: ${breaker.n} / ${breaker.threshold}. Disarms on one substantial compress (a trivial one that saves almost nothing does not count) or ${breaker.decayMinutes} min without further failures.`);
         if (substrateDestroyed) {
-            extra.push("Last failures were attributed to substrate-destruction (an out-of-band history rewrite). The Compressible-ranges list above was re-derived from the CURRENT resent view: per the receipt, compress ONLY a range listed there — one success clears this breaker. If no ranges are listed, continue the task without compressing.");
+            extra.push("Last failures were attributed to substrate-destruction (an out-of-band history rewrite). The Compressible-ranges list above was re-derived from the CURRENT resent view: per the receipt, compress ONLY a range listed there — one substantial success clears this breaker. If no ranges are listed, continue the task without compressing.");
         } else {
             extra.push("The Compressible-ranges list above was re-derived from the current view — the table is live; it is the earlier attempts that failed, not these ranges. Per the failure receipt: do not attempt to compress now; continue the task.");
         }
@@ -390,17 +435,16 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         }
         if (openCircuits.length > 4) extra.push(`UPSTREAM CIRCUIT OPEN — (+${openCircuits.length - 4} more host(s))`);
     }
-    // #4204: display counterpart of the egress-side 429 governor — holds are
-    // per origin+credential and answer locally (zero egress) while armed, so
-    // hosts/models can see WHY sends are held back and when the next probe
-    // fires. Display-only; no wire decision lives here.
+    // #4204: display counterpart of the egress-side 429 governor. Account
+    // holds are per origin+credential; a verified KeyRing model refusal has
+    // its own origin+credential+model hold. Both answer locally (zero egress).
     const throttleHolds = activeThrottleHolds();
     if (throttleHolds.length > 0) {
         for (const h of throttleHolds.slice(0, 4)) {
             extra.push("");
-            extra.push(`UPSTREAM 429 HOLD — ${h.host}: ${h.streak} consecutive upstream 429(s); outbound sends answered locally until ${new Date(h.nextAttemptAt).toISOString()} (${h.terminal ? "TERMINAL — local 424 outside SDK retry sets until a probe succeeds" : "backoff window"}); zero egress while held, clears on the next non-429 response (#4204).`);
+            extra.push(`UPSTREAM 429 HOLD — ${h.host}${h.model === undefined ? "" : ` (model ${h.model})`}: ${h.streak} consecutive upstream 429(s); outbound sends answered locally until ${new Date(h.nextAttemptAt).toISOString()} (${h.terminal ? "TERMINAL — local 424 outside SDK retry sets until a probe succeeds" : "backoff window"}); zero egress while held, clears on a resolved non-429 response in the same scope (#4204).`);
         }
-        if (throttleHolds.length > 4) extra.push(`UPSTREAM 429 HOLD — (+${throttleHolds.length - 4} more origin+credential key(s))`);
+        if (throttleHolds.length > 4) extra.push(`UPSTREAM 429 HOLD — (+${throttleHolds.length - 4} more origin+credential[+model] key(s))`);
     }
     const shrinkAt = ctx.session.stats.emergencyShrinkAt;
     if (typeof shrinkAt === "number") {
@@ -490,6 +534,13 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // — surface the active advisory here (instance-level, like #897).
         extra.push("");
         extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: the advisory field of GET /__bili/status.`);
+    }
+    // #5221 phase 2 (owner ruling 2026-10-31): suspected persistent local-resolver
+    // wedge — detection-only alarm surface, same lane as the advisory above.
+    const rw = getResolverWedgeState();
+    if (rw) {
+        extra.push("");
+        extra.push(`RESOLVER WEDGE SUSPECTED (instance-level): this process's OS name resolution keeps failing for ${rw.hosts.length} host(s) that resolved fine before (${rw.hosts.slice(0, 5).join(", ")}${rw.hosts.length > 5 ? ", …" : ""}) — model requests 502 until the proxy process restarts or egress routes through an upstream proxy (-F/--forward-proxy). Live state: the resolverWedge field of GET /__bili/status.`);
     }
     const upd = getUpdateVisibility(VERSION);
     const updateAction = updateBannerPayload(upd);

@@ -13,6 +13,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import {
     planClientSpawn,
+    quoteWinToken,
     resolveClientCommand,
     resolveCodexOfficialJsEntry,
     resolveOnPath,
@@ -20,6 +21,7 @@ import {
     type SpawnChild,
     type SpawnFn,
 } from "../src/launcher.ts";
+import { splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
 import { planDshSpawn } from "../src/dsh-channel.ts";
 import { winCmdUnsafeToken } from "../src/win-cmd.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -61,6 +63,8 @@ test("winCmdUnsafeToken: the safe set passes", () => {
         String.raw`C:\x\y\z`,
         "tailbs-nospace\\",
         String.raw`even trailing \\ with space`,
+        "odd trailing with space \\",
+        "C:\\My Projects\\",
         "!VAR! delayed expansion marker",
         "tab\there",
         "unicode ✓ 日本語 🎉",
@@ -80,7 +84,6 @@ test("winCmdUnsafeToken: every #2196 corruption class is refused", () => {
         ["a^b", "cmd metacharacters (& | < > ^ ( ))"],
         ["(a)", "cmd metacharacters (& | < > ^ ( ))"],
         ["line\nbreak", "a line break"],
-        ["odd trailing \\", "an odd number of trailing backslashes"],
     ];
     for (const [token, reason] of unsafe) {
         assert.equal(winCmdUnsafeToken(token), reason, `expected unsafe: ${JSON.stringify(token)}`);
@@ -95,6 +98,35 @@ test("planClientSpawn win32: safe argv keeps the exact #679 plan (byte-identical
     assert.deepEqual(p.args.slice(0, 3), ["/d", "/s", "/c"]);
     assert.equal(p.args[3], String.raw`"C:\npm\codex.cmd exec "hello world""`);
     assert.equal(p.windowsVerbatimArguments, true);
+});
+
+test("planClientSpawn win32: trailing backslashes in a quoted argument survive the comspec path", () => {
+    // MSVCRT reads 2n backslashes before a quote as n: an odd run used to be refused and an
+    // even one arrived halved. Doubling the run inside the quotes carries both through verbatim.
+    const p = planClientSpawn("C:\\npm\\claude.cmd", ["-p", "list C:\\My Projects\\", "ends in \\\\"], WIN_ENV, "win32");
+    assert.equal(p.args[3], '"C:\\npm\\claude.cmd -p "list C:\\My Projects\\\\" "ends in \\\\\\\\""');
+});
+
+// The comspec leg's acceptance property, pinned in CI: a whitespace-bearing
+// token quoted by quoteWinToken must parse back to itself under the receiving
+// program's CommandLineToArgvW rule (splitWindowsCommandLine models it). The
+// exact-line test above pins the bytes; this pins that those bytes decode back
+// to the token — the lossless round-trip the trailing-backslash doubling buys.
+test("comspec round-trip: quoteWinToken output parses back verbatim (MSVCRT 2n -> n)", () => {
+    const tokens = [
+        "plain spaced",          // no backslash
+        "C:\\My Docs\\a.txt",    // interior backslashes only
+        "odd trailing \\",       // 1 trailing (refused before this fix)
+        "even trailing \\\\",    // 2 trailing (arrived halved before this fix)
+        "three trailing \\\\\\", // 3 trailing
+    ];
+    for (const token of tokens) {
+        assert.deepEqual(
+            splitWindowsCommandLine(quoteWinToken(token)),
+            [token],
+            `round-trip lost: ${JSON.stringify(token)}`,
+        );
+    }
 });
 
 test("planClientSpawn win32: '!' and other non-metacharacters stay allowed on the comspec path", () => {
@@ -121,7 +153,6 @@ for (const [label, args] of [
     ["empty argument", ["exec", ""]],
     ["%VAR%", ["exec", "literal %COMSPEC% marker"]],
     ["& metacharacter", ["exec", "hello&rem"]],
-    ["odd trailing backslash", ["exec", "odd tail \\"]],
 ] as const) {
     test(`planClientSpawn win32: refuses ${label} on the comspec path with an actionable error`, () => {
         assert.throws(
@@ -176,6 +207,11 @@ test("planDshSpawn win32: safe profile args keep the #679 plan", () => {
     assert.equal(p.command, "C:\\Windows\\System32\\cmd.exe");
     assert.deepEqual(p.args.slice(0, 3), ["/d", "/s", "/c"]);
     assert.equal(p.args[3], String.raw`"C:\tools\dsh.cmd plugin --profile "my profile" add billion-context"`);
+});
+
+test("planDshSpawn win32: a quoted token's trailing backslashes are doubled, not halved or refused", () => {
+    const p = planDshSpawn("C:\\tools\\dsh.cmd", ["plugin", "--profile", "C:\\My Profiles\\"], WIN_ENV, "win32");
+    assert.equal(p.args[3], '"C:\\tools\\dsh.cmd plugin --profile "C:\\My Profiles\\\\""');
 });
 
 test("planDshSpawn win32: a metacharacter-laden profile name is refused, not mangled", () => {

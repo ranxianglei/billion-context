@@ -36,6 +36,17 @@ export function scrubLoneSurrogates(text: string): string {
         .replace(/(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd");
 }
 
+/** Variant for input that is PROVABLY the output of JSON.stringify: the
+ *  well-formed stringify spec (ES2019, Node \u226512) renders every lone
+ *  surrogate half as `\\uXXXX` escape text, so the serialized string cannot
+ *  carry a real lone-half code unit and the character-level pass above scans
+ *  the full body twice by construction without ever replacing anything.
+ *  Serialized-body call sites use this escape-only form — keep the full
+ *  OnWire scrub for strings of unproven provenance. */
+export function scrubLoneSurrogateEscapesOnJson(text: string): string {
+    return scrubLoneSurrogateEscapes(text);
+}
+
 /** Escape-text counterpart for ALREADY-SERIALIZED JSON bodies. JSON.stringify
  *  renders a lone half as the six-character escape `\uXXXX`, so by the time a
  *  body is on the wire the half is ASCII escape text and scrubLoneSurrogates
@@ -99,4 +110,20 @@ export function scrubLoneSurrogateEscapes(text: string): string {
  *  seam; use scrubLoneSurrogates alone when the text is not yet JSON-encoded. */
 export function scrubLoneSurrogatesOnWire(text: string): string {
     return scrubLoneSurrogateEscapes(scrubLoneSurrogates(text));
+}
+
+/** One bounded display line out of text this process did not write (remote
+ *  feed documents: an advisory `reason`, a release-note `summary`). Those
+ *  strings are printed inside line-oriented surfaces the MODEL reads
+ *  (acp_status sections) and inside single log lines, so a line break in the
+ *  source would start a new, unattributed line there and an unbounded length
+ *  would land in the context window as-is. Every run of whitespace and
+ *  C0/C1 control characters (CR/LF/TAB, NEL, U+2028/U+2029 included) becomes
+ *  one space; anything past `cap` code units is cut on a code-point boundary
+ *  and marked with an ellipsis. Text already inside both bounds is returned
+ *  unchanged apart from the outer trim callers did before. */
+export function boundedLine(text: string, cap: number): string {
+    const flat = text.replace(/[\s\x00-\x1f\x7f-\x9f]+/g, " ").trim();
+    if (flat.length <= cap) return flat;
+    return `${safePrefix(flat, cap - 1).trimEnd()}\u2026`;
 }

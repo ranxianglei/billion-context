@@ -22,7 +22,7 @@
  * Kernel purity: host-side only, imports nothing from kernel internals.
  */
 
-import { biliToolsDeclaredOnWire } from "../session-self-heal.js";
+import { biliToolsDeclaredOnWire, declaredToolEntries } from "../session-self-heal.js";
 import { extractBillingAttributionBlock } from "../preflight.js";
 import { ANONYMOUS, hostProfileFor, type HostProfile } from "../host-profiles.js";
 import { CODE_MODE_OMNIBUS_TOOL_NAMES, mcpBiliToolName } from "../compress-tool.js";
@@ -52,10 +52,9 @@ interface WireObservation {
 
 function observeDeclaredTools(parsed: unknown, protocol: LaneProtocol): ReadonlySet<string> {
     const out = new Set<string>();
-    if (parsed === null || typeof parsed !== "object") return out;
-    const tools = (parsed as Record<string, unknown>)["tools"];
-    if (!Array.isArray(tools)) return out;
-    for (const t of tools) {
+    // #5527: every wire declaration location (top-level tools + Responses
+    // input[].additional_tools), not only the top-level array.
+    for (const t of declaredToolEntries(parsed, protocol)) {
         if (t === null || typeof t !== "object") continue;
         const rec = t as Record<string, unknown>;
         if (typeof rec["name"] === "string" && biliToolsDeclaredOnWire({ tools: [t] }, protocol, rec["name"])) out.add(rec["name"]);
@@ -77,6 +76,49 @@ function observeDeclaredTools(parsed: unknown, protocol: LaneProtocol): Readonly
     return out;
 }
 
+// ②b Deferred-tools observation (#6958). Claude Code defers its MCP tools:
+// `mcp__bili__compress` never appears in tools[] until the client's ToolSearch
+// loads it; instead the request messages carry an announcement block
+// ("…deferred tools are now available via ToolSearch … mcp__bili__compress …").
+// Reading ONLY tools[] made the tool invisible to the dialect/reachability
+// decisions, so the nudge advertised the bare `compress` — which CC rejects
+// with "No such tool available" (14 field workers hard-failed, 13 never
+// folded, sessions pinned at 133–244K tokens, #6958). The extractor scans
+// message text for the announcement and returns the bili tool FULL names it
+// lists. Observation only — no naming is derived here.
+const DEFERRED_TOOLS_MARKER = "deferred tools are now available via ToolSearch";
+
+function messageTextOf(m: unknown): string | undefined {
+    if (m === null || typeof m !== "object") return undefined;
+    const rec = m as { content?: unknown; text?: unknown };
+    if (typeof rec.content === "string") return rec.content;
+    if (Array.isArray(rec.content)) {
+        return rec.content
+            .map((p) => (p !== null && typeof p === "object" ? (p as { text?: unknown }).text : p))
+            .filter((t): t is string => typeof t === "string")
+            .join(" ");
+    }
+    return typeof rec.text === "string" ? rec.text : undefined;
+}
+
+export function extractDeferredBiliToolNames(parsed: unknown): ReadonlySet<string> {
+    const out = new Set<string>();
+    const messages = parsed !== null && typeof parsed === "object" ? (parsed as { messages?: unknown }).messages : undefined;
+    if (!Array.isArray(messages)) return out;
+    for (const m of messages) {
+        const t = messageTextOf(m);
+        if (typeof t !== "string" || !t.includes(DEFERRED_TOOLS_MARKER)) continue;
+        // The announcement block runs from the marker to the first blank line
+        // (CC 2.1.x shape: one tool full name per line).
+        const block = t.slice(t.indexOf(DEFERRED_TOOLS_MARKER)).split("\n\n")[0];
+        for (const line of block.split("\n")) {
+            const c = line.trim();
+            if (/^mcp__bili__/.test(c) && c.length < 128) out.add(c);
+        }
+    }
+    return out;
+}
+
 // ①b WireClientProfile — proxy-lane clients carry no pluginAgent header;
 // their identity is OBSERVED from wire signals. Registry discipline as ①:
 // the wire-client header-name literals live ONLY here (the old
@@ -92,6 +134,12 @@ interface WireClientSignals {
     readonly conversationSourceName: string | undefined;
     /** The shared codex UA/header detection (isCodexClient). */
     readonly codexUserAgent: boolean;
+    /** #5456: host-level opt-out for the instructions-fingerprint split
+     *  (config `personaSplit:false` / env BILI_PERSONA_SPLIT=0). The
+     *  fingerprint exists to keep DISJOINT subagent blobs off the main
+     *  lane; on a plain-proxy lane whose system prompt legitimately
+     *  changes every turn it forks the MAIN conversation instead. */
+    readonly personaSplitOff?: boolean;
 }
 
 interface WireClientEntry {
@@ -128,7 +176,15 @@ const WIRE_CLIENTS: readonly WireClientEntry[] = [
  * unknown clients resolve ANONYMOUS — instructions key VERBATIM for them,
  * #1106). */
 export function resolveWireClientProfile(signals: WireClientSignals): HostProfile {
-    for (const entry of WIRE_CLIENTS) if (entry.matches(signals)) return entry.profile;
+    for (const entry of WIRE_CLIENTS) {
+        if (!entry.matches(signals)) continue;
+        // #5456: the switch only disables the FINGERPRINT split; every other
+        // profile field (identity, caching rules, tool surface) stays.
+        if (signals.personaSplitOff && entry.profile.instructionsFingerprintKeyed) {
+            return { ...entry.profile, instructionsFingerprintKeyed: false };
+        }
+        return entry.profile;
+    }
     return ANONYMOUS;
 }
 // ③ LaneDecisions — the frozen decision object every gate reads.
@@ -244,6 +300,11 @@ export function nudgeOn(i: NudgeGateInputs): boolean {
 export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     const profile = hostProfileFor(input.pluginAgent);
     const declaredTools = observeDeclaredTools(input.parsed, input.protocol);
+    // #6958: hosts may ANNOUNCE a bili tool as deferred (Claude Code's
+    // ToolSearch block in the messages) instead of declaring it in tools[] —
+    // "the host has this tool" means declared OR announced. Observed from
+    // this request's parsed body (single site; no caller changes).
+    const deferredBiliTools = extractDeferredBiliToolNames(input.parsed);
     // Reachability truth: in PROXY mode bili itself injects the tool
     // definitions into the outbound body, so the surface is structurally on.
     // In PLUGIN mode the host owns the tool table: reach when this request
@@ -266,6 +327,7 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     const compressReachable = !input.pluginMode
         || declaredTools.has("compress")
         || declaredTools.has(mcpBiliToolName("compress"))
+        || deferredBiliTools.has(mcpBiliToolName("compress"))
         || [...CODE_MODE_OMNIBUS_TOOL_NAMES].some((n) => declaredTools.has(n))
         || !profile.toolsHostScopedByDefault
         // #2155: a sticky plugin-bound round with NO lane header is the zombie
@@ -277,7 +339,14 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
         // (#4344's silent-bridge case always sends the header — unaffected.)
         || (input.pluginMode && input.pluginHeaderPresent === false);
     const compressSurfaceOn = input.shouldInject && compressReachable;
-    const mcpDialect = input.pluginMode && declaredTools.has(mcpBiliToolName("compress")) && !declaredTools.has("compress");
+    // #4344 dialect, extended by #6958 to the deferred announcement: the
+    // standing prompt must teach `mcp__bili__compress` whenever the host's
+    // callable name is the MCP one — declared in tools[] (zcode, #4344) OR
+    // announced deferred (Claude Code, #6958), and never when the bare
+    // `compress` is also declared (the bare name wins).
+    const mcpDialect = input.pluginMode
+        && (declaredTools.has(mcpBiliToolName("compress")) || deferredBiliTools.has(mcpBiliToolName("compress")))
+        && !declaredTools.has("compress");
     const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;
     const billingBlockWanted = profile.wantsBillingBlock || billingBlockObserved;
     return Object.freeze({
@@ -294,7 +363,8 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
 /** #3884 owner follow-up: make a reachability miss LOUD instead of silent.
  * When an armed nudge stays suppressed because the lane surface is OFF for
  * reachability (not the user's own injectTool=false choice), name what was
- * actually observed on the top-level tool table: the next host omnibus rename
+ * actually observed on the request's declared tool table (every wire
+ * declaration location, #5527): the next host omnibus rename
  * then shows up in bili.log next to the ARMED-SUPPRESSED label as
  * `surface=off(top-level=[new_name])` instead of requiring user archaeology
  * (#3600 and #3884 were both diagnosed from user-reported log dumps). Returns
@@ -311,4 +381,22 @@ function systemOf(parsed: unknown): string | Array<Record<string, unknown>> | un
     const system = (parsed as Record<string, unknown>)["system"];
     if (typeof system === "string" || Array.isArray(system)) return system;
     return undefined;
+}
+
+/** #5418 gate — is the full-resend-watermark fastpath allowed to engage for
+ * this request? The fastpath (src/server/fastpath.ts) lets plugin-lane turns
+ * assert the re-sent prefix is unchanged via a server-measured count
+ * watermark; any miss degrades byte-identically to the legacy full-parse
+ * path. Title-gen sidecars are never stamped (fresh conversations),
+ * incremental-turn requests already send deltas, and the breaker holds the
+ * lane after repeated verified misses. Row-driven truth table:
+ * tests/lane-decisions-matrix.test.ts (watermarkGateAllowed rows). */
+export function watermarkGateAllowed(input: {
+    featureOn: boolean;
+    pluginMode: boolean;
+    titleGen: boolean;
+    incrementalTurn: boolean;
+    breakerArmed: boolean;
+}): boolean {
+    return input.featureOn && input.pluginMode && !input.titleGen && !input.incrementalTurn && !input.breakerArmed;
 }

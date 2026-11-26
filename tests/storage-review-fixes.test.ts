@@ -136,35 +136,42 @@ test("review 2: destroyed-substrate blocks are deleted and cannot resurrect on a
     });
 });
 
-test("review 3: corrupt index.db degrades to legacy-only instead of bricking the proxy", async () => {
+test("review 3: corrupt index.db alarms loudly — boots envelope-served, files untouched", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-review-corrupt-"));
     try {
         const session = loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
+        void session;
         fs.writeFileSync(path.join(dir, "index.db"), Buffer.concat([
             Buffer.from("SQLite format 3\0"),
             crypto.randomBytes(4096),
         ]));
 
         process.env.BILI_STORAGE_UNIFIED = "shadow";
-        let store: SessionStore;
         try {
-            store = new SessionStore({ dir, debounceMs: 1, enabled: true }); // must NOT throw
-            await store.writeNow(session);
-            const reloaded = store.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-            assert.ok(reloaded, "legacy fallback load must succeed");
-            assert.equal(store.replicasAvailable(), false, "shadow is unavailable while degraded");
-            await store.flushAll(); // flush the JSON record to disk (closeQuietly only cancels)
+            // #5124/#4816/#4626 behavior chain (FINAL, 2026-10-30): this
+            // corruption shape makes quick_check THROW; classified corruption
+            // no longer blocks startup either — NOTHING is renamed, copied or
+            // rebuilt automatically (auto-recovery cannot guarantee full data
+            // recovery), construction SUCCEEDS serving from the envelopes,
+            // and the loud alarm carries the manual fix.
+            const s1 = new SessionStore({ dir, debounceMs: 1, enabled: true });
+            s1.closeQuietly();
+            // Files byte-in-place: nothing renamed, nothing rebuilt.
+            const names = fs.readdirSync(dir);
+            assert.ok(!names.some((n) => n.startsWith("index.db.corrupt-")), `no automatic .corrupt-* copy may exist, got ${names.join(", ")}`);
+            assert.ok(fs.existsSync(path.join(dir, "index.db")), "the corrupt index.db must stay exactly where it is");
         } finally {
-            store!.closeQuietly();
             delete process.env.BILI_STORAGE_UNIFIED;
         }
 
-        // And a later process (fresh handle) still works the same way.
+        // And a later process behaves identically — a fresh scan of the SAME
+        // untouched file set (no FAIL verdict is ever persisted), same loud
+        // alarm, same boot-without-index outcome, never silent recovery.
         process.env.BILI_STORAGE_UNIFIED = "shadow";
         try {
-            const again = new SessionStore({ dir, debounceMs: 1, enabled: true });
-            assert.ok(again.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" }), "second process must load via legacy");
-            again.closeQuietly();
+            const s2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
+            s2.closeQuietly();
+            assert.ok(fs.existsSync(path.join(dir, "index.db")), "second boot must also leave the corrupt index exactly in place");
         } finally {
             delete process.env.BILI_STORAGE_UNIFIED;
         }

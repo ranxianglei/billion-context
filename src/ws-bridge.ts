@@ -93,9 +93,17 @@ export function installWebSocketBridge(
 ): (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean {
     const wss = new WebSocketServer({ noServer: true, maxPayload: limitsReceiveBytes(), perMessageDeflate: false });
     const sessions = new Set<{ session: WsBridgeSession; peer: WebSocket }>();
+    const pendingUpgrades = new Set<Duplex>();
+    let closing = false;
+    const stopPendingUpgrades = (): void => {
+        closing = true;
+        for (const socket of pendingUpgrades) socket.destroy();
+        pendingUpgrades.clear();
+    };
     let connectionId = 0;
     const close = server.close.bind(server);
     server.close = callback => {
+        stopPendingUpgrades();
         const live = [...sessions];
         sessions.clear(); // exactly-once: the 'close' event backstop below must not re-run
         for (const { session } of live) session.shutdown("server-close");
@@ -103,6 +111,7 @@ export function installWebSocketBridge(
         return close(callback);
     };
     server.on("close", () => {
+        stopPendingUpgrades();
         for (const { session } of sessions) session.shutdown("server-close");
         for (const peer of wss.clients) peer.terminate();
         wss.close();
@@ -118,7 +127,14 @@ export function installWebSocketBridge(
             return upstream === undefined ? [] : [{ codec: candidate, upstream, conversationId }];
         })[0] : undefined;
         if (!claim) return false;
+        if (closing) { socket.destroy(); return true; }
         const { codec, upstream, conversationId } = claim;
+        // HTTP has already handed this socket to the upgrade listener, but it
+        // is not a WebSocket client until async destination admission finishes.
+        // Keep it in the shutdown set throughout that gap, including DNS waits.
+        pendingUpgrades.add(socket);
+        const forgetPending = (): void => { pendingUpgrades.delete(socket); };
+        socket.once("close", forgetPending);
         // Stamp the codec name onto the upgrade request BEFORE the session is
         // created: codecs rebuild in-process HTTP envelopes from `source`, so
         // every envelope inherits this marker and the request pipeline can tell
@@ -128,11 +144,11 @@ export function installWebSocketBridge(
         source.headers["x-bili-ws-lane"] = codec.name;
         void (async () => {
             const verdict = await checkTunnelDestination(upstream, { selfPort: source.socket.localPort, clientLoopback: true, allowlist: tunnelAllowlistFromEnv(), egressProxied: isEgressProxied?.(upstream) });
+            if (closing || socket.destroyed) return;
             if (!verdict.ok) {
                 socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
                 return;
             }
-            if (socket.destroyed) return;
             wss.handleUpgrade(source, socket, head, peer => {
                 const label = `[${codec.name}] [conn=${++connectionId}] [session=${JSON.stringify(conversationId.slice(0, 128))}]`;
                 const trace: WsBridgeLog = (level, message) => log(level, `${label} ${message}`);
@@ -149,6 +165,9 @@ export function installWebSocketBridge(
         })().catch(() => {
             log("warn", `[${codec.name}] upgrade failed`);
             if (!socket.destroyed) socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        }).finally(() => {
+            forgetPending();
+            socket.off("close", forgetPending);
         });
         return true;
     };

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { UnifiedStore, type IngestSessionInput } from "../src/storage/store.ts";
+import { UnifiedStore, sha256Hex, type IngestSessionInput } from "../src/storage/store.ts";
 import { SqliteBackend } from "../src/storage/backend.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { MysqlBackend, type Mysql2Module } from "../src/storage/mysql.ts";
@@ -20,12 +20,15 @@ function fixture(requests = 1): IngestSessionInput {
             seq, msgId: `m${seq}`, ref: null, refNum: null, role: "user", kind: "message",
             content: JSON.stringify({ id: `m${seq}`, role: "user", text: `text${seq}` }),
         })),
-        blocks: [0, 1, 2].map((ord) => ({
-            blockId: `b${ord}`, ord, startSeq: ord, endSeq: ord, startRef: null, endRef: null, tier: 0,
-            summary: JSON.stringify({ text: `full${ord}`, count: 1 }),
-            one: JSON.stringify({ text: `one${ord}`, count: 1 }), supersedesBlockId: null,
-            active: ord !== 1, createdAt: 1, coveredHash: "[]", payloadJson: JSON.stringify({ blockId: `b${ord}` }),
-        })),
+        blocks: [0, 1, 2].map((ord) => {
+            const summary = JSON.stringify({ text: `full${ord}`, count: 1 });
+            const one = JSON.stringify({ text: `one${ord}`, count: 1 });
+            return {
+                blockId: `b${ord}`, ord, startSeq: ord, endSeq: ord, startRef: null, endRef: null, tier: 0,
+                summary, one, summaryHash: sha256Hex(summary), oneHash: sha256Hex(one), supersedesBlockId: null,
+                active: ord !== 1, createdAt: 1, coveredHash: "[]", payloadJson: JSON.stringify({ blockId: `b${ord}` }),
+            };
+        }),
         refs: [
             { ord: 0, rawId: "a", ref: "m00001", refNum: 1 },
             { ord: 1, rawId: "b", ref: "m00001", refNum: 1 },
@@ -65,7 +68,9 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
                 db.prepare("UPDATE sessions SET stats_json = ? WHERE session_id = ?").run('{"requests":"2"}', "snapshot");
                 assert.equal(store.getLoadHeader("snapshot")!.requests, 2, "old numeric-string counter matches full-load arbitration");
                 assert.equal(store.getMetadataJson("snapshot"), '{"requests":1}');
-                assert.deepEqual(JSON.parse(store.getOrphansJson("snapshot")!), JSON.parse(fixture().orphansJson!));
+                // #6785 step 7: orphans_json migrates into orphan_blocks on ingest; the
+                // lazy read path is the union view (table rows + any legacy column keys).
+                assert.deepEqual(store.getOrphanViews("snapshot"), JSON.parse(fixture().orphansJson!));
                 const contents = store.getBlockContents("snapshot", { limit: 2, offset: 1 });
                 assert.deepEqual(contents.map((row) => row.blockId), ["b1", "b2"]);
                 assert.deepEqual(JSON.parse(contents[0]!.summary), { text: "full1", count: 1 });
@@ -152,7 +157,7 @@ test("mysql snapshot pins SQL, CAS and media hydration to its read-only connecti
             if (sql.includes("FROM content")) {
                 const bytes = values?.[0] === "msg" ? JSON.stringify({ imageBase64: { $media: mediaHash } })
                     : values?.[0] === mediaHash ? "image-bytes" : '{"text":"summary","count":1}';
-                return [[{ bytes }]];
+                return [[{ hash: values?.[0], bytes }]];
             }
             return [[]];
         },

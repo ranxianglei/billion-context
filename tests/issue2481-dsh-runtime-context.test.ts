@@ -25,7 +25,6 @@ import { dshRuntimeContextPath, durableMessageToolPaths } from "../src/durable-m
 // #2989: rig hygiene resets the LIVE session-order registry (the persona-
 // anchor ladder is off the production path on every lane since #3134 —
 // v2 order resolution everywhere, google included).
-import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -45,6 +44,35 @@ Approval prompts are disabled in this session: actions that require approval are
 // Cleared variant from the same emitter (deepseek-harness
 // packages/core/agent-loop/src/runtime-context.ts):
 const RT_CLEARED_MSG = `Current runtime context: none. Earlier runtime-context snapshots no longer apply.`;
+// #7085: dsh 0.2.2-rc.3 reworded the populated snapshot — it no longer
+// contains "Current runtime context" but opens with the lead-in "The
+// following information describes your current session:" wrapped in a
+// \x3csystem-reminder\x3e envelope (the cleared form still uses the old
+// literal, so both shapes coexist in transition sessions).
+const RT_MSG_NEW = `\x3csystem-reminder\x3e
+The following information describes your current session:
+
+Current working directory: "/path/to/repo".
+
+Current DSH file policy: danger-full-access. The DSH file sandbox does not restrict file modifications by available operations.
+
+Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set \`sandbox_permissions\`).
+\x3c/system-reminder\x3e`;
+// #7085: the RE-SEND variant — after the first snapshot is committed and a
+// context section changes, the emitter continues the lead-in with a period
+// ("…session. It replaces earlier versions of this context, including any
+// retained in conversation summaries.") instead of a colon. The classifier
+// marker must be the shared prefix without the trailing colon or every
+// state-change re-send (approval policy flip, cwd change) goes blind again.
+const RT_MSG_NEW_RESEND = `\x3csystem-reminder\x3e
+The following information describes your current session. It replaces earlier versions of this context, including any retained in conversation summaries.
+
+Current working directory: "/path/to/repo".
+
+Current DSH file policy: danger-full-access. The DSH file sandbox does not restrict file modifications by available operations.
+
+Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set \`sandbox_permissions\`).
+\x3c/system-reminder\x3e`;
 
 function filler(tag: string): string {
     return `${tag}-` + "z".repeat(900);
@@ -76,7 +104,6 @@ async function startRig(): Promise<Rig> {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetSessionOrderForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
@@ -142,6 +169,8 @@ test("dshRuntimeContextPath: projects both snapshot variants to durable/runtime-
     const msg = (contentType: string, text: unknown) => ({ id: "id-1", createdAt: 0, contentType, text }) as never;
     assert.equal(dshRuntimeContextPath(msg("text", RT_MSG)), "durable/runtime-context", "the populated sandbox/approval snapshot projects");
     assert.equal(dshRuntimeContextPath(msg("text", RT_CLEARED_MSG)), "durable/runtime-context", "the cleared form projects too (it invalidates the older pinned snapshots)");
+    assert.equal(dshRuntimeContextPath(msg("text", RT_MSG_NEW)), "durable/runtime-context", "the 0.2.2-rc.3 reworded snapshot projects too (#7085 — the old literal alone went blind)");
+    assert.equal(dshRuntimeContextPath(msg("text", RT_MSG_NEW_RESEND)), "durable/runtime-context", "the re-send intro (period, no colon) projects too (#7085 — the colon-terminated marker missed it)");
     // Deliberately foldable neighbors stay consumable:
     assert.equal(dshRuntimeContextPath(msg("text", "Time sampled while preparing turn: Fri Oct 09 2026 15:20:00 CST")), undefined, "the per-turn time-context carrier stays foldable");
     assert.equal(dshRuntimeContextPath(msg("text", "The approval policy changed from 'ask' to 'never' (changed by the user).")), undefined, "the approval-change DELTA is transient history (current state rides in the snapshot's approval:policy section)");
@@ -150,9 +179,11 @@ test("dshRuntimeContextPath: projects both snapshot variants to durable/runtime-
     assert.equal(dshRuntimeContextPath(msg("text", undefined)), undefined, "missing text is safe");
     const dshClassifier = durableMessageToolPaths["dsh"];
     assert.ok(dshClassifier, "dsh lane is registered");
-    assert.equal(dshClassifier!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
-    assert.equal(dshClassifier!(msg("text", "Instructions from: AGENTS.md")), "durable/agents-md", "lane entry still covers the #2447 baseline shape");
+    assert.equal(dshClassifier!(msg("text", "\x3csystem-reminder\x3e\n\x3cavailable_skills\x3e\n- name: x\n\x3c/available_skills\x3e\n\x3c/system-reminder\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
+    assert.equal(dshClassifier!(msg("text", "\x3csystem-reminder\x3e\nInstructions from: AGENTS.md\n\x3c/system-reminder\x3e")), "durable/agents-md", "lane entry still covers the #2447 baseline shape");
     assert.equal(dshClassifier!(msg("text", RT_MSG)), "durable/runtime-context", "lane entry covers the #2481 snapshot shape");
+    assert.equal(dshClassifier!(msg("text", RT_MSG_NEW)), "durable/runtime-context", "lane entry covers the #7085 reworded snapshot shape");
+    assert.equal(dshClassifier!(msg("text", RT_MSG_NEW_RESEND)), "durable/runtime-context", "lane entry covers the #7085 re-send intro shape");
     assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
 });
 
@@ -160,7 +191,7 @@ test("dshRuntimeContextPath: projects both snapshot variants to durable/runtime-
  *  runtime-context snapshot (it sits mid-history between two tagged fillers),
  *  execute a real compress through /__bili/plugin/tool, and return the next
  *  turn's upstream body. */
-async function runFoldScenario(agent: string, conv: string): Promise<{ postFoldBody: string; toolJson: Record<string, unknown> }> {
+async function runFoldScenario(agent: string, conv: string, snapshot: string = RT_MSG): Promise<{ postFoldBody: string; toolJson: Record<string, unknown> }> {
     const rig = await startRig();
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
@@ -174,7 +205,7 @@ async function runFoldScenario(agent: string, conv: string): Promise<{ postFoldB
         await (await post(msgs)).text();
         msgs.push({ role: "assistant", content: filler("A1") });
         // …turn 2 drops the snapshot mid-history…
-        msgs.push({ role: "user", content: RT_MSG });
+        msgs.push({ role: "user", content: snapshot });
         await (await post(msgs)).text();
         msgs.push({ role: "assistant", content: filler("A2") });
         // …and turns 3–8 grow past it.
@@ -228,6 +259,24 @@ test("dsh lane (#2481): the runtime-context snapshot survives a fold that positi
     assert.ok(!postFoldBody.includes("F5-"), "folded filler after the snapshot must be gone");
 });
 
+test("dsh lane (#7085): the 0.2.2-rc.3 reworded snapshot survives a fold that positionally covers it", async () => {
+    const { postFoldBody } = await runFoldScenario("dsh", "i7085-dsh", RT_MSG_NEW);
+    assert.ok(postFoldBody.includes("[Compressed conversation section]"), "the fold must have happened (protection may not veto the whole range)");
+    assert.ok(postFoldBody.includes("danger-full-access"), "the sandbox policy must survive the fold (hard-protected, stays fully visible)");
+    assert.ok(postFoldBody.includes("Approval prompts are disabled"), "the approval policy must survive too (one message carries both sections)");
+    assert.ok(!postFoldBody.includes("A1-"), "folded filler before the snapshot must be gone (the fold really consumed its range)");
+    assert.ok(!postFoldBody.includes("F5-"), "folded filler after the snapshot must be gone");
+});
+
+test("dsh lane (#7085): the 0.2.2-rc.3 re-send snapshot survives a fold that positionally covers it", async () => {
+    const { postFoldBody } = await runFoldScenario("dsh", "i7085-dsh-resend", RT_MSG_NEW_RESEND);
+    assert.ok(postFoldBody.includes("[Compressed conversation section]"), "the fold must have happened (protection may not veto the whole range)");
+    assert.ok(postFoldBody.includes("danger-full-access"), "the sandbox policy must survive the fold (hard-protected, stays fully visible)");
+    assert.ok(postFoldBody.includes("Approval prompts are disabled"), "the approval policy must survive too (one message carries both sections)");
+    assert.ok(!postFoldBody.includes("A1-"), "folded filler before the snapshot must be gone (the fold really consumed its range)");
+    assert.ok(!postFoldBody.includes("F5-"), "folded filler after the snapshot must be gone");
+});
+
 test("unregistered lane: without the guard the snapshot folds away (pins lane scoping)", async () => {
     const { postFoldBody } = await runFoldScenario("test-agent", "i2481-plain");
     assert.ok(postFoldBody.includes("[Compressed conversation section]"), "the fold must have happened");
@@ -238,21 +287,27 @@ test("session-level: the dsh lane stamps the guard onto the effective config", a
     const rig = await startRig();
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
-        const r = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "i2481-stamp" },
-            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: RT_MSG }] }),
-        });
-        assert.equal(r.status, 200);
-        await r.text();
-        const s = peekSession("i2481-stamp");
-        assert.ok(s, "dsh session exists");
+        const headers = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "i2481-stamp" };
+        // Turn 1 is a tool-less single-shot shape: the #5656 generic dsh
+        // single-shot sidecar gate diverts it onto the verbatim side lane
+        // (kernel no-touch — the declared residual), so no refs are assigned
+        // yet. No fold can happen before turn 2 (nothing compressible, no
+        // action surface), so protection landing on the first full-pipeline
+        // turn keeps the snapshot safe against every possible fold.
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: RT_MSG }] }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.ok(peekSession("i2481-stamp"), "dsh session exists");
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: RT_MSG }, { role: "assistant", content: "ok" }, { role: "user", content: "Second turn after the snapshot." }] }) });
+        assert.equal(r2.status, 200);
+        await r2.text();
         // The stamped effective config (read by /__bili/plugin/tool) carries the
         // guard — proven indirectly: the snapshot got a BLOCKED ref, i.e. it was
-        // recognized as protected AT ASSIGNMENT TIME on the very first turn.
+        // recognized as protected AT ASSIGNMENT TIME on the first full-pipeline
+        // turn (turn 2 — turn 1 rides the #5656 side lane).
         const sFull = getSession("i2481-stamp");
         const blockedRefs = Object.entries(sFull.state.messageRefs.byRaw).filter(([, ref]) => ref === "BLOCKED").length;
-        assert.ok(blockedRefs >= 1, "the snapshot message must carry a BLOCKED ref (never advertised, never foldable)");
+        assert.ok(blockedRefs >= 1, "the snapshot message must carry a BLOCKED ref by the first full-pipeline turn (never advertised, never foldable)");
     } finally {
         await closeRig(rig);
     }

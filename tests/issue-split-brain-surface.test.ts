@@ -12,6 +12,12 @@
 //   G2 the surfaced entry is dismissable (POST /__bili/storage/split-brain/
 //      ack): ack clears it, the SAME contest stays quiet, a NEW contest
 //      re-surfaces, an unknown session answers 400.
+//   G3 the stored verdict never outlives its evidence (#4626): it persists
+//      while the peer's marker evidence holds and self-clears at the status
+//      read once the peer provably stops contesting (both directions).
+//   G4 the evidence check fails closed (#4626): an unreadable writers dir or
+//      torn peer marker is UNKNOWN and keeps the notice; only provable
+//      absence/staleness clears.
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -23,8 +29,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { startServer } from "../src/server.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { probeBuiltinSqlite, probeHostBetterSqlite3, setPreferredSqliteEngineForTests, setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
-import { _resetStorageRuntimeStatusForTest, ackSplitBrainContest, recordSecondProcessOwner, recordSplitBrainContest, storageStatusWire, type SplitBrainContestInput } from "../src/storage/runtime-status.ts";
-import { createServedMarkerWriter, writerMarkerDir, type WriterIdentity } from "../src/served-markers.ts";
+import { _resetStorageRuntimeStatusForTest, ackSplitBrainContest, recordSecondProcessOwner, recordSplitBrainContest, registerSplitBrainEvidenceCheck, storageStatusWire, type SplitBrainContestInput } from "../src/storage/runtime-status.ts";
+import { createServedMarkerWriter, peerStillContests, writerMarkerDir, type WriterIdentity } from "../src/served-markers.ts";
 import { isPidAlive } from "../src/instance.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { renderPage } from "../src/web/page.ts";
@@ -112,6 +118,21 @@ function writeInstanceEntry(stateRoot: string, id: string, pid: number, lane?: s
     const entry: Record<string, unknown> = { instanceId: id, pid, port: 8787, origin: "http://127.0.0.1:8787", startedAt: Date.now() };
     if (lane !== undefined) entry.lane = lane;
     fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(entry));
+}
+
+// Beyond any sane pid_max (Linux default 4194304) — provably dead.
+const DEAD_PID = 999_999_999;
+
+function writePeerMarker(dir: string, id: string, pid: number, servedAt: Record<string, number>): string {
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${id}.json`);
+    fs.writeFileSync(file, JSON.stringify({ v: 1, instanceId: id, pid, origin: "http://127.0.0.1:8787", version: "0.1.205", lane: "dsh", servedAt }));
+    return file;
+}
+
+function backdate(file: string, ageMs: number): void {
+    const t = (Date.now() - ageMs) / 1000;
+    fs.utimesSync(file, t, t);
 }
 
 interface SplitBrainWire {
@@ -308,6 +329,121 @@ test("#3959 G2: ack clears the surfaced entry; same contest stays quiet, a new o
     _resetStorageRuntimeStatusForTest();
 });
 
+// ---- #4626: the stored verdict must not outlive its evidence ------------------
+
+test("#4626 G3: stored verdict persists while evidence holds, self-clears once the peer stops contesting", () => {
+    _resetStorageRuntimeStatusForTest();
+    const logs: string[] = [];
+    setLogCapture((level, msg) => logs.push(`${level} ${msg}`));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-4626-g3-"));
+    try {
+        const dir = writerMarkerDir(tmp);
+        const base: SplitBrainContestInput = {
+            sessionId: "sess-stale",
+            title: "Fix auth bug",
+            self: { instanceId: "self-1", pid: process.pid, origin: "http://127.0.0.1:18802", lane: "pi", version: "0.1.205" },
+            peer: { instanceId: "peer-gone", pid: DEAD_PID, origin: "http://127.0.0.1:8787", lane: "dsh", version: "0.1.204", servedAt: Date.now() - 1000 },
+            at: Date.now(),
+        };
+        // The server's registration shape (src/server.ts): the verdict holds iff
+        // the accused peer's own marker still contests — tri-state, fails closed.
+        registerSplitBrainEvidenceCheck((c) =>
+            peerStillContests(dir, "self-1", c.peer.instanceId, c.sessionId, Date.now()));
+
+        // Phase A — fresh tombstone (dead pid, marker just rewritten by the
+        // peer's graceful-shutdown flush): the notice MUST persist; a dead pid
+        // alone is not proof of absence on every platform.
+        const file = writePeerMarker(dir, "peer-gone", DEAD_PID, { [base.sessionId]: base.peer.servedAt });
+        recordSplitBrainContest(base);
+        assert.equal(storageStatusWire().splitBrain?.sessionId, "sess-stale", "fresh tombstone keeps the notice honest");
+
+        // Phase B — dead pid + marker older than the freshness grace: the next
+        // status read clears the stored verdict by itself (#4626).
+        backdate(file, 40_000);
+        assert.equal(storageStatusWire().splitBrain, null, "dead peer + stale marker clears the stored verdict at the status read");
+        assert.ok(logs.some((l) => l.startsWith("info ") && l.includes("[split-brain] session sess-stale") && l.includes("peer-gone") && l.includes(String(DEAD_PID))), "the clear is logged with full ids");
+        assert.equal(storageStatusWire().splitBrain, null, "stays cleared on subsequent reads");
+
+        // Phase C — an evidence-based clear must NOT poison the ack guard: if
+        // the same peer contests again, the notice surfaces again.
+        backdate(file, 0);
+        recordSplitBrainContest(base);
+        assert.equal(storageStatusWire().splitBrain?.sessionId, "sess-stale", "a renewed contest re-surfaces after an evidence-based clear");
+    } finally {
+        setLogCapture(null);
+        _resetStorageRuntimeStatusForTest();
+        rmrf(tmp);
+    }
+});
+
+test("#4626 G3-negative: without a registered check the stored verdict stands (legacy replay)", () => {
+    _resetStorageRuntimeStatusForTest();
+    const base: SplitBrainContestInput = {
+        sessionId: "sess-legacy",
+        self: { instanceId: "self-1", pid: process.pid, origin: "http://127.0.0.1:18802", lane: "pi", version: "0.1.205" },
+        peer: { instanceId: "peer-x", pid: DEAD_PID, origin: "http://127.0.0.1:8787", lane: "dsh", version: "0.1.204", servedAt: Date.now() - 1000 },
+        at: Date.now(),
+    };
+    try {
+        recordSplitBrainContest(base);
+        assert.equal(storageStatusWire().splitBrain?.sessionId, "sess-legacy", "no registered check ⇒ stored entry replays as-is");
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-4626-g3n-"));
+        try {
+            const dir = writerMarkerDir(tmp);
+            writePeerMarker(dir, "peer-live", process.pid, { [base.sessionId]: Date.now() - 1000 });
+            registerSplitBrainEvidenceCheck((c) =>
+                peerStillContests(dir, "self-1", c.peer.instanceId, c.sessionId, Date.now()));
+            const live: SplitBrainContestInput = { ...base, peer: { ...base.peer, instanceId: "peer-live", pid: process.pid } };
+            recordSplitBrainContest(live);
+            assert.equal(storageStatusWire().splitBrain?.sessionId, "sess-legacy", "live peer + fresh marker keeps the notice surfaced");
+        } finally {
+            rmrf(tmp);
+        }
+    } finally {
+        _resetStorageRuntimeStatusForTest();
+    }
+});
+
+test("#4626 G4: evidence check fails closed — unknown evidence keeps the notice", () => {
+    _resetStorageRuntimeStatusForTest();
+    const logs: string[] = [];
+    setLogCapture((level, msg) => logs.push(`${level} ${msg}`));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-4626-g4-"));
+    try {
+        const dir = writerMarkerDir(tmp);
+        const base: SplitBrainContestInput = {
+            sessionId: "sess-fc",
+            self: { instanceId: "self-1", pid: process.pid, origin: "http://127.0.0.1:18802", lane: "pi", version: "0.1.205" },
+            peer: { instanceId: "peer-gone", pid: DEAD_PID, origin: "http://127.0.0.1:8787", lane: "dsh", version: "0.1.204", servedAt: Date.now() - 1000 },
+            at: Date.now(),
+        };
+        registerSplitBrainEvidenceCheck((c) =>
+            peerStillContests(dir, "self-1", c.peer.instanceId, c.sessionId, Date.now()));
+        const file = writePeerMarker(dir, "peer-gone", DEAD_PID, { [base.sessionId]: base.peer.servedAt });
+        recordSplitBrainContest(base);
+        assert.equal(storageStatusWire().splitBrain?.sessionId, "sess-fc");
+
+        // Writers dir vanishes (state-dir move / transient FS error): UNKNOWN —
+        // the notice stays and no false "no longer contests" line appears.
+        fs.rmSync(dir, { recursive: true });
+        assert.equal(storageStatusWire().splitBrain?.sessionId, "sess-fc", "missing writers dir ⇒ unknown ⇒ notice kept");
+        assert.ok(!logs.some((l) => l.includes("no longer contests")), "an unknown verdict never logs a false clear");
+
+        // Dir restored but the accused marker reaped: PROVABLY STOPPED — clears.
+        fs.mkdirSync(dir, { recursive: true });
+        assert.equal(storageStatusWire().splitBrain, null, "absent peer marker ⇒ cleared at the status read");
+
+        // Torn/malformed marker: UNKNOWN again — a renewed verdict stays up.
+        fs.writeFileSync(file, "{ torn mid-write");
+        recordSplitBrainContest(base);
+        assert.equal(storageStatusWire().splitBrain?.sessionId, "sess-fc", "unreadable peer marker ⇒ unknown ⇒ notice kept");
+    } finally {
+        setLogCapture(null);
+        _resetStorageRuntimeStatusForTest();
+        rmrf(tmp);
+    }
+});
+
 // ---- web surface: wire + endpoint + page/client/i18n ---------------------------
 
 test("#3959 web: status carries secondProcess/splitBrain; ack endpoint clears; page/client/i18n wired", async () => {
@@ -326,11 +462,17 @@ test("#3959 web: status carries secondProcess/splitBrain; ack endpoint clears; p
         assert.equal(s.storage.secondProcess, null, "no second process recorded → null");
         assert.equal(s.storage.splitBrain, null, "no contest recorded → null");
 
+        // #4626: surfaced entries re-evaluate against CURRENT writer-marker
+        // evidence at each status read — give the recorded contest real
+        // evidence in the server's writers dir (fresh mtime keeps it contested
+        // even though DEAD_PID is provably not a live process).
+        const peerMarker = writePeerMarker(path.join(base, "state", "billion-context", "writers"), "peer-1", DEAD_PID, { "sess-web": Date.now() - 1000 });
+
         const contest: SplitBrainContestInput = {
             sessionId: "sess-web",
             title: "Fix auth bug",
             self: { instanceId: "self-1", pid: process.pid, origin: "http://127.0.0.1:18802", lane: "pi", version: "0.1.202" },
-            peer: { instanceId: "peer-1", pid: 4242, origin: "http://127.0.0.1:8787", lane: "dsh", version: "0.1.201", servedAt: 1000 },
+            peer: { instanceId: "peer-1", pid: DEAD_PID, origin: "http://127.0.0.1:8787", lane: "dsh", version: "0.1.201", servedAt: 1000 },
             at: Date.now(),
         };
         recordSplitBrainContest(contest);
@@ -338,7 +480,7 @@ test("#3959 web: status carries secondProcess/splitBrain; ack endpoint clears; p
         assert.equal(s.storage.splitBrain?.sessionId, "sess-web", "status wire carries the surfaced contest");
         assert.equal(s.storage.splitBrain?.title, "Fix auth bug");
         assert.equal(s.storage.splitBrain?.peer.lane, "dsh");
-        assert.equal(s.storage.splitBrain?.peer.pid, 4242);
+        assert.equal(s.storage.splitBrain?.peer.pid, DEAD_PID);
 
         const acked = await postJson(port, "/__bili/storage/split-brain/ack", { sessionId: "sess-web" });
         assert.equal(acked.status, 200, "ack of the surfaced session answers 200");
@@ -354,6 +496,13 @@ test("#3959 web: status carries secondProcess/splitBrain; ack endpoint clears; p
         recordSplitBrainContest({ ...contest, peer: { ...contest.peer, servedAt: 2000 } });
         s = await fetchJson<{ storage: StorageWireShape }>(port, "/__bili/status");
         assert.equal(s.storage.splitBrain?.sessionId, "sess-web", "a NEW contest re-surfaces on the wire after ack");
+
+        // #4626 end-to-end: once the peer's marker is past its freshness grace
+        // and its pid is provably dead, the next status read clears the notice
+        // WITHOUT a manual ack.
+        backdate(peerMarker, 40_000);
+        s = await fetchJson<{ storage: StorageWireShape }>(port, "/__bili/status");
+        assert.equal(s.storage.splitBrain, null, "stale verdict self-clears at the status read without a manual ack");
 
         const html = renderPage("http://127.0.0.1:1", "0.0.0");
         assert.ok(html.includes('id="split-brain-banner"'), "page carries the split-brain banner div");

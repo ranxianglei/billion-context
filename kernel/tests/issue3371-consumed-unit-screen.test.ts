@@ -1,13 +1,11 @@
 // #3371: screenRecommendedUnits must not advertise a message-ref unit whose
-// entire span is already owned by an active, NOT restored-inline block — the
-// apply lane's livelock guard (compress.ts, pi#199) is GUARANTEED to reject
-// exactly that shape ("Range ... contains no new compressible messages")
-// unless the shared refold verdict classifies it a genuine in-place refold
-// (#398). Before the fix the two lanes disagreed on the shape: recommend
-// advertised it, apply threw, forever — the #3236 advertise→reject loop
-// family reached through the consumed-unit shape. The verdict lives in
-// refold.ts, extracted from compress.ts so BOTH lanes consult one
-// definition (projectUnit discipline).
+// entire span is already owned by an active, NOT restored-inline block.
+// #4521 note: the apply lane (compress.ts) no longer THROWS on that shape — it
+// returns the idempotent no-op outcome (covered-range warning, zero blocks) —
+// so the two lanes now agree by both declining to fold it without failing
+// the request. Before #3371 the two lanes disagreed: recommend advertised it,
+// apply threw, forever. The verdict lives in refold.ts, extracted from
+// compress.ts so BOTH lanes consult one definition (projectUnit discipline).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -70,19 +68,26 @@ test("#3371: consumed, not-restored span is screened OUT and apply agrees (no ad
   const screened = screenRecommendedUnits([consumedUnit], all, state, cfg, new Set());
   assert.equal(screened.length, 0, "consumed & not restored-inline must not be advertised");
 
-  // apply-side agreement: the same range is a livelock-guard rejection
+  // apply-side agreement (#4521): the same range is now the idempotent
+  // no-op class — zero errors, zero blocks, guidance in warnings[] (it used
+  // to be the livelock-guard throw; refusing it whole-batch is what fed the
+  // retry loops). Recommend still never advertises it, so the lanes agree:
+  // nothing advertised, nothing folded, nothing failed.
   const applied = core.applyCompression({
     ranges: [{ startRef: consumedUnit.startRef, endRef: consumedUnit.endRef, summary: "nope" }],
     messages: all,
     state: structuredClone(state),
     config: cfg,
   });
-  assert.ok(applied.result.errors.length > 0, "apply must reject the same shape");
+  assert.equal(applied.result.errors.length, 0, applied.result.errors.join("; "));
+  assert.equal(applied.result.blocksCreated, 0);
+  assert.equal(applied.result.noop, true);
   assert.match(
-    applied.result.errors.join("; "),
-    /contains no new compressible messages/,
-    "and it must be the livelock rejection, not some other error",
+    applied.result.warnings.join("; "),
+    /already covered by active block\(s\) b1/,
+    "and it must be the covered no-op warning, not some other error",
   );
+  assert.match(applied.result.warnings.join("; "), /do not resend this range/);
 });
 
 test("#3371: a genuine refold (restored-inline) stays advertised and applies cleanly", () => {

@@ -292,6 +292,40 @@ test("config/credential API never echoes keys, and saves validate recipes and ch
     }
 });
 
+test("whole-file save accepts documented mitm:// URL lanes but still rejects route fields on named keys (#5620)", async () => {
+    const path = join(root(), "config.json");
+    const previous = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = path;
+    writeFileSync(path, "{}");
+    const server = http.createServer((req, res) => {
+        const handler = req.method === "GET" ? handleConfigGet(res) : handleConfigPut(req, res);
+        void handler.catch(() => { res.writeHead(500); res.end("test handler failed"); });
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const base = `http://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port}`;
+    const save = async (config: unknown) => fetch(base, { method: "PUT", body: JSON.stringify({ file: JSON.stringify(config) }) });
+    try {
+        let response = await save({ providers: { "mitm://api.anthropic.com": { compress: { maxContextLimit: "50%" } } } });
+        assert.equal(response.status, 200);
+        assert.equal(JSON.parse(await response.text()).ok, true);
+        assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).providers["mitm://api.anthropic.com"], { compress: { maxContextLimit: "50%" } });
+        response = await save({ providers: { "https://api.anthropic.com": { compress: { maxContextLimit: "55%" } } } });
+        assert.equal(response.status, 200);
+        assert.equal(JSON.parse(await response.text()).ok, true);
+        // A genuinely NAMED key carrying a route-only field is still refused —
+        // the predicate change admits URL lanes only, not route-shaped names.
+        response = await save({ providers: { myname: { compress: { maxContextLimit: "50%" } } } });
+        assert.equal(response.status, 400);
+        assert.match(await response.text(), /invalid recipe on named provider \\"myname\\"/);
+    } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        if (previous === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = previous;
+    }
+});
+
 test("autoFold rides both the chain form and the expanded rail form", () => {
     const chain = parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], autoFold: true, autoFoldTargetTokens: 12000 });
     assert.equal(chain.autoFold, true);

@@ -28,6 +28,7 @@ jobs:
   # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
   # or on the 30-min cron when master moved since the last green scheduled run.
   gate:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -47,7 +48,7 @@ jobs:
           run=true
           if [ "$EVENT" = "pull_request" ]; then
             # only the ci:full label itself may trigger; other label events skip
-            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then run=false
+            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ] && [ "$LABEL_EVENT" != "ci:force" ]; then run=false
             elif ! grep -qw ci:full <<<"$PR_LABELS"; then run=false; fi
           elif [ "$EVENT" = "schedule" ]; then
             LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci-registry.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
@@ -57,7 +58,7 @@ jobs:
           echo "run=$run" >> "$GITHUB_OUTPUT"
   e2e-registry:
     needs: [gate]
-    if: needs.gate.outputs.run == 'true'
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (needs.gate.outputs.run == 'true') }}
     name: hermetic registry e2e (local verdaccio; loopback only, zero secrets)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
@@ -92,13 +93,13 @@ jobs:
         run: echo "BILI_E2E_REAL_BASELINE=$(npm view billion-context version)" >> "$GITHUB_ENV"
 
       - name: Run hermetic registry E2E
-        run: ACP_TEST_REGISTRY=1 node --import tsx --test tests/e2e/e2e-registry.test.ts tests/e2e/e2e-advisory-rollback.test.ts
+        run: ACP_TEST_REGISTRY=1 node --import tsx --test tests/e2e/e2e-registry.test.ts tests/e2e/e2e-advisory-rollback.test.ts tests/e2e/e2e-selfupdate-cli.test.ts
 
       - name: Collect E2E artifacts
         if: failure()
         run: |
           mkdir -p tmp/e2e-artifacts
-          for d in tmp/e2e-registry-* tmp/e2e-advisory-* tmp/e2e-npm-global-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+          for d in tmp/e2e-registry-* tmp/e2e-advisory-* tmp/e2e-selfupdate-* tmp/e2e-npm-global-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
 
       - uses: actions/upload-artifact@v4
         if: failure()

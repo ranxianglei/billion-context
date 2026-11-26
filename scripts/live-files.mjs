@@ -57,6 +57,9 @@ export const LIVE_FILES = [
     // both spawn the corrupt-index-child helper (unified-store cold-load
     // corruption probes, #4216/#4249 follow-ups); append-only per the note above
     "tests/storage-engine-proofs.test.ts",
+    // lock-holder CHILD process parks on a hermetic mkdtemp index.db (#2195
+    // release-gate pin); binds no ports — zone slot is a formality
+    "tests/storage-open-busy-lock.test.ts",
     "tests/web-storage-banner.test.ts",
     // #4434 (split-brain surface): spawns bili CLI children against a throwaway
     // origin; own probe server is listen(0) so only the zone band matters
@@ -68,6 +71,10 @@ export const LIVE_FILES = [
     // servers; every socket is listen(0), spawns are mocked, so the zone band
     // is belt-and-braces like #3890's — the entry is for the tripwire
     "tests/issue4811-dsh-busy-drop-selfheal.test.ts",
+    // #4977: spawns real CLI children against listen(0) ports (zombie holds
+    // the port; the ghost row binds it); zone band is belt-and-braces like
+    // #4341's — the entry is for the SPAWN_RE tripwire
+    "tests/issue4977-present-twin-persist-gate.test.ts",
     // #4982: integration rows spawn bili children against freePort() picks and
     // follow each child's REGISTERED port (ladder-tolerant); BASE is an
     // in-memory-only value, so no zone band is needed — the entry is for the
@@ -83,6 +90,10 @@ export const LIVE_FILES = [
     // spawns a bare `node -e` child that only prints env — no ports, no
     // servers, so the zone band is irrelevant; the entry is for the tripwire
     "tests/preload-sandbox-dirs.test.ts",
+    // #5046/B: spawns one bare `node -e` dummy child purely as a live PID
+    // holder for the lock-file fixtures — no ports, no servers, so the zone
+    // band is irrelevant; the entry is for the tripwire
+    "tests/issue5046-second-writer-degrade.test.ts",
     // #4762: in-process eval workers only (wedge probes), never bind a port -
     // the entry exists for the spawn tripwire alone, like #3890
     "tests/event-loop-watchdog.test.ts",
@@ -99,6 +110,61 @@ export const LIVE_FILES = [
     // #4612: spawns an idle node child as the "other live process" fixture;
     // binds no ports, mkdtemp-isolated per test
     "tests/issue4612-gc-online-guard.test.ts",
+    // #5487: spawns a one-shot sealer child (process.execPath) against its own
+    // mkdtemp dir to exercise concurrent sealing; no sockets are bound, so no
+    // zone port band is needed — the entry is for the SPAWN_RE tripwire alone
+    "tests/log-retention.test.ts",
+    // #5631 restart survival: real bili proxy children under OS signals
+    // (SIGTERM/SIGKILL/clean shutdown). Private mkdtemp homes per lane-arm,
+    // probed-free ports re-probed on every restart — no band reuse.
+    "tests/issue5631-restart-survival.test.ts",
+    // #5666: process-liveness regression — spawns ONE bare node child (--import
+    // tsx) that arms a keepalive through the real scheduler and asserts it exits
+    // on its own; the child runs under a per-run mkdtemp XDG sandbox, does no
+    // network I/O and binds no port, so no zone band is needed — the entry is for
+    // the tripwire alone, like #3890/#5114
+    "tests/cache-keepalive.test.ts",
+    // #5955: the only real child is ONE bare `node -e ""` spawned purely to
+    // hand back an already-reaped pid (win32 taskkill-then-SIGKILL silence);
+    // the takeover ladder itself runs on INJECTED deps — no proxy is started,
+    // no port is bound, no shutdown/kill signal ever reaches the OS. Fixed
+    // fake origins only, so no zone band is needed — the entry is for the
+    // tripwire alone, like #3890/#5114/#5666
+    "tests/issue5955-wedged-same-lane-takeover.test.ts",
+    // #5940: the wiring facet spawnSyncs one bare node child (--import tsx) that
+    // drives the real background quick_check worker on a per-run mkdtemp fixture
+    // DB; the spawn is synchronous (blocks the shard runner while it runs), the
+    // child binds no port and does no network I/O, so no zone band is needed —
+    // the entry is for the tripwire alone, like #3890/#5114
+    "tests/integrity-worker-stderr.test.ts",
+    // Real npm pack/install children use mkdtemp package fixtures and the
+    // preload's per-process XDG roots; they bind no listener ports.
+    "tests/pack-install.test.ts",
+    // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
+    "tests/ci-janitor-fork-heads.test.ts",
+    // Spawns short-lived `bash -c` children executing the extracted ci.yml plan
+    // script with env fixtures; results land in mkdtemp dirs — no ports, no
+    // credentials, no long-lived listeners, safe under --test-concurrency.
+    "tests/ci-stale-pr-gate.test.ts",
+    // Heap-bounded log readers in isolated children; private files, no sockets.
+    "tests/web-logs-query.test.ts",
+    // Native-zstd absence is simulated in an isolated Node child; it binds
+    // no sockets and changes only that child's built-in module exports.
+    "tests/content-encoding-zstd.test.ts",
+    // One Linux-only Node child reads fixture system CAs and exits within 10s;
+    // no child ports or network I/O. In-process HTTPS fixtures use listen(0).
+    "tests/upstream-ca-default-trust.test.ts",
+    // #7156: the close-time cache-refresh gate test spawns ONE bare `node -e`
+    // dummy child purely as a live PID holder for the <db>.lock fixture — no
+    // ports, no servers, mkdtemp-isolated per test, SIGKILL'd in t.after, so
+    // the zone band is irrelevant; the entry is for the tripwire, like
+    // #5046/#4612.
+    "tests/storage-integrity-cache.test.ts",
+    // #7156: the only child is spawnSync("true") in freshDeadPid() — a
+    // guaranteed-dead pid for the stale-lock fixture; no ports, no servers,
+    // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
+    // for the tripwire, like #5046/#4612.
+    "tests/storage-backup-repair.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

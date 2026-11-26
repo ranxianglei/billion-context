@@ -134,7 +134,12 @@ test("issue #221: re-request rejected 400 → degraded retry without thinking re
     }
 });
 
-test("issue #221: signature-less thinking (relay never sent signature_delta) is proactively dropped from the replay", async () => {
+// #5495 supersedes the original #221 pin here: "unsigned ⇒ always dropped" was
+// the buggy generalization — an Anthropic-wire upstream that does NOT sign
+// (DeepSeek /anthropic) REQUIRES the unsigned block passed back. The drop now
+// keys on per-attempt signing evidence (see core.ts requiresThinkingSignature):
+// no signature seen this attempt ⇒ unsigned relay ⇒ replay verbatim.
+test("issue #221/#5495: unsigned thinking with NO signing evidence in the attempt replays verbatim (unsigned relay)", async () => {
     const captured: CapturedRequest[] = [];
     let fetchCalls = 0;
     const orig = globalThis.fetch;
@@ -150,10 +155,47 @@ test("issue #221: signature-less thinking (relay never sent signature_delta) is 
             captured,
         );
         assert.equal(fetchCalls, 1, "single re-request, accepted on first try");
-        assert.equal(assistantThinkingBlocks(captured[0].body).length, 0, "signature-less thinking is never replayed (it 400s on Anthropic-protocol validation)");
+        assert.equal(assistantThinkingBlocks(captured[0].body).length, 1, "no signature seen this attempt = unsigned upstream: the block is legitimate and must be echoed back (#5495)");
         assert.ok(JSON.stringify(captured[0].body).includes('"acp_status"'), "acp_status continuation intact");
         assert.ok(out.includes("[ACP]"), "marker surfaced to client");
         assert.ok(out.includes("Continued after compression."), "round-2 text reaches the client");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("issue #221/#5495: an attempt that SAW a signature keeps the requirement — the unsigned sibling stays dropped", async () => {
+    const events = [
+        sse("message_start", { type: "message_start", message: { id: "msg_1", usage: { input_tokens: 10 } } }),
+        sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "corrupted unsigned block" } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+        sse("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "thinking", thinking: "" } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "thinking_delta", thinking: "signed block" } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "signature_delta", signature: "sig-abc" } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 1 }),
+        sse("content_block_start", { type: "content_block_start", index: 2, content_block: { type: "tool_use", id: "toolu_1", name: "acp_status", input: {} } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: STATUS_ARGS } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 2 }),
+        sse("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 7 } }),
+        sse("message_stop", { type: "message_stop" }),
+    ].join("");
+
+    const captured: CapturedRequest[] = [];
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+        fetchCalls++;
+        captured.push({ body: JSON.parse(String(init?.body)) });
+        return new Response(ROUND2_TEXT, { status: 200 });
+    }) as typeof fetch;
+    try {
+        await drain(new Response(events, { status: 200 }).body!, makeCtx(), captured);
+        assert.equal(fetchCalls, 1, "single re-request, accepted on first try");
+        const blocks = assistantThinkingBlocks(captured[0].body) as { thinking?: string; signature?: string }[];
+        assert.equal(blocks.length, 1, "signing upstream (evidence in-attempt): the unsigned block is still dropped (#221 preserved)");
+        assert.equal(blocks[0]!.thinking, "signed block");
+        assert.equal(blocks[0]!.signature, "sig-abc");
     } finally {
         globalThis.fetch = orig;
     }

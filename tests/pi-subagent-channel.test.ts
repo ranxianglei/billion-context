@@ -6,6 +6,9 @@
 // #2694: the hardening layer — a marker quoted in HISTORY (tool results,
 // assistant/user text) must not flip a main session's channel, incomplete
 // markers are documentation residue, and namespaced ACP grants count as grants.
+// #5220: the fallback channel's FAILED-ONLY compress round feeds the model a
+// recovery receipt (not a fabricated length break) — server-level pin through
+// the real pipeline (field repro: pi child, strict allowlist, malformed call).
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -200,15 +203,24 @@ function okAnthropic(): string {
     });
 }
 
-async function startRig(): Promise<Rig> {
+type RigResponder = (body: string, index: number) => { status?: number; headers?: Record<string, string>; body: string };
+
+async function startRig(respond?: RigResponder): Promise<Rig> {
     const forwards: string[] = [];
     const upstream = http.createServer((req, res) => {
         let b = "";
         req.on("data", (c) => (b += c));
         req.on("end", () => {
+            const index = forwards.length;
             forwards.push(b);
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(okAnthropic());
+            if (respond) {
+                const r = respond(b, index);
+                res.writeHead(r.status ?? 200, r.headers ?? { "content-type": "application/json" });
+                res.end(r.body);
+            } else {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(okAnthropic());
+            }
         });
     });
     upstream.listen(0, "127.0.0.1");
@@ -264,6 +276,10 @@ function forwardedToolNames(forwards: string[], index: number): string[] {
     const out: string[] = [];
     for (const t of parsed.tools ?? []) {
         if (typeof t.name === "string") out.push(t.name);
+        else {
+            const fn = t.function as Record<string, unknown> | undefined;
+            if (fn && typeof fn.name === "string") out.push(fn.name);
+        }
     }
     return out;
 }
@@ -315,6 +331,83 @@ test("#2268 server-level: tagged ACP-less delegate child gets proxy-style inject
         }, "pi"), 200);
         const e = forwardedToolNames(rig.forwards, 4);
         for (const n of CORE_ACP) assert.ok(!e.includes(n), `history-quoted marker must stay plugin mode (${n})`);
+    } finally {
+        rig.proxy.close();
+        rig.proxy.closeIdleConnections?.();
+        await once(rig.proxy, "close");
+        rig.upstream.close();
+        rig.upstream.closeIdleConnections?.();
+        await once(rig.upstream, "close");
+    }
+});
+
+// — #5220: failed-only round through the fallback channel —
+
+test("#2268+#5220: ACP-less delegate child whose compress fails gets a recovery receipt, not a length break", async () => {
+    const malformedArgs = JSON.stringify({ content: "THIS HEADER HAS NO MESSAGE REFERENCES\nSynthetic test of validation error recovery only." });
+    const chunk = (delta: Record<string, unknown>, finishReason?: string) =>
+        `data: ${JSON.stringify({ id: "c5220", object: "chat.completion.chunk", created: 1, model: "gpt-test", choices: [{ index: 0, delta, finish_reason: finishReason ?? null }] })}\n\n`;
+    const sse = (body: string) => ({ headers: { "content-type": "text/event-stream" }, body: body + "data: [DONE]\n\n" });
+
+    const rig = await startRig((_b, idx) =>
+        idx === 0
+            ? sse(chunk({ role: "assistant" }) + chunk({ tool_calls: [{ index: 0, id: "call_c5220", type: "function", function: { name: "compress", arguments: malformedArgs } }] }, "tool_calls"))
+            : sse(chunk({ role: "assistant", content: "CONTINUED-AFTER-RECEIPT-5220" }, "stop")));
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+        const res = await fetch(url, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "x-bili-plugin": "pi",
+                "x-bili-plugin-conversation": "sar-5220-a",
+            },
+            body: JSON.stringify({
+                model: "gpt-test",
+                stream: true,
+                messages: [
+                    { role: "system", content: tagged("delegate") },
+                    { role: "user", content: "do the thing" },
+                ],
+                tools: DELEGATE_TOOLS.map((name) => ({ type: "function", function: { name, description: "" } })),
+            }),
+        });
+        const text = await res.text();
+        assert.equal(res.status, 200);
+
+        // Entry path: the #2268 fallback channel was ON for this child.
+        const injected = forwardedToolNames(rig.forwards, 0);
+        for (const n of CORE_ACP) assert.ok(injected.includes(n), `fallback must inject ${n}; got ${injected.join(",")}`);
+
+        // THE regression assertion: the turn survived the failed-only round.
+        assert.equal(rig.forwards.length, 2, "failed-only round re-requests once instead of breaking the turn (#5220)");
+
+        // The client saw the failure marker AND the model's natural continuation.
+        assert.ok(text.includes("\u274c"), "failure marker reached the client stream");
+        assert.ok(text.includes("[ACP]"), "marker framing reached the client stream");
+        assert.ok(text.includes("CONTINUED-AFTER-RECEIPT-5220"), "model continuation reached the client");
+        const finishes: string[] = [];
+        for (const line of text.split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            const payload = line.slice(6);
+            if (payload === "[DONE]") continue;
+            try {
+                const j = JSON.parse(payload) as { choices?: Array<{ finish_reason?: string | null }> };
+                const fr = j.choices?.[0]?.finish_reason;
+                if (fr) finishes.push(fr);
+            } catch { /* heartbeat / partial line */ }
+        }
+        assert.equal(finishes.at(-1), "stop", `turn ends with the model's own finish, got ${finishes.join(",")}`);
+
+        // The retry body carries the receipt (the marker bytes) and NO ephemeral frames.
+        const retry = JSON.parse(rig.forwards[1]) as { messages: Array<Record<string, unknown>> };
+        const receipt = retry.messages.find((m) => m.role === "assistant" && typeof m.content === "string" && m.content.includes("[ACP]"));
+        assert.ok(receipt, "retry body carries an assistant receipt message");
+        assert.ok(String(receipt.content).includes("\u274c"), "receipt is the streamed failure marker itself");
+        for (const m of retry.messages) {
+            assert.notEqual(m.role, "tool", "no ephemeral tool-result frame rides the retry upstream");
+            assert.equal(m.tool_calls, undefined, "no ephemeral tool-call frame rides the retry upstream");
+        }
     } finally {
         rig.proxy.close();
         rig.proxy.closeIdleConnections?.();

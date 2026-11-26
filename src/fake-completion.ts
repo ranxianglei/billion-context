@@ -104,6 +104,6 @@ export function isFakeCompletion(protocol: WireProtocol, rawText: string): boole
 /** Append the fake-completion hint to the request body as a trailing user turn
  *  (per-wire shapes live in `appendTrailingUserText`). Returns the hinted JSON,
  *  or null if the body is unparseable, in which case the retry is skipped. */
-export function injectFakeCompletionHint(protocol: WireProtocol, body: string | Buffer): string | null {
-    return appendTrailingUserText(protocol, body, FAKE_COMPLETION_HINT);
+export function injectFakeCompletionHint(protocol: WireProtocol, body: string | Buffer, model?: string): string | null {
+    return appendTrailingUserText(protocol, body, FAKE_COMPLETION_HINT, model);
 }

@@ -207,7 +207,7 @@ test("refold updates the block in place: same id, replaced summary, flag cleared
   assert.equal(result.state.nextBlockId, 2, "no new block id allocated");
 });
 
-test("partial coverage of a restored block is still rejected, naming the blocking block id", () => {
+test("partial coverage of a restored block no-ops, naming the blocking block id", () => {
   const core = createCore();
   const messages = makeMessages(10);
   const ids = messages.map((m) => m.id);
@@ -225,11 +225,18 @@ test("partial coverage of a restored block is still rejected, naming the blockin
     config: config(),
   });
 
-  assert.match(result.result.errors[0]!, /already compressed/);
-  assert.match(result.result.errors[0]!, /partially covered b1/);
+  // #4521: the partial-refold verdict is the covered no-op class — guidance
+  // (refold the WHOLE restored span, or anchor by block id) rides warnings,
+  // and nothing mutates. Previously this rejected the whole batch with the
+  // same wording; the model then re-sent the identical range (a retry loop).
+  assert.equal(result.result.errors.length, 0);
+  assert.equal(result.result.blocksCreated, 0);
+  assert.equal(result.result.noop, true);
+  const w = result.result.warnings.join(" ");
+  assert.match(w, /partially covered b1/);
   const block = result.state.blocks[0]!;
-  assert.equal(block.summary, OLD_SUMMARY, "no mutation on rejection");
-  assert.equal(block.restoredInline, true, "marker survives rejection");
+  assert.equal(block.summary, OLD_SUMMARY, "no mutation on the no-op");
+  assert.equal(block.restoredInline, true, "marker survives the no-op");
   assert.equal(result.state.nextBlockId, 2);
 });
 
@@ -257,10 +264,13 @@ test("an unrecovered higher-tier folded block above a restored block is rejected
     config: config(),
   });
 
-  assert.match(result.result.errors[0]!, /already compressed/);
-  assert.match(result.result.errors[0]!, /blocked by b2 \(not restored\)/);
+  assert.equal(result.result.errors.length, 0);
+  assert.equal(result.result.blocksCreated, 0);
+  assert.equal(result.result.noop, true, "#4521: blocked refold is the covered no-op class");
+  const w = result.result.warnings.join(" ");
+  assert.match(w, /blocked by b2 \(not restored\)/);
   assert.doesNotMatch(
-    result.result.errors[0]!,
+    w,
     /blocked by b2.*blocked by b2/,
     "blocker listed once",
   );
@@ -517,7 +527,7 @@ test("full anchor view: range mixing a restored block with live tail creates a f
   assert.equal(result.state.nextBlockId, 3, "exactly one new id allocated");
 });
 
-test("full anchor view: unmarked block keeps the legacy livelock rejection verbatim", () => {
+test("full anchor view: unmarked block gets the covered no-op with the block-id guidance", () => {
   const core = createCore();
   const messages = longMessages(10);
   const state = makeState(messages, [
@@ -537,14 +547,16 @@ test("full anchor view: unmarked block keeps the legacy livelock rejection verba
     config: config(),
   });
 
-  assert.match(
-    result.result.errors[0]!,
-    /Range m00001\.\.m00010 contains no new compressible messages — every message in it is already covered by active block\(s\) b1/,
-  );
-  assert.match(
-    result.result.errors[0]!,
-    /reference them by block ID \(b1\.\.b1\)/,
-  );
+  // #4521: the legacy livelock throw is now the covered no-op — same span,
+  // same guidance, delivered as a warning on a success-shaped result so the
+  // model stops re-sending the range after a FAILED receipt.
+  assert.equal(result.result.errors.length, 0);
+  assert.equal(result.result.blocksCreated, 0);
+  assert.equal(result.result.noop, true);
+  const w = result.result.warnings.join(" ");
+  assert.match(w, /already covered by active block\(s\) b1/);
+  assert.match(w, /reference them by block ID \(b1\.\.b1\)/);
+  assert.match(w, /do not resend this range/);
   assert.equal(result.state.blocks.length, 1, "nothing applied");
   assert.equal(result.state.blocks[0]!.summary, OLD_SUMMARY);
   assert.equal(result.state.nextBlockId, 2);
@@ -648,8 +660,11 @@ test("old persisted format without restoredInline reads as false: refold rejecte
     state: loaded,
     config: config(),
   });
-  assert.match(rejected.result.errors[0]!, /already compressed/);
-  assert.match(rejected.result.errors[0]!, /blocked by b1 \(not restored\)/);
+  // #4521: unmarked → not refoldable → covered no-op (warning, not error).
+  assert.equal(rejected.result.errors.length, 0);
+  assert.equal(rejected.result.blocksCreated, 0);
+  assert.equal(rejected.result.noop, true);
+  assert.match(rejected.result.warnings.join(" "), /blocked by b1 \(not restored\)/);
   assert.equal(rejected.state.blocks[0]!.summary, OLD_SUMMARY);
 
   // Same load, then marked inline: refold now succeeds.

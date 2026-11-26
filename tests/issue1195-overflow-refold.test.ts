@@ -114,7 +114,10 @@ interface RecordedUpstream {
 // Records every request body in order. Streaming requests are answered by
 // `onStreaming(callIndex)`; stream:false (summarization) requests by the
 // in-band summary response.
-async function recordedUpstream(onStreaming: (callIndex: number, res: http.ServerResponse) => void): Promise<RecordedUpstream> {
+async function recordedUpstream(
+    onStreaming: (callIndex: number, res: http.ServerResponse, body: string) => void,
+    summarize = summaryJson,
+): Promise<RecordedUpstream> {
     const bodies: string[] = [];
     let streamingCall = 0;
     const server = http.createServer((req, res) => {
@@ -131,12 +134,12 @@ async function recordedUpstream(onStreaming: (callIndex: number, res: http.Serve
             }
             if (parsed.stream === false) {
                 res.writeHead(200, { "content-type": "application/json" });
-                res.end(summaryJson());
+                res.end(summarize());
                 return;
             }
             const call = streamingCall;
             streamingCall += 1;
-            onStreaming(call, res);
+            onStreaming(call, res, raw);
         });
     });
     server.listen(0, "127.0.0.1");
@@ -263,12 +266,15 @@ test("#2777: a failed compress after an accepted overflow fold keeps the fold fo
     assert.equal(response.status, 200);
     const stream = await response.text();
     const forwards = () => upstream.bodies.filter((raw) => (JSON.parse(raw) as { stream?: boolean }).stream !== false);
-    // #4186: the failed-only compress round ends the turn — there is no internal
-    // continuation re-request, and its ephemeral failure frame never reaches
-    // the upstream (old contract asserted three forwards here).
-    assert.equal(forwards().length, 2, "original overflow + accepted folded retry only");
+    // #4186→#5220: the failed-only compress round no longer ends the turn —
+    // the receipt re-request is the third forward. It must carry the streamed
+    // ❌ receipt (client-visible bytes) and NONE of this round's ephemeral
+    // failure frames (#1548/#4186 seam invariant).
+    assert.equal(forwards().length, 3, "original overflow + accepted folded retry + recovery-receipt re-request (#5220)");
     assert.ok(forwards()[0].includes("MARKER_1_"), "original request contains early history");
     assert.ok(forwards()[1].includes(SUMMARY_TEXT) && !forwards()[1].includes("MARKER_1_"), "accepted retry folded early history");
+    assert.ok(forwards()[2].includes("Compression FAILED"), "receipt re-request carries the ❌ receipt as assistant text");
+    assert.ok(!forwards()[2].includes("tool_result"), "ephemeral failure frames stay off the wire (#1548/#4186)");
     assert.match(stream, /Compression FAILED/, "the invalid-range receipt reaches the client");
     // #2777 core property under the new contract: the accepted fold survives
     // the failed compress into the NEXT turn's rebuild.
@@ -279,11 +285,11 @@ test("#2777: a failed compress after an accepted overflow fold keeps the fold fo
     });
     assert.equal(r2.status, 200);
     const f = forwards();
-    assert.equal(f.length, 3, "next turn hits the upstream once more");
-    assert.ok(f[2].includes(SUMMARY_TEXT), "next-turn rebuild retains the accepted summary");
-    assert.ok(!f[2].includes("MARKER_1_"), "next-turn rebuild does not resurrect folded early history");
-    assert.ok(f[2].includes("MARKER_11_"), "next-turn rebuild preserves the recent tail");
-    assert.ok(f[2].length < f[0].length, "rebuild stays smaller than the rejected original");
+    assert.equal(f.length, 4, "next turn hits the upstream once more");
+    assert.ok(f[3].includes(SUMMARY_TEXT), "next-turn rebuild retains the accepted summary");
+    assert.ok(!f[3].includes("MARKER_1_"), "next-turn rebuild does not resurrect folded early history");
+    assert.ok(f[3].includes("MARKER_11_"), "next-turn rebuild preserves the recent tail");
+    assert.ok(f[3].length < f[0].length, "rebuild stays smaller than the rejected original");
 });
 
 test("e2e #1195 C: when the folded retry is ALSO rejected, the client sees the RETRY's verdict, not the stale first 400 — and the arm stays for the next turn", async (t) => {
@@ -333,3 +339,90 @@ test("e2e #1195 C: when the folded retry is ALSO rejected, the client sees the R
     assert.equal(s!.stats.overflowArmTokens, 128000, "#1110 arm record stays at the stated window");
     assert.equal(s!.metadata.confirmedContextLimits, undefined, "#987: nothing learned");
 });
+
+for (const scenario of ["fits-before-refold", "fits-after-refold", "still-oversized", "budget-retry-rate-limited", "mismatched-output"] as const) {
+    test(`e2e #1195: LiteLLM input ${scenario}`, async (t) => {
+        const window = 128_000;
+        const firstInput = scenario === "fits-after-refold" || scenario === "still-oversized" ? 150_000 : 108_000;
+        const foldedInput = scenario === "still-oversized" ? 129_000 : 108_000;
+        const upstream = await recordedUpstream((call, res, raw) => {
+            const { max_tokens: output } = JSON.parse(raw) as { max_tokens: number };
+            const input = call === 0 ? firstInput : foldedInput;
+            if (scenario === "budget-retry-rate-limited" && call === 1) {
+                res.writeHead(429, { "content-type": "application/json", "retry-after": "12" });
+                res.end('{"error":{"message":"rate limited"}}');
+                return;
+            }
+            if (input + output <= window) {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(
+                    'data: {"id":"reply","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"recovered"},"finish_reason":null}]}\n\n' +
+                    'data: {"id":"reply","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":108000,"completion_tokens":1,"total_tokens":108001}}\n\n' +
+                    "data: [DONE]\n\n",
+                );
+                return;
+            }
+            const statedOutput = scenario === "mismatched-output" ? output + 1 : output;
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { type: "BadRequestError", message:
+                `Requested token count exceeds the model's maximum context length of ${window} tokens. You requested a total of ${input + statedOutput} tokens: ${input} tokens from the input messages and ${statedOutput} tokens for the completion.`
+            } }));
+        }, () => JSON.stringify({ choices: [{ message: { role: "assistant", content: SUMMARY_TEXT }, finish_reason: "stop" }] }));
+
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        setRegistryForTest({});
+        const proxy = await startServer(proxyBaseOptions(upstream.port, 400_000));
+        await once(proxy, "listening");
+        t.after(async () => {
+            proxy.close();
+            proxy.closeIdleConnections?.();
+            await once(proxy, "close");
+            upstream.server.close();
+            upstream.server.closeIdleConnections?.();
+            await once(upstream.server, "close");
+        });
+
+        const proxyPort = (proxy.address() as { port: number }).port;
+        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstream.port}/v1/chat/completions`;
+        const body = JSON.stringify({ model: "claude-test", max_tokens: 32_000, stream: true, messages: bigConversation() });
+        const headers = { "content-type": "application/json", "x-acp-session": `refold-split-${scenario}` };
+        const response = await fetch(url, { method: "POST", headers, body });
+        const responseText = await response.text();
+        const sends = upstream.bodies
+            .map(raw => JSON.parse(raw) as { stream?: boolean; max_tokens: number })
+            .filter(body => body.stream === true);
+        if (scenario === "budget-retry-rate-limited") {
+            assert.equal(response.status, 429);
+            assert.equal(response.headers.get("retry-after"), "12");
+            assert.match(responseText, /rate limited/);
+            assert.equal(upstream.bodies.length, 2);
+            return;
+        }
+        if (scenario === "mismatched-output") {
+            assert.equal(response.status, 400);
+            assert.equal(sends.length, 2, "only the existing refold is sent when reported output differs from the wire");
+            assert.ok(JSON.stringify(sends[1]).includes(SUMMARY_TEXT));
+            return;
+        }
+        if (scenario === "fits-before-refold") {
+            assert.equal(response.status, 200, responseText);
+            assert.match(responseText, /recovered/);
+            assert.equal(upstream.bodies.length, 2, "the exact payload fits after a budget-only retry, without any summarization");
+            assert.deepEqual(sends[1], { ...sends[0], max_tokens: window - firstInput });
+            return;
+        }
+        assert.ok(sends[1].max_tokens > window - foldedInput, "the folded retry must be rejected by the billed-token wall");
+        assert.ok(JSON.stringify(sends[1]).includes(SUMMARY_TEXT), "the second send contains the refold");
+        if (scenario === "fits-after-refold") {
+            assert.equal(response.status, 200, responseText);
+            assert.match(responseText, /recovered/);
+            assert.equal(sends.length, 3);
+            assert.equal(sends[2].max_tokens, window - foldedInput);
+            assert.deepEqual(sends[2], { ...sends[1], max_tokens: window - foldedInput });
+        } else {
+            assert.equal(response.status, 400);
+            assert.match(responseText, /129000 tokens from the input messages/);
+            assert.equal(sends.length, 2, "an output clamp cannot rescue oversized input");
+        }
+    });
+}

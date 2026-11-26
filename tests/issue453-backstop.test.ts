@@ -23,12 +23,16 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 test("clampOutputBudget: reduces an oversized request so input+output fits", () => {
     // window 262144, input ~130k, requested 131072 (the #453 repro shape).
+    // #5278: judged on the safety-inflated estimate (x1.12) so an understating
+    // estimator cannot eat the margin.
     const capped = clampOutputBudget(131_072, 130_000, 262_144);
     assert.ok(capped !== undefined, "must clamp");
-    const margin = Math.max(2048, Math.ceil(130_000 * 0.05));
-    assert.equal(capped, 262_144 - 130_000 - margin, "cap = window - input - margin");
+    const safeEst = Math.ceil(130_000 * 1.12);
+    const margin = Math.max(2048, Math.ceil(safeEst * 0.05));
+    assert.equal(capped, 262_144 - safeEst - margin, "cap = window - safe estimate - margin");
     assert.ok(capped < 131_072, "clamped below the requested budget");
-    assert.ok((capped ?? 0) + 130_000 <= 262_144, "input + clamped output never exceeds the window");
+    // teeth for the #5278 failure mode: even a 5%-understated real input fits.
+    assert.ok((capped ?? 0) + Math.ceil(130_000 * 1.05) <= 262_144, "understated input + clamped output never exceeds the window");
 });
 
 test("clampOutputBudget: no-op when the request already fits", () => {

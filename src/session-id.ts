@@ -1,11 +1,12 @@
 import { pckKeyAbated } from "./pck-probe.js";
 import { isCodexClient } from "./codex-compact.js";
+import { claudeLaneTokenIn } from "./claude-lane-token.js";
 import { resolveWireClientProfile } from "./server/lane-decisions.js";
 import type { PromptCacheRouting } from "./config.js";
 
 export type ConversationIdentity = {
     value: string;
-    source: "header" | "body-session" | "metadata-session" | "previous-response" | "prompt-cache-key" | "content-fingerprint" | "generated";
+    source: "header" | "body-session" | "metadata-session" | "previous-response" | "prompt-cache-key" | "zed-thread-id" | "content-fingerprint" | "generated";
     clientProvided: boolean;
 };
 
@@ -60,14 +61,22 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // unchanged below.
     // x-grok-session-id next: grok-shell (xAI's CLI) stamps its per-session
     // UUID on every model request (verified against grok-shell 1.0.34; the
-    // parallel x-grok-conv-id carries the same value and stays as a
-    // fallback). Client-specific name — same trust class as the claude
+    // parallel x-grok-conv-id carries the same value on the main conversation
+    // and stays as a fallback — but the #6884 source audit found that on the
+    // Responses-backend auxiliary paths it instead carries a TAGGED value
+    // (recap-<uuid> / btw-<uuid>), so the session id is the only trustworthy
+    // one there). Client-specific name — same trust class as the claude
     // header above: without it the request is anonymous and falls to
     // prefix-affinity, which forks every turn because grok-shell reorders
     // its replayed history head between turns.
     // x-mavis-session-id: MiniMax Code (mcode) stamps its per-conversation id
     // on every model request (#1050). Client-specific name — same trust class
     // as the claude/grok headers above.
+    // agent-session-id: goose stamps its sqlite sessions.id (default
+    // YYYYMMDD_<n>, stable across restarts) on every model request, BYOK and
+    // custom-provider paths included (#5825); a user-overridden header name
+    // simply degrades this lane. Client-specific name — same trust class as
+    // the headers above.
     // x-opencode-session-id: OpenCode 2.x stamps the request's OWN session id
     // here on every model request, while x-session-affinity / X-Session-Id /
     // x-opencode-session all carry the INHERITED cache-routing affinity
@@ -79,14 +88,63 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // for 2.x traffic and is inert for 1.x (header absent); root sessions are
     // unchanged either way (affinity === own id). Client-specific name — same
     // trust class as the headers above.
+    // x-conversation-id: CodeBuddy (`bili n`) stamps its persisted
+    // conversation object id on every model request — measured 2.181.0 across
+    // fresh/-c/-r processes: stable across restarts, survives compaction
+    // (#5825, decision A: merge low-trust recognition; per-message identity
+    // rides the transcript.jsonl harvest in src/identity-codebuddy.ts).
+    // Client-specific name; placed AFTER every stricter client header and the
+    // affinity tier, before the bare generic `session-id` names.
+    // x-agent-task-id: GitHub Copilot — every model request (main + each
+    // subagent) carries its own agent-task id; placed before the bare
+    // `x-session-id` so a subagent task keys itself apart from its parent
+    // conversation (#7439 worklist). Client-specific name, low collision risk.
     const pluginMarker = typeof headers["x-bili-plugin"] === "string";
-    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "agent-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-conversation-id", "x-agent-task-id", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];
         if (typeof v === "string" && v.trim().length > 0) return { name, value: v.trim() };
     }
     return undefined;
+}
+
+/** Memory workers replay the parent history but keep their tool tail private. */
+export function zcodeMemoryConversation(parent: string, headers: Record<string, string | string[] | undefined>): string | undefined {
+    if (headers["x-zcode-query-source"] !== "project_memory_extract"
+        || headers["x-zcode-session-type"] !== "other"
+        || headers["x-session-id"] !== parent) return undefined;
+    const query = headers["x-query-id"];
+    if (typeof query !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(query)) return undefined;
+    // |sub: descendants can take over host-stamped management calls; workers cannot.
+    return `${parent}|aux:zcode-memory:${query}`;
+}
+
+/** #7439 worklist — Qoder side tasks (agent summary / webfetch summary / hook
+ *  prompt) reuse the parent `x-session-id` and carry their task type only in the
+ *  Responses body `metadata.business_type`. Give each side task its own `|aux:`
+ *  lane so it does not merge into the parent conversation (same pattern as
+ *  zcodeMemoryConversation above). Plain Task subagents carry no wire marker (a
+ *  fresh `x-request-set-id` only) and are unfixable here. The business_type
+ *  values are Qoder-specific, so applying this to any Responses-wire request is
+ *  safe. */
+const QODER_SIDE_TASK_TYPES = new Set(["agent_summary", "webfetch_summary", "hook_prompt"]);
+export function qoderSideTaskConversation(parent: string, body: unknown): string | undefined {
+    const metadata = (body as { metadata?: unknown } | undefined)?.metadata;
+    if (typeof metadata !== "object" || metadata === null) return undefined;
+    const m = metadata as Record<string, unknown>;
+    const bt = m.business_type;
+    if (typeof bt !== "string" || !QODER_SIDE_TASK_TYPES.has(bt)) return undefined;
+    // Two side tasks of the SAME business_type under one parent are distinct
+    // logical conversations. Disambiguate with the per-task id from the body
+    // (same pattern as zcodeMemoryConversation's x-query-id) so GA-on (which
+    // retires the in-lane content-guessed split) does not merge them; fall back
+    // to the type-only lane when the id is absent or malformed.
+    const taskId = m.task_id;
+    if (typeof taskId === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(taskId)) {
+        return `${parent}|aux:qoder-${bt}:${taskId}`;
+    }
+    return `${parent}|aux:qoder-${bt}`;
 }
 
 /** #1106/#1102: whether the Responses-wire instructions fingerprint should
@@ -127,7 +185,7 @@ export function conversationHeaderSource(headers: Record<string, string | string
  * (#3482): present header names, the resolved conversation-source header,
  * and the codex user-agent fact. Shared by every predicate below so the
  * signal extraction stays single-sourced. */
-function wireClientSignals(headers: Record<string, string | string[] | undefined>): { headerNames: Set<string>; conversationSourceName: string | undefined; codexUserAgent: boolean } {
+function wireClientSignals(headers: Record<string, string | string[] | undefined>, personaSplitOff?: boolean): { headerNames: Set<string>; conversationSourceName: string | undefined; codexUserAgent: boolean; personaSplitOff?: boolean } {
     const headerNames = new Set<string>();
     for (const [name, value] of Object.entries(headers ?? {})) {
         const first = Array.isArray(value) ? value[0] : value;
@@ -137,15 +195,19 @@ function wireClientSignals(headers: Record<string, string | string[] | undefined
         headerNames,
         conversationSourceName: conversationHeaderSource(headers)?.name,
         codexUserAgent: isCodexClient(headers),
+        personaSplitOff,
     };
 }
 
-export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>): boolean {
+export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>, personaSplitOff?: boolean): boolean {
     // Detection only — the client-identity DECISION (who keys by
     // instructions) lives in the lane-decisions wire-client registry
     // (#3482 site 4): the header-name literals are registry data, not
     // scattered comparisons. Signals are name-free observations here.
-    return resolveWireClientProfile(wireClientSignals(headers)).instructionsFingerprintKeyed;
+    // personaSplitOff (#5456): host-level opt-out threaded from ProxyOptions
+    // so resolveWireClientProfile can strip instructionsFingerprintKeyed
+    // without mutating WIRE_CLIENTS literals.
+    return resolveWireClientProfile(wireClientSignals(headers, personaSplitOff)).instructionsFingerprintKeyed;
 }
 
 /** #4352: whether THIS request's claude-code-over-Anthropic traffic should
@@ -170,6 +232,38 @@ export function instructionsFingerprintApplies(headers: Record<string, string | 
  * instructionsFingerprintApplies above. */
 export function claudeAnthropicPersonaOrderApplies(headers: Record<string, string | string[] | undefined>): boolean {
     return resolveWireClientProfile(wireClientSignals(headers)).personaOrderKeyed;
+}
+
+/** #5095 (D1-C): extract the bili SubagentStart lane token from an Anthropic
+ *  request's messages. The hook injects the token into the dispatch's FIRST
+ *  user message, so the scan stops at the first user message — a marker
+ *  pasted by the user into a LATER message must never fork the main
+ *  conversation off its raw key. Content shapes: bare string, or a block
+ *  array where only `type:"text"` blocks are scanned (the hook context may
+ *  sit inside a <system-reminder> wrapper; the marker is matched as a
+ *  substring, so the wrapper shape does not matter). Returns undefined when
+ *  absent — the overwhelmingly common case (main turns, other hosts,
+ *  un-upgraded installs) keeps resolution byte-identical to before. */
+export function claudeSubagentLaneTokenOf(messages: unknown): string | undefined {
+    if (!Array.isArray(messages)) return undefined;
+    for (const msg of messages) {
+        if (msg === null || typeof msg !== "object") continue;
+        const m = msg as { role?: unknown; content?: unknown };
+        if (m.role !== "user") continue;
+        if (typeof m.content === "string") return claudeLaneTokenIn(m.content);
+        if (Array.isArray(m.content)) {
+            for (const block of m.content) {
+                if (block === null || typeof block !== "object") continue;
+                const b = block as { type?: unknown; text?: unknown };
+                if (b.type === "text" && typeof b.text === "string") {
+                    const tok = claudeLaneTokenIn(b.text);
+                    if (tok !== undefined) return tok;
+                }
+            }
+        }
+        return undefined;
+    }
+    return undefined;
 }
 
 /** #1916/#1307/#1314: whether the persona fingerprint (session id + system
@@ -339,6 +433,26 @@ export function preferPromptCacheKeyIdentity<T extends ConversationIdentity>(
 }
 
 /**
+ * zed cloud wire thread_id promotion (#zed-cloud): cloud.zed.dev carries the
+ * conversation id ONLY in the request envelope (`{thread_id, prompt_id,
+ * provider, model, provider_request}`) — the inner provider body has none and
+ * zed sends no roster conversation header. `thread_id` is zed's stable
+ * per-thread uuid (the agent thread id), so it is exactly the missing signal
+ * the content-fingerprint fallback stands in for. It only replaces the
+ * fingerprint — real conversation headers and body session_ids stay stronger,
+ * so this can never override an identity the client stated more explicitly.
+ */
+export function preferZedThreadIdIdentity<T extends ConversationIdentity>(
+    identity: T | undefined,
+    threadId: unknown,
+): T | undefined {
+    if (!identity || identity.source !== "content-fingerprint") return identity;
+    const tid = typeof threadId === "string" ? threadId.trim() : "";
+    if (tid.length === 0) return identity;
+    return { ...identity, value: tid, source: "zed-thread-id", clientProvided: true };
+}
+
+/**
  * Codex turn-metadata partitioning (#316 / PR-A).
  *
  * Codex (>=0.147) sends `x-codex-turn-metadata` (JSON) on every Responses
@@ -452,6 +566,21 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
  */
 const MAIN_SYSTEM_PREFIXES = ["You are Claude Code", "You are an interactive agent"] as const;
 
+/** #7439: claude-code ≥2.1.247 sends a per-task class header
+ *  `x-claude-code-request-class` (main / subagent / workflow / compaction /
+ *  auxiliary / side_reply) — but ONLY when not on a 3rd-party base URL unless
+ *  `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is set (bili's launcher sets it, see
+ *  the `extras` on the claude preset in src/launcher.ts). Validated against the
+ *  observed set; undefined when absent or unknown so callers keep the legacy
+ *  agent-id/system-prefix path byte-for-byte. */
+const CLAUDE_REQUEST_CLASSES = ["main", "subagent", "workflow", "compaction", "auxiliary", "side_reply"] as const;
+
+export function claudeRequestClassOf(headers: Record<string, string | string[] | undefined>): string | undefined {
+    const raw = headers["x-claude-code-request-class"];
+    const v = typeof raw === "string" ? raw.trim() : "";
+    return v !== "" && (CLAUDE_REQUEST_CLASSES as readonly string[]).includes(v) ? v : undefined;
+}
+
 export function claudeSubagentAgentId(
     headers: Record<string, string | string[] | undefined>,
     systemBlocks: string[],
@@ -464,6 +593,15 @@ export function claudeSubagentAgentId(
     const agentId = typeof agent === "string" && agent.trim().length > 0 ? agent.trim() : undefined;
     const parentId = typeof parent === "string" && parent.trim().length > 0 ? parent.trim() : undefined;
     if (agentId === undefined && parentId === undefined) return undefined;
+    // #7439: an explicit client-side task label (x-claude-code-request-class,
+    // gated on CLAUDE_CODE_GATEWAY_HINT_HEADERS) overrides the system-prefix
+    // heuristic. Strictly additive: "subagent" forces the split even when the
+    // system text looks main-like; "main" suppresses it; an absent label keeps
+    // the legacy path below byte-for-byte. The unique id is still
+    // agentId ?? parentId (no lane-token threading).
+    const reqClass = claudeRequestClassOf(headers);
+    if (reqClass === "subagent") return agentId ?? parentId;
+    if (reqClass === "main") return undefined;
     const isMain = systemBlocks.some((block) => {
         const t = block.trimStart();
         return MAIN_SYSTEM_PREFIXES.some((p) => t.startsWith(p));

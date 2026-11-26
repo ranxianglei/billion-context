@@ -200,6 +200,19 @@ test("vertexAnthropicModelFromPath: query, fragment and percent-encoding are han
     assert.equal(vertexAnthropicModelFromPath("/publishers/anthropic/models/claude%ZZopus:rawPredict"), "claude%ZZopus");
 });
 
+test("googleModelFromPath keeps a namespaced model id intact (#5593)", () => {
+    // omp's `google-generative-ai` provider passes the provider-prefixed id
+    // through the path; the model, not the segment, is what every model-keyed
+    // decision needs.
+    assert.equal(googleModelFromPath("/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent"), "antigravity/gemini-3.8-flash");
+    assert.equal(googleModelFromPath("/v1beta/models/group/hard:generateContent"), "group/hard");
+    assert.equal(googleModelFromPath("/v1beta/models/llmgateway-providers/google-vertex/gemini-3.8-flash:countTokens?alt=sse"), "llmgateway-providers/google-vertex/gemini-3.8-flash");
+    // Still bounded by the method colon: nothing is extracted for a path that
+    // carries no model method.
+    assert.equal(googleModelFromPath("/v1beta/models"), undefined);
+    assert.equal(googleModelFromPath("/v1beta/models/antigravity/gemini-3.8-flash:predict"), undefined);
+});
+
 test("vertexAnthropicModelFromPath and the Gemini pair stay out of each other's paths", () => {
     const vertexPath = "/v1/projects/p/locations/global/publishers/anthropic/models/claude-opus-5-5:streamRawPredict";
     const geminiPath = "/v1beta/models/gemini-3.8-flash:streamGenerateContent";

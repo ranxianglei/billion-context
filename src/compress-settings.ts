@@ -1,9 +1,10 @@
-import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CoreMessage, type CcrConfig, type Pack, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
-import { findRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
+import { findRoute, resolveModelEntryOnRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from "./external-summary-settings.js";
+import { shippedPacksSource } from "./chat-pack.js";
 
 export type { CompressSettings } from "./config.js";
 
@@ -56,6 +57,7 @@ export function mergeCompress(
     // like `prompts`: a model-level minToolTokens must not discard a
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
+    const blockOpsLevels = [global?.blockOps, provider?.blockOps, model?.blockOps].filter(Boolean) as NonNullable<CompressSettings["blockOps"]>[];
     const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
     const searchLevels = [global?.search, provider?.search, model?.search].filter(Boolean) as NonNullable<CompressSettings["search"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
@@ -65,6 +67,9 @@ export function mergeCompress(
     // `tierNudgeTokens` is another nested-object field merged sub-field-wise
     // like `absorb`: a model-level t2 must not discard a provider-level t1.
     const tierNudgeLevels = [global?.tierNudgeTokens, provider?.tierNudgeTokens, model?.tierNudgeTokens].filter(Boolean) as NonNullable<CompressSettings["tierNudgeTokens"]>[];
+    // #7666: `degenerateRetry` is merged sub-field-wise like `absorb`: a
+    // model-level nudges list must not discard a provider-level maxAttempts.
+    const degenerateRetryLevels = [global?.degenerateRetry, provider?.degenerateRetry, model?.degenerateRetry].filter(Boolean) as NonNullable<CompressSettings["degenerateRetry"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
@@ -72,9 +77,14 @@ export function mergeCompress(
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
         minPressureBenefitTokens: pick("minPressureBenefitTokens"),
+        requireUsageSampleForPressure: pick("requireUsageSampleForPressure"),
+        maxEstimateHoldRounds: pick("maxEstimateHoldRounds"),
         tierNudgeTokens: tierNudgeLevels.length > 0 ? Object.assign({}, ...tierNudgeLevels) : undefined,
         nudgeModelDecided: pick("nudgeModelDecided"),
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
+        requireNudge: pick("requireNudge"),
+        requireRecommendation: pick("requireRecommendation"),
+        postComPressTail: pick("postComPressTail"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
@@ -83,16 +93,22 @@ export function mergeCompress(
         tiers: pick("tiers"),
         protectedLatestTools: pick("protectedLatestTools"),
         protectedTools: pick("protectedTools"),
+        protectedUserPatterns: pick("protectedUserPatterns"),
         neverPreserveRecentTools: pick("neverPreserveRecentTools"),
         preserveRecentTools: pick("preserveRecentTools"),
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
+        blockOps: blockOpsLevels.length > 0 ? Object.assign({}, ...blockOpsLevels) : undefined,
         ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
         search: searchLevels.length > 0 ? Object.assign({}, ...searchLevels) : undefined,
         rules: pick("rules"),
 
         visibilityMarkers: pick("visibilityMarkers"),
+        // #4313 (PR #5236): display gate — global level only; provider/model
+        // values are merged here but the consumer (resolveMessageTimestamps)
+        // reads the GLOBAL setting, mirroring the single shared core.
+        messageTimestamps: pick("messageTimestamps"),
         streamSummary: pick("streamSummary"),
         // `reasoning` is a third nested-object field merged sub-field-wise
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not
@@ -107,6 +123,7 @@ export function mergeCompress(
         // `externalSummary` object at a deeper level replaces the entire
         // chain above it — there is no per-target or per-budget sub-merge.
         externalSummary: pick("externalSummary"),
+        degenerateRetry: degenerateRetryLevels.length > 0 ? Object.assign({}, ...degenerateRetryLevels) : undefined,
     };
 }
 
@@ -121,7 +138,7 @@ export function resolveCompress(
     global?: CompressSettings,
 ): CompressSettings {
     const route = findRoute(routes, upstreamUrl);
-    return mergeCompress(global, route?.compress, model ? route?.models?.[model]?.compress : undefined);
+    return mergeCompress(global, route?.compress, resolveModelEntryOnRoute(route, model).entry?.compress);
 }
 
 let warnedPromptsRisk = false;
@@ -162,24 +179,35 @@ interface SurfaceResolution {
     packVersion?: string;
 }
 
+function packResolver(
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): ReturnType<typeof createPackResolver> {
+    // #5319: host-shipped packs sit between the user dirs and the kernel
+    // builtin registry — same-name user/project files still win, and the
+    // kernel registry itself stays untouched (Kernel Boundary: adding a pack
+    // must not require a kernel/** change).
+    return createPackResolver([
+        createDirPackSource("project", dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs")),
+        ...(dirs?.userDirs ?? [path.join(configDir(), "packs")]).map((dir) => createDirPackSource("user", dir)),
+        shippedPacksSource,
+        builtinSource,
+    ]);
+}
+
 /** Resolve the pack surface for one request: `promptPack` names a pack in the
- *  kernel's resolver chain [project `./.billion-context/packs` > user
- *  `<configDir>/packs` > builtin registry]. Unknown names fall back to the
- *  identity surface ({} — kernel defaults everywhere) with a one-time-per-name
- *  warning, so a typo never degrades the compression prompts. Directory
- *  layout is host policy; resolution/sanitization is the kernel's. */
+ *  host's resolver chain [project `./.billion-context/packs` > user
+ *  `<configDir>/packs` > shipped host-bundled packs (`chat`, #5319) > kernel
+ *  builtin registry]. Unknown names fall back to the identity surface
+ *  ({} — kernel defaults everywhere) with a one-time-per-name warning, so a
+ *  typo never degrades the compression prompts. Directory layout is host
+ *  policy; resolution/sanitization is the kernel's. */
 export function resolveCompressSurfaceDetailed(
     s: CompressSettings,
     dirs?: { projectDir?: string; userDirs?: readonly string[] },
 ): SurfaceResolution {
     const name = s.promptPack;
     if (typeof name !== "string" || name === "default" || !isValidPackName(name)) return { surface: {}, packName: "default" };
-    const resolver = createPackResolver(
-        defaultPackSources({
-            projectDir: dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs"),
-            userDirs: dirs?.userDirs ?? [path.join(configDir(), "packs")],
-        }),
-    );
+    const resolver = packResolver(dirs);
     const pack = resolver.resolve(name);
     if (!pack) {
         if (!warnedUnknownPack.has(name)) {
@@ -189,6 +217,14 @@ export function resolveCompressSurfaceDetailed(
         return { surface: {}, packName: "default" };
     }
     return { surface: pack.surface, packName: name, packVersion: pack.version };
+}
+
+/** Every pack resolvable by name right now (first-wins per name) — the panel
+ *  picker's inventory (#5319 web half). Same chain as per-request resolution. */
+export function listResolvedPacks(
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): Pack[] {
+    return packResolver(dirs).listPacks();
 }
 
 export function resolveCompressSurface(
@@ -248,6 +284,9 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    kernel DEFAULT_ABSORB_CONFIG, so a partial user block still resolves
   *    fully). Absent `s.absorb` leaves `base.absorb` untouched — the feature
   *    stays off unless some level enables it.
+  *  - `blockOps` → `blockOps` (kernel BlockOpsConfig, acp-kernel >= 0.0.194;
+  *    one switch: enabled = the three block-lifecycle tools ride the surface).
+  *    Absent `s.blockOps` leaves `base.blockOps` untouched — off by default.
   *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
   *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched.
   *  - `ccr` → `ccr` (kernel CcrConfig, acp-kernel >= 0.0.84; the kernel runs
@@ -263,8 +302,34 @@ export function hasCompressSettings(s: CompressSettings): boolean {
 // lands in acp-kernel 0.0.93 (acp-kernel#428) but the resolved object is
 // built and typed here regardless of the installed kernel's Config so both
 // release windows compile identically. Older kernels ignore the extra key
-// (validateConfig does not flag unknown keys).
-export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings };
+// (validateConfig does not flag unknown keys). protectedUserPatterns is the
+// clone-safe DATA half of the isMessageProtected predicate: the stamp
+// (storeEffectiveConfig) strips function fields, and effectiveConfig rebuilds
+// the predicate from this list on the session-stamp read path.
+export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings; protectedUserPatterns?: string[] };
+
+/** User-text half of the host predicate: literal substring match on
+ *  user-role text messages only. Both the resolve-time builder
+ *  (applyCompressSettings) and the read-time restore (session.ts
+ *  effectiveConfig) reach it through combineMessageProtectedPredicate, so
+ *  the two can never drift. */
+function matchesProtectedUserPatterns(patterns: readonly string[], msg: CoreMessage): boolean {
+    if (msg.role !== "user" || typeof msg.text !== "string") return false;
+    const text = msg.text;
+    return patterns.some((pattern) => text.includes(pattern));
+}
+
+/** Compose the kernel isMessageProtected hook: the inherited lane predicate
+ *  (if any) OR the configured user-text patterns. Returns undefined when
+ *  neither exists, so callers can keep the config function-free. */
+export function combineMessageProtectedPredicate(
+    inherited: Config["isMessageProtected"],
+    patterns: readonly string[],
+): Config["isMessageProtected"] {
+    if (patterns.length === 0) return inherited;
+    if (inherited === undefined) return (msg) => matchesProtectedUserPatterns(patterns, msg);
+    return (msg) => inherited(msg) === true || matchesProtectedUserPatterns(patterns, msg);
+}
 
 // Single source of truth for raw->resolved absorb: applyCompressSettings and the
 // plugin-lane base stamp (#1359) both go through this or they drift apart.
@@ -298,9 +363,20 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         nudge.growthFloor = s.nudgeGrowthTokens;
         nudge.growthCap = s.nudgeGrowthTokens;
     }
+    // Experimental fold-point carrier relocation (#view-transform-A): the env
+    // tier wins over every file level per knob doctrine (#2030), resolved
+    // per request like every other wire-facing knob. Off = byte-identical
+    // pre-change behavior (the kernel node fast-paths to the same array ref).
     // #3211: explicit 0 is meaningful (legacy any-pending pressure behavior),
     // so pass it through instead of skipping like the growth-token knobs.
     if (s.minPressureBenefitTokens !== undefined) nudge.minPressureBenefitTokens = s.minPressureBenefitTokens;
+    // Phantom-pressure guard: an explicit false is meaningful (legacy
+    // estimate-driven pressure injection), so pass it through instead of
+    // skipping like absent knobs.
+    if (s.requireUsageSampleForPressure !== undefined) nudge.requireUsageSampleForPressure = s.requireUsageSampleForPressure;
+    // #5865 estimate-hold backstop bound — pass through like every numeric
+    // knob (0 is meaningful: it disables the hold).
+    if (s.maxEstimateHoldRounds !== undefined && typeof s.maxEstimateHoldRounds === "number") nudge.maxEstimateHoldRounds = Math.floor(s.maxEstimateHoldRounds);
     if (s.tierNudgeTokens !== undefined) {
         const tg: NonNullable<Config["nudge"]["tierGrowthTokens"]> = {};
         if (typeof s.tierNudgeTokens.t1 === "number") tg.t1 = s.tierNudgeTokens.t1;
@@ -328,6 +404,16 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
         };
     }
+    // Host-marked current-task prompts: the kernel already hard-excludes any
+    // message for which Config.isMessageProtected returns true. Map the literal
+    // substrings here so a long-lived session can keep its live task prompt out
+    // of fold ranges even when tool-result/image user messages follow it (the
+    // kernel's last-user protection only covers the last one). The pattern list
+    // ALSO rides the resolved config as clone-safe data — the session stamp
+    // strips the function below, and effectiveConfig restores the predicate
+    // from the list on the plugin tool read path.
+    const protectedUserPatterns = s.protectedUserPatterns ?? [];
+    const isMessageProtected = combineMessageProtectedPredicate(base.isMessageProtected, protectedUserPatterns);
     const resolved: ResolvedKernelConfig = {
         ...base,
         modelContextLimit: limit,
@@ -346,6 +432,11 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         },
         protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         protectedTools: s.protectedTools ?? base.protectedTools,
+        // Clone-safe data twin of the predicate below (see ResolvedKernelConfig).
+        ...(protectedUserPatterns.length > 0 ? { protectedUserPatterns } : {}),
+        // Combined host predicate: literal current-task markers OR whatever
+        // the lane already installed.
+        ...(isMessageProtected !== undefined ? { isMessageProtected } : {}),
         neverPreserveRecentTools: s.neverPreserveRecentTools ?? base.neverPreserveRecentTools,
         // base is Config (0.0.92 lacks the field) — the cast keeps both kernel windows compiling.
         preserveRecentTools: s.preserveRecentTools ?? (base as ResolvedKernelConfig).preserveRecentTools,
@@ -356,6 +447,9 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         // expanded ExternalSummarySettings and never sees references.
         externalSummary: s.externalSummary !== undefined ? expandExternalSummaryChainTolerant(s.externalSummary, recipes) : (base as ResolvedKernelConfig).externalSummary,
         ...(absorb !== undefined ? { absorb } : {}),
+        // #5765: one-switch opt-in — absent `s.blockOps` leaves base untouched
+        // (off); a present block normalizes enabled (absent/false = off).
+        ...(s.blockOps !== undefined ? { blockOps: { enabled: s.blockOps.enabled === true } } : {}),
         ...(ccr !== undefined ? { ccr } : {}),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };

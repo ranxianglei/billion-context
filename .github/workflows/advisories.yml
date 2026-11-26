@@ -13,6 +13,7 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +38,17 @@ jobs:
             for (const a of p.advisories) {
               if (!a.id || !a.affected || !a.target || !a.reason) {
                 console.error('advisory entry missing required fields:', JSON.stringify(a));
+                process.exit(1);
+              }
+              // #6306: producer-side mirror of the client caps (src/advisory.ts
+              // CAP_ADVISORY_ID / CAP_ADVISORY_REASON) — the client truncates,
+              // but a publish-time failure is cheaper than a truncated banner.
+              if (String(a.id).length > 80) {
+                console.error('advisory', a.id, ': id too long (' + String(a.id).length + ' chars, cap 80)');
+                process.exit(1);
+              }
+              if (String(a.reason).length > 500) {
+                console.error('advisory', a.id, ': reason too long (' + String(a.reason).length + ' chars, cap 500)');
                 process.exit(1);
               }
               try {

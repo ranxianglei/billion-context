@@ -63,6 +63,11 @@ let remote: { items: BlogItem[]; assets: Map<string, RemoteAsset>; error?: strin
 type BlogItem = {
     id: string;
     kind: "post" | "article";
+    /** Positive integer recorded by the blog pipeline workflow in articles.json:
+     *  the GitHub Discussion thread created for this article. Absent (undefined,
+     *  dropped by JSON serialization) whenever nothing was recorded, so clients
+     *  can hide the comment button instead of guessing a link. */
+    discussion?: number;
     /** "" when the source carries no usable date. */
     date: string;
     title: string;
@@ -360,7 +365,12 @@ function collectArticles(root: string): BlogItem[] {
 function collect(): BlogItem[] {
     const root = pkgRoot();
     if (!root) return [];
-    return sortItems([...collectPosts(root), ...collectArticles(root)]);
+    // A manifest entry pointing at a file that ALSO lives in the flat posts
+    // directory would otherwise render twice under one id — the manifest entry
+    // wins (it carries the richer metadata the pipeline keys on).
+    const articles = collectArticles(root);
+    const articleIds = new Set(articles.map((a) => a.id));
+    return sortItems([...collectPosts(root).filter((p) => !articleIds.has(p.id)), ...articles]);
 }
 
 /** Cached feed (bundled content only changes across package updates → one
@@ -465,7 +475,7 @@ export function buildRemoteBlogPosts(files: Map<string, string>, assetKeys: Read
             list = [];
         }
         for (const entryRaw of list) {
-            const entry = entryRaw as { file?: unknown; zh_file?: unknown; slug?: unknown; title?: unknown; title_zh?: unknown };
+            const entry = entryRaw as { file?: unknown; zh_file?: unknown; slug?: unknown; title?: unknown; title_zh?: unknown; discussion?: unknown };
             const file = typeof entry.file === "string" ? entry.file : "";
             const raw = files.get(file);
             if (!file || raw === undefined) continue;
@@ -485,9 +495,11 @@ export function buildRemoteBlogPosts(files: Map<string, string>, assetKeys: Read
             }
             if (!en) continue;
             const date = en.fm.date || "";
+            const discussion = typeof entry.discussion === "number" && Number.isInteger(entry.discussion) && entry.discussion > 0 ? entry.discussion : undefined;
             items.push({
                 id: slugIn,
                 kind: "article",
+                discussion,
                 date: validDate(date) ? date : "",
                 title: (typeof entry.title === "string" && entry.title ? entry.title : "") || en.fm.title || en.h1 || slugIn,
                 titleZh: zhTitle,

@@ -182,7 +182,10 @@ const LEGACY_STATUS_SECTION_STARTS = [
     "COMPRESSED — ",
     "UNCOMPRESSED — ",
     "Sorted by ",
+    // #5555: the tip line was reworded off the internal function name; keep
+    // BOTH wordings so sessions carrying either generation strip fully.
     "Tip: buildStatusReport(",
+    "Tip: call again with scope:",
     "BILLED INPUT",
     "NOTE: ",
     "Nudge: ",
@@ -191,6 +194,17 @@ const LEGACY_STATUS_SECTION_STARTS = [
     "[No specific ranges detected",
     "DEAD REFS — ",
     "COMPRESS CIRCUIT BREAKER: ARMED",
+    "EMERGENCY SHRINK ARMED — ",
+    "FORK ADOPTION SKIPPED — ",
+    "HOST-NATIVE COMPACTION — ",
+    "OUTPUT BUDGET CLAMP —",
+    "PROTECTED MASS — ",
+    "UNCOVERED HISTORY — ",
+    "UPSTREAM CIRCUIT OPEN — ",
+    "UPSTREAM 429 HOLD — ",
+    "CACHE ROUTING KEY BLOCKED (instance-level): ",
+    "RESOLVER WEDGE SUSPECTED (instance-level): ",
+    "If this destination is your relay",
     "Last failures were attributed to substrate-destruction",
     "The Compressible-ranges list above was re-derived",
     "FOLD BASE GENERATION MISMATCH — ",
@@ -210,19 +224,30 @@ const LEGACY_STATUS_SECTION_STARTS = [
     "Every event above is an UNCONFIRMED signal",
     "Fix (",
     "Fix: ",
+    // Both spellings: reports persisted before #5920's doc centralization carry
+    // the old pointer and must keep stripping on upgraded instances.
     "CONFIGURATION.md →",
+    "docs/configuration.md →",
     "CRITICAL ADVISORY (instance-level): ",
     "CRITICAL UPDATE READY (instance-level): ",
     "CRITICAL UPDATE AVAILABLE (instance-level): ",
+    // Both spellings: the update-section tail was reworded to name the field;
+    // reports persisted before that carry the old pointer and must keep
+    // stripping on upgraded instances.
     "Live state: GET /__bili/status",
+    "Live state: the update field of GET /__bili/status",
     "UNDECRYPTED TRAFFIC (instance-level): ",
     "UNRECOGNIZED PATHS (instance-level): ",
 ];
 const LEGACY_STATUS_SHOWN_FOOTER = /^\d+ of \d+ shown\.$/u;
+// CACHE ROUTING KEY BLOCKED overflow line: the destination count is variable,
+// so no fixed prefix can match it (src/acp-status.ts).
+const LEGACY_STATUS_OVERFLOW_LINE = /^\u2026\d+ more destination\(s\): /u;
 
 function isLegacyStatusReportLine(line: string): boolean {
     if (line.length === 0) return true;
     if (/^\s/.test(line)) return true;
+    if (LEGACY_STATUS_OVERFLOW_LINE.test(line)) return true;
     if (LEGACY_STATUS_SHOWN_FOOTER.test(line)) return true;
     return LEGACY_STATUS_SECTION_STARTS.some((prefix) => line.startsWith(prefix));
 }

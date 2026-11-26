@@ -363,7 +363,7 @@ test("AC10: reconcile is idempotent across repeated boots", async () => {
                 derivedBlocksAdopted: undefined,
             },
         } as typeof child;
-        reconcileDerivedLineage([orphan], { log: (lvl, msg) => logs.push([lvl, msg]), adoptionEnabled: true });
+        await reconcileDerivedLineage([orphan], { log: (lvl, msg) => logs.push([lvl, msg]), adoptionEnabled: true });
         assert.equal(orphan.state.blocks.length, 0, "an unreachable parent must seed nothing");
         assert.notEqual(orphan.metadata.derivedBlocksAdopted, true, "an unreachable parent must not close the door");
         assert.ok(

@@ -27,6 +27,15 @@ import { rmrf } from "./tmp-rm.ts";
 // NOT proven (documented residuals, pinned separately in
 // tests/multi-instance-persist.test.ts): tie passthrough, counter catch-up
 // re-clobber, content-store last-writer-wins.
+//
+// History: commit 5159ce9e (2026-10-30, #5046 "no degradation in any case")
+// rewrote phases 2-4 into a boot-refusal assertion because a same-lane
+// second writer over the unified index.db REFUSED to start. Owner decision
+// 2026-10-31 withdrew that block (whatever lanes are involved, a second-writer
+// condition never blocks startup — sharing one index.db is the supported
+// topology, #5082/#5091), and this suite restored the serve/guard/converge
+// interleave. Both children now run BILI_STORAGE_UNIFIED=full so they share
+// the SAME live index.db, exactly the fleet shape the refusal had bricked.
 
 const SESSION = "mi-live-session";
 const MODEL = "claude-sonnet-4-5";
@@ -167,6 +176,13 @@ test("two live instances over one sessions dir: serve, guard, converge (#394/#40
 
     const childEnv = (p: number): NodeJS.ProcessEnv => ({
         ...process.env,
+        // The global baseline preload pins BILI_STORAGE_UNIFIED=legacy process-wide;
+        // spread into every child it would keep them BOTH legacy — neither would
+        // open the shared index.db, and this suite exists precisely to run two
+        // unifications over ONE live index.db (the fleet shape the 2026-10-30
+        // refusal had bricked, restored per owner decision 2026-10-31). Pin the
+        // production default so both children run like real boots.
+        BILI_STORAGE_UNIFIED: "full",
         BILI_SESSIONS_DIR: sessionsDir,
         XDG_STATE_HOME: stateDir,
         // #5012: non-TTY pipes now mute once the file leg proves live; this
@@ -202,6 +218,8 @@ test("two live instances over one sessions dir: serve, guard, converge (#394/#40
 
         // Phase 2 — instance B boots over the SAME dir (boot-hydrates the
         // session), serves 2 turns. B's writes must be fresh (accepted).
+        // Owner decision 2026-10-31: B sees a LIVE foreign writer holding the
+        // shared index.db — that must NEVER block startup, so B comes up fully.
         children.push(await spawnChild(upstreamPort, childEnv(2)));
         const B = children[1]!;
         await turn(B, 4);
@@ -237,7 +255,6 @@ test("two live instances over one sessions dir: serve, guard, converge (#394/#40
         await turn(B, 8);
         const final2 = await waitFor(sessionsDir, (v) => v.requests >= 6, "B serves after A's convergence");
         assert.equal(final2.requests, 6, "disk counter reflects the last accepted lineage (B tie-passthrough at 6)");
-
         // Reader loop verdict.
         clearInterval(reader);
         assert.ok(reads > 10, `reader loop ran (reads=${reads})`);

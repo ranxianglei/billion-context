@@ -95,7 +95,7 @@ test("a too-long summary in a multi-range batch rejects the WHOLE batch (#3003)"
   assert.match(result.result.errors[0]!, /drop the offending range\(s\) and resend only the rest/);
 });
 
-test("a too-short summary in a multi-range batch rejects the WHOLE batch (#3003)", () => {
+test("a short paragraph in a multi-range batch PASSES when the total meets the floor (#5894)", () => {
   const core = createCore();
   const state = createInitialState();
   const messages = [
@@ -109,10 +109,15 @@ test("a too-short summary in a multi-range batch rejects the WHOLE batch (#3003)
     nextIndex: 1,
   }).map;
 
+  // #5894 flips the old pin here: this batch used to be atomically rejected
+  // because the second summary (5 chars) was below the per-range floor of 50.
+  // The FLOOR now judges the COMBINED total (60 + 5 = 65 >= 50), so both
+  // ranges commit and the trivial span keeps its honest short summary instead
+  // of forcing padding or a drop-and-respin retry ladder.
   const result = core.applyCompression({
     ranges: [
       { startRef: "m00001", endRef: "m00002", summary: "y".repeat(60), topic: "fine" },
-      { startRef: "m00003", endRef: "m00004", summary: "x".repeat(5), topic: "too short" },
+      { startRef: "m00003", endRef: "m00004", summary: "x".repeat(5), topic: "trivial" },
     ],
     messages,
     state,
@@ -121,13 +126,9 @@ test("a too-short summary in a multi-range batch rejects the WHOLE batch (#3003)
     }),
   });
 
-  assert.equal(result.result.blocksCreated, 0, "the valid sibling must NOT land either");
-  assert.equal(result.state.blocks.length, 0);
-  assert.match(result.result.errors[0]!, /Batch rejected before folding any range/);
-  assert.match(
-    result.result.errors[0]!,
-    /range m00003\.\.m00004: Summary too short \(5 chars, min 50\)/,
-  );
+  assert.equal(result.result.blocksCreated, 2, "both ranges commit under the batch-total floor");
+  assert.equal(result.state.blocks.length, 2);
+  assert.equal(result.result.errors.length, 0);
 });
 
 test("a multi-range batch whose summaries all validate still commits every range (#3003 control)", () => {

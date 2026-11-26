@@ -33,7 +33,6 @@ export type {
     SessionSummaryRow,
     WebSummaryRow,
     IngestSessionInput,
-    SessionViewRows,
 } from "./store.js";
 import type {
     SessionRow,
@@ -45,7 +44,6 @@ import type {
     SessionSummaryRow,
     WebSummaryRow,
     IngestSessionInput,
-    SessionViewRows,
 } from "./store.js";
 
 /** Everything a storage backend must provide. Mirrors the operation surface
@@ -58,7 +56,7 @@ export interface StorageBackend {
     ingestSession(
         input: IngestSessionInput,
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
-        opts?: { completeLog?: boolean },
+        opts?: { completeLog?: boolean; envelopeImport?: boolean },
     ): Promise<boolean>;
     sessionCounters(sessionId: string): Promise<{ requests: number; nextBlockId: number } | null>;
     sessionUpdatedAt(sessionId: string): Promise<number | null>;
@@ -77,23 +75,30 @@ export interface StorageBackend {
     seqByRaw(sessionId: string): Promise<Map<string, number> | null>;
     /** #4316 PR3/3: fork adoption row clone (idempotent). */
     cloneSessionRows(parentId: string, childId: string, throughSeq: number, initial?: IngestSessionInput): Promise<boolean>;
-    getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string })[]>;
+    /** #4390/#4664: retired (tombstoned) rows stay out of the unified replay
+     *  by default; historian callers (export/diagnostics) opt in via
+     *  `includeRetired`. Every row carries `retiredAt` (null = live). */
+    getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]>;
     getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]>;
-    /** #4739: the viewFor bundle from ONE consistent read snapshot (messages
-     *  fetched only at the tail/pluginSnapshot pointer seqs). */
-    sessionViewRows(sessionId: string): Promise<SessionViewRows>;
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]>;
     getRefs(sessionId: string): Promise<RefRow[]>;
     /** All reads, including CAS hydration, use one short read-only snapshot. */
     readSnapshot<T>(read: (reader: StorageReadView) => Promise<T>): Promise<T>;
     getCcr(sessionId: string): Promise<MessageContentStore | null>;
     getCcrEntries(sessionId: string): Promise<CcrEntryRow[]>;
+    /** #6785 step 7: the merged reaped-block journal (table rows ∪ legacy
+     *  column). null = none. */
+    getOrphanViews(sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null>;
+    /** #6785 step 8: row-backed CompressionState fields (state_fields table). */
+    getStateFields(sessionId: string): Promise<Record<string, string> | null>;
 
     // --- ingest watermark / pointers (#3253, #3798) ------------------------
     ingestWatermark(sessionId: string): Promise<{ seq: number; tailSeqs: number[] } | null>;
     tailSeqs(sessionId: string): Promise<number[] | null>;
     clearIngestWatermark(sessionId: string): Promise<void>;
-    resetAllIngestWatermarks(): Promise<void>;
+    /** #3285 (2026-11-21 per-session rework): first-touch trust prime — drop
+     *  any FOREIGN-set watermark for one session; idempotent per process. */
+    primeIngestTrust(sessionId: string): Promise<void>;
     probeIngestBoundary(sessionId: string, seq: number): Promise<{ msgId: string; contentHash: string; maxSeq: number } | null>;
 
     // --- reap journal (#3841) ----------------------------------------------
@@ -148,7 +153,7 @@ export interface StorageBackend {
     init?(): Promise<void>;
 }
 
-export type StorageReadView = Pick<StorageBackend, "getSessionRow" | "getMessages" | "getBlocks" | "getDeadRefs" | "getRefs">;
+export type StorageReadView = Pick<StorageBackend, "getSessionRow" | "getMessages" | "getBlocks" | "getDeadRefs" | "getRefs" | "getCcrEntries" | "getOrphanViews" | "getStateFields">;
 
 /** The sqlite backend: the existing UnifiedStore behind the async contract.
  *  Synchronous under the hood; `Promise.resolve` wrapping only. */
@@ -163,7 +168,7 @@ export class SqliteBackend implements StorageBackend {
         return new SqliteBackend(UnifiedStore.open(indexPath, engine));
     }
 
-    ingestSession(input: IngestSessionInput, delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] }, opts?: { completeLog?: boolean }): Promise<boolean> {
+    ingestSession(input: IngestSessionInput, delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] }, opts?: { completeLog?: boolean; envelopeImport?: boolean }): Promise<boolean> {
         return Promise.resolve(this.store.ingestSession(input, delta, opts));
     }
     sessionCounters(sessionId: string): Promise<{ requests: number; nextBlockId: number } | null> {
@@ -199,14 +204,11 @@ export class SqliteBackend implements StorageBackend {
     cloneSessionRows(parentId: string, childId: string, throughSeq: number, initial?: IngestSessionInput): Promise<boolean> {
         return Promise.resolve(this.store.cloneSessionRows(parentId, childId, throughSeq, initial));
     }
-    getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string })[]> {
+    getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {
         return Promise.resolve(this.store.getMessages(sessionId, opts));
     }
     getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
         return Promise.resolve(this.store.getBlocks(sessionId, opts));
-    }
-    sessionViewRows(sessionId: string): Promise<SessionViewRows> {
-        return Promise.resolve(this.store.sessionViewRows(sessionId));
     }
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]> {
         return Promise.resolve(this.store.getDeadRefs(sessionId));
@@ -221,6 +223,9 @@ export class SqliteBackend implements StorageBackend {
             getBlocks: async (id, opts) => store.getBlocks(id, opts),
             getDeadRefs: async (id) => store.getDeadRefs(id),
             getRefs: async (id) => store.getRefs(id),
+            getCcrEntries: async (id) => store.getCcrEntries(id),
+            getOrphanViews: async (id) => store.getOrphanViews(id),
+            getStateFields: async (id) => store.getStateFields(id),
         }));
     }
     getCcr(sessionId: string): Promise<MessageContentStore | null> {
@@ -228,6 +233,13 @@ export class SqliteBackend implements StorageBackend {
     }
     getCcrEntries(sessionId: string): Promise<CcrEntryRow[]> {
         return Promise.resolve(this.store.getCcrEntries(sessionId));
+    }
+    getOrphanViews(sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null> {
+        return Promise.resolve(this.store.getOrphanViews(sessionId));
+    }
+
+    getStateFields(sessionId: string): Promise<Record<string, string> | null> {
+        return Promise.resolve(this.store.getStateFields(sessionId));
     }
     ingestWatermark(sessionId: string): Promise<{ seq: number; tailSeqs: number[] } | null> {
         return Promise.resolve(this.store.ingestWatermark(sessionId));
@@ -238,8 +250,8 @@ export class SqliteBackend implements StorageBackend {
     clearIngestWatermark(sessionId: string): Promise<void> {
         return Promise.resolve(this.store.clearIngestWatermark(sessionId));
     }
-    resetAllIngestWatermarks(): Promise<void> {
-        return Promise.resolve(this.store.resetAllIngestWatermarks());
+    primeIngestTrust(sessionId: string): Promise<void> {
+        return Promise.resolve(this.store.primeIngestTrust(sessionId));
     }
     probeIngestBoundary(sessionId: string, seq: number): Promise<{ msgId: string; contentHash: string; maxSeq: number } | null> {
         return Promise.resolve(this.store.probeIngestBoundary(sessionId, seq));

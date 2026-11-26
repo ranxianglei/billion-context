@@ -72,8 +72,12 @@ function baseMessages(): CoreMessage[] {
   } as never).msgs;
 }
 
-/** Wire systems violating the Anthropic position rule (run-aware: a run of
- *  consecutive systems is judged by its first non-system follower). */
+/** Wire systems violating EITHER Anthropic position half (#5438): the
+ *  follow side (nearest non-system predecessor must be a user or a
+ *  server-tool-result-terminated assistant; no predecessor at array start is
+ *  legal by contract) or the precede side (run's first non-system follower
+ *  must be an assistant or the array end). Mirrors healIllegalSystemPositions.
+ */
 function orphanSystems(
   messages: Array<{ role: string; content: unknown; output_config?: unknown }>,
 ): number[] {
@@ -89,8 +93,20 @@ function orphanSystems(
     let k = j + 1;
     while (k < messages.length && messages[k]!.role === "system") k++;
     const next = messages[k];
-    if (!next || next.role === "assistant") continue;
-    bad.push(j);
+    let p = j - 1;
+    while (p >= 0 && messages[p]!.role === "system") p--;
+    const pred = p >= 0 ? messages[p] : undefined;
+    const pc = pred?.content;
+    const predOk =
+      !pred ||
+      pred.role === "user" ||
+      (pred.role === "assistant" &&
+        Array.isArray(pc) &&
+        pc.length > 0 &&
+        (pc[pc.length - 1] as { type?: string } | undefined)?.type ===
+          "tool_result");
+    const nextOk = !next || next.role === "assistant";
+    if (!predOk || !nextOk) bad.push(j);
   }
   return bad;
 }

@@ -32,6 +32,7 @@ import type { AddressInfo } from "node:net";
 import { classifySameLanePeer, markPortReleased, type InstanceShape, type RegistryEntry } from "../src/instance.ts";
 import { verifyEntryOwnsPort } from "../src/port-owner.ts";
 import { assertPortDead } from "./port-race.ts";
+import { TWIN_ADOPT_EXIT_CODE } from "../src/listen-policy.ts";
 
 const ROOT = path.join(import.meta.dirname, "..");
 const ENTRY = path.join(ROOT, "src/index.ts");
@@ -454,9 +455,9 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
     }
 });
 
-test("#4982 e2e: unverified registry twin claim (unstamped marker) → ladder, not adopt-death", { timeout: 180_000 }, async () => {
+test("#4982 e2e: unverified registry twin claim (unstamped marker) → pre-persistence adopt-exit, not two-writer window (#5018 option A)", { timeout: 180_000 }, async () => {
     const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "bili-4982b-"));
-    const { stateHome } = sandboxDirs(sandbox);
+    const { stateHome, sessions } = sandboxDirs(sandbox);
     const port = await freePort();
     await assertPortDead(port, { label: "4982 unverified-twin port" });
     let p2Ref: ReturnType<typeof spawnBili> | null = null;
@@ -490,23 +491,32 @@ test("#4982 e2e: unverified registry twin claim (unstamped marker) → ladder, n
 
         const p2 = spawnBili(sandbox, port);
         p2Ref = p2;
+        // #5018 option A (owner ruling 2026-10-31): for an UNVERIFIED unstamped
+        // same-lane claim the early pre-persistence gate wins over #5016's
+        // ladder — before we bind, a silent-probe holder cannot be told apart
+        // from an event-loop-wedged zombie (#3654), and opening index.db under
+        // it IS the two-writer window (#3923/#3959). P2 must therefore exit
+        // with the twin-collision adopt signal BEFORE persistence init; the
+        // spawner retries once the holder frees the port (#4811/#4977). The
+        // ladder keeps covering stamped draining predecessors (row above) and
+        // foreign-held ports with no matching registry claim.
         const result = await Promise.race([
-            new Promise<"exited">((resolve) => p2.child.once("exit", () => resolve("exited"))),
+            new Promise<{ kind: "exited"; code: number | null }>((resolve) =>
+                p2.child.once("exit", (code) => resolve({ kind: "exited", code })),
+            ),
             (async () => {
                 const servedPort = await waitUntilLadderedHealthy(stateHome, p2.child, "P2");
                 return { kind: "healthy" as const, servedPort };
             })(),
         ]);
-        if (typeof result === "string") {
-            throw new Error(`P2 exited before becoming healthy (the #4982 failure mode):\n${p2.out.value}`);
+        if (result.kind === "healthy") {
+            throw new Error(`P2 laddered off instead of taking the early pre-persistence adopt-exit (#5018 option A violated):\n${p2.out.value}`);
         }
-        assert.notEqual(result.servedPort, port, "P2 must ladder off the contended port");
-        const logText = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
-        assert.match(logText, /no longer answers as itself/, "the demotion from twin to foreign-held must be logged");
-        // The demotion warn above deliberately names "twin-collision" in prose, so pin
-        // the verdict by its unique log marker (shared by the early #4341 and the late
-        // path) instead of that substring.
-        assert.doesNotMatch(logText, /already served by a same-build bili instance/, "an unverified claim must never reach the twin-collision verdict");
+        assert.equal(result.code, TWIN_ADOPT_EXIT_CODE, "the exit must carry the twin-collision adopt signal the spawner keys on (#4811)");
+        assert.match(p2.out.value, /still held by a same-build bili instance \(pid \d+, lane pi\) whose health probe is silent/, "the pre-persistence present-twin verdict must be emitted on the stderr leg the spawner reads");
+        const logText = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8").slice(-1200);
+        assert.doesNotMatch(logText, /already served by a same-build bili instance/, "only a VERIFIED twin may produce the served-by verdict");
+        assert.equal(fs.existsSync(path.join(sessions, "index.db")), false, "the duplicate must exit before persistence init — no index.db opened under the zombie (#3923/#3959)");
     } finally {
         if (p2Ref) await killChild(p2Ref.child);
         const squatter = squatterRef;

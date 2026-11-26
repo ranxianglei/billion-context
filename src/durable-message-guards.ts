@@ -45,6 +45,16 @@
 // such contract. The kernel stays host-agnostic: it only knows virtual paths
 // and patterns.
 //
+// #5142 second role — DRIFT ACCOUNTING (not protection): some carriers are
+// deliberately foldable AND permanently retired by their host after use
+// (the per-turn time-context notice; superseded durable instances under the
+// latest-per-identity policy). Once folded they leave the resent history
+// forever, which fold-reconcile used to count as "drift" on every later
+// turn — the O(full-history) tax of #5139. oneShotCarrierPaths below exposes
+// the same evidence-backed classifiers to that accounting surface ONLY:
+// their matches are recorded as expected rebases (excluded from drift),
+// never pinned in the kernel.
+//
 // #2766 ROLE BOUNDARY: every carrier is a host INJECTION into the user
 // channel — no classifier may project an assistant-role message. Model
 // output echoes these markers (anything visible to the model eventually
@@ -61,23 +71,89 @@ import type { Config, CoreMessage } from "acp-kernel";
  *  path (or undefined when the message is no durable carrier). */
 type DurableMessageClassifier = (msg: CoreMessage) => string | undefined;
 
+/** The machine frame every dsh durable injection is wrapped in
+ *  (\x3csystem-reminder\x3e … \x3c/system-reminder\x3e). Both producers that
+ *  own a durable carrier emit the COMPLETE frame themselves —
+ *  dsh-tool-skill's renderCatalogMessage/renderCatalogUpdate and
+ *  dsh-agent-instructions' buildInstructionText ("This producer owns the
+ *  complete <system-reminder> frame") — so the frame is a stable property of
+ *  the carrier, not of some outer host wrapper. */
+const SYSTEM_REMINDER_FRAME = "\x3csystem-reminder\x3e";
+
+/** True when the message OPENS the system-reminder frame. The marker-only
+ *  match this replaces could not tell a real injection from a message that
+ *  merely QUOTES one (#7153): a human paste or a subagent report carrying the
+ *  block took the newest instance of `durable/<name>`, so it was pinned
+ *  forever AND the real carrier lost the identity (latest-per-identity) —
+ *  and Rule 3 stopped treating the quoting message as the last human request
+ *  (#5109), which strands the live ask outside the protected zone. A future
+ *  producer that stops emitting the frame degrades to a MISS (the carrier
+ *  folds as ordinary history): the direction this file prefers over a false
+ *  positive. */
+function opensSystemReminderFrame(text: string): boolean {
+    return text.trimStart().startsWith(SYSTEM_REMINDER_FRAME);
+}
+
 /** dsh skill-catalog identity (#2419): the durable catalog message injected
  *  by dsh-tool-skill (a \x3csystem-reminder\x3e carrying the
  *  \x3cavailable_skills\x3e block; source: asar dsh-tool-skill/lib/index.js,
  *  createUserMessage({ source: { kind: "skill-catalog" } })). The marker is
- *  matched on its own rather than on the wrapper so a future wrapper change
- *  cannot silently disarm the classifier; a false positive is benign (a
- *  matching message simply stays visible) and the marker is DSH-specific
- *  XML. Re-emitted only when the visible skill set CHANGES, so the newest
- *  instance is the source of truth (`protectedLatestTools` candidate).
+ *  matched INSIDE the frame rather than on its own (#7153): the bare marker
+ *  also matches a human paste or a relay report that quotes the block, and
+ *  under latest-per-identity such a quote takes the identity over from the
+ *  real catalog — it gets pinned forever while the catalog folds. Re-emitted
+ *  only when the visible skill set CHANGES, so the newest instance is the
+ *  source of truth (`protectedLatestTools` candidate).
  *  #2766: assistant-role messages are never carriers — every carrier is a
  *  host injection into the user channel, so a model ECHO of the marker must
  *  not project (under latest-per-identity it would take the identity over
  *  from the real carrier and get it folded away). */
 export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
-    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cavailable_skills\x3e")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string"
+        && opensSystemReminderFrame(msg.text) && msg.text.includes("\x3cavailable_skills\x3e")
         ? "durable/skill-catalog"
         : undefined;
+}
+
+/** dsh workspace-instructions REVISION identity: the reconciliation shapes of
+ *  the #2447 carrier — @deepseek-ai/dsh-agent-instructions' changedSectionText
+ *  emits one message per changed file, framed by the same
+ *  \x3csystem-reminder\x3e wrapper but with a lowercase marker (or a different
+ *  verb) than the baseline's `Instructions from:`:
+ *    `Updated instructions from: <path>`      — file content edited
+ *    `Additional instructions from: <path>`   — a file discovered LATER (its
+ *                                               content was never in the
+ *                                               baseline at all)
+ *    `Instructions removed: <path>`           — the file no longer applies
+ *  These are NOT ordinary consumable history, which is what the earlier
+ *  case-sensitive match assumed. baselineIdentity excludes file CONTENT
+ *  (lib/index.js:39: projectRoot + discovery/budget config only), so a
+ *  mid-session edit never re-emits a baseline — the revision is the ONLY
+ *  carrier of the change. Folding it leaves the pinned, superseded baseline in
+ *  context and drops the correction: the model keeps obeying rules the user
+ *  already rewrote, and cannot tell it lost the update. That is strictly worse
+ *  than folding both (then the model at least knows it has no rules).
+ *
+ *  IDENTITY IS PER PATH, deliberately not one shared `durable/agents-md`
+ *  bucket: the default policy is latest-per-identity (protectedLatestTools),
+ *  so a shared bucket would let the newest revision DEMOTE the baseline — and
+ *  a baseline merges EVERY discovered file into one message, while a revision
+ *  carries only its own file. On a multi-file session that trade loses rules:
+ *  measured on a real base+d1 pair, the baseline carried 2 files (global +
+ *  project root) and the `Additional` revision carried 1, so a shared bucket
+ *  would have gone from "keep 2, lose 1" to "keep 1, lose 2". Per-path
+ *  identities keep each file's newest version and bound the pinned set to
+ *  "one baseline + one revision per touched file".
+ *
+ *  `durable/*` still matches the suffixed path: matchToolPath compares only
+ *  the first segment for a `<prefix>/*` pattern. Matched case-sensitively on
+ *  purpose: the three shapes are fixed DSH template literals, so case folding
+ *  would only grow the false-positive surface. #2766 role gate as above. */
+function agentsMdRevisionPath(text: string): string | undefined {
+    const m = /^\s*\x3csystem-reminder\x3e\s*(?:(?:Updated|Additional)\s+instructions\s+from|Instructions\s+removed)\s*:[ \t]*([^\n]+)/.exec(text);
+    if (m === null) return undefined;
+    const path = m[1]!.trim();
+    return path.length > 0 ? `durable/agents-md-update/${path}` : undefined;
 }
 
 /** dsh workspace-instructions identity (#2447): the durable AGENTS.md baseline
@@ -88,17 +164,27 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
  *  createUserMessage). The host re-emits the baseline only when
  *  baselineIdentity (projectRoot + discovery/budget config, NOT file contents)
  *  changes, so one fold of it silently kills hard constraints like "read X
+
  *  before any web access" forever. Marker-over-wrapper rationale as #2419.
- *  The match is case-sensitive on purpose — reconciliation change messages
- *  use lowercase variants ("Updated instructions from:") that remain ordinary
- *  consumable history. At most ~one such baseline lives per session
- *  (replacements are rare identity changes), so pinning every match is
- *  bounded. #2766: assistant-role messages are never carriers (see
- *  dshSkillCatalogPath). */
+ *  At most ~one such baseline lives per session (replacements are rare
+ *  identity changes), so pinning every match is bounded. #2766: assistant-role
+ *  messages are never carriers (see dshSkillCatalogPath).
+ *
+ *  THE SAME CARRIER HAS A SECOND SHAPE — its REVISIONS (see
+ *  agentsMdRevisionPath above): the baseline projects to `durable/agents-md`,
+ *  each mid-session revision to its own per-path identity. The baseline marker
+ *  stays case-sensitive for a different reason than before: the revision
+ *  shapes are classified FIRST, because a revision body can itself contain the
+ *  uppercase label (a user documenting bili's matching string puts
+ *  `Instructions from:` inside their own AGENTS.md) and would otherwise be
+ *  mistaken for a baseline. */
 export function dshWorkspaceInstructionsPath(msg: CoreMessage): string | undefined {
-    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:")
-        ? "durable/agents-md"
-        : undefined;
+    if (msg.role === "assistant" || msg.contentType !== "text" || typeof msg.text !== "string") return undefined;
+    // #7153: require the <system-reminder> frame so a human pasting a rule file
+    // ("Instructions from: AGENTS.md" quoted in prose) stays ordinary history;
+    // agentsMdRevisionPath enforces the leading frame for revisions itself.
+    if (!opensSystemReminderFrame(msg.text)) return undefined;
+    return agentsMdRevisionPath(msg.text) ?? (msg.text.includes("Instructions from:") ? "durable/agents-md" : undefined);
 }
 
 /** dsh mcp-catalog identity (#2446): the durable MCP-server catalog injected
@@ -140,21 +226,252 @@ export function dshMcpCatalogPath(msg: CoreMessage): string | undefined {
  *  forever. Each snapshot is tiny (~100–400 chars); superseded ones fold
  *  harmlessly under the latest-per-identity default because the newest
  *  carries the supersedes clause. #2766: assistant-role messages are never
- *  carriers (see dshSkillCatalogPath). */
+ *  carriers (see dshSkillCatalogPath).
+ *  #7085: dsh 0.2.2-rc.3 reworded the populated snapshot — it no longer
+ *  contains "Current runtime context" but opens with the lead-in "The
+ *  following information describes your current session" (wrapped in
+ *  \x3csystem-reminder\x3e). The lead-in has TWO continuations: the first
+ *  snapshot ends it with ":" while re-sends after a context change continue
+ *  it with ". It replaces earlier versions of this context, including any
+ *  retained in conversation summaries." — the marker is the shared prefix
+ *  WITHOUT the trailing colon so both forms classify. The old literal stays
+ *  because cross-form transition sessions carry BOTH shapes; the cleared form
+ *  still uses the old literal, so dropping it would blind the invalidation
+ *  notice. */
 export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
-    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Current runtime context")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string"
+        && (msg.text.includes("Current runtime context") || msg.text.includes("The following information describes your current session"))
         ? "durable/runtime-context"
         : undefined;
 }
 
-/** dsh lane classifier: any of the four evidence-backed carriers → its
- *  canonical durable identity. */
+/** #2286 wire shape (AUTO_INJECTED_NOTIFICATION_PREFIXES in src/server.ts):
+ *  the dsh agent loop injects one timestamp notice before each turn,
+ *  "Time sampled while preparing turn N, step M: <ts> …". Kept local — this
+ *  module must not import src/server.ts; tests pin the two lists in lockstep. */
+const TIME_CONTEXT_MARKER = "Time sampled while preparing turn";
+
+/** dsh per-turn time-context carrier (#5142, superseding #5109's naming):
+ *  the timestamp notice injected before each turn (marker above).
+ *  Deliberately FOLDABLE by design — unlike the four durable carriers it
+ *  carries no state beyond its own turn and must NEVER be pinned, so its
+ *  path lives in the oneshot/ namespace where no protection pattern matches
+ *  it (kernel-foldable) while still riding dshDurableToolPath. Its problem is
+ *  retirement, not foldability: the host re-sends it only on the turn it
+ *  was sampled for, so once folded it leaves the resent history FOREVER —
+ *  a permanent missing covered id that fold-reconcile used to count as
+ *  drift on every later turn (#5139: 157 such ids in one production
+ *  session, part of the monotonic 739→1045 growth). oneShotCarrierPaths
+ *  accounts that retirement as EXPECTED. Prefix match (trimmed) on purpose
+ *  (the turn-number/timestamp tail varies) — a substring hit would
+ *  reclassify a real human request that merely quotes the phrase
+ *  mid-sentence; case-insensitive like the other auto-injected notification
+ *  prefixes (#2286). The path still matters beyond accounting: kernel Rule 3
+ *  refuses virtual-path messages as the last-user anchor (#5109), so a stale
+ *  clock reading can never displace the newest human request from the
+ *  protected zone. #2766: model echoes are never carriers (assistant gate
+ *  below). */
+export function dshTimeContextPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && startsWithAsciiCI(msg.text.trim(), TIME_CONTEXT_MARKER)
+        ? "oneshot/time-context"
+        : undefined;
+}
+/** dsh paste-to-context image carrier (#5142, reporter evidence 2026-10-29):
+ *  the ptc-mode message dsh emits when a user pastes an image into context —
+ *  a user-role (text, image) pair whose text block is the generated template
+ *  \x3cpath\x3e…\x3c/path\x3e \x3ctype\x3eimage\x3c/type\x3e \x3ccontent\x3e…px, …
+ *  bytes…\x3c/content\x3e (shape verified against a production session journal:
+ *  all 550 instances carry the identical shape). One-shot: the host resends it
+ *  only on the turn it was pasted for, so once folded it leaves the resent
+ *  history forever — the ×550 drift-id family of #5139. The match is on the
+ *  most distinctive template token alone (single-marker discipline like every
+ *  other classifier here); a literal user echo is benign in both directions —
+ *  a persistent misclassified message never goes missing, so the expected-
+ *  rebase record has no observable effect on it, and a true carrier missing
+ *  its marker tail still retires loudly as drift (honest failure). These
+ *  messages are also prime image-offload targets (inline bytes), which C3's
+ *  structural pairing handles independently. #2766: assistant-role messages
+ *  are never carriers (see dshSkillCatalogPath). */
+export function dshPastedImagePath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3ctype\x3eimage\x3c/type\x3e")
+        ? "oneshot/ptc-image"
+        : undefined;
+}
+
+/** dsh background-job completion notice (#5142, reporter evidence 2026-10-29):
+ *  tool-jobs / form:"notice" — a user-role message announcing a finished
+ *  background job ("background job <id> (…) finished [status: …, exit code:
+ *  N]. Read its output with job_output."), one per job completion (×39 in the
+ *  #5139 session). One-shot like time-context: resent only while the notice
+ *  is fresh, then gone forever after use. The match requires the job ID after
+ *  the lead-in (#7153) — the bare prefix also matches ordinary English
+ *  ("background jobs keep failing because …"), and a misclassified HUMAN
+ *  message loses its Rule-3 anchor role and folds as a one-shot carrier.
+ *  All three emitter shapes keep matching (packages/jobs/tool-jobs/src/
+ *  index.ts): inline "background job <id> (kind: label) finished …",
+ *  truncated "background job <id>\\n[notice truncated]…", compact
+ *  "background job <id>\\nDone; job_output." — hence " (" / EOL. #2766:
+ *  assistant-role messages are never carriers. */
+const TOOL_JOB_NOTICE_RE = /^background job \S+(?: \(|$|\r?\n)/i;
+
+export function dshToolJobNoticePath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && TOOL_JOB_NOTICE_RE.test(msg.text.trim())
+        ? "oneshot/tool-job-notice"
+        : undefined;
+}
+
+/** #5173 reporter jsonl measurement (source.kind=dsh-mnemon, omdsh-dev/dsh-mnemon
+ *  memory plugin): recalled-memory injections ride user-role messages prefixed
+ *  `[MNEMON] ` or `[MNEMON RUNTIME MEMORY` (both observed in the production
+ *  session journal that filed the issue; the plugin ships built, so the
+ *  literal is not source-verifiable — stability owned by the plugin author,
+ *  same bar as the #2446 mcp-catalog entry; if the prefix ever changes the
+ *  classifier simply stops matching: status quo ante, no harm done). One-shot
+ *  per recall event: a folded instance is never re-sent verbatim, so its
+ *  retirement is accounted via oneShotCarrierPaths. Prefix match (asciiCI) on
+ *  the leading-trimmed text — trimStart on purpose because the marker's TRAILING
+ *  space is part of the shape (it separates the tag from the payload) while a
+ *  host may still pad the front. Slot exclusion is the point (#5173): a mnemon
+ *  line landing right after the newest human request steals the Rule-3
+ *  last-user anchor (#5109). #2766: assistant-role messages are never carriers. */
+export function dshMnemonPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" &&
+        (startsWithAsciiCI(msg.text.trimStart(), "[MNEMON] ") || startsWithAsciiCI(msg.text.trimStart(), "[MNEMON RUNTIME MEMORY"))
+        ? "oneshot/mnemon"
+        : undefined;
+}
+
+/** dsh background-subagent settlement notice (#5173, source evidence:
+ *  deepseek-harness MIT packages/subagent/subagent/src/continuation-messages.ts
+ *  settlementSummary(): subject `Background subagent ${childId}` followed by a
+ *  fixed ending (" finished and will do no further work unless you send it
+ *  more." / " was stopped before it finished." / " ran out of room before it
+ *  finished."), spliced into the PARENT session as a user-role message when a
+ *  child settles. One-shot: emitted once per settlement and never re-sent —
+ *  retirement accounted via oneShotCarrierPaths. The match requires the
+ *  settlement ENDING after the child id (#7153): the bare `Background
+ *  subagent ` lead-in also matches human prose that names a subagent
+ *  ("Background subagent X is stuck again — why?"), and a misclassified human
+ *  message loses its Rule-3 anchor role. All six endings the emitter can
+ *  produce stay matched (finished / was stopped / ran out of room / declined /
+ *  failed / ended). Slot exclusion is the point (#5173): a settlement notice
+ *  landing right after the newest human request steals the Rule-3 last-user
+ *  anchor (#5109). #2766: assistant-role messages are never carriers. */
+const SUBAGENT_SETTLED_RE = /^background subagent .+? (?:finished|was stopped|ran out of room|declined|failed|ended)\b/i;
+
+export function dshSubagentSettledPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" &&
+        SUBAGENT_SETTLED_RE.test(msg.text.trim())
+        ? "oneshot/subagent-settled"
+        : undefined;
+}
+
+/** dsh cross-agent relay message (#5173, source evidence: deepseek-harness MIT
+ *  packages/subagent/subagent/src/continuation-messages.ts wrapper
+ *  `{ type: "text", text: \`Agent ${sender.id} sent a message: \` }` + the
+ *  sender's content parts, spliced into the recipient session as a user-role
+ *  message). One-shot: sent once per relay and never re-sent — retirement
+ *  accounted via oneShotCarrierPaths. Both halves case-sensitive on purpose
+ *  (deterministic template literal in the emitter, like the case-sensitive
+ *  `Instructions from:` of #2447): the `Agent ` lead-in plus the distinctive
+ *  ` sent a message: ` joint. A literal user echo of the phrase is benign in
+ *  both directions — slot exclusion only, the message stays foldable. Slot
+ *  exclusion is the point (#5173): a relay landing right after the newest
+ *  human request steals the Rule-3 last-user anchor (#5109). #2766:
+ *  assistant-role messages are never carriers. */
+export function dshAgentRelayPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" &&
+        msg.text.startsWith("Agent ") && msg.text.includes(" sent a message: ")
+        ? "oneshot/agent-relay"
+        : undefined;
+}
+
+/** dsh request-image handle annotation (#5142 residual, session evidence
+ *  2026-11-04): the user-role text cell dsh emits beside a pasted image's
+ *  request copy — "Image NAME (sha256:DIGEST); request preview WxHpx."
+ *  plus the normalized-copy access note (requestImageHandleText in
+ *  @deepseek-ai/dsh-llm/lib/types/content.js).
+ *  It rides ONLY the turn its attachment is rendered for; from the next turn
+ *  the same wire slot carries the offload placeholder instead ("[image omitted
+ *  to fit request image limits; …", offloadedImageText), so the handle retires
+ *  one-shot exactly like the ptc paste template above. Session evidence: in a
+ *  cross-provider replay drop this handle was the SINGLE non-reasoning id left
+ *  in an 111-id missing set, and its absence from the expected record kept the
+ *  #2193 reasoning-only verdict from firing for the whole episode — one
+ *  unaccounted text id turned a tolerated switch into a per-turn drift warn.
+ *  Single-marker discipline like every other classifier here: the match is on
+ *  the `; request preview ` separator alone. The offload placeholder opens
+ *  `[image omitted to fit request image limits;` and never carries that
+ *  separator, so a placeholder can never be misread as a live handle (that
+ *  pairing belongs to C3's structural slot evidence). A literal user echo is
+ *  benign in both directions, same argument as dshPastedImagePath. #2766:
+ *  assistant-role messages are never carriers. */
+export function dshImageHandlePath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("; request preview ")
+        ? "oneshot/image-handle"
+        : undefined;
+}
+
+/** #6021 — the image-offload placeholder (@deepseek-ai/dsh-compaction-image-
+ *  offload) replaces the live request-image handle in the slot after a
+ *  compaction: "[image omitted to fit request image limits; ...]" plus the
+ *  user's original words. #5752 deliberately left it unclassified — then it
+ *  was only C3 slot evidence that the handle had retired. But once the slot
+ *  holds the placeholder it IS the only text-bearing user message in the
+ *  visible zone, so lastUserAnchor() pins a two-day-old screenshot as the
+ *  current question. Classifying it as a one-shot carrier in BOTH registries
+ *  below fixes the anchor (and lets the retired old id take the
+ *  expected-rebase channel) without touching the handle logic — a placeholder
+ *  still never classifies as a handle (pinned in #5142). The marker may sit
+ *  mid-text (user words follow the closing bracket), so `includes`, not a
+ *  prefix match. The text-only-route sibling ("image omitted because this
+ *  model accepts text only;") is the same emitter and shares the family.
+ *  #2766: assistant-role messages are never carriers. */
+export function dshImageOffloadPlaceholderPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" &&
+        msg.contentType === "text" &&
+        typeof msg.text === "string" &&
+        (msg.text.includes("image omitted to fit request image limits;") ||
+            msg.text.includes("image omitted because this model accepts text only;"))
+        ? "oneshot/image-offload-placeholder"
+        : undefined;
+}
+
+/** Case-insensitive ASCII prefix check over the first needle.length chars —
+ *  mirrors the asciiCI convention of src/server.ts (kept local so this
+ *  module stays dependency-free). */
+function startsWithAsciiCI(hay: string, needle: string): boolean {
+    if (hay.length < needle.length) return false;
+    for (let i = 0; i < needle.length; i++) {
+        const h = hay.charCodeAt(i);
+        const n = needle.charCodeAt(i);
+        if (h === n) continue;
+        const hl = h >= 65 && h <= 90 ? h + 32 : h;
+        if (hl !== (n >= 65 && n <= 90 ? n + 32 : n)) return false;
+    }
+    return true;
+}
+
+/** dsh lane classifier: any of the twelve evidence-backed identities → its
+ *  canonical path (four durable carriers + eight foldable one-shot injections).
+ *  Every classified message loses Rule-3 last-user anchor eligibility (#5109/
+ *  #5173); only `durable/*` paths are actually pinned by the default policy —
+ *  the oneshot/ families ride here purely so an injection can never displace
+ *  the newest human request from the protected zone. */
 function dshDurableToolPath(msg: CoreMessage): string | undefined {
     return (
         dshSkillCatalogPath(msg) ??
         dshWorkspaceInstructionsPath(msg) ??
         dshRuntimeContextPath(msg) ??
-        dshMcpCatalogPath(msg)
+        dshMcpCatalogPath(msg) ??
+        dshTimeContextPath(msg) ??
+        dshPastedImagePath(msg) ??
+        dshToolJobNoticePath(msg) ??
+        dshMnemonPath(msg) ??
+        dshSubagentSettledPath(msg) ??
+        dshAgentRelayPath(msg) ??
+        dshImageHandlePath(msg) ??
+        dshImageOffloadPlaceholderPath(msg)
     );
 }
 
@@ -191,3 +508,59 @@ export function withDurableProtection(config: Config, classifier: DurableMessage
     }
     return { ...config, protectedLatestTools: [...(config.protectedLatestTools ?? []), "durable/*"], messagePathOf: classifier };
 }
+
+/** #5142: lane → ONE-SHOT carrier classifier for FOLD-DRIFT ACCOUNTING only
+ *  (fold-reconcile's expected-rebase record). Deliberately separate from
+ *  durableMessageToolPaths: these carriers stay kernel-foldable (lean
+ *  context) but are PERMANENTLY retired by their host after use — superseded
+ *  durable instances under the latest-per-identity policy included (a folded
+ *  old skill-catalog snapshot never comes back either). Their absence from
+ *  later resends is expected host behavior, accounted out of drift, NEVER
+ *  pinned. Same KDD #9 discipline: per-host entries with traffic evidence. */
+export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
+    dsh: (msg) =>
+        dshSkillCatalogPath(msg) ??
+        dshWorkspaceInstructionsPath(msg) ??
+        dshRuntimeContextPath(msg) ??
+        dshMcpCatalogPath(msg) ??
+        dshTimeContextPath(msg) ??
+        dshPastedImagePath(msg) ??
+        dshToolJobNoticePath(msg) ??
+        dshMnemonPath(msg) ??
+        dshSubagentSettledPath(msg) ??
+        dshAgentRelayPath(msg) ??
+        dshImageHandlePath(msg) ??
+        dshImageOffloadPlaceholderPath(msg),
+};
+
+/** #5142: raw-content pre-filter markers for the stored-row backfill — the
+ *  exact marker strings of the twelve dsh classifiers above (eighteen markers:
+ *  the workspace-instructions family contributes four, the runtime-context
+ *  family two — the pre-0.2.2-rc.3 "Current runtime context" literal and the
+ *  0.2.2-rc.3 lead-in without its trailing colon, which both the
+ *  first-snapshot and re-send intros share, #7085 — the mnemon family
+ *  contributes two, the agent-relay family two, the image-offload family
+ *  two), so a unified-store row can be screened with cheap substring checks
+ *  BEFORE JSON.parse (rows may carry megabytes of base64 media). Lockstep
+ *  with the classifiers is enforced in
+ *  tests/issue5142-expected-rebase.test.ts. */
+export const dshCarrierRawMarkers: readonly string[] = [
+    "\x3cavailable_skills\x3e",
+    "Instructions from:",
+    "Updated instructions from:",
+    "Additional instructions from:",
+    "Instructions removed:",
+    "Current runtime context",
+    "The following information describes your current session",
+    "\x3cmcp_catalog\x3e",
+    "Time sampled while preparing turn",
+    "\x3ctype\x3eimage\x3c/type\x3e",
+    "background job",
+    "[MNEMON] ",
+    "[MNEMON RUNTIME MEMORY",
+    "Background subagent ",
+    " sent a message: ",
+    "; request preview ",
+    "image omitted to fit request image limits;",
+    "image omitted because this model accepts text only;",
+];

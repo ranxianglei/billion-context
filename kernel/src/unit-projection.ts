@@ -1,5 +1,14 @@
-import { activeBlocks, blockById, isLiveCheckpointCarrier } from "./state.js";
-import { resolveBoundaries, blockVisibleInRange } from "./boundaries.js";
+import {
+  activeBlocks,
+  blockById,
+  coveredMessageIds,
+  isLiveCheckpointCarrier,
+} from "./state.js";
+import {
+  buildIndexByMessageId,
+  resolveBoundaries,
+  blockVisibleInRange,
+} from "./boundaries.js";
 import { isSummaryMessageId } from "./prune.js";
 import {
   collectFailedCompressCallIds,
@@ -8,10 +17,19 @@ import {
   isMessageLatestProtected,
   isMessageProtected,
   collectAgedCompressCallIds,
+  lastUserAnchor,
 } from "./protected.js";
-import { computeIntegrityWithdrawals } from "./turn-integrity.js";
+import type { LatestProtected } from "./protected.js";
+import {
+  buildIntegrityPre,
+  computeIntegrityWithdrawals,
+} from "./turn-integrity.js";
+import type { IntegrityPre } from "./turn-integrity.js";
 import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
-import { adjustBoundariesForToolPairs } from "./tool-pairs.js";
+import {
+  adjustBoundariesForToolPairs,
+  buildToolPairExtremes,
+} from "./tool-pairs.js";
 import type {
   CompressionState,
   CompressionTier,
@@ -60,11 +78,29 @@ export interface UnitProjectionInput {
   /** Warnings are pushed here in apply's original emission order so the
    * apply-side refactor stays byte-identical. Omit for read-only screens. */
   warnings?: string[];
+  /** #5337 option A: per-pass O(n) derivations shared by every unit screened
+   *  against the SAME (messages, state, config) triple — build once with
+   *  {@link buildProjectionShared}. Omitted callers (the single-shot
+   *  apply/report paths) compute inline exactly as before. */
+  shared?: ProjectionShared;
+  /** #5789 recovery ladder (internal): nested block ids kept ACTIVE even
+   *  though they sit inside the span — the merge proceeds without consuming
+   *  them. Set only by projectUnit's own shrink retry; external callers must
+   *  never pass it. */
+  excludeNestedBlockIds?: ReadonlySet<string>;
 }
 
 export interface UnitProjectionFatal {
   kind: "zone" | "split";
   error: Error;
+  /** #7596: set only by the fresh-fold path where the integrity withdrawal
+   *  left the range with NOTHING foldable (not a merge). applySingleRange
+   *  treats this as a no-op success with a warning instead of throwing —
+   *  killing the whole batch over one doomed range made the model re-pay
+   *  full-context reads on every retry until the breaker fired. The merge
+   *  split fatals (excluded-merge / actionable split) do NOT set it and stay
+   *  hard errors. */
+  degradable?: boolean;
 }
 
 export interface UnitProjection {
@@ -97,11 +133,23 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   let splitTurnCount = 0;
   let splitPairCount = 0;
 
+  // #5337 option A: optional per-pass derivations (see buildProjectionShared).
+  // Every use site below falls back to the legacy inline computation when the
+  // caller provides no shared context, so standalone projections (apply,
+  // report) stay byte-identical to the pre-sharing implementation.
+  const shared = input.shared;
+  const byId = shared?.byId;
+  const msgById = (id: string): CoreMessage | undefined =>
+    byId === undefined
+      ? input.messages.find((m) => m.id === id)
+      : input.messages[byId.get(id) ?? -1];
+
   const resolved = resolveBoundaries({
     startRef: input.startRef,
     endRef: input.endRef,
     messages: input.messages,
     state: input.state,
+    indexByMessageId: byId,
   });
 
   // Host checkpoint carriers (#335): a host that renders its own compression
@@ -113,8 +161,10 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // unknown id) fold like ordinary messages. Block-ref boundaries deliberately
   // distill across checkpoints and keep folding carriers.
   const plainRange = resolved.boundaryKind !== "block";
-  const liveCarrierIds = new Set<string>();
-  if (plainRange) {
+  const liveCarrierIds = new Set<string>(
+    plainRange ? shared?.liveCarrierIds : undefined,
+  );
+  if (plainRange && !shared) {
     // #2663: the selector screens with this same predicate — one definition,
     // two call sites, so advertise/validate cannot drift apart again.
     for (const message of input.messages) {
@@ -123,7 +173,31 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       }
     }
   }
-  const adjustedIds = applyPairBoundaryAdjustments(resolved, input.messages);
+  // #1592: the clamp discriminates a RE-FOLD (requested span already overlaps
+  // an active block → contain it so the old summary is replaceable) from a
+  // DRAG-IN (disjoint block → keep it out, the mega-turn killer). Shared
+  // passes carry the spans prebuilt; the single-shot apply path builds them
+  // inline like its other fallbacks, and only when coverage exists at all.
+  const clampIndexById =
+    byId ??
+    (input.preExistingCoverage.size > 0 ? buildIndexByMessageId(input.messages) : undefined);
+  const clampBlockSpans =
+    input.preExistingCoverage.size > 0
+      ? (shared?.blockSpans ?? buildBlockIndexSpans(input.state, clampIndexById!))
+      : undefined;
+  const adjustedIds = clampAdjustmentAtCoverage(
+    applyPairBoundaryAdjustments(resolved, input.messages, shared),
+    resolved,
+    input.messages,
+    // Fresh folds pass the active coverage; hand-built inputs without it
+    // (unit tests) keep the legacy unclamped adjustment behavior.
+    input.preExistingCoverage,
+    // #5337 discipline: reuse the shared index map — the clamp runs on every
+    // screened unit, and a per-call map rebuild would resurface the O(units×n)
+    // quadratic the shared context exists to prevent.
+    clampIndexById,
+    clampBlockSpans,
+  );
   const skippedCarrierIds = adjustedIds.filter((id) => liveCarrierIds.has(id));
   if (skippedCarrierIds.length > 0) {
     warnings.push(
@@ -139,8 +213,8 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // Re-scan for nested blocks in the ADJUSTED range (tool-pair extension may
   // have pulled in messages that are anchors of existing blocks).
   if (rangeMessageIds.length > resolved.messageIds.length) {
-    const indexByMessageId = new Map<string, number>();
-    input.messages.forEach((m, i) => indexByMessageId.set(m.id, i));
+    const indexByMessageId =
+      shared?.byId ?? buildIndexByMessageId(input.messages);
     const adjustedStart =
       rangeMessageIds.length > 0
         ? (indexByMessageId.get(rangeMessageIds[0]!) ?? resolved.startIndex)
@@ -172,7 +246,18 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     ? (Math.min(3, targetTier + 1) as CompressionTier)
     : 1;
 
-  const consumedBlockIds = resolved.nestedBlockIds.filter((id) => {
+  // #5789: blocks excluded by the recovery ladder stay ACTIVE and are simply
+  // not consumed here — their ids drop out of effectiveMessageIds below
+  // automatically (the union iterates consumedBlockIds), and because they
+  // remain active they are part of preExistingCoverage, so none of their ids
+  // re-enter as direct content either.
+  const excludedNestedBlockIds = input.excludeNestedBlockIds
+    ? resolved.nestedBlockIds.filter((id) =>
+        input.excludeNestedBlockIds!.has(id),
+      )
+    : [];
+  let consumedBlockIds = resolved.nestedBlockIds.filter((id) => {
+    if (input.excludeNestedBlockIds?.has(id)) return false;
     const block = blockById(input.state, id);
     return block?.active && block.tier === targetTier;
   });
@@ -194,6 +279,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     directMessageIds,
     input.messages,
     input.config,
+    shared,
   );
 
   // filterProtectedToolMessages drops protected tool calls (and their paired
@@ -208,12 +294,12 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   }
 
   const mediaExcluded = directMessageIds.filter((id) => {
-    const msg = input.messages.find((m) => m.id === id);
+    const msg = msgById(id);
     return !!msg && hasUnrecoverableMediaPayload(msg);
   });
   if (mediaExcluded.length > 0) {
     warnings.push(
-      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (remote URL / file references with no stored bytes) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Inline images fold normally and stay restorable via decompress({ imageRef }).`,
+      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (no stored bytes and no re-access handle in the message) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Ref-based media (remote URL / file id) folds normally since #5620 with its handle recorded in the summary; inline images fold normally too and stay restorable via decompress({ imageRef }).`,
     );
   }
 
@@ -258,22 +344,23 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       // semantics: fold what remains, exactly as before (#3953 changes
       // nothing there; the zone fatal below still fires only when even the
       // carve empties the range).
-      const pairByCallId = new Map<string, [string, string]>();
-      for (const m of input.messages) {
-        if (m.contentType === "tool-call" || m.contentType === "tool-result") {
-          const key = m.toolCallId ?? m.id;
-          const pair = pairByCallId.get(key) ?? ["", ""];
-          if (m.contentType === "tool-call") pair[0] = m.id; else pair[1] = m.id;
-          pairByCallId.set(key, pair);
-        }
-      }
+      // #5337 option A: pair map shared across units; the DROP side becomes a
+      // Set so membership stays O(1) — the previous .includes() inside .some()
+      // made this branch quadratic in unit width.
+      const pairByCallId = shared?.pairByCallId ?? buildPairMap(input.messages);
       const keptIds = filteredIds.slice(0, firstProtectedIdx);
       const droppedIds = filteredIds.slice(firstProtectedIdx);
+      const droppedSet = new Set(droppedIds);
       const strandsPair = keptIds.some((id) => {
-        const m = input.messages.find((x) => x.id === id);
+        const m = msgById(id);
         if (!m || (m.contentType !== "tool-call" && m.contentType !== "tool-result")) return false;
         const pair = pairByCallId.get(m.toolCallId ?? m.id);
-        return !!pair && pair.some((half) => half !== "" && half !== id && droppedIds.includes(half));
+        return (
+          !!pair &&
+          pair.some(
+            (half) => half !== "" && half !== id && droppedSet.has(half),
+          )
+        );
       });
       if (truncatable > 0 && firstProtectedIdx > 0 && !strandsPair) {
         truncatedAfter = truncatable;
@@ -292,21 +379,47 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
 
     if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
       const recentN = input.config.preserveRecentMessages;
+      // #5789: an empty-after-exclusion span is NOT the protected-zone case —
+      // every nested block was excluded by the recovery ladder because its
+      // coverage strands a live conflict. Zone fatals are treated as no-op
+      // successes by applySingleRange (#4521); this one must stay a hard
+      // error with actionable guidance.
+      const excludedFatal =
+        excludedNestedBlockIds.length > 0
+          ? new Error(
+              `Merging ${resolved.nestedBlockIds.join(", ")} cannot proceed: excluding ${excludedNestedBlockIds.join(", ")} (their coverage would strand a live turn-integrity conflict) leaves nothing left to fold in ${input.startRef}..${input.endRef}. Fold the stranded visible partner(s) first with a plain message-range compress so the turn closes, or retry once those block(s) can fold whole.`,
+            )
+          : null;
       return finish({
         fatal: {
-          kind: "zone",
-          error: new Error(
-            `Range is entirely within the protected zone (the last ${recentN} messages and/or the most recent user message): ${hitRefs.join(
-              ", ",
-            )}. Adjust startId/endId to older messages.`,
-          ),
+          kind: excludedFatal ? "split" : "zone",
+          error:
+            excludedFatal ??
+            new Error(
+              `Range is entirely within the protected zone (the last ${recentN} messages and/or the most recent user message): ${hitRefs.join(
+                ", ",
+              )}. Adjust startId/endId to older messages.`,
+            ),
         },
       });
     }
+    const anchorMsg = shared
+      ? shared.anchorMessage
+      : lastUserAnchor(input.messages, coveredMessageIds(input.state), input.config);
+    const anchorRef = anchorMsg ? input.state.messageRefs.byRaw[anchorMsg.id] : undefined;
+    // 2026-11-18 (owner): the anchor QUOTES user speech inside a system
+    // receipt that carries no <acp> time tag on the wire — weak models have
+    // read the quote as the user's LATEST message (ti_an incident 2026-11-17).
+    // Label the quote's origin so it cannot pass for a fresh instruction.
+    const anchorNote =
+      anchorRef && anchorRef !== "BLOCKED"
+        ? ` Last-user anchor (historical quote, NOT a new user message): ${anchorRef} "${(anchorMsg!.text ?? "").replace(/\s+/g, " ").slice(0, 40)}".`
+        : "";
     warnings.push(
       `Excluded ${hitProtectedRaw.length} protected message(s) ${hitRefs.join(
         ", ",
       )} from compression range (recent/last-user zone) — they stay visible outside the new block; do not target them in another compress call.` +
+        anchorNote +
         (truncatedAfter > 0
           ? ` Range truncated at that boundary — ${truncatedAfter} later message(s) (including replies to the protected message) stay visible too, so no summary can land above the question it answers (#3953).`
           : ""),
@@ -362,7 +475,17 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       foldedRef = new Set(effectiveMessageIds);
       for (const id of survivingCoverage) foldedRef.add(id);
     }
-    const initial = computeIntegrityWithdrawals(input.messages, foldedRef);
+    // #5531: fresh folds judge on their OWN ids alone, so the coverage of OTHER
+    // active blocks must arrive as the invisible set — a covered call is not
+    // kept-visible and cannot strand its turn's reasoning (#564 reverse-split
+    // residue, billion-context#5531). Merges already model post-fold coverage
+    // through foldedRef ∪ survivingCoverage and stay untouched.
+    const initial = computeIntegrityWithdrawals(
+      input.messages,
+      foldedRef,
+      shared?.integrityPre,
+      isMerge ? undefined : input.preExistingCoverage,
+    );
     splitTurnCount = initial.splitTurnCount;
     splitPairCount = initial.splitPairCount;
     if (initial.withdrawn.size > 0) {
@@ -381,6 +504,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
           return finish({
             fatal: {
               kind: "split",
+              degradable: true,
               error: new Error(
                 `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
               ),
@@ -413,26 +537,284 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
           const recheck = new Set(effectiveMessageIds);
           for (const id of unfolded) recheck.delete(id);
           for (const id of survivingCoverage) recheck.add(id);
-          current = computeIntegrityWithdrawals(input.messages, recheck).withdrawn;
+          current = computeIntegrityWithdrawals(
+            input.messages,
+            recheck,
+            shared?.integrityPre,
+          ).withdrawn;
         }
         if (stuck || current.size > 0) {
-          const sample = [...consumedCoverage].slice(0, 5).join(", ");
-          return finish({
-            fatal: {
-              kind: "split",
-              error: new Error(
-                `Merging ${consumedBlockIds.join(", ")} cannot satisfy turn integrity without unfolding already-folded message(s) owned by those blocks (${sample}) — doing so would drop their existing coverage. Align the range to whole turns (do not cut through a reasoning/tool-call/result group) or merge fewer blocks.`,
-              ),
-            },
-          });
+          // #5789: a conflict whose withdrawn ids are ENTIRELY outside this
+          // merge's fold set pre-dates it — the merge neither created nor
+          // worsened it (every id it touches stays covered, owner aside).
+          // Refusing over such conflicts kills EVERY merge in a session that
+          // carries one historical split (the reported permanent T2 death:
+          // survivingCoverage is global, so one poison block dooms all
+          // merges, even of two adjacent clean blocks). Tolerate: inherit
+          // the conflict as-is and warn honestly.
+          // A conflict only binds THIS merge when it touches content the merge
+          // newly folds (filteredIds) or re-owns (consumed coverage transfers
+          // to the new block). Ids merely inside the span geometry, or owned
+          // by surviving/excluded blocks, keep their covered status either way
+          // — their conflicts are inherited, not caused. #4484's invariant
+          // (a merge never drops existing coverage) holds: nothing here
+          // unfolds a covered id into the visible stream permanently.
+          const mergeOwned = new Set<string>([
+            ...filteredIds,
+            ...consumedCoverage,
+          ]);
+          const relevantUnresolved = [...current].filter((id) =>
+            mergeOwned.has(id),
+          );
+          if (relevantUnresolved.length === 0) {
+            // Merge-neutral: inherit and continue to the success path below
+            // (do NOT return — the fatal must be skipped).
+            warnings.push(
+              `Inherited a pre-existing turn-integrity conflict this merge does not touch (${[...current].slice(0, 6).map((id) => input.state.messageRefs.byRaw[id] ?? id).join(", ")}): the partner(s) are already covered by other blocks or still visible. Left as-is — fold the visible partner(s) into coverage to clear it.`,
+            );
+          } else {
+            // #5919: classify the stranded set BEFORE the exclusion dance.
+            // A merge can only end one of two ways: by closing the turn
+            // (every partner of every folded reasoning/call gets coverage)
+            // or by keeping the poison block active AROUND a turn that is
+            // already closed outside the span. A stranded partner that can
+            // NEVER fold (BLOCKED / recent-zone / protected tool /
+            // unrecoverable media) makes both impossible — pre-#5919 that
+            // surfaced as a retryable "cannot satisfy turn integrity" fatal
+            // promising the partner(s) would "age into coverage", which never
+            // happens: every retry re-failed the same way and the advertised
+            // merge dead-ended (billion-context#5919, session-ad47cd30).
+            // Such a merge is now an idempotent no-op with exact guidance.
+            const refOf5919 = (id: string): string =>
+              input.state.messageRefs.byRaw[id] ?? id;
+            const isNeverFoldable5919 = (id: string): boolean => {
+              const ref = refOf5919(id);
+              const msg = msgById(id);
+              if (ref === "BLOCKED" || !msg) return true;
+              if (input.protectedMessageIds?.has(ref)) return true;
+              if (
+                filterProtectedToolMessages(
+                  [id],
+                  input.messages,
+                  input.config,
+                  shared,
+                ).length === 0
+              )
+                return true;
+              return hasUnrecoverableMediaPayload(msg);
+            };
+            // #6709: `isNeverFoldable5919` lumps two very different cases under
+            // ref === "BLOCKED". One is CONTENT-FREE — the body was removed by
+            // native compression, so there is no live wire content to protect
+            // and the message can never age into foldability. Letting THAT one
+            // doom the merge turns the #5919 no-op into a permanent deadlock:
+            // every merge covering its turn re-hits the same skip and the
+            // session stays stuck at its context ceiling (billion-context#6709,
+            // session-ad47cd30, 6,115 BLOCKED). Such a partner carries nothing
+            // the turn-integrity gate is protecting, so it may flow to rung 2
+            // (folded into the merged block, closing the turn) exactly like a
+            // foldable partner.
+            // The OTHER case is LIVE — a protected tool / unrecoverable media
+            // whose FULL body sits in the wire (assignRefs pins those to ref
+            // "BLOCKED" too). That partner MUST still doom the merge: folding
+            // it in drops protected content from the wire, and leaving it split
+            // emits an orphaned tool_call / tool_result the provider rejects.
+            // So only a BLOCKED ref that is NOT live-protected/media is
+            // content-free; everything else never-foldable keeps dooming.
+            // COUPLING INVARIANT (do not relax one side independently of the
+            // other): the un-doom decision below delegates to
+            // filterProtectedToolMessages with the identical `shared` context
+            // the fresh-fold path uses (unit-projection.ts:250). A partner is
+            // therefore un-doomed ONLY if the fold path itself would fold it —
+            // it can never be un-doomed into a live-body drop or an orphaned
+            // tool_call/tool_result. Pinned by tests/issue5919-shredded-merge.
+            // test.ts ("6709-lockstep"). (Review B risk #1 / review A risk r1.)
+            const isContentFreeBlocked5919 = (id: string): boolean => {
+              const ref = refOf5919(id);
+              if (ref !== "BLOCKED") return false;
+              if (input.protectedMessageIds?.has(ref)) return false;
+              if (
+                filterProtectedToolMessages(
+                  [id],
+                  input.messages,
+                  input.config,
+                  shared,
+                ).length === 0
+              )
+                return false;
+              const msg = msgById(id);
+              if (msg !== undefined && hasUnrecoverableMediaPayload(msg))
+                return false;
+              return true;
+            };
+            const visibleStranded = [...current].filter(
+              (id) => !survivingCoverage.has(id) && !consumedCoverage.has(id),
+            );
+            const doomedStranded = visibleStranded.filter(
+              (id) => isNeverFoldable5919(id) && !isContentFreeBlocked5919(id),
+            );
+            if (doomedStranded.length > 0) {
+              const foldablePartners = visibleStranded.filter(
+                (id) => !isNeverFoldable5919(id),
+              );
+              warnings.push(
+                `Merge of ${consumedBlockIds.join(", ")} skipped — its turn cannot be closed now: ${doomedStranded.map(refOf5919).join(", ")} ${doomedStranded.length === 1 ? "is" : "are"} protected (never foldable) while the rest of their turn is covered by block(s). Do not retry this merge.${foldablePartners.length > 0 ? ` The foldable partner(s) ${foldablePartners.map(refOf5919).join(", ")} can only close their turn together with the protected member(s) — they stay visible until the protection lifts.` : ""}`,
+              );
+              // Consume nothing so the no-op below leaves every block active
+              // (coverage intact — the #4484 invariant).
+              consumedBlockIds = [];
+              filteredIds = [];
+              return finish({ fatal: null });
+            }
+            // #5919 rung 2 (fallback): rung 1 (the exclusion ladder) could
+            // not complete the merge — it re-failed, or it "succeeded" by
+            // folding nothing while the conflict stays live (the silent
+            // variant of the same deadlock). Before surfacing the fatal, try
+            // closing the turn by extending THIS fold to the stranded visible
+            // partner(s): the exact manual unblock the old error text
+            // instructed ("fold the stranded visible partner(s) first with a
+            // plain message-range compress"), done automatically so the
+            // advertised merge stops dead-ending (billion-context#5919).
+            let extended5919 = false;
+            const tryExtend5919 = (): boolean => {
+              // >16 stranded partners: bail to the actionable fatal below.
+              // Post-#6709 a content-free BLOCKED partner among them no longer
+              // no-ops the merge, so a shape that pre-fix silently no-opped now
+              // surfaces as the actionable fatal (fold the partners via a plain
+              // range compress) — the #5919 ladder's intent: an actionable
+              // error beats a silent no-op deadlock (review A risk r2).
+              if (
+                extended5919 ||
+                visibleStranded.length === 0 ||
+                visibleStranded.length > 16
+              )
+                return false;
+              // Every stranded member is foldable (the doomed check above
+              // already no-ops the protected/BLOCKED ones). Commit the
+              // extension only if a fixed-point re-judge shows NO fold-side
+              // withdrawal (the same judge the merge path below runs).
+              const extended = new Set(effectiveMessageIds);
+              for (const id of unfolded) extended.delete(id);
+              for (const id of visibleStranded) extended.add(id);
+              const checkBase = new Set(extended);
+              for (const id of survivingCoverage) checkBase.add(id);
+              let clean = false;
+              let check = new Set(checkBase);
+              for (let guard = 0; guard < 8; guard++) {
+                const w = computeIntegrityWithdrawals(
+                  input.messages,
+                  check,
+                  shared?.integrityPre,
+                ).withdrawn;
+                if (w.size === 0) {
+                  clean = true;
+                  break;
+                }
+                let touchesFold = false;
+                for (const id of w) {
+                  if (extended.has(id)) {
+                    touchesFold = true;
+                    break;
+                  }
+                }
+                if (touchesFold) break;
+                const next = new Set(check);
+                for (const id of w) next.delete(id);
+                if (next.size === check.size) break;
+                check = next;
+              }
+              if (!clean) return false;
+              for (const id of visibleStranded) {
+                if (skippedCarrierIds.includes(id)) continue;
+                effectiveMessageIds.add(id);
+                if (!directMessageIds.includes(id))
+                  directMessageIds.push(id);
+                if (!filteredIds.includes(id)) filteredIds.push(id);
+              }
+              warnings.push(
+                `Extended this merge to fold stranded partner(s) ${visibleStranded.map(refOf5919).join(", ")} so the turn closes (billion-context#5919) — the new block's coverage includes them.`,
+              );
+              extended5919 = true;
+              return true;
+            };
+            let retried: UnitProjection | null = null;
+            if ((input.excludeNestedBlockIds?.size ?? 0) < 64) {
+              const ownerByMessageId = new Map<string, string>();
+              for (const bid of consumedBlockIds) {
+                const block = blockById(input.state, bid);
+                if (!block) continue;
+                for (const id of block.effectiveMessageIds)
+                  ownerByMessageId.set(id, bid);
+              }
+              const offending = [
+                ...new Set(
+                  relevantUnresolved
+                    .filter((id) => !survivingCoverage.has(id))
+                    .map((id) => ownerByMessageId.get(id))
+                    .filter((bid): bid is string => bid !== undefined),
+                ),
+              ].sort();
+              if (offending.length > 0) {
+                retried = projectUnit({
+                  ...input,
+                  excludeNestedBlockIds: new Set([
+                    ...(input.excludeNestedBlockIds ?? []),
+                    ...offending,
+                  ]),
+                });
+                const retriedFoldedNothing =
+                  retried.fatal === null &&
+                  retried.filteredIds.length === 0 &&
+                  retried.consumedBlockIds.length === 0;
+                if (retried.fatal === null && !retriedFoldedNothing) {
+                  warnings.push(
+                    `Excluded ${offending.join(", ")} from this merge — their coverage cuts through a turn group whose partner(s) are still visible outside the span, and unfolding them would drop their only coverage. They stay ACTIVE (coverage intact); the merge proceeded around them.`,
+                  );
+                  return retried;
+                }
+                // Rung 1 could not complete the merge (re-failed, or folded
+                // nothing while the conflict stays live) — rung 2.
+                tryExtend5919();
+              } else {
+                // No consumed block owns the unresolved ids: nothing to
+                // exclude — rung 2 directly.
+                tryExtend5919();
+              }
+            } else {
+              // Ladder exhausted (64 exclusions) — rung 2.
+              tryExtend5919();
+            }
+            if (!extended5919) {
+              if (retried !== null && retried.fatal === null) {
+                // Rung 1 "succeeded" by folding nothing and rung 2 had no
+                // foldable partner to extend to (the #5789 self-range no-op
+                // shape): keep the pinned idempotent no-op — a retry here
+                // must not arm the breaker.
+                return retried;
+              }
+              return finish({
+                fatal: {
+                  kind: "split",
+                  error: new Error(
+                    actionableSplitError(consumedBlockIds, current, input),
+                  ),
+                },
+              });
+            }
+            // #5919 rung 2 committed the extension: the fold now closes the
+            // turn, so fall through to the common withdrawal handling below
+            // (the same path merge-neutral inheritance takes).
+          }
         }
         withdrawnIds = unfolded;
         for (const id of unfolded) effectiveMessageIds.delete(id);
         const beforeWithdraw = filteredIds.length;
         filteredIds = filteredIds.filter((id) => !unfolded.has(id));
-        warnings.push(
-          `Withdrew ${beforeWithdraw - filteredIds.length} newly-folded message(s) from the merge to keep ${splitDesc} intact while preserving the existing coverage of ${consumedBlockIds.join(", ")}.`,
-        );
+        if (beforeWithdraw !== filteredIds.length) {
+          warnings.push(
+            `Withdrew ${beforeWithdraw - filteredIds.length} newly-folded message(s) from the merge to keep ${splitDesc} intact while preserving the existing coverage of ${consumedBlockIds.join(", ")}.`,
+          );
+        }
       }
     }
   }
@@ -461,6 +843,143 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   }
 }
 
+/** #5337 option A: every per-screening-pass O(n) derivation over ONE message
+ *  array, computed ONCE instead of once per screened unit. This was the
+ *  quadratic term of the recommend node: U units x O(n) rescans (history
+ *  index maps, carrier scan, protected/latest/aged collectors, tool-pairing
+ *  map, last-user anchor, turn-integrity pre-scan) about O(n^2) total —
+ *  ~17 s for a single processTurn at 23k core messages while Node's event
+ *  loop was blocked (#5304 repro on v0.1.209).
+ *
+ *  Build once per (messages, state, config) triple via
+ *  {@link buildProjectionShared} and pass to every projectUnit call on that
+ *  triple. Semantics are byte-identical: each field is exactly the value the
+ *  corresponding inline computation produced per unit (projectUnit screens
+ *  many units against one immutable array within a turn). The judgment
+ *  criteria themselves (#3236 discipline) are untouched — only how the
+ *  inputs reach them changed. */
+export interface ProjectionShared {
+  /** Raw-id -> index over `messages` (last occurrence wins, map semantics). */
+  byId: Map<string, number>;
+  /** Host checkpoint carriers (#335/#2663) — the plain-range scan result. */
+  liveCarrierIds: Set<string>;
+  /** Failed-compress exchange toolCallIds (#4289). */
+  failedCompressCallIds: Set<string>;
+  /** Latest-only protection sets (protectedLatestTools). */
+  latestProtected: LatestProtected;
+  /** Aged compress-exchange toolCallIds (#4348 fold exemption lift). */
+  agedCompressCallIds: Set<string>;
+  /** latest.callIds plus the full-history protected-tool scan — the exact
+   *  base set filterProtectedToolMessages builds without sharing. Callers
+   *  must COPY it (per-unit passes add removed ids' toolCallIds). Immutable. */
+  baseProtectedCallIds: Set<string>;
+  /** tool-call/tool-result pairing keyed by toolCallId ?? id. */
+  pairByCallId: Map<string, [string, string]>;
+  /** Per-toolCallId [lowest, highest] positions over the whole array —
+   *  #5751 id-exact boundary widening. Rebuilding it per unit is the #5337
+   *  quadratic class (U units x O(n)) — hence shared. Immutable. */
+  toolPairExtremes: Map<string, [number, number]>;
+  /** Last visible user anchor (drives the #3953 truncation warning note). */
+  anchorMessage: CoreMessage | undefined;
+  /** Per-message inputs of computeIntegrityWithdrawals (#684 gate). */
+  integrityPre: IntegrityPre;
+  /** Index spans [start..end] of every active block's effectiveMessageIds
+   *  over `messages`, sorted by start — the clampAdjustmentAtCoverage
+   *  refold-vs-drag discriminator. Rebuilding per unit is the #5337
+   *  quadratic class; one build serves the whole pass. Immutable. */
+  blockSpans: BlockIndexSpan[];
+}
+
+/** One-pass build of {@link ProjectionShared}; see that interface for what
+ *  each field mirrors and why one build serves an entire screening pass. */
+export function buildProjectionShared(
+  messages: CoreMessage[],
+  state: CompressionState,
+  config: Config,
+): ProjectionShared {
+  const liveCarrierIds = new Set<string>();
+  for (const message of messages) {
+    if (isLiveCheckpointCarrier(message, state)) liveCarrierIds.add(message.id);
+  }
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
+  const latestProtected = collectLatestProtected(messages, config);
+  const agedCompressCallIds = collectAgedCompressCallIds(messages, config);
+  const baseProtectedCallIds = new Set<string>(latestProtected.callIds);
+  const isExemptFold = (msg: CoreMessage): boolean =>
+    !!msg.toolCallId && agedCompressCallIds.has(msg.toolCallId);
+  for (const msg of messages) {
+    if (
+      isMessageProtected(msg, config, failedCompressCallIds) &&
+      msg.toolCallId &&
+      !isExemptFold(msg)
+    ) {
+      baseProtectedCallIds.add(msg.toolCallId);
+    }
+  }
+  const byId = buildIndexByMessageId(messages);
+  return {
+    byId,
+    liveCarrierIds,
+    failedCompressCallIds,
+    latestProtected,
+    agedCompressCallIds,
+    baseProtectedCallIds,
+    pairByCallId: buildPairMap(messages),
+    toolPairExtremes: buildToolPairExtremes(messages),
+    anchorMessage: lastUserAnchor(messages, coveredMessageIds(state), config),
+    integrityPre: buildIntegrityPre(messages),
+    blockSpans: buildBlockIndexSpans(state, byId),
+  };
+}
+
+/** Contiguous index span [start..end] one active block covers over the
+ *  message array being projected. */
+export interface BlockIndexSpan {
+  start: number;
+  end: number;
+}
+
+/** Index intervals of every active block's effectiveMessageIds, sorted by
+ *  start. A block folds a contiguous history region, so min/max over its
+ *  covered ids is the region. Built once per pass (shared) or per apply
+ *  call (single-shot fallback) — never per screened unit. */
+function buildBlockIndexSpans(
+  state: CompressionState,
+  byId: Map<string, number>,
+): BlockIndexSpan[] {
+  const spans: BlockIndexSpan[] = [];
+  for (const block of activeBlocks(state)) {
+    let start: number | undefined;
+    let end: number | undefined;
+    for (const id of block.effectiveMessageIds ?? []) {
+      const idx = byId.get(id);
+      if (idx === undefined) continue;
+      if (start === undefined || idx < start) start = idx;
+      if (end === undefined || idx > end) end = idx;
+    }
+    if (start !== undefined && end !== undefined) spans.push({ start, end });
+  }
+  spans.sort((a, b) => a.start - b.start);
+  return spans;
+}
+
+/** tool-call/tool-result pairing map over a whole message array (a side may
+ *  be empty until its half shows up). Mirrors the inline map the #3953
+ *  truncation check used to rebuild per unit. */
+function buildPairMap(messages: CoreMessage[]): Map<string, [string, string]> {
+  const pairByCallId = new Map<string, [string, string]>();
+  for (const m of messages) {
+    if (m.contentType === "tool-call" || m.contentType === "tool-result") {
+      const key = m.toolCallId ?? m.id;
+      const pair = pairByCallId.get(key) ?? ["", ""];
+      if (m.contentType === "tool-call") pair[0] = m.id;
+      else pair[1] = m.id;
+      pairByCallId.set(key, pair);
+    }
+  }
+  return pairByCallId;
+}
+
 /** Union of the raw ids covered by all active blocks — the set apply treats
  * as "already folded" before a new spec runs (one per applyCompression call). */
 export function collectCoverage(state: CompressionState): Set<string> {
@@ -479,6 +998,7 @@ function applyPairBoundaryAdjustments(
     boundaryKind: string;
   },
   messages: CoreMessage[],
+  shared?: ProjectionShared,
 ): string[] {
   if (resolved.boundaryKind === "block") {
     return resolved.messageIds;
@@ -499,6 +1019,7 @@ function applyPairBoundaryAdjustments(
       reasoningAdjusted.startIndex,
       reasoningAdjusted.endIndex,
       messages,
+      shared?.toolPairExtremes,
     );
     const changed =
       toolAdjusted.startIndex !== startIndex ||
@@ -518,10 +1039,153 @@ function applyPairBoundaryAdjustments(
   return ids;
 }
 
+/**
+ * Clamp the pair-boundary ADJUSTMENT's widened head/tail at active-coverage
+ * boundaries (production 2026-11-09 mega-turn incident).
+ *
+ * When a range ends (or starts) right where a block was cut mid-group — a
+ * spine-cut/fold boundary slicing between a round's reasoning and its
+ * tool-call — the pair/reasoning adjustment widens the range ACROSS the
+ * boundary to close the pair, pulling in already-covered members. The drag
+ * makes the block visible in range → nestedBlock/consumed machinery engages
+ * → the merge-integrity path resolves the unit to fold-nothing (fatal=null,
+ * filteredIds=0) or a split fatal: every range ending adjacent to a mid-group
+ * block cut dies at screening. This predates the merge-gate bridging fix —
+ * bridging only exposed it, by finally letting units reach the screen with
+ * that geometry.
+ *
+ * Clamping is safe precisely because the partner half is COVERED: #5531 makes
+ * covered halves invisible to the integrity judge (a covered call cannot
+ * strand its turn's reasoning; a covered result leaves no unanswered
+ * tool_call_id), so folding the visible part while the covered partner stays
+ * covered is the allowed reverse-split shape. The requested span itself is
+ * NEVER clamped — only the adjustment's widening — so hand-built ranges that
+ * deliberately target covered spans (refold candidates) keep resolving.
+ *
+ * #1592 refines the cut into a discriminator on the active block's span
+ * (blockSpans): a widened boundary that runs into a block the REQUESTED span
+ * already overlaps is a re-fold — the boundary must CONTAIN the block's span
+ * (push through to its far edge, or keep the deeper widening) so the old
+ * block is wholly re-folded and its summary replaced; cutting back would
+ * strand a partial overlap that renders as two stacked summaries. A block
+ * the requested span never touched is a pure drag-in — keep-out, exactly the
+ * pre-#1592 cut.
+ */
+function clampAdjustmentAtCoverage(
+  adjustedIds: string[],
+  resolved: { startIndex: number; endIndex: number; messageIds: string[] },
+  messages: CoreMessage[],
+  coverage?: ReadonlySet<string>,
+  /** Shared id→index map (#5337): reuse the caller's O(n) derivation instead
+   *  of rebuilding it per call on the screening hot path. */
+  indexById?: Map<string, number>,
+  /** Index spans of the active blocks (#1592 discriminator): a widened
+   *  boundary that runs into a block the REQUESTED span already overlaps is
+   *  a re-fold and must CONTAIN the block; a block the requested span never
+   *  touched is a drag-in and stays out. Undefined (hand-built inputs,
+   *  coverage-free spans) keeps the pure keep-out behavior. */
+  blockSpans?: ReadonlyArray<BlockIndexSpan>,
+): string[] {
+  if (!coverage || coverage.size === 0 || adjustedIds.length === 0) {
+    return adjustedIds;
+  }
+  // Recover the adjusted span's index bounds (ids are contiguous by index —
+  // applyPairBoundaryAdjustments pushes by loop index).
+  let startIdx: number | undefined;
+  let endIdx: number | undefined;
+  if (indexById) {
+    startIdx = indexById.get(adjustedIds[0]!);
+    endIdx = indexById.get(adjustedIds[adjustedIds.length - 1]!);
+  } else {
+    const built = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) {
+      const id = messages[i]?.id;
+      if (id !== undefined) built.set(id, i);
+    }
+    startIdx = built.get(adjustedIds[0]!);
+    endIdx = built.get(adjustedIds[adjustedIds.length - 1]!);
+  }
+  if (startIdx === undefined || endIdx === undefined) return adjustedIds;
+  const isCovered = (i: number): boolean => {
+    const id = messages[i]?.id;
+    return id !== undefined && coverage.has(id);
+  };
+  const spanAt = (i: number): BlockIndexSpan | undefined => {
+    if (!blockSpans) return undefined;
+    for (const span of blockSpans) {
+      if (i >= span.start && i <= span.end) return span;
+    }
+    return undefined;
+  };
+  // A partial overlap between the new fold's span and an active block's span
+  // cannot render: the block's own summary stays visible while the new fold
+  // emits a second one next to it (the #1592 round-2 stacked-shape break).
+  // The requested span is never clamped, so the resolution runs through the
+  // adjustment's widening, with the block spans as the discriminator:
+  //  - requested span overlaps the block → CONTAIN: push the widened
+  //    boundary to the block's far edge (or keep the deeper widening the
+  //    adjustment already produced) so the old block is wholly re-folded and
+  //    its summary replaced — the merge/refold semantics.
+  //  - requested span disjoint from the block → KEEP-OUT: pull the widened
+  //    boundary back before the block's near edge — the mega-turn killer
+  //    (nested/consumed machinery resolves the drag to fold-nothing).
+  const intersectsRequested = (span: BlockIndexSpan): boolean =>
+    resolved.startIndex <= span.end && resolved.endIndex >= span.start;
+  // Pull the widened TAIL back to just before the first covered member of a
+  // disjoint block, contain a re-folded one, and the widened HEAD likewise.
+  // Only the WIDENED portion is clamped — covered ids inside the requested
+  // span stay (refold/consumed semantics).
+  let clamped = false;
+  for (let i = resolved.endIndex + 1; i <= endIdx; ) {
+    if (!isCovered(i)) {
+      i++;
+      continue;
+    }
+    const span = spanAt(i);
+    if (span && intersectsRequested(span)) {
+      if (endIdx < span.end) {
+        endIdx = span.end;
+        clamped = true;
+      }
+      i = span.end + 1;
+      continue;
+    }
+    endIdx = i - 1;
+    clamped = true;
+    break;
+  }
+  for (let i = resolved.startIndex - 1; i >= startIdx; ) {
+    if (!isCovered(i)) {
+      i--;
+      continue;
+    }
+    const span = spanAt(i);
+    if (span && intersectsRequested(span)) {
+      if (startIdx > span.start) {
+        startIdx = span.start;
+        clamped = true;
+      }
+      i = span.start - 1;
+      continue;
+    }
+    startIdx = i + 1;
+    clamped = true;
+    break;
+  }
+  if (!clamped) return adjustedIds;
+  const ids: string[] = [];
+  for (let i = startIdx; i <= endIdx; i++) {
+    const msg = messages[i];
+    if (msg) ids.push(msg.id);
+  }
+  return ids;
+}
+
 function filterProtectedToolMessages(
   directMessageIds: string[],
   messages: CoreMessage[],
   config: Config,
+  shared?: ProjectionShared,
 ): string[] {
   // Protected tool calls (and their results, paired by toolCallId) stay in
   // visible context and are simply dropped from the compressible set. They are
@@ -530,10 +1194,19 @@ function filterProtectedToolMessages(
   // #4289: failed compress exchanges (result = "[Compression FAILED…", zero
   // ranges applied) are NOT protected — they are dead drafts that must stay
   // foldable so a failing compress loop cannot permanently bloat context.
-  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
-  const protectedCallIds = new Set<string>();
+  // #5337 option A: each collector below is a full O(n) history scan. With a
+  // shared context they were derived ONCE per screening pass (the ?? inline
+  // fallbacks keep the single-shot apply/report paths identical to the
+  // pre-sharing implementation). `baseProtectedCallIds` already unions
+  // latest.callIds with the full-history protection scan; callers copy it
+  // because the per-unit passes below may add to it.
+  const failedCompressCallIds =
+    shared?.failedCompressCallIds ??
+    collectFailedCompressCallIds(messages, config);
+  const protectedCallIds = new Set<string>(shared?.baseProtectedCallIds ?? []);
   const removedIds = new Set<string>();
-  const latest = collectLatestProtected(messages, config);
+  const latest =
+    shared?.latestProtected ?? collectLatestProtected(messages, config);
   // #4348: compress exchanges older than the newest few lose the hard-coded
   // ALWAYS_PROTECTED_TOOLS exemption inside the FOLD path — their receipts
   // are exhaust and the summaries live on in block anchors. Newest exchanges
@@ -541,22 +1214,34 @@ function filterProtectedToolMessages(
   // recognized compress dialects too — required, since the MCP lane's
   // hard-protection hook would otherwise pin mcp__bili__compress forever;
   // host patterns for all other tools are unaffected.
-  const agedCompressCallIds = collectAgedCompressCallIds(messages, config);
+  const agedCompressCallIds =
+    shared?.agedCompressCallIds ?? collectAgedCompressCallIds(messages, config);
   const isExemptFold = (msg: CoreMessage): boolean =>
     !!msg.toolCallId && agedCompressCallIds.has(msg.toolCallId);
-  for (const id of latest.callIds) protectedCallIds.add(id);
-  for (const msg of messages) {
-    if (
-      isMessageProtected(msg, config, failedCompressCallIds) &&
-      msg.toolCallId &&
-      !isExemptFold(msg)
-    ) {
-      protectedCallIds.add(msg.toolCallId);
+  if (!shared) {
+    for (const id of latest.callIds) protectedCallIds.add(id);
+    for (const msg of messages) {
+      if (
+        isMessageProtected(msg, config, failedCompressCallIds) &&
+        msg.toolCallId &&
+        !isExemptFold(msg)
+      ) {
+        protectedCallIds.add(msg.toolCallId);
+      }
     }
   }
+  // Shared byId resolves duplicate ids to the LAST occurrence — the semantics
+  // of every existing index-based path (resolveBoundaries always used maps).
+  // The replaced .find() hits returned the FIRST, reachable only on invalid
+  // duplicate-id inputs (message ids are ledger-unique in practice).
+  const byId = shared?.byId;
+  const lookupMsg = (id: string): CoreMessage | undefined =>
+    byId === undefined
+      ? messages.find((m) => m.id === id)
+      : messages[byId.get(id) ?? -1];
 
   for (const id of directMessageIds) {
-    const msg = messages.find((m) => m.id === id);
+    const msg = lookupMsg(id);
     if (!msg) continue;
     if (
       hasUnrecoverableMediaPayload(msg) ||
@@ -571,7 +1256,7 @@ function filterProtectedToolMessages(
 
   for (const id of directMessageIds) {
     if (removedIds.has(id)) continue;
-    const msg = messages.find((m) => m.id === id);
+    const msg = lookupMsg(id);
     if (!msg) continue;
     if (
       msg.contentType === "tool-result" &&
@@ -598,4 +1283,61 @@ function resolveTargetTier(
     if (block && block.tier < minTier) minTier = block.tier;
   }
   return minTier;
+}
+
+/** #5789: actionable refusal for merges the exclusion ladder cannot complete
+ *  — names the exact conflicted refs, who covers them, and the concrete next
+ *  moves (fold the stranded partner first / sub-span around the offender).
+ *  Keeps the "cannot satisfy turn integrity" phrase the host and the #4484
+ *  suite key on. */
+function actionableSplitError(
+  consumedBlockIds: string[],
+  unresolved: ReadonlySet<string>,
+  input: UnitProjectionInput,
+): string {
+  const refOf = (id: string): string =>
+    input.state.messageRefs.byRaw[id] ?? id;
+  const consumedOwners = new Map<string, string>();
+  const survivingOwners = new Map<string, string>();
+  for (const block of activeBlocks(input.state)) {
+    const map = consumedBlockIds.includes(block.blockId)
+      ? consumedOwners
+      : survivingOwners;
+    for (const id of block.effectiveMessageIds) map.set(id, block.blockId);
+  }
+  const detail = [...unresolved]
+    .slice(0, 6)
+    .map((id) => {
+      const ref = refOf(id);
+      const owner = consumedOwners.get(id) ?? survivingOwners.get(id);
+      return owner ? `${ref} (covered by ${owner})` : `${ref} (visible)`;
+    })
+    .join(", ");
+  const survivingOffenders = [
+    ...new Set(
+      [...unresolved]
+        .map((id) => survivingOwners.get(id))
+        .filter((bid): bid is string => bid !== undefined),
+    ),
+  ];
+  const visibleRefs = [...unresolved]
+    .filter((id) => !consumedOwners.has(id) && !survivingOwners.has(id))
+    .map(refOf)
+    .sort((a, b) => refNum5919(a) - refNum5919(b) || a.localeCompare(b))
+    .slice(0, 6);
+  const unblockHint =
+    visibleRefs.length > 0
+      ? ` The exact unblock: one plain message-range compress over ${visibleRefs[0]}..${visibleRefs[visibleRefs.length - 1]!} (it may cover extra messages — that is fine), then retry this merge — the conflict clears once those partner(s) are covered.`
+      : ` The exact unblock: fold the stranded partner(s) listed above into coverage with a plain message-range compress, then retry this merge.`;
+  const tail =
+    survivingOffenders.length > 0
+      ? ` Block(s) ${survivingOffenders.join(", ")} stay active with their current coverage; this merge will not touch them.`
+      : ` Merge a sub-span that stops before or resumes after the offending block instead.`;
+  return `Merging ${consumedBlockIds.join(", ")} cannot satisfy turn integrity without dropping existing coverage: folding would strand ${detail}. Do not retry the same span — fold the stranded visible partner(s) first with a plain message-range compress so the turn closes.${unblockHint}${tail}`;
+
+/** #5919: numeric order for the unblock hint (BLOCKED sorts last). */
+function refNum5919(ref: string): number {
+  const m = /^m(\d+)$/.exec(ref);
+  return m ? Number(m[1]!) : Number.MAX_SAFE_INTEGER;
+}
 }

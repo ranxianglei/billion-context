@@ -8,6 +8,79 @@ import { LOCALES, MESSAGES, translate } from "../src/web/i18n.ts";
 import { renderPage } from "../src/web/page.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 
+test("session column resizing redistributes across each side and keeps both outer edges fixed", () => {
+    const start = WEB_CLIENT.indexOf("    function bindSessionColumns()");
+    const end = WEB_CLIENT.indexOf("    function hydrate()", start);
+    assert.ok(start >= 0 && end > start);
+    const result = vm.runInNewContext(`
+        const cols = [270, 502, 80].map(width => ({ style: { width: width + "px" } }));
+        const handles = [];
+        const headers = cols.map((col, i) => ({
+            textContent: "Column " + i,
+            querySelector: () => handles[i] || null,
+            getBoundingClientRect: () => ({ width: parseFloat(col.style.width) }),
+            appendChild: handle => { handles[i] = handle; }
+        }));
+        const table = {
+            style: {}, classList: { add() {} },
+            getBoundingClientRect: () => ({ width: parseFloat(table.style.width) || 852 }),
+            querySelectorAll: selector => selector === "col" ? cols : headers
+        };
+        const document = {
+            querySelectorAll: () => [table],
+            createElement: () => ({
+                handlers: {}, setAttribute() {}, setPointerCapture() {},
+                addEventListener(name, fn) { this.handlers[name] = fn; },
+                removeEventListener(name) { delete this.handlers[name]; }
+            })
+        };
+        const t = key => key;
+        ${WEB_CLIENT.slice(start, end)}
+        bindSessionColumns();
+        bindSessionColumns();
+        const event = { button: 0, clientX: 100, pointerId: 1, preventDefault() {} };
+        const stray = { button: 0, clientX: 100, pointerId: 3, preventDefault() {} };
+        handles[1].handlers.pointerdown(stray);
+        handles[1].handlers.pointerup();
+        const unpinned = table.style.width === undefined && table.style.minWidth === undefined;
+        handles[0].handlers.pointerdown(event);
+        handles[0].handlers.pointermove({ clientX: 550 });
+        const grown = [cols[0].style.width, cols[1].style.width, cols[2].style.width, table.style.width];
+        handles[0].handlers.pointermove({ clientX: 580 });
+        const cascaded = cols.map(col => col.style.width);
+        handles[0].handlers.pointermove({ clientX: 5000 });
+        const capped = [cols[0].style.width, cols[1].style.width, cols[2].style.width, table.style.width];
+        handles[0].handlers.pointermove({ clientX: 550 });
+        handles[0].handlers.pointercancel();
+        const cleaned = !handles[0].handlers.pointermove;
+        handles[0].handlers.keydown({ key: "ArrowLeft", preventDefault() {} });
+        const keyboard = cols[0].style.width;
+        handles[0].handlers.pointerdown(event);
+        handles[0].handlers.pointermove({ clientX: -1000 });
+        const minimum = cols[0].style.width;
+        handles[0].handlers.pointerup();
+        handles[1].handlers.pointerdown(event);
+        handles[1].handlers.pointermove({ clientX: -1000 });
+        const leftCascade = cols.map(col => col.style.width);
+        handles[1].handlers.pointerup();
+        cols[1].style.width = "0px";
+        handles[0].handlers.keydown({ key: "ArrowRight", preventDefault() {} });
+        const hidden = cols[1].style.width;
+        ({ unpinned, grown, cascaded, capped, cleaned, keyboard, minimum, leftCascade, hidden, minWidth: table.style.minWidth, handles: handles.length });
+    `);
+    assert.equal(result.unpinned, true);
+    assert.equal(JSON.stringify(result.grown), JSON.stringify(["720px", "52px", "80px", "852px"]));
+    assert.equal(JSON.stringify(result.cascaded), JSON.stringify(["750px", "48px", "54px"]));
+    assert.equal(JSON.stringify(result.capped), JSON.stringify(["756px", "48px", "48px", "852px"]));
+    assert.equal(JSON.stringify(result.leftCascade), JSON.stringify(["120px", "48px", "684px"]));
+    assert.equal(result.hidden, "0px");
+    assert.equal(result.cleaned, true);
+    assert.equal(result.keyboard, "700px");
+    assert.equal(result.minimum, "120px");
+    assert.equal(result.minWidth, "100%");
+    assert.equal(result.handles, 2);
+});
+
 const here = dirname(fileURLToPath(import.meta.url));
 const han = /\p{Script=Han}/u;
 const placeholders = (text: string) => [...text.matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort();
@@ -23,12 +96,19 @@ test("#1024: catalog parity — every key in every locale with matching placehol
     }
     for (const key of zhKeys) {
         assert.deepEqual(placeholders(MESSAGES.en[key]), placeholders(MESSAGES["zh-CN"][key]), `placeholder mismatch for "${key}"`);
+        assert.deepEqual(placeholders(MESSAGES.ko[key]), placeholders(MESSAGES.en[key]), `ko placeholder mismatch for "${key}"`);
     }
 });
 
 test("#1024: no Chinese residue in English translations", () => {
     for (const [key, value] of Object.entries(MESSAGES.en)) {
         assert.ok(!han.test(value), `English value for "${key}" still contains Chinese: ${value}`);
+    }
+});
+
+test("#1024: no Chinese residue in Korean translations", () => {
+    for (const [key, value] of Object.entries(MESSAGES.ko)) {
+        assert.ok(!han.test(value), `Korean value for "${key}" still contains Chinese: ${value}`);
     }
 });
 
@@ -42,12 +122,30 @@ function collectRefs(): Set<string> {
     const pageSrc = readFileSync(join(here, "..", "src", "web", "page.ts"), "utf8");
     const clientSrc = readFileSync(join(here, "..", "src", "web", "client.ts"), "utf8");
     const reportSrc = readFileSync(join(here, "..", "src", "web", "report.ts"), "utf8"); // #3099 server-side report renderer
+    const noticesSrc = readFileSync(join(here, "..", "src", "notices.ts"), "utf8"); // #5548 built-in notice registry
     const refs = new Set<string>();
     for (const m of pageSrc.matchAll(/data-i18n(?:-ph|-title)?="([\w.]+)"/g)) refs.add(m[1]);
     for (const m of pageSrc.matchAll(/zh\("([\w.]+)"\)/g)) refs.add(m[1]);
     for (const m of clientSrc.matchAll(/\bt\("([\w.]+)"/g)) refs.add(m[1]);
     for (const m of reportSrc.matchAll(/\bt\("([\w.]+)"/g)) refs.add(m[1]);
     for (const m of reportSrc.matchAll(/\btr\(\s*\w+,\s*"([\w.]+)"/g)) refs.add(m[1]);
+    // #5345: the pack editor builds its <option> labels through a pair-array
+    // (t(pair[1])), so those catalog keys are only referenced via bare quoted
+    // strings — accept any dot-qualified identifier that appears verbatim in
+    // the sources as a live reference too. Filenames share the dotted shape
+    // (package.json / config.json in notices.ts) but are not keys: drop tokens
+    // whose final segment is a file extension. Segments already proven to be
+    // key suffixes (summary.key, det.log) stay out of the exclusion, and those
+    // keys are referenced through the explicit t()/data-i18n rules above anyway.
+    const fileExt = new Set(["json", "jsonl", "js", "mjs", "cjs", "ts", "tsx", "map", "db", "sqlite", "sqlite3", "pem", "crt", "cert", "txt", "md", "yml", "yaml", "toml", "lock", "html", "css", "sh", "bat", "ps1", "png", "jpg", "jpeg", "gif", "svg", "ico", "woff", "woff2", "ttf"]);
+    for (const src of [pageSrc, clientSrc, reportSrc, noticesSrc]) {
+        for (const m of src.matchAll(/"([a-z][\w]*\.[\w.]+)"/g)) {
+            const token = m[1];
+            if (!/^[a-z][\w]*(\.[\w]+)+$/.test(token) || token.includes("..")) continue;
+            if (fileExt.has(token.slice(token.lastIndexOf(".") + 1))) continue;
+            refs.add(token);
+        }
+    }
     return refs;
 }
 
@@ -263,6 +361,9 @@ test("#2321: ?lang= pin outranks stored choice and browser default (real client)
     assert.equal((await runClient(undefined, "en-US", null)).lang, "en", "no pin: en navigator still resolves en");
     assert.equal((await runClient(undefined, "zh-CN", "en")).lang, "en", "no pin: stored choice still beats navigator");
     assert.equal((await runClient(undefined, "zh-CN", null)).lang, "zh-CN", "no pin: nothing stored falls back to zh-CN");
+    assert.equal((await runClient("?embed=1&lang=ko", "en-US", "en")).lang, "ko", "pin ko beats both stored en and en navigator");
+    assert.equal((await runClient(undefined, "zh-CN", "ko")).lang, "ko", "no pin: stored ko beats navigator");
+    assert.equal((await runClient(undefined, "ko-KR", null)).lang, "ko", "no pin: ko navigator resolves ko");
 });
 
 test("#2321: language toggle drops the ?lang= pin so the manual choice sticks", async () => {
@@ -272,6 +373,17 @@ test("#2321: language toggle drops the ?lang= pin so the manual choice sticks", 
     assert.ok(tog, "language toggle rendered");
     assert.ok(tog!.handlers.click, "toggle has a click handler");
     tog!.handlers.click!();
-    assert.deepEqual(r.storageSet, [["bili-language", "zh-CN"]], "manual choice persisted");
+    assert.deepEqual(r.storageSet, [["bili-language", "ko"]], "manual choice persisted");
     assert.equal(r.location.href, "/__bili/?embed=1#/overview", "navigation keeps other params but strips the lang pin");
+});
+
+test("language toggle cycles zh-CN → en → ko → zh-CN and labels the next language", async () => {
+    for (const [from, next, label] of [["zh-CN", "en", "English"], ["en", "ko", "한국어"], ["ko", "zh-CN", "中文"]] as const) {
+        const r = await runClient(`?embed=1&lang=${from}`, "zh-CN", null);
+        assert.equal(r.lang, from);
+        const tog = r.els.get("language-toggle")!;
+        assert.equal(tog.textContent, label, `toggle on ${from} names ${next}`);
+        tog.handlers.click!();
+        assert.deepEqual(r.storageSet, [["bili-language", next]], `${from} toggles to ${next}`);
+    }
 });

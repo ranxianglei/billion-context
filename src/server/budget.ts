@@ -4,9 +4,54 @@ import { estimateCoreMessages } from "../preflight.js";
 import { SELF_HEAL_SUPPRESS_CAP_MS, reductionKeyOf } from "../session-self-heal.js";
 import type { Session } from "../session.js";
 import { applyEstimateCalibration } from "../util.js";
-import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
-export { readOutputBudget };
+// #6752: the output-budget field plumbing moved here from side-request.ts —
+// it is generic wire plumbing (used by the clamp, the restore path, and the
+// watermark fastpath), not side-lane logic, and the prepare modules must stay
+// decoupled from the side-lane engine (#1440 P2 cut 2). side-request.ts
+// re-exports these, so its existing importers are untouched.
+export type OutputBudgetField = "max_tokens" | "max_completion_tokens" | "max_output_tokens" | "generationConfig.maxOutputTokens";
+
+/** The declared output budget, proto-agnostically. Gemini nests it under
+ *  `generationConfig` (the dotted field name above), the OpenAI/Anthropic
+ *  families keep it flat, so every reader goes through these two accessors. */
+export function outputBudgetField(parsed: unknown): OutputBudgetField | null {
+    if (!parsed || typeof parsed !== "object") return null;
+    const p = parsed as Record<string, unknown>;
+    for (const field of ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const) {
+        if (typeof p[field] === "number" && (p[field] as number) > 0) return field;
+    }
+    const gen = p.generationConfig;
+    if (gen && typeof gen === "object") {
+        const v = (gen as Record<string, unknown>).maxOutputTokens;
+        if (typeof v === "number" && v > 0) return "generationConfig.maxOutputTokens";
+    }
+    return null;
+}
+
+export function readOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField): number | undefined {
+    if (field !== "generationConfig.maxOutputTokens") {
+        const v = parsed[field];
+        return typeof v === "number" ? v : undefined;
+    }
+    const gen = parsed.generationConfig;
+    if (!gen || typeof gen !== "object") return undefined;
+    const v = (gen as Record<string, unknown>).maxOutputTokens;
+    return typeof v === "number" ? v : undefined;
+}
+
+export function writeOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField, value: number): void {
+    // #2011: output-budget fields are integer-typed on every wire protocol. Coerce at this
+    // sole writer so NO caller can emit a fractional token count — the clamp path already
+    // floors, but this also guards the restore path and any future caller at the type boundary.
+    const tokens = Number.isInteger(value) ? value : Math.floor(value);
+    if (field !== "generationConfig.maxOutputTokens") {
+        parsed[field] = tokens;
+        return;
+    }
+    const gen = parsed.generationConfig;
+    parsed.generationConfig = { ...(gen && typeof gen === "object" ? (gen as Record<string, unknown>) : {}), maxOutputTokens: tokens };
+}
 
 // #453 hard backstop: cap the forwarded output budget so input+output can never
 // exceed the window on request-rebuilding upstreams (vLLM rejects an oversized
@@ -21,6 +66,24 @@ export { readOutputBudget };
 // compress nudge.
 const OUTPUT_CLAMP_MARGIN_PCT = 0.05;
 const OUTPUT_CLAMP_MIN_MARGIN = 2048;
+// #5278: safety inflation applied to the planning estimate BEFORE sizing both
+// the subtraction and the margin below. The margin exists to absorb the
+// ESTIMATOR's error, but it is computed from the very estimate whose error it
+// must absorb — self-referential. The heuristic estimator (defaultCountTokens:
+// CJK 1 token/char, rest chars/4) systematically understates CJK-heavy payloads
+// by ~5%, the same order as OUTPUT_CLAMP_MARGIN_PCT, so on those sessions
+// margin < actual error and the clamped total lands at exactly window+1 ->
+// upstream ContextWindowExceededError 502 (three field incidents on bili
+// 0.1.206/0.1.209, billed/estimated ratios 1.050011/1.050016/1.050020).
+// Inflating by S makes any true input up to S*estimate provably fit (both the
+// cap path and the #3071 floor path bound their output against the inflated
+// basis); with S=1.12 the compound reservation S*(1+MARGIN_PCT) additionally
+// covers underestimates up to u <= ~17.6%, ~3.5x the observed 5%. Deliberately
+// a module constant, not config surface: it hardens an invariant, it is not a
+// tuning knob. Behavior change vs pre-#5278: emitted caps tighten by up to
+// ~12% of the input estimate (field-validated 120–18891 tokens across a 1088-
+// sample sweep); previously-unclamped oversized requests may now clamp.
+const OUTPUT_CLAMP_ESTIMATE_SAFETY = 1.12;
 const OUTPUT_CLAMP_FLOOR = 1024;
 // #3071/#2490: capability floor for the clamped budget — see clampOutputBudget.
 const OUTPUT_CLAMP_MIN_OUTPUT = 4096;
@@ -44,7 +107,21 @@ const OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT = 0.25;
 // nudge each turn once usage reaches this — kept under the default 0.75
 // over-limit line so it fills the pre-limit silent climb seen in #453/#14. Pure
 // host-side: renderNudgeText does not depend on shouldInject.
-const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
+export const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
+const DEFAULT_MAX_CONTEXT_LIMIT_PCT = 0.75;
+
+/** Resolve the effective host-side emergency escalation line (#453). Under the
+ *  default over-limit line (0.75), the escalation line sits 5 percentage points
+ *  below it (0.70) to cover the pre-limit silent zone. When an operator raises
+ *  maxContextLimitPct above the default (e.g. 0.78 or 0.85), shift the
+ *  escalation line proportionally (maxContextLimitPct - 0.05) so it never fires
+ *  at hardcoded 0.70 inside the operator's intended quiet band. */
+export function resolveEmergencyEscalationPct(maxContextLimitPct?: number): number {
+    if (typeof maxContextLimitPct === "number" && Number.isFinite(maxContextLimitPct) && maxContextLimitPct > DEFAULT_MAX_CONTEXT_LIMIT_PCT) {
+        return Math.max(EMERGENCY_NUDGE_ESCALATION_PCT, maxContextLimitPct - (DEFAULT_MAX_CONTEXT_LIMIT_PCT - EMERGENCY_NUDGE_ESCALATION_PCT));
+    }
+    return EMERGENCY_NUDGE_ESCALATION_PCT;
+}
 
 /** #2391: a budget view only; never forward this projection. OpenAI tool search
  * defers individual function schemas, while namespace descriptions stay visible.
@@ -151,6 +228,13 @@ export interface ThinkingMassInput {
      *  the inbound body because it captures the proxy-injected ACP content that
      *  was actually billed last turn. Ignored when not a positive finite number. */
     storedOverhead?: number;
+    /** Active per-route estimator scale k̂ (currentCalibrationFactor) + provenance
+     *  so the visible text+overhead baseline is compared against providerInputTokens
+     *  in billed units and the residual is stored back in local-estimate units,
+     *  preventing double multiplication when preflight/output-clamp apply k̂. */
+    calibrationFactor?: number;
+    calibrationOrigin?: string;
+    currentOrigin?: string;
 }
 
 /** Project the hidden thinking mass onto signature-only reasoning messages.
@@ -172,7 +256,11 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
     const overhead = typeof input.storedOverhead === "number" && Number.isFinite(input.storedOverhead) && input.storedOverhead > 0
         ? input.storedOverhead
         : countSystemAndToolsTokens(input.systemText, input.tools);
-    const gap = Math.max(0, input.providerInputTokens - estimateCoreMessages(msgs) - overhead - Math.max(0, input.imageTokens));
+    const effK = applyEstimateCalibration(1, input.calibrationFactor, input.calibrationOrigin, input.currentOrigin);
+    const localBase = estimateCoreMessages(msgs) + overhead;
+    const billedGap = Math.max(0, input.providerInputTokens - localBase * effK - Math.max(0, input.imageTokens));
+    if (billedGap <= 0) return 0;
+    const gap = Math.round(billedGap / effK);
     if (gap <= 0) return 0;
     const totalSig = targets.reduce((s, t) => s + t.sig, 0);
     let assigned = 0;
@@ -280,30 +368,42 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
  *  (fail-closed preserved). The sub-floor surrender above (cap < OUTPUT_CLAMP_FLOOR)
  *  stays byte-identical. */
 export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number, knownOutputCeiling?: number): number | undefined {
-    const margin = Math.max(OUTPUT_CLAMP_MIN_MARGIN, Math.ceil(inputEstimate * OUTPUT_CLAMP_MARGIN_PCT));
-    // #2011: max_tokens / max_completion_tokens / max_output_tokens are integer-typed on every
-    // wire protocol. Since v0.1.181 inputEstimate can carry a fraction: #1843 L1's learned
-    // per-route image cost (learnedImageReserve in cache-ledger.ts — an EMA over
-    // observed/nImages usage samples) takes precedence over the integer pixel/byte priors
-    // (#488) when fresh matching evidence exists, which made this cap fractional and strict
-    // upstreams rejected the whole turn with `max_tokens: Input should be a valid integer`.
-    // Floor at the decision point so the emitted budget is always an integer (floor <= exact
-    // headroom, so input+output <= window still holds).
-    // #3833: the window headroom cap can still sit ABOVE the model's declared
-    // output ceiling (window - input - margin > ceiling) — a 1M-window model with
-    // a 131072 output ceiling and ~827K input yields headroom 131577 > 131072.
-    // The ceiling is a hard upstream bound (strict providers reject max_tokens above
-    // it with 400), so cap BOTH the headroom and the #3071 floor to min(·, ceiling);
-    // absent a known ceiling (Infinity) every term is byte-identical to before.
     const ceilingBound = typeof knownOutputCeiling === "number" && Number.isFinite(knownOutputCeiling) ? knownOutputCeiling : Number.POSITIVE_INFINITY;
-    const cap = Math.min(Math.floor(nativeWindow - inputEstimate - margin), ceilingBound);
-    if (cap < OUTPUT_CLAMP_FLOOR || cap >= requested) return undefined;
-    // #3071: cap >= OUTPUT_CLAMP_FLOOR here. Never reduce below the capability
-    // floor, bounded by raw headroom so input+output <= window still holds.
-    const floorOut = Math.min(OUTPUT_CLAMP_MIN_OUTPUT, Math.floor(nativeWindow - inputEstimate), ceilingBound);
-    const clamped = Math.max(cap, floorOut);
-    if (clamped >= requested) return undefined;
-    return clamped;
+    const clampFor = (est: number): number | undefined => {
+        const margin = Math.max(OUTPUT_CLAMP_MIN_MARGIN, Math.ceil(est * OUTPUT_CLAMP_MARGIN_PCT));
+        // #2011: max_tokens / max_completion_tokens / max_output_tokens are integer-typed on every
+        // wire protocol. Since v0.1.181 est can carry a fraction: #1843 L1's learned
+        // per-route image cost (learnedImageReserve in cache-ledger.ts — an EMA over
+        // observed/nImages usage samples) takes precedence over the integer pixel/byte priors
+        // (#488) when fresh matching evidence exists, which made this cap fractional and strict
+        // upstreams rejected the whole turn with `max_tokens: Input should be a valid integer`.
+        // Floor at the decision point so the emitted budget is always an integer (floor <= exact
+        // headroom, so input+output <= window still holds).
+        // #3833: the window headroom cap can sit ABOVE the model's declared output
+        // ceiling (window - est - margin > ceiling). The ceiling is a hard upstream bound
+        // (strict providers reject max_tokens above it with 400), so cap BOTH the headroom
+        // and the #3071 floor to min(·, ceiling); absent a known ceiling (Infinity) every
+        // term is byte-identical to before.
+        const cap = Math.min(Math.floor(nativeWindow - est - margin), ceilingBound);
+        if (cap < OUTPUT_CLAMP_FLOOR || cap >= requested) return undefined;
+        // #3071: cap >= OUTPUT_CLAMP_FLOOR here. Never reduce below the capability
+        // floor, bounded by raw headroom so input+output <= window still holds.
+        const floorOut = Math.min(OUTPUT_CLAMP_MIN_OUTPUT, Math.floor(nativeWindow - est), ceilingBound);
+        const clamped = Math.max(cap, floorOut);
+        if (clamped >= requested) return undefined;
+        return clamped;
+    };
+    // #5278: judge on the safety-inflated estimate so a systematically low estimator
+    // cannot eat the margin (see OUTPUT_CLAMP_ESTIMATE_SAFETY).
+    const safe = clampFor(Math.ceil(inputEstimate * OUTPUT_CLAMP_ESTIMATE_SAFETY));
+    if (safe !== undefined) return safe;
+    // The inflated estimate dropped the cap below the capability floor (input alone
+    // nearly fills the window — preflight/self-heal territory) while the raw formula
+    // would still clamp (the #2490/#3071 pinned ledger shapes). Re-run on the raw
+    // estimate so we never surrender a clamp the raw formula applies — those regimes
+    // stay byte-identical. Every other safe-path no-op implies the same no-op on the
+    // raw path: a looser estimate only raises every term.
+    return clampFor(inputEstimate);
 }
 
 /** #2490: translate the refused dsh compaction replay size (recorded on the
@@ -365,10 +465,26 @@ export function dshLedgerFloorTokens(metadata: Record<string, unknown> | undefin
 export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalationPct: number = EMERGENCY_NUDGE_ESCALATION_PCT, minCompressRange: number = 0): boolean {
     if (!nudge || nudge.shouldInject) return false;
     if (nudge.contextUsage < escalationPct) return false;
+    // Phantom-pressure guard mirror: the kernel already deferred the pressure
+    // band because the meter was estimate-grade (no billing sample this
+    // cycle) — this early-advertising arm must not re-arm against the same
+    // bad reading. Hand-built decisions without the bit keep pre-fix semantics.
+    if ((nudge.breakdown?.pressureDeferredNoSample ?? 0) === 1) return false;
     if (!nudge.compressibleRanges.some((r) => minCompressRange <= 0 || (r.chars ?? r.tokens * 4) >= minCompressRange)) return false;
     const b = nudge.breakdown;
     const minBenefit = b?.minPressureBenefit;
     return !(typeof minBenefit === "number" && Number.isFinite(minBenefit) && minBenefit > 0 && (b.maxPending ?? 0) < minBenefit);
+}
+
+export function emergencyNudgeForConfig(
+    nudge: NudgeDecision | null | undefined,
+    loopConfig: { compress: { minCompressRange: number }; nudge: { maxContextLimitPct?: number } },
+): boolean {
+    return emergencyNudge(
+        nudge,
+        resolveEmergencyEscalationPct(loopConfig.nudge.maxContextLimitPct),
+        loopConfig.compress.minCompressRange,
+    );
 }
 
 /** #3461 problem 2: backoff for the EMERGENCY override. The pure check above
@@ -392,15 +508,19 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
  * Kernel-driven injections (nudge.shouldInject=true) never pass through here —
  * call sites OR them in BEFORE the emergency arm, so normal cadence is
  * untouched. State lives in session.metadata.emergencyNudgeGate (survives
- * restarts with the snapshot, visible on /__bili/sessions like selfHeal). */
+ * restarts with the snapshot, visible on /__bili/sessions like selfHeal).
+ * The escalation line is config-aware (#7605): resolveEmergencyEscalationPct
+ * keeps the default 0.70 and tracks maxContextLimitPct - 0.05 once an operator
+ * raises the over-limit line above the 0.75 default. */
 export function emergencyNudgeArmed(
     session: Session,
     nudge: NudgeDecision | null | undefined,
     minCompressRange: number,
     tokenCount: number,
     growthStep?: number,
+    maxContextLimitPct?: number,
 ): boolean {
-    if (!emergencyNudge(nudge, undefined, minCompressRange)) return false;
+    if (!emergencyNudge(nudge, resolveEmergencyEscalationPct(maxContextLimitPct), minCompressRange)) return false;
     const now = Date.now();
     const key = reductionKeyOf(session);
     const raw = session.metadata["emergencyNudgeGate"];

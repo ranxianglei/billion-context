@@ -1,10 +1,11 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
     decodeChildOutput,
+    DSH_PACKAGE,
     dshProfileDepSpec,
     dshProfileDependsOnBili,
     isRegistryDepSpec,
@@ -13,9 +14,22 @@ import {
     resolveDshBinary,
     runDshPlugin,
     _setDshRunnersForTest,
+    _resetProfileCopyLedgerForTest,
     type DshPlan,
 } from "../src/dsh-channel.ts";
 import { rmrf } from "./tmp-rm.ts";
+
+// #5642: refreshDshProfileBundles keeps its observation ledger under the
+// cache dir — relocate it so the suite never touches the host's real state.
+const ledgerCacheRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-refresh-cache-"));
+const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+process.env.XDG_CACHE_HOME = ledgerCacheRoot;
+after(() => {
+    if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+    _resetProfileCopyLedgerForTest();
+    rmrf(ledgerCacheRoot);
+});
 
 // — planDshSpawn (#679 spawn rules) ---------------------------------
 
@@ -186,8 +200,12 @@ function makeHome(entries: Record<string, Manifest | undefined>): string {
 
 /** Records successful calls; profiles in `failNames` throw before recording.
  *  On Windows the plan rides cmd.exe /d /s /c "<line>" — unpack to argv
- *  tokens first so recording is platform-neutral (no spaced test tokens). */
-function recordingAsyncRunner(calls: string[], failNames?: Set<string>): (plan: DshPlan) => Promise<{ stdout: string; stderr: string }> {
+ *  tokens first so recording is platform-neutral (no spaced test tokens).
+ *  #5642: a successful op materializes the requested version into the
+ *  profile's node_modules, mirroring what the real channel leaves behind —
+ *  refreshDshProfileBundles now verifies that outcome instead of trusting
+ *  the exit code. */
+function recordingAsyncRunner(home: string, calls: string[], failNames?: Set<string>): (plan: DshPlan) => Promise<{ stdout: string; stderr: string }> {
     return async (plan) => {
         const base = path.basename(plan.command).toLowerCase();
         const tokens = base === "cmd.exe" || base === "cmd"
@@ -196,6 +214,13 @@ function recordingAsyncRunner(calls: string[], failNames?: Set<string>): (plan: 
         const name = tokens[tokens.indexOf("--profile") + 1];
         if (failNames?.has(name)) throw Object.assign(new Error("spawn failed"), { status: 1, stderr: "boom" });
         calls.push(tokens.join(" "));
+        const spec = tokens[tokens.length - 1];
+        const version = spec.startsWith(`${DSH_PACKAGE}@`) ? spec.slice(DSH_PACKAGE.length + 1) : undefined;
+        if (version !== undefined) {
+            const copyDir = path.join(home, "profiles", name, "node_modules", DSH_PACKAGE);
+            fs.mkdirSync(copyDir, { recursive: true });
+            fs.writeFileSync(path.join(copyDir, "package.json"), JSON.stringify({ name: DSH_PACKAGE, version }));
+        }
         return { stdout: "", stderr: "" };
     };
 }
@@ -211,7 +236,7 @@ test("refreshDshProfileBundles: registry-pinned profiles get the exact new versi
     const logs: string[] = [];
     const log = (level: string, msg: string): void => { logs.push(`${level}: ${msg}`); };
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(home, calls) });
         await refreshDshProfileBundles("0.1.121", log, { ...process.env, DSH_HOME: home });
         assert.deepEqual(calls, ["plugin --profile a add billion-context@0.1.121"]);
         assert.ok(logs.some((l) => l.includes("refreshed 1 dsh profile bundle(s) to 0.1.121")));
@@ -231,7 +256,7 @@ test("refreshDshProfileBundles: one profile's failure does not stop the rest and
     const calls: string[] = [];
     const logs: string[] = [];
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls, new Set(["a"])) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(home, calls, new Set(["a"])) });
         await assert.doesNotReject(refreshDshProfileBundles("0.1.121", (l, m) => logs.push(`${l}: ${m}`), { ...process.env, DSH_HOME: home }));
         assert.deepEqual(calls, ["plugin --profile b add billion-context@0.1.121"]);
         const failLog = logs.find((l) => l.startsWith("warn") && l.includes("dsh profile a"));

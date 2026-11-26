@@ -56,8 +56,8 @@ export function parseBillingSettings(value: unknown): BillingSettings | undefine
     if (value === undefined || value === null) return undefined;
     if (typeof value !== "object" || Array.isArray(value)) return undefined;
     const root = value as Record<string, unknown>;
+    for (const k of Object.keys(root)) if (k !== "prices") return undefined;
     if (root["prices"] === undefined) {
-        for (const k of Object.keys(root)) if (k !== "prices") return undefined;
         return { prices: {} };
     }
     if (root["prices"] === null || typeof root["prices"] !== "object" || Array.isArray(root["prices"])) return undefined;
@@ -107,9 +107,11 @@ function nonNegNumStrict(v: unknown): number | undefined | typeof REJECT {
  *  reload path funnels through it) and by nothing else. Keeps deep settle
  *  sites free of options plumbing, mirroring the registry costCache pattern. */
 let overridePrices: Record<string, BillingPrice> = {};
+let overrideCostRows: CostsShape | null = null;
 
 export function setBillingOverrides(prices: Record<string, BillingPrice> | undefined): void {
     overridePrices = prices ?? {};
+    overrideCostRows = overrideCosts();
 }
 
 export function billingOverrides(): Record<string, BillingPrice> {
@@ -130,9 +132,8 @@ function overrideCosts(): CostsShape | null {
 
 export function resolveBillingPrice(model: string | undefined, host?: string): ResolvedBillingPrice | undefined {
     if (!model) return undefined;
-    const costs = overrideCosts();
-    if (costs !== null) {
-        const hit = scanRegistryCostRow(costs, model, host, { conflictHint: "billing.prices" });
+    if (overrideCostRows !== null) {
+        const hit = scanRegistryCostRow(overrideCostRows, model, host, { conflictHint: "billing.prices" });
         if (hit) return finalize(hit.row, "config");
     }
     const row = peekRegistryCostRow(model, host);
@@ -176,6 +177,20 @@ export function stampedBillingPrice(session: Session): ResolvedBillingPrice | un
     if (input === undefined) return undefined;
     const out: ResolvedBillingPrice = { input, source: o.source === "config" ? "config" : "registry", output: nonNegNum(o.output) ?? input, cacheRead: nonNegNum(o.cacheRead) ?? input, cacheWrite: nonNegNum(o.cacheWrite) ?? input };
     return out;
+}
+
+/** #5303: validate the persisted USD spend ledger blob (`stats.costUsd`).
+ *  stats are user-editable JSON — only finite non-negative fields survive;
+ *  a partially-valid blob zero-fills missing lanes (the writer always emits
+ *  all four, init 0), an all-invalid one reads as "no ledger" instead of
+ *  poisoning the ledger. Shared by the restore path (persist.buildSession)
+ *  and the panel (sessions-data): one definition of what a ledger means. */
+export function validCostUsd(v: unknown): { input: number; cacheRead: number; cacheWrite: number; output: number } | undefined {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+    const o = v as Record<string, unknown>;
+    const input = nonNegNum(o.input), cacheRead = nonNegNum(o.cacheRead), cacheWrite = nonNegNum(o.cacheWrite), output = nonNegNum(o.output);
+    if (input === undefined && cacheRead === undefined && cacheWrite === undefined && output === undefined) return undefined;
+    return { input: input ?? 0, cacheRead: cacheRead ?? 0, cacheWrite: cacheWrite ?? 0, output: output ?? 0 };
 }
 
 /** Bill one settled usage report's input side: fresh input at the input

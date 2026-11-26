@@ -169,7 +169,7 @@ test("#841 foreign no-match and empty-state strings carry session scope", () => 
     const core = compressInto(s1);
     // #2751: negative result is scoped to what was actually searched (active
     // topics/summaries), never phrased as "history doesn't contain it".
-    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, s1.state, "pfa-old").text, /^\[No blocks matched "zzz-no-such-topic" among 1 active block\(s\) in session pfa-old\. Scope = active compressed topics\/summaries only/);
+    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, s1.state, "pfa-old").text, /^\[No blocks matched "zzz-no-such-topic" among 1 block\(s\) in session pfa-old\. Scope = compressed topics\/summaries \(active \+ folded-away\)/);
     assert.equal(executeSearchContext({ query: "anything" }, createCore(), createInitialState(), "pfa-old").text, "[No compressed blocks exist yet in session pfa-old — nothing to search.]");
 });
 

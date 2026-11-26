@@ -200,6 +200,9 @@ test("checkTunnelDestination: public destinations pass for any client; unresolva
         clientLoopback: true,
         allowlist: [],
         localIps,
+        // #5222: exercise the legacy exhaustion path only — the worker-fallback
+        // stage is covered by tests/tunnel-guard-worker-fallback.test.ts.
+        workerFallback: false,
         resolveHost: async () => {
             throw new Error("ENOTFOUND");
         },
@@ -238,6 +241,7 @@ test("checkTunnelDestination: persistent resolution failure stays unresolvable w
         clientLoopback: true,
         allowlist: [],
         localIps,
+        workerFallback: false, // #5222: legacy exhaustion path only (see tunnel-guard-worker-fallback.test.ts)
         resolveHost: dead,
         resolveBackoffMs: 1,
     });
@@ -300,6 +304,7 @@ test("checkTunnelDestination: proxied egress STILL enforces IP-literal self/meta
 test("checkTunnelDestination: unresolvable surfaces the raw resolver code + remediation hint (#2124)", async () => {
     const v = await checkTunnelDestination("https://no-such-host.invalid/v1", {
         selfPort: 8787, clientLoopback: true, allowlist: [], localIps, resolveBackoffMs: 1,
+        workerFallback: false, // #5222: legacy exhaustion path only (see tunnel-guard-worker-fallback.test.ts)
         resolveHost: async () => { throw Object.assign(new Error("EAI_AGAIN"), { code: "EAI_AGAIN" }); },
     });
     assert.equal(v.ok, false);
@@ -307,6 +312,7 @@ test("checkTunnelDestination: unresolvable surfaces the raw resolver code + reme
     assert.match(v.message, /\(EAI_AGAIN\)/, "raw resolver error code is surfaced");
     assert.match(v.message, /local name resolution failed/, "diagnostic hint points at a poisoned/unreachable resolver");
     assert.match(v.message, /upstream proxy/, "hint offers the proxy remediation");
+    assert.match(v.message, /restart the bili proxy process/, "#5224: hint offers the stale-resolver restart remedy");
 });
 
 test("tunnelAllowlistFromEnv: comma parsing, case normalization, blanks dropped", () => {
@@ -374,6 +380,11 @@ test("integration: tunnel cannot reach the proxy's own management plane (#409 Po
         assert.match(poc.body, /tunnel_destination_denied/);
         const pocPut = await get(selfPort, `/bili/http://127.0.0.1:${selfPort}/__bili/config`);
         assert.equal(pocPut.status, 403);
+        // Every 127/8 address denotes this machine, including aliases that do
+        // not appear in networkInterfaces(). Reject before opening a socket.
+        const alias = await get(selfPort, `/bili/http://127.42.19.8:${selfPort}/v1/models`);
+        assert.equal(alias.status, 403);
+        assert.match(alias.body, /"detail":"self"/);
         // Direct loopback management access still works (marker not present).
         const direct = await get(selfPort, "/__bili/config", { host: `127.0.0.1:${selfPort}` });
         assert.equal(direct.status, 200);

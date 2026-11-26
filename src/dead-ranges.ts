@@ -46,17 +46,28 @@ function activeBlockIds(session: Session): string[] {
     return session.state.blocks.filter((b) => b.active).map((b) => b.blockId).sort();
 }
 
-/** Both structural-empty wordings the kernel emits for a span with zero foldable content:
+/** The structural-empty verdicts the kernel emits for a span with zero foldable content.
+ *  Failure-era wordings (kept so downgraded kernels still classify):
  *  - the #199 livelock guard: "...contains no new compressible messages — every message in it
  *    is already covered by active block(s) b3..."
  *  - validateCompressionRange: "Range contains no compressible messages — all are already
  *    covered by active blocks or protected."
- * Returns the named covering blocks ([] for the unnamed variant); null when the verdict is
- * NOT structural-empty — transient, zone, min-gate and length rejections must stay retryable
- * (they can clear mid-invocation or next turn). Feed the RAW kernel error strings, not a
- * truncated/joined rendering: the named-block list must survive intact. */
+ *  #4521 no-op era: the same structural deaths now arrive as SUCCESS warnings
+ *  (applySingleRange in kernel/src/compress.ts)
+ *  - covered: "...folded nothing — every message in it is already covered by active block(s) b2..."
+ *  - filter/protected: "...folded nothing — all of its content is protected or filtered (...)"
+ *    (unnamed structural empty).
+ *  The zone variant ("folded nothing — it lies entirely inside the protected zone") is NOT
+ *  structural here: the recent zone shifts as newer messages arrive, so it can clear next
+ *  turn and must stay retryable. Transient, min-gate and length rejections likewise.
+ * Returns the named covering blocks ([] for the unnamed variants); null when the verdict is
+ * NOT structural-empty. Feed the RAW kernel errors+warnings strings, not a truncated/joined
+ * rendering: the named-block list must survive intact. */
+const STRUCTURAL_EMPTY_VERDICTS =
+    /no (?:new )?compressible messages|folded nothing — every message in it is already covered by active block\(s\)|folded nothing — all of its content is protected or filtered/;
+
 export function parseStructuralEmptyVerdict(verdict: string): string[] | null {
-    if (!/no (?:new )?compressible messages/.test(verdict)) return null;
+    if (!STRUCTURAL_EMPTY_VERDICTS.test(verdict)) return null;
     const named = /active block\(s\) ([A-Za-z0-9]+(?:,\s*[A-Za-z0-9]+)*)/.exec(verdict)?.[1] ?? "";
     return named ? named.split(/,\s*/).filter(Boolean) : [];
 }
