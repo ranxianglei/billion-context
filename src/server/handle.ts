@@ -2014,7 +2014,7 @@ async function handleRequest(
         if (isCompressionDisabled(session)) {
             log("info", `[session-compress-off] ${sessionId}: compression disabled for this session (#5300) — forwarding verbatim, kernel bypassed (re-enable: POST /__bili/session/${sessionId}/compress {"enabled":true})`);
             forwarded = true;
-            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
+            await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
             return;
         }
         // #5490: the first-sight warn above needs no session identity; this one

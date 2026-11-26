@@ -188,6 +188,40 @@ test("#5300: disable — the excluded session forwards byte-identical, read-back
     }
 });
 
+test("#5300: excluded forward scrubs the host msgid envelope (no biliMsgIds/biliLedgerSeqs leak to upstream)", async () => {
+    const h = await startHarness();
+    try {
+        assert.equal(await modelRequest(h, "sess-5300-msgid"), 200);
+        assert.equal((await setCompression(h, "sess-5300-msgid", false)).status, 200);
+
+        const body = JSON.stringify({
+            model: "gpt-test",
+            messages: [{ role: "user", content: "hi" }],
+            biliMsgIds: ["m00001", "m00002"],
+            biliLedgerSeqs: [1, 2],
+        });
+        const resp = await fetch(`${baseUrl(h)}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "sess-5300-msgid" },
+            body,
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+        assert.equal(h.captured.length, 2);
+        // the host's msgid envelope is bili-internal (host<->bili) and must never
+        // reach the upstream — the excluded verbatim tail scrubs it like every
+        // other passthrough forward (#6539 egress hygiene)
+        const sent = JSON.parse(h.captured[1].body) as Record<string, unknown>;
+        assert.equal("biliMsgIds" in sent, false, "biliMsgIds must not leak to the upstream");
+        assert.equal("biliLedgerSeqs" in sent, false, "biliLedgerSeqs must not leak to the upstream");
+        // the rest of the body is untouched
+        assert.deepEqual(sent.messages, [{ role: "user", content: "hi" }]);
+        assert.equal(sent.model, "gpt-test");
+    } finally {
+        await h.close();
+    }
+});
+
 test("#5300: re-enable — injection returns for the same session (cycle closes both ways)", async () => {
     const h = await startHarness();
     try {
