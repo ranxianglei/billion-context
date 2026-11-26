@@ -2635,6 +2635,12 @@ export async function handlePluginTool(
                 // permanent drift against the client's unchanged history
                 // (same split as the relay loop ctx).
                 compressMessages: mem && mem.original.length > 0 ? mem.original : undefined,
+                // The block-content ORIGINAL cache must be built from the
+                // TAGGED processed view the model saw (the fold view above is
+                // the raw client history without ACP tags — a full decompress
+                // must return originals with citable refs; session-
+                // continuity proof).
+                blockContentSource: messages,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
