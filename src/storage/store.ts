@@ -310,15 +310,18 @@ export interface CheckpointRow {
      /** #3928: 'active' or 'archived' — archived rows are tombstones kept for
       *  restore (see archiveSession); the CLI surfaces both. */
      status: string;
-     /** #7595: raw stored fields for the display-title fallback (the export
-      *  list + handoff need hostTitle separately from the merged `title`, and
-      *  the first block's topic/summary to fall back to when `title` is the
-      *  subagent dispatch boilerplate). `title` stays the merged
-      *  `hostTitle ?? title` for existing consumers. */
-     hostTitle?: string | null;
-     firstTopic?: string | null;
-     firstSummary?: string | null;
- }
+      /** #7595: raw stored fields for the display-title fallback (the export
+       *  list + handoff need hostTitle separately from the merged `title`, and
+       *  the first block's topic/summary to fall back to when `title` is the
+       *  subagent dispatch boilerplate). `title` stays the merged
+       *  `hostTitle ?? title` for existing consumers. */
+      hostTitle?: string | null;
+      firstTopic?: string | null;
+      firstSummary?: string | null;
+  }
+
+/** Boot aliases need identity fields only, without web-list aggregates. */
+export type SessionAliasRow = Pick<SessionSummaryRow, "sessionId" | "label" | "protocol" | "origin" | "updatedAt">;
 
 /** #2960 R2.2: row backing the WEB session list in full mode. Carries the
  *  JSON columns the web summaryOf needs (stats/metadata) plus block
@@ -1541,7 +1544,18 @@ export class UnifiedStore {
             // #4313: one wall-clock sample per save batch — rows without a
             //  per-message first-sight stamp all carry the same second.
             const batchTs = Date.now();
+            const existingMessages = new Map<number, { msg_id: string; identity: string; content_hash: string }>();
+            if (!delta && messages.length > 0) {
+                const rows = this.db.prepare("SELECT m.seq, m.msg_id, m.identity, m.content_hash FROM messages m " +
+                    "JOIN content c ON c.hash = m.content_hash AND c.refcount > 0 WHERE m.session_id = ?")
+                    .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string }[];
+                for (const row of rows) existingMessages.set(row.seq, row);
+            }
             for (const m of messages) {
+                const existing = existingMessages.get(m.seq);
+                if ((!m.media || m.media.length === 0) && existing && existing.msg_id === m.msgId &&
+                    existing.identity === (m.identity ?? identityOfStoredContent(m.content)) &&
+                    existing.content_hash === (m.contentHash ?? sha256Hex(m.content))) continue;
                 const hash = this.putContent(m.content, m.contentHash);
                 const res = this.db
                     .prepare(
@@ -4035,6 +4049,22 @@ export class UnifiedStore {
                   .all(namespace)
         ) as { namespace: string; conversation_id: string; session_id: string; claimed_at: number }[];
         return rows.map((r) => ({ namespace: r.namespace, conversationId: r.conversation_id, sessionId: r.session_id, claimedAt: r.claimed_at }));
+    }
+
+    /** Boot alias seed (#6850): identity fields only, no web-list aggregates. */
+    sessionAliasRows(): SessionAliasRow[] {
+        // Keep the summary query's table-scan order: equal-time alias ties
+        // retain its last-row-wins behavior even with a covering index.
+        const rows = this.db.prepare(
+            "SELECT session_id AS sessionId, label, protocol, origin, updated_at AS updatedAt FROM sessions NOT INDEXED",
+        ).all() as { sessionId: string; label: string | null; protocol: string | null; origin: string | null; updatedAt: number }[];
+        return rows.map((row) => ({
+            sessionId: row.sessionId,
+            label: row.label ?? undefined,
+            protocol: row.protocol ?? undefined,
+            origin: row.origin ?? undefined,
+            updatedAt: row.updatedAt,
+        }));
     }
 
     /** Summary rows for the export/web list fast path (#2960 R2.1):

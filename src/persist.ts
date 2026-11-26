@@ -1213,7 +1213,7 @@ export class SessionStore {
         if (!shadow) return;
         let rows;
         try {
-            rows = shadow.sessionSummaries();
+            rows = shadow.sessionAliasRows();
         } catch {
             return; // sidecar degraded mid-boot: background scan still covers it
         }

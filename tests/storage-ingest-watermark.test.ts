@@ -51,6 +51,28 @@ function msg(i: number, text = `hello ${i}`): CoreMessage {
     return { id: `h_msg${i}`, role: i % 2 === 0 ? "user" : "assistant", contentType: "text", text } as CoreMessage;
 }
 
+test("writer handoff re-verifies a same-length prefix with an edited interior message", () => {
+    const dir = tmpdir("bili-interior-handoff-");
+    const a = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
+    assert.ok(a);
+    const original = Array.from({ length: 10 }, (_, i) => msg(i));
+    try {
+        a.record(mkLegacy("interior-handoff", original), { lastMessages: original });
+    } finally { a.close(); }
+    const b = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
+    assert.ok(b);
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const changed = original.map((m, i) => i === 4 ? msg(i, "edited interior; identical head and boundary") : m);
+        b.record(mkLegacy("interior-handoff", changed), { lastMessages: changed });
+        assert.equal(stats(b).deltaIngests, 0, "inherited matching head/boundary do not prove the interior");
+        assert.equal(stats(b).verifyDrift, 0, "first save must converge immediately, without a later sampled repair");
+        assert.deepEqual(view(store, "interior-handoff").lastMessages, changed);
+        b.record(mkLegacy("interior-handoff", [...changed, msg(10)]), { lastMessages: [...changed, msg(10)] });
+        assert.equal(stats(b).deltaIngests, 1, "an owned committed prefix resumes delta saves");
+    } finally { b.close(); store.close(); rmBestEffort(dir); }
+});
+
 function mkLegacy(id: string, lastMessages: LegacySessionLike["lastMessages"], pluginSnapshot?: LegacySessionLike["pluginSnapshot"]): LegacySessionLike {
     return {
         id,

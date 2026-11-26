@@ -38,7 +38,7 @@ import { splitMediaContent } from "./identity.js";
 import { rebuildEgressKstateOverlay, type EgressBlockSnapshot } from "./egress-block.ts";
 import type { BlockView } from "../session.js";
 import { effectiveJsonWriterOff, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionAliasRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
@@ -1377,6 +1377,11 @@ export class UnifiedShadow {
     messageContentByMsgIds(sessionId: string, msgIds: readonly string[]): MessageIdContentRow[] {
         if (this.sync === null || msgIds.length === 0) return [];
         return this.sync.messageContentByMsgIds(sessionId, msgIds);
+    }
+
+    sessionAliasRows(): SessionAliasRow[] {
+        if (this.sync === null) return [];
+        return this.sync.sessionAliasRows();
     }
 
     sessionSummaries(): SessionSummaryRow[] {
