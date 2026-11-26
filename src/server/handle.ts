@@ -2001,6 +2001,16 @@ async function handleRequest(
         // be able to reload from the DB instead of starting a fresh session.
         const session = await getSessionAsync(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
+        // #7744: track the high-water mark of inbound message count on EVERY
+        // request (not just compaction calls) so the signal is observable for
+        // sessions that never send a compaction call.
+        if (inboundMsgs !== null) {
+            const prevMaxMsgs = typeof session.metadata["dshMaxInboundMsgs"] === "number" ? session.metadata["dshMaxInboundMsgs"] as number : 0;
+            if (inboundMsgs > prevMaxMsgs) {
+                session.metadata["dshMaxInboundMsgs"] = inboundMsgs;
+                markDirty(session);
+            }
+        }
         // #5490: the first-sight warn above needs no session identity; this one
         // does — recurrence across DISTINCT sessions is what turns "a model I
         // haven't declared" into "an alias this host resolves internally that
@@ -2765,15 +2775,15 @@ async function handleRequest(
             // #7745: track compaction calls per session, distinguishing auto/manual.
             // Manual = text match (final user message is COMPACTION_INSTRUCTION);
             // auto = declaration-only (purpose=compaction without text match).
+            // When BOTH match (text + declaration), the text match wins (manual)
+            // — the text is the stronger signal (a user-typed instruction
+            // outranks a machine-stamped header). This priority is deliberate;
+            // do not swap it without re-reading #7745's rationale.
             const isManualCompaction = isDshCompactionCall(protocol, parsed);
             if (isManualCompaction) {
                 session.metadata["dshCompactionCallsManual"] = (typeof session.metadata["dshCompactionCallsManual"] === "number" ? session.metadata["dshCompactionCallsManual"] as number : 0) + 1;
             } else {
                 session.metadata["dshCompactionCallsAuto"] = (typeof session.metadata["dshCompactionCallsAuto"] === "number" ? session.metadata["dshCompactionCallsAuto"] as number : 0) + 1;
-            }
-            const prevMaxMsgs = typeof session.metadata["dshMaxInboundMsgs"] === "number" ? session.metadata["dshMaxInboundMsgs"] as number : 0;
-            if (inboundMsgs !== null && inboundMsgs > prevMaxMsgs) {
-                session.metadata["dshMaxInboundMsgs"] = inboundMsgs;
             }
             markDirty(session);
             log("info", `[${session.id}] dsh compaction call tracked: auto=${session.metadata["dshCompactionCallsAuto"] ?? 0}, manual=${session.metadata["dshCompactionCallsManual"] ?? 0}, inboundMsgs=${inboundMsgs}, maxInboundMsgs=${session.metadata["dshMaxInboundMsgs"] ?? 0}, contextTokensSource=${session.stats.contextTokensSource ?? "unknown"}`);
