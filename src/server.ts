@@ -546,7 +546,7 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     }
     // #4313 toggle (PR #5236): resolved ONCE per instance — stamping/rendering
     // are baked into the pipeline nodes, so changing the flag needs a restart.
-    // #7729: the kernel's own diagnostics must not reach a terminal through a raw
+    // #7791: the kernel's own diagnostics must not reach a terminal through a raw
     // console call — the sink decides per lane (inline lanes are embedded in a
     // host TUI; this lane's stderr legs are the logger's business).
     const core = createCore({
