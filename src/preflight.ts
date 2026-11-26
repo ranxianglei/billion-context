@@ -2383,6 +2383,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             `Raise the model context window or restart the session.`;
         return { recovered, callsUsed, netSaved, honestDetail };
     };
+    let roundStartTokens = -1;
+    const netSavingsHistory: number[] = [];
     for (let round = 0; round < effectiveRoundCap; round++) {
         if (deps.signal?.aborted) {
             failure = ABORTED_FAILURE;
@@ -2433,6 +2435,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // the trigger that started the invocation (no mid-loop scale drift).
         const roundText = applyEstimateCalibration(rawRoundText, kFactor, kOrigin, deps.upstreamOrigin);
         currentTokens = Math.max(baselineFloor, roundText + imageReserve);
+        roundStartTokens = currentTokens;
         // #1843: the TEXT-channel judgment quantity — the usage-grade baseline
         // bills images too, so project it onto the text channel by subtracting
         // the reserve (floored at zero).
@@ -3762,6 +3765,24 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 continue;
             }
             break;
+        }
+        if (roundStartTokens > 0) {
+            const netSavedThisRound = roundStartTokens - currentTokens;
+            if (netSavedThisRound > 0) {
+                netSavingsHistory.push(netSavedThisRound);
+                if (netSavingsHistory.length > 3) netSavingsHistory.shift();
+            }
+            const remainingRounds = effectiveRoundCap - round - 1;
+            if (netSavingsHistory.length >= 2 && remainingRounds > 0) {
+                const avgNetSaving = netSavingsHistory.reduce((a, b) => a + b, 0) / netSavingsHistory.length;
+                const currentDeficit = Math.max(0, currentTokens - limit);
+                const progressRate = avgNetSaving / limit;
+                if (currentDeficit > 0 && progressRate < 0.03 && avgNetSaving * remainingRounds * 0.5 < currentDeficit) {
+                    failure = { kind: "exhausted", detail: `progress stall: the average net saving over the last ${netSavingsHistory.length} rounds (~${Math.round(avgNetSaving)} tok/round) cannot close the ~${Math.round(currentDeficit)}-tok gap in the remaining ${remainingRounds} rounds — the fold is not converging. Raise the model context window or restart the session.` };
+                    deps.log("warn", `[preflight] progress stall: avg net saving ~${Math.round(avgNetSaving)} tok/round over last ${netSavingsHistory.length} rounds; deficit ~${Math.round(currentDeficit)} tok; remaining ${remainingRounds} rounds — failing fast (#7775)`);
+                    break;
+                }
+            }
         }
     }
     if (currentTokens >= limit && !failure) {
