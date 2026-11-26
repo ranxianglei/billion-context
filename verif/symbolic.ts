@@ -2157,6 +2157,25 @@ const mergeBranch = (
         }
       }
     }
+    // JS `in` operator: `key in obj` — own-property check on the obj model.
+    // The obj model only tracks own properties via `fields` (not the
+    // prototype chain), so a concrete key `l` is "in" `r` iff `r.fields`
+    // has `l`. A merged-away object (nullUnder) is only an obj when
+    // ¬nullUnder — gate the result (real JS throws on a null receiver; we
+    // approximate with false). Symbolic keys or non-obj receivers degrade
+    // (the if-condition path turns the `any` result into a degradation).
+    if (op === ts.SyntaxKind.InKeyword) {
+      if (isStr(l) && r.kind === "obj") {
+        const lc = strConst.get(l.t);
+        if (lc !== undefined) {
+          const has = bool(ctx, r.fields.has(lc));
+          const nu = (r as { nullUnder?: Bool<"main"> }).nullUnder;
+          if (nu) return { kind: "bool", t: ctx.If(nu.not(), has, bool(ctx, false)) };
+          return { kind: "bool", t: has };
+        }
+      }
+      return { kind: "any" };
+    }
     return { kind: "any" };
   };
 
