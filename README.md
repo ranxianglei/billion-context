@@ -576,7 +576,7 @@ What's inside (details in docs/configuration.md):
 
 - `providers` — per-provider routing table: upstream override, model context windows, per-provider/model compress tuning, wire-protocol declaration, compaction opt-in.
 - `compress` — three-level compression tuning (global → provider → model): thresholds, nudge cadence, preservation rules, prompts, tiers.
-- Server-level blocks — process-wide behavior, including the #2030 additions: `network` (timeouts / retry / keep-alive / preflight cadence), `persist` (session persistence format + tail), `sessions` (cap + GC policy), `update` (registry mirror + check interval), `diagnostics` (dumps, render-tag mode, injection switches), `fakeCompletion`, plus scalars `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap` and extensions `mitm.handshakeTimeoutMs`, `compat.noCacheControl`, `compat.keepResponseId`.
+- Server-level blocks — process-wide behavior, including the #2030 additions: `network` (timeouts / retry / keep-alive / preflight cadence), `persist` (session persistence format + tail), `sessions` (cap + GC policy), `update` (registry mirror + check interval), `diagnostics` (dumps, render-tag mode, injection switches), `fakeCompletion`, plus scalars `codexCompact` / `decompressTmpCap` and extensions `mitm.handshakeTimeoutMs`, `compat.noCacheControl`, `compat.keepResponseId`.
 
 Minimal example:
 
@@ -680,7 +680,7 @@ Consequences for anyone tempted to put several instances behind one Service:
   that is never shared. Pointing two instances at the same RWX/NFS path does
   not give you a shared store — it gives you silent corruption behind a
   timeout. One RWO volume per instance, `storage.unified` included: "unified"
-  means one store *for that instance* (sessions + CCR + CAS in one
+  means one store *for that instance* (sessions + CAS in one
   `index.db`), not one store for the fleet.
 - **The workload that actually scales** is *many independent short-lived
   conversations* — one proxy per client or per lane — not *one long
@@ -715,7 +715,7 @@ The proxy rewrites each session's state file every turn of a long session; on Wi
 
 ### Session file cleanup (#1082)
 
-Short-lived sessions leave small state files behind that are never resumed. Cleanup is **opt-in** (`BILI_SESSION_GC=1`; off by default — session files are user data, no silent deletion policy): when enabled, bili sweeps the sessions dir at boot and hourly and deletes a file only when BOTH hold — older than `BILI_SESSION_GC_MAX_AGE_DAYS` (default 7 days) AND never compressed with its newest request body ≤ `BILI_SESSION_GC_MAX_TOKENS` tokens (default 1M) — so deletion loses nothing but bytes. CCR content stores follow their session file's lifecycle; compressed sessions are never deleted; every deletion is audit-logged. Full policy: [docs/configuration.md](docs/configuration.md#environment-variables).
+Short-lived sessions leave small state files behind that are never resumed. Cleanup is **opt-in** (`BILI_SESSION_GC=1`; off by default — session files are user data, no silent deletion policy): when enabled, bili sweeps the sessions dir at boot and hourly and deletes a file only when BOTH hold — older than `BILI_SESSION_GC_MAX_AGE_DAYS` (default 7 days) AND never compressed with its newest request body ≤ `BILI_SESSION_GC_MAX_TOKENS` tokens (default 1M) — so deletion loses nothing but bytes. compressed sessions are never deleted; every deletion is audit-logged. Full policy: [docs/configuration.md](docs/configuration.md#environment-variables).
 
 ### Storage maintenance CLI (#3928)
 
