@@ -1425,10 +1425,12 @@ export class UnifiedShadow {
         return false;
     }
 
-    /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */
-    webSummaryRows(): WebSummaryRow[] {
+    /** Web summaries are projected before the next SQLite row is decoded. */
+    webSummaryRows(): WebSummaryRow[];
+    webSummaryRows<T>(map: (row: WebSummaryRow) => T): T[];
+    webSummaryRows(map?: (row: WebSummaryRow) => unknown): unknown[] {
         if (this.sync === null) return [];
-        return this.sync.webSummaryRows();
+        return map ? this.sync.webSummaryRows(map) : this.sync.webSummaryRows();
     }
 
     // ------------------------------------------------------------------

@@ -25,14 +25,13 @@ import { readdirSync, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import * as path from "node:path";
 
-/** #1420/#1937: read-only session browsing for the web UI. Merges the LIVE
- *  in-memory pool (bounded — evicted sessions are gone) with the on-disk
- *  corpus. #1937: the disk side is a BOUNDED SUMMARY INDEX — a directory walk
- *  over metadata only, per-file summaries cached by (mtime,size,price), and
- *  sequential decode of changed/new files whose parsed records are discarded
- *  right after extraction. List/overview paths never construct or retain full
- *  Session objects, so resident memory stays O(#sessions × ~1KB) regardless of
- *  total corpus bytes; a single admin request's peak is one decoded file. */
+/** #1420/#1937: read-only session browsing merges the live pool with a compact
+ * disk summary index. Legacy files are decoded sequentially and discarded
+ * after extraction. SQLite projects only summary inputs and reduces each row
+ * before reading the next; block previews cross into JS in bounded chunks.
+ * List/overview memory is O(session count × summary size + one projected row
+ * or decoded file), not total archive bytes. Filtering still scans the compact
+ * index; SQLite still reads/parses source JSON, so latency scales with corpus. */
 
 // #5796: the host-side conversation surface (dsh session file, agent
 // transcripts) grows without bound — bili compression shrinks what is SENT to
@@ -456,12 +455,14 @@ function liveCoveredPaths(dir: string): Set<string> {
  *  views always read the file, and any activity re-ingests the row. */
 const SHADOW_ROW_STALE_WINDOW_MS = 5 * 60 * 1000;
 
+type WebSummaryClaim = Pick<WebSummaryRow, "sessionId" | "protocol" | "origin" | "updatedAt"> & { summary: WebSessionSummary };
+
 /** #3199: basename → freshest unified row claiming that filename. Session
  *  filenames derive from the session id (sha256 prefix), so row→file needs no
  *  stat and no decode — the walk's own basenames are the join key (the same
  *  three candidates liveCoveredPaths builds per live id). */
-function rowClaimsByBasename(rows: WebSummaryRow[]): Map<string, WebSummaryRow> {
-    const claims = new Map<string, WebSummaryRow>();
+function rowClaimsByBasename(rows: WebSummaryClaim[]): Map<string, WebSummaryClaim> {
+    const claims = new Map<string, WebSummaryClaim>();
     for (const r of rows) {
         const candidates = [
             relPathFor(r.sessionId, r.protocol, r.origin),
@@ -544,13 +545,16 @@ async function refreshIndex(): Promise<void> {
         };
         const covered = liveCoveredPaths(dir);
         // #3199: shadow mode adopts fresh unified rows instead of decoding the
-        // files they describe — cold-start cost drops from "decode the whole
-        // corpus" to one SQL + one stat per file. Full mode never walks here
+        // files they describe — cold-start cost drops from envelope decoding
+        // to projected SQLite reads + one stat per file. Full mode never walks here
         // (its rows are authoritative); legacy has no rows; both keep the
         // plain decode path below.
-        let claims: Map<string, WebSummaryRow> | null = null;
+        let claims: Map<string, WebSummaryClaim> | null = null;
         if (store.webSummaryBaseline() === "reconcile") {
-            const rows = store.unifiedWebSummaries();
+            const rows = store.unifiedWebSummaries((row) => ({
+                sessionId: row.sessionId, protocol: row.protocol, origin: row.origin,
+                updatedAt: row.updatedAt, summary: summaryFromRow(row),
+            }));
             if (rows !== null) claims = rowClaimsByBasename(rows);
         }
         for (const f of files) {
@@ -562,7 +566,7 @@ async function refreshIndex(): Promise<void> {
             }
             const claim = claims?.get(path.basename(f.abs));
             if (claim && f.mtimeMs - claim.updatedAt <= SHADOW_ROW_STALE_WINDOW_MS) {
-                const summary = summaryFromRow(claim);
+                const summary = claim.summary;
                 next.set(f.abs, { abs: f.abs, mtimeMs: f.mtimeMs, size: f.size, savedAt: claim.updatedAt, summary, priceKey: priceKey(summary, true) });
                 continue;
             }
@@ -662,7 +666,7 @@ interface SummarySource {
     meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string; hostTitle?: string };
     stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean; costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number } };
     metadata: Record<string, unknown>;
-    state: { blocks: Array<{ topic?: string; summary: string; active?: boolean; compressedTokens?: number }> };
+    state: { blocks: Array<{ topic?: string; summary: string; active?: boolean; compressedTokens?: number }>; blockCount?: number };
     lastSeen: number;
     restored?: boolean;
 }
@@ -766,24 +770,16 @@ function summaryFromRecord(rec: unknown): WebSessionSummary {
     return summaryOf(source, false);
 }
 
-/** #2960 R2.2: build the same SummarySource the disk index builds, but from
- *  a unified-index row — no envelope file decode. The synthetic blocks array
- *  carries: length = ALL blocks count (summaryOf's `blocks` field), entry [0]
- *  = the first block's topic/summary lead plus the ACTIVE-block compressed
- *  token sum (blocksSaved floor), remaining entries inactive fillers that
- *  summaryOf skips for both derivation and the firstBlockHint `.find`. */
-function summaryFromRow(row: import("../storage/store.js").WebSummaryRow): WebSessionSummary {
+/** The database already counted blocks and summed active compressed tokens.
+ * Carry those aggregates without allocating one synthetic object per block. */
+function summaryFromRow(row: WebSummaryRow): WebSessionSummary {
     let stats: Record<string, unknown> = {};
     let metadata: Record<string, unknown> = {};
     try { stats = JSON.parse(row.statsJson) as Record<string, unknown>; } catch { /* malformed: empty like a missing field */ }
     try { metadata = JSON.parse(row.metadataJson) as Record<string, unknown>; } catch { /* same */ }
-    const blocks = Array.from(
-        { length: row.blocks },
-        (_, i) =>
-            i === 0 && (row.firstTopic !== null || row.firstSummary !== null)
-                ? { topic: row.firstTopic ?? undefined, summary: row.firstSummary ?? "", active: true, compressedTokens: row.activeCompressedTokens }
-                : { summary: "", active: false },
-    );
+    const blocks = row.blocks > 0
+        ? [{ topic: row.firstTopic ?? undefined, summary: row.firstSummary ?? "", active: true, compressedTokens: row.activeCompressedTokens }]
+        : [];
     const source: SummarySource = {
         id: row.sessionId,
         meta: {
@@ -808,7 +804,7 @@ function summaryFromRow(row: import("../storage/store.js").WebSummaryRow): WebSe
             costUsd: validCostUsd(stats.costUsd),
         },
         metadata,
-        state: { blocks },
+        state: { blocks, blockCount: row.blocks },
         lastSeen: row.updatedAt,
         restored: true,
     };
@@ -1015,7 +1011,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         cachedTokens,
         outputTokens,
         cacheHitPct: hitPct(inputTokens, cachedTokens),
-        blocks: s.state.blocks.length,
+        blocks: s.state.blockCount ?? s.state.blocks.length,
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
         ...(selfHeal ? { selfHeal } : {}),
         ...(autoModeForge ? { autoModeForge } : {}),
@@ -1070,16 +1066,16 @@ export function hiddenEmptyCount(): number { return lastHiddenEmpty; }
 async function mergedSummaries(): Promise<WebSessionSummary[]> {
     const out = new Map<string, WebSessionSummary>();
     // #2960 R2.2 / #3199: full mode serves the disk side from the unified index
-    // alone (one SQL — no walk, no decode; sessions whose JSON file vanished
+    // alone (compact per-row projection, no file decode; vanished JSON files
     // stay listed). Shadow RECONCILES the rows against the tree inside
     // refreshIndex (fresh rows adopted without decode; stale/unrecorded files
     // decoded; ghost rows dropped because only files produce entries). Legacy
     // keeps the plain bounded file walk.
     let fromRows = false;
     if (getStore().webSummaryBaseline() === "authoritative") {
-        const rows = getStore().unifiedWebSummaries();
+        const rows = getStore().unifiedWebSummaries(summaryFromRow);
         if (rows !== null) {
-            for (const r of rows) out.set(r.sessionId, summaryFromRow(r));
+            for (const r of rows) out.set(r.id, r);
             fromRows = true;
         }
     }

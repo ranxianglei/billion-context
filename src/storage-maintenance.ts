@@ -86,7 +86,7 @@ function fail(text: string, json?: boolean, data?: Record<string, unknown>): Sto
 async function runLs(store: SessionStore, json: boolean): Promise<StorageCommandResult> {
     const loaded = await store.loadAll();
     const dbRows = new Map<string, { status: string; updatedAt: number; label?: string }>();
-    for (const r of store.unifiedWebSummaries() ?? []) {
+    for (const r of store.unifiedWebSummaries(({ sessionId, status, updatedAt, label }) => ({ sessionId, status, updatedAt, label })) ?? []) {
         dbRows.set(r.sessionId, { status: r.status, updatedAt: r.updatedAt, label: r.label });
     }
     const rows: LsRow[] = [];
