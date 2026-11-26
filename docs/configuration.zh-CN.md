@@ -2379,7 +2379,7 @@ export ANTHROPIC_VERTEX_BASE_URL="http://localhost:8787/bili/anthropic/https://a
 
 鉴权在这条通道上原样透传：Claude Code 自己签发 ADC access token，bili 不为它签发任何鉴权。以上动作 `bili claude` 会全部自动完成 —— 它把 `ANTHROPIC_VERTEX_BASE_URL` 设成同样的转发形式，并保留普通变量（在 Vertex 下无效，因此关闭 provider 时同一次启动仍然可用）。
 
-> **自动压缩对齐（仅手动模式）。** `bili claude` launcher 会自动把 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 设成 bili 对你模型的有效窗口，让 claude 自己的自动压缩阈值与 bili 的压缩预算对齐。手动 `/bili/` 模式下需要你自己设 —— 否则 claude 可能在与 bili 窗口不一致的阈值上跑它自己的本地自动压缩（一次“总结对话”轮次）。这通常无害（同一 session-id，bili 会从截断中重新推导状态），但比必要的更吵。把它设成 bili 对你模型的有效窗口：
+> **自动压缩对齐（仅手动模式）。** `bili claude` launcher 会自动把 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 设成 bili 对你模型的有效窗口，让 claude 自己的自动压缩阈值与 bili 的压缩预算对齐。手动 `/bili/` 模式下需要你自己设 —— 否则 claude 可能在与 bili 窗口不一致的阈值上跑它自己的本地自动压缩（一次“总结对话”轮次）。**claude 每次自动压缩后，bili 会在同一通道上重新锚定，保留已积累的压缩状态（fold 块、用量基线）——不会 fork 到新的零状态通道。** 状态是安全的，但阈值不一致的自动压缩仍然比必要的更吵（claude 先按自己的节奏压缩，bili 可能随后再压缩）。为了保持安静，要么禁用 claude 的自动压缩（`DISABLE_AUTO_COMPACT=1`），要么把 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 设成比 bili 窗口更大的值（在模型感知窗口允许时），让 bili 先压缩。作为基线，把它设成 bili 对你模型的有效窗口：
 >
 > ```bash
 > export CLAUDE_CODE_AUTO_COMPACT_WINDOW=<bili 有效窗口 token 数>
