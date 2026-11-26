@@ -231,6 +231,40 @@ describe("createV1ServerHooks", () => {
         assert.equal("toolCallId" in (deps.forwarded[1] ?? {}), false);
     });
 
+    // #7505 (review supplement): the injected-deps test above covers the call
+    // sites; this one covers the runtime DEFAULT adapter (deps.forward absent)
+    // — ctx.id must thread through forwardTool's 7th arg into the real HTTP
+    // forward body, over a live loopback proxy.
+    it("#7505 default adapter threads ctx.id into the real forward body over HTTP", async () => {
+        const bodies: Array<Record<string, unknown>> = [];
+        const server = http.createServer((req, res) => {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                bodies.push(JSON.parse(body) as Record<string, unknown>);
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, result: "compressed 42 tokens" }));
+            });
+        });
+        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+        const addr = server.address();
+        if (addr === null || typeof addr === "string") throw new Error("expected a tcp address");
+        const capOrigin = `http://127.0.0.1:${addr.port}`;
+        try {
+            const hooks = createV1ServerHooks(() => capOrigin, {}, { z: fakeZ });
+            const compress = hooks.tool?.compress;
+            assert.ok(compress);
+            const out = await compress.execute({ range: "m1-m2" }, { sessionID: "ses_1", id: "call-7505-def-1" });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(bodies[0], { conversationId: "ses_1", tool: "compress", args: { range: "m1-m2" }, nativeCaller: true, toolCallId: "call-7505-def-1" });
+            // host without an id → body has NO toolCallId field at all
+            await compress.execute({ range: "m3-m4" }, { sessionID: "ses_1" });
+            assert.deepEqual(bodies[1], { conversationId: "ses_1", tool: "compress", args: { range: "m3-m4" }, nativeCaller: true });
+        } finally {
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+    });
+
     it("degrades to proxy mode (no headers, no tools) when zod is unavailable", async () => {
         const hooks = createV1ServerHooks(() => origin, {}, {});
         assert.equal(hooks["chat.headers"], undefined);
