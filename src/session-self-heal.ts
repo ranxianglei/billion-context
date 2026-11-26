@@ -70,6 +70,11 @@ type SelfHealCounters = {
     lastReductionKey: string | undefined;
     zombieStreak: number;
     idleStreak: number;
+    /** #7567: consecutive nudge-active rounds where the agent DID call a bili
+     * tool (compress) but no reduction landed — the tool is failing (e.g. DSH
+     * auto-review 400s every attempt), so the nudge is prompting a retry that
+     * can never succeed. Distinct from idleStreak (agent not calling at all). */
+    stallStreak: number;
 };
 
 const counters = new WeakMap<Session, SelfHealCounters>();
@@ -116,7 +121,7 @@ function clearSelfHeal(session: Session): void {
     delete session.metadata["selfHeal"];
 }
 
-function armSelfHeal(session: Session, detected: "plugin-lane-gone" | "nudge-idle", action: SelfHealAction): void {
+function armSelfHeal(session: Session, detected: "plugin-lane-gone" | "nudge-idle" | "compress-failing", action: SelfHealAction): void {
     session.metadata["selfHeal"] = { detected, action, since: Date.now() };
 }
 
@@ -198,7 +203,7 @@ type LogFn = (level: "info" | "warn", message: string) => void;
  * HTTP request after prepare (nudge-carrying rounds only — bypass lanes
  * never reach it). */
 export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInputs, log: LogFn): void {
-    const st = counters.get(session) ?? { lastReductionKey: undefined, zombieStreak: 0, idleStreak: 0 };
+    const st = counters.get(session) ?? { lastReductionKey: undefined, zombieStreak: 0, idleStreak: 0, stallStreak: 0 };
     counters.set(session, st);
     const key = reductionKeyOf(session);
     const reduction = st.lastReductionKey !== undefined && key !== st.lastReductionKey;
@@ -212,6 +217,7 @@ export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInp
         clearSelfHeal(session);
         st.zombieStreak = 0;
         st.idleStreak = 0;
+        st.stallStreak = 0;
         log("info", `[${session.id}] [self-heal] nudge suppression expired after ${Math.round((Date.now() - active.since) / 60_000)} min without compression evidence — re-enabling the nudge channel (re-arms after ${SELF_HEAL_WINDOW} more idle rounds if still ignored) (#3004)`);
     }
     // Recovery: evidence first, detection second — a recovered session can
@@ -227,12 +233,24 @@ export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInp
             clearSelfHeal(session);
             st.zombieStreak = 0;
             st.idleStreak = 0;
+            st.stallStreak = 0;
             log("info", `[${session.id}] [self-heal] plugin lane is back (live marker on request) — session restored to plugin mode`);
-        } else if (active.action === "suppress-nudge" && (reduction || inputs.biliToolUses > 0)) {
-            clearSelfHeal(session);
-            st.zombieStreak = 0;
-            st.idleStreak = 0;
-            log("info", `[${session.id}] [self-heal] compression resumed — nudge suppression lifted`);
+        } else if (active.action === "suppress-nudge") {
+            // #7567: a compress-failing suppression lifts ONLY on a real
+            // reduction — the agent is already calling compress (biliToolUses >
+            // 0) but every attempt is failing, so "still calling" is not
+            // recovery evidence (that would lift the suppression on the very
+            // next broken round and re-arm it, oscillating). nudge-idle and the
+            // D2 fallback keep the original evidence (a reduction OR the agent
+            // starting to use bili tools).
+            const liftsOnToolUse = active.detected !== "compress-failing";
+            if (reduction || (liftsOnToolUse && inputs.biliToolUses > 0)) {
+                clearSelfHeal(session);
+                st.zombieStreak = 0;
+                st.idleStreak = 0;
+                st.stallStreak = 0;
+                log("info", `[${session.id}] [self-heal] compression resumed — nudge suppression lifted`);
+            }
         }
     }
 
@@ -242,12 +260,24 @@ export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInp
     // and a reduction or an agent-side tool use always resets both streaks.
     if (inputs.nudgeActive) {
         const zombieSignal = pluginBound && !inputs.pluginHeaderPresent && !inputs.biliToolsDeclared;
-        if (reduction || inputs.biliToolUses > 0) {
+        if (reduction) {
+            // A reduction landed — every streak resets.
             st.zombieStreak = 0;
             st.idleStreak = 0;
+            st.stallStreak = 0;
+        } else if (inputs.biliToolUses > 0) {
+            // #7567: the agent IS calling a bili tool (compress) but no
+            // reduction landed — the tool is failing (e.g. DSH auto-review
+            // 400s every attempt). The agent is alive and trying, so the
+            // zombie/idle streaks reset; but the stall counts toward the
+            // compress-failing remedy.
+            st.zombieStreak = 0;
+            st.idleStreak = 0;
+            st.stallStreak += 1;
         } else {
             st.idleStreak += 1;
             st.zombieStreak = zombieSignal ? st.zombieStreak + 1 : 0;
+            st.stallStreak = 0;
         }
     }
 
@@ -262,11 +292,28 @@ export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInp
         }
         st.zombieStreak = 0;
         st.idleStreak = 0;
+        st.stallStreak = 0;
         return;
     }
     if (st.idleStreak >= SELF_HEAL_WINDOW) {
         armSelfHeal(session, "nudge-idle", "suppress-nudge");
         log("warn", `[${session.id}] [self-heal] nudge idle for ${st.idleStreak} rounds (injected but nothing ever compressed) — nudge suppressed for this session until compression resumes`);
+        st.idleStreak = 0;
+        st.zombieStreak = 0;
+        st.stallStreak = 0;
+        return;
+    }
+    // #7567: the agent keeps calling compress but no reduction ever lands —
+    // the tool is failing at the infrastructure layer (e.g. DSH auto-review
+    // 400s every attempt before the body runs). The nudge is prompting a retry
+    // that can never succeed, so suppress it. Bounded by the #3004 cap and
+    // lifts only on a real reduction (not on further failed calls). Mutually
+    // exclusive with the idle arm (a round is either "tool use, no reduction"
+    // or "no tool use"), so at most one of the two fires per evaluation.
+    if (st.stallStreak >= SELF_HEAL_WINDOW) {
+        armSelfHeal(session, "compress-failing", "suppress-nudge");
+        log("warn", `[${session.id}] [self-heal] compress failing for ${st.stallStreak} nudged rounds (agent calling compress but no reduction lands — tool-layer failure, e.g. DSH auto-review 400) — nudge suppressed for this session until a reduction actually lands (#7567)`);
+        st.stallStreak = 0;
         st.idleStreak = 0;
         st.zombieStreak = 0;
     }
