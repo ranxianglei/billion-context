@@ -160,7 +160,7 @@ test("#564 path 2: compress re-request keeps Responses assistant run ordering va
     const endRef = refOf(fcoA!);
     assert.ok(startRef && endRef, "refs resolved for the bash_a interaction");
 
-    const args = JSON.stringify({ content: [{ startId: startRef!, endId: endRef!, summary: "Inspected files A and B." }] });
+    const args = JSON.stringify({ content: [{ startId: startRef!, endId: endRef!, summary: "ok" }] });
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_c", "compress", args),

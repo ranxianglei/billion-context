@@ -33,7 +33,7 @@ import { applyRanges } from "../stream.js";
 import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeAcpRetire, executeAcpRestore, executeAcpRewrite, effectiveBlockOpsConfig } from "../acp-block-ops.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
-import { toolFail, toolOk, type ProxyToolResult } from "../proxy-tool-result.js";
+import { toolFail, toolOk, type ProxyToolResult, type ToolOutcomeKind } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, throttle429ModelScope } from "../upstream-throttle.js";
 import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
@@ -195,11 +195,18 @@ function isReasoningRequiredError(e: unknown): boolean {
     return e instanceof UpstreamHttpError && /must be passed back/i.test(e.body);
 }
 
-function proxyToolResultFailed(result: string): boolean {
-    // A successful compression receipt embeds the model-authored summary in later fingerprint
-    // lines. That summary may legitimately quote an earlier FAILED tool result; only the status
-    // line is authoritative for whether this tool call itself failed.
-    return (result.trimStart().split("\n", 1)[0] ?? "").includes("FAILED");
+function proxyToolResultFailed(pr: { name: string; outcome?: ToolOutcomeKind; result: string }): boolean {
+    // #5383: the structured outcome is authoritative when the dispatcher carries
+    // it — a compress is "failed" only when refused (applied/partial both folded
+    // something); every other tool fails on "failure". Only when no outcome is
+    // present do we fall back to the first status line: a successful compression
+    // receipt embeds the model-authored summary in later fingerprint lines, which
+    // may legitimately quote an earlier FAILED result, so the whole body is not
+    // authoritative for whether this call itself failed.
+    if (pr.outcome !== undefined) {
+        return pr.name === "compress" ? pr.outcome === "refused" : pr.outcome === "failure";
+    }
+    return (pr.result.trimStart().split("\n", 1)[0] ?? "").includes("FAILED");
 }
 
 // #1453 client-facing labels for transport failures that end the turn in-band.
@@ -1427,7 +1434,7 @@ export async function* runCompressLoop(
 
             let realCalls = 0;
             const realToolCalls: ToolCallEmit[] = [];
-            const proxyResults: { name: string; callId: string; result: string; arguments: string; wireArguments: string; signature?: string; image?: { base64: string; mediaType: string } }[] = [];
+            const proxyResults: { name: string; callId: string; result: string; outcome?: ToolOutcomeKind; arguments: string; wireArguments: string; signature?: string; image?: { base64: string; mediaType: string } }[] = [];
             // #5220: the marker lines ACTUALLY streamed to the client this round
             // (deduped, same order as the stream). On a failed-only round this IS
             // the recovery receipt the retry body must carry — reconstructing it
@@ -1458,7 +1465,7 @@ export async function* runCompressLoop(
                         parsedArgs = {};
                     }
                     const result = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, parsedArgs, ctx, call.callId, rawArgs, signal));
-                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, wireArguments: rawArgs === undefined ? call.arguments : MALFORMED_PROXY_TOOL_ARGS_REPLAY, signature: call.signature, ...(result.image ? { image: result.image } : {}) });
+                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, outcome: result.outcome, arguments: call.arguments, wireArguments: rawArgs === undefined ? call.arguments : MALFORMED_PROXY_TOOL_ARGS_REPLAY, signature: call.signature, ...(result.image ? { image: result.image } : {}) });
                     if (ctx.visibilityMarkers !== false) {
                         const markerKey = `${call.name}\u0000${result.text}`;
                         if (seenMarkers.has(markerKey)) {
@@ -1651,7 +1658,7 @@ export async function* runCompressLoop(
                     if (threadContinue) threadDelta.push(injection);
                 }
                 const anyCompressFailed = proxyResults.some(
-                    (pr) => (pr.name === "compress" || pr.name === "decompress") && proxyToolResultFailed(pr.result),
+                    (pr) => (pr.name === "compress" || pr.name === "decompress") && proxyToolResultFailed(pr),
                 );
                 if (!ctx.textProtocol && !anyCompressFailed) {
                     const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages, ctx.config.isCompressTool);
@@ -1671,7 +1678,7 @@ export async function* runCompressLoop(
                 const absorbName = activeAbsorbToolName(ctx.session, ctx.config);
                 if (
                     ctx.refreshFolded &&
-                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !proxyToolResultFailed(pr.result))
+                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !proxyToolResultFailed(pr))
                 ) {
                     try {
                         const refreshed = await ctx.refreshFolded(coreMessages);
@@ -1760,7 +1767,7 @@ export async function* runCompressLoop(
             // carry server-invisible bytes upstream — exactly the seam #4186
             // forbids.
             const failedMutating = proxyResults.filter(
-                (pr) => (pr.name === "compress" || pr.name === "decompress") && proxyToolResultFailed(pr.result),
+                (pr) => (pr.name === "compress" || pr.name === "decompress") && proxyToolResultFailed(pr),
             );
 
             if (!probeWarned) {
@@ -1881,14 +1888,14 @@ export async function* runCompressLoop(
                         let committedTokens = 0;
                         let committedBlocks = 0;
                         for (const pr of proxyResults) {
-                            if (pr.name === "compress" && !proxyToolResultFailed(pr.result)) {
+                            if (pr.name === "compress" && !proxyToolResultFailed(pr)) {
                                 const saved = /~(\d[\d,]*) tokens saved/.exec(pr.result);
                                 if (saved) committedTokens += Number(saved[1]!.replace(/,/g, ""));
                                 const blocks = /(\d+) block\(s\)/.exec(pr.result);
                                 if (blocks) committedBlocks += Number(blocks[1]);
                             }
                         }
-                        const absorbed = proxyResults.some((pr) => pr.name === activeAbsorbToolName(ctx.session, ctx.config) && !proxyToolResultFailed(pr.result));
+                        const absorbed = proxyResults.some((pr) => pr.name === activeAbsorbToolName(ctx.session, ctx.config) && !proxyToolResultFailed(pr));
                         const note = committedTokens > 0
                             ? `compression committed (~${committedTokens.toLocaleString("en-US")} tokens saved${committedBlocks > 0 ? ` in ${committedBlocks} block(s)` : ""}); `
                             : absorbed ? "context work committed; " : "";

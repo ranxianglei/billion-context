@@ -84,6 +84,25 @@ function compressToolScript(summary = "plugin e2e compress summary with enough c
     ];
 }
 
+function decompressToolScript(blockId = "synthetic-missing-block"): string[] {
+    const decompressArgs = JSON.stringify({ blockId });
+    return [
+        anthropicSse("message_start", {
+            type: "message_start",
+            message: { id: "msg_plug_3", role: "assistant", usage: { input_tokens: 55 } },
+        }),
+        anthropicSse("content_block_start", {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "tool_use", id: "toolu_d_1", name: "decompress", input: {} },
+        }),
+        anthropicSse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: decompressArgs } }),
+        anthropicSse("content_block_stop", { type: "content_block_stop", index: 0 }),
+        anthropicSse("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 12 } }),
+        anthropicSse("message_stop", { type: "message_stop" }),
+    ];
+}
+
 async function startHarness(
     scripts: string[][],
     kernelConfig?: Config,
@@ -896,6 +915,27 @@ test("a successful compression summary containing FAILED still continues with ma
 
         assert.equal(h.captured.length, 2, `a success marker must not be classified by FAILED inside its summary; raw=${raw}`);
         assert.ok(raw.includes("plain answer"), `expected the continued answer, got: ${raw}`);
+    } finally {
+        await h.close();
+    }
+});
+
+test("a genuine decompress failure without the FAILED keyword is classified as failed", async () => {
+    const h = await startHarness([decompressToolScript("synthetic-missing-block")], undefined, { visibilityMarkers: false });
+    try {
+        const { raw } = await callPluginAnthropic(h, "plug-conv-decompress-notfound", sizedPluginHistory(), {
+            agent: "hermes",
+            tools: ["tool_search", "tool_describe", "tool_call"].map((name) => ({
+                name, description: `Hermes ${name}`, input_schema: { type: "object", properties: {} },
+            })),
+            compressionProxy: true,
+        });
+
+        // A not-found decompress returns outcome:"failure" with no "FAILED" on the first
+        // line. With the structured outcome it is classified as failed, so a failed-only
+        // round with visibility markers off ends the turn instead of re-requesting (the
+        // pre-fix first-line classifier saw no FAILED and re-requested a second time).
+        assert.equal(h.captured.length, 1, `a genuine decompress failure must be classified as failed and end the turn; raw=${raw}`);
     } finally {
         await h.close();
     }
