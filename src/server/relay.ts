@@ -49,7 +49,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { describeCoreTextDuplication, formatForwardFieldSizes, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { describeCoreTextDuplication, formatForwardFieldSizes, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -72,7 +72,7 @@ import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { detectThinkingSignatureRejection, rememberStrictThinkingPosture, stripUnsignedThinkingFromWire, thinkingPostureIsStrict } from "./thinking-posture.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
-import { estimateWireOverhead, outputBudgetField, readOutputBudget, writeOutputBudget } from "./budget.js";
+import { calibratedImageTextSide, outputBudgetField, readOutputBudget, writeOutputBudget } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
@@ -1131,8 +1131,11 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // Overhead against the SENT bytes: parsedBody is the pre-shed memo and
                 // would drift from wireBody once an egress shed rewrites the body; when
                 // nothing was rewritten, measuring the serialized bytes is exactly what
-                // pre-#5131 measured — one fewer branch, identical value.
-                textSide: estimateCoreMessages(msgs) + estimateWireOverhead(prepared.protocol, wireBody),
+                // pre-#5131 measured — one fewer branch, identical value. #7621: the
+                // text side is k̂-calibrated (billing caliber) so settleImageLearning's
+                // observed = billedTotal - textSide does not mis-attribute the tokenizer
+                // gap to the images on k̂>1 routes.
+                textSide: calibratedImageTextSide(prepared.session, prepared.protocol, msgs, wireBody, normalizeUpstreamOrigin(upstreamUrl)),
                 host: upstreamHost(learnUpstream),
                 fp: `${imageBillingFor(opts, learnUpstream)}:${imageTokenCapFor(opts, learnUpstream)}`,
             });
