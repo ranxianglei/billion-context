@@ -56,7 +56,7 @@ import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER } from "./msgid-pin.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
+import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback, applyProbeBaselineAnchor } from "./session.js";
 import type { SeparatorManifest } from "./server/responses-ordering.js";
 import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
@@ -4577,18 +4577,9 @@ export async function preflightCompressIfNeeded(
             pendingRebuild = probe;
             const probeMsgs = probe.processedMessages.length > 0 ? probe.processedMessages : probe.originalMessages;
             const probeTextSize = estimateCoreMessages(probeMsgs) + overheadEstimate;
-            // #6865: never let the #5974 probe demote an active overflow-arm
-            // baseline — the arm is the evidence floor that keeps an armed
-            // session folding instead of trusting optimistic local estimates
-            // (same doctrine as the #5880 fix and relay.ts #2484
-            // armFailureShrink). Without this, the probe rewrites the armed
-            // tag to "estimate" before the #5880 guard reads it, re-opening
-            // the #5880 400-livelock on a different code path.
-            if (probeTextSize > session.stats.lastInputTokens
-                && session.stats.lastInputTokensSource !== "overflow-arm") {
-                session.stats.lastInputTokens = probeTextSize;
-                session.stats.lastInputTokensSource = "estimate";
-            }
+            // #6865: the probe's baseline write is guarded by applyProbeBaselineAnchor
+            // (session.ts) so it never demotes an active overflow-arm tag.
+            applyProbeBaselineAnchor(session, probeTextSize);
             const correctiveMeter = wireMeter ? responsesPreflightMeter(probe, limit) : undefined;
             const probeCalibrated = Math.max(
                 applyEstimateCalibration(probeTextSize, kFactor, kOrigin, currentOrigin) + imageTokens,

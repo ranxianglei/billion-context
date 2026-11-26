@@ -1280,6 +1280,23 @@ export function setPostRebuildAnchor(session: Session, tokens: number): void {
     markDirty(session);
 }
 
+// #5974 probe baseline write, hardened by the #5880 doctrine: the #5974
+// corrective-pass probe measures the fresh rebuild and writes a local estimate
+// onto the session baseline. An upstream-proven overflow-arm tag must NEVER be
+// demoted to estimate-grade by that probe — demoting drops the evidence floor
+// that keeps an armed session folding instead of trusting optimistic estimates,
+// re-opening the #5880 fold → forward → 400 livelock on the probe path (same
+// doctrine as armFailureShrink, relay.ts #2484). Unarmed and usage-grade
+// behavior is unchanged: a larger local measurement still anchors the baseline
+// (#1987), and a newer larger estimate still retires an older usage sample.
+export function applyProbeBaselineAnchor(session: Session, probeTextSize: number): void {
+    if (session.stats.lastInputTokensSource === "overflow-arm") return;
+    if (probeTextSize > session.stats.lastInputTokens) {
+        session.stats.lastInputTokens = probeTextSize;
+        session.stats.lastInputTokensSource = "estimate";
+    }
+}
+
 /** Metadata is persisted user-editable JSON — re-validate on read; a corrupt
  *  stamp degrades to "no anchor" (legacy sizing) instead of poisoning the meter. */
 export function postRebuildAnchorTokens(session: Session | undefined): number {
