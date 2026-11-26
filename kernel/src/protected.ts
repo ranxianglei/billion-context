@@ -139,6 +139,9 @@ export function collectAgedCompressCallIds(
  *  - `decompress`: large restored content as an inline tool result.
  *  - `search_context`: large result lists (10 ranked hits with previews).
  *  - `read`: file/image contents — the largest common source of context bloat.
+ *  - `read_file`: same as `read` but the name Hermes (and some other hosts)
+ *    use; without it a ~10 KB file read eats half the 5000-token recent-zone
+ *    budget and pins the zone back over older ranges forever (#7726).
  *  - `bash`: command output (build/test/logs) — frequently large and spent.
  *
  *  Note: this only affects the recent-zone computation. Such messages remain
@@ -147,6 +150,7 @@ export const NEVER_PRESERVE_RECENT_TOOLS = [
   "decompress",
   "search_context",
   "read",
+  "read_file",
   "bash",
 ] as const;
 
