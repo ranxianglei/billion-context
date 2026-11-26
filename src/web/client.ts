@@ -3878,12 +3878,63 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         d.blockDetails.forEach((b) => { L.push(""); L.push(buildBlockMd(b)); });
         return L.join("\\n");
     }
-    // #3057 report export: MD/SVG render server-side (/__bili/session-report); the browser downloads MD and rasterizes the closed-vector SVG to PNG.
-    function downloadUrl(url, name) {
-        var a = document.createElement("a");
-        a.href = url; a.download = name;
-        document.body.appendChild(a); a.click(); a.remove();
-        setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    // #7233: every web-panel export goes through this one saver. It prefers the
+    // File System Access API (Chromium on loopback is a secure context, so
+    // showSaveFilePicker is available) so the file lands where the user picks
+    // it; when the API is absent (Firefox/Safari, or a remote panel that is not
+    // a secure context) or the user closes the picker, it falls back to the
+    // plain blob download — byte-identical to the previous behavior.
+    async function saveBlob(blob, name) {
+        if (typeof window.showSaveFilePicker === "function") {
+            const opts = { suggestedName: name };
+            const dot = name.lastIndexOf(".");
+            if (dot > 0) {
+                const ext = "." + name.slice(dot + 1);
+                opts.types = [{ description: "File", accept: { [blob.type || "application/octet-stream"]: [ext] } }];
+            }
+            try {
+                const handle = await window.showSaveFilePicker(opts);
+                const writable = await handle.createWritable();
+                await writable.write(blob);
+                await writable.close();
+                return;
+            } catch (e) {
+                if (e && e.name === "AbortError") return; // user closed the picker - no download
+                // any other error (e.g. NotAllowedError after a fetch consumed the
+                // click's transient activation) falls through to the plain download
+            }
+        }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+    }
+    // #7233: session-scoped exports are named by title (what users search by) +
+    // an id prefix, not the bare UUID. The full id is dropped because the title
+    // + 8-hex prefix is what a human greps for; the picker treats it as a
+    // suggestion and the browser de-duplicates collisions on the fallback path.
+    // The slug is sanitized char-by-char (backslash-free) so it survives the
+    // WEB_CLIENT template-literal escaping: filesystem-unsafe and control chars
+    // become spaces, everything else (incl. non-ASCII titles) is kept.
+    function exportName(prefix, d) {
+        const id8 = String(d.id).slice(0, 8);
+        let slug = "";
+        if (d.title) {
+            for (const ch of String(d.title)) {
+                const code = ch.codePointAt(0);
+                const unsafe = (code === 92 || code === 47 || code === 58 || code === 42
+                    || code === 63 || code === 34 || code === 60 || code === 62 || code === 124
+                    || code < 32 || code === 127);
+                slug += unsafe ? " " : ch;
+            }
+            slug = slug.replace(/ +/g, " ").trim();
+            if (slug.length > 40) slug = slug.slice(0, 39).trimEnd() + "…";
+        }
+        return "billion-context-" + prefix + (slug ? "-" + slug : "") + "-" + id8 + ".md";
     }
     function svgToPngBlob(svgStr, w, h) {
         return new Promise(function (resolve, reject) {
@@ -3918,7 +3969,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             try {
                 var r = await json(API_ROOT + "/session-report?format=md&" + q);
                 if (!r || typeof r.md !== "string") throw new Error("no report");
-                downloadUrl(URL.createObjectURL(new Blob([r.md], { type: "text/markdown;charset=utf-8" })), base + ".md");
+                await saveBlob(new Blob([r.md], { type: "text/markdown;charset=utf-8" }), base + ".md");
             } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(mdBtn, false); }
         });
         if (pngBtn) pngBtn.addEventListener("click", async function () {
@@ -3927,7 +3978,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 var r = await json(API_ROOT + "/session-report?format=svg&" + q);
                 if (!r || !r.svg) throw new Error("no report");
                 var blob = await svgToPngBlob(r.svg, r.w || 920, r.h || 800);
-                downloadUrl(URL.createObjectURL(blob), base + ".png");
+                await saveBlob(blob, base + ".png");
             } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(pngBtn, false); }
         });
     }
@@ -3937,14 +3988,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (cp) cp.addEventListener("click", () => copyText(buildBlocksMd(d), cp));
         const dl = $("blocks-dl");
         if (dl) dl.addEventListener("click", () => {
-            const url = URL.createObjectURL(new Blob([buildBlocksMd(d)], { type: "text/markdown;charset=utf-8" }));
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = "billion-context-blocks-" + String(d.id).replace(/[^A-Za-z0-9._-]/g, "_") + ".md";
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 4000);
+            saveBlob(new Blob([buildBlocksMd(d)], { type: "text/markdown;charset=utf-8" }), exportName("blocks", d));
         });
         // Per-block copy buttons live inside <summary>, so stop propagation/toggle.
         document.querySelectorAll(".blk-copy").forEach((btn) => {
@@ -4295,12 +4339,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             busy(dlB, true);
             try {
                 const md = await grab();
-                const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(blob);
-                a.download = "billion-context-cacherpt-" + String(d.id).replace(/[^A-Za-z0-9._-]/g, "_") + ".md";
-                document.body.appendChild(a); a.click(); a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+                await saveBlob(new Blob([md], { type: "text/markdown;charset=utf-8" }), exportName("cacherpt", d));
             } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(dlB, false); }
         });
     }
@@ -4379,14 +4418,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") hideQTip(); });
         window.addEventListener("hashchange", hideQTip);
         if (dlBtn) dlBtn.addEventListener("click", () => {
-            const url = URL.createObjectURL(new Blob([md], { type: "text/markdown;charset=utf-8" }));
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = "billion-context-handoff-" + String(d.id).replace(/[^A-Za-z0-9._-]/g, "_") + ".md";
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 4000);
+            saveBlob(new Blob([md], { type: "text/markdown;charset=utf-8" }), exportName("handoff", d));
         });
     }
 
@@ -5855,13 +5887,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                     const unreadable = response.headers.get("x-bili-log-incomplete");
                     if (unreadable) toast(t("logs.incomplete", { n: unreadable }), "err");
                     const blob = await response.blob();
-                    const a = document.createElement("a");
-                    a.href = URL.createObjectURL(blob);
-                    a.download = all ? "billion-context-full-log.txt" : "billion-context-log.txt";
-                    document.body.appendChild(a);
-                    a.click();
-                    a.remove();
-                    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+                    await saveBlob(blob, all ? "billion-context-full-log.txt" : "billion-context-log.txt");
                 } catch (e) {
                     toast(t("toast.failed", { msg: e.message }), "err");
                 } finally {
