@@ -53,6 +53,8 @@ interface UpdateStateSnapshotData {
         version?: string;
         until?: number;
         tempBuild: boolean;
+        /** #7806: git-ref provenance, present only for `bili install` pins. */
+        source?: { kind: "git"; ref: string; sha: string };
     };
 }
 
@@ -167,6 +169,10 @@ export async function updateStateSnapshot(runningVersion: string): Promise<Updat
             active: pin.kind === "active",
             ...(pin.kind !== "none" ? { version: pin.pin.version, ...(pin.pin.until !== undefined ? { until: pin.pin.until } : {}) } : {}),
             tempBuild: isPrereleaseVersion(installed),
+            // #7806: git-ref provenance (present only for `bili install` pins)
+            // so the panel can say WHAT dev build is installed, not just that
+            // it is held.
+            ...(pin.kind !== "none" && pin.pin.source !== undefined ? { source: pin.pin.source } : {}),
         },
     };
 }

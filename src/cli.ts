@@ -42,6 +42,7 @@ import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
 import { checkForUpdate, forceInstallVersion, findInstallDir, readDiskVersion, startAutoUpdate } from "./update.js";
 import { clearPin, formatPinUntil, parsePinDuration, resolvePinState, writePin } from "./update-pin.js";
+import { DEFAULT_INSTALL_PIN_DURATION, installFromRef, installStatus, resolveInstallRef } from "./install-ref.js";
 import { registerUpdateActions } from "./server/update-actions.js";
 import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion, advisoryAwaitingFirstCheck } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
@@ -142,6 +143,11 @@ Usage:
                                    1h/12h/1d/7d/forever (default forever); no arg =
                                    show pin status
   bili unpin                       release the pin now (same as: bili pin --clear)
+  bili install [ref] [duration]    install from a git ref (branch/tag/PR number/PR
+                                   URL, e.g. bili install 7738), built from source;
+                                   auto-pins the result (default ${DEFAULT_INSTALL_PIN_DURATION}) so
+                                   auto-upgrade stays check-only — bili install
+                                   status shows what is installed from where
   bili doctor                      audit every install lane: versions, owners,
                                     freshness vs registry, running proxy processes
                                     (read-only; --json for machine-readable output);
@@ -233,7 +239,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "pin" | "unpin" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "pack";
+    command: "start" | "update" | "pin" | "unpin" | "install" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "pack";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -241,6 +247,9 @@ type Parsed = {
     updateVersion?: string;
     pinDuration?: string;
     pinClear?: boolean;
+    installRef?: string;
+    installDuration?: string;
+    installStatusCmd?: boolean;
     exportSelector?: string;
     exportOutput?: string;
     exportFull?: boolean;
@@ -313,6 +322,9 @@ export function parseArgs(argv: string[]): Parsed {
     let updateVersion: string | undefined;
     let pinDuration: string | undefined;
     let pinClear = false;
+    let installRef: string | undefined;
+    let installDuration: string | undefined;
+    let installStatusCmd = false;
     let doctorFix = false;
 
     for (let i = 0; i < argv.length; i++) {
@@ -551,6 +563,15 @@ export function parseArgs(argv: string[]): Parsed {
         } else if (cmd === "pin" || cmd === "unpin") {
             command = cmd;
             if (cmd === "pin") pinDuration = positional[1];
+        } else if (cmd === "install") {
+            command = "install";
+            const first = positional[1]?.trim();
+            if (first === "status") {
+                installStatusCmd = true;
+            } else if (first !== undefined) {
+                installRef = first;
+                installDuration = positional[2];
+            }
         } else if (cmd === "doctor") {
             command = "doctor";
         } else if (cmd === "export") {
@@ -680,11 +701,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, updateVersion, pinDuration, pinClear, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
+    return { command, client, clientArgs, mitmDomains, overrides, updateVersion, pinDuration, pinClear, installRef, installDuration, installStatusCmd, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, updateVersion, pinDuration, pinClear, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, updateVersion, pinDuration, pinClear, installRef, installDuration, installStatusCmd, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
     // -c/--config fail-fast: a bare NAME that resolves to a missing
     // <configDir>/NAME.json names the typo + the available siblings instead of
     // silently starting on an empty config (see paths.ts for path behavior).
@@ -977,6 +998,37 @@ export async function main(): Promise<void> {
         const until = parsed.ms !== undefined ? now + parsed.ms : undefined;
         await writePin({ v: 1, version, setAt: now, ...(until !== undefined ? { until } : {}) });
         console.log(`Pinned ${version} — ${formatPinUntil({ until })}. Auto-upgrade keeps checking but will not install; release with: bili unpin`);
+        return;
+    }
+    if (command === "install") {
+        // #7806: source-build install from a git ref (branch/tag/PR number/
+        // PR URL) — the lane for code that was never published, where
+        // `bili update [version]` (#6804) cannot reach. Auto-pins the result
+        // (default 30d) so auto-upgrade stays check-only; explicit `bili
+        // update` / `unpin` still break through. Never kills running
+        // processes; the new build takes effect on restart.
+        if (installStatusCmd) {
+            const st = await installStatus();
+            console.log(st.line);
+            return;
+        }
+        if (!installRef) {
+            console.error(`bili install: a ref is required — branch, tag, PR number or PR URL (e.g. bili install 7738), or: bili install status`);
+            process.exit(2);
+        }
+        try {
+            const r = await installFromRef(installRef, {
+                pinDurationText: installDuration,
+                log: (line) => console.error(`  ${line}`),
+            });
+            const what = r.spec.kind === "pr" ? `PR ${r.spec.ref.split("/")[1]}` : r.spec.ref;
+            console.log(`installed ${r.version} from ${what} (${r.sha.slice(0, 8)}) → ${r.installDir}`);
+            console.log(`pinned ${r.pinDescription} — auto-upgrade keeps checking but will not install; \`bili unpin\` (or an explicit \`bili update\`) resumes moving.`);
+            console.log("Restart bili and any running sessions to run the new build.");
+        } catch (error) {
+            console.error(`bili install: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
         return;
     }
     if (command === "test") {

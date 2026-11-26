@@ -144,6 +144,23 @@ test("parseArgs: update takes an exact version; pin/unpin take a duration (#6804
     assert.equal(pinClear.pinClear, true);
 });
 
+test("parseArgs: install takes <ref> [duration]; install status = show state (#7806)", () => {
+    const bare = parseArgs(["install"]);
+    assert.equal(bare.command, "install");
+    assert.equal(bare.installRef, undefined, "no ref = usage error at the handler");
+    const pr = parseArgs(["install", "7738"]);
+    assert.equal(pr.command, "install");
+    assert.equal(pr.installRef, "7738");
+    assert.equal(pr.installDuration, undefined);
+    const prDur = parseArgs(["install", "master", "7d"]);
+    assert.equal(prDur.installRef, "master");
+    assert.equal(prDur.installDuration, "7d");
+    const st = parseArgs(["install", "status"]);
+    assert.equal(st.command, "install");
+    assert.equal(st.installStatusCmd, true);
+    assert.equal(st.installRef, undefined);
+});
+
 test("parseArgs: --clear outside pin/unpin exits 2 (#6804)", () => {
     const origExit = process.exit;
     const origError = console.error;

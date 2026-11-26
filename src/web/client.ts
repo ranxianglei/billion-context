@@ -1057,6 +1057,9 @@ function changelogCatOf(rawLine) {
                 txt = t("up.pin_none");
             }
             if (p.tempBuild) txt += " " + t("up.pin_tempbuild");
+            // #7806: dev-install provenance (bili install <ref> pins carry the
+            // git ref + sha) — say WHAT is installed, not just that it is held.
+            if (p.source && p.source.kind === "git") txt += " " + t("up.pin_git", { ref: String(p.source.ref), sha: String(p.source.sha).slice(0, 8) });
             pstate.textContent = txt;
         }
         const pdur = $("up-pin-duration");
