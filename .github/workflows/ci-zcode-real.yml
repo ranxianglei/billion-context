@@ -54,16 +54,6 @@ env:
   ZCODE_VERSION: ${{ github.event.inputs.zcode_version || '3.14.4' }}
   ZCODE_SHA256: 4b4631987172fd975aa1f85fa0dc1f55ac1c756b26bd8ab18d68592ed9391182
 
-# #7785: a `labeled` arm may only fire for the CI labels themselves —
-# ci:full widens the matrix, ci:force re-arms CI on a PR past the 72h stale
-# gate. Any other label must not create a run at all: previously every label
-# burned one gate/plan job per workflow before being skipped inside it.
-if: |
-  github.event_name != 'pull_request' ||
-  github.event.action != 'labeled' ||
-  github.event.label.name == 'ci:full' ||
-  github.event.label.name == 'ci:force'
-
 jobs:
   # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
   # or on the 30-min cron when master moved since the last green scheduled run.

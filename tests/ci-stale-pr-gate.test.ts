@@ -1,13 +1,18 @@
 // #7785 — stale-PR CI gate + label-trigger discipline.
 //
 // Two regressions this locks down:
-//  (a) every `labeled` event (ANY label) used to create a run in all 14
-//      pull_request workflows — each paying one gate/plan job on a runner
-//      before being skipped inside it. The fix is a workflow-level `if:`
-//      that lets only the CI labels (ci:full / ci:force) create a run.
-//  (b) pushes to PRs older than 72h kept paying the full core matrix. The
+//  (a) pushes to PRs older than 72h kept paying the full core matrix. The
 //      ci.yml plan job now computes STALE from PR_CREATED_AT and skips the
 //      matrix unless ci:force (or ci:full / release heuristics) outranks it.
+//  (b) 2026-11-26 incident: an attempt to filter the `labeled` arm at the
+//      TRIGGER level (workflow-level top-level `if:`) shipped a file that
+//      GitHub's schema rejects — every workflow run on that commit died in
+//      seconds with zero jobs and the PR's pull_request events created no
+//      runs at all. Top-level `if:` is NOT a supported workflow key (only
+//      job/step/matrix levels are), so this test guards that it never comes
+//      back. Non-CI labels still create a run, but the first job of each
+//      workflow skips it after ~10s (the in-job labeled gate is the only
+//      supported filtering point).
 //
 // Part 1 is a static guard over the workflow files (always runs).
 // Part 2 extracts the ci.yml plan bash script and executes it with env
@@ -16,53 +21,26 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-const wf = (name: string): string =>
-    readFileSync(path.resolve(import.meta.dirname, "../.github/workflows", name), "utf8");
+const WF_DIR = path.resolve(import.meta.dirname, "../.github/workflows");
+const wf = (name: string): string => readFileSync(path.join(WF_DIR, name), "utf8");
 
-// All workflows whose pull_request trigger carries a `labeled` arm (the
-// guard set for (a)). Keep in sync with .github/workflows/*.yml.
-const LABELED_WORKFLOWS = [
-    "ci.yml",
-    "ci-e2e.yml",
-    "ci-e2e-codex-persona.yml",
-    "ci-e2e-dsh.yml",
-    "ci-e2e-dsh-native.yml",
-    "ci-e2e-fake.yml",
-    "ci-e2e-native.yml",
-    "ci-e2e-native-opencode.yml",
-    "ci-e2e-pi-ws.yml",
-    "ci-image.yml",
-    "ci-registry.yml",
-    "ci-theorem.yml",
-    "ci-windows-codex.yml",
-    "ci-zcode-real.yml",
-    "announcements-lint.yml",
-];
-
-for (const name of LABELED_WORKFLOWS) {
-    test(`${name}: labeled arm is filtered at the trigger level`, () => {
-        const text = wf(name);
-        // The guard lives at the WORKFLOW level (top-level `if:`), i.e. in
-        // the document outside any job — check it appears before `jobs:`.
-        const head = text.split("\njobs:")[0];
+test("no workflow file carries an unsupported top-level `if:` (#7785 regression)", () => {
+    const files = readdirSync(WF_DIR).filter((f) => f.endsWith(".yml"));
+    assert.ok(files.length >= 15, `expected >= 15 workflow files, saw ${files.length}`);
+    for (const f of files) {
+        // A top-level `if:` is a column-0 key followed by a block scalar or a
+        // plain expression — the 2026-11-26 incident shape. Job-level `if:`
+        // is always indented, so a column-0 match is unambiguous.
         assert.ok(
-            head.includes("github.event.action != 'labeled'"),
-            `${name}: missing workflow-level labeled filter`,
+            !/^if:\s*(\||.*)$/m.test(wf(f)),
+            `${f}: top-level 'if:' is not a valid GitHub Actions workflow key — it makes every run on the file die with zero jobs`,
         );
-        assert.ok(
-            head.includes("github.event.label.name == 'ci:full'"),
-            `${name}: labeled filter must allow ci:full`,
-        );
-        assert.ok(
-            head.includes("github.event.label.name == 'ci:force'"),
-            `${name}: labeled filter must allow ci:force (stale-PR re-arm)`,
-        );
-    });
-}
+    }
+});
 
 test("ci.yml: plan job carries the 72h stale gate", () => {
     const text = wf("ci.yml");
