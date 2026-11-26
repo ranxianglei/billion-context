@@ -2530,7 +2530,7 @@ type FileConfig = {
      *  fork API — beyond the cap the session stops being forkable (409)
      *  instead of retaining an unbounded raw copy. Default 100 MiB; `0`
      *  disables retention entirely; env BILI_PUBLIC_SNAPSHOT_CAP_BYTES wins. */
-    plugin?: { snapshotCapBytes?: number };
+    plugin?: { snapshotCapBytes?: number; maxToolCallIdLength?: number };
     /** Updater knobs (#2030) — was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS.
      *  `staggerMinDelayMs`/`staggerMaxDelayMs` override the LOCAL base window of
      *  the #3619 staggered rollout (remote policy `default`/overrides still stack

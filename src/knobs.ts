@@ -657,6 +657,12 @@ export function publicSnapshotCapBytes(): number {
     return Number.isFinite(v) && v >= 0 ? v : 104_857_600;
 }
 
+/** Plugin tool endpoint only (#7380); not the routing witness ring. */
+export function pluginMaxToolCallIdLength(): number {
+    const v = loadConfigFile().plugin?.maxToolCallIdLength;
+    return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 4096;
+}
+
 /** BILI_CCR_RETRIEVAL_TTL_MS > ccrRetrievalTtlMs > 600000. */
 export function ccrRetrievalTtlMs(): number {
     const envRaw = process.env.BILI_CCR_RETRIEVAL_TTL_MS;

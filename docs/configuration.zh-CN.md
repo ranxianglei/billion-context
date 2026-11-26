@@ -234,6 +234,7 @@
 | `storage.jsonWriter` | on\|off | unset (off for the pure-sqlite selection — absent/unified=sqlite — and on for explicit full) | BILI_STORAGE_JSON_WRITER | Phase 3 信封开关（#2960）—— 本次发布翻转缺省：UNSET（未设置）现在对纯 SQLite 选择（storage.unified 未设置或 "sqlite"）缺省为 OFF —— SQLite 索引成为唯一持久副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。显式 full 保留 #3818 的历史双写缺省（除非本键另说，信封照写）。有效 full 模式下任一层的显式 on/off 总是生效：shadow/legacy（或加密激活）下请求的 off 会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层（"off"/"on"）。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。恢复双写：设 storage.jsonWriter=on（或 BILI_STORAGE_JSON_WRITER=1）—— 纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 CCR content-store 边车也不再写 —— full 模式下读取时先查索引里的 ccr 镜像，镜像才是持久副本。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。 |
 | `storage.walJournalSizeLimitBytes` | number | 0 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | index.db-wal 的 WAL 回收上限（#3250），单位字节。0（默认，#7674）= 不限制 —— 引擎不在 checkpoint 后截断 WAL 文件；文件停留在历史高水位（现场 ~55 MiB 稳定），帧仍会在每次周期/收尾 checkpoint（PASSIVE —— 重放尾为零）收敛进 index.db。opencode 就是这么跑的（13 个并发写者、9.55 GB 库、零损坏）。#7674 之前的 8 MiB 默认让引擎在每次完成的 checkpoint 后内部截断 WAL —— 一条 JS 护栏都盖不住的隐式地板回收，把 WAL 从共享会话目录的活 peer 连接脚下抽走（#2671：5 个 daemon、kill-9 换代）—— 正是 #7156 的损伤形。正数 N：每次完成的 checkpoint 把 WAL 截回 N。不是每会话数据配额 —— 数据写入时就已落进 index.db。环境变量层（正整数）优先于配置文件层；env 值非法或非正数时静默落到文件/默认层，boot 不崩。lane 启动、store open 时生效 —— 热改动需重启。 |
 | `storage.archiveAfterDays` | integer | 365 | BILI_STORAGE_ARCHIVE_AFTER_DAYS | GC 年龄清扫窗口（天，#3463/#3901）：闲置超过该时长的会话被归档 —— 以单行 JSON 追加到单一归档日志（会话目录下的 archive/archive.jsonl——不撒每会话小文件），墓碑行保留标签与身份，释放内容/媒体引用，一条 POST 即可恢复。0 关闭年龄清扫；POST /__bili/storage/gc 始终可用并支持 ?vacuum=full 收缩存量 index.db（新写入始终 auto_vacuum=INCREMENTAL）。同一套操作另有 CLI 层（#3928）：bili storage gc [--days N] [--vacuum full\|incremental] [--dry-run]，以及 bili sessions ls/rm/archive/restore <id>（README「存储维护 CLI」一节）。环境变量优先于配置文件层。 |
+| `plugin.maxToolCallIdLength` | number | 4096 | — | 插件接受的toolCallId 最大长度，默认4096 |
 
 **更新与公告**
 
@@ -1063,8 +1064,8 @@
 
 ### `plugin`
 
-- **类型：** `{ snapshotCapBytes?: number }`
-- **默认：** `{ snapshotCapBytes: 104857600 }`
+- **类型：** `{ snapshotCapBytes?: number, maxToolCallIdLength?: number }`
+- **默认：** `{ snapshotCapBytes: 104857600, maxToolCallIdLength: 4096 }`
 - **状态：** ACTIVE
 - **说明：** 插件面开关（#2017）。`snapshotCapBytes` 限制为公开 fork API（`GET /__bili/plugin/snapshot`、`POST /__bili/plugin/fork`）按插件会话保留的原始 wire 历史快照大小：序列化快照超限时 bili 拒绝留存 —— 该会话不再可 fork（snapshot/fork 返回 `409` 并注明原因），而不是在磁盘上无限保留全量原始副本。默认 `100 MiB`；`0` 完全停用留存；对应环境变量 `BILI_PUBLIC_SNAPSHOT_CAP_BYTES`。详见[环境变量表](#环境变量的配置键对照-2030)。
 

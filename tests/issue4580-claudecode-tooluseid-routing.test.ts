@@ -15,9 +15,16 @@
 //   3. shim     — mcp.ts forwards _meta["claudecode/toolUseId"] as body
 //      toolCallId without touching any routing channel or the global
 //      binding.
-import { beforeEach, describe, test } from "node:test";
+import { after, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { Session } from "../src/session.ts";
+
+const configRoot = mkdtempSync(path.join(tmpdir(), "bili-tooluseid-routing-"));
+process.env.BILI_CONFIG_FILE = path.join(configRoot, "config.json");
+after(() => rmSync(configRoot, { recursive: true, force: true }));
 
 const { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, _resetPluginStateForTest, handlePluginTool } = await import("../src/plugin.ts");
 const { recordToolUseId, lookupToolUseIdSession, resetToolRingForTest, _setToolRingClockForTest } = await import("../src/tool-ring.ts");
@@ -278,7 +285,7 @@ describe("#4580 routing: host-stamped toolCallId routes to the witnessing lane",
         const r1 = await post({ conversationId: "x", tool: "acp_status", args: {}, toolCallId: "" });
         assert.equal(r1.status, 400);
         assert.equal(r1.json.code, "INVALID_REQUEST");
-        const r2 = await post({ conversationId: "x", tool: "acp_status", args: {}, toolCallId: "y".repeat(513) });
+        const r2 = await post({ conversationId: "x", tool: "acp_status", args: {}, toolCallId: "y".repeat(4097) });
         assert.equal(r2.status, 400);
         assert.equal(r2.json.code, "INVALID_REQUEST");
     });

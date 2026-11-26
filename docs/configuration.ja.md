@@ -231,6 +231,7 @@
 | `storage.jsonWriter` | on\|off | unset (off for the pure-sqlite selection — absent/unified=sqlite — and on for explicit full) | BILI_STORAGE_JSON_WRITER | フェーズ 3 エンベロープスイッチ (#2960) — 今回のリリースでデフォルト反転: 未設定 (UNSET) はピュア SQLite 選択 (storage.unified 未設定または "sqlite") ではデフォルト OFF — SQLite インデックスが唯一の永続コピーとなる (読み取りはすでに統合優先; 起動時にインデックスの和集合を列挙するため、インデックスのみのセッションは正常にロードされる)。明示的な full は #3818 由来のダブルライトデフォルトを維持 (このキーが指定しない限りエンベロープは書き込まれ続ける)。有効な full モードではいずれの階層でも明示的な on/off が常に優先: shadow/legacy (または暗号化が有効な場合) で要求された off は、JSON ファイルが唯一の真実のソースであるため 1 回限りの警告付きで無視される。環境変数階層 0/false/off = off、1/true/on = on が厳密なファイル表記 ("off"/"on") より優先される。フェイルセーフ: サイドカーが実行中に自身を無効化した場合、次のセーブでエンベロープ書き込みが再開される。ダブルライトの復元: storage.jsonWriter=on (または BILI_STORAGE_JSON_WRITER=1) — インデックスのみのセッションは起動和集合経由で引き続きロードされ、レプリカ/リストアはポータブルな JSON エンベロープを再物質化する。バイナリのダウングレード (または SQLite エンジンの喪失) は、>=v0.1.197 バイナリが再び実行されるまで、インデックスのみのセッションを v0.1.196 以前のバージョンから不可視にする - データは index.db に無傷のまま残るが、古いコードによって読み取られないだけである。セッションごとの CCR コンテンツストアサイドカーも書き込みが停止する - full モードでは、すべての読み取りで最初にインデックスの ccr ミラーが参照されるため、ミラーが永続コピーとなる。jsonWriter=off レーンは、そのセッションディレクトリの唯一のライターでなければならない: off レーンは統合優先で読み取り、決してファイルにフォールバックしないため、同じディレクトリに対して legacy/shadow で実行されるピアインスタンスは静かに分岐する (その JSON コピーは更新を受け取らなくなり、off レーンはピアの書き込みを決して見ない)。 |
 | `storage.walJournalSizeLimitBytes` | number | 0 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | index.db-wal の WAL 回収上限 (#3250)、バイト単位。0 (デフォルト、#7674) = 無制限 — エンジンはチェックポイント後に WAL ファイルを切り詰めない。ファイルは過去の高水位 (現場: 安定して ~55 MiB) に留まり、フレームは毎回定期/終了時のチェックポイント (PASSIVE — リプレイテールゼロ) で index.db に収斂する。opencode がこの運用 (13 並行ライター、9.55 GB db、破損ゼロ)。#7674 前の 8 MiB デフォルトはすべての完了したチェックポイント後にエンジンが WAL を内部で切り詰める暗黙の床回収を生んでいた — JS 側のガードがどこからもカバーせず、共有セッションディレクトリの生きたピア接続 (#2671: 5 daemon、kill-9 交代) の真下から WAL を引き抜く — #7156 の損傷形。正数 N: 完了したチェックポイントごとに WAL を N に切り詰め。セッションごとのデータクォータではない - データは書き込まれた時点で index.db に着地。環境変数階層 (正の整数) がファイル階層より優先される; ゴミまたは非正の環境変数値はファイル/デフォルト階層にフォールスルーし起動は失敗しない。レーン起動時のストアオープン時点で適用 - ホット編集には再起動が必要。 |
 | `storage.archiveAfterDays` | integer | 365 | BILI_STORAGE_ARCHIVE_AFTER_DAYS | 日単位の GC 年齢スイープウィンドウ (#3463, #3901): これより長くアイドル状態のセッションはアーカイブされる - 単一のアーカイブログ (セッションディレクトリ配下の archive/archive.jsonl — セッションごとのファイルスプレーなし) に 1 行の JSON が追記され、トombストーン行がラベルとアイデンティティを保持し、コンテンツ/メディア参照が解放され、リストアは 1 つの POST のみで可能。0 は年齢スイープを無効にする; POST /__bili/storage/gc は常に実行され、既存の index.db を縮小するには ?vacuum=full を取る (新規書き込みには常に auto_vacuum=INCREMENTAL が有効)。同じ操作に CLI レイヤーがある (#3928): bili storage gc [--days N] [--vacuum full\|incremental] [--dry-run]、および bili sessions ls/rm/archive/restore <id> (README の 'Storage maintenance CLI' セクション)。環境変数がファイル階層より優先される。 |
+| `plugin.maxToolCallIdLength` | number | 4096 | — | プラグインが受け付ける toolCallId の最大長（既定値: 4096）。 |
 
 **更新 & アドバイズリー**
 
@@ -1068,8 +1069,8 @@
 
 ### `plugin`
 
-- **Type:** `{ snapshotCapBytes?: number }`
-- **Default:** `{ snapshotCapBytes: 104857600 }`
+- **Type:** `{ snapshotCapBytes?: number, maxToolCallIdLength?: number }`
+- **Default:** `{ snapshotCapBytes: 104857600, maxToolCallIdLength: 4096 }`
 - **Status:** ACTIVE
 - **Description:** プラグインサーフェスのノブ（#2017）。`snapshotCapBytes` は、パブリックフォーク API（`GET /__bili/plugin/snapshot`, `POST /__bili/plugin/fork`）のためにプラグインセッションごとに保持される生ワイヤー履歴スナップショットの上限を定める：シリアライズされたスナップショットが上限を超えると、bili はそれを保持することを拒否する — ディスク上に無制限の生コピーを保持する代わりに、セッションはフォーク可能でなくなる（snapshot/fork が上限理由とともに `409` を返す）。デフォルトは `100 MiB`；`0` で保持を完全に無効化（どのセッションもフォーク不可）；対応する環境変数 `BILI_PUBLIC_SNAPSHOT_CAP_BYTES`。詳細は [env table](#config-file-keys-for-environment-knobs-2030) を参照。
 

@@ -81,14 +81,28 @@ function appendPair(history: ResponseInputItem[], id: string, args: unknown, res
 
 const args = { content: [{ startId: "m00002", endId: "m00007", topic: "identity", summary: "The earlier fixture messages establish the completed setup. Preserve the retained tail and use the original block when full detail is needed." }] };
 
-test("native plugin compress stores the host call identity, not an unrelated synthetic identity", async () => {
+test("native plugin compress keeps a 522-character host call identity and matches the resent carrier", async () => {
     const h = await harness();
     try {
+        const toolCallId = `call_${"a".repeat(32)}|${"B".repeat(482)}==`;
+        assert.equal(toolCallId.length, 522);
         await h.post();
-        const out = await h.tool({ toolCallId: "call_host_success", args });
+        const out = await h.tool({ toolCallId, args });
         assert.equal(out.status, 200);
-        assert.ok(h.session().state.blocks.some(b => b.active), out.data.result);
-        assert.equal(h.session().state.blocks.at(-1)?.compressCallId, "call_host_success");
+        assert.ok(out.data.result);
+        const block = h.session().state.blocks.at(-1);
+        assert.ok(block?.active, out.data.result);
+        assert.equal(block.compressCallId, toolCallId);
+        const blockId = block.blockId;
+
+        appendPair(h.history, toolCallId, args, out.data.result);
+        const forwarded = await h.post();
+        assert.ok(forwarded.some(item => item.type === "function_call" && item.call_id === toolCallId));
+        assert.ok(forwarded.some(item => item.type === "function_call_output" && item.call_id === toolCallId));
+        const active = h.session().state.blocks.filter(b => b.active);
+        assert.equal(active.length, 1);
+        assert.equal(active[0].blockId, blockId);
+        assert.equal(active[0].compressCallId, toolCallId);
     } finally { await h.close(); }
 });
 
@@ -153,13 +167,35 @@ test("missing host call identity keeps legacy compatibility; malformed identity 
     const h = await harness();
     try {
         await h.post();
-        for (const toolCallId of [null, 23, "", " ", "x".repeat(513)]) {
+        for (const toolCallId of [null, 23, "", " ", "x".repeat(4097)]) {
             const out = await h.tool({ toolCallId, args });
             assert.equal(out.status, 400, `invalid id ${String(toolCallId).slice(0, 15)}`);
             assert.equal(h.session().state.blocks.length, 0);
         }
+        const atLimit = await h.tool({ tool: "acp_status", toolCallId: "x".repeat(4096), args: {} });
+        assert.equal(atLimit.status, 200);
         const out = await h.tool({ args });
         assert.equal(out.status, 200);
         assert.match(h.session().state.blocks.at(-1)?.compressCallId ?? "", /^plugin_/);
     } finally { await h.close(); }
+});
+
+test("plugin.maxToolCallIdLength changes the inclusive tool call ID limit", async () => {
+    const h = await harness();
+    const configPath = path.join(home, "config.json");
+    try {
+        await h.post();
+        const toolCallId = "x".repeat(522);
+        fs.writeFileSync(configPath, JSON.stringify({ plugin: { maxToolCallIdLength: 521 } }));
+        const rejected = await h.tool({ toolCallId, args });
+        assert.equal(rejected.status, 400);
+        assert.equal(h.session().state.blocks.length, 0);
+
+        fs.writeFileSync(configPath, JSON.stringify({ plugin: { maxToolCallIdLength: 522 } }));
+        assert.equal((await h.tool({ toolCallId, args })).status, 200);
+        assert.equal(h.session().state.blocks.at(-1)?.compressCallId, toolCallId);
+    } finally {
+        fs.rmSync(configPath, { force: true });
+        await h.close();
+    }
 });

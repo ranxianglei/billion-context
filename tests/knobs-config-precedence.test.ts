@@ -69,6 +69,19 @@ test("#3128 limits: defaults 5/10/5 GiB, file tier, env precedence, garbage fall
     clearConfig();
 });
 
+test("plugin.maxToolCallIdLength falls back when missing or not a positive safe integer", () => {
+    clearConfig();
+    assert.equal(knobs.pluginMaxToolCallIdLength(), 4096);
+    try {
+        for (const maxToolCallIdLength of [0, -1, 522.5, Number.MAX_SAFE_INTEGER + 1, "522", null]) {
+            setConfig({ plugin: { maxToolCallIdLength } });
+            assert.equal(knobs.pluginMaxToolCallIdLength(), 4096);
+        }
+    } finally {
+        clearConfig();
+    }
+});
+
 test("defaults: no env, no file", () => {
     clearConfig();
     assert.equal(knobs.upstreamTimeoutMs(), UPSTREAM_TIMEOUT_MS);
