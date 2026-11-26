@@ -1,4 +1,4 @@
-import { clampPrefix } from "./truncate.js";
+import { clampPrefix, scrubLoneSurrogates } from "./truncate.js";
 import { isToolMessage } from "./message-kind.js";
 import { BLOCKED_REF, orderedRefPair, refForRaw } from "./refs.js";
 import { countMessageTokens } from "./tokenize.js";
@@ -14,7 +14,12 @@ import {
   collectAgedCompressCallIds,
   isCompressToolName,
 } from "./protected.js";
-import { computeProtectedRefs } from "./recommend.js";
+import {
+  computeProtectedRefs,
+  crossingOwnersBetween,
+  ownedHoles,
+  refNumber,
+} from "./recommend.js";
 import {
   buildProjectionShared,
   collectCoverage,
@@ -539,6 +544,17 @@ function renderUncompressedRanges(
   // ordering would mis-sort equal-size ranges.
   if (sort !== "time")
     merged.sort((a, b) => b.tokens - a.tokens || a.startIndex - b.startIndex);
+  // Honest span labels: rows derived from surface-replacing views can bridge
+  // folded territory (the covered ids left no array slot or gap flag). Name
+  // the hiding active blocks inline — display only, eligibility untouched.
+  const holes = ownedHoles(state);
+  const crossedFolded = (r: Merged): string | undefined => {
+    const [lo, hi] = orderedRefPair(r.startRef, r.endRef);
+    const loN = refNumber(lo);
+    const hiN = refNumber(hi);
+    if (loN === null || hiN === null) return undefined;
+    return crossingOwnersBetween(holes, loN, hiN)?.join(", ");
+  };
   // #3236: screen displayed rows through the SAME projection applySingleRange
   // executes so a row that would be rejected wholesale carries a ⚠ flag. The
   // diagnostic view flags rather than drops — it must keep showing what is
@@ -579,8 +595,19 @@ function renderUncompressedRanges(
           protectedMessageIds: protectedRefs,
           shared,
         });
-      } catch {
-        return "\u26a0 not foldable: refs unresolvable";
+      } catch (err) {
+        // A thrown resolution failure means the row's endpoints cannot be
+        // mapped onto the apply array class at all (stale/BLOCKED/surface-
+        // drift refs). Surface the underlying reason verbatim-ish: the flat
+        // "refs unresolvable" verdict sent agents down dead-end theories
+        // (they read it as ledger corruption when it was one bad endpoint).
+        const detail = scrubLoneSurrogates(
+          err instanceof Error ? err.message : String(err),
+        )
+          .replace(/[\r\n]+/g, " ")
+          .trim()
+          .slice(0, 120);
+        return `\u26a0 not foldable: projection failed${detail ? ` (${detail})` : ""}`;
       }
       if (proj.fatal?.kind === "zone")
         return "\u26a0 not foldable: protected zone only";
@@ -604,8 +631,9 @@ function renderUncompressedRanges(
           ? r.startRef
           : orderedRefPair(r.startRef, r.endRef).join("–");
       const flag = flagFor ? flagFor(r) : null;
+      const crossed = crossedFolded(r);
       lines.push(
-        `  ${range}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}${flag ? `  ${flag}` : ""}`,
+        `  ${range}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}${crossed ? ` · spans folded ${crossed}` : ""}${flag ? `  ${flag}` : ""}`,
       );
     }
     if (merged.length > limit) {
@@ -838,7 +866,9 @@ export function buildRecap(state: CompressionState, blockId?: string): string {
       return `Block ${blockId} not found. Active blocks: ${activeList}`;
     }
     if (!block.active) {
-      return `Block ${blockId} is inactive (deactivated by nested compression).`;
+      return block.supersedesBlockId
+        ? `Block ${blockId} is inactive (deactivated by nested compression, superseded by ${block.supersedesBlockId}).`
+        : `Block ${blockId} is inactive (deactivated by nested compression).`;
     }
     const range = `${block.effectiveMessageIds.length} messages`;
     return `[Compressed conversation section]\n${block.summary}\n\n[${blockId} | ${range} | topic: "${block.topic ?? "(none)"}"]`;
