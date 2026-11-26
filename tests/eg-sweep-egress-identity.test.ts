@@ -32,6 +32,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
 import { UnifiedStore, KV_VALUE_MAX_CHARS, KV_VALUE_WHITELIST } from "../src/storage/store.ts";
+import { EGRESS_IDENTITY_METADATA_KEYS, sanitizeEgressIdentityMetadata } from "../src/storage/egress-record.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
@@ -276,6 +277,38 @@ test("A4: the 256-char cap is eg-plane discipline — on with the flag, off with
     }
 });
 
+test("A5: the identity row's metadata_json is sanitized to identity keys — the runtime bag (handoffReply/handoffResponse chat stashes, effectiveConfig, cacheLedger) never lands", () => {
+    const bag: Record<string, unknown> = {
+        egressAuthority: true,
+        pluginAgent: "pi",
+        derivedFromSessionId: "parent-1",
+        egressFlowUnreadable: true,
+        lastModel: "qwen3.8-27b",
+        handoffReply: { request: "r1", rows: [{ id: "h_1", role: "assistant", contentType: "text", text: "x".repeat(200_000) }] },
+        handoffResponse: { messages: [{ content: "y".repeat(200_000) }] },
+        effectiveConfig: { model: "m", params: { a: 1, b: 2, c: "z".repeat(5000) } },
+        cacheLedger: { hits: 1, misses: 2 },
+        outputBudgetHighWater: 8192,
+        publicSnapshotStoredRefs: ["a", "b"],
+    };
+    const out = sanitizeEgressIdentityMetadata(bag);
+    assert.deepEqual(
+        Object.keys(out).sort(),
+        [...EGRESS_IDENTITY_METADATA_KEYS].sort(),
+        "exactly the whitelist keys land",
+    );
+    assert.equal(out.egressAuthority, true);
+    assert.equal(out.pluginAgent, "pi");
+    assert.equal(out.egressFlowUnreadable, true);
+    assert.equal(out.lastModel, "qwen3.8-27b");
+    for (const k of ["handoffReply", "handoffResponse", "effectiveConfig", "cacheLedger", "outputBudgetHighWater", "publicSnapshotStoredRefs"]) {
+        assert.equal(out[k], undefined, `${k} must NOT land in the identity row`);
+    }
+    // absent optional keys are dropped, not undefined-stamped
+    assert.deepEqual(sanitizeEgressIdentityMetadata({}), { egressAuthority: true });
+    assert.ok(JSON.stringify(out).length < 512, "the sanitized bag stays tiny (identity, not chat content)");
+});
+
 // ---------------------------------------------------------------------------
 // B: fresh-DB invariants end to end (real server, pinned plugin lane)
 // ---------------------------------------------------------------------------
@@ -395,7 +428,14 @@ test("B1: fresh eg-mode database after a real pinned lane — exactly 7 tables, 
             // the sessions row survived the turns (per-turn upsert, one row)
             const rows = db.prepare("SELECT * FROM sessions").all() as Record<string, unknown>[];
             assert.equal(rows.length, 1, "still exactly one sessions row after two turns");
-            assert.equal(JSON.parse(String(rows[0].metadata_json)).egressAuthority, true);
+            const rowMeta = JSON.parse(String(rows[0].metadata_json)) as Record<string, unknown>;
+            assert.equal(rowMeta.egressAuthority, true);
+            // KDD #25: the identity row carries identity keys ONLY — no chat
+            // content stashes from the runtime bag (handoffReply etc.)
+            const allowed = new Set(EGRESS_IDENTITY_METADATA_KEYS);
+            for (const k of Object.keys(rowMeta)) {
+                assert.ok(allowed.has(k), `unexpected metadata key in the identity row: ${k}`);
+            }
             // the egress tables carried the whole conversation
             const flow = db.prepare("SELECT COUNT(*) AS n FROM egress_flow").get() as { n: number };
             assert.ok(flow.n >= 5, `egress flow holds the seeded cells (got ${flow.n})`);

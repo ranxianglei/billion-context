@@ -44,7 +44,7 @@
 // Rollout gate (egressPlane, default 0 — opt-in per owner ruling 2026-11-24) and each lane's arming condition
 // are owned by the caller.
 
-import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
+import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, sanitizeEgressIdentityMetadata, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
 import type { EgressBlockLedgerInput } from "../storage/egress-block.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { featureEnabled } from "../rollout.js";
@@ -250,7 +250,10 @@ export function resolveEgressAuthority(args: {
             createdAt: session.createdAt,
             updatedAt: session.lastSeen,
             metaJson: JSON.stringify(session.meta ?? {}),
-            metadataJson: JSON.stringify(session.metadata),
+            // KDD #25: NEVER the full runtime bag — it can carry the #6947
+            // turn-final reply stashes (handoffReply/handoffResponse, up to
+            // 1.5 MB each of chat content). Identity keys only.
+            metadataJson: JSON.stringify(sanitizeEgressIdentityMetadata(session.metadata)),
         });
     } catch (err) {
         log("warn", `[${sessionId}] egress: identity row upsert failed (best-effort; the egress_flow probe still covers identity): ${String((err as { message?: unknown })?.message ?? err).slice(0, 200)}`);

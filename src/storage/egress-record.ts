@@ -189,8 +189,37 @@ export interface EgressIdentityInput {
     updatedAt: number;
     /** meta_json: the typed identity fields (protocol/label/title/hostTitle/origin + pack fields). */
     metaJson: string;
-    /** metadata_json: the egressAuthority/egressFlowUnreadable/pluginAgent/derivedFromSessionId/lastModel carrier. */
+    /** metadata_json: the sanitized identity keys (see EGRESS_IDENTITY_METADATA_KEYS) — never the full runtime bag. */
     metadataJson: string;
+}
+
+/** The only metadata keys the identity row's metadata_json carries. The
+ *  rest of the runtime bag is recomputed per request (effectiveConfig,
+ *  cacheLedger, outputBudgetHighWater, publicSnapshot*) or is conversation
+ *  content that lives in the op log — most notably the #6947 turn-final
+ *  reply stashes handoffReply/handoffResponse, each capped at
+ *  HANDOFF_REPLY_MAX_BYTES (1.5 MB): those must never land in the identity
+ *  row (KDD #25; owner ruling 2026-11-26: the sessions table holds identity
+ *  only). */
+export const EGRESS_IDENTITY_METADATA_KEYS: readonly string[] = [
+    "egressAuthority",
+    "pluginAgent",
+    "derivedFromSessionId",
+    "egressFlowUnreadable",
+    "lastModel",
+];
+
+/** Reduce a live session metadata bag to the identity-row whitelist:
+ *  egressAuthority is always true; whitelisted keys pass through when
+ *  defined; everything else is dropped. */
+export function sanitizeEgressIdentityMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = { egressAuthority: true };
+    for (const k of EGRESS_IDENTITY_METADATA_KEYS) {
+        if (k === "egressAuthority") continue;
+        const v = metadata[k];
+        if (v !== undefined) out[k] = v;
+    }
+    return out;
 }
 
 /** Record this turn's outbound conversation view as sparse ops. `prev` is
