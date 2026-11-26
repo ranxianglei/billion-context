@@ -1034,6 +1034,20 @@ function changelogCatOf(rawLine) {
         set("up-last-check", st.lastCheckAt ? new Date(st.lastCheckAt).toLocaleString() : t("common.none"));
         const hint = $("up-pending-hint");
         if (hint) hint.hidden = !st.pendingRestart;
+        // #7806: a git-source dev-install pin earns a "dev install" badge
+        // (ref @ sha) on the pin status line; hidden otherwise.
+        const dev = $("up-dev-install");
+        if (dev) {
+            if (st.pin && st.pin.ref) {
+                dev.hidden = false;
+                const lbl = $("up-dev-install-label");
+                if (lbl) lbl.textContent = t("up.dev_install", { ref: st.pin.ref, sha: String(st.pin.sha).slice(0, 12), v: st.pin.version });
+                const stt = $("up-dev-install-state");
+                if (stt) stt.textContent = st.pin.active ? t("up.dev_install_active") : t("up.dev_install_expired");
+            } else {
+                dev.hidden = true;
+            }
+        }
         renderNotices(Array.isArray(st.notices) ? st.notices : []);
         const sel = $("up-select");
         if (sel) {

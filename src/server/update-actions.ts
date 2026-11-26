@@ -17,6 +17,7 @@
  */
 import { checkForUpdate, findInstallDir, forceInstallVersion, lastUpdateCheckTime, readDiskVersion, staleInstallStatus, type UpdateCheckOutcome, type UpdateOptions } from "../update.js";
 import { getUpdateVisibility } from "../update-notes.js";
+import { readPin, type PinRecord } from "../update-pin.js";
 import { log as loggerLog } from "../logger.js";
 
 /** One pushed release note mapped for the wire (span entries are oldest→newest). */
@@ -44,6 +45,17 @@ interface UpdateStateSnapshotData {
     checking: boolean;
     /** True while a pinned install is in flight in this process. */
     installing: boolean;
+    /** A git-source dev-install pin is on disk (#7806) — the panel shows a
+     *  "dev install" badge (ref @ sha). Absent when no such pin exists. */
+    pin?: {
+        version: string;
+        ref: string;
+        sha: string;
+        setAt: number;
+        until?: number;
+        /** Pin currently holds (not time-expired AND still matches the disk). */
+        active: boolean;
+    };
 }
 
 let registeredOpts: UpdateOptions | undefined;
@@ -139,6 +151,24 @@ export async function updateStateSnapshot(runningVersion: string): Promise<Updat
         }
     }
     const lastCheckAt = await lastUpdateCheckTime();
+    // #7806: a git-source dev-install pin earns a "dev install" badge. Read the
+    // pin WITHOUT sweeping (resolvePinState self-deletes; a panel read must be
+    // side-effect-free) and derive "active" from time + disk match only.
+    const pin = await readPin();
+    let pinData: UpdateStateSnapshotData["pin"];
+    if (pin !== undefined && pin.source?.kind === "git") {
+        const now = Date.now();
+        const timeHolds = pin.until === undefined || now < pin.until;
+        const diskHolds = disk === undefined || pin.version === disk;
+        pinData = {
+            version: pin.version,
+            ref: pin.source.ref,
+            sha: pin.source.sha,
+            setAt: pin.setAt,
+            ...(pin.until !== undefined ? { until: pin.until } : {}),
+            active: timeHolds && diskHolds,
+        };
+    }
     return {
         running: runningVersion,
         ...(disk !== undefined ? { disk } : {}),
@@ -148,6 +178,7 @@ export async function updateStateSnapshot(runningVersion: string): Promise<Updat
         ...(lastCheckAt !== undefined ? { lastCheckAt } : {}),
         checking,
         installing,
+        ...(pinData !== undefined ? { pin: pinData } : {}),
     };
 }
 

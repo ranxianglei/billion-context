@@ -58,6 +58,7 @@ import { exportSession } from "./export.js";
 import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
 import { runStorageBackupCommand, runStorageRepairCommand } from "./storage-backup-repair.js";
 import { installPackFromNpm, removePackFile } from "./pack-install.js";
+import { installFromGitRef, installStatus } from "./git-install.js";
 import { listResolvedPacks } from "./compress-settings.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
@@ -133,8 +134,16 @@ Usage:
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
                                    --json machine output, --log FILE correlates [acp-usage]
                                    lines (default <dir>/bili.log), --no-log skips, --session SID filters
-  bili update                      check for & install a newer version now
-  bili doctor                      audit every install lane: versions, owners,
+   bili update                      check for & install a newer version now
+   bili install <ref> [duration]    install from a git ref (PR number / PR URL /
+                                     branch / tag / master): shallow clone → build →
+                                     back up current → npm install -g (real copy) →
+                                     verify; auto-pins the result (default 30d;
+                                     duration like 7d/forever) so auto-upgrade won't
+                                     swap it back; restart the host to finish
+   bili install status              report the current dev install (version + git
+                                     ref @ sha) and whether its pin is active
+   bili doctor                      audit every install lane: versions, owners,
                                     freshness vs registry, running proxy processes
                                     (read-only; --json for machine-readable output);
                                     --fix converges drifted dsh-profile ledgers
@@ -225,11 +234,14 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "pack";
+    command: "start" | "update" | "install" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "pack";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
     overrides: Record<string, string | undefined>;
+    installSub?: "status";
+    installRef?: string;
+    installDuration?: string;
     exportSelector?: string;
     exportOutput?: string;
     exportFull?: boolean;
@@ -270,6 +282,9 @@ export function parseArgs(argv: string[]): Parsed {
     let clientArgs: string[] = [];
     let posture: "inline" | "server" | undefined;
     const mitmDomains: string[] = [];
+    let installSub: Parsed["installSub"];
+    let installRef: string | undefined;
+    let installDuration: string | undefined;
     let exportSelector: string | undefined;
     let registerConversationId: string | undefined;
     let exportOutput: string | undefined;
@@ -530,6 +545,18 @@ export function parseArgs(argv: string[]): Parsed {
             command = "start";
         } else if (cmd === "update") {
             command = "update";
+        } else if (cmd === "install") {
+            command = "install";
+            const sub = positional[1];
+            if (sub === "status") {
+                installSub = "status";
+            } else if (sub === undefined) {
+                console.error(`bili install: <ref> is required (a PR number, PR URL, branch, tag, or master; or "status")`);
+                process.exit(2);
+            } else {
+                installRef = sub;
+                installDuration = positional[2];
+            }
         } else if (cmd === "doctor") {
             command = "doctor";
         } else if (cmd === "export") {
@@ -655,11 +682,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
+    return { command, client, clientArgs, mitmDomains, overrides, installSub, installRef, installDuration, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, installSub, installRef, installDuration, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
     // -c/--config fail-fast: a bare NAME that resolves to a missing
     // <configDir>/NAME.json names the typo + the available siblings instead of
     // silently starting on an empty config (see paths.ts for path behavior).
@@ -895,6 +922,33 @@ export async function main(): Promise<void> {
             { packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag },
             true,
         );
+        return;
+    }
+    if (command === "install") {
+        // #7806: install from an arbitrary git ref (PR head / branch / tag /
+        // master) and auto-pin the result. Runs as a one-shot command — no
+        // proxy spawned, no config loaded. The running process stays on the
+        // old dist/ (self-replacement safe); a restart finishes the switch.
+        if (installSub === "status") {
+            const st = await installStatus();
+            if (!st.hasDevInstall) {
+                console.log("No dev install (no git-source pin on disk).");
+                return;
+            }
+            console.log(`Dev install: ${st.version} from ${st.ref} @ ${st.sha}`);
+            console.log(`  pinned ${new Date(st.setAt!).toISOString()}${st.until !== undefined ? ` until ${new Date(st.until).toISOString()}` : " (indefinite)"}`);
+            console.log(`  pin ${st.active ? "active" : "expired"}`);
+            return;
+        }
+        const result = await installFromGitRef(installRef!, installDuration);
+        if (!result.ok) {
+            console.error(`bili install: ${result.error}`);
+            process.exit(1);
+        }
+        console.log(`Installed ${result.version} from ${result.ref} @ ${result.sha.slice(0, 12)}`);
+        if (result.backupDir) console.log(`Previous install backed up to ${result.backupDir}`);
+        console.log(`Auto-upgrade pinned ${result.pinUntil !== undefined ? `until ${new Date(result.pinUntil).toISOString()}` : "indefinitely"} (bili unpin or an explicit bili update breaks through).`);
+        console.log("Restart the host to finish — the running process is still the old version.");
         return;
     }
     if (command === "test") {
