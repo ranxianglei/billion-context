@@ -15,7 +15,7 @@ import {
     addPromptSection,
     DEFAULT_DELEGATE_POLICY,
     DELEGATE_PROMPT_SECTION,
-    DELEGATE_STAND_DOWN_MESSAGE,
+    buildStandDownMessage,
     delegateStatusWidget,
     findPiSubagentsInstalls,
     loadSubagentsUserConfig,
@@ -41,6 +41,15 @@ import {
 import type { ExtensionAPI, ToolDefinition } from "./pi.js";
 import { loadConfigFile, type PiSubagentsFileConfig } from "../config.js";
 import { logHostEvent } from "./host-log.js";
+
+/** Native-lane stand-down warning. Unlike the standalone package (which ships
+ *  /acp-subagents), the bili native pi lane has no such command — pi-subagents'
+ *  agents get ACP compression only by manually listing the tools in
+ *  subagents.agentOverrides.<name>.tools (a string array) in settings.json. */
+const NATIVE_STAND_DOWN_MESSAGE = buildStandDownMessage(
+  "pi-subagents' agents do NOT get ACP context compression by default. To give them compress/decompress/search_context/acp_status, add those tool names to subagents.agentOverrides.<name>.tools (a string array) in settings.json.",
+  'To keep acp_delegate despite pi-subagents being installed, set "pi": { "subagents": { "forceEnable": true } } in billion-context.json. If you have chosen pi-subagents and do not need acp_delegate, set "pi": { "subagents": false } to disable it and silence this warning.',
+);
 
 /** The four bili pi-plugin slash commands ownable via `pi.commands`. */
 export const PI_COMMAND_NAMES = ["acp", "acp-cache", "acp-rule", "acp-fleet"] as const;
@@ -223,7 +232,7 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
                     state.stoodDown = true;
                     if (!standDownWarned) {
                         standDownWarned = true;
-                        ctx.ui?.notify?.(DELEGATE_STAND_DOWN_MESSAGE, "warning");
+                        ctx.ui?.notify?.(NATIVE_STAND_DOWN_MESSAGE, "warning");
                     }
                 }
             }

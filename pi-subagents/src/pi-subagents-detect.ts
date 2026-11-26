@@ -3,13 +3,26 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { CONFIG_DIR_NAME } from "./config-dir.js";
 
+const STAND_DOWN_HEAD =
+  "[billion-context-pi-subagents] pi-subagents detected — acp_delegate has been automatically disabled to avoid two overlapping sub-agent systems.";
+
+/** Assemble the stand-down warning from a shared head plus two lane-specific
+ *  lines. The instruction (how to give pi-subagents' agents ACP compression)
+ *  and the force-enable hint (where to set forceEnable) differ by lane: the
+ *  standalone package (billion-context-pi) ships /acp-subagents and reads
+ *  acp.json, while the bili native pi lane has no /acp-subagents (manual
+ *  agentOverrides) and reads billion-context.json. */
+export function buildStandDownMessage(instruction: string, forceEnableHint: string): string {
+  return [STAND_DOWN_HEAD, instruction, forceEnableHint].join("\n");
+}
+
 /** Printed/logged once per process when acp_delegate stands down because
- *  pi-subagents is installed (billion-context-pi #415). */
-export const DELEGATE_STAND_DOWN_MESSAGE = [
-  "[billion-context-pi-subagents] pi-subagents detected — acp_delegate has been automatically disabled to avoid two overlapping sub-agent systems.",
+ *  pi-subagents is installed (billion-context-pi #415). Standalone-package
+ *  default — the lane that ships /acp-subagents and reads acp.json. */
+export const DELEGATE_STAND_DOWN_MESSAGE = buildStandDownMessage(
   "pi-subagents' agents do NOT get ACP context compression by default. Run /acp-subagents (billion-context-pi) to inject compress/decompress/search_context/acp_status into its agent overrides.",
   'To keep acp_delegate despite pi-subagents being installed, set "delegate": { "forceEnable": true } in acp.json (standalone) or "pi": { "subagents": { "forceEnable": true } } in billion-context.json (bili native lane).',
-].join("\n");
+);
 
 /** Resolve the pi agent config directory (e.g. ~/.pi/agent), honoring the
  *  PI_CODING_AGENT_DIR environment variable (mirroring pi's own resolution). */
