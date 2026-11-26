@@ -25,5 +25,34 @@ export function mergeCompressionState(
     rules: parsed.rules ?? fresh.rules,
     nextRuleId: parsed.nextRuleId ?? fresh.nextRuleId,
     terminalStreak: parsed.terminalStreak,
+    // #2388/#2370: bare passthrough like terminalStreak above — none of these
+    // optional fields is seeded by createInitialState, and without a line here
+    // a standalone acp-kernel consumer loses it on restart. The host's own
+    // hydrator (billion-context src/state-hydration.ts) carries the same set;
+    // the clone-fidelity guard (kernel/tests/state-clone-fidelity.test.ts)
+    // fails if this list ever lags CompressionState again.
+    hiddenOrphanRefs: parsed.hiddenOrphanRefs,
+    deadRefs: parsed.deadRefs,
+    lastPassIds: parsed.lastPassIds,
+    sweptOrphanCallIds: parsed.sweptOrphanCallIds,
+    pendingOrphanSweepMinRef: parsed.pendingOrphanSweepMinRef,
+    emergencyTruncateLatch: parsed.emergencyTruncateLatch,
+    renderDeferredRefs: parsed.renderDeferredRefs,
+    refLedgerAligned: parsed.refLedgerAligned,
+    viewLatches: parsed.viewLatches,
+    viewLatchConfigDigest: parsed.viewLatchConfigDigest,
+    tsStamps: parsed.tsStamps,
+    // #5608-C: the visibility mark survives hydration only when the persisted
+    // state actually carries it — legacy states stay key-free (an explicit
+    // undefined would materialize a phantom key every state-key digest
+    // compares). Same conditional-spread contract as the host's mergeState.
+    ...(parsed.timestampsHighWaterRefSeq !== undefined
+        ? { timestampsHighWaterRefSeq: parsed.timestampsHighWaterRefSeq }
+        : {}),
+    // suppressMintingOnce is deliberately NOT carried — hydration rebuilds
+    // from disk, and re-arming honest-NULL after a restart would eat genuine
+    // first-sight mints of truly new messages; dropping it (the safe default)
+    // is what pre-arm states look like anyway. Same decision as the host's
+    // mergeState (src/state-hydration.ts).
   };
 }
