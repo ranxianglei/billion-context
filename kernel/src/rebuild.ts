@@ -3,7 +3,8 @@ import { parseCompressArgs } from "./parse-compress-input.js";
 import { assignRefs, highestUsedIndex } from "./refs.js";
 import { RETRIEVED_ID_PREFIX } from "./ccr.js";
 import { defaultCountTokens } from "./tokenize.js";
-import type { CompressionState, CoreMessage } from "./types.js";
+import { isCompressToolName } from "./protected.js";
+import type { CompressionState, Config, CoreMessage } from "./types.js";
 
 export interface RebuildResult {
   state: CompressionState;
@@ -40,7 +41,7 @@ export function rebuildCompressionState(
   });
   let working: CompressionState = { ...state, messageRefs: refResult.map };
 
-  const invocations = collectCompressInvocations(messages);
+  const invocations = collectCompressInvocations(messages, config);
   let blocksRebuilt = 0;
 
   for (const invocation of invocations) {
@@ -68,11 +69,14 @@ interface CompressInvocation {
 
 function collectCompressInvocations(
   messages: CoreMessage[],
+  config: Pick<Config, "isCompressTool">,
 ): CompressInvocation[] {
   const invocations: CompressInvocation[] = [];
   for (const message of messages) {
-    if (message.toolName !== "compress" || message.contentType !== "tool-call")
-      continue;
+    if (message.contentType !== "tool-call" || !message.toolName) continue;
+    // Same predicate as every other compress recognition site, so an
+    // MCP-dialect call (config.isCompressTool) rebuilds like its bare twin.
+    if (!isCompressToolName(message.toolName, config)) continue;
     invocations.push({ callId: message.toolCallId, raw: message.text ?? "" });
   }
   return invocations;
