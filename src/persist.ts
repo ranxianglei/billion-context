@@ -36,7 +36,7 @@ import { markDirty } from "./session.js";
 import { validCostUsd } from "./billing.js";
 import { mergeState } from "./state-hydration.js";
 import { restampRefsToLedger, restampContentStore } from "acp-kernel";
-import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
+import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight, pruneRefsToLiveIds, REF_FLOOR_RAW_ID } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
 import { featureEnabled } from "./rollout.js";
@@ -2028,8 +2028,33 @@ export class SessionStore {
         // arrivals keep minting counter refs until alignment (fresh numbers,
         // no collision), exactly like pre-alignment master. Envelope-only
         // loads (no rows) skip honestly via the guard inside.
+        this.tombstoneOrphanRefs(id, session);
         this.logColdLoad(id, "unified store", session, record.savedAt);
         return session;
+    }
+
+    /** #7236/#7246: at cold load, tombstone orphan refs (raw ids present in
+     *  byRaw but with no backing message row in the unified store) into
+     *  deadRefs. The kernel's dead-ref snap path only fires for refs NOT in
+     *  byRef; orphan refs ARE in byRef so they never reach it and instead
+     *  throw BoundaryNotFoundError('consumed'), permanently blocking
+     *  compaction of any range that cites them. This is the host-side
+     *  complement to the kernel's own pruneRefsToLiveIds (which the #6057
+     *  remint path never triggers). Guard: unified store unavailable or no
+     *  rows → honest skip, never a guess. */
+    private tombstoneOrphanRefs(id: string, session: Session): void {
+        const refs = session.state.messageRefs;
+        if (!refs || Object.keys(refs.byRaw).length === 0) return;
+        const liveRawIds = this.unifiedLiveMsgIds(id);
+        if (liveRawIds === null || liveRawIds.size === 0) return;
+        const orphanIds = Object.keys(refs.byRaw).filter(
+            (rawId) => rawId !== REF_FLOOR_RAW_ID && !liveRawIds.has(rawId),
+        );
+        if (orphanIds.length === 0) return;
+        pruneRefsToLiveIds(session, liveRawIds, refs.byRaw, refs.byRef);
+        markDirty(session);
+        this.scheduleSave(session);
+        this.log("info", `[persist] tombstoned ${orphanIds.length} orphan ref(s) into deadRefs on cold load for ${id} (#7236)`);
     }
 
     /** #4316 PR3/3 (timing changed by #5608-D): one-time ref/ledger
@@ -2294,6 +2319,19 @@ export class SessionStore {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
             return this.shadow.seqByRaw(id);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #7258: distinct live msg_ids (any generation count). Unlike
+     *  unifiedSeqByRaw, multi-generation ids (edits) are included — they
+     *  have live rows, so their byRaw entries are not orphans. Null when the
+     *  unified store is unavailable. */
+    unifiedLiveMsgIds(id: string): Set<string> | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.liveMsgIds(id);
         } catch {
             return null;
         }

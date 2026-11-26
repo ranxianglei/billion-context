@@ -4329,6 +4329,20 @@ export class UnifiedStore {
         return out;
     }
 
+    /** #7258: distinct live msg_ids (any generation count). Unlike seqByRaw,
+     *  multi-generation ids (edits that left several rows) are included —
+     *  they have live rows, so their byRaw entries are not orphans. */
+    liveMsgIds(sessionId: string): Set<string> {
+        const rows = this.db
+            .prepare(
+                "SELECT DISTINCT msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL",
+            )
+            .all(sessionId) as Record<string, unknown>[];
+        const out = new Set<string>();
+        for (const r of rows) out.add(r.msg_id as string);
+        return out;
+    }
+
     /** #4316 PR3/3: fork adoption clones the parent's rows wholesale so the
      *  child's cloned kernel refs keep pointing at the same ledger positions
      *  (owner decision 2026-10-22: fork copies every number). The child

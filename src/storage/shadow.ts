@@ -1399,6 +1399,15 @@ export class UnifiedShadow {
         return this.sync.seqByRaw(sessionId);
     }
 
+    /** #7258: distinct live msg_ids (any generation count). Null when the
+     *  unified store is unavailable. Unlike seqByRaw, multi-generation ids
+     *  (edits) are included — they have live rows, so their byRaw entries
+     *  are not orphans. */
+    liveMsgIds(sessionId: string): Set<string> | null {
+        if (this.sync === null) return null;
+        return this.sync.liveMsgIds(sessionId);
+    }
+
     /** #4316 PR3/3: live (non-retired) message row count. */
     liveRowCount(sessionId: string): number {
         if (this.sync !== null) return this.sync.liveRowCount(sessionId);

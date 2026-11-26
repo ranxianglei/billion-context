@@ -2049,7 +2049,7 @@ export function applyCompactionArchive(
  *  REF_FLOOR_RAW_ID (refs are never reused within a session, Kernel
  *  Contract). Shared by the announced archive path (#395) and the zombie
  *  reap (#2695). */
-function pruneRefsToLiveIds(
+export function pruneRefsToLiveIds(
     session: Session,
     liveRawIds: Set<string>,
     byRaw: Record<string, string>,
