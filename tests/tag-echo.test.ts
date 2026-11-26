@@ -87,6 +87,60 @@ test("stripAcpTags still strips whitespace-padded ref echoes (#1720)", () => {
     assert.equal(stripAcpTags(`before ${OPEN}tokens="1" type="text"> m00123 ${CLOSE} after`), "before  after");
 });
 
+// #7570: a render tag whose body is a LEADING refs run + prose — the model
+// imitated the ref payload and appended its own answer inside the tag. The
+// leading ref is the imitated payload (kernel render form is ref-first) and
+// dies with the tags; the prose after it is the model's own words and stays.
+// A prose-first body (no leading ref) is genuine prose wearing tags and stays
+// whole (#1720); a refs-only body is PAIRED's job (strips whole).
+test("stripAcpTags drops the leading ref of a ref+prose body, keeps the prose (#7570)", () => {
+    // ref at the head of the body: the imitated payload dies, the prose stays.
+    assert.equal(stripAcpTags(`${OPEN}tokens="2" type="text">m01912 你好${CLOSE}`), "你好");
+    assert.equal(stripAcpTags(`${OPEN}tokens="2" type="text">m01912\n你好${CLOSE}`), "你好");
+    assert.equal(stripAcpTags(`${OPEN}tokens="2" type="text"> m01912 你好 ${CLOSE}`), "你好");
+    // multi-ref run at the head: the whole run dies, the prose stays.
+    assert.equal(stripAcpTags(`${OPEN}tokens="2" type="text">m01912 m01913 你好${CLOSE}`), "你好");
+    // prose FIRST (no leading ref): genuine prose wearing tags, stays whole (#1720).
+    assert.equal(stripAcpTags(`${OPEN}tokens="2" type="text">你好 m01912${CLOSE}`), "你好 m01912");
+    // refs-only body: the whole tag dies (PAIRED, not #7570).
+    assert.equal(stripAcpTags(`${OPEN}tokens="2" type="text">m01912${CLOSE}`), "");
+    assert.equal(stripAcpTags(`${OPEN}tokens="2" type="text">m01912 m01913${CLOSE}`), "");
+});
+
+test("streaming filter matches stripAcpTags for a ref+prose body at every split position (#7570)", () => {
+    const cases = [
+        `${OPEN}tokens="2" type="text">m01912 你好${CLOSE}`,
+        `${OPEN}tokens="2" type="text">m01912\n你好${CLOSE}`,
+        `${OPEN}tokens="2" type="text"> m01912 你好 ${CLOSE}`,
+        `${OPEN}tokens="2" type="text">m01912 m01913 你好${CLOSE}`,
+        `lead ${OPEN}tokens="2" type="text">m01912 你好${CLOSE} tail`,
+        `lead ${OPEN}tokens="2" type="text">你好 m01912${CLOSE} tail`,
+    ];
+    for (const full of cases) {
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+        for (let seed = 1; seed < 8; seed++) {
+            const f = createTagEchoFilter();
+            let out = "";
+            let rest = full;
+            while (rest.length > 0) {
+                const take = (seed * 7 + rest.length) % (rest.length) + 1;
+                out += f.push(rest.slice(0, take));
+                rest = rest.slice(take);
+            }
+            out += f.flush();
+            assert.equal(out, expected, `seed=${seed} full=${JSON.stringify(full)}`);
+        }
+    }
+    // Pin the drop semantics explicitly (parity alone would track any future drift).
+    assert.equal(stripAcpTags(`${OPEN}tokens="2" type="text">m01912 你好${CLOSE}`), "你好");
+    assert.equal(stripAcpTags(`lead ${OPEN}tokens="2" type="text">m01912 你好${CLOSE} tail`), "lead 你好 tail");
+});
+
 test("stripAcpTags removes lone open/close tags", () => {
     assert.equal(stripAcpTags(`a ${OPEN}tokens="1"> tail`), "a  tail");
     assert.equal(stripAcpTags(`x ${CLOSE} y`), "x  y");
