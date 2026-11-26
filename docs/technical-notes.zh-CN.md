@@ -33,9 +33,9 @@ hook 附着前先探测候选者的 `/__bili/health`:armed → 附着并注册 w
 
 ## 共享 state 目录与多实例安全边界(#394、#1724)
 
-同一台 host 上的每个 bili 实例读写的是**同一组** per-host 存储:XDG data 目录(`~/.local/share/billion-context/` —— 会话记录、CCR content-store、prefix-affinity)加 state 目录(`~/.local/state/billion-context/` —— 日志、实例注册表)。控制面是 lane 感知的(#1232:附着发现与 #394 共存告警都尊重已声明 lane),但**数据面没有分区** —— 既无按会话的属主,也无按 lane 的磁盘隔离。由此带来两个后果:
+同一台 host 上的每个 bili 实例读写的是**同一组** per-host 存储:XDG data 目录(`~/.local/share/billion-context/` —— 会话记录、prefix-affinity)加 state 目录(`~/.local/state/billion-context/` —— 日志、实例注册表)。控制面是 lane 感知的(#1232:附着发现与 #394 共存告警都尊重已声明 lane),但**数据面没有分区** —— 既无按会话的属主,也无按 lane 的磁盘隔离。由此带来两个后果:
 
-- **跨实例会话可见。** 每个实例的 Web UI(`__bili/sessions` list / detail / logs)都会重新扫描整个共享存储,因此任何经回环可达的实例都能枚举并读取*任意*会话 —— 原始报文、content-store 载荷、压缩块 —— 无论它由该 host 上哪个其他实例/lane 创建。
+- **跨实例会话可见。** 每个实例的 Web UI(`__bili/sessions` list / detail / logs)都会重新扫描整个共享存储,因此任何经回环可达的实例都能枚举并读取*任意*会话 —— 原始报文、压缩块 —— 无论它由该 host 上哪个其他实例/lane 创建。
 - **重启 drain 竞态。** 重启时新进程在旧进程完成 flush 之前就 hydrate 了存储,last-writer-wins 可能丢掉旧进程的最终写入:tail 更新丢失,以及 provider 前缀缓存击穿(出站 body 与 provider 已缓存的前缀分叉)。#1724 的缓解措施:#405 快照计数器守卫(拒绝陈旧会话写入)、prefix-affinity union-on-write 守卫(#1737:一个实例的 flush 永不覆盖兄弟 chain)、自重启顺序修复(#1742:durable state 在替换进程 spawn 之前落盘)。host 驱动的重启(dsh 等,#991)仍依赖这些数据层守卫,因为其 kill/spawn 顺序不受 bili 控制。
 
 **安全边界:** 共享 state 面目前**仅**由管理端点的回环门禁(非回环源地址被拒绝)+ 用户 home 树下这些目录的文件系统权限保护(两个目录都在 $HOME 下)—— 没有按会话的鉴权。对**单用户 host** 这已足够。对**多用户 host** 则不够:任何能触达代理回环端口的本地账户都能读取所有用户的所有会话。这类 host 必须给这组 per-host 存储分区(按用户/按 lane 子目录)—— 即 #1724 指出的根因修复(direction #1),目前仍作为架构决策开放;Web UI scoping(#1724 direction #4)能减少跨实例浏览,但不改变这一边界。
@@ -118,7 +118,7 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 
 三种故障形态共享 `src/session-self-heal.ts` 里的同一族检测器,每请求评估一次(prepare 之后,仅有 nudge 的主车道;旁路/侧请求车道不积累信用):
 
-- **D2 僵尸插件车道** —— 插件已卸载(或 MCP 子进程已死)但已开着的客户端窗口仍带着插件绑定(粘滞 `metadata.pluginAgent`)。信号:连续 5 轮(`SELF_HEAL_WINDOW`)被 nudge、**无** `x-bili-plugin` 头、线上**无** bili 工具声明、**零**压缩缩减。补救:**降级为代理模式** —— 单点 `pluginMode` 翻转(`pluginAgent !== undefined && !pluginLaneDegraded(session)`)线上回注 ACP 工具、重新接管压缩 rewriter/CCR 盖章/absorb,并**保留 nudge**(工具回来了)。线上注入不可用时(`compress.injectTool=false` → `degradeAvailable=false`)退为**静默 nudge**。恢复:**活的**插件头(`pluginLaneRestore`,在 `pluginMode` 翻转**之前**调用,首个带头请求即恢复 plugin 模式 —— 恢复信号绝不能用粘滞 `pluginAgent`,否则降级一轮后即被自己清掉)。绑定保留、永不抹除。
+- **D2 僵尸插件车道** —— 插件已卸载(或 MCP 子进程已死)但已开着的客户端窗口仍带着插件绑定(粘滞 `metadata.pluginAgent`)。信号:连续 5 轮(`SELF_HEAL_WINDOW`)被 nudge、**无** `x-bili-plugin` 头、线上**无** bili 工具声明、**零**压缩缩减。补救:**降级为代理模式** —— 单点 `pluginMode` 翻转(`pluginAgent !== undefined && !pluginLaneDegraded(session)`)线上回注 ACP 工具、重新接管压缩 rewriter/absorb,并**保留 nudge**(工具回来了)。线上注入不可用时(`compress.injectTool=false` → `degradeAvailable=false`)退为**静默 nudge**。恢复:**活的**插件头(`pluginLaneRestore`,在 `pluginMode` 翻转**之前**调用,首个带头请求即恢复 plugin 模式 —— 恢复信号绝不能用粘滞 `pluginAgent`,否则降级一轮后即被自己清掉)。绑定保留、永不抹除。
 - **D1 nudge 空转**(非插件泛化)—— 连续 5 轮被 nudge 却零缩减、零 bili 工具调用。补救:在全部四处 `willInjectNudge` 门加 `&& !nudgeSuppressed(session)`(覆盖 emergency 路径)。恢复:任一次压缩缩减或 bili 工具调用即解除——或者在 `SELF_HEAL_SUPPRESS_CAP_MS`(10 分钟)内两者皆无时,抑制到时自解并重新武装(#3004/#3008:上下文单调增长时永远产生不了恢复证据,纯证据式解除曾把建议通道锁死一个多小时而用量停在 ~75%)。重新武装是有界的:再空转完整一个 `SELF_HEAL_WINDOW`(5 轮)才会再次抑制;决策梯的 fallback 逃逸在抑制期间仍可打出一次性 legacy 建议(`consumeFallback` 重置计数)。
 - **D3 网关杀摘要** —— **非流式** preflight 摘要以 HTTP 524/504(Cloudflare 类)死亡时不再原地重试(旧的 transient 重试对着死网关每次烧 ~100 秒);会话在**首次**命中即学习 `metadata.preflightStreamSummary = true` 并改用 SSE 重取摘要 —— 与手动 `compress.streamSummary` 旋钮(#2133)同一学习存储,自动武装。级联双向被尊重:任一级显式 `streamSummary: false`(global → provider → model)即操作员 opt-out —— 两条学习路径都不武装、已学习的旧标志被忽略(`PreflightDeps.streamSummaryOff`)。
 
