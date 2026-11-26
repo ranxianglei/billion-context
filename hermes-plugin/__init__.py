@@ -80,6 +80,12 @@ BOOTSTRAP_RETRY_BACKOFF_S = (10.0, 30.0, 60.0)
 # self-heal (30 s tick x 3 failures = recovery within ~90 s, README "Self-healing").
 ORIGIN_WATCH_INTERVAL_S = 30.0
 ORIGIN_WATCH_FAIL_LIMIT = 3
+# #7491: beat the routed proxy's /__bili/watcher with {pid, hb: true} on this cadence — the
+# owner-attestation opt-in the TS lanes send (src/launcher.ts OWNER_HEARTBEAT_INTERVAL_MS).
+# Without it the proxy sees the host pid as a legacy kill-0-only watcher, and a RECYCLED host
+# pid reads alive forever (kill-0 is an existence check, identity-blind under pid reuse,
+# #3544), so the proxy never exits when the host dies (runaway proxies, #7484).
+OWNER_HEARTBEAT_INTERVAL_S = 5.0
 # Core ACP tools whose absence from the OUTGOING request proves this session's tool snapshot was
 # built before the background registration landed — plugin-mode headers must not be stamped then.
 CORE_TOOL_NAMES = ("compress", "decompress", "acp_status")
@@ -134,6 +140,10 @@ _state: Dict[str, Any] = {
     "watchdog_thread": None,
     "recovering": False,
     "env_backup": {},
+    # #7491: heartbeat_gen invalidates a previous generation's owner-heartbeat thread on
+    # load/unload; heartbeat_thread is the beating thread itself (see _owner_heartbeat_loop).
+    "heartbeat_gen": 0,
+    "heartbeat_thread": None,
 }
 
 # Serializes load/unload against bootstrap side effects (tool registration, env routing, child
@@ -167,6 +177,8 @@ def _reset_for_test() -> None:
         _state["watchdog_thread"] = None
         _state["recovering"] = False
         _state["env_backup"] = {}
+        _state["heartbeat_gen"] = 0
+        _state["heartbeat_thread"] = None
 
 
 # — paths ---------------------------------------------------------------------
@@ -1311,6 +1323,7 @@ def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = 
             os.environ["SSL_CERT_FILE"] = str(combined)
         _state["env_applied"] = True
     _ensure_watchdog(sidecar, ctx)
+    _ensure_owner_heartbeat()
     return True
 
 
@@ -1414,6 +1427,58 @@ def _watchdog_loop(sidecar: Dict[str, str], ctx: Any, gen: int) -> None:
             with _lifecycle_lock:
                 _state["recovering"] = False
         fails = 0
+
+
+def _ensure_owner_heartbeat() -> None:
+    """Start the owner-heartbeat thread once per generation (#7491). A live thread means nothing
+    to do; register()/unload bump heartbeat_gen so a previous generation's thread exits on its
+    next tick. The thread follows _state["origin"] dynamically, so a #4644 re-route to a new
+    origin is covered by the same thread — no restart needed."""
+    if _stopped():
+        return
+    thread = _state.get("heartbeat_thread")
+    if thread is not None and thread.is_alive():
+        return
+    gen = int(_state.get("heartbeat_gen") or 0)
+    beater = threading.Thread(target=_owner_heartbeat_loop, args=(gen,),
+                              name="bili-owner-heartbeat", daemon=True)
+    _state["heartbeat_thread"] = beater
+    beater.start()
+
+
+def _owner_heartbeat_loop(gen: int) -> None:
+    """#7491: attest the host pid to the routed proxy every OWNER_HEARTBEAT_INTERVAL_S with
+    {pid, hb: true} — the opt-in that lets the proxy's parent-gone watchdog age the pid out by
+    HEARTBEAT SILENCE instead of trusting kill-0 alone. kill(pid, 0) is an existence check,
+    identity-blind under pid reuse (#3544): without the heartbeat, a host death whose pid gets
+    recycled reads ALIVE forever and the proxy never exits (runaway proxies, #7484). The server
+    already handles hb:true (src/server/admin.ts) — no server change. A 409 answer means the
+    origin is a daemon proxy with no watchdog: skip it until the origin changes. http_post_json
+    swallows every transport error, so this thread can never raise out."""
+    skip_origin: Optional[str] = None
+    while True:
+        if _stopped() or int(_state.get("heartbeat_gen") or 0) != gen:
+            return
+        event = _state.get("stop_event")
+        if event is not None and event.wait(OWNER_HEARTBEAT_INTERVAL_S):
+            return
+        if _stopped() or int(_state.get("heartbeat_gen") or 0) != gen:
+            return
+        with _lifecycle_lock:
+            origin = _state.get("origin")
+            env_applied = bool(_state.get("env_applied"))
+        if not origin or not env_applied:
+            skip_origin = None
+            continue
+        if origin == skip_origin:
+            continue
+        status, _body = http_post_json(str(origin).rstrip("/") + "/__bili/watcher",
+                                       {"pid": os.getpid(), "hb": True},
+                                       HEALTH_PROBE_TIMEOUT_S)
+        if status == 409:
+            skip_origin = origin
+        else:
+            skip_origin = None
 
 
 def make_tool_handler(tool_name: str) -> Callable[..., str]:
@@ -1628,9 +1693,10 @@ def _shutdown() -> None:
         _state["loaded"] = False
         _state["tools_ready"] = False
         _state["tool_names"] = ()
-        # Invalidate any watchdog of this generation: it must not drive recovery for an
-        # unloaded plugin (the stop event above wakes it from its tick wait anyway).
+        # Invalidate any watchdog/owner-heartbeat threads of this generation: they must not act
+        # for an unloaded plugin (the stop event above wakes them from their tick wait anyway).
         _state["watchdog_gen"] = int(_state.get("watchdog_gen") or 0) + 1
+        _state["heartbeat_gen"] = int(_state.get("heartbeat_gen") or 0) + 1
         rec = _state.get("bootstrap")
         if isinstance(rec, dict) and rec.get("state") != "ready":
             rec.update(state="stopped", error=None)
@@ -1640,6 +1706,9 @@ def _shutdown() -> None:
     watcher = _state.get("watchdog_thread")
     if watcher is not None and watcher.is_alive() and watcher is not threading.current_thread():
         watcher.join(timeout=1.0)
+    beater = _state.get("heartbeat_thread")
+    if beater is not None and beater.is_alive() and beater is not threading.current_thread():
+        beater.join(timeout=1.0)
     _reap_unready_child()
 
 
@@ -1989,9 +2058,10 @@ def register(ctx: Any) -> None:
                 # a stale stop event would kill the new bootstrap on its first check, so this
                 # generation gets fresh events and a clean record.
                 _state["stop_event"] = threading.Event()
-            # New generation: a previous generation's watchdog (if any) exits on its next tick
-            # instead of racing this bootstrap for recovery.
+            # New generation: a previous generation's watchdog and owner-heartbeat threads (if
+            # any) exit on their next tick instead of racing this bootstrap.
             _state["watchdog_gen"] = int(_state.get("watchdog_gen") or 0) + 1
+            _state["heartbeat_gen"] = int(_state.get("heartbeat_gen") or 0) + 1
             _state["ready_event"] = threading.Event()
             _state["bootstrap"] = None
             _state["loaded"] = True

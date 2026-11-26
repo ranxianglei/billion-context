@@ -487,6 +487,8 @@ if SCENARIO == "discover-foreign-lane":
 elif SCENARIO == "discover-user-zone":
     install_sidecar(True)
     write_origin(inst_rec(True, lane=None, token=None))
+    # Asserts the registration shape; keep the #7491 owner heartbeat out of the watcher call log.
+    mod.OWNER_HEARTBEAT_INTERVAL_S = 3600.0
     mod.register(ctx)
 elif SCENARIO == "discover-lane-first":
     install_sidecar(True)
@@ -520,6 +522,9 @@ elif SCENARIO == "spawn-env":
 elif SCENARIO.startswith("discover-"):
     install_sidecar(SCENARIO == "discover-armed")
     write_origin(inst_rec(SCENARIO == "discover-armed"))
+    # These scenarios assert the registration shape; keep the #7491 owner heartbeat out of the
+    # watcher call log (a 5 s beat could land on a slow machine and change the shape).
+    mod.OWNER_HEARTBEAT_INTERVAL_S = 3600.0
     mod.register(ctx)
 elif SCENARIO.startswith("gate-"):
     flag = SCENARIO[len("gate-"):]
@@ -776,6 +781,9 @@ elif SCENARIO == "output-limits":
 elif SCENARIO.startswith("attach"):
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    # These scenarios assert the registration shape; keep the #7491 owner heartbeat out of the
+    # watcher call log (a 5 s beat could land on a slow machine and change the shape).
+    mod.OWNER_HEARTBEAT_INTERVAL_S = 3600.0
     # #6862: an operator-provided NO_PROXY present when apply_env runs must be merged in,
     # never replaced — BC_TEST_NO_PROXY simulates it (the preamble pops the real keys).
     operator_no_proxy = os.environ.get("BC_TEST_NO_PROXY", "").strip()
@@ -1203,6 +1211,38 @@ elif SCENARIO == "ready-unload":
     out["env_routed"] = os.environ.get("HTTPS_PROXY") == ORIGIN
     ctx.run_unload()
     out["env_after_unload_no_proxy"] = os.environ.get("NO_PROXY")
+elif SCENARIO == "owner-heartbeat":
+    # #7491: an attached host must beat the proxy's /__bili/watcher with {pid, hb: true} — the
+    # opt-in that lets the proxy age a RECYCLED host pid out by heartbeat silence (kill-0 is an
+    # existence check, identity-blind under pid reuse, #3544; without it the proxy never exits
+    # when its host dies and the pid is recycled — runaway proxies, #7484).
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    mod.OWNER_HEARTBEAT_INTERVAL_S = 0.5
+    mod.register(ctx)
+    deadline = __import__("time").monotonic() + 15.0
+    while __import__("time").monotonic() < deadline:
+        if sum(1 for b in RECORDED["watcher"] if b.get("hb") is True) >= 2:
+            break
+        __import__("time").sleep(0.05)
+    out["heartbeat_thread_alive"] = bool(mod._state.get("heartbeat_thread") is not None
+                                         and mod._state["heartbeat_thread"].is_alive())
+    # 409 = the origin is a daemon proxy with no watchdog: the beat that learns it must be the
+    # LAST one (skip until the origin changes), not a hammering loop.
+    os.environ["BC_WATCHER_STATUS"] = "409"
+    __import__("time").sleep(1.0)
+    seen = len(RECORDED["watcher"])
+    __import__("time").sleep(1.5)
+    out["beats_stopped_on_409"] = len(RECORDED["watcher"]) == seen
+    ctx.run_unload()
+    beater = mod._state.get("heartbeat_thread")
+    deadline = __import__("time").monotonic() + 3.0
+    while beater is not None and beater.is_alive() and __import__("time").monotonic() < deadline:
+        __import__("time").sleep(0.02)
+    out["heartbeat_thread_after_unload"] = bool(beater is not None and beater.is_alive())
+    seen = len(RECORDED["watcher"])
+    __import__("time").sleep(1.5)
+    out["beats_stopped_after_unload"] = len(RECORDED["watcher"]) == seen
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -1254,6 +1294,10 @@ interface DriverOut {
     tool_calls: Array<Record<string, unknown>>;
     runtime_info: Array<Record<string, unknown>>;
     watcher_calls: Array<Record<string, unknown>>;
+    heartbeat_thread_alive?: boolean;
+    beats_stopped_on_409?: boolean;
+    heartbeat_thread_after_unload?: boolean;
+    beats_stopped_after_unload?: boolean;
     health_probes?: number;
     refused?: string[];
     instance_id?: string | null;
@@ -1466,6 +1510,27 @@ describe("python plugin runtime (subprocess)", () => {
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.
         assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }], "attached session registers its host pid as a watchdog owner");
+    });
+
+    test("attach: beats the proxy with owner heartbeats (hb:true) — the recycled-pid opt-in (#7491)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("owner-heartbeat");
+        assert.ok(out, err);
+        const calls = out!.watcher_calls;
+        assert.ok(calls.length >= 3, `expected the legacy registration plus ≥2 hb beats, got ${JSON.stringify(calls)}`);
+        assert.deepEqual(calls[0], { pid: out!.pid }, "the initial registration stays legacy (no hb)");
+        const hb = calls.filter((c) => c.hb === true);
+        assert.ok(hb.length >= 2, `expected ≥2 owner heartbeats, got ${hb.length}`);
+        for (const c of hb) {
+            assert.equal(c.pid, out!.pid, "each beat attests THIS host process's pid");
+        }
+        assert.equal(out!.heartbeat_thread_alive, true, "the beating thread runs while routed");
+        assert.equal(out!.beats_stopped_on_409, true, "a 409 origin (daemon proxy) stops the beats");
+        assert.equal(out!.heartbeat_thread_after_unload, false, "unload kills the beating thread");
+        assert.equal(out!.beats_stopped_after_unload, true, "no beats after unload");
     });
 
     test("attach with an operator NO_PROXY: the operator's entries are merged in, never replaced (#6862)", () => {
