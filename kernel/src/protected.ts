@@ -764,15 +764,38 @@ export function isPlainTextSystemMessage(raw: unknown): boolean {
   );
 }
 
+/** #6949: top-level keys a responses message item may carry beyond
+ *  type/role/content without becoming structural. `id` is the standard item
+ *  id — the plain-text rewrite path (wire/responses.ts) already re-emits
+ *  plain-text items without it. `internal_chat_message_metadata_passthrough`
+ *  is Codex's per-message bookkeeping (turn_id, content_item_kinds,
+ *  provenance): the model never reads it and it dies with the message on
+ *  fold. Strict shape checks — a different value shape still pins, and any
+ *  OTHER unknown key keeps the conservative #4166 behavior. */
+function isHarmlessResponsesItemKey(key: string, value: unknown): boolean {
+  if (key === "id") return typeof value === "string";
+  if (key === "internal_chat_message_metadata_passthrough")
+    return (
+      typeof value === "object" && value !== null && !Array.isArray(value)
+    );
+  return false;
+}
+
 /** #4166: plain-text responses system/developer item — content is a
  *  string or an all-text parts array (input_text/output_text), so its bytes
- *  live entirely in `text` and folding loses nothing structural. */
+ *  live entirely in `text` and folding loses nothing structural. #6949:
+ *  known-harmless top-level metadata keys (isHarmlessResponsesItemKey)
+ *  don't make the item structural either. */
 function isPlainTextResponsesSystemItem(raw: unknown): boolean {
   const m = asObj(raw);
   if (
     !m ||
     Object.keys(m).some(
-      (k) => k !== "type" && k !== "role" && k !== "content",
+      (k) =>
+        k !== "type" &&
+        k !== "role" &&
+        k !== "content" &&
+        !isHarmlessResponsesItemKey(k, m[k]),
     )
   )
     return false;

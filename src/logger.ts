@@ -208,6 +208,19 @@ export function setLogCapture(fn: ((level: string, msg: string) => void) | null)
 }
 
 let pendingRetentionDrains = 0;
+// closeLogger() waiters, invoked when the last replaced stream drains so a
+// shutdown can prove EVERY buffered line is on disk (not just the final
+// stream's). Cleared on fire so a later close does not re-run stale callbacks.
+let drainWaiters: Array<() => void> = [];
+
+function notifyDrainsSettled(): void {
+    if (pendingRetentionDrains !== 0) return;
+    const waiters = drainWaiters;
+    drainWaiters = [];
+    for (const w of waiters) {
+        try { w(); } catch { /* best-effort */ }
+    }
+}
 
 function openStream(file: string, deferRetention = false): WriteStream {
     mkdirSync(path.dirname(file), { recursive: true });
@@ -332,6 +345,7 @@ function getStream(): WriteStream | undefined {
             replaced.removeListener("close", settle);
             pendingRetentionDrains--;
             if (pendingRetentionDrains === 0 && replacedPath) applyLogRetention(replacedPath);
+            notifyDrainsSettled();
         };
         replaced.once("close", settle);
         closeQuietly(replaced, settle);
@@ -466,23 +480,38 @@ export const log: Logger = (level, msg) => {
 };
 
 /** Flush + close the log file. Call on shutdown; resolves once every buffered
- *  line has drained to disk, so awaiting it proves the durable record is complete. */
+ *  line has drained to disk, so awaiting it proves the durable record is complete.
+ *  That includes lines still in flight on REPLACED streams (rotated out before
+ *  shutdown): each is end()-ed asynchronously, so we wait for the drain counter
+ *  to settle as well as the final stream, or a slow replaced flush could resolve
+ *  us with its tail still unflushed (observed: a rotated record lost on Windows). */
 export function closeLogger(): Promise<void> {
     const s = stream;
     stream = undefined;
     streamFd = undefined;
     writeProven = false;
     bytesWritten = 0;
-    if (!s) return Promise.resolve();
     return new Promise((resolve) => {
         let done = false;
-        const finish = (): void => {
+        let streamEnded = !s;
+        const tryFinish = (): void => {
             if (done) return;
+            if (!streamEnded || pendingRetentionDrains !== 0) return;
             done = true;
             resolve();
         };
-        s.once("error", finish);
-        try { s.end(finish); } catch { finish(); }
+        if (s) {
+            const onEnd = (): void => {
+                streamEnded = true;
+                tryFinish();
+            };
+            s.once("error", onEnd);
+            try { s.end(onEnd); } catch { onEnd(); }
+        }
+        // settle() re-invokes tryFinish() as each replaced stream drains; the
+        // trailing call covers the already-settled case (no waiter registered).
+        if (pendingRetentionDrains > 0) drainWaiters.push(tryFinish);
+        tryFinish();
     });
 }
 
