@@ -1679,6 +1679,12 @@ const emergencyTruncateNode: PipelineNode = {
         },
       };
     }
+    // #7771: protected tools are hard-excluded from folding, so ordinary
+    // output must be spent first here too; protected text is the fallback.
+    const protectedIds = new Set<string>();
+    for (const message of messages) {
+      if (isMessageProtected(message, ctx.config)) protectedIds.add(message.id);
+    }
     const trunc = truncateLargeToolOutputs(
       messages,
       // Account for replayed clips: they already shrank the real request;
@@ -1689,6 +1695,7 @@ const emergencyTruncateNode: PipelineNode = {
       {
         protectRecentMessages: ctx.config.preserveRecentMessages,
         includeTextMessages: true,
+        protectedIds,
       },
     );
 
