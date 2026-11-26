@@ -191,7 +191,7 @@ const SELF_CLOSE = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?\\/>");
 // ref): a dead unit NEVER consumes the whitespace around it (it is content),
 // in either mode, so chunk-split parity needs no cross-push whitespace
 // memory.
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "(?:\\s*(?:[\\u2013\\u2014,\\-]\\s*)?(?:m\\d{0,3})?)?\\s*|(?<![\\w>])\\s*m\\d{0,3})$");
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "(?:\\s*(?:[\\u2013\\u2014,\\-]\\s*)?(?:m\\d{0,3})?)?\\s*|(?<![\\w>])\\s*m\\d{0,3}|\x3c\/\uFF5C(?:\uFF5C(?:D(?:S(?:M(?:L(?:\uFF5C(?:\uFF5C[^<>]{0,32})?)?)?)?)?)?)?)$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
 // The mangled \x3c<name>=… form counts too: once the `=` is there the tail is
@@ -321,6 +321,16 @@ function looseCloseEnd(s: string): number {
 // both modes agree on where the span dies. The termination still routes
 // through drop(), i.e. the existing [tag-echo] warn callback (owner §4(b)).
 const DEGEN_CLOSE_NAME = /^[^<>]{1,32}>/;
+// #7683: DeepSeek's tool-call template delimiter (the DSML pipe, fullwidth
+// U+FF5C wrapping "DSML") leaks into visible prose when the model emits its own
+// template tokens as text instead of structured tool calls — the serving layer
+// fails to parse them and returns them as text. The close form `</｜｜DSML｜｜name>`
+// is a complete tag (has both `</` and `>`), so it dies in place. The name is a
+// short tool word (invoke/calls/parameter); {0,32} mirrors the LONE_CLOSE
+// close-side bound. The DSML pipe is fullwidth (U+FF5C), a different code point
+// from the ASCII pipe (U+007C), so it cannot appear in legitimate prose.
+const DSML_PIPE = "\uFF5C\uFF5CDSML\uFF5C\uFF5C";
+const DSML_CLOSE = new RegExp("\x3c\\/" + DSML_PIPE + "[^<>]{0,32}>");
 // Single bare ref, exactly one (#2190 DEGEN_PAIR body rule); standalone const so
 // this stays valid when the master REF_* token constants churn (#2025 stack compat, #2229).
 const SINGLE_REF_BODY = /^\s*m\d{4,}\s*$/;
@@ -537,6 +547,7 @@ function stripPass(text: string, dropToolCallEmission: boolean, requestText: str
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(MANGLED_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
+        .replace(new RegExp(DSML_CLOSE.source, "g"), "")
     // #2862: dead ref-close units (ref + unterminated close head, mid-text or
     // at EOF). Position matters twice: BEFORE the truncate passes — TRUNC_CLOSE
     // eats the \x3c/name tail first and would leave the bare ref behind (the
@@ -599,6 +610,7 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
 export function normalizeEchoArtifacts(text: string): string {
     if (
         !containsRenderTagText(text) &&
+        !containsDsmlCloseText(text) &&
         !containsMarkerLineText(text) &&
         !containsBiliInternalText(text)
     ) {
@@ -628,6 +640,18 @@ export function containsRenderTagText(s: string): boolean {
     return RENDER_TAG_DETECT.test(s);
 }
 
+// #7683: whole-text pre-check for the DSML orphan close (DSML_CLOSE): the
+// non-streaming / event-level strip gates disjoin family probes to decide
+// whether stripAcpTags has work to do, and a DSML-only payload trips none of
+// the acplike probes — without this the whole-text paths leak the very shape
+// the streaming machine drops. Escape-tolerant like RENDER_TAG_DETECT: the
+// raw-body gate sites (plugin non-stream, responses event strings) see the
+// provider-serialized form where \x3c may ride as \u003c.
+const DSML_CLOSE_DETECT = new RegExp("\\\\u003c\\/" + DSML_PIPE + "[^<>]{0,32}(?:>|\\\\u003e)|\x3c\\/" + DSML_PIPE + "[^<>]{0,32}>");
+export function containsDsmlCloseText(s: string): boolean {
+    return DSML_CLOSE_DETECT.test(s);
+}
+
 // #2190: post-audit shape check — a bare ref immediately followed by ANY close
 // tag is echo residue by construction (genuine prose never puts mNNNNN right
 // before </word>; the kernel wraps refs in tags, so a naked ref IS the leak).
@@ -648,8 +672,10 @@ export function containsEchoResidue(s: string): boolean {
 export function mayStartRenderTag(s: string): boolean {
     // MANGLED_OPEN carries its own ">" (PARTIAL_TAIL only sees unterminated
     // tails), so it is tested directly: a chunk with a complete mangled open
-    // must engage the machine to drop it.
-    return RENDER_TAG_DETECT.test(s) || MANGLED_OPEN.test(s) || PARTIAL_TAIL.test(s);
+    // must engage the machine to drop it. DSML_CLOSE is likewise a complete
+    // tag (has both `</` and `>`), so it is tested directly rather than via
+    // PARTIAL_TAIL (#7683).
+    return RENDER_TAG_DETECT.test(s) || MANGLED_OPEN.test(s) || DSML_CLOSE.test(s) || PARTIAL_TAIL.test(s);
 }
 
 // #2190: a BROADER ambiguous head, used by the streaming gate and the filter's
@@ -1114,9 +1140,15 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
      *  close that releases its prose body), or does the artifact die whole /
      *  release content (false: complete refs-only units, dead orphans, a
      *  refs-only close, discarded payloads)? Default false; only the sites
-     *  below that provably leave or release interior pass true. */
-    const recordDrop = (snippet: string, duringDrain = false, leavesInterior = false) => {
-        onDropVerdict?.(leavesInterior);
+     *  below that provably leave or release interior pass true. A drop with
+     *  deliverVerdict=false touches no verdict at all: the DSML close (#7683)
+     *  is self-contained but is NOT an acplike span resolution — it cannot
+     *  close a pending acplike open, so it must not carry the span-resolution
+     *  "false" that would disarm a mangled-close's "suspect markup" arming
+     *  (the unclosed-echo retry tests in plugin-empty-turn-retry pin that
+     *  direction). */
+    const recordDrop = (snippet: string, duringDrain = false, leavesInterior = false, deliverVerdict = true) => {
+        if (deliverVerdict) onDropVerdict?.(leavesInterior);
         droppedAny = true;
         if (duringDrain) {
             if (onDrop && !drainNoticed) {
@@ -1131,9 +1163,9 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
         }
     };
     /** One self-contained artifact resolved by a single drop call. */
-    const drop = (snippet: string, duringDrain = false, leavesInterior = false) => {
+    const drop = (snippet: string, duringDrain = false, leavesInterior = false, deliverVerdict = true) => {
         dropCount += 1;
-        recordDrop(snippet, duringDrain, leavesInterior);
+        recordDrop(snippet, duringDrain, leavesInterior, deliverVerdict);
     };
     /** Any drop inside a live swallow session — the session counts once. */
     const dropSwallowSpan = (snippet: string, duringDrain = false, leavesInterior = false) => {
@@ -1360,8 +1392,11 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
             // drop it in place, no swallow (a following close dies via
             // LONE_CLOSE on its own).
             const g = MANGLED_OPEN.exec(buf);
+            // #7683: an orphan DSML close (DeepSeek's tool-call template
+            // delimiter leaking as text) is a complete tag — drop it in place.
+            const d = DSML_CLOSE.exec(buf);
             let m: RegExpExecArray | null = null;
-            for (const cand of [p, s, o, c, r, g]) {
+            for (const cand of [p, s, o, c, r, g, d]) {
                 if (cand && (m === null || cand.index < m.index)) m = cand;
             }
             // An opening whose attribute list never terminates (see
@@ -1525,6 +1560,12 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
                 swallowReleases = !wrapped && !toolTyped;
                 swallowBareOpen = bare;
                 swallowed = "";
+            } else if (m === d) {
+                // #7683: the DSML close drops without a verdict (see
+                // recordDrop) — it is not an acplike span resolution, so its
+                // drop must not disarm a mangled-close's "suspect markup"
+                // arming earlier in this frame.
+                drop(m[0], false, false, false);
             } else {
                 drop(m[0]);
             }

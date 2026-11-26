@@ -5,7 +5,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter } from "../src/loop/index.ts";
-import { stripAcpTags, createTagEchoFilter, containsRenderTagText, containsToolCallXmlFragment, mayStartRenderTag, isOrphanMarkupText } from "../src/loop/tag-echo-filter.ts";
+import { stripAcpTags, createTagEchoFilter, containsDsmlCloseText, containsRenderTagText, containsToolCallXmlFragment, mayStartRenderTag, normalizeEchoArtifacts, isOrphanMarkupText } from "../src/loop/tag-echo-filter.ts";
 import { rewriteJsonResponse } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponse } from "../src/stream-openai.ts";
 import { rewriteResponsesJsonResponse } from "../src/stream-responses.ts";
@@ -1190,4 +1190,118 @@ test("#2769: flush() can return non-orphan prose after a non-empty release with 
     const tail = f.flush();
     assert.equal(tail, "    ", "the held remainder resolves as content at EOF");
     assert.equal(isOrphanMarkupText(tail), false, "that content is NOT orphan markup — the pipe must count it as prose");
+});
+
+// #7683: DeepSeek's tool-call template delimiter (the DSML pipe, fullwidth
+// U+FF5C wrapping "DSML") leaks into visible prose when the model emits its
+// own template tokens as text. The close form `</｜｜DSML｜｜name>` is an
+// orphan close (no matching open, no ref body) that the existing acplike
+// matchers do not recognize. It must be stripped in both whole-text and
+// streaming modes, at every split position.
+const DSML_ORPHAN_CLOSE_NO_SPACE = (name: string) => `${LT}/${DSML_PIPE}${name}>`;
+const DSML_ORPHAN_CLOSE_SPACE = (name: string) => `${LT}/${DSML_PIPE} ${name}>`;
+
+test("#7683: stripAcpTags drops an orphan DSML close (no space)", () => {
+    assert.equal(stripAcpTags(DSML_ORPHAN_CLOSE_NO_SPACE("invoke")), "");
+    assert.equal(stripAcpTags(DSML_ORPHAN_CLOSE_NO_SPACE("calls")), "");
+    assert.equal(stripAcpTags(`prose ${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")} tail`), "prose  tail");
+});
+
+test("#7683: stripAcpTags drops an orphan DSML close (with space)", () => {
+    assert.equal(stripAcpTags(DSML_ORPHAN_CLOSE_SPACE("invoke")), "");
+    assert.equal(stripAcpTags(DSML_ORPHAN_CLOSE_SPACE("calls")), "");
+});
+
+test("#7683: streaming filter matches stripAcpTags for an orphan DSML close at every split position", () => {
+    const cases = [
+        DSML_ORPHAN_CLOSE_NO_SPACE("invoke"),
+        DSML_ORPHAN_CLOSE_NO_SPACE("calls"),
+        `prose ${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")} tail`,
+        `prose ${DSML_ORPHAN_CLOSE_SPACE("calls")} tail`,
+        `${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")}${DSML_ORPHAN_CLOSE_NO_SPACE("calls")}`,
+    ];
+    for (const full of cases) {
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+    }
+});
+
+test("#7683: legitimate prose is not affected by the DSML close strip", () => {
+    assert.equal(stripAcpTags("normal prose without any tags"), "normal prose without any tags");
+    assert.equal(stripAcpTags("a < b and c > d"), "a < b and c > d");
+    assert.equal(stripAcpTags(`keep ${TAG("m00100")} this`), "keep  this");
+});
+
+test("#7683: whole-text gate probe engages on a DSML-only payload (literal and JSON-escaped)", () => {
+    // The non-streaming / event-level strip gates disjoin family probes; a
+    // DSML-only payload trips none of the acplike probes, so the DSML probe
+    // must carry it. Without it stripAcpTags is never invoked on these paths.
+    assert.equal(containsRenderTagText(DSML_ORPHAN_CLOSE_NO_SPACE("invoke")), false, "acplike probe alone misses DSML — the gap this test pins");
+    assert.equal(containsDsmlCloseText(DSML_ORPHAN_CLOSE_NO_SPACE("invoke")), true);
+    assert.equal(containsDsmlCloseText(DSML_ORPHAN_CLOSE_SPACE("calls")), true);
+    assert.equal(containsDsmlCloseText(`{"content":"${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")}"}`), true);
+    // Provider-serialized raw body: \x3c rides as \u003c (and \x3e as \u003e).
+    const escaped = `\\u003c/${DSML_PIPE}invoke\\u003e`;
+    assert.equal(containsDsmlCloseText(escaped), true);
+    assert.equal(containsDsmlCloseText(`\\u003c/${DSML_PIPE} invoke>`), true);
+    // Negative: prose and acplike tags stay out of the DSML probe.
+    assert.equal(containsDsmlCloseText("normal prose without any tags"), false);
+    assert.equal(containsDsmlCloseText(TAG("m00100")), false);
+    assert.equal(containsDsmlCloseText(`${LT}/acp>`), false);
+});
+
+test("#7683: normalizeEchoArtifacts strips a DSML orphan close (judge parity)", () => {
+    // The invariant judge normalizes by the same artifact set the outbound
+    // filters strip; a DSML-only exit must not read as a mid-history rewrite.
+    assert.equal(normalizeEchoArtifacts(DSML_ORPHAN_CLOSE_NO_SPACE("invoke")), "");
+    assert.equal(normalizeEchoArtifacts(`prose ${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")} tail`), "prose  tail");
+    assert.equal(normalizeEchoArtifacts("normal prose without any tags"), "normal prose without any tags");
+});
+
+test("#7683: a DSML close inside an unclosed echo's interior does not disarm the markup verdict", () => {
+    // The unclosed-echo retry gate counts a frame's released text as markup
+    // when the LAST drop verdict leaves interior (#6034 last-write-wins). A
+    // mangled close arms that verdict ("whatever the frame still releases
+    // after the dead unit is suspect markup"); a DSML close dropped later in
+    // the same frame is NOT an acplike span resolution, so its drop must not
+    // carry the span-resolution "false" that would reclassify the interior as
+    // the answer and kill the retry (plugin-empty-turn-retry pins the
+    // end-to-end direction of this exact fixture).
+    const pad = " ".repeat(120);
+    const full = `${OPEN}tokens="247" type="text"\x3e m00693${LT}/cp\x3e${pad}\n${pad}\n <parameter name="i">Checking pocket CLI surface${DSML_ORPHAN_CLOSE_SPACE("parameter")}`;
+    const verdicts: boolean[] = [];
+    const f = createTagEchoFilter(undefined, undefined, undefined, undefined, (v) => verdicts.push(v));
+    const out = f.push(full) + f.flush();
+    assert.equal(out, `${pad}\n${pad}\n <parameter name="i">Checking pocket CLI surface`, "the interior is released, the DSML close is stripped");
+    assert.deepEqual(verdicts, [true, true], "open + mangled close arm the verdict; the DSML drop delivers none");
+});
+
+test("#7683: a DSML close after a settled acplike unit keeps the answer verdict", () => {
+    // The #6034 direction must stay intact: a complete refs-only unit (a valid
+    // 4+-digit ref body) dies whole and the text around it counts as the
+    // answer. A DSML close dropped after the unit must not flip that verdict
+    // back to markup.
+    const full = `${LT}acp\x3em00123${CLOSE} ${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")} tail`;
+    const verdicts: boolean[] = [];
+    const f = createTagEchoFilter(undefined, undefined, undefined, undefined, (v) => verdicts.push(v));
+    const out = f.push(full) + f.flush();
+    assert.equal(out, `  tail`, "the prose survives, the unit and the DSML close are stripped");
+    assert.deepEqual(verdicts, [false], "the settled unit delivers the answer verdict; the DSML drop delivers none");
+});
+
+test("#7683: a DSML-only turn delivers no verdict at all", () => {
+    // The issue's real case: the whole turn is DSML template tokens. Each
+    // close is self-contained and unrelated to any acplike span — the answer
+    // ledger's flag must be untouched (the retry then fires on the stripped
+    // echo alone, with nothing counted as the answer).
+    const full = `${DSML_ORPHAN_CLOSE_NO_SPACE("invoke")}${DSML_ORPHAN_CLOSE_NO_SPACE("calls")}`;
+    const verdicts: boolean[] = [];
+    const f = createTagEchoFilter(undefined, undefined, undefined, undefined, (v) => verdicts.push(v));
+    const out = f.push(full) + f.flush();
+    assert.equal(out, "");
+    assert.deepEqual(verdicts, [], "no acplike span is involved, so no verdict is delivered");
 });

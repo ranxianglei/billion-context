@@ -21,7 +21,7 @@ import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
 import { executeProxyToolAsync } from "./loop/core.js";
 import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
-import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { composeStreamFilters, containsBiliInternalText, containsDsmlCloseText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
@@ -5183,7 +5183,7 @@ export async function pipePluginResponsesWithStrip(
                         // Whole-field tool-call emission (m00885) — an absorb-instructed
                         // turn may answer as prose; drop the span, not just the tags.
                         const dropEmission = absorbInstructed === true && containsToolCallEmissionText(jsonStr);
-                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr) || dropEmission;
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsDsmlCloseText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr) || dropEmission;
                         if (hadEchoText) sawStrippedEcho = true;
                         let evOut = ev;
                         let rebuild = hadEchoText || retryRewritePending();
@@ -5240,7 +5240,7 @@ export async function pipePluginResponsesWithStrip(
                         // Whole-field tool-call emission (m00885) — an absorb-instructed
                         // turn may answer as prose; drop the span, not just the tags.
                         const dropEmission = absorbInstructed === true && containsToolCallEmissionText(jsonStr);
-                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr) || dropEmission;
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsDsmlCloseText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr) || dropEmission;
                         if (hadEchoText) sawStrippedEcho = true;
                         let evOut = ev;
                         let rebuild = hadEchoText || retryRewritePending();
@@ -5536,7 +5536,7 @@ export async function pipePluginJson(
         // tool-call emission written as prose — the raw-body probe is
         // escape-tolerant so it fires on the serialized JSON too.
         const dropEmission = absorbInstructed === true && containsToolCallEmissionText(text);
-        if (json && (dropEmission || containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text) || containsEchoResidue(text))) {
+        if (json && (dropEmission || containsRenderTagText(text) || containsDsmlCloseText(text) || containsMarkerLineText(text) || containsBiliInternalText(text) || containsEchoResidue(text))) {
         // #206 parity for the non-streaming plugin path: the compress loop's
         // JSON branch strips render tags from every round; a verbatim plugin
         // JSON response would re-feed the model's tag echoes. Strips mutate in
