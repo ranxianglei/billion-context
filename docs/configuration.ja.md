@@ -213,7 +213,7 @@
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | ログにアラートを出すまでの連続 EPERM 書き込み失敗回数。 |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM アラートの繰り返し間隔。0 の場合は 1 回のみログ出力する。 |
 | `sessions` | object | {} (all defaults) | — | セッションプールと GC のノブ（#2030）— 以前は BILI_MAX_SESSIONS / BILI_SESSION_GC* が環境変数のみ。 |
-| `sessions.dir` | string | unset (XDG data ディレクトリ) | BILI_SESSIONS_DIR | セッションディレクトリ全体（index.db + セッション JSON + CCR コンテンツストア）を容量不足のドライブ（例：肥大化する index.db を収まらない Windows C: ドライブ）からシェル環境を触らずに再配置する。環境変数の方が優先（#2030 の上書きレイヤ）。既存のファイル（ディレクトリでない）を指す値は、そのパスを名指しした明確なエラーで起動を拒否する（サイレントなフォールバックは、このキーが回避するべきディスク容量問題そのものを再生してしまうため）。非文字列値は警告付きで無視；相対パスはプロセスの CWD に対して解決される。他のパスと同様、ホット編集は次回再起動で反映。 |
+| `sessions.dir` | string | unset (XDG data dir) | BILI_SESSIONS_DIR | セッションディレクトリの再配置（#7803）：セッションレコード、index.db と CCR コンテントストアの保存先。優先順位は BILI_SESSIONS_DIR 環境変数 > このキー > XDG データディレクトリ。相対値はプロセス CWD に対して解決される。既存のファイルを指すと（静黙的なフォールバックでデータが満杯ディスクに戻るのを防ぐため）明確なエラーで起動を拒否する。変更は次回再起動で有効。 |
 | `sessions.max` | number | 256 | BILI_MAX_SESSIONS | セッションプールの上限：メモリに保持するセッション数の最大値。超過すると最も冷たいセッションが LRU で退避されます（ファイルはディスクに残ります）。 |
 | `sessions.warmMax` | number | 0 (warms none) | BILI_SESSION_WARM_MAX | 有界起動（#2803/#3050）：リッスン前に最近保存されたセッションのうち何個をウォームするか。0 = ウォームしない（未ウォームのセッションは初回アクセス時にオンデマンドで 1 回読み込み）。8 にすると #2803 のイージートウォームセットが復元されます。 |
 | `sessions.warmMaxBytes` | number | 67108864 (64 MiB) | BILI_SESSION_WARM_MAX_BYTES | 起動ウォームセットのデコードバイト予算（#2803）。予算を超える単一ファイルはウォームされません。 |
@@ -404,7 +404,6 @@
 | `BILI_STORAGE_ALLOW_LEGACY_DEGRADE` | boolean-ish | off | — | ピュア SQLite 姿勢の本破損拒否の脱出ハッチ (2026-11-21, #7156): 1/true/on は、破損したインデックスが唯一の永続コピーであるにもかかわらず、従来のアラーム & デグレード契約 (インデックスなしで起動し、JSON パスでサーブ) を復元する — そのようにサーブされた各ターンは非永続ビューにのみ落ちる。決してデフォルトではなく、いかなる設定値からも暗黙にはされない。 |
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | スナップショットレンダリングのシャドウ観測可能性（#3756 のフォローアップ）: アームされたターンごとに送信スナップショットビューを計算するが使用せず、レガシー送信との差分を分類し、セッションごとのカウンターを Web パネルおよびスナップショットシャドウ診断トピックに表示する。0/false/off で無効化、1/true/on で有効化、それ以外の場合は設定ファイルの snapshot.shadow ブール値が適用される（デフォルトは on）。レンダリングレーン自体はロールアウトゲート（BILI_ROLLOUT_SNAPSHOT_RENDER）で制御されるため、シャドウレーンは送信バイト列を変更しない - これは後日のロールアウトを切り替えるためのドライラン証拠である。 |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 設定ファイルのパスを上書きする（パスの再配置）。スラッシュ `/` を含まない名前（NAME）のみは命名設定 `<configDir>/NAME.json` を選択します。名前が誤っている場合は利用可能な名前を列挙して即座にエラーとなり、明示的なパスが誤っている場合は従来の空設定の挙動を維持します。 |
-| `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | セッションレコードの保存先（パスの再配置）。設定ファイルキーの `sessions.dir` でも同じ再配置が可能；両方が設定されている場合、環境変数が優先。 |
 | `BILI_ENCRYPTION_KEY` | string | unset | — | 暗号化された永続化ペイロード用の鍵材料（シークレット）。 |
 | `BILI_TUNNEL_ALLOWED_HOSTS` | string[] (csv) | unset | — | MITM トンネルレーン用のホスト許可リスト。 |
 | `BILI_RECLAIM_FETCH_PATCH` | boolean-ish | on | — | シャットダウン時にグローバル fetch パッチを回収するためのトグル。 |
@@ -2061,6 +2060,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 100 (GA — on by default) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 100 (on, GA) |
 | `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL` | `rollout.features.pluginMsgIdIncremental` | 100 (on, GA) |
+| `BILI_SESSIONS_DIR` | `sessions.dir` | unset (XDG data dir) |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false (off) |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 (1 h) |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |

@@ -216,7 +216,7 @@
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | 连续 EPERM 写失败达到该次数后在日志中告警。 |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM 告警的重复间隔；0 只记录一次。 |
 | `sessions` | object | {} (all defaults) | — | 会话池与 GC 旋钮（#2030）——原 BILI_MAX_SESSIONS / BILI_SESSION_GC* 仅环境变量。 |
-| `sessions.dir` | string | unset (XDG data 目录) | BILI_SESSIONS_DIR | 把整个会话目录（index.db + 会话 JSON + CCR 内容存储）从容量受限的磁盘（例如放不下不断增长 index.db 的 Windows C 盘）挪走，无需改动 shell 环境。环境变量优先（#2030 覆盖层）。指向已存在的文件（非目录）的值会带着该路径的明确报错拒绝启动（静默回退会重现这个 key 要解决的那个磁盘容量问题）；非字符串值带警告忽略；相对路径按进程 CWD 解析。与其他路径一样，热改在下次重启生效。 |
+| `sessions.dir` | string | unset (XDG data dir) | BILI_SESSIONS_DIR | 会话目录重定位（#7803）：会话记录、index.db 与 CCR 内容存储的存放位置。优先级 BILI_SESSIONS_DIR 环境变量 > 本键 > XDG 数据目录；相对值按进程 CWD 解析；指向已存在的文件会带路径明确报错拒绝启动（静默回退会把数据放回满盘上）。改动下次重启生效。 |
 | `sessions.max` | number | 256 | BILI_MAX_SESSIONS | 会话池上限：内存中最多持有的会话数；超出时最冷的会话被 LRU 逐出（其文件仍留在磁盘上）。 |
 | `sessions.warmMax` | number | 0 (warms none) | BILI_SESSION_WARM_MAX | 有界启动（#2803/#3050）：监听前预热最近保存的多少个会话；0 = 不预热（未预热会话首次触及时按需加载一次）。设 8 可恢复 #2803 的急切预热集。 |
 | `sessions.warmMaxBytes` | number | 67108864 (64 MiB) | BILI_SESSION_WARM_MAX_BYTES | 启动预热集的解码字节预算（#2803）；单文件超过预算则永不预热。 |
@@ -407,7 +407,6 @@
 | `BILI_STORAGE_ALLOW_LEGACY_DEGRADE` | boolean-ish | off | — | 纯 SQLite 姿态下“证实损坏拒启”的逃生阀（2026-11-21，#7156）：设 1/true/on 可恢复旧契约——响亮告警后照常不挂索引启动、以 JSON 路径服务，尽管此时损坏的索引是唯一持久副本，这样服务的每一轮都只落在非持久视图里。永不缺省、不被任何配置值隐含。 |
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。 |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。不带 `/` 的纯名字 NAME 选择命名配置 `<configDir>/NAME.json`；名字写错立即报错并列出可用名字，显式路径写错保持历史空配置行为。 |
-| `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。配置键 `sessions.dir` 可达成同样的重定位；两者都设时环境变量优先。 |
 | `BILI_ENCRYPTION_KEY` | string | unset | — | 加密持久化载荷的密钥材料（机密）。 |
 | `BILI_TUNNEL_ALLOWED_HOSTS` | string[] (csv) | unset | — | MITM 隧道车道的主机白名单。 |
 | `BILI_RECLAIM_FETCH_PATCH` | boolean-ish | on | — | 进程退出时回收全局 fetch 补丁的开关。 |
@@ -2060,6 +2059,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 100 (GA — on by default) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 100 (on, GA) |
 | `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL` | `rollout.features.pluginMsgIdIncremental` | 100 (on, GA) |
+| `BILI_SESSIONS_DIR` | `sessions.dir` | unset (XDG data dir) |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false (off) |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 (1 h) |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
