@@ -1,4 +1,5 @@
 export function stripComments(src: string): string;
+export function objectBody(src: string, openIdx: number): string;
 export function parseObjectMembers(body: string): Array<{ name: string; type: string }>;
 export function extractStringSet(src: string, varName: string): string[];
 export function extractConfigLeaves(configSrc: string): string[];

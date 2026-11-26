@@ -2641,11 +2641,17 @@ function dedupeDomains(list: string[]): string[] {
 // above; keep it in sync when adding fields there.
 const KNOWN_TOP_LEVEL_KEYS = new Set([
     "port", "host", "upstream", "providersPath", "providers", "proxy",
+    // #7483: FileConfig.modelEndpointPatterns (consumed by parseModelEndpointPatterns,
+    // src/config.ts + src/model-endpoints.ts) was missing here and warned as unknown.
+    "modelEndpointPatterns",
     "modelContextLimit", "sessionHeader", "log", "debug", "dumpSse",
     "passthrough", "autoUpdate", "autoRestartOnUpdate", "updateTag",
     "advisoryCheck", "advisoryUrl", "releaseNotesCheck", "releaseNotesUrl", "remoteAnnouncementsUrl",
     "upstreamProxy", "upstreamProxyMode",
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
+    // #7483: FileConfig.snapshot (consumed by src/server/snapshot-render.ts shadow) was
+    // missing here and warned as unknown.
+    "snapshot",
     "subagentSplit", "personaSplit", "forkAdoption", "affinitySimhash", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
     "rollout",
