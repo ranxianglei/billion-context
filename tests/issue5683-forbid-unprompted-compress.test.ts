@@ -162,11 +162,16 @@ test("#5683: requireRecommendation ON + SUBDIVIDING a recommended span — allow
     assert.ok(out.startsWith("[Compressed"), `subdivided span must pass, got: ${out.slice(0, 160)}`);
 });
 
-test("#5683: requireRecommendation ON + live range OUTSIDE the offer — refused naming the span, nothing folded", () => {
+test("#5683: requireRecommendation ON + span in NEITHER offer NOR live plan (dead refs) — refused naming the span, nothing folded", () => {
+    // #7816: the gate's set is the UNION of the prepare offer and the live
+    // recompute, so a live-compressible span outside a stale offer now PASSES
+    // (pinned by the #7816 staleness test below). Refusal now requires the span
+    // to be absent from BOTH: killing m5-m7 removes it from the live plan, and
+    // it was never in the offer, so the union has no coverage for it.
     const ctx = freshCtx();
     setOffer(ctx, [offerRange("m00001", "m00004", 4)]);
+    ctx.session.state.deadRefs = ["m00005", "m00006", "m00007"];
     storeUnpromptedGate(ctx.session, { nudgeInjected: false, requireNudge: false, requireRecommendation: true });
-    // m5-m7 are live-compressible per the kernel but were NOT offered this round.
     const out = runApply(ctx, { content: [{ startId: "m00005", endId: "m00007", summary: SUM }] });
     assert.ok(out.startsWith("[Compression REFUSED"), `expected refusal, got: ${out.slice(0, 160)}`);
     assert.ok(out.includes("requireRecommendation"), "receipt names the knob:\n" + out);
@@ -174,9 +179,14 @@ test("#5683: requireRecommendation ON + live range OUTSIDE the offer — refused
     assert.equal(ctx.session.state.blocks.length, 0, "no block may be created");
 });
 
-test("#5683: requireRecommendation ON + mixed range (part offered, part not) — refused as a whole", () => {
+test("#5683: requireRecommendation ON + mixed range (part offered, part dead) — refused as a whole", () => {
+    // #7816: the live-compressible tail (m5-m6) now sits in the union via the
+    // live recompute, so a purely "part offered / part not-offered" span passes.
+    // Refusal still fires when the non-offered portion is dead (in neither the
+    // offer nor the live plan): m3-m4 is offered, m5-m6 is dead ⇒ refused whole.
     const ctx = freshCtx();
     setOffer(ctx, [offerRange("m00001", "m00004", 4)]);
+    ctx.session.state.deadRefs = ["m00005", "m00006"];
     storeUnpromptedGate(ctx.session, { nudgeInjected: false, requireNudge: false, requireRecommendation: true });
     const out = runApply(ctx, { content: [{ startId: "m00003", endId: "m00006", summary: SUM }] });
     assert.ok(out.startsWith("[Compression REFUSED"), `mixed span must be refused whole, got: ${out.slice(0, 160)}`);
@@ -325,4 +335,50 @@ test("#5943: non-model stamps hold the window open (neither refresh nor decay)",
     }
     const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: SUM }] });
     assert.ok(out.startsWith("[Compressed"), `countTokens-style shapes must not burn the window, got: ${out.slice(0, 160)}`);
+});
+
+// ---------------------------------------------------------------------------
+// #7816 — position-merge consistency: the gate merges by POSITION (mirroring
+// formatRanges), so a positionally-merged advertised line is accepted as a
+// whole even when its raw ranges are ref-number-disjoint (non-monotonic refs).
+// ---------------------------------------------------------------------------
+
+test("#7816: positionally-merged advertised span with a ref-number hole — accepted by the scope gate", () => {
+    // The kernel's formatRanges merges positionally-adjacent raw ranges into one
+    // line (the model reads that line). When the refs are non-monotonic in array
+    // order (subagent interleaving / mid-array summary nodes), the positionally-
+    // merged line's raw ranges are ref-number-disjoint — the OLD gate's ref-number
+    // union kept a hole and refused the exact line formatRanges just printed.
+    // The NEW gate merges by position (mirroring formatRanges), so the line is
+    // accepted as a whole.
+    const msgs = Array.from({ length: 11 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 0, preserveRecentTokens: 0 }));
+    // Two raw ranges: positionally adjacent (indices 0-1 and 2-3) but ref-number-
+    // disjoint (m1-m2 vs m10-m11). formatRanges merges them into one line m1-m11.
+    // The OLD gate's ref-number union was [1,2] ∪ [10,11] (hole at [3,9]) and
+    // refused m1-m11; the NEW gate's position-merge yields [1,11] and accepts.
+    setOffer(ctx, [
+        { startRef: "m00001", endRef: "m00002", count: 2, tokens: 8000, chars: 32000, toolPct: 0, textPct: 100, startIndex: 0, endIndex: 1 },
+        { startRef: "m00010", endRef: "m00011", count: 2, tokens: 8000, chars: 32000, toolPct: 0, textPct: 100, startIndex: 2, endIndex: 3 },
+    ]);
+    storeUnpromptedGate(ctx.session, { nudgeInjected: false, requireNudge: false, requireRecommendation: true });
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00011", summary: SUM }] });
+    assert.ok(!out.includes("out-of-bounds compression is disabled"), "positionally-merged span must pass the scope gate:\n" + out);
+});
+
+test("#7816: span only in the live recompute (absent from a stale prepare offer) — accepted by the scope gate", () => {
+    // The OLD gate preferred the prepare-time snapshot (ctx.lastNudge) when
+    // present, so a span that the LIVE recompute advertised (acp_status shows it)
+    // but the stale offer did not was refused. The NEW gate unions the offer with
+    // the live recompute, so the live-advertised span passes.
+    const ctx = freshCtx();
+    const live = liveCompressionRanges(ctx);
+    assert.ok(live && live.ranges.length > 0, "fixture must yield a live recommendation set");
+    const r = live.ranges[0];
+    // Stale offer pointing at a DIFFERENT (small) span — the live range is NOT
+    // in the offer, so the OLD gate (offer-only) would refuse the live span.
+    setOffer(ctx, [offerRange("m00001", "m00002", 2)]);
+    storeUnpromptedGate(ctx.session, { nudgeInjected: false, requireNudge: false, requireRecommendation: true });
+    const out = runApply(ctx, { content: [{ startId: r.startRef, endId: r.endRef, summary: SUM }] });
+    assert.ok(!out.includes("out-of-bounds compression is disabled"), "live-advertised span must pass the scope gate:\n" + out);
 });
