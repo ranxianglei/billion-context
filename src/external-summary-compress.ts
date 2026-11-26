@@ -1,4 +1,4 @@
-import { collectBlockContent } from "acp-kernel";
+import { collectBlockContent, type CompressionState } from "acp-kernel";
 import { blockContentSnapshot } from "./session.js";
 import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from "./compress-tool.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
@@ -34,6 +34,13 @@ function withOptionalSummaries(input: unknown): unknown {
     return Array.isArray(content) ? { ...object, content: content.map(fill) } : fill(object);
 }
 
+/** Fingerprint of the conversation's raw message ids. Catches in-place state
+ *  mutation (new message added/removed) without firing on bookkeeping
+ *  markDirty, which bumps revisionEpoch without touching messageRefs. (#7655) */
+function stateFingerprint(state: CompressionState): string {
+    return Object.keys(state.messageRefs.byRaw).sort().join("\n");
+}
+
 /** Called under the host session lock; generation is separate from kernel commit. */
 export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx, callId?: string, signal?: AbortSignal): Promise<ProxyToolResult> {
     if (signal?.aborted) return compressResult("[Compression FAILED: cancelled. Nothing compressed.]", "refused", 0);
@@ -65,7 +72,7 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     const breaker = externalSummaryBreakerRefusal(ctx, plan.fingerprint, parsed.ranges);
     if (breaker) return compressResult(`[Compression FAILED: external summary requests paused. Nothing compressed.]${breaker}`, "refused", 0);
     const state = ctx.session.state;
-    const revision = ctx.session.revisionEpoch;
+    const fingerprint = stateFingerprint(state);
     const messages = (ctx.compressMessages ?? ctx.messages).map((message) => {
         const notes = imagePlaceholders(message);
         return notes.length > 0 ? { ...message, text: `${message.text ?? ""}\n${notes.join(" ")}` } : message;
@@ -123,7 +130,11 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
         return compressResult("[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);
     }
     const batch = await plan.summarize(work, signal);
-    if (signal?.aborted || ctx.session.state !== state || ctx.session.revisionEpoch !== revision) return compressResult("[Compression FAILED: cancelled or session changed while generating external summaries. Nothing compressed.]", "refused", 0);
+    if (signal?.aborted) return compressResult("[Compression FAILED: cancelled. Nothing compressed.]", "refused", 0);
+    if (ctx.session.state !== state || stateFingerprint(ctx.session.state) !== fingerprint) {
+        ctx.log("[external-summary] refused: session changed while generating external summaries");
+        return compressResult("[Compression FAILED: session changed while generating external summaries. Nothing compressed.]", "refused", 0);
+    }
     const successful: ParsedRange[] = [];
     for (const [index, result] of batch.results.entries()) {
         if (result.status === "success") successful.push({ ...valid[index], summary: result.summary, compressCallId: newExternalCallId() });

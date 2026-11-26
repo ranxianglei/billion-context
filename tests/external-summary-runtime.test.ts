@@ -428,7 +428,7 @@ test("dead-end restamped refs keep the specific superseded-ref refusal without a
     }, (_req, res) => { calls++; success(res); });
 });
 
-test("revision changes during generation discard results instead of committing a stale fold", async () => {
+test("real conversation change during generation discards results instead of committing a stale fold", async () => {
     let session: Session;
     await fixture(async (_base, externalSummary) => {
         const ctx = context(externalSummary); session = ctx.session;
@@ -436,6 +436,20 @@ test("revision changes during generation discard results instead of committing a
         assert.equal(result.outcome, "refused");
         assert.match(result.text, /session changed/);
         assert.equal(ctx.session.state.blocks.length, 0);
+    }, (_req, res) => {
+        session.state.messageRefs.byRaw["new-message"] = "m00999";
+        session.state.messageRefs.byRef["m00999"] = "new-message";
+        success(res);
+    });
+});
+
+test("bookkeeping markDirty during generation does not discard a succeeded summary", async () => {
+    let session: Session;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary); session = ctx.session;
+        const result = await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal(result.outcome, "applied", result.text);
+        assert.equal(ctx.session.state.blocks.length, 1);
     }, (_req, res) => { markDirty(session); success(res); });
 });
 
