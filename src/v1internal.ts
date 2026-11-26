@@ -16,7 +16,7 @@
 // int64 of the FNV-1a empty-string hash, "-3750763034362895579") — it must NOT
 // be used as conversation identity; extractConversationId does that instead.
 
-import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
+import { createSseFramer, finalizeSseLineEndings } from "./sse-util.js";
 
 const V1_MODEL_ENDPOINTS = ["streamGenerateContent", "generateContent", "countTokens"] as const;
 
@@ -176,31 +176,37 @@ export function wrapV1SseFrame(frame: string): string {
 export function v1UnwrapStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
-    let buf = "";
+    const framer = createSseFramer(true);
+    let pending: string[] = [];
     let mode: "unknown" | "sse" | "json" = "unknown";
-    const flushSse = (controller: TransformStreamDefaultController<Uint8Array>) => {
-        let idx: number;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-            const frame = buf.slice(0, idx);
-            buf = buf.slice(idx + 2);
-            controller.enqueue(encoder.encode(unwrapV1SseFrame(frame) + "\n\n"));
+    const flushSse = (text: string, controller: TransformStreamDefaultController<Uint8Array>) => {
+        for (const frame of framer.push(text)) {
+            controller.enqueue(encoder.encode(unwrapV1SseFrame(frame)));
         }
     };
     return stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
-            buf += decoder.decode(chunk, { stream: true });
-            // #3331: CRLF-emitting upstreams would otherwise never produce a
-            // `\n\n` boundary and every frame would hang in the buffer.
-            buf = normalizeSseLineEndings(buf);
+            const text = decoder.decode(chunk, { stream: true });
+            if (mode === "sse") { flushSse(text, controller); return; }
+            pending.push(text);
             if (mode === "unknown") {
-                const lead = buf.replace(/^[\uFEFF\s]+/, "");
+                // Earlier chunks contain only whitespace. Inspect the new
+                // chunk once, without joining or rescanning that prefix.
+                const lead = text.replace(/^[\uFEFF\s]+/, "");
                 if (lead.length > 0) mode = lead.startsWith("{") ? "json" : "sse";
             }
-            if (mode === "sse") flushSse(controller);
+            if (mode === "sse") {
+                for (const part of pending) flushSse(part, controller);
+                pending = [];
+            }
         },
         flush(controller) {
-            buf += decoder.decode();
-            buf = finalizeSseLineEndings(buf);
+            const tail = decoder.decode();
+            // Preserve the old EOF mapping: any last split CR and decoder
+            // residual belong to one final payload, with no invented delimiter.
+            const buf = mode === "sse"
+                ? [...framer.push(tail), ...framer.finish()].join("")
+                : finalizeSseLineEndings(pending.join("") + tail);
             if (buf.trim().length === 0) return;
             if (mode === "json") controller.enqueue(encoder.encode(unwrapV1ResponseJson(buf.trim())));
             else controller.enqueue(encoder.encode(unwrapV1SseFrame(buf)));
