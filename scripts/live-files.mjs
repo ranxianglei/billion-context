@@ -142,6 +142,10 @@ export const LIVE_FILES = [
     "tests/pack-install.test.ts",
     // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
     "tests/ci-janitor-fork-heads.test.ts",
+    // Spawns short-lived `bash -c` children executing the extracted ci.yml plan
+    // script with env fixtures; results land in mkdtemp dirs — no ports, no
+    // credentials, no long-lived listeners, safe under --test-concurrency.
+    "tests/ci-stale-pr-gate.test.ts",
     // Heap-bounded log readers in isolated children; private files, no sockets.
     "tests/web-logs-query.test.ts",
     // Native-zstd absence is simulated in an isolated Node child; it binds
