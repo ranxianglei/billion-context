@@ -413,7 +413,10 @@ host-side file grows with every turn: each turn takes longer as it grows
 (measured: tens of seconds per turn at ~30K messages, #5796), and the
 practical convergence path is to **start a new session** when it gets heavy.
 The web session list badges sessions at 5,000+ requests (长会话/slow) as a
-reminder that this point has been reached.
+reminder that this point has been reached. If you plan to uninstall bili, see
+the dsh "Before you uninstall" note in [docs/clients.md](docs/clients.md) — a
+bili-era session already over the model window cannot be continued by stock
+dsh after uninstall (#6972).
 
 **Why does the first compaction wait until ~200k?** Compaction does not
 trigger on absolute window position but on growth intervals: by default the
