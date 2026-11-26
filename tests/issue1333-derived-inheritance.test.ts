@@ -215,6 +215,90 @@ test("decompress and search_context fall back to the parent chain read-only (#13
     assert.ok(parent.blockContents.has(blockId));
 });
 
+// #7001: a session with one folded block whose SUMMARY omits `keyword` but
+// whose verbatim folded original (blockContents) carries it — the exact shape
+// the derived-session search fallback used to miss (summary-only precheck).
+function origOnlyFixture(id: string, keyword: string): Session {
+    const messages: CoreMessage[] = [];
+    for (let i = 1; i <= 6; i++) {
+        messages.push({ id: `u${i}`, role: "user", contentType: "text", text: `user turn ${i} with enough prose to fold comfortably`.repeat(3) });
+        messages.push({ id: `a${i}`, role: "assistant", contentType: "text", text: `assistant reply ${i} with enough prose to fold comfortably`.repeat(3) });
+    }
+    const core = createCore({ countTokens });
+    const seeded = core.processTurn({ messages, state: createInitialState(), config: defaultConfig(100000), tokenCount: 500 });
+    const compressed = core.applyCompression({
+        ranges: [{ startRef: "m00001", endRef: "m00008", summary: "a generic fixture summary that deliberately omits the distinctive keyword" }],
+        messages: seeded.messages,
+        state: seeded.state,
+        config: defaultConfig(100000, { compress: { minCompressRange: 0, minSummaryLength: 1, maxSummaryLength: 5000 }, preserveRecentMessages: 2, preserveRecentTokens: 0 }),
+    });
+    const session = getSession(id, { protocol: "openai", upstreamOrigin: "http://upstream" });
+    session.state = compressed.state;
+    for (const b of compressed.state.blocks) {
+        if (b.active) session.blockContents.set(b.blockId, { one: { text: `one-level view carrying the keyword ${keyword}`, count: 4 }, full: { text: `full verbatim original carrying the keyword ${keyword}`, count: 8 } });
+    }
+    return session;
+}
+
+test("derived-session search finds a keyword retained only in the parent's folded originals (#7001)", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const run = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const core = createCore({ countTokens });
+
+    const parent = origOnlyFixture(`pfa-parent-orig-${run}`, "quixotic");
+    const parentBlock = parent.state.blocks.filter((b) => b.active)[0]!;
+    assert.ok(parentBlock, "fixture must fold a block");
+    assert.ok(!parentBlock.summary.includes("quixotic"), "keyword must be absent from the summary");
+    assert.ok(parent.blockContents.get(parentBlock.blockId)!.full.text.includes("quixotic"), "keyword must be present in the folded original");
+
+    const child = getSession(`pfa-child-orig-${run}`, { protocol: "openai", upstreamOrigin: "http://upstream" });
+    child.metadata.derivedFromSessionId = parent.id;
+
+    // From the CHILD (no conversation target): the derived fallback must reach
+    // the parent's folded originals, not report "nothing to search".
+    const fromChild = executeSearchContextTarget({ query: "quixotic" }, core, child.id, child.state).text;
+    assert.doesNotMatch(fromChild, /^\[No compressed blocks exist yet/, "child must not report nothing to search");
+    assert.match(fromChild, /original text, not in any summary/, "the hit must be marked as folded-original text");
+    assert.match(fromChild, new RegExp(`Read-only search of historical session ${parent.id}`), "the result must name the derived ancestor");
+
+    // The explicit parent search already finds it — the child must agree.
+    const fromParent = executeSearchContextTarget({ query: "quixotic", conversation_id: parent.id }, core, child.id, child.state).text;
+    assert.match(fromParent, /original text, not in any summary/);
+});
+
+test("derived-session search reaches an original-only hit in a grandparent (#7001)", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const run = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const core = createCore({ countTokens });
+
+    // grandparent (original-only hit) ← parent (no blocks) ← child (no blocks).
+    const grand = origOnlyFixture(`pfa-grand-orig-${run}`, "zephyrine");
+    const parent = getSession(`pfa-parent-orig2-${run}`, { protocol: "openai", upstreamOrigin: "http://upstream" });
+    parent.metadata.derivedFromSessionId = grand.id;
+    const child = getSession(`pfa-child-orig2-${run}`, { protocol: "openai", upstreamOrigin: "http://upstream" });
+    child.metadata.derivedFromSessionId = parent.id;
+
+    const fromChild = executeSearchContextTarget({ query: "zephyrine" }, core, child.id, child.state).text;
+    assert.doesNotMatch(fromChild, /^\[No compressed blocks exist yet/, "child must not report nothing to search");
+    assert.match(fromChild, /original text, not in any summary/, "the grandparent's folded original must be surfaced");
+    assert.match(fromChild, new RegExp(`Read-only search of historical session ${grand.id}`), "the result must name the grandparent");
+});
+
+test("derived-session search still reports nothing when no ancestor holds the keyword (#7001 negative)", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const run = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const core = createCore({ countTokens });
+
+    const parent = origOnlyFixture(`pfa-parent-neg-${run}`, "quixotic");
+    const child = getSession(`pfa-child-neg-${run}`, { protocol: "openai", upstreamOrigin: "http://upstream" });
+    child.metadata.derivedFromSessionId = parent.id;
+
+    // A keyword absent from BOTH the parent's summary and its folded original
+    // must NOT be fabricated — the child reports the honest no-result.
+    const fromChild = executeSearchContextTarget({ query: "nonexistentkeyword" }, core, child.id, child.state).text;
+    assert.match(fromChild, /^\[No compressed blocks exist yet/, "no hit anywhere → honest no-result, not a fabricated match");
+});
+
 function listen(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();
     return once(server, "listening").then(() => undefined);
