@@ -2194,6 +2194,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "det.blocks_title": "압축 블록",
         "det.blocks_count": "{total}개 · 활성 {active}개",
         "det.blocks_empty": "아직 압축 블록 없음",
+        "det.blocks_empty_rebased": "authored-checkpoint rebase를 거쳤습니다: 기존 압축 블록은 클라이언트 체크포인트로 대체되었습니다. 원본은 여전히 CCR에 보관되어 있습니다(acp_status / decompress로 복원 가능) — 데이터 손실이 아닙니다.",
         "det.block_active": "활성",
         "det.block_external": "외부",
         "det.block_inactive": "비활성",
