@@ -177,6 +177,21 @@ export function isPluginFoldCallId(callId: string | undefined): boolean {
     return typeof callId === "string" && callId.startsWith(PLUGIN_FOLD_CALLID_PREFIX);
 }
 
+// #7497: line-format compress args header — "m00150–m0220 optional topic" per
+// the kernel COMPRESS_TOOL contract. Mirrored from the kernel's parseLineEntry
+// acceptance surface (kernel/src/parse-compress-input.ts REF_PAIR_IN_LINE +
+// normalizeLineRef): anchored at line start, m/b refs, the separator set the
+// kernel accepts, m-refs padded to 5 digits. Mirrored, not imported: the host
+// already mirrors kernel rules at its seams (#17 discipline). The `m` flag
+// makes `^` match the start of EACH line (the kernel applies it to one entry's
+// head at a time; here we scan the whole content string for all range blocks).
+const LINE_REF_PAIR = /^([mb]\d{1,7})\s*(?:[-\u2013\u2014\u2026~\u2212\uFF0D]|\.{2,3}|to)\s*([mb]\d{1,7})\b/gim;
+function normalizeLineRef(raw: string): string {
+    const lower = raw.toLowerCase();
+    const digits = lower.slice(1);
+    return lower[0] === "b" ? `b${digits}` : `m${digits.padStart(5, "0")}`;
+}
+
 /** Reconnect legacy plugin blocks before the kernel mistakes their live carriers for orphans. */
 export function reconcilePluginFoldCallIds(session: Session, messages: CoreMessage[]): number {
     const blocks = new Map<string, typeof session.state.blocks>();
@@ -193,8 +208,27 @@ export function reconcilePluginFoldCallIds(session: Session, messages: CoreMessa
         if (message.contentType !== "tool-call" || message.toolName !== "compress" || !message.toolCallId) continue;
         try {
             const args = JSON.parse(message.text ?? "") as { content?: unknown; startId?: unknown; endId?: unknown };
-            for (const range of Array.isArray(args?.content) ? args.content : [args]) {
-                if (!range || typeof range.startId !== "string" || typeof range.endId !== "string") continue;
+            const ranges: Array<{ startId: string; endId: string }> = [];
+            if (Array.isArray(args?.content)) {
+                for (const range of args.content) {
+                    if (range && typeof range.startId === "string" && typeof range.endId === "string") {
+                        ranges.push({ startId: range.startId, endId: range.endId });
+                    }
+                }
+            } else if (typeof args?.content === "string") {
+                // #7497: line format — content is a plain string of line blocks
+                // ("m00150–m0220 topic\n<summary>…"). Extract the range from each
+                // header line (aligned with the kernel's parseLineEntry surface).
+                // Previously this fell through to the flat {startId,endId} branch
+                // and matched nothing, so line-format plugin_ blocks were never
+                // reconciled and the kernel judged their re-sent carriers orphans.
+                for (const m of args.content.matchAll(LINE_REF_PAIR)) {
+                    ranges.push({ startId: normalizeLineRef(m[1]!), endId: normalizeLineRef(m[2]!) });
+                }
+            } else if (typeof args?.startId === "string" && typeof args?.endId === "string") {
+                ranges.push({ startId: args.startId, endId: args.endId });
+            }
+            for (const range of ranges) {
                 const key = JSON.stringify([range.startId, range.endId]);
                 if (!blocks.has(key)) continue;
                 const ids = calls.get(key) ?? new Set<string>();
