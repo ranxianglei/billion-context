@@ -865,6 +865,24 @@ export function coreToResponses(
             (part) => part.type === "input_image",
           ),
         });
+      else if (
+        ((message as BiliMessage).imagePart ||
+          (message as BiliMessage).text === CANONICAL_IMAGE_TEXT) &&
+        (message as BiliMessage).imageBase64 &&
+        (message as BiliMessage).imageMediaType
+      )
+        // Cross-lane image: no foreign raw item — rebuild the input_image
+        // part from the media sidecars (never the "[image]" text).
+        out.push({
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_image",
+              image_url: `data:${(message as BiliMessage).imageMediaType};base64,${(message as BiliMessage).imageBase64}`,
+            },
+          ],
+        });
       else
         out.push({
           type: "message",
@@ -905,6 +923,17 @@ export function coreToResponses(
       if (bili.imagePart && bili.rawResponsesItem) {
         const part = imageParts[img++];
         if (part) parts.push(part);
+      } else if (
+        bili.imagePart &&
+        bili.imageBase64 &&
+        bili.imageMediaType
+      ) {
+        // Cross-lane image: no foreign raw item — rebuild the input_image
+        // part from the media sidecars (never the "[image]" text).
+        parts.push({
+          type: "input_image",
+          image_url: `data:${bili.imageMediaType};base64,${bili.imageBase64}`,
+        });
       } else if (bili.text) {
         parts.push({ type: "input_text", text: bili.text });
       }
@@ -990,6 +1019,16 @@ export function coreToResponses(
         }
       } else if (message.contentType === "reasoning") {
         if (raw) out.push(raw);
+        else if ((message.text ?? "").trim().length > 0) {
+          // Cross-lane reasoning: no raw item to reuse and no signature the
+          // Responses API would accept — degrade to a visible assistant text
+          // message instead of dropping the content silently.
+          out.push({
+            type: "message",
+            role: "assistant",
+            content: message.text ?? "",
+          });
+        }
       }
     } else if (message.role === "tool") {
       const callId = message.toolCallId ?? "";

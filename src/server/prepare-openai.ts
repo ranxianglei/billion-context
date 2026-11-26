@@ -63,7 +63,7 @@ interface EgressRecordSourceMsg {
     text?: unknown;
 }
 import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
-import { resolveEgressAuthority, egressAuthorityArmed, egressBlockLedgerFor } from "./egress-lane-io.js";
+import { resolveEgressAuthority, egressAuthorityArmed, egressBlockLedgerFor, stampEgressSeqs } from "./egress-lane-io.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
@@ -397,7 +397,11 @@ export async function prepareOpenai(
         // re-mints #3752); only the live tail keeps the client's bytes.
         // No-op returns `msgs` when the lane is inactive/degraded.
         // reconcileFoldCoverage below still observes the CLIENT view.
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        let renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #7439 follow-up (C6): egress-on sequence authority — canonical 1-based
+        // flow message numbers on the kernel-visible cores (same reference when
+        // the plane does not record this session; the id path stays authoritative).
+        renderMsgs = stampEgressSeqs(getStore()?.egressOpLogStore(), sessionId, renderMsgs);
 
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),

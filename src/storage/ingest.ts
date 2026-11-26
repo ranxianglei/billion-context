@@ -517,11 +517,22 @@ function finishPlan(
             if (startSeq === -1 || s < startSeq) startSeq = s;
             if (s > endSeq) endSeq = s;
         }
+        // #7439 follow-up (C6): the kernel's OWN attested coverage bounds,
+        // carried on their native 1-based display space (CoreMessage.ledgerSeq
+        // / refs #4316 L3). The transcript resolution above lives in 0-based
+        // table space and is what eg-off keeps; egress-on sessions bind from
+        // these (see the per-block rule in ingestSession) — without it the
+        // flow-folded ids are already D'd from the view at save time and the
+        // bound would resolve to the honest no-claim sentinel.
+        const proven = typeof b.startSeq === "number" && typeof b.endSeq === "number" && b.startSeq >= 1 && b.endSeq >= b.startSeq
+            ? { provenStartSeq: b.startSeq, provenEndSeq: b.endSeq }
+            : {};
         return {
             blockId: b.blockId,
             ord,
             startSeq,
             endSeq,
+            ...proven,
             startRef: b.startRef !== undefined ? refToIndex(b.startRef) : null,
             endRef: b.endRef !== undefined ? refToIndex(b.endRef) : null,
             tier: b.tier,

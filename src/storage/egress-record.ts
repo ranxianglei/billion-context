@@ -89,6 +89,8 @@ export interface EgressSourceMsg {
     role: string;
     contentType?: unknown;
     text?: unknown;
+    /** #7439 follow-up (C6): per-turn flow stamp (never recorded). */
+    ledgerSeq?: number;
 }
 
 /** Build this turn's view rows: [system?] + one row per conversation
@@ -119,6 +121,15 @@ export function buildEgressViewRows(
     }
     for (const m of conversation) {
         const text = typeof m.text === "string" ? m.text : "";
+        // #7439 follow-up (C6): the kernel-visible core may carry a flow
+        // stamp (ledgerSeq — egress-on sequence authority). The RECORDED
+        // bytes are the lane-neutral canonical core: strip the stamp so a
+        // stamped round-trip never rewrites the row's bytes (a one-shot
+        // whole-flow U drift). The stamp is per-process, per-turn state —
+        // re-derived from the flow on every request; the identity hash
+        // already ignores it (identity.ts strips ledgerSeq).
+        const record = m.ledgerSeq === undefined ? m : Object.assign({}, m, { ledgerSeq: undefined });
+        delete (record as { ledgerSeq?: number }).ledgerSeq;
         rows.push({
             num: citationNumber(m.id, refMap),
             msgid: m.id,
@@ -126,7 +137,7 @@ export function buildEgressViewRows(
             tokens: Math.max(1, Math.ceil(text.length / 4)),
             type: m.id.startsWith("acp_summary") ? "acp_summary" : m.role === "tool" ? "tool" : "text",
             role: m.role,
-            bytes: JSON.stringify(m),
+            bytes: JSON.stringify(record),
         });
     }
     return rows;
