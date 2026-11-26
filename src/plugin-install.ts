@@ -44,7 +44,7 @@ import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome, read
 import { stripBiliWrappers, vertexBaseUrlForLocation } from "./vertex.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { isPidAlive, isProxyInstanceFile, lanePreferredPort, readProxyInstanceFile } from "./instance.js";
-import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
+import { DSH_PACKAGE, dshBundleInstalled, dshCopyDeclaresBundle, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { piNpmCopyRoot } from "./pi-channel.js";
 import { clearOwnerLaneBackoff, fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
@@ -2409,7 +2409,7 @@ interface LanePresence {
     targets: string[];
     form: "npm" | "local-path" | "managed-block" | "none";
     copyVersion?: string;
-    profiles?: Array<{ name: string; spec?: string; pinned: boolean; bundleInstalled: boolean; copyVersion?: string }>;
+    profiles?: Array<{ name: string; spec?: string; pinned: boolean; bundleInstalled: boolean; copyVersion?: string; bundleDeclared?: boolean }>;
 }
 
 function laneAbsent(): LanePresence {
@@ -2648,16 +2648,25 @@ export function inspectLanePresence(agent: PluginAgent): LanePresence {
         } catch {
             return laneAbsent();
         }
+        // #7643: dsh resolves bare bundle names installation-anchor-first — the
+        // DSH_HOME launcher shim ($DSH_HOME/node_modules/billion-context) shadows
+        // the profile-local copy when present, so the copy whose dsh.bundle
+        // declaration decides the lane is the shim, not the profile copy.
+        const shimRoot = path.join(resolveDshHome(process.env), "node_modules", DSH_PACKAGE);
+        const shimPresent = fs.existsSync(shimRoot);
         const profiles = dirs.flatMap((dir) => {
             const spec = dshProfileDepSpec(dir);
             const bundled = dshBundleInstalled(dir);
             if (spec === undefined && !bundled) return [];
+            const copyRoot = path.join(dir, "node_modules", DSH_PACKAGE);
+            const declRoot = shimPresent ? shimRoot : copyRoot;
             return [{
                 name: path.basename(dir),
                 spec,
                 pinned: spec !== undefined && !isRegistryDepSpec(spec),
                 bundleInstalled: bundled,
-                copyVersion: bundled ? pkgVersionAt(path.join(dir, "node_modules", DSH_PACKAGE)) : undefined,
+                copyVersion: bundled ? pkgVersionAt(copyRoot) : undefined,
+                bundleDeclared: bundled ? dshCopyDeclaresBundle(declRoot) : undefined,
             }];
         });
         if (profiles.length === 0) return laneAbsent();
