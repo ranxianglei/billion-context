@@ -73,7 +73,9 @@ test("banner carries pid + instance id and fires exactly once per listen", async
         }
         const banners = captured.filter((c) => c.msg.includes("listening on"));
         assert.equal(banners.length, 1, "one banner per successful listen");
-        assert.match(banners[0]!.msg, new RegExp(`^acp-proxy v[\\d.]+ \\(pid ${process.pid}, id [0-9a-f]{8}\\) listening on http://127\\.0\\.0\\.1:${port}`));
+        // #7556: the banner now stamps the process type — a bare `startServer`
+        // (no BILI_LAUNCHER_LANE) is a long-lived daemon.
+        assert.match(banners[0]!.msg, new RegExp(`^acp-proxy v[\\d.]+ \\(pid ${process.pid}, id [0-9a-f]{8}, daemon\\) listening on http://127\\.0\\.0\\.1:${port}`));
         assert.ok(banners[0]!.msg.includes("web UI:"), "rest of the banner line is unchanged");
     } finally {
         // best-effort close on EVERY path — an assertion failure above must not
@@ -85,5 +87,39 @@ test("banner carries pid + instance id and fires exactly once per listen", async
         setLogCapture(null);
         closeLogger();
         if (dir) rmrf(dir);
+    }
+});
+
+// #7556: a launcher-spawned proxy (BILI_LAUNCHER_LANE set) is a session-tied
+// lane, not a long-lived daemon — the banner must say so so a shared bili.log
+// reader can tell a lane boot from a daemon boot at a glance.
+test("banner stamps lane:<lane> when BILI_LAUNCHER_LANE is set", async () => {
+    const captured: Captured[] = [];
+    let dir: string | undefined;
+    let proxy: http.Server | undefined;
+    const prevLane = process.env.BILI_LAUNCHER_LANE;
+    try {
+        process.env.BILI_LAUNCHER_LANE = "claude";
+        const started = await startBare({}, captured);
+        proxy = started.proxy;
+        dir = started.dir;
+        const port = (proxy.address() as { port: number }).port;
+        const t0 = Date.now();
+        while (!captured.some((c) => c.msg.includes("listening on")) && Date.now() - t0 < 10_000) {
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        const banners = captured.filter((c) => c.msg.includes("listening on"));
+        assert.equal(banners.length, 1, "one banner per successful listen");
+        assert.match(banners[0]!.msg, new RegExp(`^acp-proxy v[\\d.]+ \\(pid ${process.pid}, id [0-9a-f]{8}, lane:claude\\) listening on http://127\\.0\\.0\\.1:${port}`));
+    } finally {
+        if (proxy !== undefined) {
+            const p = proxy;
+            await new Promise<void>((resolve) => p.close(() => resolve()));
+        }
+        setLogCapture(null);
+        closeLogger();
+        if (dir) rmrf(dir);
+        if (prevLane === undefined) delete process.env.BILI_LAUNCHER_LANE;
+        else process.env.BILI_LAUNCHER_LANE = prevLane;
     }
 });

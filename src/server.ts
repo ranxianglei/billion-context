@@ -1446,9 +1446,14 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // indistinguishable banners in 13s (short-lived instances rebinding
         // the same port) were impossible to attribute without them. The id
         // prefix matches the registry entry's full instanceId for grep.
+        // #7556: stamp the process type too — a launcher-spawned lane (BILI_LAUNCHER_LANE
+        // set) is session-tied and dies with its host, while a bare `bili start` is a
+        // long-lived daemon; on a shared bili.log the two were indistinguishable and a
+        // lane boot read as an unexplained daemon generation change.
+        const processType = launcherLane ? `lane:${launcherLane}` : "daemon";
         log(
             "info",
-            `acp-proxy v${VERSION} (pid ${process.pid}, id ${instanceId.slice(0, 8)}) listening on http://${displayHost}:${actualPort}` +
+            `acp-proxy v${VERSION} (pid ${process.pid}, id ${instanceId.slice(0, 8)}, ${processType}) listening on http://${displayHost}:${actualPort}` +
                 ` — web UI: http://${displayHost}:${actualPort}/__bili/` +
                 ` — zero-config: prefix any baseURL with http://${displayHost}:${actualPort}/bili/` +
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
@@ -1464,7 +1469,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         if (launchToken !== undefined) {
             writeSpawnPortLog(
                 opts.port,
-                `${logTimestamp()} [info] acp-proxy v${VERSION} (pid ${process.pid}, id ${instanceId.slice(0, 8)}) listening on http://${displayHost}:${actualPort}`,
+                `${logTimestamp()} [info] acp-proxy v${VERSION} (pid ${process.pid}, id ${instanceId.slice(0, 8)}, ${processType}) listening on http://${displayHost}:${actualPort}`,
             );
         }
         if (opts.passthrough) {
