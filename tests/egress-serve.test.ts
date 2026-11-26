@@ -1,8 +1,9 @@
 /**
  * Egress serve-from-log byte identity (seg 4a, proposal discussions/7398,
  * #6785 perf work): rebuildOutboundFromLog must produce EXACTLY the bytes
- * the legacy chain (systemToUser → coreToOpenai → hardenOpenaiAssistantContent)
- * produces for the same messages — that is the claim the shadow comparison
+ * the legacy chain (systemToUser → coreToOpenai → hardenOpenaiToolCallArguments
+ * → hardenOpenaiAssistantContent) produces for the same messages — that is
+ * the claim the shadow comparison
  * in prepare-openai measures, and the precondition for any future swap.
  * Also pins the degrade directions (#3617): corrupted/empty row bytes →
  * null (caller keeps the legacy path), never a partial rebuild.
@@ -12,7 +13,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isRenderedSummaryMessage } from "acp-kernel";
 import { coreToOpenai, type BiliMessage } from "acp-kernel/wire";
-import { hardenOpenaiAssistantContent, systemToUser } from "../src/util.ts";
+import { hardenOpenaiAssistantContent, hardenOpenaiToolCallArguments, systemToUser } from "../src/util.ts";
 import { egressAppendTurn, egressStateAt, egressStateView } from "../src/storage/egress-state.ts";
 import { recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
 import { rebuildCoreFromLog, rebuildOutboundFromLog } from "../src/storage/egress-serve.ts";
@@ -61,7 +62,8 @@ const M = (id: string, text: string, role: "user" | "assistant" = "user"): BiliM
     ({ id, role, contentType: "text", text } as BiliMessage);
 
 function legacyChain(msgs: BiliMessage[]): unknown {
-    return hardenOpenaiAssistantContent(coreToOpenai(systemToUser(msgs, (m) => isRenderedSummaryMessage(m))));
+    const argsHardened = hardenOpenaiToolCallArguments(coreToOpenai(systemToUser(msgs, (m) => isRenderedSummaryMessage(m))));
+    return hardenOpenaiAssistantContent(argsHardened.messages);
 }
 
 test("byte identity: plain text conversation rebuilds EXACTLY the legacy elements", () => {
@@ -138,6 +140,25 @@ test("byte identity: tool rows rebuild (the CAS body carries the sidecars)", () 
         const reb = rebuildOutboundFromLog(view);
         assert.ok(reb !== null, "tool rows rebuild — the recorded CAS bytes are the full core message (toolCallId/toolName included)");
         assert.equal(JSON.stringify(reb!.elements), JSON.stringify(legacyChain(msgs)), "tool-heavy conversation is byte-identical to the legacy chain");
+    } finally {
+        close(H);
+    }
+});
+
+test("byte identity: empty tool-call arguments harden identically (#5595)", () => {
+    const H = open();
+    try {
+        const S = "sess-s7";
+        const emptyCall = { id: "t0", role: "assistant", contentType: "tool-call", text: "", toolCallId: "call_empty", toolName: "bash" } as BiliMessage;
+        const toolMsg = { id: "t1", role: "tool", contentType: "text", text: "result", toolCallId: "call_empty", toolName: "bash" } as BiliMessage;
+        const msgs: BiliMessage[] = [M("a", "hello"), emptyCall, toolMsg, M("b", "after", "assistant")];
+        const view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: msgs, systemText: undefined, nowMs: 1000 });
+        const reb = rebuildOutboundFromLog(view);
+        assert.ok(reb !== null, "empty-args tool rows rebuild");
+        assert.equal(JSON.stringify(reb!.elements), JSON.stringify(legacyChain(msgs)), "empty-args conversation is byte-identical to the legacy chain (both hardened)");
+        const served = JSON.stringify(reb!.elements);
+        assert.ok(served.includes("_bili"), "the served arguments carry the placeholder, not an empty string");
+        assert.ok(!served.includes('"arguments":""'), "no empty arguments survive to the served elements");
     } finally {
         close(H);
     }

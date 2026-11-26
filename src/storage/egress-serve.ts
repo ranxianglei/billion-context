@@ -27,7 +27,7 @@
 
 import { isRenderedSummaryMessage } from "acp-kernel";
 import { coreToOpenai, type BiliMessage } from "acp-kernel/wire";
-import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
+import { hardenOpenaiAssistantContent, hardenOpenaiToolCallArguments, systemToUser } from "../util.js";
 import type { EgressViewRow } from "./egress-state.js";
 
 interface EgressRebuildResult {
@@ -68,8 +68,10 @@ export function rebuildCoreFromLog(view: readonly EgressViewRow[]): BiliMessage[
 export function rebuildOutboundFromLog(view: readonly EgressViewRow[]): EgressRebuildResult | null {
     const msgs = rebuildCoreFromLog(view);
     if (msgs === null) return null;
-    // Same chain, same predicates as prepare-openai :572 — identity is the
-    // claim, so the chain must be identical, not equivalent.
-    const elements = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(msgs, (m: BiliMessage) => isRenderedSummaryMessage(m))));
+    // Same chain, same predicates as the prepare-openai legacy rebuild
+    // (the !egressServedFromLog branch) — identity is the claim, so the
+    // chain must be identical, not equivalent.
+    const argsHardened = hardenOpenaiToolCallArguments(coreToOpenai(systemToUser(msgs, (m: BiliMessage) => isRenderedSummaryMessage(m))));
+    const elements = hardenOpenaiAssistantContent(argsHardened.messages);
     return { elements };
 }
