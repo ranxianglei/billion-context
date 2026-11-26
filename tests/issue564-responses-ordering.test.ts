@@ -132,6 +132,11 @@ const asstMsg = (id: string, text: string): CoreMessage => ({ id, role: "assista
 const reasoningMsg = (id: string, enc: string): CoreMessage & { rawResponsesItem: Record<string, unknown> } => ({ id, role: "assistant", contentType: "reasoning", text: id, rawResponsesItem: { type: "reasoning", id, encrypted_content: enc, summary: [] } });
 const toolCall = (id: string, callId: string, name: string, args: string): CoreMessage => ({ id, role: "assistant", contentType: "tool-call", toolCallId: callId, toolName: name, text: args });
 const toolResult = (id: string, callId: string, out: string): CoreMessage => ({ id, role: "tool", contentType: "tool-result", toolCallId: callId, text: out });
+// #7296: the kernel flattens a hosted call (web_search_call, file_search_call,
+// mcp_call, ...) into a contentType:"reasoning" core whose rawResponsesItem is
+// the original wire item. coreToResponses re-emits that raw item verbatim.
+const hostedCall = (id: string, type: string, extra: Record<string, unknown> = {}): CoreMessage & { rawResponsesItem: Record<string, unknown> } =>
+    ({ id, role: "assistant", contentType: "reasoning", text: `opaque:${id}`, rawResponsesItem: { type, id, status: "completed", ...extra } });
 
 function wireItems(core: CoreMessage[]): Item[] {
     return coreToResponses(core) as Item[];
@@ -261,6 +266,56 @@ test("#564: a surviving acp_summary carrier is untouched (no spurious separator)
     assert.ok(out.map((m) => m.id).includes("acp_summary_b1"), "summary carrier preserved");
     assert.ok(!out.some((m) => (m.text ?? "").includes("compressed")), "no synthetic separator injected");
     assertValidAssistantOrdering(wireItems(out), "carrier");
+});
+
+test("#7296: a hosted web_search_call stays in the same run as its reasoning (no spurious separator)", () => {
+    // The kernel flattens hosted calls into contentType:"reasoning" cores. The
+    // ordering repair must classify them as tool-call (phase 2), NOT as a second
+    // reasoning — otherwise it inserts a user separator between the reasoning and
+    // the hosted call, splitting the assistant run and making the server reject
+    // the web_search_call "without its required 'reasoning' item".
+    const original: CoreMessage[] = [
+        userMsg("u1", "Find a public reference."),
+        reasoningMsg("rs_fixture", "ENC_RS"),
+        hostedCall("ws_fixture", "web_search_call", { action: { type: "search", query: "fixture query" } }),
+    ];
+    const out = repairResponsesAssistantOrdering([...original], original);
+    assert.equal(out.slots.length, 0, "no separator inserted between reasoning and hosted call");
+    assert.deepEqual(out.messages.map((m) => m.id), ["u1", "rs_fixture", "ws_fixture"], "nothing added or dropped");
+    const items = wireItems(out.messages);
+    assert.deepEqual(
+        items.map((i) => (i.type === "message" ? `message:${i.role}` : i.type)),
+        ["message:user", "reasoning", "web_search_call"],
+        "reasoning + hosted call render as one intact assistant run",
+    );
+    assertValidAssistantOrdering(items, "#7296 hosted-call");
+});
+
+test("#7296: the separator still lands between distinct runs, not before a hosted call", () => {
+    // Two original assistant runs (split by a user message that folding removes):
+    // run 1 = reasoning + hosted call, run 2 = reasoning + message. The repair
+    // must keep run 1 intact (no separator between its reasoning and hosted call)
+    // and still separate run 2 (separator before run 2's reasoning).
+    const original: CoreMessage[] = [
+        userMsg("u1", "q1"),
+        reasoningMsg("rs1", "ENC_1"), hostedCall("ws1", "web_search_call", { action: { type: "search", query: "q" } }),
+        userMsg("u2", "q2"),
+        reasoningMsg("rs2", "ENC_2"), asstMsg("tx2", "BODY-2"),
+    ];
+    const folded: CoreMessage[] = [
+        userMsg("u1", "q1"),
+        reasoningMsg("rs1", "ENC_1"), hostedCall("ws1", "web_search_call", { action: { type: "search", query: "q" } }),
+        reasoningMsg("rs2", "ENC_2"), asstMsg("tx2", "BODY-2"),
+    ];
+    const out = repairResponsesAssistantOrdering(folded, original);
+    const ids = out.messages.map((m) => m.id);
+    assert.equal(out.slots.length, 1, "exactly one separator, between the two runs");
+    const sep = ids.find((id) => id.startsWith("acp_turn_sep_"));
+    assert.ok(sep, "a separator was minted");
+    const sepIdx = ids.indexOf(sep!);
+    assert.equal(ids[sepIdx - 1], "ws1", "separator comes right after the hosted call (run 1 intact)");
+    assert.equal(ids[sepIdx + 1], "rs2", "separator comes right before run 2's reasoning");
+    assertValidAssistantOrdering(wireItems(out.messages), "#7296 distinct-runs");
 });
 
 // --- #564/#2627 producer-owned provenance -------------------------------
