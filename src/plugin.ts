@@ -3235,6 +3235,18 @@ export async function pipePluginChatWithStrip(
                 undefined, streamErrorShape, { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
             return true;
         }
+        // #7410: thinking-then-stop — the model thought but produced no answer
+        // or tool call. Refetching the same request + same nudge degenerates
+        // again 41% of the time (measured), so skip the refetch and hand the
+        // turn back to the host as a retryable in-band error (same frame shape
+        // as the exhausted-retry path above). The host's own retry is the right
+        // recovery path for this shape; the first attempt's thinking block is
+        // the complete visible output, so no second thinking block is appended.
+        if (sawThinking && answerChars === 0 && !sawToolUse && !stalledTail) {
+            log?.("[plugin] degenerate terminal turn (thinking-then-stop); not refetching, emitting in-band error for host retry (#7410)");
+            emitStreamError(res, protocol, "the turn degenerated (thinking-then-stop)", undefined, streamErrorShape, { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
+            return true;
+        }
         degenerateRetries += 1;
         const attemptNote = maxDegenerateRetries > 1 ? ` (attempt ${degenerateRetries}/${maxDegenerateRetries})` : " once";
         log?.(announceTail
