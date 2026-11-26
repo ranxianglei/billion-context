@@ -24,7 +24,7 @@ import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSes
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
-import { estimateRawBodyTokens } from "../preflight.js";
+import { estimateRawBodyTokens, systemExcludingBilling } from "../preflight.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { countImagesInRawBody, imageTokensInParsedBody } from "../image-tokens.js";
 import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, recordSignedRefusal, signedRefusal } from "../apig-resign.js";
@@ -1291,11 +1291,18 @@ async function handleRequest(
         // (see claudeSubagentAgentId for the two-signal contract). Hoisted so
         // the conversation split, the pending-register guard, and the plugin
         // conversation binding below all test the same signal.
+        // #7726: identity view MINUS the rotating billing block (#2189) — cch /
+        // cc_prev_msg flip every turn and would otherwise flip the #5095
+        // lane-token subagent key on every turn. parsed.system (forwarding) is
+        // untouched; only this identity derivation drops the block.
+        const personaSystem = systemExcludingBilling(
+            (parsed as { system?: unknown }).system as string | Array<Record<string, unknown>> | undefined,
+        );
         const systemTextsForSplit: string[] =
-            typeof (parsed as { system?: unknown }).system === "string"
-                ? [(parsed as { system: string }).system]
-                : Array.isArray((parsed as { system?: unknown }).system)
-                  ? (parsed as { system: { text?: unknown }[] }).system
+            typeof personaSystem === "string"
+                ? [personaSystem]
+                : Array.isArray(personaSystem)
+                  ? personaSystem
                         .map((b) => (typeof b?.text === "string" ? b.text : ""))
                         .filter((t) => t.length > 0)
                   : [];

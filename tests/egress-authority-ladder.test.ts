@@ -55,9 +55,11 @@ test("recoverEgressBase: corrupt tail walks back to the newest healthy point and
     try {
         let view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: [M("m1", "alpha")], systemText: "sys", nowMs: 1 });
         view = recordEgressTurn({ store: H.store, sessionId: S, prev: view, conversation: [M("m1", "alpha"), M("m2", "beta")], systemText: "sys", nowMs: 2 });
-        // structurally corrupt the newest row (log_seq 3 = m2's I op) in BOTH tables
-        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND log_seq = 3`).run('{"x":1}', S);
-        H.db.prepare(`UPDATE egress_state SET payload = ? WHERE session_id = ? AND log_seq = 3`).run('{"x":1}', S);
+        // structurally corrupt the newest row (op_seq 3 = m2's I op) in BOTH tables
+        // (post-renumber 6842c71: log_seq is the kernel citation number — m2 is log_seq 2,
+        //  op_seq 3 — so the row must be addressed by op_seq, the ordering key)
+        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND op_seq = 3`).run('{"x":1}', S);
+        H.db.prepare(`UPDATE egress_state SET payload = ? WHERE session_id = ? AND op_seq = 3`).run('{"x":1}', S);
         const got = recoverEgressBase(H.store, S);
         assert.ok(got !== null);
         assert.equal(got.degraded, true);

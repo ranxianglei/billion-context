@@ -234,6 +234,25 @@ export function extractBillingAttributionBlock(
     return undefined;
 }
 
+// #7726: the billing-attribution block rotates per turn (cch / cc_prev_msg
+// inside it change), so it must never enter a system-IDENTITY derivation —
+// hashing it flips systemFp (#1930) and the #5095 lane-token subagent key on
+// every turn even when the real persona prompt is byte-identical. Returns the
+// system with billing blocks removed; non-array systems (string / absent) pass
+// through unchanged because only the anthropic block-array wire carries the
+// block. This is an identity view ONLY: parsed.system (forwarding) and the
+// #2189 extraction above are untouched.
+export function systemExcludingBilling(
+    system: string | Array<Record<string, unknown>> | undefined,
+): string | Array<Record<string, unknown>> | undefined {
+    if (!Array.isArray(system)) return system;
+    return system.filter((block) => {
+        if (!block || typeof block !== "object" || block.type !== "text") return true;
+        const text = block.text;
+        return !(typeof text === "string" && text.trimStart().startsWith(BILLING_ATTRIBUTION_PREFIX));
+    });
+}
+
 // #2189: 429 + error.type "rate_limit_error" + the BARE message "Error" is
 // upstream's credential-shape rejection (see above), not a rate limit — real
 // limits carry descriptive messages. Retrying the identical shape cannot

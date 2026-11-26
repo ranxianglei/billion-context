@@ -32,7 +32,7 @@ import { autoFoldEngaged, autoFoldFloor, externalSummaryEnabled, growthFoldingAr
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
-import { estimateCoreMessages, estimateCoreMessagesUpper, extractBillingAttributionBlock } from "../preflight.js";
+import { estimateCoreMessages, estimateCoreMessagesUpper, extractBillingAttributionBlock, systemExcludingBilling } from "../preflight.js";
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
 import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, countAnthropicSystemCacheControls, countAnthropicToolsCacheControls, pinClientMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
@@ -409,7 +409,10 @@ export async function prepareAnthropic(
         // re-serialization stay covered (src/fold-reconcile.ts).
         const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
         const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
-        noteSystemPromptFingerprint(session, clientSystem, { sessionId, log });
+        // #7726: fingerprint the client system MINUS the rotating billing block
+        // (#2189) — cch / cc_prev_msg flip every turn and would otherwise flip
+        // systemFp and mis-attribute genuine TTL drops to prompt switches.
+        noteSystemPromptFingerprint(session, systemExcludingBilling(clientSystem), { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
