@@ -3907,7 +3907,16 @@ interface MeasuredOutbound {
 // operator WHERE (a 55.2 MiB #5000 body with 1.44 MiB of messages[] means the
 // mass is tools[], not a giant paste).
 export function measuredBreakdownClause(b: RawBodyBreakdown): string {
-    return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
+    let s = `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
+    // #6957: when "other" carries real mass, name the specific top-level field(s)
+    // so the operator knows WHERE to look — a 1.6M-token "other" is only actionable
+    // if it says which field (the dsh→official-DeepSeek wire put the mass in a
+    // top-level field bili's messages-only compression can never touch).
+    if (b.other > 0 && b.otherTop.length > 0) {
+        const top = b.otherTop.slice(0, 3).map((e) => `${e.field} ~${e.tokens.toLocaleString("en-US")}`).join(", ");
+        s += ` (other: ${top})`;
+    }
+    return s;
 }
 
 export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {

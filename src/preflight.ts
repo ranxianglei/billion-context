@@ -576,40 +576,54 @@ export interface RawBodyBreakdown {
     tools: number;
     system: number;
     other: number;
+    /** #6957: the top-level field(s) carrying the "other" mass, sorted desc by
+     *  tokens. Empty when "other" is 0 or the body is not a top-level object.
+     *  Makes a 1.6M-token "other" actionable: the operator sees WHICH field. */
+    otherTop: { field: string; tokens: number }[];
 }
 
 export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
-    const pending: [unknown, string | undefined, number][] = [];
+    const otherTop = new Map<string, number>();
+    const pending: [unknown, string | undefined, number, string | undefined][] = [];
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
             if (isNonModelTopLevelKey(k)) continue;
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
-            pending.push([v, k, bucket]);
+            pending.push([v, k, bucket, bucket === 3 ? k : undefined]);
         }
     } else {
-        pending.push([parsed, undefined, 3]);
+        pending.push([parsed, undefined, 3, undefined]);
     }
     while (pending.length > 0) {
-        const [value, key, bucket] = pending.pop()!;
+        const [value, key, bucket, topField] = pending.pop()!;
         if (typeof value === "string") {
-            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) {
+                const t = defaultCountTokens(value);
+                buckets[bucket] += t;
+                if (topField !== undefined) otherTop.set(topField, (otherTop.get(topField) ?? 0) + t);
+            }
             continue;
         }
         if (Array.isArray(value)) {
-            for (const item of value) pending.push([item, key, bucket]);
+            for (const item of value) pending.push([item, key, bucket, topField]);
             continue;
         }
         if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket]);
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket, topField]);
         }
     }
+    const otherTopArr = [...otherTop.entries()]
+        .filter(([, t]) => t > 0)
+        .sort((a, b) => b[1] - a[1])
+        .map(([field, tokens]) => ({ field, tokens }));
     return {
         total: buckets[0] + buckets[1] + buckets[2] + buckets[3],
         messages: buckets[0],
         tools: buckets[1],
         system: buckets[2],
         other: buckets[3],
+        otherTop: otherTopArr,
     };
 }
 

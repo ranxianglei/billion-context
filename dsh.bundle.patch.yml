@@ -18,6 +18,15 @@
 # disable the bili-compaction-gate entry itself: it carries the service the
 # presets wait on; to uninstall, remove billion-context from
 # dsh.profile.bundles instead.
+# #6956: the dsh PLUGIN-MARKET "disable" toggle kills BOTH entries (bili-native
+# AND the gate) at once — the gate service then never registers, the presets'
+# inject [biliBasicCompactionPolicy] latch is unsatisfiable, and the host
+# reports preset-ptc (the default) as not-found, bricking new-conversation
+# init. That is a DSH-side defect (an unsatisfiable inject must degrade, not
+# hang); the in-repo surface is this note + the docs/clients.md "Disabling vs
+# removing" pointer. The supported off-switches are: disable bili-native ONLY
+# (gate stays alive, #3662) or remove billion-context from bundles (uninstall,
+# #6972).
 - insert:
     - id: bili-native
       name: billion-context
