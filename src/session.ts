@@ -648,7 +648,14 @@ export type Session = {
           *  value in the window carries it; one legacy sample in the window
           *  keeps the factor inert until the window flushes it out. */
          calibrationRing?: { origin: string; model?: string; values: number[]; provenances?: (string | undefined)[] };
-        /** #1933 F1: pending pairing input — local estimate of the LAST
+         /** #7778: the session's peak local estimate (billed caliber) seen so
+          *  far — the reference for the calibration mass-gate. A sample whose
+          *  estimate is a small fraction of this peak is a side call (fixed-
+          *  overhead-dominated, biased ratio) and must not teach the ring.
+          *  Persisted so a restart keeps the gate warm; reset at the same
+          *  native-compaction boundary as the ring. */
+         calibrationPeakEstimate?: number;
+         /** #1933 F1: pending pairing input — local estimate of the LAST
          *  prepared outbound in BILLED caliber (estimateCoreMessages +
          *  system/tools overhead + image reserve, defaultCountTokens rate;
          *  includes host-projected thinking mass since #2407),
@@ -1902,6 +1909,10 @@ export function resetSessionCompression(session: Session): void {
     // #5952: same boundary — the factor's text-only provenance dies with it.
     delete session.stats.calibratedEstimateProvenance;
     delete session.stats.calibrationRing;
+    // #7778: the mass-gate reference dies with the ring — the rebuilt
+    // conversation is a new size regime, and a stale peak would keep gating
+    // out the rebuilt session's own (honest) samples.
+    delete session.stats.calibrationPeakEstimate;
     delete session.stats.lastLocalTextEstimate;
     delete session.stats.lastLocalTextEstimateOrigin;
     delete session.stats.lastCalibrationPolicy;

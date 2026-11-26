@@ -227,8 +227,12 @@ interface PersistedSession {
         calibratedEstimate?: number;
         calibratedEstimateOrigin?: string;
         calibratedEstimateModel?: string;
-        calibratedEstimateProvenance?: string;
-        calibrationRing?: { origin: string; model?: string; values: number[]; provenances?: (string | undefined)[] };
+         calibratedEstimateProvenance?: string;
+         calibrationRing?: { origin: string; model?: string; values: number[]; provenances?: (string | undefined)[] };
+         // #7778: the mass-gate's peak reference — persisted so a restart keeps
+         // the gate warm (side calls stay gated out instead of re-poisoning the
+         // ring while the peak re-learns). Restored in buildSession.
+         calibrationPeakEstimate?: number;
         pendingFoldUsage?: boolean;
         lastLocalTextEstimate?: number;
         lastLocalTextEstimateOrigin?: string;
@@ -4545,6 +4549,12 @@ function buildSession(parsed: PersistedSession): Session {
             // not survive a restart wearing a provenance it never earned.
             calibratedEstimateProvenance: stats.calibratedEstimateProvenance === CALIBRATION_PROVENANCE_TEXT_ONLY ? CALIBRATION_PROVENANCE_TEXT_ONLY : undefined,
             calibrationRing: restoreCalibrationRing(stats.calibrationRing),
+            // #7778: the mass-gate's peak reference — restored so a restart
+            // keeps the gate warm (side calls stay gated out instead of
+            // re-poisoning the ring while the peak re-learns). A corrupt or
+            // non-positive value is rejected outright (treated as "no peak
+            // yet"), the same discipline as the entries above.
+            calibrationPeakEstimate: typeof stats.calibrationPeakEstimate === "number" && Number.isFinite(stats.calibrationPeakEstimate) && stats.calibrationPeakEstimate > 0 ? stats.calibrationPeakEstimate : undefined,
             // Intentionally NOT restored (#2129 triage): pendingFoldUsage is set at
             // compress execution and consumed only as a log-suffix attribution by the
             // NEXT usage report (#695) — restoring a stale true would mislabel an
