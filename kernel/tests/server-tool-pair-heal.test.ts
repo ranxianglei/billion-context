@@ -22,6 +22,15 @@ const res = (id: string) => ({
   tool_use_id: id,
   content: { type: "advisor_result", text: "advice" },
 });
+const think = (signature?: string) => ({
+  type: "thinking",
+  thinking: "hmm",
+  ...(signature ? { signature } : {}),
+});
+const redacted = () => ({
+  type: "redacted_thinking",
+  data: "REDACTED",
+});
 const wire = (messages: unknown[]) => messages as AnthropicWireMessage[];
 const roundTrip = (messages: AnthropicWireMessage[]) => {
   const { msgs, cacheControls } = anthropicToCore({
@@ -157,4 +166,107 @@ test("an assistant message emptied by the heal keeps role alternation via placeh
   assert.deepEqual(out[1]!.content, [
     { type: "text", text: "(server tool exchange folded)" },
   ]);
+});
+
+// #5864 second producer: dropping the orphaned server-tool half can leave a
+// thinking-family block as the FINAL block — "the final block in an assistant
+// message cannot be thinking" 400s the whole request. The heal must append the
+// same placeholder the emptied case uses so the thinking block is never final.
+// Positive rows (both fold directions + redacted_thinking) AND a negative row
+// (thinking with a complete pair round-trips byte-identical, #3617).
+
+test("orphaned result after thinking: placeholder keeps thinking from being the final block", () => {
+  const messages = wire([
+    { role: "user", content: [{ type: "text", text: "q1" }] },
+    {
+      role: "assistant",
+      content: [think("sig"), use("srvtoolu_a"), res("srvtoolu_a")],
+    },
+    { role: "user", content: [{ type: "text", text: "q2" }] },
+  ]);
+  const { msgs } = roundTrip(messages);
+  // Simulate a fold that covered only the server_tool_use block.
+  const folded = msgs.filter(
+    (m) =>
+      !(m.rawAnthropicBlock as { type?: string } | undefined)?.type?.startsWith(
+        "server_tool_use",
+      ),
+  );
+  const out = coreToAnthropic(folded);
+  assert.deepEqual(out[1], {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "hmm", signature: "sig" },
+      { type: "text", text: "(server tool exchange folded)" },
+    ],
+  });
+});
+
+test("orphaned use after thinking (not last message): placeholder keeps thinking from being the final block", () => {
+  const messages = wire([
+    { role: "user", content: [{ type: "text", text: "q1" }] },
+    {
+      role: "assistant",
+      content: [think("sig"), use("srvtoolu_a"), res("srvtoolu_a")],
+    },
+    { role: "user", content: [{ type: "text", text: "q2" }] },
+  ]);
+  const { msgs } = roundTrip(messages);
+  // Simulate a fold that covered only the advisor_tool_result block.
+  const folded = msgs.filter(
+    (m) =>
+      (m.rawAnthropicBlock as { type?: string } | undefined)?.type !==
+      "advisor_tool_result",
+  );
+  const out = coreToAnthropic(folded);
+  assert.deepEqual(out[1], {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "hmm", signature: "sig" },
+      { type: "text", text: "(server tool exchange folded)" },
+    ],
+  });
+});
+
+test("orphaned result after redacted_thinking: placeholder keeps redacted_thinking from being the final block", () => {
+  const messages = wire([
+    { role: "user", content: [{ type: "text", text: "q1" }] },
+    {
+      role: "assistant",
+      content: [redacted(), use("srvtoolu_a"), res("srvtoolu_a")],
+    },
+    { role: "user", content: [{ type: "text", text: "q2" }] },
+  ]);
+  const { msgs } = roundTrip(messages);
+  const folded = msgs.filter(
+    (m) =>
+      !(m.rawAnthropicBlock as { type?: string } | undefined)?.type?.startsWith(
+        "server_tool_use",
+      ),
+  );
+  const out = coreToAnthropic(folded);
+  assert.deepEqual(out[1], {
+    role: "assistant",
+    content: [
+      { type: "redacted_thinking", data: "REDACTED" },
+      { type: "text", text: "(server tool exchange folded)" },
+    ],
+  });
+});
+
+test("thinking with a complete server-tool pair round-trips byte-identical (negative row)", () => {
+  const messages = wire([
+    { role: "user", content: [{ type: "text", text: "q1" }] },
+    {
+      role: "assistant",
+      content: [
+        think("sig"),
+        use("srvtoolu_a"),
+        res("srvtoolu_a"),
+        { type: "text", text: "a1" },
+      ],
+    },
+    { role: "user", content: [{ type: "text", text: "q2" }] },
+  ]);
+  assert.deepEqual(roundTrip(messages).out, messages);
 });
