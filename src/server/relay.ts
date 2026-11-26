@@ -1065,14 +1065,17 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // small. Log the measurement as evidence and forward; the
                 // upstream answers with its own real numbers (annotated in
                 // the upstream size-error branch below, same issue).
-                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; the #554 meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
+                // #5172: the wall is the UNRESERVED one — name it "declared",
+                // never "effective" (that label means the lower reserved
+                // judging window nudge/preflight use: one word, two numbers).
+                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; the #554 meter) vs the declared model window ${declaredWindow.toLocaleString("en-US")} (the unreserved upstream wall — nudge/preflight judge against the lower reserved window, see [headroom]; model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
                 log("info", `[${prepared.session.id}] egress window fuse profile (duplication): ${describeCoreTextDuplication(fuseMsgs)}`);
             }
             const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
             if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
                 // #7537: byte-math profile over the local window bar — log and
                 // forward, same ruling as above.
-                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound core text alone is ~${fuseBytes} bytes (≥ ~${Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN)} tok at the densest observed density, #2122) vs the effective model window ${declaredWindow} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
+                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound core text alone is ~${fuseBytes} bytes (≥ ~${Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN)} tok at the densest observed density, #2122) vs the declared model window ${declaredWindow} (the unreserved upstream wall — nudge/preflight judge against the lower reserved window, see [headroom]; model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
             }
         }
     }

@@ -37,11 +37,13 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { setLogCapture, muteStderrLeg } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 const WINDOW = 20_000;
 
 type Call = { bytes: number };
+type Captured = { level: string; msg: string };
 
 function chatSse(text: string): string {
     const chunk = (delta: Record<string, unknown>, finish: string | null, extra?: Record<string, unknown>): string =>
@@ -95,7 +97,9 @@ function proxyOptions(routes: Record<string, object>): ProxyOptions {
         }),
         compress: { injectTool: true, injectNudge: true },
         sessionHeader: "x-acp-session",
-        log: false,
+        // #5172: log ON so the fuse's profile line reaches the capture hook
+        // (logMsg is gated on opts.log); the stderr leg is muted below.
+        log: true,
         debug: false,
         passthrough: false,
         autoUpdate: false,
@@ -116,6 +120,9 @@ type Ctx = { url: string; headers: Record<string, string> };
 async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => void }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
+    // #5172: log is ON for the capture hook — keep the stderr leg out of the
+    // test-runner output (same seam issue5191-arm-judge-line uses).
+    muteStderrLeg();
     const { server: upstream, calls } = makeUpstream();
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
@@ -157,8 +164,14 @@ const post = (ctx: Ctx, messages: Array<{ role: string; content: string }>, with
         body: JSON.stringify({ ...(withModel ? { model: "gpt-test" } : {}), stream: true, messages }),
     });
 
-test("e2e #4079 (#7537): a body that no window can fit is FORWARDED — the fuse logs, the upstream's 413 passes through annotated", async () => {
+test("e2e #4079 (#7537): a body that no window can fit is FORWARDED — the fuse logs, the upstream's 413 passes through annotated", async (t) => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-4079a-"));
+    // #5172: capture the fuse's log profile to pin its wall wording (the same
+    // seam issue5191-arm-judge-line uses); opts.log must be ON for logMsg to
+    // reach the capture hook, and the stderr leg is muted in setup().
+    const captured: Captured[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    t.after(() => setLogCapture(null));
     const { ctx, calls, close } = await setup();
     try {
         // No `model` in the body → preflight's `!model` early return skips its
@@ -181,6 +194,15 @@ test("e2e #4079 (#7537): a body that no window can fit is FORWARDED — the fuse
         // THE behavior under test: the payload WAS forwarded — the fuse logs,
         // it does not judge (#7537).
         assert.equal(calls.length, 1, `upstream must see exactly one call (got ${JSON.stringify(calls)})`);
+        // #5172: the fuse's reference to the unreserved wall now lives in its
+        // log profile (the local 413 message #7537 removed) — pin the wording
+        // there: "declared", never "effective" (that label means the lower
+        // reserved judging window nudge/preflight use: one word, two numbers).
+        const fuseLine = captured.find((e) => e.level === "warn" && e.msg.includes("egress window fuse profile: outbound body measures"));
+        assert.ok(fuseLine, "the measured tier logged its profile before forwarding");
+        assert.match(fuseLine.msg, /declared model window/, "the fuse names the unreserved wall it measures against (#5172)");
+        assert.match(fuseLine.msg, /unreserved upstream wall/, "the fuse states it is the unreserved wall, not the reserved judging window (#5172)");
+        assert.doesNotMatch(fuseLine.msg, /effective model window/, "the ambiguous 'effective model window' label is gone (#5172)");
     } finally {
         await close();
         rmrf(root);
