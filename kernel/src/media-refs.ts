@@ -11,7 +11,8 @@
  *
  * The fix splits the class: a media message is FOLDABLE when it exposes at
  * least one extractable re-access handle (a non-data: URL, a file id, a
- * fileUri). Folding then loses nothing unrecoverable — the handles ride the
+ * fileUri, a DSH attachment id — #6875). Folding then loses nothing
+ * unrecoverable — the handles ride the
  * stored summary verbatim (collectFoldMediaRefs appends them mechanically at
  * apply time, below), and decompress restores the original message
  * losslessly regardless. Only media with NO extractable ref stays pinned,
@@ -88,6 +89,19 @@ export function looksEphemeralSignedUrl(ref: string): boolean {
   return false;
 }
 
+/** #6875: a DSH image part's re-access handle is its attachment's
+ *  content-addressed id — push it verbatim (bare-id parallel to a DeepSeek
+ *  file_id; pushRef's inline-data/ephemeral guards do not apply to it).
+ *  An attachment with no usable id pushes nothing, so the message keeps
+ *  pinning (conservative). */
+function pushDshAttachmentRef(
+  refs: string[],
+  part: Record<string, unknown>,
+): void {
+  if (part.type !== "image") return;
+  pushRef(refs, asObj(part.attachment)?.attachmentId);
+}
+
 function pushRef(refs: string[], ref: unknown): void {
   if (typeof ref !== "string" || ref.length === 0 || isInlineDataUrl(ref)) return;
   // #5865-P2: an expiring handle is not a re-access handle — keep the
@@ -111,7 +125,7 @@ export function extractMediaRefs(message: CoreMessage): string[] {
     else if (roc.type === "file") {
       pushRef(refs, roc.file_id);
       pushRef(refs, roc.url);
-    }
+    } else if (roc.type === "image") pushDshAttachmentRef(refs, roc);
   }
   if (Array.isArray(m.rawOpenaiContentParts)) {
     for (const p of m.rawOpenaiContentParts) {
@@ -121,7 +135,7 @@ export function extractMediaRefs(message: CoreMessage): string[] {
       else if (part.type === "file") {
         pushRef(refs, part.file_id);
         pushRef(refs, part.url);
-      }
+      } else if (part.type === "image") pushDshAttachmentRef(refs, part);
     }
   }
 

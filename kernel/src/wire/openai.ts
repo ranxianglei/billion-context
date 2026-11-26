@@ -28,6 +28,25 @@ function imageFingerprintsOfParts(parts: unknown[]): string[] {
   return out;
 }
 
+/** #6875: a DSH image part — `{type:"image",
+ *  attachment:{attachmentId, ...}}` — is the one tool-result shape the
+ *  codec preserves into a sidecar. The attachmentId is a durable
+ *  content-addressed handle (media-refs.ts enumerates it), so carrying it
+ *  through is what makes the message foldable instead of invisibly
+ *  media-carrying. Any other opaque tool-result part keeps the legacy
+ *  text-only reduction: a sidecar the classifier does not recognize would
+ *  newly pin the message (the #6875 trap — codec and enumeration must land
+ *  together). */
+function isDshAttachmentPart(part: unknown): part is OpenAIContentPart {
+  if (!part || typeof part !== "object") return false;
+  const p = part as { type?: unknown; attachment?: unknown };
+  if (p.type !== "image") return false;
+  const attachment = p.attachment;
+  if (!attachment || typeof attachment !== "object") return false;
+  const id = (attachment as { attachmentId?: unknown }).attachmentId;
+  return typeof id === "string" && id.length > 0;
+}
+
 export type OpenAIContentPart =
   | { type: "text"; text: string }
   | { type: "image_url"; image_url: { url: string } }
@@ -326,6 +345,17 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
           { toolName: m.name || toolNames.get(m.tool_call_id ?? "") },
         );
         const name = m.name || toolNames.get(m.tool_call_id ?? "");
+        // #6875: a DSH read_image result carries its image as
+        // `{type:"image", attachment:{attachmentId, ...}}` in the content
+        // array. stringContent() below drops every non-text part, so
+        // without a sidecar the attachment never reaches CoreMessage and
+        // extractMediaRefs can never see it — the message looks like plain
+        // text while its media is invisible. Preserve ONLY the
+        // attachment-carrying image parts (see isDshAttachmentPart): any
+        // other opaque part keeps the legacy text-only reduction.
+        const attachmentParts = Array.isArray(m.content)
+          ? m.content.filter(isDshAttachmentPart)
+          : [];
         msgs.push({
           id: clusters.next(base),
           role: "tool",
@@ -333,6 +363,9 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
           toolCallId: m.tool_call_id ?? "",
           text: stringContent(m.content),
           ...(name ? { toolName: name } : {}),
+          ...(attachmentParts.length > 0
+            ? { rawOpenaiContentParts: attachmentParts }
+            : {}),
         });
         break;
       }
@@ -529,11 +562,28 @@ export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
         }
         userRun.push(m);
       } else if (m.role === "tool") {
-        out.push({
-          role: "tool",
-          tool_call_id: m.toolCallId ?? "",
-          content: m.text ?? "",
-        });
+        // #6875: a tool result carrying preserved DSH attachment parts
+        // re-emits them after its text part (mirror of flushUserRun) so
+        // the parse→rebuild round trip keeps the attachment; text-only
+        // results keep the legacy plain-string shape byte-identically.
+        const parts = m.rawOpenaiContentParts;
+        if (Array.isArray(parts) && parts.length > 0) {
+          const content: OpenAIContentPart[] = [];
+          if (m.text) content.push({ type: "text", text: m.text });
+          for (const part of parts)
+            content.push(part as OpenAIContentPart);
+          out.push({
+            role: "tool",
+            tool_call_id: m.toolCallId ?? "",
+            content,
+          });
+        } else {
+          out.push({
+            role: "tool",
+            tool_call_id: m.toolCallId ?? "",
+            content: m.text ?? "",
+          });
+        }
       }
     }
   }
