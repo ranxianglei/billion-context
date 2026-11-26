@@ -31,7 +31,6 @@ test("defaultNodes exposes the canonical ordered pipeline", () => {
     "sync-blocks",
     "prune",
     "pre-transform-snapshot",
-    "ccr-store",
     "absorb-hide",
     "crush",
     "absorb-prompt",

@@ -657,18 +657,6 @@ export function publicSnapshotCapBytes(): number {
     return Number.isFinite(v) && v >= 0 ? v : 104_857_600;
 }
 
-/** BILI_CCR_RETRIEVAL_TTL_MS > ccrRetrievalTtlMs > 600000. */
-export function ccrRetrievalTtlMs(): number {
-    const envRaw = process.env.BILI_CCR_RETRIEVAL_TTL_MS;
-    const v = envRaw === undefined || envRaw === ""
-        ? (() => {
-            const f = loadConfigFile().ccrRetrievalTtlMs;
-            return typeof f === "number" ? f : NaN;
-        })()
-        : Number(envRaw);
-    return Number.isFinite(v) && v >= 0 ? v : 10 * 60 * 1000;
-}
-
 export type CodexCompactMode = "intercept" | "pass";
 
 /** BILI_CODEX_COMPACT > codexCompact > "intercept". Read per-request so the kill-switch flips without a restart. */

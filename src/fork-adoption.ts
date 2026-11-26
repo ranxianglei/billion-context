@@ -1,12 +1,11 @@
 import { anthropicToCore, googleToCore, openaiToCore } from "acp-kernel/wire";
-import { BLOCKED_REF, STORED_PLACEHOLDER_MARKER, highestUsedIndex, type CompressionBlock, type CoreMessage } from "acp-kernel";
+import { BLOCKED_REF, highestUsedIndex, type CompressionBlock, type CoreMessage } from "acp-kernel";
 import { stripRawStage } from "./marker/engine.js";
 import { normalizeResponsesMessageItems, sanitizeResponsesInputIds, dropWhitespaceResponsesMessages } from "./loop/adapter-responses.js";
 import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
 import { replaceBiliCompactionItems } from "./codex-compact.js";
 import { peekSession, markDirty, reserveRefsThrough, type Session } from "./session.js";
 import { getStore } from "./persist.js";
-import { adoptContentStore, cloneStoreForRefs, contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
 
 /**
@@ -35,7 +34,7 @@ import type { WireProtocol } from "./util.js";
  *
  * Seeding is the disk-restore recipe (persist.ts buildSession → mergeState)
  * applied to a filtered subset: blocks + blockContents + the messageRefs
- * entries of the adopted ids (+ their tokenSnapshot), plus the CCR content-
+ * entries of the adopted ids (+ their tokenSnapshot),
  * store entries behind those refs (#1341): a ref-filtered independent clone,
  * because adopted block summaries cite their covered refs as retrievable and
  * the fork must be able to honor that (an empty store turns every cited ref
@@ -48,7 +47,7 @@ import type { WireProtocol } from "./util.js";
  * exactly one message, ever (the kernel's id-never-reused contract).
  * Deliberately NOT inherited: nudge state, the parent's own stats counters,
  * absorbed records, rules, terminalStreak (store byte counters are recomputed
- * from the child's own store via adoptContentStore).
+ *
  *
  * Copy-on-fork, not shared: the parent is deep-copied and untouched, so the
  * two branches never mutate each other's blocks. Adoption runs once, on the
@@ -137,20 +136,7 @@ export function incomingCoreMessages(protocol: WireProtocol, parsed: unknown): C
  *  message's own bytes differ from the original's, so its raw id maps to no
  *  parent ref — the citation embedded in the placeholder is the only link
  *  back to the stored original, and arrival-time storing skips placeholder
- *  text by design, so nothing else can restore it. */
-function citedPlaceholderRefs(msgs: CoreMessage[]): string[] {
-    const refs: string[] = [];
-    for (const m of msgs) {
-        const text = m.text ?? "";
-        const at = text.indexOf(STORED_PLACEHOLDER_MARKER);
-        if (at < 0) continue;
-        const mm = /#(m\d{4,})/.exec(text.slice(at));
-        if (mm) refs.push(mm[1]);
-    }
-    return refs;
-}
-
-/** Decide which of the parent's blocks survive into the fork. Pure: reads
+ /** Decide which of the parent's blocks survive into the fork. Pure: reads
  *  the parent, returns a plan, mutates nothing.
  *  opts.seedAllRefs (#1486): seed EVERY ref whose raw id is present in the
  *  incoming request, not just the ones covered by adopted blocks — a resumed
@@ -439,16 +425,6 @@ export async function maybeAdoptForkBlocks(args: {
     session.metadata.derivedBlocksAdopted = true;
     persistForkLineageNow(session, log);
     log("info", `[fork-adoption] session ${session.id} adopted ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens, refs up to ${plan.maxRef || "n/a"}) from parent ${parentId} across fork (#629)`);
-    // #1341: carry the originals behind the refs the fork now advertises as
-    // retrievable — covered messages of the adopted blocks ∪ refs cited by
-    // placeholder-shaped incoming messages (their originals left the view).
-    const wanted = new Set([...Object.keys(plan.refs.byRef), ...citedPlaceholderRefs(incomingMsgs)]);
-    const storeSlice = cloneStoreForRefs(contentStoreOf(parent), wanted);
-    if (storeSlice) {
-        adoptContentStore(session, storeSlice);
-        const n = Object.keys(storeSlice.byRef).length;
-        log("info", `[fork-adoption] session ${session.id} adopted ${n} CCR content-store entr${n === 1 ? "y" : "ies"} for the covered/cited refs from parent ${parentId} (#1341)`);
-    }
 }
 
 /** Outcome of an inheritance attempt (#3351): lets the caller tell "blocks
@@ -535,13 +511,6 @@ export function maybeAdoptResume(args: {
         "info",
         `[resume-inheritance] ${session.id} ${rel}: inherited ${seededRefs} ref(s) up to ${plan.maxRef || "n/a"}${plan.adoptedActive > 0 ? `, ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens)` : ""}; stale citations now resolve to their original messages (#1486)`,
     );
-    const wanted = new Set([...Object.keys(plan.refs.byRef), ...citedPlaceholderRefs(incomingMsgs)]);
-    const storeSlice = cloneStoreForRefs(contentStoreOf(parent), wanted);
-    if (storeSlice) {
-        adoptContentStore(session, storeSlice);
-        const n = Object.keys(storeSlice.byRef).length;
-        log("info", `[resume-inheritance] ${session.id} adopted ${n} CCR content-store entr${n === 1 ? "y" : "ies"} for the inherited/cited refs from parent ${parent.id} (#1341/#1486)`);
-    }
     return { adoptedActive: plan.adoptedActive, seededRefs };
 }
 
@@ -669,11 +638,6 @@ export async function reconcileDerivedLineage(
                 continue;
             }
             applyForkAdoption(s, plan, parent);
-            const wanted = new Set(Object.keys(plan.refs.byRef));
-            const storeSlice = cloneStoreForRefs(contentStoreOf(parent), wanted);
-            if (storeSlice) {
-                adoptContentStore(s, storeSlice);
-            }
             s.metadata.derivedFrom ??= parent.id;
             s.metadata.derivedFromSessionId = parent.id;
             s.metadata.derivedBlocksAdopted = true;

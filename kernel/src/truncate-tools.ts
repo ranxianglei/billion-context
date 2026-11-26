@@ -1,7 +1,6 @@
 import { clampPrefix, clampWindow } from "./truncate.js";
 import type { Config, CoreMessage } from "./types.js";
 import { SUMMARY_HEADER, isRenderedSummaryMessage } from "./prune.js";
-import { isRetrievedMessage } from "./ccr.js";
 
 export interface TruncateOptions {
   minOutputTokens?: number;
@@ -79,7 +78,6 @@ export function truncateLargeToolOutputs(
           m.contentType === "text" &&
           (m.role === "user" || m.role === "assistant") &&
           !isRenderedSummaryMessage(m) &&
-          !isRetrievedMessage(m) &&
           !m.text?.startsWith(SUMMARY_HEADER),
       )
     : [];

@@ -740,8 +740,8 @@ export const ACP_READONLY_TOOLS_RESPONSES = [
 ] as const;
 
 /** All ACP tool names (dynamic membership — Set, not a static record). Does
- *  NOT include absorb, acp_retrieve or the #5765 block ops: all opt-in
- *  (config.absorb.enabled / config.ccr.enabled / config.blockOps.enabled) and
+ *  NOT include absorb or the #5765 block ops: all opt-in
+ *  (config.absorb.enabled / config.blockOps.enabled) and
  *  hosts only register/inject them when on. */
 export const ACP_TOOL_NAMES: ReadonlySet<string> = new Set([
   COMPRESS_TOOL_NAME,
@@ -751,10 +751,10 @@ export const ACP_TOOL_NAMES: ReadonlySet<string> = new Set([
   ACP_CACHE_TOOL_NAME,
 ]);
 
-/** #5765: the opt-in block-lifecycle tool names. Like absorb/acp_retrieve they
+/** #5765: the opt-in block-lifecycle tool names. Like absorb they
  *  stay OUT of ACP_TOOL_NAMES (config.blockOps.enabled gates the surface), but
- *  every "is this a bili-owned tool" check (absorb candidacy, ccr placeholder
- *  skip, side-request demotion) must still recognize them — when enabled their
+ *  every "is this a bili-owned tool" check (absorb candidacy,
+ *  side-request demotion) must still recognize them — when enabled their
  *  receipts behave like any other ACP tool receipt. */
 export const BLOCK_OP_TOOL_NAMES: ReadonlySet<string> = new Set([
   ACP_RETIRE_TOOL_NAME,
@@ -890,45 +890,4 @@ export const ABSORB_TOOL_GOOGLE = {
   name: ABSORB_TOOL_NAME,
   description: ABSORB_TOOL_DESCRIPTION,
   parameters: ABSORB_PARAMETERS,
-};
-
-/** Opt-in retrieve tool (lossless content-cached retrieval). Inject/register
- *  only when config.ccr.enabled — NOT part of ACP_TOOLS_* arrays (same
- *  opt-in pattern as absorb). */
-export const RETRIEVE_TOOL_NAME = "acp_retrieve";
-
-export const RETRIEVE_TOOL_DESCRIPTION =
-  "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text inline — very large originals are exported to a file instead, and the result then carries the exported file's path. The placeholder stays in context. Unknown refs return not-found.";
-
-const RETRIEVE_PARAMETERS = {
-  type: "object" as const,
-  properties: {
-    ref: {
-      type: "string",
-      description: "mNNNNN ref shown in the 📦 [acp-stored …] placeholder",
-    },
-  },
-  required: ["ref"],
-};
-
-export const RETRIEVE_TOOL = {
-  name: RETRIEVE_TOOL_NAME,
-  description: RETRIEVE_TOOL_DESCRIPTION,
-  input_schema: RETRIEVE_PARAMETERS,
-};
-
-export const RETRIEVE_TOOL_OPENAI = {
-  type: "function" as const,
-  function: {
-    name: RETRIEVE_TOOL_NAME,
-    description: RETRIEVE_TOOL_DESCRIPTION,
-    parameters: RETRIEVE_PARAMETERS,
-  },
-};
-
-export const RETRIEVE_TOOL_RESPONSES = {
-  type: "function" as const,
-  name: RETRIEVE_TOOL_NAME,
-  description: RETRIEVE_TOOL_DESCRIPTION,
-  parameters: RETRIEVE_PARAMETERS,
 };

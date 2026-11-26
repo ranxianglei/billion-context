@@ -9,9 +9,6 @@ import {
   ABSORB_TOOL,
   ABSORB_TOOL_OPENAI,
   ABSORB_TOOL_GOOGLE,
-  RETRIEVE_TOOL,
-  RETRIEVE_TOOL_OPENAI,
-  RETRIEVE_TOOL_RESPONSES,
 } from "../src/compress-tools.js";
 
 /**
@@ -73,25 +70,16 @@ function walk(
 test("anthropic input_schema: no top-level combinators on any tool", () => {
   walk(ACP_TOOLS_ANTHROPIC, "anthropic");
   assertPlainTopLevel(ABSORB_TOOL as Record<string, unknown>, "anthropic");
-  assertPlainTopLevel(RETRIEVE_TOOL as Record<string, unknown>, "anthropic");
 });
 
 test("openai function.parameters: no top-level combinators on any tool", () => {
   walk(ACP_TOOLS_OPENAI, "openai");
   assertPlainTopLevel(ABSORB_TOOL_OPENAI as Record<string, unknown>, "openai");
-  assertPlainTopLevel(
-    RETRIEVE_TOOL_OPENAI as Record<string, unknown>,
-    "openai",
-  );
 });
 
 test("responses flat parameters: no top-level combinators on any tool", () => {
   walk(ACP_TOOLS_RESPONSES, "responses");
   walk(ACP_READONLY_TOOLS_RESPONSES, "responses");
-  assertPlainTopLevel(
-    RETRIEVE_TOOL_RESPONSES as Record<string, unknown>,
-    "responses",
-  );
 });
 
 test("google functionDeclarations parameters: no top-level combinators on any tool", () => {

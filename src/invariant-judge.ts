@@ -11,8 +11,7 @@
 //     named, count-bounded exemption list — chain checkpoint / acp_summary
 //     carriers (outbound-injected, or inbound-ECHOED by stateful hosts, which
 //     match their own twin by identity), policy reasoning drops, crush
-//     envelopes, CCR-stored tool results (canonical placeholder substitutes
-//     the client's full text, #4186), emergency-truncation twins (kernel
+//     envelopes,//     the client's full text, #4186), emergency-truncation twins (kernel
 //     prefix+marker+suffix clip of the same message, #4186).
 //   I2 (fold): all divergence is confined to [earliest-fold-start, end); the
 //     bytes before the fold point stay identical, and the fold carrier stays
@@ -50,7 +49,7 @@
 // Pure: no I/O, no mutation. `judgeInboundOutbound` never throws on well-formed
 // input; the runtime wrapper records events only and never blocks traffic.
 
-import { parseStoredPlaceholder, type CompressionState, type CoreMessage } from "acp-kernel";
+import { type CompressionState, type CoreMessage } from "acp-kernel";
 import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "acp-kernel/wire";
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
@@ -104,7 +103,7 @@ export interface JudgeVerdict {
   total: number;
   violations: Violation[];
   /** Named-exemption volume consumed this request (#3842 count-bounded list). */
-  exempt?: { carrier: number; reasoning: number; crush: number; ccr: number; truncate: number };
+  exempt?: { carrier: number; reasoning: number; crush: number; truncate: number };
   /** Entry cells excused as fold-covered by host state (#4401). */
   covered?: number;
   /** Egress lane the verdict came from — main first-send vs loop round-2+. */
@@ -220,12 +219,6 @@ function isCrushedToolResult(m: CoreMessage): boolean {
   }
 }
 
-// #4186 G2: CCR-stored tool results ride outbound as canonical placeholders
-// while the inbound twin is still the client's full text. Recognized via the
-// kernel's STRICT whole-body parser (#1456 discipline) — never a substring scan.
-function isCcrStoredResult(m: CoreMessage): boolean {
-  return m.contentType === "tool-result" && parseStoredPlaceholder(m.text ?? "") !== null;
-}
 
 // #4186 G3: emergency truncation (kernel truncateLargeToolOutputs) clips an old
 // message to prefix + marker line + suffix. Marker line shape mirrors
@@ -390,7 +383,6 @@ function stableEqual(a: CoreMessage, b: CoreMessage): boolean {
   if (a.role !== b.role || a.contentType !== b.contentType) return false;
   if (a.contentType === "tool-call" && a.toolName && b.toolName && a.toolName !== b.toolName) return false;
   if (isCrushedToolResult(b)) return true;
-  if (a.contentType === "tool-result" && isCcrStoredResult(b)) return true; // #4186 G2
   if (isTruncatedTwin(a, b)) return true; // #4186 G3
   if (a.contentType === "tool-call" && isCompressToolName(a.toolName) && isCompressToolName(b.toolName) && isSanctionedCompressTwin(a, b)) return true; // #4401/#5866
   return normText(a) === normText(b);
@@ -698,14 +690,13 @@ export function judgeInboundOutbound(
   const pairExcess = Math.max(0, pairVolume - pairCeiling);
   const reasoningExempt = exit.filter(isReasoning).length;
   const crushExempt = exit.filter(isCrushedToolResult).length;
-  const ccrExempt = exit.filter(isCcrStoredResult).length;
   const truncateExempt = exit.filter(isTruncationExit).length;
-  const exemptTotal = (carrierExempt - pairVolume) + pairExcess + reasoningExempt + crushExempt + ccrExempt + truncateExempt;
+  const exemptTotal = (carrierExempt - pairVolume) + pairExcess + reasoningExempt + crushExempt + truncateExempt;
   if (exemptTotal > maxExempt) {
     violations.push({
       kind: "exemption-overflow",
       index: -1,
-      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} pairExcess=${pairExcess} reasoning=${reasoningExempt} crush=${crushExempt} ccr=${ccrExempt} truncate=${truncateExempt})`,
+      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} pairExcess=${pairExcess} reasoning=${reasoningExempt} crush=${crushExempt} truncate=${truncateExempt})`,
     });
   }
 
@@ -721,7 +712,7 @@ export function judgeInboundOutbound(
     total,
     ...(covered > 0 ? { covered } : {}),
     violations,
-    exempt: { carrier: carrierExempt, reasoning: reasoningExempt, crush: crushExempt, ccr: ccrExempt, truncate: truncateExempt },
+    exempt: { carrier: carrierExempt, reasoning: reasoningExempt, crush: crushExempt, truncate: truncateExempt },
     ...(renderLane ? { renderLane: true } : {}),
   };
 }
@@ -818,9 +809,9 @@ function defaultSink(sessionId: string | undefined, lane: "main" | "loop"): Sink
       // #4862: label by the invariant that actually fired — an I3 pairing
       // violation on a non-folded request must not read as "I1".
       const inv = head.kind === "unpaired-tool-call" || head.kind === "unpaired-tool-result" ? 3 : v.folded ? 2 : 1;
-      loggerLog("warn", `${where} I${inv} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.covered ? `, covered ${v.covered}` : ``}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``})`);
+      loggerLog("warn", `${where} I${inv} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.covered ? `, covered ${v.covered}` : ``}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} truncate=${v.exempt.truncate}` : ``})`);
     } else {
-      loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.covered ? `, covered ${v.covered}` : ``}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``}`);
+      loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.covered ? `, covered ${v.covered}` : ``}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} truncate=${v.exempt.truncate}` : ``}`);
     }
   };
 }

@@ -29,7 +29,6 @@ import {
   type CompressionState,
   type Config,
   type CoreMessage,
-  type MessageContentStore,
 } from "acp-kernel";
 import { withoutTurnSeparators } from "./turn-separator.js";
 
@@ -73,7 +72,6 @@ interface UncoveredAuditInput {
   config: Config;
   /** statusInputBaseline — the token level the live-recompute lanes use. */
   tokenCount?: number;
-  contentStore?: MessageContentStore;
   applyView?: CoreMessage[];
   /** Spans the model can act on right now (post-filter offer / remaining list).
    *  Runs overlapping these are NOT reported — they are surfaced elsewhere. */
@@ -217,7 +215,6 @@ export function uncoveredAudit(input: UncoveredAuditInput): UncoveredAuditResult
       messages,
       tokenCount: input.tokenCount ?? 0,
       renderTags: "none" as const,
-      contentStore: input.contentStore,
       applyView: input.applyView,
     };
     if (!input.normalRanges) {

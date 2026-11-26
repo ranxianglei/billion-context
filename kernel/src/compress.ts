@@ -17,12 +17,8 @@ import { scrubLoneSurrogates } from "./truncate.js";
 import { hideConsumedCompressCalls, refNum } from "./hide-consumed.js";
 import { appendAbsorbPrompts, hideAbsorbedMessages } from "./absorb.js";
 import { applyCrushToMessages } from "./crush.js";
-import { applyRetrieve, ccrStoreNode, RETRIEVED_ID_PREFIX } from "./ccr.js";
 import { preTransformSnapshotNode, viewLatchNode } from "./view-latch.js";
-import type { ApplyRetrieveResult, CcrEffect } from "./ccr.js";
 import type { EmergencyTruncateLatchEntry } from "./types.js";
-import { createContentStore } from "./content-store.js";
-import type { MessageContentStore } from "./content-store.js";
 import { applyMessageFilters, listMessageFilters } from "./filter/index.js";
 import { activeBlockSpans } from "./block-map.js";
 import { createRenderRefsNode } from "./render-refs.js";
@@ -88,9 +84,6 @@ export interface Ports {
 
 export interface CompressionCore {
   processTurn(input: ProcessTurnInput): ProcessTurnResult;
-  /** Kernel primitive behind acp_retrieve: resolve a ref to its stored
-   *  original plus the wire-safe injection pair (see ccr.ts). */
-  retrieve(store: MessageContentStore, ref: string): ApplyRetrieveResult;
   applyCompression(input: ApplyCompressionInput): ApplyCompressionResult;
   defaultNodes(): PipelineNode[];
   decompress(
@@ -140,9 +133,6 @@ export interface ProcessTurnInput {
    *     directly from result.state.messageRefs.
    */
   renderTags?: RenderStrategy;
-  /** Per-session CCR content store (pass result.contentStore back here).
-   *  Omit for pre-CCR sessions — an empty store is used. */
-  contentStore?: MessageContentStore;
   /** #3236: the EXACT message array class applyCompression will run on for
    * this lane. Hosts whose render view (`messages`) differs from the fold
    * view (pruned separators, host-side compaction tails) pass the unpruned
@@ -1022,13 +1012,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
         `[acp-kernel] Config validation warnings: ${configErrors.join("; ")}. Thresholds may not fire correctly.`,
       );
     }
-    const contentStore = input.contentStore ?? createContentStore();
     const ctx: PipelineContext = {
       config: input.config,
       tokenCount: input.tokenCount,
       tokenCountSource: input.tokenCountSource,
       countTokens,
-      contentStore,
     };
     const initial: NodeIO = {
       messages: input.messages,
@@ -1057,7 +1045,6 @@ export function createCore(ports: Ports = {}): CompressionCore {
       deadRefs = kept.length > 0 ? kept : undefined;
     }
     const state = { ...result.state, lastPassIds: inboundIds, deadRefs };
-    const ccrEffect = result.effects.ccr as CcrEffect | undefined;
     // #6928: the #4521 armed-but-silent refresh line ("[ACP status: …]",
     // emitted on turns where a nudge plan is armed but its banner is not
     // delivered) is removed. It fired precisely when the banner was withheld,
@@ -1072,16 +1059,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
       nudge: result.effects.nudge,
       terminalEscape: result.effects.terminalEscape,
       truncationSkipped: result.effects.truncationSkipped,
-      contentStore: ccrEffect?.store ?? contentStore,
     };
-  }
-
-  function retrieve(
-    store: MessageContentStore,
-    ref: string,
-    opts?: { exportDir?: string; inlineTokenLimit?: number },
-  ): ApplyRetrieveResult {
-    return applyRetrieve({ store, ref, ...opts });
   }
 
   function decompress(blockId: string, state: CompressionState) {
@@ -1122,8 +1100,6 @@ export function createCore(ports: Ports = {}): CompressionCore {
       breakdown: {
         active: active.length,
         total: state.blocks.length,
-        storedMessages: state.stats.storedCount ?? 0,
-        retrievals: state.stats.retrievalCount ?? 0,
       },
     };
   }
@@ -1143,7 +1119,6 @@ export function createCore(ports: Ports = {}): CompressionCore {
       syncBlocksNode,
       pruneNode,
       preTransformSnapshotNode,
-      ccrStoreNode,
       absorbHideNode,
       crushNode,
       absorbPromptNode,
@@ -1160,7 +1135,6 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
   return {
     processTurn,
-    retrieve,
     applyCompression,
     defaultNodes,
     decompress,
@@ -1223,7 +1197,7 @@ function createStampTimestampsNode(enabled: boolean): PipelineNode {
     // #5608-B: the host arms this one-shot from a fresh-child-from-parent path.
     const suppressed = io.state.suppressMintingOnce === true;
     const messages = io.messages.map((m) => {
-      if (!m.id || m.id.startsWith(RETRIEVED_ID_PREFIX)) return m;
+      if (!m.id) return m;
       const stamped = stamps[m.id];
       if (stamped !== undefined) {
         if (m.ts === stamped) return m;
@@ -1320,8 +1294,6 @@ const assignRefsNode: PipelineNode = {
       existing: io.state.messageRefs,
       nextIndex: highestUsedIndex(io.state.messageRefs) + 1,
       isProtected: protectedFn,
-      // Ephemeral retrieval injections never consume a ref slot.
-      shouldSkip: (m) => m.id.startsWith(RETRIEVED_ID_PREFIX),
     });
     // #3939 ②/#3805: a BLOCKED→numeric migration mints the ref NOW but the
     // carrier's <acp> tag render is DEFERRED to the next fold boundary —

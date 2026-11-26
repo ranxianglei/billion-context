@@ -1,4 +1,3 @@
-import type { MessageContentStore } from "./content-store.js";
 
 export type MessageRole = "user" | "assistant" | "system" | "tool";
 
@@ -188,10 +187,6 @@ export interface CompressionStats {
   compressionCount: number;
   /** Cumulative tokens reclaimed by absorb (instant tool-result hiding). Optional for pre-absorb persisted states. */
   absorbedTokens?: number;
-  /** Cumulative messages stored in the CCR content store. Optional for pre-CCR persisted states. */
-  storedCount?: number;
-  /** Cumulative successful acp_retrieve calls. Optional for pre-CCR persisted states. */
-  retrievalCount?: number;
 }
 
 /** View-latch entry shape (#3939 ⑤) — see CompressionState.viewLatches. */
@@ -288,23 +283,6 @@ export interface CrushConfig {
   minReduction: number;
   /** Per-strategy toggles/exclusions keyed by plugin id (json-fold, code-trim, log-select, ...). */
   strategies?: Record<string, CrushStrategyOverride>;
-}
-
-export interface CcrConfig {
-  enabled: boolean;
-  /** Model-facing retrieve tool name (adapters may rename, e.g. acp_retrieve). */
-  toolName: string;
-  /** Only tool results >= this many tokens are stored + replaced. 0 = all. */
-  minToolTokens: number;
-  /** Tool-name patterns (glob suffix allowed) never CCR-stored, independent of protectedTools. */
-  excludeTools: string[];
-  /** Max characters for the placeholder's head/command preview. */
-  maxHeadChars: number;
-  /** Retrieved originals below this many tokens are inlined into the
-   *  acp_retrieve tool result; at/above it they are exported to a file under
-   *  the host-provided export dir (pointer rides the tool result). Default
-   *  4000 (RETRIEVE_INLINE_TOKENS_DEFAULT). */
-  retrieveInlineTokens?: number;
 }
 
 export interface CompressionState {
@@ -420,8 +398,7 @@ export interface CompressionState {
    *  per-feature: every transform output is latched at first application and
    *  replays until the next successful fold (applyCompression resets the
    *  whole map — the refresh rides the fold's own history rewrite); new or
-   *  edited messages (new ref) latch fresh at their arrival boundary. ccr
-   *  needs no latch (replace-once-at-arrival, byte-stable by design #1460).
+   *  edited messages (new ref) latch fresh at their arrival boundary.
    *  Entry: text=null = passthrough (source bytes stand); text=string =
    *  transformed bytes; hidden=true = dropped from the view. Optional:
    *  absent until the first latched transform. */
@@ -650,8 +627,6 @@ export interface Config {
   rules?: RulesConfig;
   /** Deterministic tool-result compression, tier 1 of the absorb gate (see crush.ts). Requires absorb enabled. */
   crush?: CrushConfig;
-  /** Lossless content-cached retrieval for oversized tool results (see ccr.ts). Absent/disabled = feature off. */
-  ccr?: CcrConfig;
   messageFilters?: import("./filter/types.js").MessageFiltersConfig;
 }
 
@@ -857,10 +832,6 @@ export interface ProcessTurnResult {
   /** Set when emergency truncation ran at/above its threshold but reclaimed
    *  nothing — hosts should warn-log this (it was silent before, #300). */
   truncationSkipped?: string;
-  /** Per-session content store after this turn (pass back as input.contentStore
-   *  next turn and persist via the host's own mechanism). Always present;
-   *  empty until CCR stores something. */
-  contentStore: MessageContentStore;
 }
 
 export interface StatusReport {

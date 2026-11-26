@@ -170,62 +170,6 @@ export {
   ABSORB_TOOL_OPENAI,
 } from "./compress-tools.js";
 export {
-  RETRIEVE_TOOL_NAME,
-  RETRIEVE_TOOL,
-  RETRIEVE_TOOL_OPENAI,
-  RETRIEVE_TOOL_RESPONSES,
-  RETRIEVE_TOOL_DESCRIPTION,
-} from "./compress-tools.js";
-export {
-  createContentStore,
-  hashContent,
-  storeOriginal,
-  restampContentStore,
-  retrieveByRef,
-  hasStoredRef,
-  contentStoreStats,
-} from "./content-store.js";
-export type {
-  MessageContentStore,
-  StoredEntry,
-  StoreSpec,
-  RetrieveResult,
-  ContentStoreStats,
-} from "./content-store.js";
-export {
-  DEFAULT_CCR_CONFIG,
-  resolveCcrConfig,
-  STORED_PLACEHOLDER_MARKER,
-  RETRIEVED_ID_PREFIX,
-  classifyKind,
-  normalizeHead,
-  extractCommand,
-  buildStoredPlaceholder,
-  parseStoredPlaceholder,
-  isStoredPlaceholderText,
-  restoreStoredPlaceholderText,
-  retrievedMessageId,
-  isRetrievedMessage,
-  frameRetrievedOriginal,
-  buildRetrievalPointer,
-  RETRIEVE_INLINE_TOKENS_DEFAULT,
-  applyRetrieve,
-  storeLargeResults,
-  storeCoveredOriginals,
-  noteRetrieval,
-  ccrStoreNode,
-} from "./ccr.js";
-export type {
-  StoredPlaceholderInput,
-  ParsedStoredPlaceholder,
-  RetrievalExport,
-  ApplyRetrieveInput,
-  ApplyRetrieveResult,
-  StoreLargeResultsInput,
-  StoreLargeResultsResult,
-  CcrEffect,
-} from "./ccr.js";
-export {
   ABSORB_PROMPT_MARKER,
   DEFAULT_ABSORB_CONFIG,
   resolveAbsorbConfig,

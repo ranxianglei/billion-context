@@ -44,8 +44,8 @@ export function defaultConfig(
     absorb: {
       enabled: false,
       toolName: "absorb",
-      // Raised 1000 → 4000 (issue #352): lossless CCR takes over large-result
-      // handling; absorb's forced distillation only fires above the new bar.
+      // Absorb threshold (issue #352): forced distillation only fires above
+      // this bar; smaller tool results stay in the view verbatim.
       minToolTokens: 4000,
       contextThresholdPct: 0,
       excludeTools: [],
@@ -53,13 +53,6 @@ export function defaultConfig(
     crush: {
       enabled: false,
       minReduction: 0.1,
-    },
-    ccr: {
-      enabled: false,
-      toolName: "acp_retrieve",
-      minToolTokens: 4000,
-      excludeTools: [],
-      maxHeadChars: 96,
     },
   };
   return {
@@ -73,7 +66,6 @@ export function defaultConfig(
       ? { ...base.absorb, ...overrides.absorb }
       : base.absorb,
     crush: overrides.crush ? { ...base.crush, ...overrides.crush } : base.crush,
-    ccr: overrides.ccr ? { ...base.ccr, ...overrides.ccr } : base.ccr,
   };
 }
 
@@ -201,23 +193,6 @@ export function validateConfig(config: Config): string[] {
           );
         }
       }
-    }
-  }
-  if (config.ccr) {
-    if (config.ccr.enabled && !config.ccr.toolName) {
-      errors.push("ccr.toolName must be a non-empty string when enabled");
-    }
-    if (
-      !Number.isFinite(config.ccr.minToolTokens) ||
-      config.ccr.minToolTokens < 0
-    ) {
-      errors.push("ccr.minToolTokens must be >= 0");
-    }
-    if (
-      !Number.isFinite(config.ccr.maxHeadChars) ||
-      config.ccr.maxHeadChars < 0
-    ) {
-      errors.push("ccr.maxHeadChars must be >= 0");
     }
   }
   return errors;
