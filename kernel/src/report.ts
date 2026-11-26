@@ -38,6 +38,18 @@ function pct(n: number, total: number): number {
   return Math.round((n / total) * 100);
 }
 
+// #6168: bound + clean a projection exception for display on a flag line —
+// one bad row must not flood a status report, and the reason must survive
+// intact enough to distinguish a stale ref from other failures (the old flat
+// "refs unresolvable" verdict misdiagnosed known protection as ledger
+// corruption; #5667 family).
+function cleanProjectionError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const single = raw.replace(/\s+/g, " ").trim();
+  if (single.length <= 100) return single || "projection failed";
+  return `${single.slice(0, 97)}...`;
+}
+
 function numericPart(blockId: string): number {
   const match = /^b(\d+)$/.exec(blockId);
   return match && match[1] !== undefined ? Number(match[1]) : 0;
@@ -579,8 +591,11 @@ function renderUncompressedRanges(
           protectedMessageIds: protectedRefs,
           shared,
         });
-      } catch {
-        return "\u26a0 not foldable: refs unresolvable";
+      } catch (err) {
+        // #6168: range rows are built from resolvable refs only (rangeable),
+        // so a throw here is a GENUINE projection failure — surface its real
+        // reason, not the flat "refs unresolvable" misdiagnosis (#5667 family).
+        return `\u26a0 not foldable: ${cleanProjectionError(err)}`;
       }
       if (proj.fatal?.kind === "zone")
         return "\u26a0 not foldable: protected zone only";
