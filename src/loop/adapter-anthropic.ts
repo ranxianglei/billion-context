@@ -2,7 +2,7 @@ import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, healAnthropicSystemPositions, insertBeforeTrailingSystemRun, type AnthropicRequestBody } from "acp-kernel/wire";
 import { dedupeAdjacentOutputConfig } from "../dedupe-adjacent-output-config.js";
 import { appendSystemText, declaredInclusiveFromUsage, lastIterationContext } from "../util.js";
-import { stampAnthropicSystemCacheControl } from "./cache-control.js";
+import { stampSystemWithinAnthropicBudget } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
@@ -131,7 +131,7 @@ function buildTextDeltaEvent(index: number, text: string): Buffer {
     );
 }
 
-export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[], errorShape: "protocol" | "completion" = "protocol", cacheMarks?: Map<string, { type: "ephemeral" }>, clientCacheControls?: Map<string, unknown>, absorbArmed?: boolean): CompressLoopAdapter {
+export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[], errorShape: "protocol" | "completion" = "protocol", cacheMarks?: Map<string, unknown>, clientCacheControls?: Map<string, unknown>, absorbArmed?: boolean): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
     let stopSequence: string | null = null;
@@ -274,11 +274,12 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // [#5688] round-2 re-renders from the core view fold reconstruction
             // can leave adjacent effort directives in — collapse like the
             // steady egress or the rebuild 400s where the main request passed.
-            const messages = dedupeAdjacentOutputConfig(coreToAnthropic(coreMessages, cacheMarks ?? clientCacheControls));
+            const effectiveMarks = cacheMarks ?? clientCacheControls;
+            const messages = dedupeAdjacentOutputConfig(coreToAnthropic(coreMessages, effectiveMarks));
             // #1876: same append-not-merge rebuild as the steady path's
             // injectSystem — both must emit byte-identical system (F2 seam).
             const system = originalSystem !== undefined ? appendSystemText(systemPrompt, originalSystem) : systemPrompt;
-            const stamped = cacheMarks ? stampAnthropicSystemCacheControl(system) : system;
+            const stamped = stampSystemWithinAnthropicBudget(system, body.tools, originalSystem, effectiveMarks, cacheMarks !== undefined);
             // #5432: notes go BEFORE a trailing client system run; the #4570
             // backstop heals whatever still arrives illegal (fold orphans).
             const withNotes = notes && notes.length > 0

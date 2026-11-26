@@ -31,7 +31,7 @@ export function pickAdapter(
     google?: { system?: string; model?: string },
     systemNotes?: string[],
     streamErrorShape?: "protocol" | "completion",
-    anthropicCacheMarks?: Map<string, { type: "ephemeral" }>,
+    anthropicCacheMarks?: Map<string, unknown>,
     anthropicClientCacheControls?: Map<string, unknown>,
     absorbArmed?: boolean,
 ): CompressLoopAdapter {

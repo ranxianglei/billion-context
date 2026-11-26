@@ -34,6 +34,8 @@ export type AnthropicThinking = {
   type: "thinking";
   thinking: string;
   signature?: string;
+  cache_control?: unknown;
+  [key: string]: unknown;
 };
 export type AnthropicRedactedThinking = {
   type: "redacted_thinking";
@@ -95,11 +97,16 @@ export function buildSystem(
   return text;
 }
 
-type Flat = { msgs: BiliMessage[]; cacheControls: Map<string, unknown> };
+type Flat = {
+  msgs: BiliMessage[];
+  cacheControls: Map<string, unknown>;
+  clientMessageControls: Map<string, unknown>;
+};
 
 export function anthropicToCore(body: AnthropicRequestBody): Flat {
   const msgs: BiliMessage[] = [];
   const cacheControls = new Map<string, unknown>();
+  const clientMessageControls = new Map<string, unknown>();
   const clusters = new ClusterCounter();
   // Backfill toolName onto tool-results from their paired tool_use: the wire
   // format only carries the call id on results, but kernel guards
@@ -122,6 +129,7 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
       if (mark) cacheControls.set(core.id, mark);
       continue;
     }
+    const msgLevelCtrl = (m as { cache_control?: unknown }).cache_control;
     const blocks =
       typeof m.content === "string"
         ? [{ type: "text" as const, text: m.content }]
@@ -203,13 +211,25 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
             "reasoning",
             b.thinking,
           );
+          const id = clusters.next(base);
+          const hasExtra = Object.keys(b).some(
+            (k) =>
+              k !== "type" &&
+              k !== "thinking" &&
+              k !== "signature" &&
+              k !== "cache_control",
+          );
           msgs.push({
-            id: clusters.next(base),
+            id,
             role: "assistant",
             contentType: "reasoning",
             text: b.thinking,
-            ...(b.signature ? { thinkingSignature: b.signature } : {}),
+            ...(typeof b.signature === "string"
+              ? { thinkingSignature: b.signature }
+              : {}),
+            ...(hasExtra ? { rawAnthropicBlock: b } : {}),
           });
+          if (b.cache_control) cacheControls.set(id, b.cache_control);
           break;
         }
         case "image": {
@@ -239,8 +259,9 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
                   ? imageMediaFingerprint(source.url)
                   : undefined,
           });
+          const id = clusters.next(base);
           msgs.push({
-            id: clusters.next(base),
+            id,
             role: m.role,
             contentType: "text",
             text: CANONICAL_IMAGE_TEXT,
@@ -248,6 +269,9 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
             rawAnthropicBlock: b,
             ...mediaSidecar,
           });
+          if ((b as { cache_control?: unknown }).cache_control) {
+            cacheControls.set(id, (b as { cache_control?: unknown }).cache_control);
+          }
           break;
         }
         case "redacted_thinking": {
@@ -262,13 +286,17 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
             "text",
             CANONICAL_REDACTED_THINKING_TEXT,
           );
+          const id = clusters.next(base);
           msgs.push({
-            id: clusters.next(base),
+            id,
             role: m.role,
             contentType: "text",
             text: "[redacted_thinking]",
             rawAnthropicBlock: b,
           });
+          if ((b as { cache_control?: unknown }).cache_control) {
+            cacheControls.set(id, (b as { cache_control?: unknown }).cache_control);
+          }
           break;
         }
         default: {
@@ -282,13 +310,17 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
           const label =
             typeof unknownType === "string" ? `[${unknownType}]` : "[unknown]";
           const base = deriveCanonicalMessageId(m.role, "text", label);
+          const id = clusters.next(base);
           msgs.push({
-            id: clusters.next(base),
+            id,
             role: m.role,
             contentType: "text",
             text: label,
             rawAnthropicBlock: b,
           });
+          if ((b as { cache_control?: unknown }).cache_control) {
+            cacheControls.set(id, (b as { cache_control?: unknown }).cache_control);
+          }
           break;
         }
       }
@@ -296,8 +328,17 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
     for (let k = before; k < msgs.length; k++) {
       (msgs[k] as BiliMessage).wireIndex = wireIndex;
     }
+    if (msgLevelCtrl !== undefined) {
+      for (let k = msgs.length - 1; k >= before; k--) {
+        const cand = msgs[k]!;
+        if (cand.contentType !== "reasoning") {
+          clientMessageControls.set(cand.id, msgLevelCtrl);
+          break;
+        }
+      }
+    }
   }
-  return { msgs, cacheControls };
+  return { msgs, cacheControls, clientMessageControls };
 }
 
 // Mid-conversation system messages (Pi's tool_addition / tool_removal
@@ -638,7 +679,7 @@ export function coreToAnthropic(
     switch (m.contentType) {
       case "text": {
         if (m.rawAnthropicBlock) {
-          current.blocks.push(m.rawAnthropicBlock as AnthropicBlock);
+          current.blocks.push({ ...(m.rawAnthropicBlock as AnthropicBlock), ...cc(m.id) });
           break;
         }
         current.blocks.push({ type: "text", text: m.text ?? "", ...cc(m.id) });
@@ -655,7 +696,7 @@ export function coreToAnthropic(
         break;
       case "tool-result":
         if (m.rawAnthropicBlock) {
-          current.blocks.push(m.rawAnthropicBlock as AnthropicBlock);
+          current.blocks.push({ ...(m.rawAnthropicBlock as AnthropicBlock), ...cc(m.id) });
           break;
         }
         current.blocks.push({
@@ -667,10 +708,25 @@ export function coreToAnthropic(
         });
         break;
       case "reasoning":
+        if (m.rawAnthropicBlock) {
+          current.blocks.push({
+            ...(m.rawAnthropicBlock as AnthropicThinking),
+            type: "thinking",
+            thinking: m.text ?? "",
+            ...(typeof m.thinkingSignature === "string"
+              ? { signature: m.thinkingSignature }
+              : {}),
+            ...cc(m.id),
+          });
+          break;
+        }
         current.blocks.push({
           type: "thinking",
           thinking: m.text ?? "",
-          ...(m.thinkingSignature ? { signature: m.thinkingSignature } : {}),
+          ...(typeof m.thinkingSignature === "string"
+            ? { signature: m.thinkingSignature }
+            : {}),
+          ...cc(m.id),
         });
         break;
     }

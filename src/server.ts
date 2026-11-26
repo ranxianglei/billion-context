@@ -109,7 +109,6 @@ import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInf
 import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
 import { tcpConnectable } from "./liveness.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
-import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
@@ -2075,7 +2074,7 @@ export type Prepared = {
      *  subscription-OAuth upstreams answer calls lacking it with 429
      *  rate_limit_error "Error" (#2189). See extractBillingAttributionBlock. */
     anthropicBillingBlock?: { type: "text"; text: string };
-    anthropicCacheMarks?: Map<string, { type: "ephemeral" }>;
+    anthropicCacheMarks?: Map<string, unknown>;
     /** #2499: the client's own harvested message-level cache_control breakpoints
      *  (keyed by content-hash id), returned verbatim by the steady path. The
      *  round-2 rebuild applies `anthropicCacheMarks ?? anthropicClientCacheControls`
