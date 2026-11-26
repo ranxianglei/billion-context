@@ -1179,9 +1179,16 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // never runs once an earlier handler returned cancel. Accepted
         // evidence, in order: (1) local — we stamped
         // x-bili-plugin-conversation for this session id (tools registered
-        // AND a request routed through the proxy), or omp's identity register
-        // succeeded; (2) remote — the proxy confirms it carries the
-        // conversation id (/__bili/plugin/status ok). A non-http(s) baseUrl
+        // AND a request routed through the proxy) [pi only]; (2) remote — the
+        // proxy confirms it carries the conversation id (/__bili/plugin/status
+        // reports a LIVE session, sessionId non-null) [pi and omp]. omp's
+        // identity register is NOT carriage evidence (#7060: registration
+        // populates registeredIds without creating a tracked session, so a
+        // stamp-only claim cancels native compaction for a conversation the
+        // proxy never sees → overflow). A 200 WITHOUT a session (pre-first-
+        // request / chain-advisory, sessionId: null) is likewise NOT carriage:
+        // the proxy knows the id from registration/runtime-info but has never
+        // folded it. A non-http(s) baseUrl
         // vetoes by default (opt-in via BILI_NON_HTTP_PROVIDERS below only
         // widens the candidate set; carriage evidence still decides). Hosts
         // exposing no stable session id keep the
@@ -1207,9 +1214,18 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             }
             const sid = ctx === undefined ? undefined : sessionIdOf(ctx);
             if (sid === undefined || sid.length === 0) return true;
-            if (agent === "pi" ? state.carriedSids?.has(sid) === true : state.identityAt === sid) return true;
+            if (agent === "pi" && state.carriedSids?.has(sid) === true) return true;
             try {
-                return (await fetchStatus(proxyBase, sid)) !== undefined;
+                const status = await fetchStatus(proxyBase, sid);
+                // 200 is NOT carriage evidence by itself: the status endpoint
+                // answers 200 for conversations it has NOT tracked —
+                // pre-first-request (runtime-info registered, no session yet)
+                // and chain-advisory (content verdict only) both carry
+                // sessionId: null. Carriage is a LIVE tracked session, i.e. a
+                // non-null session id. Claiming on the no-session 200s re-opens
+                // the #7060 bypass (cancel native compaction for a
+                // conversation the proxy never folds → overflow).
+                return status !== undefined && typeof status.sessionId === "string" && status.sessionId.length > 0;
             } catch (err) {
                 logHostEvent("error", "[native-client]", `bili-plugin(${agent}): compaction ownership probe failed (${err instanceof Error ? err.message : String(err)}) — leaving native compaction enabled`);
                 return false;
