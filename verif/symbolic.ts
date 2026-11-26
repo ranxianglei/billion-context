@@ -281,7 +281,7 @@ interface ModuleInfo {
 
 /** Resolve relative imports of a file recursively and collect exported
  *  callables/consts into a global registry (kernel files import helpers
- *  across files: truncate-tools → truncate/prune/ccr, hide-consumed → refs). */
+ *  across files: truncate-tools → truncate/prune/store, hide-consumed → refs). */
 function loadImportGraph(entry: string): Map<string, ModuleInfo> {
   const modules = new Map<string, ModuleInfo>();
   const queue: string[] = [entry];
