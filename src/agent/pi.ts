@@ -23,7 +23,7 @@ import { detectWireFormat } from "acp-kernel/wire";
 import * as pfChannel from "./pf-channel.js";
 import { validateMsgIds } from "../msgid-pin.js";
 import type { DirectSendPrep } from "./native-intercept.js";
-import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, PI_CLAUDE_CODE_PROVIDER, piClaudeCodeRoutedTo, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 import { plainHttpTrusted } from "../private-host.js";
@@ -1202,8 +1202,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 // BILI_NON_HTTP_PROVIDERS. Opt-in only widens the candidate set — the carriage
                 // evidence below (carriedSids / status probe) still decides, so unrouted traffic
                 // never cancels and #1382 cannot recur for a newly-opted-in provider class.
+                // pi-claude-code (`process://claude-code`) counts as opted in when its turn
+                // relay's upstream override points at this proxy (piClaudeCodeRoutedTo).
                 const provider = ctx?.model?.provider;
-                if (!(typeof provider === "string" && provider.length > 0 && nonHttpProvidersFromEnv().has(provider))) return false;
+                const optedIn = typeof provider === "string" && provider.length > 0
+                    && (nonHttpProvidersFromEnv().has(provider) || (provider === PI_CLAUDE_CODE_PROVIDER && piClaudeCodeRoutedTo(proxyBase)));
+                if (!optedIn) return false;
             }
             const sid = ctx === undefined ? undefined : sessionIdOf(ctx);
             if (sid === undefined || sid.length === 0) return true;
