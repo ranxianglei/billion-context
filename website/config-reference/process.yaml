@@ -399,6 +399,14 @@ entries:
     desc_ja: "セッションプールと GC のノブ（#2030）— 以前は BILI_MAX_SESSIONS / BILI_SESSION_GC* が環境変数のみ。"
     site_en: "<code>sessions</code> — session pool & GC: <span class='mech'>max 256 · warmMax 0 · warmMaxBytes 67108864 · residentMaxBytes 4294967296 · hardMaxBytes = residentMaxBytes · gc { enabled false · maxAgeDays 7 · maxTokens 1000000 · intervalMs 3600000 }</span>."
     site_zh: "<code>sessions</code> —— 会话池与 GC：<span class='mech'>max 256 · warmMax 0 · warmMaxBytes 67108864 · residentMaxBytes 4294967296 · hardMaxBytes = residentMaxBytes · gc { enabled false · maxAgeDays 7 · maxTokens 1000000 · intervalMs 3600000 }</span>。"
+  - key: sessions.dir
+    type: string
+    default: "unset (XDG data dir)"
+    env: BILI_SESSIONS_DIR
+    group: process
+    desc_en: "Sessions directory relocation (#7803): where session records, index.db and the CCR content stores live. Precedence BILI_SESSIONS_DIR env > this key > XDG data dir; a relative value resolves against the process CWD; pointing it at an existing FILE refuses boot with a clear error (silent fallback would put data back on the full disk). Tweak = next restart."
+    desc_zh: "会话目录重定位（#7803）：会话记录、index.db 与 CCR 内容存储的存放位置。优先级 BILI_SESSIONS_DIR 环境变量 > 本键 > XDG 数据目录；相对值按进程 CWD 解析；指向已存在的文件会带路径明确报错拒绝启动（静默回退会把数据放回满盘上）。改动下次重启生效。"
+    desc_ja: "セッションディレクトリの再配置（#7803）：セッションレコード、index.db と CCR コンテントストアの保存先。優先順位は BILI_SESSIONS_DIR 環境変数 > このキー > XDG データディレクトリ。相対値はプロセス CWD に対して解決される。既存のファイルを指すと（静黙的なフォールバックでデータが満杯ディスクに戻るのを防ぐため）明確なエラーで起動を拒否する。変更は次回再起動で有効。"
   - key: sessions.max
     type: number
     default: "256"

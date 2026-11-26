@@ -19,7 +19,7 @@ import { markdownToHtml } from "./markdown.js";
 import { displaySessionTitle, firstBlockTopicLead } from "../session-title.js";
 import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
-import { dataDir } from "../paths.js";
+import { dataDir, sessionsDirRelocated } from "../paths.js";
 import { isExternalSummaryBlock } from "../external-summary-marker.js";
 import { readdirSync, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
@@ -480,14 +480,14 @@ const DATA_DIR_INFRA_ENTRIES = new Set(["ca"]);
 
 /** #2180: a top-level ENOENT means "pristine" — no session file can exist
  *  anywhere — only when the DEFAULT layout is in effect: BILI_SESSIONS_DIR
- *  unset AND the XDG data root either absent or holding ONLY bili's own infra
+ *  unset AND no `sessions.dir` config key AND the XDG data root either absent or holding ONLY bili's own infra
  *  dirs (a fresh install where ensureRootCA() already ran). An explicit
  *  override pointing nowhere, or a data root containing anything else, stays
  *  loud (#1937): silence there would hide a moved/misconfigured path while
  *  real sessions sit elsewhere. */
 function isPristineSessionsRoot(error: unknown): boolean {
     if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") return false;
-    if (process.env.BILI_SESSIONS_DIR) return false;
+    if (sessionsDirRelocated()) return false;
     let entries: string[];
     try {
         statSync(dataDir());

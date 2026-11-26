@@ -700,7 +700,8 @@ nothing more (policy settled 2026-10-31, withdrawing the #5046/B-era
 refuse-to-start for exactly this shape). What genuinely remains hazardous is
 two installs walking the SAME *session* concurrently — that case alarms
 separately (split-brain contest, #3923). If you still want strictly separate
-histories and stores per install, give each its own `BILI_SESSIONS_DIR` (plus
+histories and stores per install, give each its own `BILI_SESSIONS_DIR` (or the
+`sessions.dir` config key when the install is driven by a config file; plus
 `BILI_CONFIG_FILE` when the config should differ too) through that install's
 launcher/profile environment — no global env changes needed. Once isolated,
 the `[instances]` notice drops off entirely. Note the distinction from the
