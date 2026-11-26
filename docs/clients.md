@@ -353,8 +353,8 @@ pure-stdlib Python module shipped inside the npm package:
   #5117, while the `bili hermes` launcher lane already routes both schemes.
   `NO_PROXY`/`no_proxy` default to keeping loopback and hermes' own
   code/dependency hosts (github.com, pypi, npm registries) direct so the
-  host's git/uv/npm children never ride the lane (#6862); an operator-set value
-  wins. `~/.hermes/config.yaml` is never touched. Provider https hosts are read
+  host's git/uv/npm children never ride the lane (#6862); the launcher's static
+  value is the whole value (the inherited env is stripped first). `~/.hermes/config.yaml` is never touched. Provider https hosts are read
   from hermes' config and whitelisted
   for MITM; everything else blind-tunnels exactly like launcher mode. If no
   proxy can be made healthy, the plugin stands down silently and traffic goes
