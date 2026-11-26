@@ -4252,6 +4252,39 @@ export async function preflightCompressIfNeeded(
         }
         return prepared;
     }
+    // #7167: the irreducible-dimension gate — tools[], system and other are
+    // dimensions folding CANNOT touch: the moment they alone clear the doom
+    // bar, no amount of message compaction can fit the body, so the fold
+    // below is guaranteed-doomed from its first summary call — it would
+    // irreversibly rewrite the session's history and bill real tokens for a
+    // body that still cannot fit. Per #7537 (owner ruling 2026-11-22) the
+    // local estimate-refusal is gone: instead of a local 413, the gate now
+    // SKIPS the doomed fold (no irreversible history rewrite, no summary
+    // billing) and forwards the unmodified body — the upstream's own size
+    // verdict is authoritative. Measure the UNMODIFIED prepared body with the
+    // #554 guard meter, right after the one-shot fold gate. Same bar as the
+    // post-fold dooms (the native window when bili knows it, the headroom
+    // limit as fallback): the gate can only skip a fold the post-fold flow
+    // would have measured-doomed with the same meter — no new failure mode.
+    // Growth-armed payloads keep the autoFold fail-open rule (a growth
+    // trigger is operator intent and the payload fits the real window by
+    // definition — the #3444 floor mechanism owns that regime's
+    // unreachable-target case). Unparseable bodies fall through
+    // (measuredOutbound undefined) — current behavior holds.
+    if (!growthArmed) {
+        const preFoldOutbound = measuredOutbound(prepared);
+        if (preFoldOutbound !== undefined) {
+            const pf = preFoldOutbound.breakdown;
+            const irreducible = pf.tools + pf.system + pf.other;
+            const doomBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
+            if (irreducible >= doomBar) {
+                const nativeKnown = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0;
+                const skipMessage = `tools[] + system + other alone measure ~${irreducible.toLocaleString("en-US")} tokens (${measuredBreakdownClause(pf)}; CJK-aware count, the #554 guard meter; images billed separately and never doom here — #496/#1800/#857) vs ${nativeKnown ? `the model's window ${doomBar.toLocaleString("en-US")}` : `bili's effective window ${doomBar.toLocaleString("en-US")}`} (model=${model}) — dimensions compression cannot touch, so no amount of message folding can fit this body. SKIPPING the preflight fold (no irreversible history rewrite, no summary billing) and forwarding the unmodified body per #7537 — the upstream's own size verdict is authoritative. Trim the tool surface (fewer or smaller tools, lazy tool discovery) or shorten the system prompt if the upstream rejects it.`;
+                log("warn", `[${session.id}] preflight fold-skip (irreducible-dimension gate, #7537): ${skipMessage}`);
+                return prepared;
+            }
+        }
+    }
     // #3846: an earlier local 413 for THIS origin+model at an equal or wider
     // window is independent evidence the payload cannot fit here — the
     // forward-once escapes below must not re-bet the estimator guess. Fitting
