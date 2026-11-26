@@ -241,7 +241,13 @@ async function main() {
   // bili config: window per model id + the plane switch (snapBase parity)
   const biliJson = path.join(xdgConfig, "billion-context", "billion-context.json");
   fs.mkdirSync(path.dirname(biliJson), { recursive: true });
+  // The lane's client hits the proxy port directly (plugin-host style, bare
+  // headers) — without a default upstream the proxy cannot tell which provider
+  // a non-prefixed request belongs to and forwards it to a built-in default
+  // (observed: api.anthropic.com → 403 "Request not allowed"). upstream: recUrl
+  // makes the recorder the fallback target, exactly like the e2e test servers.
   fs.writeFileSync(biliJson, JSON.stringify({
+    upstream: recUrl,
     providers: { [recUrl]: { models: { [MODEL]: { context: BIG_WINDOW, output: 4096 } } } },
     compress: { preserveRecentTokens: 0 },
     ...rolloutCfg,
@@ -300,7 +306,7 @@ async function main() {
     const t1q = `A long document follows. Which GATE-MARK-Sxx markers does it contain? List every marker you find, nothing else.\n\n${corpus}`;
 
     // ---- t1: chat wire, big window — establish the context ---------------
-    const t1 = await turn("chat", (t) => buildChat(t), BIG_WINDOW);
+    const t1 = await turn("chat", () => buildChat(t1q), BIG_WINDOW);
     t1.q = t1q;
     record("t1 chat-wire turn completes", t1.status === 200, `status ${t1.status} ${t1.body.slice(0, 120)}`);
     noKernelBypass("t1", 0);
