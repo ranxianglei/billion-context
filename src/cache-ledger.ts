@@ -2050,6 +2050,38 @@ export function settleUsageReport(
             : typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel
             : undefined;
         if (stampedModel !== undefined) session.stats.lastInputTokensModel = stampedModel;
+        // C4 (PR #7684): window ratchet — this session judged `stampedModel` on
+        // the anonymous DEFAULT window (recorded per request in
+        // metadata.windowFallbackModels, C4 site in src/server/handle.ts). A
+        // successful report that BILLed input beyond the window it was judged
+        // on proves the upstream window is bigger: raise the session-local
+        // window to 2× the observation, monotonically (never down, never below
+        // a previous raise). Declared / registry / operator windows are never
+        // in windowFallbackModels, so they are never touched. No ledgerSeq /
+        // table write — this is session metadata only.
+        if (stampedModel !== undefined) {
+            const fallbackWindows = (session.metadata.windowFallbackModels ?? {}) as Record<string, number>;
+            const judged = fallbackWindows[stampedModel];
+            if (typeof judged === "number" && Number.isFinite(judged)) {
+                const ratchet = (session.metadata.windowRatchet ?? {}) as Record<string, number>;
+                const current = Math.max(ratchet[stampedModel] ?? judged, judged);
+                // One anomalous giant bill (e.g. #6781's 43.3MB full resend) must not
+                // turn the session window into a permanent 2× of it in a single leap:
+                // a bill FAR beyond what even a 4×-judged window could contain is
+                // clamped to the 4× bound (the next over-window bill — judged against
+                // the raised value — re-raises monotonically within the same bound, so
+                // a genuinely large window still converges in bounded steps); a bill
+                // INSIDE the 4× bound is trusted at full 2× strength.
+                const trustedCeiling = 4 * judged;
+                let raised = Math.max(2 * session.stats.lastInputTokens, ratchet[stampedModel] ?? 0);
+                if (session.stats.lastInputTokens > trustedCeiling) raised = Math.min(raised, trustedCeiling);
+                if (raised > current) {
+                    ratchet[stampedModel] = raised;
+                    session.metadata.windowRatchet = ratchet;
+                    loggerLog("info", `[${session.id}] [window-ratchet] model=${stampedModel} billed ${session.stats.lastInputTokens} input beyond the judged window ${judged} — session window raised to ${raised} (${session.stats.lastInputTokens > trustedCeiling ? `clamped to the ${4}×-judged bound ${trustedCeiling} against one anomalous bill` : "2× the observation"}; monotonic, session-local)`);
+                }
+            }
+        }
         // #1933 F1: consume the pending pair — the local text estimate of the
         // payload THIS report bills, recorded at prepare time. Same route
         // required. Admitted samples (plausibility band) accumulate in a

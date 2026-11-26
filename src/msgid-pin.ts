@@ -25,8 +25,7 @@ const RESERVED_PREFIX = "acp_summary_";
 
 type MsgIdValidation = { ok: true; ids: string[] } | { ok: false; reason: string };
 
-export function validateMsgIds(raw: unknown, expectedLen: number): MsgIdValidation {
-    if (!Array.isArray(raw)) return { ok: false, reason: "not-an-array" };
+function validateIdEntries(raw: unknown[], expectedLen: number): MsgIdValidation {
     if (raw.length !== expectedLen) return { ok: false, reason: "length-mismatch" };
     const seen = new Set<string>();
     for (const v of raw) {
@@ -40,8 +39,113 @@ export function validateMsgIds(raw: unknown, expectedLen: number): MsgIdValidati
     return { ok: true, ids: raw as string[] };
 }
 
+export function validateMsgIds(raw: unknown, expectedLen: number): MsgIdValidation {
+    if (!Array.isArray(raw)) return { ok: false, reason: "not-an-array" };
+    return validateIdEntries(raw, expectedLen);
+}
+
 export function applyMsgIdPin(msgs: BiliMessage[], ids: string[]): BiliMessage[] {
     return msgs.map((m, i) => ({ ...m, id: ids[i] }));
+}
+
+// #7439 follow-up (cross-lane model/protocol switching): WIRE-granularity
+// pinning. The host stamps one id per WIRE message element (the pi-ai
+// walkers prove element⇄host-message pairing); the kernel splits one
+// element into N cores (an agentic assistant with text+tool_calls becomes
+// text core + tool-call cores, sharing one wireIndex). The per-core form
+// (validateMsgIds against msgs.length) can never express that — the old
+// host-side proof bailed to content-derived ids instead. The wire form:
+// group the post-hoist cores by their kernel-stamped wireIndex and pin
+// per group — the head core takes the host id, siblings get deterministic
+// derived ids (`<head>#p<k>`, lane-neutral, no schema change).
+//
+// Dual-mode unambiguity: a host that CAN'T split-proof still emits one id
+// per element, but ONLY when every element is 1:1 with its cores — which
+// is exactly the per-core length. So: ids.length === msgs.length → per-core
+// path (byte-identical to before); ids.length === group count AND at least
+// one group has >1 core → wire form. No overlap, no guess.
+
+/** #7439 follow-up: group post-hoist cores by wireIndex. Null when the
+ *  grouping can't express the envelope: any core lacks a non-negative
+ *  integer wireIndex, or the index range has a gap (a vanished wire element
+ *  has no group head to carry its host id → safe degrade to content-derived). */
+type WirePinGroups = {
+    /** Lowest wireIndex present (openai/responses hoist the leading
+     *  system/developer run, so the first surviving core may start past 0). */
+    min: number;
+    /** Number of wire elements (groups) — the expected envelope length. */
+    size: number;
+    /** True when at least one element owns more than one core. */
+    split: boolean;
+    /** wireIndex → core indices into the msgs array (array order = core order). */
+    groups: Map<number, number[]>;
+};
+
+export function wirePinGroups(msgs: BiliMessage[]): WirePinGroups | null {
+    const groups = new Map<number, number[]>();
+    let split = false;
+    for (let i = 0; i < msgs.length; i++) {
+        const w = msgs[i]!.wireIndex;
+        if (typeof w !== "number" || !Number.isInteger(w) || w < 0) return null;
+        const g = groups.get(w);
+        if (g === undefined) groups.set(w, [i]);
+        else {
+            g.push(i);
+            split = true;
+        }
+    }
+    if (groups.size === 0) return null;
+    let min = Infinity;
+    let max = -Infinity;
+    for (const w of groups.keys()) {
+        if (w < min) min = w;
+        if (w > max) max = w;
+    }
+    if (max - min + 1 !== groups.size) return null; // gap — orphan index
+    return { min, size: groups.size, split, groups };
+}
+
+const WIRE_SIBLING_RE = /^(\S+)#p\d+$/;
+
+/**
+ * #7439 follow-up (Part 2): the ledger view is CORE-granular — a multi-core
+ * wire element carries its host id on its FIRST core and derived `#pN` ids
+ * on its siblings. Wire-element-granular consumers (the incremental tail pin
+ * compares against the host's element list) need the ELEMENT list: drop
+ * every derived sibling, keep every leader.
+ *
+ * Documented limit: a host-minted id that genuinely ends in `#pN` while its
+ * base is ALSO in the ledger is indistinguishable from a derived sibling and
+ * is treated as one (host ids are a host-owned namespace; the collision
+ * would have to match both the exact suffix and a co-resident base id).
+ */
+export function wireElementIds(ledgerIds: readonly string[]): string[] {
+    const set = new Set(ledgerIds);
+    return ledgerIds.filter((id) => {
+        const m = WIRE_SIBLING_RE.exec(id);
+        return !(m !== null && set.has(m[1]));
+    });
+}
+
+/** Wire-form validation: same entry rules as the per-core path, length
+ *  against the GROUP count (wire elements), not the core count. */
+export function validateWireMsgIds(raw: unknown, groups: WirePinGroups): MsgIdValidation {
+    if (!Array.isArray(raw)) return { ok: false, reason: "not-an-array" };
+    return validateIdEntries(raw, groups.size);
+}
+
+/** Wire-form pinning: each group's head core takes the host id for its
+ *  wireIndex; siblings derive `<head>#p<k>` in core order. Deterministic
+ *  and lane-neutral — the same logical split pins the same ids on every
+ *  lane, so a lane switch keeps the flow's ids (the op-log swap matches by
+ *  id). Pinning copies — the source messages keep their derived ids. */
+export function applyWireMsgIdPin(msgs: BiliMessage[], groups: WirePinGroups, ids: string[]): BiliMessage[] {
+    return msgs.map((m, i) => {
+        const w = m.wireIndex as number;
+        const g = groups.groups.get(w)!;
+        const pos = g.indexOf(i);
+        return { ...m, id: pos === 0 ? ids[w - groups.min] : `${ids[w - groups.min]}#p${pos}` };
+    });
 }
 
 // #5719: the lane resolver's identity input — same degrade-over-mispair

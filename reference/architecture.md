@@ -33,6 +33,7 @@ billion-context/
 │   │   ├── request-cost.ts       #   Per-request local-cost line (outbound measured at the real wire body) + #5408 heartbeat + wall-clock slow-session advisory, facts only (#903/#4528/#5744)
 │   │   ├── responses-ordering.ts #   #564 Responses assistant-run ordering repair + producer-owned turn-separator provenance (#2627)
 │   │   ├── responses-separator.ts #   Canonical Responses turn-separator literal and carrier predicates (#2627)
+│   │   ├── session-lane.ts       #   Wire-lane switch recorder: one loud line per session wire-lane switch (bounded cross-wire loss list), previous lane persisted in session metadata (#7439 C5 / #7684)
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests
 │   │   ├── attribution-status.ts #   Takeover-failure visibility from host attribution reports (#3581)
 │   │   ├── dsh-authored-compaction.ts #   Bili-authored dsh compaction: answers the summarize call locally (#3733)

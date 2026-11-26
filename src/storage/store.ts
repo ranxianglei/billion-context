@@ -251,6 +251,13 @@ export interface BlockRow {
     startMsgid?: string | null;
     /** #7439 ruling 2: msgid of the last message in the block. */
     endMsgid?: string | null;
+    /** #7439 follow-up (C6): kernel-attested coverage bounds in the 1-based
+     *  flow display space (CoreMessage.ledgerSeq / refs #4316 L3). Bound when
+     *  the kernel could prove the fold covered a single contiguous span of
+     *  stamped messages; absent otherwise. Egress-on sessions bind block seq
+     *  coordinates from these (ingestSession); eg-off never reads them. */
+    provenStartSeq?: number;
+    provenEndSeq?: number;
 }
 
 export interface RefRow {
@@ -1798,10 +1805,66 @@ export class UnifiedStore {
             // #7577: collect the transcript-resolved coordinates per block so
             // the egress block recorder (below) can build self-contained
             // snapshots without re-reading the egress flow view.
+            // #7439 follow-up (C6): for egress-on sessions the op log IS the
+            // transcript — these sessions stop extending the frozen messages
+            // table, so bounds bind to the flow's canonical 1-based message
+            // numbers (the kernel's ledgerSeq/ref space; stamps come from
+            // stampEgressSeqs, the same numbering). Parsed ONCE per save.
+            let egressOn = false;
+            try {
+                egressOn = (JSON.parse(s.metadataJson) as Record<string, unknown>)["egressAuthority"] === true;
+            } catch { /* metadataJson parse failure → not egress-on */ }
+            let egressNum: Map<string, number> | null = null;
+            const flowBoundsForCovered = (payloadJson: string): [number, number] => {
+                if (egressNum === null) {
+                    try {
+                        egressNum = new Map(
+                            egressStateView(this.db, s.sessionId)
+                                .filter((r) => r.num > 0 && r.msgid !== EGRESS_SYSTEM_MSGID)
+                                .map((r) => [r.msgid, r.num] as const),
+                        );
+                    } catch {
+                        egressNum = new Map(); // corrupt/absent flow: no claim, never fail the save
+                    }
+                }
+                let lo = Number.POSITIVE_INFINITY;
+                let hi = -1;
+                try {
+                    const cov = JSON.parse(payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                    for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) {
+                        const n = egressNum.get(id);
+                        if (n === undefined) continue;
+                        if (n < lo) lo = n;
+                        if (n > hi) hi = n;
+                    }
+                } catch { /* malformed payload: keep the no-claim sentinel */ }
+                return hi < 0 ? [-1, -1] : [lo, hi];
+            };
             const blockCoords = new Map<string, { startSeq: number; endSeq: number; startMsgid: string | null; endMsgid: string | null }>();
             for (const b of input.blocks) {
                 if (skipIncomingBlocks) continue;
-                const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
+                let bStartSeq: number;
+                let bEndSeq: number;
+                if (egressOn) {
+                    // Proven (kernel-attested, 1-based flow space) FIRST: a
+                    // flow fold D's its covered ids in the SAME turn, so the
+                    // flow read cannot see them — the kernel's own attested
+                    // bound is the exact one. Then the flow view (pre-arm
+                    // imported blocks whose covered messages are still live),
+                    // then the honest no-claim sentinel.
+                    const ps = b.provenStartSeq;
+                    const pe = b.provenEndSeq;
+                    const provenOk = typeof ps === "number" && typeof pe === "number"
+                        && ps >= 1 && pe >= ps;
+                    if (provenOk) {
+                        bStartSeq = ps;
+                        bEndSeq = pe;
+                    } else {
+                        [bStartSeq, bEndSeq] = flowBoundsForCovered(b.payloadJson);
+                    }
+                } else {
+                    [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
+                }
                 // #5744: steady-state saves re-send every block byte-identical.
                 // When the effective post-upsert row equals the stored row the
                 // whole write (and its CAS bump/release dance, which nets to
@@ -1903,11 +1966,6 @@ export class UnifiedStore {
             // updated for them). A live block leaving the set emits a terminal
             // reaped U (D6), not a DELETE + orphan_blocks copy.
             if (!skipIncomingBlocks) {
-                let egressOn = false;
-                try {
-                    const meta = JSON.parse(s.metadataJson) as Record<string, unknown>;
-                    egressOn = meta["egressAuthority"] === true;
-                } catch { /* metadataJson parse failure → not egress-on */ }
                 if (egressOn) {
                     const currentBlocks = new Map<string, EgressBlockSnapshot>();
                     for (const b of input.blocks) {

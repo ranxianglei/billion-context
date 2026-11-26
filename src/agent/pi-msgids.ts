@@ -47,7 +47,6 @@
 // #6525: the core-alignment proof below runs the KERNEL's own wire→core
 // projection (the same one the proxy runs before pinning), so a stamp that
 // passes it is guaranteed to be the exact array the server will validate.
-import { anthropicToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
 
 type FpPart = { t: "text" | "img" | "tooluse" | "toolres" | "think" | "redact"; v: string };
 
@@ -580,23 +579,28 @@ export function laneMsgIdsForResponsesWire(input: unknown, branch: unknown): str
     return leftover === "exhausted" ? ids : undefined;
 }
 
-// #6525 (send): CORE-alignment proof shared by every client's full-resend
-// msgid envelope stamp (dsh #6532 inlines the same logic; pi/omp call this).
-// Input = the WALKER's wire-aligned output (openai/responses wires keep their
-// leading bili-ps-N hoist slots) + the wire elements + the full payload.
-// Returns the core-aligned id array — == the POST-hoist core count the server
-// validates — or undefined when a 1:1 host pin is not provable; the caller
-// must then send NO envelope (byte-identical to before, never a misaligned
-// array).
-// The kernel's wireIndex is the alignment authority: a wire element that
-// splits into N cores (or vanishes) has no 1:1 host id, so the whole stamp
-// bails. Duplicates are refused here too (validateMsgIds would reject them
-// server-side anyway — refusing locally skips the one-time warn path).
+// #6525 (send): full-resend msgid envelope alignment shared by every
+// client's stamp (dsh #6532 reuses this; pi/omp call it directly). Input =
+// the WALKER's wire-aligned output (openai/responses wires keep their
+// leading bili-ps-N hoist slots) + the wire elements. Returns the
+// PER-WIRE-ELEMENT id array (leading hoist slots dropped) — or undefined
+// when the pairing is not provable and the caller must send NO envelope
+// (byte-identical to before, never a misaligned array).
+//
+// #7439 follow-up (cross-lane switching): the array is ELEMENT-aligned, not
+// core-aligned. The kernel splits one wire element into N cores (agentic
+// text+tool_calls, multi-part user) — the old per-element core-count proof
+// bailed those turns to content-derived ids. The server now dual-modes:
+// all-1:1 (element count == core count) pins per-core exactly as before;
+// a split envelope (element count == wire-element groups) pins the group
+// head to the host id with deterministic derived sibling ids. The host
+// therefore stamps whenever the WALKER's element⇄host-message pairing holds
+// — no kernel re-conversion needed here (also one fewer converter run per
+// stamp). Duplicates are refused locally (validateMsgIds/validateWireMsgIds
+// would reject them server-side anyway).
 export function coreAlignEnvelopeIds(
-    fmt: "openai" | "anthropic" | "responses",
     wireAligned: string[],
     wire: unknown,
-    parsed: Record<string, unknown>,
 ): string[] | undefined {
     if (!Array.isArray(wire)) return undefined;
     // The walk's contract is 1:1 with the element count — a mismatched pair
@@ -613,22 +617,8 @@ export function coreAlignEnvelopeIds(
     for (let i = lead; i < wireAligned.length; i++) {
         if ((wireAligned[i] as string).startsWith("bili-ps-")) return undefined;
     }
-    const coreAligned = wireAligned.slice(lead);
-    if (coreAligned.length === 0) return undefined;
-    const flat = fmt === "anthropic"
-        ? anthropicToCore(parsed as Parameters<typeof anthropicToCore>[0])
-        : fmt === "responses"
-        ? responsesToCore(parsed as Parameters<typeof responsesToCore>[0])
-        : openaiToCore(parsed as Parameters<typeof openaiToCore>[0]);
-    const perEl = new Map<number, number>();
-    for (const c of flat.msgs) {
-        const w = c.wireIndex;
-        if (w === undefined) continue;
-        perEl.set(w, (perEl.get(w) ?? 0) + 1);
-    }
-    for (let i = lead; i < wire.length; i++) {
-        if ((perEl.get(i) ?? 0) !== 1) return undefined; // element split into N cores (or vanished) — no 1:1 host pin exists
-    }
-    if (new Set(coreAligned).size !== coreAligned.length) return undefined;
-    return coreAligned;
+    const elementAligned = wireAligned.slice(lead);
+    if (elementAligned.length === 0) return undefined;
+    if (new Set(elementAligned).size !== elementAligned.length) return undefined;
+    return elementAligned;
 }

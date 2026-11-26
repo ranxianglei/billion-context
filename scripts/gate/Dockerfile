@@ -68,6 +68,6 @@ ENV GATE_OC1_BIN=opencode-v1
 
 # gate-tools = the orchestrator + container-only lanes (COPY'd, not cloned)
 RUN mkdir -p /gate /gate-tools /work
-COPY entrypoint.sh docker-lanes.mjs plugin-lanes.mjs restart-lanes.mjs upstream-recorder.mjs patch-gate.mjs verdaccio.config.yaml /gate-tools/
+COPY entrypoint.sh docker-lanes.mjs plugin-lanes.mjs restart-lanes.mjs wire-lanes.mjs upstream-recorder.mjs patch-gate.mjs verdaccio.config.yaml /gate-tools/
 
 ENTRYPOINT ["/bin/bash", "/gate-tools/entrypoint.sh"]

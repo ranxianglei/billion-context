@@ -8,6 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { rebuildCoreFromLog } from "./storage/egress-serve.js";
+import { stampEgressSeqs } from "./server/egress-lane-io.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -2630,7 +2631,16 @@ export async function handlePluginTool(
             // (rememberPluginMessages), so a racing tool call sees a consistent
             // state instead of a stale/empty window.
             const mem = session.transient?.pluginMessages;
-            const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+            const rawMessages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+            // #7439 follow-up (C6): egress-on sessions number their live
+            // messages in the op log (the renumbered citation space — the
+            // system row holds 0). Stamp
+            // that space onto the fold's cores BEFORE the kernel runs — the
+            // same way the four wire lanes stamp their processTurn input.
+            // The kernel attests a fold block's startSeq/endSeq only from
+            // cores that carry ledgerSeq; without this, a plugin-channel fold
+            // on an egress-on session lands an unattested block ([-1,-1]).
+            const messages = stampEgressSeqs(getStore()?.egressOpLogStore(), session.id, rawMessages);
             const before = currentContextObservation(session);
             const creditBefore = session.stats.compressCreditTokens ?? 0;
             const compressBefore = session.lastCompress;
@@ -2647,7 +2657,7 @@ export async function handlePluginTool(
                 // registered into new blocks' coverage and read back as
                 // permanent drift against the client's unchanged history
                 // (same split as the relay loop ctx).
-                compressMessages: mem && mem.original.length > 0 ? mem.original : undefined,
+                compressMessages: mem && mem.original.length > 0 ? stampEgressSeqs(getStore()?.egressOpLogStore(), session.id, mem.original) : undefined,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
