@@ -7,7 +7,7 @@ import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { applyRanges, externalSummaryBreakerRefusal, recordExternalSummaryFailure, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, supersededRefRejection, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
-import { describeExternalSummaryFailure, externalSummaryFailureAdvice, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
+import { describeExternalSummaryFailure, externalSummaryFailureAdvice, summaryInputTokenEstimate, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
 import { newExternalCallId } from "./external-summary-marker.js";
 
 // Re-exported for callers that historically imported it here; the canonical
@@ -140,7 +140,21 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     if (successful.length === 0) {
         const advice = externalSummaryFailureAdvice(batch);
         const guard = plan.stats.attempts > 0 ? recordExternalSummaryFailure(ctx, parsed.ranges, advice) : "";
-        return compressResult(`[Compression FAILED: all configured external summary candidates failed or exceeded their budget. Nothing compressed; do not retry unchanged configuration — ${advice}] [${describeExternalSummaryFailure(batch)}]${guard}`, "refused", 0);
+        // #6945: name the oversized range(s) so the refusal is actionable — a
+        // generic "exhausted" left the user guessing which range to split. The
+        // estimate matches the guard's byte-for-byte (same system + payload +
+        // defaultCountTokens), so a range flagged here is one the smallest
+        // target would have rejected before any fetch.
+        let oversizedDiag = "";
+        const budget = plan.tightestInputBudget;
+        if (budget !== undefined) {
+            const oversized = work.map((item, index) => ({ index, tokens: summaryInputTokenEstimate(item) }))
+                .filter((entry) => entry.tokens > budget);
+            if (oversized.length > 0) {
+                oversizedDiag = ` [oversized: ${oversized.map((entry) => `${valid[entry.index].startRef}-${valid[entry.index].endRef} ≈${entry.tokens}tok, split ≥${Math.ceil(entry.tokens / budget)}`).join("; ")} — each exceeds the tightest target input budget (${budget}tok); split each into the stated number of smaller ranges]`;
+            }
+        }
+        return compressResult(`[Compression FAILED: all configured external summary candidates failed or exceeded their budget. Nothing compressed; do not retry unchanged configuration — ${advice}] [${describeExternalSummaryFailure(batch)}]${oversizedDiag}${guard}`, "refused", 0);
     }
     const applied = applyRanges({ ...parsed, ranges: successful }, ctx);
     // Client call arguments carry only an optional hint, never the generated summary.

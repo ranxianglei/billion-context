@@ -277,12 +277,23 @@ test("#3380 P2 integration: failures escalate on the ladder, then heal clean", a
             const raw = mockCtx({ registerError: () => (failing ? new Error("manifest down (transient)") : undefined) });
             const ctx = mockCtxTyped(raw);
             apply(ctx);
-            // Third consecutive failure arms the third ladder step (4×base).
+            // Consecutive failures arm the ladder; the recovery timer keeps
+            // driving failures while the manifest is down, so by the time we
+            // observe the streak it may have advanced past 3 and re-armed
+            // retryAt, and a loaded CI runner can stall the event loop between
+            // the arming and this read (2026-11-17: ~260ms), which made the old
+            // tight 30..95ms window flaky. Assert the stall-proof invariant for
+            // whatever streak we observe: the failure that set failStreak=S
+            // armed retryAt = T_S + backoff(S) with T_S <= now, so the arm is at
+            // most one full ladder step ahead of now — and it is armed at all.
+            // The exact ladder values are pinned by the unit test above.
             await waitFor(() => _registerStateForTest().failStreak >= 3, "three consecutive failures");
             const snap = _registerStateForTest();
             assert.equal(snap.lastRegistrationError, "manifest down (transient)", "last error recorded for status surfaces");
+            const step = _regBackoffForTest(snap.failStreak);
             const delta = snap.retryAt - Date.now();
-            assert.ok(delta >= 30 && delta <= 95, `retryAt sits on the 80ms ladder step (got ${delta}ms)`);
+            assert.ok(delta <= step, `retryAt armed within the current ladder step (streak ${snap.failStreak}, step ${step}ms, got ${delta}ms)`);
+            assert.ok(snap.retryAt > 0, "retryAt is armed (back-off applied, not left flat at 0)");
             // Heal: the transient fault clears, the next attempt succeeds, and
             // the bookkeeping resets.
             failing = false;

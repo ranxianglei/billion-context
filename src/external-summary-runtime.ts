@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { SummaryCredentialStore } from "./external-summary-credentials.js";
 import { createSummaryHttpCandidate } from "./external-summary-http.js";
 import { parseExternalSummarySettings, SUMMARY_CONCURRENCY_DEFAULT, type ExternalSummarySettings } from "./external-summary-settings.js";
-import { ExternalSummaryExecutor, type ExternalSummaryBatchResult, type SummaryCandidate, type SummaryWork } from "./external-summary.js";
+import { ExternalSummaryExecutor, targetInputBudget, type ExternalSummaryBatchResult, type SummaryCandidate, type SummaryWork } from "./external-summary.js";
 import { log as loggerLog } from "./logger.js";
 
 // One shared queue across all sessions and all compression entry points; its
@@ -82,6 +82,21 @@ export class ConfiguredSummaryPlan {
         this.stats.calls += 1;
         for (const item of batch.results) this.stats.attempts += item.attempts.length;
         return batch;
+    }
+
+    /** #6945: the tightest per-target input budget across the chain — the
+     *  smallest (contextWindow - outputTokens - 256) — for the manual lane's
+     *  pre-validation of nominated ranges. A range whose input tokens exceed
+     *  this is rejected by the smallest target's guard before any fetch.
+     *  Undefined when the chain has no targets (a disabled/empty chain never
+     *  reaches the manual lane). */
+    get tightestInputBudget(): number | undefined {
+        let tightest: number | undefined;
+        for (const target of this.settings.targets) {
+            const room = targetInputBudget(target.contextWindow, target.outputTokens);
+            if (tightest === undefined || room < tightest) tightest = room;
+        }
+        return tightest;
     }
 }
 
