@@ -271,6 +271,41 @@ withSessionsDir("buildSessionDetail returns blocks, ledger and rendered handoff"
     assert.equal(await buildSessionDetail("nope"), null);
 });
 
+withSessionsDir("buildSessionDetail exposes authoredCheckpointLanded after an authored-checkpoint rebase (#7788)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    // Session A: an authored checkpoint landed (dshAuthoredCheckpointLanded) and
+    // the ACP state was rebased — blocks wiped to 0 by design.
+    const a = makeSession("rebased-1", { protocol: "openai" });
+    a.metadata["dshAuthoredCheckpointLanded"] = true;
+    a.metadata["nativeCompactionAt"] = Date.now();
+    await store.writeNow(a);
+    // Session B: a fresh session that never compressed — no authored checkpoint.
+    const b = makeSession("fresh-1", { protocol: "openai" });
+    await store.writeNow(b);
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const da = await buildSessionDetail("rebased-1");
+    assert.ok(da);
+    assert.equal(da.blockDetails.length, 0, "rebased session has 0 blocks");
+    assert.equal(da.authoredCheckpointLanded, true, "authoredCheckpointLanded is true after an authored rebase");
+    const db = await buildSessionDetail("fresh-1");
+    assert.ok(db);
+    assert.equal(db.blockDetails.length, 0, "fresh session has 0 blocks");
+    assert.equal(db.authoredCheckpointLanded, undefined, "no authoredCheckpointLanded on a fresh session");
+});
+
+test("#7788: the panel explains a 0-block state after an authored-checkpoint rebase", () => {
+    // The client renders the note (det.blocks_empty_rebased) only when the detail
+    // carries authoredCheckpointLanded — a fresh 0-block session keeps the
+    // plain "no blocks yet" message.
+    assert.ok(WEB_CLIENT.includes("det.blocks_empty_rebased"), "client references the rebased empty-state note");
+    assert.ok(WEB_CLIENT.includes("authoredCheckpointLanded"), "client reads the authoredCheckpointLanded flag");
+    // Both i18n locales carry the note.
+    assert.ok(WEB_CLIENT.includes("Went through an authored-checkpoint rebase"), "en note present");
+    assert.ok(WEB_CLIENT.includes("经历过 authored checkpoint rebase"), "zh note present");
+});
+
 withSessionsDir("tokensSaved derives from active blocks when the stat is dead (#2734)", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     const mk = (blockId: string, compressedTokens: number, active: boolean): CompressionBlock => ({

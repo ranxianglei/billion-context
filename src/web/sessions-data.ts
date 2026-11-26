@@ -353,6 +353,12 @@ interface WebSessionDetail extends WebSessionSummary {
         summaryTokens: number;
         summaryBytes: number;
     }>;
+    /** #7788: an authored bili-snapshot checkpoint landed and the ACP state was
+     *  rebased onto it — the compression blocks were wiped by design (the client
+     *  checkpoint replaced them; originals stay in CCR). The panel uses this to
+     *  explain a "0 blocks" state instead of letting it read as data loss.
+     *  Absent when no authored checkpoint ever landed. */
+    authoredCheckpointLanded?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,6 +1596,9 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
             if (session.metadata["egressAuthority"] === true) return { storageMode: "egress" as const };
             return typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {};
         })(),
+        // #7788: authored checkpoint landed + ACP state rebased — the panel uses
+        // this to explain a "0 blocks" state as expected, not data loss.
+        ...(session.metadata["dshAuthoredCheckpointLanded"] === true ? { authoredCheckpointLanded: true } : {}),
         // #3756 follow-up: snapshot-render shadow observability (compute the
         // view, never emit it) — surfaced so the panel can prove the render
         // engine healthy across the fleet before the rollout flip.
