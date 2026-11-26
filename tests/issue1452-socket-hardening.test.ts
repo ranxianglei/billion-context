@@ -334,6 +334,40 @@ test("exposure telemetry: periodic info line with liveConns breakdown (#1452)", 
     }
 });
 
+test("exposure telemetry: tcpHandles counts live TCP sockets (TCPSocketWrap), not the dead TCPWrap/TLSSocket names (#7597)", async () => {
+    // The #7597 blind-tunnel socket leak was invisible because the old match
+    // ("TCPWrap" || "TLSSocket") never matched getActiveResourcesInfo()'s real
+    // "TCPSocketWrap" name, so tcpHandles was always 0. Hold a raw connection
+    // open and assert the counter now sees it.
+    const upstream = http.createServer((_req, res) => res.end("{}"));
+    await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
+    const captured: { level: string; msg: string }[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    const restoreExposure = withEnv("BILI_EXPOSURE_LOG_INTERVAL_MS", "100");
+    let harness: Harness | null = null;
+    let held: net.Socket | null = null;
+    try {
+        harness = await startProxy(upstream, false);
+        held = net.connect(harness.port, "127.0.0.1");
+        await once(held, "connect");
+        const deadline = Date.now() + 5000;
+        let line: { level: string; msg: string } | undefined;
+        while (Date.now() < deadline) {
+            line = captured.find((c) => /\[exposure\] uptime=/.test(c.msg) && /tcpHandles=([1-9]\d*)/.test(c.msg));
+            if (line) break;
+            await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.ok(line, `expected an [exposure] line with tcpHandles>=1 while a socket is held, got: ${captured.filter((c) => c.msg.startsWith("[exposure]")).map((c) => c.msg).join(" | ")}`);
+    } finally {
+        if (held && !held.destroyed) held.destroy();
+        restoreExposure();
+        setLogCapture(null);
+        if (harness) { await harness.stop(); harness.cleanup(); }
+        upstream.closeAllConnections?.();
+        await close(upstream);
+    }
+});
+
 test("retired stall guard: stale export ignored + named at startup; idle budget bounds the silence (#1706/#1714)", async () => {
     // First chunk then silence forever — the #1706 incident shape. The retired
     // BILI_STREAM_STALL_MS=400 export must NOT cut this stream at ~400ms; only

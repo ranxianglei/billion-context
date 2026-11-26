@@ -1220,7 +1220,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         const exposureStartedAt = Date.now();
         const exposureTimer = setInterval(() => {
             const handles = process.getActiveResourcesInfo();
-            const tcpHandles = handles.reduce((n, h) => n + (h === "TCPWrap" || h === "TLSSocket" ? 1 : 0), 0);
+            // getActiveResourcesInfo() reports the handle type, which is
+            // "TCPSocketWrap" for BOTH plain-TCP and TLS sockets (the JS
+            // TLSSocket wraps a TCPSocketWrap handle) — not "TCPWrap"/"TLSSocket"
+            // (those names are never emitted, so the old match was always 0 and
+            // the #7597 blind-tunnel socket leak was invisible here).
+            const tcpHandles = handles.reduce((n, h) => n + (h === "TCPSocketWrap" ? 1 : 0), 0);
             log("info", `[exposure] uptime=${Math.round(((Date.now() - exposureStartedAt) / 3_600_000) * 10) / 10}h liveConns=${connRecords.size} tcpHandles=${tcpHandles} handles=${handles.length} sessions=${listSessions().length} blindTunnels=${liveBlindTunnels()} inFlight=${totalInFlight()}`);
         }, exposureIntervalMs);
         exposureTimer.unref?.();

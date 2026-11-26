@@ -356,6 +356,73 @@ await test("setupMitm e2e: blind TCP tunnel to a non-whitelisted host passes byt
     });
 });
 
+await test("setupMitm e2e: blind tunnel closes when the remote FINs first and the client sends a last record (#7597)", async () => {
+    await withTmpCa(async () => {
+        // The remote (real upstream) closes first. The proxy pipes both ways, so
+        // upstream.pipe(clientSocket) ends the client's write side (FIN) and the
+        // clientSocket→upstream pipe leaves the client socket paused on the
+        // upstream close.
+        let resolveRemote!: (s: net.Socket) => void;
+        const remoteConnected = new Promise<net.Socket>((r) => { resolveRemote = r; });
+        const upstream = net.createServer((sock) => {
+            sock.on("data", () => {});
+            resolveRemote(sock);
+        });
+        upstream.listen(0, "127.0.0.1");
+        await once(upstream, "listening");
+        const upPort = (upstream.address() as { port: number }).port;
+
+        const server = http.createServer((_req, res) => { res.writeHead(500); res.end(); });
+        setupMitm(server, []);
+        // Capture the proxy-side client socket. The http server's 'connection'
+        // event hands the SAME socket object tunnelThrough() pipes, so its
+        // 'close' is the leak signal (a leaked socket never fires 'close').
+        const proxySockets: net.Socket[] = [];
+        server.on("connection", (s) => { proxySockets.push(s as net.Socket); });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const port = (server.address() as { port: number }).port;
+        try {
+            // 127.0.0.1 is an IP, not a domain → isMitmHost is false → blind tunnel.
+            const { statusLine, socket } = await rawConnect(port, "127.0.0.1", `127.0.0.1:${upPort}`);
+            assert.match(statusLine, /^HTTP\/1\.1 200/, "blind tunnel must answer CONNECT with 200");
+            // rawConnect drops its data listener (pausing the socket); re-flow it
+            // so the client actually receives the proxy's FIN.
+            socket.resume();
+            // A TLS client answers the server's FIN with a final close_notify
+            // record before its own FIN. Simulate it: on the proxy's FIN, send a
+            // 24-byte TLS application-data record (the size of an encrypted
+            // close_notify) and then end.
+            socket.on("end", () => {
+                const record = Buffer.concat([Buffer.from([0x17, 0x03, 0x03, 0x00, 0x13]), Buffer.alloc(19)]);
+                socket.write(record);
+                socket.end();
+            });
+            // Wait for the remote leg to be established, then close it first —
+            // the trigger for the leak.
+            const remoteSock = await remoteConnected;
+            remoteSock.end();
+            // The proxy's client socket must close: the trailing record drains,
+            // 'end' fires, and autoDestroy closes it. Before the fix the socket
+            // was paused with the record in its buffer, so 'end'/'close' never
+            // fired and the socket (and its connRecords entry) leaked.
+            const proxySocket = proxySockets[0];
+            assert.ok(proxySocket, "proxy must have accepted the CONNECT socket");
+            const closed = await Promise.race([
+                (async () => { await once(proxySocket, "close"); return true; })(),
+                new Promise((r) => setTimeout(() => r(false), 2_000)),
+            ]);
+            assert.ok(closed, "proxy blind-tunnel client socket must close after the remote FINs first and the client sends a last record (#7597)");
+            socket.destroy();
+        } finally {
+            server.close();
+            server.closeAllConnections?.();
+            upstream.close();
+            (upstream as net.Server & { closeAllConnections?: () => void }).closeAllConnections?.();
+        }
+    });
+});
+
 test("recordBlindTunnel: counts per host and warns exactly once per host (#897)", () => {
     _resetBlindTunnelStatsForTest();
     const logs: string[] = [];
