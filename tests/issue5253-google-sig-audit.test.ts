@@ -55,9 +55,11 @@ test("auditGoogleSignatures: site list caps at five entries", () => {
 });
 
 test("googleSigWarnDecision: warns on first affected turn of a signing model, attributes origin", () => {
-    assert.deepEqual(googleSigWarnDecision({ modelSigns: true, unsignedIn: 3, unsignedOut: 3, warnedTurns: 0 }), { warn: true, clientOrigin: true });
+    // warnedTurns is 1-based (the caller increments before deciding); the first
+    // affected turn is 1.
+    assert.deepEqual(googleSigWarnDecision({ modelSigns: true, unsignedIn: 3, unsignedOut: 3, warnedTurns: 1 }), { warn: true, clientOrigin: true });
     // inbound clean, outbound dirty = bili-side defect attribution
-    assert.deepEqual(googleSigWarnDecision({ modelSigns: true, unsignedIn: 0, unsignedOut: 2, warnedTurns: 0 }), { warn: true, clientOrigin: false });
+    assert.deepEqual(googleSigWarnDecision({ modelSigns: true, unsignedIn: 0, unsignedOut: 2, warnedTurns: 1 }), { warn: true, clientOrigin: false });
 });
 
 test("googleSigWarnDecision: silent for non-signing models and clean outbounds", () => {
@@ -65,9 +67,9 @@ test("googleSigWarnDecision: silent for non-signing models and clean outbounds",
     assert.equal(googleSigWarnDecision({ modelSigns: true, unsignedIn: 0, unsignedOut: 0, warnedTurns: 0 }).warn, false);
 });
 
-test("googleSigWarnDecision: re-warns every tenth affected turn only", () => {
+test("googleSigWarnDecision: warns on the first affected turn, then re-warns every tenth", () => {
     for (let n = 1; n < 30; n++) {
-        const expected = n % 10 === 0;
+        const expected = n === 1 || n % 10 === 0;
         assert.equal(googleSigWarnDecision({ modelSigns: true, unsignedIn: 1, unsignedOut: 1, warnedTurns: n }).warn, expected, `turn ${n}`);
     }
 });

@@ -56,7 +56,9 @@ interface GoogleSigWarnInput {
     modelSigns: boolean;
     unsignedIn: number;
     unsignedOut: number;
-    /** Prior affected turns already warned in this session. */
+    /** Affected turns seen so far in this session (1-based, including the
+     *  current one — the caller increments before deciding). Warn fires on
+     *  the first and every REWARN_EVERY-th affected turn. */
     warnedTurns: number;
 }
 
@@ -72,6 +74,8 @@ const REWARN_EVERY = 10;
 
 export function googleSigWarnDecision(x: GoogleSigWarnInput): GoogleSigWarnDecision {
     const clientOrigin = x.unsignedIn > 0;
-    const warn = x.modelSigns && x.unsignedOut > 0 && (x.warnedTurns === 0 || x.warnedTurns % REWARN_EVERY === 0);
+    // warnedTurns is 1-based (the caller increments before deciding), so the
+    // first affected turn is 1, not 0 — warn on it and every REWARN_EVERY-th.
+    const warn = x.modelSigns && x.unsignedOut > 0 && (x.warnedTurns === 1 || x.warnedTurns % REWARN_EVERY === 0);
     return { warn, clientOrigin };
 }
