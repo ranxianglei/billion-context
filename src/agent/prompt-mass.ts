@@ -27,7 +27,7 @@ import type { WireProtocol } from "../util.js";
  *  (Same split as the server-side `PROMPT_BODY_KEYS` added by #7092; kept
  *  local so this client fix applies without depending on that PR landing.) */
 const PROMPT_KEYS: Record<WireProtocol, readonly string[]> = {
-    openai: ["messages", "tools"],
+    openai: ["messages", "tools", "system"],
     anthropic: ["messages", "tools", "system"],
     google: ["contents", "systemInstruction", "tools"],
     responses: ["input", "instructions", "tools"],

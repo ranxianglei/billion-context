@@ -27,7 +27,7 @@ import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
-import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
+import { applyEstimateCalibration, currentCalibrationFactor, type WireProtocol } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 import { preflightEmergencyDigestEnabled } from "./knobs.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
@@ -563,45 +563,116 @@ export function estimateRawBodyTokens(parsed: unknown): number {
     return tokens;
 }
 
+// #7013: the wire-format's PROMPT keys — the top-level fields the upstream's
+// tokenizer actually counts against the model window. Everything else (telemetry
+// uploads like DSH's `dsh_session_log`, config scalars, cache directives) rides
+// the wire but consumes NO window, so a window-fit judgment must price only
+// these — NOT a hardcoded exclusion of one plugin's field (the next plugin that
+// registers a different upload field would recur the #7013 bug). The keys mirror
+// what each prepare lane feeds its core converter: openai (messages + tools +
+// top-level system — the system prompt normally rides inside messages, but a
+// top-level system field is also counted to align with estimateWireOverhead),
+// anthropic (messages + tools + top-level system), google (contents +
+// systemInstruction + tools), responses (input + instructions + tools).
+export const PROMPT_BODY_KEYS: Record<WireProtocol, ReadonlySet<string>> = {
+    openai: new Set(["messages", "tools", "system"]),
+    anthropic: new Set(["messages", "tools", "system"]),
+    google: new Set(["contents", "systemInstruction", "tools"]),
+    responses: new Set(["input", "instructions", "tools"]),
+};
+
+// #7090: which DISPLAY bucket each wire-format's prompt key lands in — so the
+// breakdown's named buckets (messages/tools/system) align with the prompt mass
+// on EVERY lane, not just openai/anthropic. Without this, the responses lane's
+// `input` (the main prompt content) and the google lane's `contents` /
+// `systemInstruction` fall into the `other` catch-all, and the 413 clause's
+// "non-prompt, excluded" note would mislabel prompt mass as non-prompt. The
+// gate already prices `prompt` correctly (PROMPT_BODY_KEYS); this only fixes
+// the diagnostic split so `other` truly holds non-prompt mass on every lane.
+const PROMPT_KEY_BUCKET: Record<string, number> = {
+    messages: 0, contents: 0, input: 0,
+    tools: 1,
+    system: 2, systemInstruction: 2, instructions: 2,
+};
+
 /** #5000 item 3: which DIMENSION carries the outbound mass. The doom messages
  *  must say whether it is messages[] (a giant paste / tool result), tools[]
  *  (84 schemas in #5000), the system prompt, or structural other — "trim the
  *  oversized content" is actively misleading for a 55.2 MiB body whose
  *  messages[] is only 1.44 MiB. Same walk + same exclusions as
  *  estimateRawBodyTokens, split on the TOP-LEVEL field, so `total` always
- *  equals estimateRawBodyTokens(parsed) exactly. */
+ *  equals estimateRawBodyTokens(parsed) exactly. #7013: `prompt` is the mass
+ *  under the wire-format's prompt keys — what the window-fit gates price.
+ *  #7090: with promptKeys supplied, the named buckets (messages/tools/system)
+ *  hold the prompt mass on every lane (responses `input`→messages, google
+ *  `contents`→messages / `systemInstruction`→system), and `other` holds only
+ *  non-prompt mass — so `prompt === messages + tools + system` and
+ *  `prompt + other === total`. */
 export interface RawBodyBreakdown {
     total: number;
     messages: number;
     tools: number;
     system: number;
     other: number;
+    /** #7013: mass under the wire-format's prompt keys (PROMPT_BODY_KEYS) —
+     *  what the upstream tokenizer counts against the model window. Non-prompt
+     *  fields (telemetry uploads, config scalars) sit in `other` but NOT here.
+     *  0 when no promptKeys were supplied to the walk. */
+    prompt: number;
+    /** #6844: per-top-level-field token counts inside the `other` bucket,
+     *  descending by tokens — the field dominating `other` is the actionable
+     *  signal in a measured-doom 413 (which host-attached field carries the
+     *  non-prompt mass) without manual arithmetic. Empty when `other` is empty.
+     *  #7090: `bytes` is the UTF-8 byte length of the field's string content
+     *  (sum of leaves) — for a capped upload like DSH's 8 MiB `dsh_session_log`
+     *  the cap is in BYTES, so bytes localize the truncation/backlog better
+     *  than tokens. An approximation of the field's JSON size (leaf content
+     *  only, excludes syntax overhead). */
+    otherTop: Array<{ field: string; tokens: number; bytes: number }>;
 }
 
-export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
+export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlySet<string>): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
-    const pending: [unknown, string | undefined, number][] = [];
+    let prompt = 0;
+    const otherByField = new Map<string, number>();
+    const otherByFieldBytes = new Map<string, number>();
+    const pending: [unknown, string | undefined, number, boolean, string | undefined][] = [];
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
             if (isNonModelTopLevelKey(k)) continue;
-            const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
-            pending.push([v, k, bucket]);
+            // #7090: with promptKeys, the prompt keys land in their named display
+            // bucket (PROMPT_KEY_BUCKET) and everything else in `other` — so the
+            // named buckets align with the prompt mass on every lane. Without
+            // promptKeys (legacy/test callers) the openai/anthropic split stands.
+            const isPrompt = promptKeys ? promptKeys.has(k) : false;
+            const bucket = promptKeys
+                ? (isPrompt ? (PROMPT_KEY_BUCKET[k] ?? 3) : 3)
+                : (k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3);
+            pending.push([v, k, bucket, isPrompt, bucket === 3 ? k : undefined]);
         }
     } else {
-        pending.push([parsed, undefined, 3]);
+        pending.push([parsed, undefined, 3, false, undefined]);
     }
     while (pending.length > 0) {
-        const [value, key, bucket] = pending.pop()!;
+        const [value, key, bucket, isPrompt, field] = pending.pop()!;
         if (typeof value === "string") {
-            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) {
+                const t = defaultCountTokens(value);
+                buckets[bucket] += t;
+                if (isPrompt) prompt += t;
+                if (bucket === 3 && field !== undefined) {
+                    otherByField.set(field, (otherByField.get(field) ?? 0) + t);
+                    otherByFieldBytes.set(field, (otherByFieldBytes.get(field) ?? 0) + Buffer.byteLength(value, "utf8"));
+                }
+            }
             continue;
         }
         if (Array.isArray(value)) {
-            for (const item of value) pending.push([item, key, bucket]);
+            for (const item of value) pending.push([item, key, bucket, isPrompt, field]);
             continue;
         }
         if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket]);
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket, isPrompt, field]);
         }
     }
     return {
@@ -610,7 +681,21 @@ export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
         tools: buckets[1],
         system: buckets[2],
         other: buckets[3],
+        prompt,
+        otherTop: [...otherByField.entries()].map(([field, tokens]) => ({ field, tokens, bytes: otherByFieldBytes.get(field) ?? 0 })).sort((a, b) => b.tokens - a.tokens),
     };
+}
+
+// #7013 hardening: the prompt mass for a wire protocol, fail-closed. When the
+// protocol has no PROMPT_BODY_KEYS entry (a future protocol added to
+// WireProtocol without a keys table), price the WHOLE body (breakdown.total)
+// instead of 0 — a silent 0 would OPEN the gate. The enumeration test in
+// tests/raw-body-walk-depth.test.ts pins that every current WireProtocol
+// member has an entry, so this fallback is unreachable today.
+export function promptMassForProtocol(parsed: unknown, protocol: WireProtocol): { tokens: number; breakdown: RawBodyBreakdown } {
+    const promptKeys = PROMPT_BODY_KEYS[protocol];
+    const breakdown = estimateRawBodyBreakdown(parsed, promptKeys);
+    return { tokens: promptKeys ? breakdown.prompt : breakdown.total, breakdown };
 }
 
 // #553: upper-bound variant of estimateCoreMessages — every character counts

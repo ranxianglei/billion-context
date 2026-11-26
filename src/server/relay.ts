@@ -1057,6 +1057,10 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 }
                 return;
             }
+            // #7013: the fuse prices the wire-format's PROMPT mass (PROMPT_BODY_KEYS
+            // for prepared.protocol) — non-prompt fields (telemetry uploads like
+            // DSH's dsh_session_log, config scalars) ride the wire but consume no
+            // window, so they must not 413 a fitting prompt.
             const fuseMeasured = measuredOutbound(prepared);
             const fuseRawTokens = fuseMeasured?.tokens;
             if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {

@@ -283,3 +283,78 @@ test("e2e #4079 both-ways: bodies under the doom bars still forward — includin
         rmrf(root);
     }
 });
+
+// #7013: the fuse prices the wire-format's PROMPT mass, not the whole body.
+// A non-prompt upload field (DSH's dsh_session_log — telemetry that rides the
+// wire but consumes no window) must NOT doom a fitting prompt. This reproduces
+// the issue's exact repro: ~100K-token prompt + an 8 MiB dsh_session_log that
+// used to measure ~2M tokens and doom the send.
+// #7537 (owner ruling 2026-11-22): the fuse no longer refuses on estimate — it
+// logs the prompt-mass evidence and forwards. The dsh_* strip (passDshExtensions
+// default OFF, #7168/#7439) removes the upload before the wire, so the forwarded
+// body is just the small prompt and the upstream answers 200.
+test("e2e #7013: a giant non-prompt upload field does not doom a fitting prompt at the egress fuse", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-7013-"));
+    const { ctx, calls, close } = await setup();
+    try {
+        // No `model` in the body → preflight's `!model` early return skips its
+        // doom math; forward()'s egress fuse is the last line (#4079). The
+        // prompt is small (~1K tokens); the dsh_session_log upload is 8 MiB of
+        // non-prompt telemetry. #7537: the fuse logs the prompt-mass evidence
+        // and forwards; the dsh_* strip removes the upload before the wire.
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({
+                stream: true,
+                messages: [{ role: "user", content: "hello, a small fitting prompt" }],
+                dsh_session_log: "t".repeat(8_000_000),
+            }),
+        });
+        const body = await r.text();
+        assert.equal(r.status, 200, `the fitting prompt must forward despite the 8 MiB non-prompt upload (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(calls.length, 1, `the request reached the upstream exactly once (got ${calls.length})`);
+        assert.ok(calls[0]!.bytes < 2_000_000, "the non-prompt upload was stripped before the wire — the forwarded body is just the small prompt (#7168/#7439)");
+    } finally {
+        await close();
+        rmrf(root);
+    }
+});
+
+// #7013 both-ways: a prompt that GENUINELY exceeds the window is still the
+// upstream's problem, not a local estimate refusal — even with a large
+// non-prompt upload field present. #7537: the fuse logs the prompt-mass
+// evidence and forwards; the upstream's own 413 (the CJK prompt body exceeds
+// its limit) passes through annotated. The 2 MiB upload is stripped before the
+// wire (#7168/#7439), so it does not change the verdict.
+test("e2e #7013 both-ways: a genuinely over-window prompt is forwarded; the upstream's 413 passes through annotated (#7537)", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-7013b-"));
+    const { ctx, calls, close } = await setup();
+    try {
+        // ~1.2M CJK chars ≈ ~1.2M tokens of PROMPT mass — over the floored 1M
+        // bar on its own. Plus a 2 MiB non-prompt upload (stripped before the
+        // wire). The 3.6MB CJK prompt body exceeds the fake upstream's 2MB
+        // limit, so its own 413 is the verdict.
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({
+                stream: true,
+                messages: [{ role: "user", content: "数".repeat(1_200_000) }],
+                dsh_session_log: "t".repeat(2_000_000),
+            }),
+        });
+        const body = await r.text();
+        const parsed = JSON.parse(body) as { error?: { code?: string; message?: string } };
+        assert.equal(r.status, 413, `the upstream's size verdict must pass through (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.match(parsed.error?.message ?? "", /upstream says: request entity too large/, "the 413 is the UPSTREAM's message, not a local refusal");
+        assert.equal(r.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
+        assert.equal(r.headers.get("x-bili-retryable"), "false", "non-retryable — the CJK mass won't change on retry");
+        // THE behavior under test: the payload WAS forwarded — the fuse logs,
+        // it does not judge (#7537).
+        assert.equal(calls.length, 1, `upstream must see exactly one call (got ${JSON.stringify(calls)})`);
+    } finally {
+        await close();
+        rmrf(root);
+    }
+});

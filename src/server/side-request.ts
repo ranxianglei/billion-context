@@ -1,5 +1,5 @@
 import type { WireProtocol } from "../util.js";
-import { estimateRawBodyTokens } from "../preflight.js";
+import { promptMassForProtocol } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
 import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
@@ -1012,9 +1012,12 @@ const SIDE_REQUEST_GUARD_TOLERANCE = 1.15;
  *  reservation on routes that carry one (#4205: decided by the caller via
  *  shouldReserveOutputHeadroom with route+model evidence — the guard stays
  *  pure mechanics and self-reserves once from the UNRESERVED limit it is
- *  handed). blocked=false with limit<=0 means "window unknown — forward as
- *  before". blocked requires estimate >= limit x SIDE_REQUEST_GUARD_TOLERANCE
- *  (estimator bias). */
+ *  handed). #7013: the estimate prices only the wire-format's PROMPT mass
+ *  (PROMPT_BODY_KEYS[protocol]) — non-prompt fields (telemetry uploads like
+ *  DSH's dsh_session_log, config scalars) ride the wire but consume no window,
+ *  so they must not block a fitting prompt. blocked=false with limit<=0 means
+ *  "window unknown — forward as before". blocked requires estimate >= limit x
+ *  SIDE_REQUEST_GUARD_TOLERANCE (estimator bias). */
 export function sideRequestGuard(
     parsed: unknown,
     protocol: WireProtocol,
@@ -1044,6 +1047,8 @@ export function sideRequestGuard(
     const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
     if (reserveHeadroom && limit > 0) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
     const imageMass = imageReserve ?? imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
-    const estimate = estimateRawBodyTokens(parsed) + imageMass;
+    // #7013: price the wire-format's prompt mass (PROMPT_BODY_KEYS[protocol]) —
+    // non-prompt fields (telemetry uploads, config scalars) consume no window.
+    const estimate = promptMassForProtocol(parsed, protocol).tokens + imageMass;
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
 }
