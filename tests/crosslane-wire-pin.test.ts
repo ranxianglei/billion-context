@@ -66,9 +66,14 @@ test("wire-granularity pin: agentic split + lane switch keeps ids and placement 
                         usage: { input_tokens: 10, output_tokens: 5 },
                     }));
                 } else {
+                    // The conv-reason turn-1 reply carries reasoning_content
+                    // (the qwen/sglang shape) so turn 2's history must
+                    // re-send it byte-identically for the pin to match.
+                    const msgsText = JSON.stringify(body.messages);
+                    const isReasonFirst = msgsText.includes("intro yourself") && !msgsText.includes("1 + 1?");
                     res.end(JSON.stringify({
                         id: "chatcmpl-test", object: "chat.completion", model: MODEL,
-                        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+                        choices: [{ index: 0, message: isReasonFirst ? { role: "assistant", content: "I am the test model.", reasoning_content: "the user asks for an intro" } : { role: "assistant", content: "ok" }, finish_reason: "stop" }],
                         usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
                     }));
                 }
@@ -177,6 +182,47 @@ test("wire-granularity pin: agentic split + lane switch keeps ids and placement 
         //    reject.
         const r3 = await post("/v1/chat/completions", "conv-split", { model: MODEL, stream: false, messages: [...oaiHist, { role: "user", content: "again" }], biliMsgIds: ["x1", "x2"] });
         assert.equal(r3.status, 200, `the no-form turn must degrade to 200 (got ${r3.status}: ${r3.body.slice(0, 200)})`);
+
+        // D. The pi/qwen regression shape: a REASONING conversation on the
+        //    openai wire (assistant text + reasoning_content from turn 2
+        //    on). The client stamps one host id per element — INCLUDING the
+        //    turn-1 response, which the server minted itself last turn. The
+        //    egress_state rows must carry EXACTLY the declared host ids
+        //    (request ↔ database msgid equality, the reported bug: the rows
+        //    fell back to content-hash mints from turn 2 onward). Only the
+        //    turn-2 RESPONSE may still be a mint — the host has not declared
+        //    it yet (it will, on the next turn).
+        const reasonHist1 = [{ role: "user", content: "intro yourself" }];
+        const rD1 = await post("/v1/chat/completions", "conv-reason", { model: MODEL, stream: false, messages: reasonHist1, biliMsgIds: ["pi-u1"] });
+        assert.equal(rD1.status, 200, `reason turn 1 must succeed (got ${rD1.status}: ${rD1.body.slice(0, 200)})`);
+        const reasonHist2 = [
+            { role: "user", content: "intro yourself" },
+            { role: "assistant", content: "I am the test model.", reasoning_content: "the user asks for an intro" },
+            { role: "user", content: "1 + 1?" },
+        ];
+        const rD2 = await post("/v1/chat/completions", "conv-reason", { model: MODEL, stream: false, messages: reasonHist2, biliMsgIds: ["pi-u1", "pi-a1", "pi-u2"] });
+        assert.equal(rD2.status, 200, `reason turn 2 must succeed (got ${rD2.status}: ${rD2.body.slice(0, 200)})`);
+        await settle("conv-reason");
+        const { DatabaseSync } = await import("node:sqlite");
+        const db = new DatabaseSync(join(dir, "sessions", "index.db"), { readOnly: true });
+        try {
+            const rows = db.prepare("SELECT pos, msgid FROM egress_state WHERE session_id = ? ORDER BY pos").all("conv-reason") as Array<{ pos: number; msgid: string }>;
+            const ids = rows.map((r) => r.msgid);
+            for (const want of ["pi-u1", "pi-a1", "pi-u2"]) {
+                assert.equal(ids.filter((x) => x === want).length, 1, `egress_state must carry the declared host id ${want} exactly once (rows: ${JSON.stringify(rows)})`);
+            }
+            // The turn-1 response was minted by the server; turn 2's pin
+            // re-homes it onto the host's own id for that message — no
+            // orphaned mint may survive for a message the host declared.
+            const mints = ids.filter((x) => /^h_[0-9a-f]+$/.test(x) || (/^[0-9a-f]{16}$/.test(x)));
+            assert.ok(mints.length <= 1, `at most the turn-2 response may still be a mint (rows: ${JSON.stringify(rows)})`);
+            // Position order must mirror the conversation order (no
+            // drift between wire order and database order).
+            const posOf = (msgid: string) => rows.find((r) => r.msgid === msgid)!.pos;
+            assert.ok(posOf("pi-u1") < posOf("pi-a1") && posOf("pi-a1") < posOf("pi-u2"), `database order must mirror wire order (rows: ${JSON.stringify(rows)})`);
+        } finally {
+            db.close();
+        }
     } finally {
         setLogCapture(null);
         store?.closeQuietly();

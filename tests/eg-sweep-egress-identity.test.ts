@@ -36,7 +36,8 @@ import { EGRESS_IDENTITY_METADATA_KEYS, sanitizeEgressIdentityMetadata } from ".
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { prefixAffinity } from "../src/prefix-affinity.ts";
 import { _resetAffinityPersistForTest, flushPrefixAffinity, hydrateAffinityUnified, scheduleAffinityPersist } from "../src/affinity-persist.ts";
-import { _resetSessionsForTest } from "../src/session.ts";
+import { _resetSessionsForTest, type Session } from "../src/session.ts";
+import { resolveEgressAuthority } from "../src/server/egress-lane-io.js";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
 import { setLogCapture } from "../src/logger.ts";
@@ -63,14 +64,14 @@ function tablesOf(db: Db): string[] {
         .sort();
 }
 
-const EG_CORE_TABLES = ["egress_block_flow", "egress_block_state", "egress_flow", "egress_state", "kv_store", "session_ext", "sessions"];
+const EG_CORE_TABLES = ["egress_block_flow", "egress_block_state", "egress_flow", "egress_state", "egress_usage", "kv_store", "session_ext", "sessions"];
 const LEGACY_TABLES = ["blocks", "checkpoints", "ccr_entries", "conversations", "content", "dead_refs", "l1_world", "message_media", "messages", "orphan_blocks", "refs", "state_fields"];
 
 // ---------------------------------------------------------------------------
-// A1: the table creation gate (fresh eg db = 7 tables; convergence back to 19)
+// A1: the table creation gate (fresh eg db = 8 tables; convergence back to 20)
 // ---------------------------------------------------------------------------
 
-test("A1: fresh egress-mode database creates exactly the 7 core+egress tables; a legacy open converges the 12 back in", () => {
+test("A1: fresh egress-mode database creates exactly the 8 core+egress tables; a legacy open converges the 12 back in", () => {
     const dir = mkdtempSync(join(testRoot, "a1-"));
     const { db } = openSqliteDatabase(join(dir, "index.db"));
     try {
@@ -81,19 +82,19 @@ test("A1: fresh egress-mode database creates exactly the 7 core+egress tables; a
         migrateSchema(db); // default: legacyTables = true
         const all = tablesOf(db);
         for (const t of [...EG_CORE_TABLES, ...LEGACY_TABLES]) assert.ok(all.includes(t), `converged db carries ${t}`);
-        assert.equal(all.length, EG_CORE_TABLES.length + LEGACY_TABLES.length, `exactly 19 tables after convergence (got ${all.length})`);
+        assert.equal(all.length, EG_CORE_TABLES.length + LEGACY_TABLES.length, `exactly 20 tables after convergence (got ${all.length})`);
     } finally {
         db.close();
         rmBestEffort(dir);
     }
 });
 
-test("A1b: a fresh LEGACY database is unchanged (all 19 tables, as before this change)", () => {
+test("A1b: a fresh LEGACY database is unchanged (all 20 tables, as before this change)", () => {
     const dir = mkdtempSync(join(testRoot, "a1b-"));
     const { db } = openSqliteDatabase(join(dir, "index.db"));
     try {
         migrateSchema(db);
-        assert.equal(tablesOf(db).length, 19, `legacy fresh db keeps all 19 tables (got ${tablesOf(db).join(", ")})`);
+        assert.equal(tablesOf(db).length, 20, `legacy fresh db keeps all 20 tables (got ${tablesOf(db).join(", ")})`);
     } finally {
         db.close();
         rmBestEffort(dir);
@@ -446,7 +447,7 @@ function readOnlyDb(p: string): InstanceType<typeof DatabaseSync> {
     return new DatabaseSync(p, { readOnly: true });
 }
 
-test("B1: fresh eg-mode database after a real pinned lane — exactly 7 tables, identity row first request, no big kv blobs", async () => {
+test("B1: fresh eg-mode database after a real pinned lane — exactly 8 tables, identity row first request, no big kv blobs", async () => {
     const h = await harness("1");
     try {
         // --- the identity row lands with the FIRST request (before any flush)
@@ -470,7 +471,7 @@ test("B1: fresh eg-mode database after a real pinned lane — exactly 7 tables, 
         try {
             const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[])
                 .map((r) => r.name).filter((n) => !n.startsWith("sqlite_")).sort();
-            assert.deepEqual(tables, EG_CORE_TABLES, `fresh eg db after real traffic has exactly the 7 core+egress tables (got ${tables.join(", ")})`);
+            assert.deepEqual(tables, EG_CORE_TABLES, `fresh eg db after real traffic has exactly the 8 core+egress tables (got ${tables.join(", ")})`);
             // kv: only small config rows; the three big blobs must not exist
             // (kv is the primary; the legacy file is the pre-hydration fallback
             // — assert both paths are dry in eg mode)
@@ -484,10 +485,12 @@ test("B1: fresh eg-mode database after a real pinned lane — exactly 7 tables, 
                     assert.ok(row.value_json.length <= KV_VALUE_MAX_CHARS, `kv row ${row.namespace}|${row.key} = ${row.value_json.length} chars exceeds the ${KV_VALUE_MAX_CHARS} cap`);
                 }
             }
-            // session_ext: pf:state only (the K1 exemption) — and small
+            // session_ext: pf:state (the K1 exemption) + usage:stats (the
+            // bounded usage-stats materialization) — both small
             const ext = db.prepare("SELECT key, value_json FROM session_ext WHERE session_id = 'p1'").all() as { key: string; value_json: string }[];
             for (const row of ext) {
-                assert.ok(["pf:state"].includes(row.key), `unexpected session_ext key ${row.key} for the egress-on session`);
+                assert.ok(["pf:state", "usage:stats"].includes(row.key), `unexpected session_ext key ${row.key} for the egress-on session`);
+                assert.ok(row.value_json.length <= 2048, `session_ext ${row.key} = ${row.value_json.length} chars must stay bounded`);
             }
             // the sessions row survived the turns (per-turn upsert, one row)
             const rows = db.prepare("SELECT * FROM sessions").all() as Record<string, unknown>[];
@@ -644,6 +647,70 @@ test("C4: legacy instance — deleteSession still sweeps the projection (the gat
         assert.equal(n("messages"), 0, "the message projection is swept");
         assert.equal(n("content"), 0, "the released CAS row is collected");
         assert.equal(n("sessions"), 0, "the identity row dies");
+    } finally {
+        try { store.close(); } catch { /* already closed */ }
+        rmBestEffort(dir);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// C5: the identity row is refreshed on EVERY egress-on turn — armed or
+// latched-record-only. Field bug: the pi+reasoning wire made the full-resend
+// pin bail, every later turn ran record-only, and the armed-only upsert left
+// the sessions row's title NULL forever (flow rows kept accumulating).
+// ---------------------------------------------------------------------------
+
+function makeSession(id: string, meta: Record<string, unknown>): Session {
+    return { id, metadata: {}, meta, createdAt: 1, lastSeen: 1 } as unknown as Session;
+}
+
+test("C5: a latched record-only turn still refreshes the identity row (title lands without re-arming)", () => {
+    const dir = mkdtempSync(join(testRoot, "c5-"));
+    const store = openEgStore(dir);
+    const db = (store as unknown as { db: Db }).db;
+    try {
+        const sid = "c5-s1";
+        const noop = (_l: string, _m: string) => {};
+        // Turn 1 — ARMED, empty flow: bootstrap. The latch is claimed and the
+        // identity row lands (the lane derives the title AFTER the resolve
+        // call, so the first row carries title=null).
+        const s1 = makeSession(sid, { protocol: "openai", label: sid, title: null, hostTitle: null, upstreamOrigin: "http://127.0.0.1:1" });
+        const r1 = resolveEgressAuthority({ session: s1, st: store, sessionId: sid, core: [], log: noop, armed: true });
+        assert.equal(r1.bootstrapping, true, "turn 1 bootstraps the empty flow");
+        assert.equal(s1.metadata["egressAuthority"], true, "the latch is claimed on the armed turn");
+        let row = db.prepare(`SELECT title, metadata_json FROM sessions WHERE session_id = ?`).get(sid) as { title: string | null; metadata_json: string };
+        assert.equal(row.title, null, "title not derived yet on turn 1");
+        assert.equal(JSON.parse(row.metadata_json).egressAuthority, true, "the latch PERSISTS in the row (load restores it from metadata_json)");
+        // The turn-1 record (what recordAuthorityTurn appends for the lane).
+        store.egressAppendTurn(sid, [{ type: "I", msgid: "m1", after: null, ref: "m00001", tokens: 5, typeTag: "text", bytes: "hello" }], 0, Date.now());
+        // Turn 2 — the pin FAILED this turn (host declared no ids): the lane
+        // calls the seam with armed=false. The record-only path must STILL
+        // refresh the identity row (meta.title now carries the lane's
+        // turn-1-derived value).
+        const s2 = makeSession(sid, { protocol: "openai", label: sid, title: "what is 2+2", hostTitle: null, upstreamOrigin: "http://127.0.0.1:1" });
+        s2.metadata["egressAuthority"] = true;
+        const r2 = resolveEgressAuthority({ session: s2, st: store, sessionId: sid, core: [], log: noop, armed: false });
+        assert.equal(r2.bootstrapping, false, "turn 2 is not a bootstrap");
+        const row2 = db.prepare(`SELECT title, meta_json FROM sessions WHERE session_id = ?`).get(sid) as { title: string | null; meta_json: string };
+        assert.equal(row2.title, "what is 2+2", "the latched record-only turn refreshed the title (armed-only upsert left it NULL forever)");
+        assert.equal(JSON.parse(row2.meta_json).title, "what is 2+2", "meta_json mirrors the title");
+    } finally {
+        try { store.close(); } catch { /* already closed */ }
+        rmBestEffort(dir);
+    }
+});
+
+test("C5b: a NON-latched record-only turn does not create the row (plain proxy posture unchanged)", () => {
+    const dir = mkdtempSync(join(testRoot, "c5b-"));
+    const store = openEgStore(dir);
+    const db = (store as unknown as { db: Db }).db;
+    try {
+        const sid = "c5b-s1";
+        const noop = (_l: string, _m: string) => {};
+        const s = makeSession(sid, { protocol: "openai", label: sid, title: null, hostTitle: null, upstreamOrigin: null });
+        resolveEgressAuthority({ session: s, st: store, sessionId: sid, core: [], log: noop, armed: false });
+        const n = Number((db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE session_id = ?`).get(sid) as { n: number }).n);
+        assert.equal(n, 0, "no identity row for a record-only session that never armed");
     } finally {
         try { store.close(); } catch { /* already closed */ }
         rmBestEffort(dir);

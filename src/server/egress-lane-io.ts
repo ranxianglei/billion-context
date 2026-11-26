@@ -212,11 +212,6 @@ export function resolveEgressAuthority(args: {
         session.metadata["egressFlowUnreadable"] = true;
         throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (ruling 7439-5) — failing the turn instead of trusting client bytes`);
     }
-    if (!armed) {
-        // Record-only turn: the lane's own core is written as-is and served
-        // as-is.
-        return { base: base0.view, baseSeq: base0.seq, bootstrapping: false, swappedCore: null, recordCore: core };
-    }
     // Ruling 7439: from this turn the op log is the content source of
     // truth for the session, so the unified-storage verifier must not
     // compare client-resend bytes against the canonical rows (that
@@ -224,16 +219,28 @@ export function resolveEgressAuthority(args: {
     // bytes the client never saw verbatim). The marker persists in
     // session metadata (meta_json) so it survives restarts and covers
     // every later turn, not just this one.
-    session.metadata["egressAuthority"] = true;
-    // KDD #25 (discussions/7735): persist the MINIMAL identity row the moment
-    // authority is claimed — never rely on the first ingest (egressProjection
-    // Frozen freezes it for armed sessions, so the row would never land and
-    // the session was invisible to list/GC/load after a restart). Every armed
-    // turn re-runs this: idempotent upsert = self-healing + updated_at keeps
-    // the sessions row fresh. Best-effort: a failure degrades to the existing
-    // fallback (isEgressOnSession probes egress_flow directly) — it never
-    // fails the request.
-    try {
+    //
+    // The latch is claimed BEFORE the identity upsert (the upsert's
+    // metadata_json is what makes the latch survive a restart — load
+    // restores session.metadata from the sessions row's metadata_json).
+    if (armed) session.metadata["egressAuthority"] = true;
+    // KDD #25 (discussions/7735): persist the MINIMAL identity row on EVERY
+    // egress-on turn — ARMED or LATCHED-RECORD-ONLY — never rely on the first
+    // ingest (egressProjection Frozen freezes it for armed sessions, so the
+    // row would never land and the session was invisible to list/GC/load
+    // after a restart). The latch is what makes a session egress-on, not the
+    // arm verdict of the current turn: a latched session whose pin FAILED
+    // this turn (host did not declare ids — e.g. the pi+reasoning wire made
+    // the full-resend resolver bail, every later turn record-only) degrades
+    // to record-only turns, and an armed-only upsert would then stop
+    // refreshing the row forever: title/origin/label never land or go stale
+    // (the field report: a pi thinking session whose title stayed NULL while
+    // its flow rows accumulated). Idempotent upsert = self-healing +
+    // updated_at keeps the sessions row fresh. Best-effort: a failure
+    // degrades to the existing fallback (isEgressOnSession probes
+    // egress_flow directly) — it never fails the request.
+    if (armed || session.metadata["egressAuthority"] === true) {
+        try {
         st.ensureEgressIdentity?.({
             sessionId: session.id,
             parentSessionId:
@@ -265,8 +272,14 @@ export function resolveEgressAuthority(args: {
             // 1.5 MB each of chat content). Identity keys only.
             metadataJson: JSON.stringify(sanitizeEgressIdentityMetadata(session.metadata)),
         });
-    } catch (err) {
-        log("warn", `[${sessionId}] egress: identity row upsert failed (best-effort; the egress_flow probe still covers identity): ${String((err as { message?: unknown })?.message ?? err).slice(0, 200)}`);
+        } catch (err) {
+            log("warn", `[${sessionId}] egress: identity row upsert failed (best-effort; the egress_flow probe still covers identity): ${String((err as { message?: unknown })?.message ?? err).slice(0, 200)}`);
+        }
+    }
+    if (!armed) {
+        // Record-only turn: the lane's own core is written as-is and served
+        // as-is.
+        return { base: base0.view, baseSeq: base0.seq, bootstrapping: false, swappedCore: null, recordCore: core };
     }
     if (base0.view.length === 0) {
         // Turn-1 cold start (ruling 7439-5): the client bytes are the

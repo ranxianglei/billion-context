@@ -118,7 +118,15 @@ test("C4 a successful turn that bills beyond the default window raises the sessi
             `the model resolves to the anonymous default (log: ${logs.filter((l) => l.includes(`model=${MODEL}`) && l.includes("[window]")).slice(0, 2).join(" | ")})`);
         await settle("c4-sess");
 
-        // 2. a successful turn that BILLS beyond the default window (120K >
+        // 1b. NEGATIVE (the #971 e2e red, 2026-11-27): a bill INSIDE the
+        //     judged window proves nothing — 60K bills inside the 100K default
+        //     (2×60K would "outrank" it) must NOT ratchet. Only a bill BEYOND
+        //     the judged window is acceptance evidence for a bigger upstream.
+        const t1b = await turn("c4-sess", MODEL, 60_000, 1);
+        assert.equal(t1b.status, 200, `mid-window bill turn (got ${t1b.status}: ${t1b.text.slice(0, 200)})`);
+        await settle("c4-sess");
+        assert.deepEqual(ratchetRaises().length, 0, `a mid-window bill never raises (log: ${ratchetRaises().join(" | ")})`);
+
         //    100K): the proof the upstream window is bigger.
         const t2 = await turn("c4-sess", MODEL, 120_000, 1);
         assert.equal(t2.status, 200, `the over-default turn succeeds (got ${t2.status}: ${t2.text.slice(0, 200)})`);

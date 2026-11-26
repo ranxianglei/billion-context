@@ -66,6 +66,7 @@
 
 import type { SqliteDatabase } from "./driver.js";
 import { egressMaterializeState, egressStateAt, type EgressViewRow } from "./egress-state.js";
+import { egressUsageForkCopy, egressUsageForkCopyPrefix } from "./egress-usage.js";
 import type { CompressionState } from "acp-kernel";
 
 /**
@@ -613,6 +614,20 @@ export function egressPointFork(db: SqliteDatabase, fromSessionId: string, toSes
         db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(toSessionId);
         db.prepare("DELETE FROM egress_block_state WHERE session_id = ?").run(toSessionId);
         db.prepare("DELETE FROM egress_block_flow WHERE session_id = ?").run(toSessionId);
+        // Usage stream (8th egress table): the child inherits the parent's
+        // analytics prefix — fork-to-now copies the WHOLE stream (owner
+        // ruling: one usage stream per session), a true point fork copies
+        // the at <= watermark prefix. The boundary is the parent flow's
+        // MAX(created_at) at op_seq <= wm: the S events of exactly the
+        // settlements the child inherited.
+        if (forkToNow) {
+            egressUsageForkCopy(db, fromSessionId, toSessionId);
+        } else {
+            const usageWm = (
+                db.prepare("SELECT COALESCE(MAX(created_at), 0) AS m FROM egress_flow WHERE session_id = ? AND op_seq <= ?").get(fromSessionId, wm) as { m: number }
+            ).m;
+            egressUsageForkCopyPrefix(db, fromSessionId, toSessionId, usageWm);
+        }
         if (forkToNow) {
             db.prepare(
                 `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)

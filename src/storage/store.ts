@@ -62,6 +62,17 @@ import {
 } from "./snap.js";
 import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
 import { EGRESS_SYSTEM_MSGID, type EgressIdentityInput } from "./egress-record.js";
+import {
+    egressUsageAppend,
+    egressUsageDelete,
+    egressUsageRows,
+    readUsageStats,
+    writeUsageStats,
+    writeUsageStatsBestEffort,
+    USAGE_STAT_KEY,
+    type EgressUsageEvent,
+    type EgressUsageRow,
+} from "./egress-usage.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
@@ -2661,17 +2672,45 @@ export class UnifiedStore {
         return egressFork(this.db, parentId, childId) > 0;
     }
 
-    /** #7398: delete the session's egress op-log rows (state AND flow).
-     *  Egress rows are self-contained (ruling 7439-1: the bytes live in the
-     *  rows) — there is no content-CAS to release. Runs inside the caller's
-     *  sweep transaction. */
+    /** #7398: delete the session's egress op-log rows (state AND flow AND
+     *  the usage event stream). Egress rows are self-contained (ruling
+     *  7439-1: the bytes live in the rows) — there is no content-CAS to
+     *  release. Runs inside the caller's sweep transaction. */
     deleteEgressOps(sessionId: string): void {
         this.db.transaction(() => {
             this.db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(sessionId);
             // #7577: the block lifecycle log rides the same session — delete it too.
             this.deleteEgressBlockOps(sessionId);
+            // egress_usage event stream + its materialized stats row.
+            egressUsageDelete(this.db, sessionId);
+            this.db.prepare("DELETE FROM session_ext WHERE session_id = ? AND key = ?").run(sessionId, USAGE_STAT_KEY);
         });
+    }
+
+    /** Egress usage event stream (8th egress table, owner ruling 2026-11-27):
+     *  append-only S/F/M events — the restart-survival source of the cache
+     *  ledger on 7+1-table instances. */
+    egressUsageAppend(sessionId: string, events: readonly EgressUsageEvent[]): number {
+        return egressUsageAppend(this.db, sessionId, events);
+    }
+
+    egressUsageRows(sessionId: string): EgressUsageRow[] {
+        return egressUsageRows(this.db, sessionId);
+    }
+
+    /** The materialized stats row (session_ext "usage:stats", <=1024 chars —
+     *  the fast read; the stream is truth). */
+    readUsageStats(sessionId: string): string | null {
+        return readUsageStats(this.db, sessionId);
+    }
+
+    writeUsageStats(sessionId: string, json: string): void {
+        writeUsageStats(this.db, sessionId, json);
+    }
+
+    writeUsageStatsBestEffort(sessionId: string, json: string, log: (msg: string) => void): boolean {
+        return writeUsageStatsBestEffort(this.db, sessionId, json, log);
     }
 
 

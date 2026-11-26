@@ -89,6 +89,7 @@
 
 import type { SqliteDatabase } from "./driver.js";
 import { log as loggerLog } from "../logger.js";
+import { egressUsageForkCopy } from "./egress-usage.js";
 
 export class EgressStateCorruptError extends Error {
     constructor(readonly sessionId: string, readonly reason: string) {
@@ -821,6 +822,9 @@ export function egressFork(db: SqliteDatabase, fromSessionId: string, toSessionI
             `INSERT INTO egress_state (session_id, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at)
              SELECT ?, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at FROM egress_state WHERE session_id = ?`,
         ).run(toSessionId, fromSessionId);
+        // The usage event stream rides with the whole copy (owner ruling:
+        // one usage stream per session) — idempotent re-fork: replace.
+        egressUsageForkCopy(db, fromSessionId, toSessionId);
         return Number(n.c);
     });
 }

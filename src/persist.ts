@@ -46,7 +46,7 @@ import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow, type MessageRefContentRow, type MessageIdContentRow } from "./storage/store.js";
 import { contentStoreOf } from "./store.js";
 import { CALIBRATION_PROVENANCE_TEXT_ONLY, type WireProtocol } from "./util.js";
-import { currentContextObservation, canonicalJson, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
+import { currentContextObservation, canonicalJson, cacheLedgerIsEmpty, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW, rebuildCacheLedgerFromUsageEvents } from "./cache-ledger.js";
 
 /**
  * On-disk persistence for proxy sessions.
@@ -1426,11 +1426,11 @@ export class SessionStore {
                 // instead of a rollback through viewFor.
                 if (!importedNewer && dbAt !== null && payload.savedAt > dbAt) {
                     this.log("warn", `[persist] newer envelope for ${id} (savedAt ${payload.savedAt}) could not be imported — serving the envelope view, unified row kept at ${dbAt}`);
-                    return buildSession(payload);
+                    return this.withEgressUsageReplay(buildSession(payload));
                 }
-                return buildSession(viewToRecord(view));
+                return this.withEgressUsageReplay(buildSession(viewToRecord(view)));
             }
-            return buildSession(payload);
+            return this.withEgressUsageReplay(buildSession(payload));
         }
         return buildSession(payload);
     }
@@ -2029,6 +2029,41 @@ export class SessionStore {
         // no collision), exactly like pre-alignment master. Envelope-only
         // loads (no rows) skip honestly via the guard inside.
         this.logColdLoad(id, "unified store", session, record.savedAt);
+        return this.withEgressUsageReplay(session);
+    }
+
+    /** Egress usage plane (8th egress table): a cold-loaded egress-on
+     *  session whose in-memory cache ledger is EMPTY (fresh process; a
+     *  7+1-table instance has no envelope ledger) is rebuilt from the
+     *  egress_usage event stream — the ledger's own recordCacheSample /
+     *  pushFold re-run, so the output is byte-identical to the live run
+     *  (modulo the documented seam-observation boundary). A restored
+     *  non-empty envelope ledger (legacy 19-table mode) wins over the
+     *  stream. Best-effort: a damaged stream starts an empty ledger with a
+     *  warn — the load never fails on analytics. */
+    private withEgressUsageReplay(session: Session): Session {
+        if (session.metadata?.["egressAuthority"] !== true) return session;
+        if (!cacheLedgerIsEmpty(session)) return session;
+        const st = this.egressOpLogStore();
+        if (!st) return session;
+        try {
+            const rows = st.egressUsageRows(session.id);
+            if (rows.length === 0) return session;
+            const events: Array<{ type: "M" | "S" | "F"; at: number; payload?: unknown }> = [];
+            for (const r of rows) {
+                let payload: unknown;
+                try {
+                    payload = r.rowType === "M" ? undefined : JSON.parse(r.payloadText);
+                } catch {
+                    continue;
+                }
+                events.push({ type: r.rowType, at: r.at, payload });
+            }
+            const n = rebuildCacheLedgerFromUsageEvents(session, events);
+            this.log("info", `[persist] rebuilt the cache ledger for ${session.id} from the egress_usage stream (${n.lines} line(s), ${n.folds} fold(s))`);
+        } catch (err) {
+            this.log("warn", `[persist] egress usage replay failed for ${session.id} (${err instanceof Error ? err.message : String(err)}) — serving an empty ledger; new samples book fresh from this load`);
+        }
         return session;
     }
 

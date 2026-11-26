@@ -30,7 +30,7 @@
 
 ## 3. 表结构（SQLite，`src/storage/schema.ts`；probe-first DDL，开发期表）
 
-创建说明（KDD #25）：**egressPlane 开**的实例上，**新建**数据库只建核心三件套（`sessions`/`session_ext`/`kv_store`）+ 四张 egress 表——下方 12 张 legacy 表跳过创建，flag 日后关闭时由 probe-first 收敛补建；已有数据库绝不删表。见 §11。
+创建说明（KDD #25）：**egressPlane 开**的实例上，**新建**数据库只建核心三件套（`sessions`/`session_ext`/`kv_store`）+ egress 表 = 本清扫时的 **7 张——2026-11-27 起被第 5 张 egress 表 `egress_usage`（§12）取代：新建 eg 库为 **8 张**，完全收敛后为 20 张**——下方 12 张 legacy 表跳过创建，flag 日后关闭时由 probe-first 收敛补建；已有数据库绝不删表。见 §11。
 
 | 表 | 主键 | 作用 | 关键列 |
 |---|---|---|---|
@@ -38,10 +38,11 @@
 | `egress_state` | `(session_id, msgid)` | **物化 live 视图**（7773）：每条**存活**消息一行，按 `pos` 排序。每次 append 在同一事务内把 op 应用到行上——`I` 插入（`pos` 后移）、`U` 就地改、`D` 物理删 + 前移。构造上以 live 视图大小为界；没有压实、没有 base 行、没有 op 镜像。 | `pos`、`log_seq`（I 孪生在 flow 里的编号，不可变——孪生锚点）、`num`（当前内核引用号；0 = 无引用/已退役）、`msgid`、`ref`、`tokens`、`type`、`role`、`ts`、`sys_in`、`bytes`、`created_at`。`snapPinLiveIds`/serving 读命中它。 |
 | `egress_block_flow` | `(session_id, op_seq)` | 追加式**块**历史。**独立编号池**（双时钟）。 | `row_type` I/U/D（reap = 一条 `D` 行，带该块的**终态全量快照**，#7773；退役的 `B` 行已不存在）· 快照 payload `{tier, startMsgid, startSeq, endMsgid, endSeq, supersedesBlockId, active, reaped, one, full}` · **`flow_op_seq`** = 写入时刻 flow 的 `MAX(op_seq)`（跨表指针）· kstate 边车（残差字段清单） |
 | `egress_block_state` | `(session_id, block_id)` | **物化** live 块：每个未 reap 的块一行，按 `pos` 排序；reap 物理删行（flow 保留终态 `D` 快照）。 | 快照 payload + `pos` + `op_seq`/`flow_op_seq` |
+| `egress_usage` | `(session_id, op_seq)` | 追加式**缓存/用量事件流**（owner 裁定 2026-11-27）：把内存 cache ledger 的变更记成 op log，进程重启后可重建（§12）。第三个 egress 时钟，独立编号池。 | `row_type` M/S/F · `at`（epoch ms——点位 fork 水位）· `payload` = 有界 JSON（S：`recordCacheSample` 的**精确**参数 + model · F：原始 fold 行） |
 | `sessions.r3_latched_at` | — | R3 身份故障 latch 载体（#7617）。NULL/0 = 未 latch。 | 双载体：读 `?? l1_world.r3_latched_at`，清**两个都清** |
 | `conversations` | — | 宿主身份认领表。egress-on 会话不再需要认领行（身份无状态）；物理 DROP 在退役登记。 | |
 
-保留规则：**flow append-only、从不裁剪**（#7439——它的增长是已推迟的优化项 #7475，另行解决，绝不用裁剪解决）；**state 表 = 物化 live 视图**——它的大小就是 live 视图的大小，被覆盖行在折叠时物理删除（base 行/压实路径 `egressStateCompact`/`egressBlockCompact` 已退役，#7773）；block_flow 与消息 flow 一样 append-only。
+保留规则：**flow append-only、从不裁剪**（#7439——它的增长是已推迟的优化项 #7475，另行解决，绝不用裁剪解决）；**state 表 = 物化 live 视图**——它的大小就是 live 视图的大小，被覆盖行在折叠时物理删除（base 行/压实路径 `egressStateCompact`/`egressBlockCompact` 已退役，#7773）；block_flow 与消息 flow 一样 append-only；**egress_usage** 与它的兄弟们一样 append-only（只在会话删除 / fork 拷贝时清除，§12）。
 
 **结构不变量（7773 §6，每次写入后断言，两平面）。** ① flow 总行数只增（append-only）；② state 行数 == live 视图行数（物化，不是聚合、不是 op 镜像）；③ flow/state 里最大 value 大小 == 历史最大**单行**大小——针对退役 `B` 行全视图聚合 payload 的回归防线；④ 行字母表恰为 I/D/U（消息平面）与 I/U/D（块平面）——`B` 永不出现。套件：`tests/egress-invariants-7773.test.ts`。
 
@@ -140,3 +141,27 @@
 **kv_store 策略。** `kv_store` 是小配置面（install id、notices、host flags），不是 blob 库：开启 `egressPlane` 时每个值 JSON 序列化后不得超过 **256 字符**（`KV_VALUE_MAX_CHARS`，sqlite/mysql 两后端 `setKv` 入口按调用时刻判定）。**legacy 模式保持原有 4MB 字节预算**——存量键可能已经存着非常大的值，上限不能把非 eg 部署炸掉（owner 裁定 2026-11-26）。冻结白名单（`KV_VALUE_WHITELIST`，加条目 = review 事件，须登记 [deprecations.zh-CN.md](./deprecations.zh-CN.md)）给两个已知会长大的键保留 4MB 上限：`prefix-affinity|v1`、`plugin-conversations|table`。eg 模式下大 blob 在写入侧退役：`session-order` 早已退役（写入模块已被上游移除——孤儿行不再触碰，新库干净）；`plugin-conversations` 不写（路由表纯内存；重启 miss 等下一个模型请求重建——既有 miss 语义）；`prefix-affinity` 持久化在 eg 下整体退役（owner 裁定 2026-11-26）：显式 ID 分支、file→kv 一次性迁移、kv/文件持久化路径全部加门——链表仍每轮计算、但 eg 模式下永不落盘（匿名客户端在 eg 下丢失跨重启链连续性，已接受），legacy JSON 文件降为只读 hydration 源，legacy 模式字节级不变。
 
 **flag 默认值修正。** `ci:full` 验证合并（#7691）误把 `egressPlane` / `egressKstateRetireWrites` / `egressKstateRebuild` 的默认发到 **100**，违反本文档的 owner 裁定（默认 0、opt-in）。本次扫尾把三个默认在 `src/rollout.ts` 与配置文档中全部改回 **0**。**开关合并（owner 裁定 2026-11-26）：**两个 kstate 开关（`egressKstateRetireWrites` / `egressKstateRebuild`）随后被**整个移除**——写侧裁剪与读侧 op log 重建就是 `egressPlane` 本身的一部分。`egressPlane` 是唯一的开关：开 = 含 kstate 退役在内的全套平面，关 = 字节级 legacy。两个环境变量不复存在（已登记 [deprecations.zh-CN.md](./deprecations.zh-CN.md)）；旧配置里残留的键被无害忽略。
+
+## 12. 用量事件流 — `egress_usage`（owner 裁定 2026-11-27）
+
+**是什么。** 内存 **cache ledger**（`src/cache-ledger.ts`，挂在会话信封 `cacheLedger` 上）今天**重启即丢**——面板、seam-suspect 判定、fold-coverage 累计在进程重启后全部归零。裁定：egress-on 会话反正已经在付逐轮 op-log 写的成本，把 ledger 的变更也记成 op log——与消息平面同一哲学（flow = 正史，state = 物化，load = 重放）。流落在第 5 张 egress 表 `egress_usage`（probe-first DDL，未发布规则——新建库直接带上，无版本号变更）。
+
+**行字母表（M/S/F），每会话一个编号池（`op_seq` = MAX+1）：**
+
+| 行 | 含义 | Payload |
+|---|---|---|
+| `M` | boot-epoch 标记——ledger 的重启哨兵触发（某样本以「boot 后首个已知样本」结算，`rs=1`） | 无 |
+| `S` | 用量样本——`recordCacheSample` 的**精确**参数（`at`、`input`、`cached`、`output`、`protocol`、`upstream`、`keyFp`、`sysFp`、`canonFp`、`effFp`、`mode`）+ 结算时刻的 model 基线（`lastModel`） | `{s: UsageSample, model?}` |
+| `F` | 折叠登记——pushFold 时的**原始** fold 行（`at`、`S`、`sigma`、`X`、`V`、`Vp`、`bid`） | 该 fold 行 |
+
+**写路径。** 纯 best-effort，永不致命于请求：服务器启动时注册 sink（`setEgressUsageSink` / `setEgressUsageStatsSink`，`src/server.ts`），store 解析是懒的（`getStore().egressOpLogStore()`——legacy 后端为 null ⇒ 静默跳过）。`settleUsageReport` 发 `[M?] + S`——M 在且仅在该样本带重启标记时先于 S；`recordCacheFoldsFromBlocks` 每登记一个新 fold 发一条 F（eager 流点与 lazy detect 共用路径，一个 fold 恰好发一次）。坏行（如 stats JSON 超 1024 字符上限）在写入端 throw，但被 best-effort 包装吞掉——请求照常，流/统计行降级。
+
+**统计物化。** 每条 S 另把有界聚合（`usageStatsJson`：requests/input/cached/output/nc/cr/tr/folds + lastAt/hitPct/finalContext）写进 `session_ext` 键 `usage:stats`，**独立小事务**，1024 字符硬上限（throw + best-effort，同流）。该行是读捷径；流才是正史。
+
+**重放（重启重建）。** 冷载一个 `metadata.egressAuthority === true` 且信封 ledger 为**空**的会话（`persist.ts` → `withEgressUsageReplay` → `rebuildCacheLedgerFromUsageEvents`）在空白 ledger 上重跑事件流：F 行走 `pushFold`，S 行走 `recordCacheSample`（model pin 为瞬态），M 行重新武装 `lastBoot` 哨兵，使下一条样本的 restart 标记与 live 完全一致。两条结构规则：(1) 高水位 `lastBlockId` 先用流内 F 行预算——载入的 `state.blocks` 已全量物化，若让 `detectNewFolds` 从 state 再推，会把流即将投递的每个 fold 双推一遍（截断流的自愈方式即文档化行为：缺失 block 在下一条 S 时按无 geo 字段重推）；(2) 重建只降级、不失败——payload 解析失败跳过该行，全流损坏则保留空 ledger + warn。
+
+**不重放边界（文档化，接受）：** seam-suspect 计数器（自首次 live settle 重新计算——live/replay 构造上同基线，`detectOrphanSweeps` 两侧都在首样本建基线）、结算后填的 line 证据字段（`bd`/`be`/`bs`/`bl`/`captureId`/`captureRound`）、`xMeasured` seam 调整（瞬态结算上下文，重放时缺席——样本在 ledger 面上无它们重跑）。这些字段在 live 与重放 ledger 间可以不同；聚合、lines、folds 与重启哨兵不会不同。
+
+**Fork。** fork-to-now 拷贝**整条流**（子会话继承父会话的 ledger 历史——「按 session 复制一个 usage」，owner 裁定）；点位 W 的 fork 拷 `at <= W` 前缀（W = 父 flow 在 `op_seq <= W` 处 `MAX(created_at)` 推出）。重复 fork 幂等（先删子会话的行再拷）。会话删除清流 + 删 stats 行（`deleteEgressOps`）。
+
+**测试。** `tests/egress-usage.test.ts` — A：存储（DDL/表集、append 序号、fork 整拷/前缀/幂等、删除）；B：发射（精确样本 S、仅 rs=1 的 M 先于 S、零 total 隔离样本 S、有界 stats JSON）；C：重放（字节相等 ledger、M 重武装、坏流降级）；D：载入门（egressAuthority 门、非 egress 跳过、坏流 warn 降级）。

@@ -564,6 +564,36 @@ CREATE TABLE IF NOT EXISTS egress_block_state (
 );
 `;
 
+/** Usage-event stream (owner ruling 2026-11-27): the per-request usage /
+ *  cache-hit samples (S) and fold events (F), plus restart-boundary marks
+ *  (M), for egress-on sessions — where the in-memory cache ledger's inputs
+ *  were previously LOST on restart (the ledger lived in session metadata /
+ *  the legacy projection, neither of which exists for an egress-on session).
+ *  Append-only like egress_flow: rows are NEVER deleted (the session-scope
+ *  sweep only), op_seq dense per session, payload = the exact arguments the
+ *  in-memory ledger consumed. REBUILD BY REPLAY (same discipline as
+ *  egressStateAt): rows are replayed through recordCacheSample /
+ *  recordCacheFolds in order; replay must reproduce the ledger field-for-
+ *  field (golden-tested) — a failed replay is session-level damage on the
+ *  existing ladder, never a fuzzy merge. The MATIALIZED summary is a
+ *  session_ext row (`usage:stats`, <=1024 chars, re-derived from the stream)
+ *  — dual clock: this stream is the authority, the ext row is a derived
+ *  view that is rebuilt, never written back into the stream.
+ *  Never shipped: probe-first, no version bump (same rule as the rest of
+ *  the egress family). */
+const EGRESS_USAGE_DDL = `-- usage event stream for egress-on sessions (S samples / F folds / M restart marks).
+CREATE TABLE IF NOT EXISTS egress_usage (
+    session_id TEXT NOT NULL,
+    op_seq INTEGER NOT NULL,
+    row_type TEXT NOT NULL CHECK (row_type IN ('S','F','M')),
+    at INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, op_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_egress_usage_at ON egress_usage (session_id, at, op_seq);
+`;
+
 /** egress-mode table creation gate (KDD #25, discussions/7735).
  *  INTERNAL_ONLY — callers pass an object literal (structural typing);
  *  no other module imports the name. */
@@ -684,6 +714,13 @@ export function migrateSchema(db: {
         });
     }
     // #7577: the block lifecycle log — own probe (same discipline, no bump).
+    // Usage event stream (owner ruling 2026-11-27): third table of the
+    // egress group — same never-shipped probe-first rule (a missing table
+    // recreates the group in one step).
+    const hasEgressUsage = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_usage'")
+        .get();
+    if (!hasEgressUsage) db.transaction(() => db.exec(EGRESS_USAGE_DDL));
     const hasEgressBlockFlow = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_block_flow'")
         .get();
