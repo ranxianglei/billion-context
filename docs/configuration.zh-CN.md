@@ -456,6 +456,7 @@
 | `BILI_MODEL_INFO_RETRY_MS` | number | (built-in) | — | 测试钩子：模型信息查询的重试间隔。 |
 | `BILI_DSH_RETRY_INTERVAL_MS` | number | (built-in) | — | 测试钩子：dsh 车道操作的重试间隔。 |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | number | (built-in) | — | 测试钩子：dsh 车道恢复清扫间隔。 |
+| `BILI_TEST_FORCE_FULL_DDL` | boolean-ish | unset (egress-plane creation gate applies) | — | 测试专用逃生口（KDD #25）：egressPlane 开启时**新建**库默认只建核心三件套（sessions/session_ext/kv_store）+ 四张 egress 表（7 表形态），12 张 legacy 表不创建。断言门禁前 legacy 表形状（l1_world/conversations/messages 行）的测试套件设 `=1` 强制建全表、模拟门禁前的库。生产永不设置；缺省 = egress-plane 创建门生效（读点 src/storage/shadow.ts 的 UnifiedShadow.maybeOpen）。 |
 | `ACP_DUMP_DIR` | string | unset | — | 线路转储输出基础目录覆盖（路径重定位）。 |
 | `BILI_STREAM_STALL_MS` | number | (built-in) | — | 已提交上游流的停滞检测超时（无字节静默多久后中止）。 |
 | `BILI_CLIENT_BIN` | string | unset (PATH lookup) | — | 被启动客户端二进制的显式覆盖（在 PATH 上解析）。 |

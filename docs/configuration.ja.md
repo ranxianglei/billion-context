@@ -453,6 +453,7 @@
 | `BILI_MODEL_INFO_RETRY_MS` | number | (built-in) | — | テストフック: モデル情報の参照におけるリトライ間隔。 |
 | `BILI_DSH_RETRY_INTERVAL_MS` | number | (built-in) | — | テストフック: dsh レーン操作におけるリトライ間隔。 |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | number | (built-in) | — | テストフック: dsh レーンのリカバリスウィープ間隔。 |
+| `BILI_TEST_FORCE_FULL_DDL` | boolean-ish | unset (egress-plane creation gate applies) | — | テスト専用エスケープハッチ (KDD #25): egressPlane がオンでは、新規データベースは通常コア3点セット (sessions/session_ext/kv_store) + 4 つの egress テーブル (7 テーブル形状) のみを作成し、12 個の legacy テーブルは作成されない。ゲート前の legacy テーブル形状 (l1_world/conversations/messages 行) をアサートするテストスイートは、これを 1 に設定して完全な DDL を強制し、ゲート前の DB をシミュレートする。本番では決して設定しない; 未設定 = egress-plane 作成ゲートが適用される (読み取り点 src/storage/shadow.ts の UnifiedShadow.maybeOpen)。 |
 | `ACP_DUMP_DIR` | string | unset | — | ワイヤダンプ出力のベースディレクトリのオーバーライド（パスの再配置）。 |
 | `BILI_STREAM_STALL_MS` | number | (built-in) | — | コミット済みアップストリームストリームのストール検出タイムアウト（中断前の無バイト沈黙）。 |
 | `BILI_CLIENT_BIN` | string | unset (PATH lookup) | — | 起動するクライアントの明示的なバイナリオーバーライド（PATH で解決）。 |

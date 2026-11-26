@@ -456,6 +456,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_MODEL_INFO_RETRY_MS` | number | (built-in) | — | Test hook: retry interval for model-info lookups. |
 | `BILI_DSH_RETRY_INTERVAL_MS` | number | (built-in) | — | Test hook: retry interval for dsh lane operations. |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | number | (built-in) | — | Test hook: recovery sweep interval for the dsh lane. |
+| `BILI_TEST_FORCE_FULL_DDL` | boolean-ish | unset (egress-plane creation gate applies) | — | TEST-ONLY escape hatch (KDD #25): with egressPlane on, a FRESH database normally gets only the core trio (sessions/session_ext/kv_store) + the four egress tables (7-table shape); the 12 legacy tables are not created. Test suites that assert the pre-gate legacy table shapes (l1_world/conversations/messages rows) set this to 1 to force the full DDL and simulate a pre-gate DB. Production never sets it; unset = the egress-plane creation gate applies (read point src/storage/shadow.ts UnifiedShadow.maybeOpen). |
 | `ACP_DUMP_DIR` | string | unset | — | Base directory override for wire dump output (path relocation). |
 | `BILI_STREAM_STALL_MS` | number | (built-in) | — | Stall-detection timeout for committed upstream streams (no-byte silence before abort). |
 | `BILI_CLIENT_BIN` | string | unset (PATH lookup) | — | Explicit binary override for the launched client (resolved on PATH). |
