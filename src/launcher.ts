@@ -3559,13 +3559,21 @@ const DSH_BARE_ENTRY = "billion-context";
  *    reaches <DSH_HOME>/node_modules (every profile lives under DSH_HOME);
  *  - the client scanner's CJS resolve anchors inside dsh's install tree and
  *    only reaches a global npm prefix through NODE_PATH, which the launcher
- *    seeds with the same dir. The shim is a minimal package.json carrying the
- *  `dsh.client` declaration the scanner reads plus two SYMLINKS into bili's
- *  live dist — an auto-update that moves dist self-heals on the next launch.
- *  Returns false when nothing was written (existing shims stay untouched). */
-export function writeDshClientShimFiles(shimDir: string, hostBundle: string, clientBundle: string, version: string, gateBundle?: string): boolean {
+ *    seeds with the same dir. The shim is a COMPLETE bundle declaration —
+ *  `dsh.bundle.patch` + `dsh.client` — carrying SYMLINKS into bili's live dist
+ *  (host/client/gate bundles AND the patch file). dsh resolves bare bundle
+ *  names installation-anchor-first (#953/#1803), so this DSH_HOME copy is read
+ *  BEFORE the profile's own install; a client-only shim (no dsh.bundle) made
+ *  dsh reject it as not-bundle and skip the whole bundle (#7643). An
+ *  auto-update that moves dist self-heals on the next launch. Returns false
+ *  when nothing was written (existing shims stay untouched) — including when
+ *  the patch file is missing, so a client-only shadow is never emitted. */
+export function writeDshClientShimFiles(shimDir: string, hostBundle: string, clientBundle: string, version: string, patchFile: string, gateBundle?: string): boolean {
     try {
-        if (!fs.existsSync(hostBundle) || !fs.existsSync(clientBundle)) return false;
+        // #7643: the patch file is required for the shim to be a valid bundle —
+        // without it the shim would be a client-only shadow that dsh rejects
+        // (not-bundle) and skips, so refuse the write instead of emitting it.
+        if (!fs.existsSync(hostBundle) || !fs.existsSync(clientBundle) || !fs.existsSync(patchFile)) return false;
         // #3662: the always-on gate entry rides the same shim (a dangling
         // symlink would break its load, so it joins only when present).
         const hasGate = gateBundle !== undefined && fs.existsSync(gateBundle);
@@ -3580,11 +3588,15 @@ export function writeDshClientShimFiles(shimDir: string, hostBundle: string, cli
                 version,
                 type: "module",
                 exports: exportsMap,
-                dsh: { client: { platform: "web" } },
+                dsh: {
+                    bundle: { patch: "./dsh.bundle.patch.yml" },
+                    client: { platform: "web" },
+                },
             })}\n`,
         );
         fs.symlinkSync(hostBundle, path.join(shimDir, "index.js"));
         fs.symlinkSync(clientBundle, path.join(shimDir, "bundle.js"));
+        fs.symlinkSync(patchFile, path.join(shimDir, "dsh.bundle.patch.yml"));
         if (hasGate) fs.symlinkSync(gateBundle, path.join(shimDir, "gate.js"));
         return true;
     } catch {
@@ -3599,11 +3611,14 @@ export function writeDshClientShimFiles(shimDir: string, hostBundle: string, cli
 export function writeDshClientShim(dshHome: string): boolean {
     const hostBundle = selfDistFile("agent/dsh-native.js");
     const clientBundle = selfDistFile("agent/dsh-native-client.js");
+    // #7643: the patch file ships at the package root (not in dist) and makes
+    // the shim a complete bundle dsh won't reject as not-bundle.
+    const patchFile = path.join(selfPackageRoot(), "dsh.bundle.patch.yml");
     let version = "0.0.0";
     try {
         version = JSON.parse(fs.readFileSync(path.join(selfPackageRoot(), "package.json"), "utf8")).version ?? version;
     } catch {}
-    return writeDshClientShimFiles(path.join(dshHome, "node_modules", "billion-context"), hostBundle, clientBundle, version, selfDistFile("agent/dsh-compaction-gate.js"));
+    return writeDshClientShimFiles(path.join(dshHome, "node_modules", "billion-context"), hostBundle, clientBundle, version, patchFile, selfDistFile("agent/dsh-compaction-gate.js"));
 }
 
 /** #1590: entry name for the launcher's --patch overlay. The BARE package

@@ -4480,19 +4480,26 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         fs.writeFileSync(hostBundle, "// host\n");
         fs.writeFileSync(clientBundle, "// client\n");
         fs.writeFileSync(gateBundle, "// gate\n");
+        const patchFile = path.join(dir, "dsh.bundle.patch.yml");
+        fs.writeFileSync(patchFile, "- id: bili-native\n  name: billion-context\n");
         const shimDir = path.join(home, "node_modules", "billion-context");
 
-        assert.equal(writeDshClientShimFiles(shimDir, hostBundle, clientBundle, "0.1.169", gateBundle), true);
+        assert.equal(writeDshClientShimFiles(shimDir, hostBundle, clientBundle, "0.1.169", patchFile, gateBundle), true);
         const shimPkg = JSON.parse(fs.readFileSync(path.join(shimDir, "package.json"), "utf8"));
         assert.equal(shimPkg.name, "billion-context");
         // #3662: the bare lane resolves the gate entry through this subpath export
         assert.deepEqual(shimPkg.exports, { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js", "./dsh-compaction-gate": "./gate.js" });
         assert.equal(shimPkg.dsh.client.platform, "web");
+        // #7643: the shim is a COMPLETE bundle — dsh.bundle.patch so dsh's
+        // installation-anchor-first resolve (#953/#1803) finds a valid bundle
+        // instead of a client-only shadow it would reject as not-bundle.
+        assert.equal(shimPkg.dsh.bundle.patch, "./dsh.bundle.patch.yml");
         // The bundles are SYMLINKS into bili's live dist — an auto-update that
         // moves dist self-heals on the next launch without rewriting the shim.
         assert.equal(fs.realpathSync(path.join(shimDir, "index.js")), fs.realpathSync(hostBundle));
         assert.equal(fs.realpathSync(path.join(shimDir, "bundle.js")), fs.realpathSync(clientBundle));
         assert.equal(fs.realpathSync(path.join(shimDir, "gate.js")), fs.realpathSync(gateBundle));
+        assert.equal(fs.realpathSync(path.join(shimDir, "dsh.bundle.patch.yml")), fs.realpathSync(patchFile));
 
         // Resolvable from the home's walk-up chain, and the root import
         // lands on the host module itself ⇒ the bare entry.
@@ -4515,7 +4522,7 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         const home2 = path.join(dir, ".dsh2");
         fs.mkdirSync(home2);
         const shimDir2 = path.join(home2, "node_modules", "billion-context");
-        assert.equal(writeDshClientShimFiles(shimDir2, hostBundle, clientBundle, "0.1.169"), true);
+        assert.equal(writeDshClientShimFiles(shimDir2, hostBundle, clientBundle, "0.1.169", patchFile), true);
         const pkg2 = path.join(shimDir2, "package.json");
         fs.writeFileSync(pkg2, JSON.stringify({ ...JSON.parse(fs.readFileSync(pkg2, "utf8")), exports: { ".": "./other.js" } }));
         fs.writeFileSync(path.join(shimDir2, "other.js"), "// not the host half\n");
@@ -4534,17 +4541,27 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         const other = path.join(dir, "nm", "billion-context");
         fs.mkdirSync(other, { recursive: true });
         fs.writeFileSync(path.join(other, "keep.txt"), "x");
-        assert.equal(writeDshClientShimFiles(other, path.join(dir, "missing.js"), clientBundle, "0.0.0"), false);
+        assert.equal(writeDshClientShimFiles(other, path.join(dir, "missing.js"), clientBundle, "0.0.0", patchFile), false);
         assert.equal(fs.readFileSync(path.join(other, "keep.txt"), "utf8"), "x");
 
         // #3662: a missing gate bundle degrades to the pre-gate shim (no export,
         // no dangling symlink) instead of failing the whole shim.
         const other2 = path.join(dir, "nm2", "billion-context");
         fs.mkdirSync(other2, { recursive: true });
-        assert.equal(writeDshClientShimFiles(other2, hostBundle, clientBundle, "0.0.0", path.join(dir, "missing-gate.js")), true);
+        assert.equal(writeDshClientShimFiles(other2, hostBundle, clientBundle, "0.0.0", patchFile, path.join(dir, "missing-gate.js")), true);
         const shimPkg3 = JSON.parse(fs.readFileSync(path.join(other2, "package.json"), "utf8"));
         assert.ok(!Object.hasOwn(shimPkg3.exports, "./dsh-compaction-gate"));
         assert.ok(!fs.existsSync(path.join(other2, "gate.js")));
+
+        // #7643: a missing patch file refuses the write — a client-only shadow
+        // is exactly what dsh rejects as not-bundle, so no partial shim is
+        // emitted and existing content stays untouched.
+        const other3 = path.join(dir, "nm3", "billion-context");
+        fs.mkdirSync(other3, { recursive: true });
+        fs.writeFileSync(path.join(other3, "keep.txt"), "x");
+        assert.equal(writeDshClientShimFiles(other3, hostBundle, clientBundle, "0.0.0", path.join(dir, "missing-patch.yml"), gateBundle), false);
+        assert.equal(fs.readFileSync(path.join(other3, "keep.txt"), "utf8"), "x");
+        assert.ok(!fs.existsSync(path.join(other3, "package.json")));
     } finally {
         rmrf(dir);
     }
@@ -4570,6 +4587,9 @@ test("writeDshClientShim: stamps the real bili version into the shim package.jso
         assert.equal(shimPkg.version, repoPkg.version);
         // #3662: the real-dist shim carries the gate subpath export for the bare lane
         assert.equal(shimPkg.exports["./dsh-compaction-gate"], "./gate.js");
+        // #7643: the real-dist shim is a complete bundle (patch file symlinked)
+        assert.equal(shimPkg.dsh.bundle.patch, "./dsh.bundle.patch.yml");
+        assert.ok(fs.existsSync(path.join(home, "node_modules", "billion-context", "dsh.bundle.patch.yml")));
     } finally {
         rmrf(dir);
     }
@@ -4775,7 +4795,9 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
     fs.mkdirSync(path.dirname(hostFixture), { recursive: true });
     fs.writeFileSync(hostFixture, "// host\n");
     fs.writeFileSync(clientFixture, "// client\n");
-    assert.equal(writeDshClientShimFiles(path.join(`${dshHome}-bili`, "node_modules", "billion-context"), hostFixture, clientFixture, "0.1.169"), true);
+    const patchFixture = path.join(home, "dsh.bundle.patch.yml");
+    fs.writeFileSync(patchFixture, "- id: bili-native\n  name: billion-context\n");
+    assert.equal(writeDshClientShimFiles(path.join(`${dshHome}-bili`, "node_modules", "billion-context"), hostFixture, clientFixture, "0.1.169", patchFixture), true);
     const fakeDsh = path.join(dshTree, "bin", process.platform === "win32" ? "fake-dsh.exe" : "fake-dsh");
     fs.writeFileSync(fakeDsh, "");
     process.env.BILI_CLIENT_BIN = fakeDsh;
