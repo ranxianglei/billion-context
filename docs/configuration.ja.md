@@ -213,7 +213,7 @@
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | ログにアラートを出すまでの連続 EPERM 書き込み失敗回数。 |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM アラートの繰り返し間隔。0 の場合は 1 回のみログ出力する。 |
 | `sessions` | object | {} (all defaults) | — | セッションプールと GC のノブ（#2030）— 以前は BILI_MAX_SESSIONS / BILI_SESSION_GC* が環境変数のみ。 |
-| `sessions.dir` | string | unset (XDG data dir) | BILI_SESSIONS_DIR | セッションディレクトリの再配置（#7803）：セッションレコード、index.db と CCR コンテントストアの保存先。優先順位は BILI_SESSIONS_DIR 環境変数 > このキー > XDG データディレクトリ。相対値はプロセス CWD に対して解決される。既存のファイルを指すと（静黙的なフォールバックでデータが満杯ディスクに戻るのを防ぐため）明確なエラーで起動を拒否する。変更は次回再起動で有効。 |
+| `sessions.dir` | string | unset (XDG data dir) | BILI_SESSIONS_DIR | セッションディレクトリ全体（index.db + セッション JSON + CCR コンテンツストア）を容量不足のドライブ（例：肥大化する index.db を収まらない Windows C: ドライブ）からシェル環境を触らずに再配置する。環境変数の方が優先（#2030 の上書きレイヤ）。既存のファイル（ディレクトリでない）を指す値は、そのパスを名指しした明確なエラーで起動を拒否する（サイレントなフォールバックは、このキーが回避するべきディスク容量問題そのものを再生してしまうため）。非文字列値は警告付きで無視；相対パスはプロセスの CWD に対して解決される。他のパスと同様、ホット編集は次回再起動で反映。 |
 | `sessions.max` | number | 256 | BILI_MAX_SESSIONS | セッションプールの上限：メモリに保持するセッション数の最大値。超過すると最も冷たいセッションが LRU で退避されます（ファイルはディスクに残ります）。 |
 | `sessions.warmMax` | number | 0 (warms none) | BILI_SESSION_WARM_MAX | 有界起動（#2803/#3050）：リッスン前に最近保存されたセッションのうち何個をウォームするか。0 = ウォームしない（未ウォームのセッションは初回アクセス時にオンデマンドで 1 回読み込み）。8 にすると #2803 のイージートウォームセットが復元されます。 |
 | `sessions.warmMaxBytes` | number | 67108864 (64 MiB) | BILI_SESSION_WARM_MAX_BYTES | 起動ウォームセットのデコードバイト予算（#2803）。予算を超える単一ファイルはウォームされません。 |

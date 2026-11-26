@@ -216,7 +216,7 @@
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | 连续 EPERM 写失败达到该次数后在日志中告警。 |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM 告警的重复间隔；0 只记录一次。 |
 | `sessions` | object | {} (all defaults) | — | 会话池与 GC 旋钮（#2030）——原 BILI_MAX_SESSIONS / BILI_SESSION_GC* 仅环境变量。 |
-| `sessions.dir` | string | unset (XDG data dir) | BILI_SESSIONS_DIR | 会话目录重定位（#7803）：会话记录、index.db 与 CCR 内容存储的存放位置。优先级 BILI_SESSIONS_DIR 环境变量 > 本键 > XDG 数据目录；相对值按进程 CWD 解析；指向已存在的文件会带路径明确报错拒绝启动（静默回退会把数据放回满盘上）。改动下次重启生效。 |
+| `sessions.dir` | string | unset (XDG data 目录) | BILI_SESSIONS_DIR | 把整个会话目录（index.db + 会话 JSON + CCR 内容存储）从容量受限的磁盘（例如放不下不断增长 index.db 的 Windows C 盘）挪走，无需改动 shell 环境。环境变量优先（#2030 覆盖层）。指向已存在的文件（非目录）的值会带着该路径的明确报错拒绝启动（静默回退会重现这个 key 要解决的那个磁盘容量问题）；非字符串值带警告忽略；相对路径按进程 CWD 解析。与其他路径一样，热改在下次重启生效。 |
 | `sessions.max` | number | 256 | BILI_MAX_SESSIONS | 会话池上限：内存中最多持有的会话数；超出时最冷的会话被 LRU 逐出（其文件仍留在磁盘上）。 |
 | `sessions.warmMax` | number | 0 (warms none) | BILI_SESSION_WARM_MAX | 有界启动（#2803/#3050）：监听前预热最近保存的多少个会话；0 = 不预热（未预热会话首次触及时按需加载一次）。设 8 可恢复 #2803 的急切预热集。 |
 | `sessions.warmMaxBytes` | number | 67108864 (64 MiB) | BILI_SESSION_WARM_MAX_BYTES | 启动预热集的解码字节预算（#2803）；单文件超过预算则永不预热。 |

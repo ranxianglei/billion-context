@@ -402,11 +402,12 @@ entries:
   - key: sessions.dir
     type: string
     default: "unset (XDG data dir)"
+    default_zh: "unset (XDG data 目录)"
     env: BILI_SESSIONS_DIR
     group: process
-    desc_en: "Sessions directory relocation (#7803): where session records, index.db and the CCR content stores live. Precedence BILI_SESSIONS_DIR env > this key > XDG data dir; a relative value resolves against the process CWD; pointing it at an existing FILE refuses boot with a clear error (silent fallback would put data back on the full disk). Tweak = next restart."
-    desc_zh: "会话目录重定位（#7803）：会话记录、index.db 与 CCR 内容存储的存放位置。优先级 BILI_SESSIONS_DIR 环境变量 > 本键 > XDG 数据目录；相对值按进程 CWD 解析；指向已存在的文件会带路径明确报错拒绝启动（静默回退会把数据放回满盘上）。改动下次重启生效。"
-    desc_ja: "セッションディレクトリの再配置（#7803）：セッションレコード、index.db と CCR コンテントストアの保存先。優先順位は BILI_SESSIONS_DIR 環境変数 > このキー > XDG データディレクトリ。相対値はプロセス CWD に対して解決される。既存のファイルを指すと（静黙的なフォールバックでデータが満杯ディスクに戻るのを防ぐため）明確なエラーで起動を拒否する。変更は次回再起動で有効。"
+    desc_en: "Relocate the whole sessions directory (index.db + session JSON + CCR content stores) off a capacity-constrained drive — e.g. a Windows C: that cannot hold a growing index.db — without touching the shell environment. The env var still wins (the #2030 override tier). A value pointing at an existing FILE refuses to start with a loud error naming the path (a silent fallback would recreate the exact disk-capacity failure the key exists to work around); non-string values are ignored with a warning; relative paths resolve against the process CWD. Like every other path, a hot edit applies on the next restart."
+    desc_zh: "把整个会话目录（index.db + 会话 JSON + CCR 内容存储）从容量受限的磁盘（例如放不下不断增长 index.db 的 Windows C 盘）挪走，无需改动 shell 环境。环境变量优先（#2030 覆盖层）。指向已存在的文件（非目录）的值会带着该路径的明确报错拒绝启动（静默回退会重现这个 key 要解决的那个磁盘容量问题）；非字符串值带警告忽略；相对路径按进程 CWD 解析。与其他路径一样，热改在下次重启生效。"
+    desc_ja: "セッションディレクトリ全体（index.db + セッション JSON + CCR コンテンツストア）を容量不足のドライブ（例：肥大化する index.db を収まらない Windows C: ドライブ）からシェル環境を触らずに再配置する。環境変数の方が優先（#2030 の上書きレイヤ）。既存のファイル（ディレクトリでない）を指す値は、そのパスを名指しした明確なエラーで起動を拒否する（サイレントなフォールバックは、このキーが回避するべきディスク容量問題そのものを再生してしまうため）。非文字列値は警告付きで無視；相対パスはプロセスの CWD に対して解決される。他のパスと同様、ホット編集は次回再起動で反映。"
   - key: sessions.max
     type: number
     default: "256"
