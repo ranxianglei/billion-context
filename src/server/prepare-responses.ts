@@ -24,7 +24,7 @@ import { featureEnabled } from "../rollout.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
-import { compressBreakerArmed } from "../stream.js";
+import { compressBreakerArmed, gateRefusalDamperArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, nudgeStampsOf, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, restoreNudgeStamps, snapshotMessages, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
@@ -519,7 +519,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // two DELIBERATE differences are explicit inputs: the compaction
         // trigger (#2155/#2432 — a trigger request never carries the nudge)
         // and the codex-intercept health window (#2774).
-        const willInjectNudge = !nudgeHeldAfterReject && nudgeOn({
+        const willInjectNudge = !nudgeHeldAfterReject && !gateRefusalDamperArmed(session) && nudgeOn({
             injectNudge: opts.compress.injectNudge,
             hasNudgePlan: !!turn.nudge,
             compressSurfaceOn: laneDecisions.compressSurfaceOn,

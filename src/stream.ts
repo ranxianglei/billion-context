@@ -419,6 +419,78 @@ export function compressLastFailureCause(session: Session): string | undefined {
     return s.cause;
 }
 
+// #7049: the no-net-shrink and coverage-regression gate refusals are
+// deliberately NOT fed into the #2146 circuit breaker (#847: a too-long
+// summary is recoverable, so arming "stop calling compress entirely" would
+// wrongly kill legit folds). But the nudge keeps re-inviting the model to
+// compress, and the model re-issues the same refused call — a loop the #2146
+// breaker never sees (it only counts failures it was fed). This damper tracks
+// consecutive gate refusals (any spec) per session; at N with no commit in
+// between, it suppresses nudge injection until a commit lands or a decay
+// elapses. The model can still call compress (user-driven or spontaneous);
+// the nudge just stops re-inviting it. Respects the #847 intent (no "stop
+// calling compress entirely" receipt text — the damper only dampens the
+// nudge, not the compress tool).
+const GATE_REFUSAL_LOOP_KEY = "compressGateRefusalStreak";
+const GATE_REFUSAL_LOOP_THRESHOLD = 3;
+const GATE_REFUSAL_LOOP_DECAY_MS = 10 * 60 * 1000;
+
+type GateRefusalStreak = { n: number; lastAt: number };
+
+function readGateRefusalStreak(session: Session): GateRefusalStreak | undefined {
+    const v = session.metadata[GATE_REFUSAL_LOOP_KEY];
+    if (!v || typeof v !== "object") return undefined;
+    const o = v as Record<string, unknown>;
+    if (typeof o["n"] !== "number" || !Number.isFinite(o["n"]) || typeof o["lastAt"] !== "number") return undefined;
+    return {
+        n: Math.max(0, Math.floor(o["n"] as number)),
+        lastAt: o["lastAt"] as number,
+    };
+}
+
+function writeGateRefusalStreak(session: Session, s: GateRefusalStreak | undefined): void {
+    if (s === undefined) delete session.metadata[GATE_REFUSAL_LOOP_KEY];
+    else session.metadata[GATE_REFUSAL_LOOP_KEY] = s;
+    markDirty(session);
+}
+
+// #7049: record one gate refusal (no-net-shrink or coverage-regression).
+// Returns "" always — the damper does NOT change the receipt text (per #847,
+// the receipt keeps its existing advice). The damper only suppresses nudge
+// injection (gated in the prepare-* files via gateRefusalDamperArmed).
+// Callers gate this on trackLoop: preflight backstop folds
+// (loopTracking:false) are bili's own internal folds, not model re-issues —
+// they must not arm the model-loop damper (same discipline as the #2146
+// breaker's noteCompressLoopFailure sites).
+function noteGateRefusal(ctx: RewriteCtx, specLabel: string): string {
+    const now = Date.now();
+    let streak = readGateRefusalStreak(ctx.session);
+    if (streak && now - streak.lastAt > GATE_REFUSAL_LOOP_DECAY_MS) streak = undefined;
+    const n = (streak?.n ?? 0) + 1;
+    writeGateRefusalStreak(ctx.session, { n, lastAt: now });
+    if (n === GATE_REFUSAL_LOOP_THRESHOLD) {
+        ctx.log(`[warn: gate-refusal-damper] nudge dampened after ${n} consecutive gate refusals (last spec: ${specLabel || "unknown"}) — nudge injection suppressed until a commit lands or ${GATE_REFUSAL_LOOP_DECAY_MS / 60000} min quiet`);
+    } else if (n > GATE_REFUSAL_LOOP_THRESHOLD) {
+        ctx.log(`[warn: gate-refusal-damper] refusal ${n} in dampened streak (last spec: ${specLabel || "unknown"})`);
+    }
+    return "";
+}
+
+function clearGateRefusalStreak(session: Session): void {
+    if (readGateRefusalStreak(session)) writeGateRefusalStreak(session, undefined);
+}
+
+// #7049: gate-refusal-damper state for the nudge injection gates. A streak
+// counts as armed while n >= threshold AND within the decay window — the same
+// two conditions noteGateRefusal applies, so a decayed-but-not-yet-overwritten
+// streak reads as disarmed here even before the next refusal rewrites the
+// metadata.
+export function gateRefusalDamperArmed(session: Session): boolean {
+    const s = readGateRefusalStreak(session);
+    if (!s || s.n < GATE_REFUSAL_LOOP_THRESHOLD) return false;
+    return Date.now() - s.lastAt <= GATE_REFUSAL_LOOP_DECAY_MS;
+}
+
 // #2360 §2: while the breaker is armed, the kernel's per-error retry guidance
 // ("Run acp_status, then call the compress tool again …") sits in the SAME
 // receipt as the breaker paragraph's "do not poll acp_status" — the looping
@@ -1530,6 +1602,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 const sample = [...lostCoverage].slice(0, 5).map((id) => saltedMsgIdForLog(id)).join(", ");
                 const specKey = normalizedSpecKey(ranges);
                 const repeatGuard = recordCompressFailure(ctx.session, specKey);
+                if (trackLoop) noteGateRefusal(ctx, specKey);
                 ctx.log(`[acp-proxy: compress REFUSED ${detail} — coverage regression: ${lostCoverage.size} previously-folded message(s) would lose ALL covering block(s) (${sample}); committing it grows the live view and can push the local estimate past the model window (#3322). State left uncommitted, prefix cache untouched.]`);
                 const receipt = `[Compression refused: coverage regression — folding these ranges would leave ${lostCoverage.size} already-folded message(s) without any covering block, so the live context view would GROW instead of shrink (and the size estimate can blow past the model window, bricking the session behind permanent preflight rejections). Nothing was folded: no block was created and the context prefix/cache were left untouched. Retry with ranges aligned to whole turns (do not cut through a reasoning/tool-call/result group), target fewer blocks, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}]`;
                 return compressResult(receipt, "refused", 0, "gate:coverage-regression");
@@ -1598,6 +1671,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // "stop calling compress entirely" would wrongly kill legit folds.
             const specKey = normalizedSpecKey(ranges);
             const repeatGuard = recordCompressFailure(ctx.session, specKey);
+            if (trackLoop) noteGateRefusal(ctx, specKey);
             ctx.log(`[acp-proxy: compress REFUSED ${detail} — no net shrink (net delta=${netDelta} tok across ${touchedBlocks} touched block(s)); state left uncommitted, prefix cache untouched]`);
             const receipt = `[Compression refused: no net shrink — the summary you supplied is not smaller than the range it replaces (${netDesc}). Nothing was folded: no block was created and the context prefix/cache were left untouched.${revNote} Do not re-issue this same range and summary; supply a much shorter summary for the range, target a larger span so the summary shrinks it, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}]`;
             return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
@@ -1776,6 +1850,9 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             .reduce((n, b) => n + defaultCountTokens(b.summary), 0);
         const netSaved = Math.max(0, r.tokensCompressed - newSummaryTokens);
         clearCompressLoopStreak(ctx.session, netSaved);
+        // #7051: any successful commit breaks the gate-refusal loop — the model
+        // found a working call, so the nudge may resume inviting it.
+        clearGateRefusalStreak(ctx.session);
 
         // #189 observability: record the rewrite magnitude + fold point so a
         // downstream transient rejection (GLM 3007) can be correlated with it.
