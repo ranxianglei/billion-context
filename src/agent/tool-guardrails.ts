@@ -31,7 +31,13 @@ type ToolResultEventLike = {
     toolCallId: string;
     content: ToolContent;
     isError?: boolean;
-    details?: { fullOutputPath?: string } & Record<string, unknown>;
+    details?: {
+        fullOutputPath?: string;
+        /** pi's `read` (and other self-bounding host tools) set this when they
+         *  cap their own output; `truncated: true` means the host already
+         *  bounded the result and attached a continuation notice. */
+        truncation?: { truncated?: boolean } & Record<string, unknown>;
+    } & Record<string, unknown>;
 };
 
 // Local view of the host ctx we touch (not imported from pi.ts to avoid a
@@ -46,6 +52,14 @@ type GuardrailCtx = {
 // named export, and a missing named export fails the whole module at load time.
 export function isBashToolResult(e: ToolResultEventLike): boolean {
     return e.toolName === "bash";
+}
+/** True when the host already bounded this result's own output (pi's `read`
+ *  caps at 2000 lines / 50 KiB and appends a "Use offset=N to continue"
+ *  notice). Re-capping such a result would cut that trailing notice off and
+ *  misreport the gap as a tiny drop (#7638: codemode read→write lost everything
+ *  past ~50 KB), so the generic byte cap must skip host-bounded results. */
+export function isHostBoundedResult(e: ToolResultEventLike): boolean {
+    return e.details?.truncation?.truncated === true;
 }
 function isBashToolCall(e: ToolCallEventLike): boolean {
     return e.toolName === "bash";
@@ -407,8 +421,13 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
         const timeoutSecs = isBash && e.isError ? detectBashTimeout(e.content) : undefined;
 
         let modified: ToolContent | undefined;
-        const next = capToolOutput(e.content, maxBytes, fullPath);
-        if (next) modified = next;
+        // Host-bounded results (pi's read) already carry the host's own
+        // continuation notice; the generic cap would strip it and understate
+        // the gap (#7638), so only cap results the host did not bound.
+        if (!isHostBoundedResult(e)) {
+            const next = capToolOutput(e.content, maxBytes, fullPath);
+            if (next) modified = next;
+        }
 
         if (timeoutSecs !== undefined) {
             modified = appendTimeoutNotice(modified ?? e.content, timeoutSecs);
