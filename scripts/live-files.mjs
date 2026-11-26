@@ -165,6 +165,14 @@ export const LIVE_FILES = [
     // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
     // for the tripwire, like #5046/#4612.
     "tests/storage-backup-repair.test.ts",
+    // #7176: the pinned-attach decision test. Every origin is a listen(0)
+    // pick (the dead arm binds :0, reads the port, closes it and requires
+    // ECONNREFUSED there), so no fixed port and no zone band is involved; no
+    // child process is spawned either — the entry is for the SPAWN_RE
+    // tripwire alone (its hit is the identifier "spawn-fallback" wording plus
+    // _setSpawnForTest). Both arms reset the module-level origin plane in
+    // `finally`, so rows cannot leak into each other.
+    "tests/issue7176-dead-attach-origin-release.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

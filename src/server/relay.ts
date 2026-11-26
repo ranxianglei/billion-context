@@ -688,6 +688,13 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // bytes. Protocol-neutral (any JSON-object body), unlike the role
         // rewrite above which is openai/responses-only.
         compatDropPaths = resolveCompatDropFields(opts.routes, upstreamUrl, opts.compat?.dropFields);
+        // #6752: when the drop overrides an earlier "output budget restored" log,
+        // say so explicitly so the log is honest (the restore fired, but the field
+        // is gone by the time the wire is built).
+        const OUTPUT_BUDGET_DROP_PATHS = ["max_tokens", "max_completion_tokens", "max_output_tokens", "generationConfig.maxOutputTokens"];
+        const budgetOverrideNote = compatDropPaths.some(p => OUTPUT_BUDGET_DROP_PATHS.includes(p))
+            ? " (overrides the earlier 'output budget restored' log — the field is absent from the forwarded body)"
+            : "";
         if (compatDropPaths.length > 0 && typeof wireBody === "string") {
             // #564/#2627: drops run on the SAME graph as every other transform, so
             // identity decides — not the drop path's shape. A drop that deletes or
@@ -699,14 +706,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 const dropped = dropCompatFieldsJson(graph, compatDropPaths);
                 if (dropped > 0) {
                     commitGraph();
-                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] dropped ${dropped} field(s) per compat.dropFields (${compatDropPaths.join(", ")}) (#1757)`);
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] dropped ${dropped} field(s) per compat.dropFields (${compatDropPaths.join(", ")})${budgetOverrideNote} (#1757)`);
                 }
             } else {
                 const applied = applyCompatDropFields(wireBody, compatDropPaths);
                 if (applied.dropped > 0) {
                     wireBody = applied.body;
                     invalidateSeparatorOwnership();
-                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] dropped ${applied.dropped} field(s) per compat.dropFields (${compatDropPaths.join(", ")}) (#1757)`);
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] dropped ${applied.dropped} field(s) per compat.dropFields (${compatDropPaths.join(", ")})${budgetOverrideNote} (#1757)`);
                 }
             }
         }
