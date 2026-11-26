@@ -357,6 +357,46 @@ export function normalizeGoogleUserPartOrder(
   return [...moved, ...rest];
 }
 
+/** Google's documented bypass value for a functionCall whose real
+ *  thoughtSignature is unavailable. */
+export const GOOGLE_SIGNATURE_BYPASS = "skip_thought_signature_validator";
+
+/** Gemini 3+ requires the FIRST functionCall part of a model content to carry
+ *  a thoughtSignature (parallel siblings never do) and 400s the request
+ *  otherwise. A rebuilt model content can lead with an unsigned call when the
+ *  signed head did not survive: a fold that covers the head but keeps a
+ *  protected sibling of the same parallel batch. The real signature cannot be
+ *  recovered, so that head gets the bypass value. Applies only when the
+ *  target requires signatures (the conversation carries signatures, or the
+ *  model is Gemini 3+) and no part of the model content carries one: any
+ *  signed part is left byte-identical (KDD #10), siblings are never touched,
+ *  and Claude-family targets keep the input as-is (#5390). */
+export function signLeadingFunctionCall(
+  parts: GooglePart[],
+  opts?: { model?: string; signing?: boolean },
+): GooglePart[] {
+  const model = typeof opts?.model === "string" ? opts.model : "";
+  if (CLAUDE_WIRE_MODEL.test(model)) return parts;
+  if (opts?.signing !== true && !SIGNING_GEMINI_MODEL.test(model)) return parts;
+  if (parts.some(hasSignature)) return parts;
+  const head = parts.findIndex((p) => p.functionCall !== undefined);
+  if (head < 0) return parts;
+  const out = parts.slice();
+  out[head] = { ...parts[head]!, thoughtSignature: GOOGLE_SIGNATURE_BYPASS };
+  return out;
+}
+
+const SIGNING_GEMINI_MODEL = /gemini-(?:[3-9]|\d{2,})/i;
+
+function hasSignature(p: GooglePart): boolean {
+  return typeof p.thoughtSignature === "string" && p.thoughtSignature.length > 0;
+}
+
+function carriesGoogleSignature(m: BiliMessage): boolean {
+  if (typeof m.googleThoughtSignature === "string" && m.googleThoughtSignature.length > 0) return true;
+  return rawParts(m).some(hasSignature);
+}
+
 /** Rebuild Gemini `contents` from kernel messages. Runs of same-side cores
  *  are merged into ONE content (Gemini rejects non-alternating roles): an
  *  assistant run becomes a single `{"role":"model"}` content whose parts are
@@ -379,6 +419,7 @@ export function normalizeGoogleUserPartOrder(
  *  kernel/tests/issue3939-wire-byte-stability.test.ts. */
 export function coreToGoogle(messages: BiliMessage[], opts?: { model?: string }): GoogleContent[] {
   const out: GoogleContent[] = [];
+  const signing = messages.some(carriesGoogleSignature);
   let model: {
     reasoning: GooglePart[];
     text: GooglePart[];
@@ -387,7 +428,10 @@ export function coreToGoogle(messages: BiliMessage[], opts?: { model?: string })
   let user: { responses: GooglePart[]; content: GooglePart[] } | null = null;
   const flushModel = () => {
     if (!model) return;
-    const parts = [...model.reasoning, ...model.text, ...model.calls];
+    const parts = signLeadingFunctionCall(
+      [...model.reasoning, ...model.text, ...model.calls],
+      { model: opts?.model, signing },
+    );
     model = null;
     if (parts.length > 0) out.push({ role: "model", parts });
   };

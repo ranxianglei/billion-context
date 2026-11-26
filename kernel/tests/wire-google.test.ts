@@ -7,6 +7,8 @@ import {
   googleToCore,
   injectGoogleSystem,
   normalizeGoogleUserPartOrder,
+  signLeadingFunctionCall,
+  GOOGLE_SIGNATURE_BYPASS,
   type GooglePart,
   type GoogleRequestBody,
 } from "../src/wire/google.js";
@@ -517,4 +519,98 @@ test("coreToGoogle: Claude-family target emits functionResponse before text (#53
     { functionResponse: { name: "add", response: { result: 66 }, id: "c1" } },
     { text: "nudge" },
   ]);
+});
+
+function parallelBatchBody(): GoogleRequestBody {
+  return {
+    contents: [
+      { role: "user", parts: [{ text: "go" }] },
+      {
+        role: "model",
+        parts: [
+          { functionCall: { name: "read_file", args: { path: "a" } }, thoughtSignature: "SIG-HEAD" },
+          { functionCall: { name: "manage_task", args: { op: "list" } } },
+          { functionCall: { name: "manage_task", args: { op: "add" } } },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { name: "read_file", response: { output: "a" } } },
+          { functionResponse: { name: "manage_task", response: { output: "list" } } },
+          { functionResponse: { name: "manage_task", response: { output: "add" } } },
+        ],
+      },
+    ],
+  };
+}
+
+test("coreToGoogle: a fold that drops the signed head of a parallel batch still leads with a signed call", () => {
+  const body = parallelBatchBody();
+  body.contents.push(
+    { role: "model", parts: [{ functionCall: { name: "ls", args: {} }, thoughtSignature: "SIG-LATER" }] },
+    { role: "user", parts: [{ functionResponse: { name: "ls", response: { output: "." } } }] },
+  );
+  const msgs = googleToCore(body).msgs;
+  const calls = msgs.filter((m) => m.contentType === "tool-call");
+  const results = msgs.filter((m) => m.contentType === "tool-result");
+  const covered = new Set([calls[0], calls[1], results[0], results[1]]);
+  const kept = msgs.filter((m) => !covered.has(m));
+  const contents = coreToGoogle([
+    kept[0]!,
+    { id: "sum", role: "user", contentType: "text", text: "summary" },
+    ...kept.slice(1),
+  ] as typeof msgs);
+  const model = contents.filter((c) => c.role === "model");
+  assert.equal(model[0]!.parts[0]!.functionCall!.name, "manage_task");
+  assert.equal(model[0]!.parts[0]!.thoughtSignature, GOOGLE_SIGNATURE_BYPASS);
+  assert.equal(model[1]!.parts[0]!.thoughtSignature, "SIG-LATER");
+});
+
+test("coreToGoogle: an intact signed parallel batch round-trips byte-identical", () => {
+  const body = parallelBatchBody();
+  assert.deepEqual(coreToGoogle(googleToCore(body).msgs), body.contents);
+});
+
+test("coreToGoogle: an unsigned history is never given a bypass signature", () => {
+  const body = parallelBatchBody();
+  delete body.contents[1]!.parts[0]!.thoughtSignature;
+  assert.deepEqual(coreToGoogle(googleToCore(body).msgs), body.contents);
+});
+
+test("coreToGoogle: a Gemini 3+ target signs the surviving head even when no signature is left", () => {
+  const body = parallelBatchBody();
+  const msgs = googleToCore(body).msgs.filter(
+    (m) => !(m.contentType === "tool-call" && m.toolName === "read_file"),
+  );
+  const model = coreToGoogle(msgs, { model: "gemini-4-carbon-high" }).find((c) => c.role === "model")!;
+  assert.equal(model.parts[0]!.thoughtSignature, GOOGLE_SIGNATURE_BYPASS);
+  assert.equal(model.parts[1]!.thoughtSignature, undefined);
+});
+
+test("signLeadingFunctionCall: only an unsigned model content on a signing target changes", () => {
+  const head: GooglePart = { functionCall: { name: "f", args: {} } };
+  const sib: GooglePart = { functionCall: { name: "g", args: {} } };
+  const text: GooglePart = { text: "t" };
+  const signedHead: GooglePart = { functionCall: { name: "f", args: {} }, thoughtSignature: "S" };
+  const signedThought: GooglePart = { thought: true, text: "x", thoughtSignature: "S" };
+  assert.deepEqual(signLeadingFunctionCall([text, head, sib], { signing: true }), [
+    text,
+    { ...head, thoughtSignature: GOOGLE_SIGNATURE_BYPASS },
+    sib,
+  ]);
+  assert.deepEqual(signLeadingFunctionCall([head, sib], { model: "gemini-3.8-flash-high" })[0], {
+    ...head,
+    thoughtSignature: GOOGLE_SIGNATURE_BYPASS,
+  });
+  assert.equal(signLeadingFunctionCall([head, sib], { signing: false })[0], head);
+  assert.equal(signLeadingFunctionCall([head, sib])[0], head);
+  assert.equal(signLeadingFunctionCall([head, sib], { model: "gemini-2.5-pro" })[0], head);
+  assert.equal(signLeadingFunctionCall([signedHead, sib], { signing: true })[0], signedHead);
+  assert.equal(signLeadingFunctionCall([signedThought, head], { signing: true })[1], head);
+  assert.equal(
+    signLeadingFunctionCall([head, sib], { signing: true, model: "claude-opus-4-6-thinking" })[0],
+    head,
+  );
+  assert.deepEqual(signLeadingFunctionCall([text], { signing: true }), [text]);
 });

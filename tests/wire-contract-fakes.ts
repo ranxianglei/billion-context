@@ -237,6 +237,14 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             'bili #6636 production 400 (dsh-fish-soul TTS through bili 0.1.213, Xiaomi MiMo mimo-v2.5-tts over an OpenAI-compatible /chat/completions endpoint): the plugin sends {model, messages:[user, assistant], audio:{format:"mp3",voice:"mimo_default"}, stream:false} with no tools; bili injected the FUNCTION_ACP_TAGS_TIMESTAMPED system prompt as messages[0] plus an <acp> prefix on every message, and the upstream answered 400 "messages[0] system role is not allowed for TTS model". Control experiment in the issue: the same messages undecorated return 200 with audio. Repair: isAudioOutputCall (src/server/side-request.ts) routes tool-less audio requests through the #388 verbatim side passthrough, so neither the system prompt nor the tags are ever injected. The validator keys on the `audio` field, not the model name — the shape, not the spelling, is what makes the call a TTS request.',
     },
+    {
+        id: "WC-026",
+        wire: "google",
+        summary:
+            'in a conversation that carries thoughtSignatures, a model content holding functionCall parts must carry a signature on some part — Gemini 3+ validates that the FIRST functionCall of each model content is signed (parallel siblings never are) and 400s the request otherwise; a fold that covers the signed head of a parallel batch while a protected sibling survives must not forward the sibling as an unsigned leading call',
+        provenance:
+            'production 400 on bili 0.1.214 / acp-kernel 0.0.198, Antigravity (agy 1.5.8) lane, gemini-4-carbon-high: after a compress covering the signed read_file head of a 3-call parallel batch (read_file signed, manage_task x2 unsigned) with the last manage_task call/result pair protected, every request answered "Function call is missing a thought_signature in functionCall parts ... function call default_api:manage_task" (sticky across retries and cold reloads). Repair: kernel/src/wire/google.ts signLeadingFunctionCall stamps Google\'s documented bypass value "skip_thought_signature_validator" on the unsigned leading call of a fully unsigned model content; this validator is the tripwire on every outbound Google body',
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -725,6 +733,19 @@ function validateGoogleBody(body: unknown, model?: string): string[] {
                     out.push(`WC-018 contents[${i}].parts[${j}]: plain text part follows a functionResponse part — Vertex rejects user content ending on a model turn (#3159)`);
                 }
             });
+        });
+    }
+    // WC-026: Gemini 3+ requires the leading functionCall of every model
+    // content to be signed; judged only in conversations that carry
+    // signatures, and satisfied by a signature on any part of that content.
+    if (!claudeWire && Array.isArray(body.contents) && JSON.stringify(body.contents).includes('"thoughtSignature"')) {
+        body.contents.forEach((content, i) => {
+            if (!isPlainObject(content) || content.role !== "model" || !Array.isArray(content.parts)) return;
+            const parts = content.parts.filter(isPlainObject);
+            const head = parts.findIndex((part) => part.functionCall !== undefined);
+            if (head < 0) return;
+            const signed = parts.some((part) => typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0);
+            if (!signed) out.push(`WC-026 contents[${i}].parts[${head}]: leading functionCall of a model content carries no thoughtSignature — Gemini 3+ 400s "Function call is missing a thought_signature"`);
         });
     }
     if (!Array.isArray(body.tools)) return out;

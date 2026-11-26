@@ -291,6 +291,20 @@ test("WC-018 validates user-side part order on the Google wire (plain text befor
     }), []);
 });
 
+test("WC-026 validates that a signing conversation never leads a model content with an unsigned functionCall", () => {
+    const signedTurn = { role: "model", parts: [{ functionCall: { name: "ls", args: {} }, thoughtSignature: "sig" }] };
+    const reply = { role: "user", parts: [{ functionResponse: { name: "ls", response: {} } }] };
+    assert.match(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ text: "go" }] }, { role: "model", parts: [{ functionCall: { name: "manage_task", args: {} } }] }, reply, signedTurn],
+    })[0], /WC-026/);
+    assert.deepEqual(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ text: "go" }] }, { role: "model", parts: [{ functionCall: { name: "manage_task", args: {} }, thoughtSignature: "skip_thought_signature_validator" }, { functionCall: { name: "manage_task", args: {} } }] }, reply, signedTurn],
+    }), []);
+    assert.deepEqual(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ text: "go" }] }, { role: "model", parts: [{ functionCall: { name: "manage_task", args: {} } }] }],
+    }), []);
+});
+
 function syntheticBody(wire: Wire, tool: unknown): Record<string, unknown> {
     if (wire === "google") return { tools: [{ functionDeclarations: [tool] }] };
     return { tools: [tool] };
@@ -375,6 +389,11 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [{ functionDeclarations: [{ name: "ok", parameters: { anyOf: [] } }] }] },
             // WC-018: the #3159 shape — plain text after a functionResponse part.
             { contents: [{ role: "user", parts: [{ functionResponse: { name: "add", response: {} } }, { text: "nudge" }] }] },
+            // WC-026: a fold kept an unsigned parallel sibling while a later turn stays signed.
+            { contents: [
+                { role: "model", parts: [{ functionCall: { name: "manage_task", args: {} } }] },
+                { role: "model", parts: [{ functionCall: { name: "ls", args: {} }, thoughtSignature: "S" }] },
+            ] },
         ],
     };
     for (const rule of WIRE_RULES) {
