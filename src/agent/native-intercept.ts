@@ -6,12 +6,14 @@
 // at extension load always wins. The patch is surgical — it rewrites ONLY
 // model-API shaped URLs and leaves every other request untouched.
 
-import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from "./fetch-chain/index.js";
+import { installFetchChain, isDeadClosureError, isInlineOriginUrl, resetFetchChainForTest } from "./fetch-chain/index.js";
 import { logHostEvent } from "./host-log.js";
+import { serveInlineOrigin } from "./pi-inline.js";
 
 import { envMillis } from "./native-bootstrap.js";
 import { matchModelEndpoint, type ModelEndpointPattern } from "../model-endpoints.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
+import { promptMassOfWireBody } from "./prompt-mass.js";
 import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, CALIBRATED_TEXT_TOKEN_RATIO, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
@@ -430,7 +432,7 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
         try {
             const headers = new Headers(input.headers);
             for (const [k, v] of Object.entries(extra)) headers.set(k, v);
-            const rebuilt = new Request(input.url, { method: input.method, headers, body: input.body, duplex: "half" });
+            const rebuilt = new Request(input.url, { method: input.method, headers, body: input.body, signal: input.signal, duplex: "half" });
             return { input: rebuilt, init };
         } catch {
             return { input, init };
@@ -522,8 +524,8 @@ function isLoopbackTarget(url: string): boolean {
     } catch {
         return false;
     }
-    const h = u.hostname;
-    return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+    const h = u.hostname; // URL.hostname brackets IPv6 literals ([::1])
+    return h === "localhost" || h === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
 const droppedHopsLogged = new Set<string>();
@@ -587,7 +589,9 @@ function envHopForUrl(url: string, env: NodeJS.ProcessEnv): string | undefined {
  *  the base values are captured lazily on the first hold and restored EXACTLY
  *  on the last release. Bun honors runtime NO_PROXY changes immediately
  *  (probed on bun 1.4.0); node hosts treat these vars as inert for their
- *  fetch — a harmless no-op there. */
+ *  fetch. The mutation is process-wide — children spawned during the hold
+ *  window inherit the entries forever — so only NO_PROXY-safe hosts are ever
+ *  held (no IPv6 literals; #7319). */
 const noProxyHolds = new Map<string, number>();
 let noProxyBase: { upper: string | undefined; lower: string | undefined } | undefined;
 
@@ -829,7 +833,7 @@ async function streamBytesCapped(stream: ReadableStream<Uint8Array>, cap: number
  *  restart (session state is persisted on disk), not another attempt (#3589). */
 function oversizeRefusal(url: string): Response {
     const message =
-        "billion-context refused this request locally: the host's attribution lookup threw mid-request (its agent scope is disposed/closing), and this body is priced over the model's context window under the calibrated size check (conservative text pricing — every declared byte counts as text, and the bar is the larger of the client-declared window and 1,000,000 tokens) — forwarding it uncompressed would be rejected upstream (#2924). " +
+        "billion-context refused this request locally: the host's attribution lookup threw mid-request (its agent scope is disposed/closing), and this body is priced over the model's context window under the calibrated size check (conservative text pricing — every declared byte of prompt mass counts as text (transport-only fields are excluded when the body parses, #7106), and the bar is the larger of the client-declared window and 1,000,000 tokens) — forwarding it uncompressed would be rejected upstream (#2924). " +
         "While that scope stays dead, retrying this same call will keep failing; restart the client host once (its session state is persisted on disk, so nothing is lost) so the oversized history can be folded back under the window. If you cannot restart, start a fresh session instead. If the model's real window is larger than the client host declared, fix the host's model declaration and restart — the direct path reopens.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal" };
     if (url.endsWith("/messages")) {
@@ -849,7 +853,7 @@ function oversizeRefusal(url: string): Response {
  *  (there is no broken scope to restart). */
 function unattributedOversizeRefusal(url: string): Response {
     const message =
-        "billion-context refused this request locally: it is not attributed to any bili-managed session, and its core text is priced over the model's context window (conservative text pricing — every declared byte counts as text, and the bar is never assumed below the larger of the client-declared window and 1,000,000 tokens) — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). " +
+        "billion-context refused this request locally: it is not attributed to any bili-managed session, and its core text is priced over the model's context window (conservative text pricing — every declared byte of prompt mass counts as text (transport-only fields are excluded when the body parses, #7106), and the bar is never assumed below the larger of the client-declared window and 1,000,000 tokens) — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). " +
         "If the model's real window is larger than the client host declared, fix the host's model declaration and restart — the direct path reopens. Otherwise, route the conversation through a bili-managed session so it can be compressed (check the client's bili plugin attribution), or trim/remove the oversized content (e.g. a giant paste or tool result), or start a fresh session.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed" };
     if (url.endsWith("/messages")) {
@@ -905,7 +909,9 @@ function emptySlotOversizeRefusal(
           : `against the ${doom.window.toLocaleString("en-US")} token local bar (${doom.declaredWindow.toLocaleString("en-US")} resolved by the active lane; the bar never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}, #4079)`;
     const basis = doom === undefined
         ? "this model request is larger than the silent-direct byte ceiling"
-        : `this model request's core text prices at ~${doom.estTokens.toLocaleString("en-US")} tokens (optimistic floor ${doom.floorTokens.toLocaleString("en-US")}) ${barNote}`;
+        : doom.promptTokens === undefined
+          ? `this model request's core text prices at ~${doom.estTokens.toLocaleString("en-US")} tokens (optimistic floor ${doom.floorTokens.toLocaleString("en-US")}) ${barNote}`
+          : `this model request's prompt prices at ~${doom.estTokens.toLocaleString("en-US")} tokens (optimistic floor ${doom.floorTokens.toLocaleString("en-US")}; transport-only fields excluded on the ${doom.protocol ?? "detected"} lane, #7106) ${barNote}`;
     const message =
         "billion-context refused this request locally: the native interceptor's live-state slot is empty (the plugin is between activations or was deactivated), and " + basis + " — forwarding it would send the prompt to the provider uncompressed (#5405/#5996). " +
         "The slot normally rebinds on the next plugin activation; retry shortly. If it persists, restart the host so the interceptor can rebind.";
@@ -918,11 +924,20 @@ function emptySlotOversizeRefusal(
 
 /** #5405: same byte ceiling for an unattributed gate verdict. This is not a
  *  window-doom verdict (the 1M floor may still allow the body), so it needs
- *  its own marker and wording; retryable:true because attribution can return. */
-function unattributedByteOversizeRefusal(url: string): Response {
+ *  its own marker and wording; retryable:true because attribution can return.
+ *  #7450: the ceiling is on TOTAL bytes but compression only acts on text —
+ *  when the media split is known, name it in the message so the user can tell
+ *  at a glance whether any folding could ever bring this body under the cap. */
+function unattributedByteOversizeRefusal(url: string, detail: { bytes: number; cap: number; mediaBytes?: number }): Response {
+    const basis = `its body (${detail.bytes.toLocaleString("en-US")} B) is larger than the silent-direct byte ceiling (${detail.cap.toLocaleString("en-US")} B)`;
+    const remedy = detail.mediaBytes !== undefined && detail.mediaBytes > 0
+        ? detail.mediaBytes >= detail.cap
+            ? `Of those bytes, ${detail.mediaBytes.toLocaleString("en-US")} B is inline media (images/audio) that no compression can shrink — the media alone already exceeds the ceiling, so this conversation cannot fit under it as-is: start a fresh session or attach smaller images. Routing through a bili session will not remove the media.`
+            : `Of those bytes, ${detail.mediaBytes.toLocaleString("en-US")} B is inline media that compression cannot shrink; the rest is text a bili-managed session can fold. Route the conversation through a bili-managed session so the text can be compressed under the ceiling, or retry after the host re-establishes attribution.`
+        : "Route the conversation through a bili-managed session so it can be compressed, or retry after the host re-establishes attribution.";
     const message =
-        "billion-context refused this request locally: it is not attributed to a bili-managed session and its body is larger than the silent-direct byte ceiling, so forwarding it would send a multi-megabyte prompt to the provider uncompressed (#5405). " +
-        "Route the conversation through a bili-managed session so it can be compressed, or retry after the host re-establishes attribution.";
+        "billion-context refused this request locally: it is not attributed to a bili-managed session and " + basis + ", so forwarding it would send a multi-megabyte prompt to the provider uncompressed (#5405). " +
+        remedy;
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed-bytes" };
     if (url.endsWith("/messages")) {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message, retryable: true } }), { status: 422, headers });
@@ -958,18 +973,44 @@ export function bodyOverWindowDetail(
     bodyBytes: number | undefined,
     rawBody: string | undefined,
     declaredWindow: number | undefined,
-): { coreBytes: number; mediaBytes: number; floorTokens: number; estTokens: number; provablyOver: boolean; window: number; declaredWindow: number } | undefined {
+): { coreBytes: number; mediaBytes: number; floorTokens: number; estTokens: number; provablyOver: boolean; window: number; declaredWindow: number; promptTokens?: number; protocol?: string } | undefined {
     if (bodyBytes === undefined || declaredWindow === undefined) return undefined;
     const window = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
     // Worst case: zero media credits → core = full mass. If even THAT fits
     // the calibrated bar, no raw body can refuse — skip the JSON walk.
-    if (Math.ceil(Math.ceil(bodyBytes / 4) * CALIBRATED_TEXT_TOKEN_RATIO) <= window) return undefined;
+    // #7106: bytes/3 bounds CJK-dense text (1 token per 3-byte char) from above;
+    // bytes/4 is only the ASCII bound and would skip this check for CJK bodies.
+    if (Math.ceil((bodyBytes / 3) * CALIBRATED_TEXT_TOKEN_RATIO) <= window) return undefined;
     const mediaBytes = rawBody === undefined ? 0 : mediaBytesOfWireBody(rawBody);
     const coreBytes = Math.max(bodyBytes - mediaBytes, 0);
-    const floorTokens = Math.ceil(coreBytes / 4);
-    const estTokens = Math.ceil(floorTokens * CALIBRATED_TEXT_TOKEN_RATIO);
+    // #7106: when the body parses, price the PROMPT mass instead of the whole
+    // wire body. DSH stamps transport-only top-level fields (dsh_session_log up
+    // to 8 MiB, dsh_plugin_packages) that never reach the model, so whole-body
+    // byte pricing refuses healthy in-window requests before the provider ever
+    // sees them. Byte pricing stays the fallback for bodies we cannot price by
+    // shape (non-JSON, or no recognizable prompt key).
+    const promptMass = promptMassOfWireBody(rawBody);
+    const floorTokens = promptMass === undefined
+        ? Math.ceil(coreBytes / 4)
+        : promptMass.promptTokens; // media stays excluded, as the byte math has since #4111
+    // A shape-priced prompt is a direct token count (CJK-aware, same walker as the
+    // server gates), not a byte heuristic: compare it to the window as-is. Only the
+    // byte fallback keeps the 1.14 calibration bias.
+    // #4111 two-tier contract unchanged: the calibrated tier is floor x 1.14 and
+    // the bare floor is the provably-over tier — #7106 only changes what the
+    // floor PRICES (prompt mass when the body parses, whole-body bytes otherwise).
+    // #7106 review: apply the 1.14 calibration ONLY to the byte heuristic. A
+    // shape-priced prompt is already a token count, so multiplying it would
+    // double-calibrate and refuse at ~0.877 x window (the wrong direction for
+    // the false-refusal this issue fixes).
+    const estTokens = promptMass === undefined
+        ? Math.ceil(floorTokens * CALIBRATED_TEXT_TOKEN_RATIO)
+        : floorTokens;
     if (estTokens <= window) return undefined;
-    return { coreBytes, mediaBytes, floorTokens, estTokens, provablyOver: floorTokens > window, window, declaredWindow };
+    return {
+        coreBytes, mediaBytes, floorTokens, estTokens, provablyOver: floorTokens > window, window, declaredWindow,
+        ...(promptMass === undefined ? {} : { promptTokens: promptMass.promptTokens, protocol: promptMass.protocol }),
+    };
 }
 
 /** The model context window every plugin lane stamps onto its model requests
@@ -1440,9 +1481,9 @@ export function replaceRequestTarget(e: { request?: unknown }, target: string): 
     } catch {
         // undici refuses to copy a body-bearing Request without explicit
         // duplex — reconstruct with the body stream passed explicitly.
-        const src = old as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null };
+        const src = old as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null; signal?: AbortSignal };
         try {
-            const init: RequestInit & { duplex?: "half" } = { method: typeof src.method === "string" ? src.method : "GET" };
+            const init: RequestInit & { duplex?: "half" } = { method: typeof src.method === "string" ? src.method : "GET", signal: src.signal };
             const pairs: [string, string][] = [];
             try {
                 for (const pair of src.headers ?? []) pairs.push([pair[0], pair[1]]);
@@ -1465,7 +1506,7 @@ export function replaceRequestTarget(e: { request?: unknown }, target: string): 
  *  whose target and headers must survive while the body is swapped for the
  *  incremental payload. A string body needs no duplex. */
 export function replaceRequestPayload(e: { request?: unknown }, body: string, extraHeaders?: Record<string, string>): void {
-    const old = e.request as { url?: unknown; method?: unknown; headers?: unknown } | null | undefined;
+    const old = e.request as { url?: unknown; method?: unknown; headers?: unknown; signal?: AbortSignal } | null | undefined;
     if (old == null || typeof old.url !== "string") return;
     try {
         const headers = new Headers((old.headers ?? undefined) as ConstructorParameters<typeof Headers>[0]);
@@ -1474,6 +1515,7 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
             method: typeof old.method === "string" ? old.method : "POST",
             headers,
             body,
+            signal: old.signal,
         });
     } catch {
         // replacement impossible (exotic request) — the caller's plan is
@@ -1488,14 +1530,14 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
 export function withRestoredBody(input: string | URL | Request, init: RequestInit | undefined, body: string): { input: string | URL | Request; init: RequestInit | undefined } {
     if (input instanceof Request) {
         try {
-            const plain = new Request(input.url, { method: input.method, headers: input.headers });
+            const plain = new Request(input.url, { method: input.method, headers: input.headers, signal: input.signal });
             return { input: plain, init: { ...(init ?? {}), body } };
         } catch {
             const headers: Record<string, string> = {};
             try {
                 for (const [k, v] of input.headers) headers[k] = v;
             } catch {}
-            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body } };
+            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body, signal: init?.signal !== undefined ? init.signal : input.signal } };
         }
     }
     return { input, init: { ...(init ?? {}), body } };
@@ -1567,7 +1609,25 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
     // network again. Only ever contains origins we ourselves observed dying.
     const replacedOrigins = new Set<string>();
 
-    installFetchChain((send) => async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    installFetchChain((chainSend) => async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        // #6841 rework: never hand pseudo-origin traffic to a downstream
+        // that may be a foreign wrapper. The pi-web-access wrapper sits
+        // ABOVE the inline link; with its proxy scope on it curls an
+        // INLINE_ORIGIN URL before bili's chain ever sees it, so the #1662
+        // depth-1 fix never runs on that path. Bili cannot observe the
+        // wrapper's scope state from outside, so the rule is unconditional:
+        // every INLINE_ORIGIN send from this dispatch is served in-process
+        // by the inline transport instead. Non-inline sends pass through
+        // untouched, and when the inline transport was never installed the
+        // serve returns undefined and the send goes down the chain as today.
+        const send = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+            const url = fetchUrlOf(input);
+            if (url !== undefined && isInlineOriginUrl(url)) {
+                const served = await serveInlineOrigin(input, init);
+                if (served !== undefined) return served;
+            }
+            return chainSend(input, init);
+        };
         const url = fetchUrlOf(input);
         // #3394: resolve the ACTIVE state per request instead of capturing the
         // first installer's — a hot-reimport swapped in a fresh instance whose
@@ -1711,7 +1771,15 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     } catch {
                         // no parseable host → nothing to scope
                     }
-                    if (host !== undefined && !hostExemptedByNoProxy(host, process.env)) {
+                    // #7319: never write an IPv6 literal into NO_PROXY — URL.hostname
+                    // brackets it ([::1]) and Python httpx (trust_env) crashes at
+                    // client construction on bracketed/bare IPv6 entries (InvalidURL:
+                    // Invalid port). No bracket convention satisfies both Node's URL
+                    // output and httpx's parsing, so IPv6 hosts skip the hold: a
+                    // fallback send to one rides the env hop on Bun (Node fetch is
+                    // env-inert) — accepted over poisoning every child of the host
+                    // process.
+                    if (host !== undefined && !host.includes(":") && !hostExemptedByNoProxy(host, process.env)) {
                         heldHost = host;
                         acquireNoProxyHold(host);
                     }
@@ -1832,8 +1900,17 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                       : await outgoingBodyBytesCapped(defaultInput, init, cap);
                 if (silentBytes !== undefined && silentBytes > cap) {
                     state.onDispatch?.(dispatchUrl, "refused");
-                    logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B); would be sent uncompressed (#5405/#5408)`);
-                    return unattributedByteOversizeRefusal(dispatchUrl);
+                    // #7450: the ceiling is on TOTAL bytes but compression only
+                    // acts on text — bill the incompressible media share (when
+                    // the raw body is cheaply at hand) so the refusal and the
+                    // log say whether any folding could ever bring this body
+                    // under the cap.
+                    const silentRaw = prep.outcome === "restored"
+                        ? prep.body
+                        : measured?.raw ?? (typeof init?.body === "string" ? init.body : undefined);
+                    const silentMediaBytes = silentRaw !== undefined ? mediaBytesOfWireBody(silentRaw) : undefined;
+                    logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B${silentMediaBytes !== undefined && silentMediaBytes > 0 ? `; ${silentMediaBytes.toLocaleString("en-US")} B inline media, incompressible` : ""}); would be sent uncompressed (#5405/#5408)`);
+                    return unattributedByteOversizeRefusal(dispatchUrl, { bytes: silentBytes, cap, mediaBytes: silentMediaBytes });
                 }
             }
             // #4566: clean the stale hops only when a real send follows — the

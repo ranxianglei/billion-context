@@ -279,7 +279,11 @@ test("e2e session identity: anthropic x-claude-code-session-id survives x-api-ke
 test("e2e session identity: anthropic x-mavis-session-id survives x-api-key rotation (#1050)", async () => {
     const h = await startHarness();
     try {
-        const body = anthropicBody();
+        // #6884: a real mcode main turn carries the agent's tool surface; a
+        // tools-less single-user body on the mcode lane is exactly the
+        // one-shot auxiliary shape bili now demotes, so the fixture keeps the
+        // (identity-irrelevant) tool to stay a main turn.
+        const body = { ...anthropicBody(), tools: [{ type: "function", function: { name: "bash", description: "run a command", parameters: { type: "object", properties: {} } } }] };
         await post(h, 0, "/v1/messages", body, { "x-api-key": "sk-mm-old", "x-mavis-session-id": "mcode-sess-1" });
         await post(h, 0, "/v1/messages", body, { "x-api-key": "sk-mm-new", "x-mavis-session-id": "mcode-sess-1" });
         const sessions = await getSessions(h);
@@ -368,6 +372,55 @@ test("e2e session identity: anonymous degenerate request (no history signal) →
         const resp = await postRaw(h, 0, "/v1/messages", { model: "claude-test", max_tokens: 1024, stream: true, system: "system only", messages: [] }, { "x-api-key": "sk-ant" });
         assert.equal(resp.status, 400);
         const json = (await resp.json()) as { type?: string; error?: { message?: string } };
+        assert.match(json.error?.message ?? "", /Missing stable conversation identity/);
+        assert.equal((await getSessions(h)).length, 0);
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e session identity: anonymous single-shot Responses server-tool call forwards verbatim, no session (#6548)", async () => {
+    const h = await startHarness();
+    try {
+        // pi-web-access's xAI web-search backend: string input, web_search /
+        // x_search tools only, no history, and no knob for a session id — the
+        // client cannot carry an identity here. Pre-fix the #286 refusal
+        // hard-400d it; post-fix it rides the verbatim forward like any
+        // utility call and creates no session state.
+        const body = { model: "gpt-test", stream: true, input: "latest news on context compression", tools: [{ type: "web_search" }, { type: "x_search" }] };
+        const resp = await postRaw(h, 0, "/v1/responses", body, { authorization: "Bearer <redacted>" });
+        assert.equal(resp.status, 200, `proxy returned ${resp.status}: ${await resp.text()}`);
+        assert.equal((await getSessions(h)).length, 0, "verbatim forward must not create a session");
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e session identity: anonymous Responses single-shot shape with a client tool still 400s (#6548 negative)", async () => {
+    const h = await startHarness();
+    try {
+        // A function tool makes it an agent turn, not a server-tool utility
+        // call — the #286 refusal still applies.
+        const body = { model: "gpt-test", stream: true, input: "what is the weather", tools: [{ type: "function", name: "get_weather", description: "weather", parameters: { type: "object", properties: {} } }] };
+        const resp = await postRaw(h, 0, "/v1/responses", body, { authorization: "Bearer <redacted>" });
+        assert.equal(resp.status, 400);
+        const json = (await resp.json()) as { error?: { message?: string } };
+        assert.match(json.error?.message ?? "", /Missing stable conversation identity/);
+        assert.equal((await getSessions(h)).length, 0);
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e session identity: anonymous Responses search call chaining previous_response_id still 400s (#6548 negative)", async () => {
+    const h = await startHarness();
+    try {
+        // previous_response_id chains the call onto a prior response — a
+        // conversation continuation, not a single shot.
+        const body = { model: "gpt-test", stream: true, input: "follow-up search", tools: [{ type: "web_search" }], previous_response_id: "resp_abc" };
+        const resp = await postRaw(h, 0, "/v1/responses", body, { authorization: "Bearer <redacted>" });
+        assert.equal(resp.status, 400);
+        const json = (await resp.json()) as { error?: { message?: string } };
         assert.match(json.error?.message ?? "", /Missing stable conversation identity/);
         assert.equal((await getSessions(h)).length, 0);
     } finally {

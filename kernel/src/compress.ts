@@ -49,6 +49,7 @@ import {
   buildCompressibleRanges,
   mergeRangesToThreshold,
   screenRecommendedUnits,
+  warnScreenDrop,
 } from "./recommend.js";
 import {
   runPipeline,
@@ -205,10 +206,6 @@ function numericBlockId(id: string): number {
   return parsed ? Number(parsed[1]) : 0;
 }
 
-function formatK(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
-}
-
 function refGateDiagnostics(
   state: CompressionState,
   requestedRanges: number,
@@ -290,7 +287,10 @@ function coveringBlockIds(
 // Block-ID-boundary advice is only actionable when tier distillation is ready;
 // emitting it otherwise sends the model to retry bN..bM ranges that cannot
 // fire yet (the misleading hint behind ranxianglei/billion-context-pi#470).
-function tierActionHint(config: Config, state: CompressionState): string {
+// Exported so the uncompressed status view (report.ts) can advertise the
+// byte-identical tier-distillation action the nudge and the compress
+// failure receipts use — one wording, every surface.
+export function tierActionHint(config: Config, state: CompressionState): string {
   if (!config.tiers.enabled) return "";
   // #5765: retired blocks are excluded from distillation targets — a hint
   // spanning one would point the model at a range apply refuses (#5765 guard
@@ -387,7 +387,12 @@ export function createCore(ports: Ports = {}): CompressionCore {
         countTokens,
       );
 
-    const preExistingCoverage = collectCoverage(state);
+    // This snapshot is refreshed at the top of the apply loop below (each
+    // sibling range claims against what earlier siblings in the SAME batch
+    // already cover — a frozen pre-batch snapshot let two adjacent ranges
+    // both claim the tool pair on their shared seam, breaking the
+    // no-overlapping-active-siblings invariant at the top of this file).
+    let preExistingCoverage = collectCoverage(state);
 
     // Classify every requested range ONCE. The result feeds overlap
     // skipSpecs, the minCompressRange pre-check, and the per-range loop —
@@ -728,12 +733,18 @@ export function createCore(ports: Ports = {}): CompressionCore {
         foldCandidates.push(spec);
       }
       const lengthFailures: string[] = [];
+      // #6730: track the DIRECTION of each length failure so the remediation
+      // text below points the same way the validation failed (grow for
+      // too-short/empty, shrink for too-long) instead of one generic "shorten
+      // to fit its cap" that is backwards for the too-short case.
+      const failureKinds = new Set<SummaryLengthKind>();
       const minLen = input.config.compress.minSummaryLength;
       if (foldCandidates.length === 1) {
         const solo = foldCandidates[0]!;
         try {
           validateSummaryLength(solo, input.config.compress);
         } catch (error) {
+          if (isSummaryLengthError(error)) failureKinds.add(error.kind);
           lengthFailures.push(
             rangeError(
               solo,
@@ -746,6 +757,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
           try {
             validateSummaryLength(spec, input.config.compress, { skipMin: true });
           } catch (error) {
+            if (isSummaryLengthError(error)) failureKinds.add(error.kind);
             lengthFailures.push(
               rangeError(
                 spec,
@@ -760,6 +772,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
             0,
           );
           if (total < minLen) {
+            failureKinds.add("tooShort");
             lengthFailures.push(
               `Batch summary too short (${total} chars across ${foldCandidates.length} ranges, min ${minLen}). The combined summaries must capture the compressed content's key information.`,
             );
@@ -777,7 +790,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
             blocksCreated: 0,
             tokensCompressed: 0,
             errors: [
-              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. Fix it one way or the other and resend: shorten or split each offending range's summary to fit its cap, then resend the whole batch; or drop the offending range(s) and resend only the rest that validate.`,
+              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. ${lengthRemediation(failureKinds)}`,
               ...classificationErrors,
             ],
             warnings: [],
@@ -805,6 +818,15 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
 
     for (const spec of input.ranges) {
+      // The batch applies every range to ONE shared state in order, so each
+      // projection must judge "already covered" against the siblings that
+      // landed EARLIER in this same batch, not only the pre-batch snapshot:
+      // without the refresh, two adjacent ranges whose spans share the seam
+      // tool pair both claimed it (two active sibling blocks directly owning
+      // the same messages). First-come-first-served: the earlier range keeps
+      // the seam; the later one shrinks to its own new messages or becomes
+      // the #4521 idempotent no-op. Cheap: active blocks × their id sets.
+      preExistingCoverage = collectCoverage(state);
       if (skipSpecs.has(spec)) continue;
       const resolution = classifications.get(spec);
       if (resolution === undefined) continue;
@@ -847,9 +869,25 @@ export function createCore(ports: Ports = {}): CompressionCore {
       warnings.push(...resolution.resolved.snappedBoundaries);
       const note = resolution.resolved.reversedNote;
       if (note) notes.push(note);
+      // A clamped endpoint landed on a real message but the REQUESTED ref was
+      // never allocated in this session — it will be minted for an unrelated
+      // later message, so persisting it as the block's recorded span aliases
+      // that future message. Record the effective (anchored) ref instead;
+      // error attribution below keeps the original spec so the model sees its
+      // own range in any failure text.
+      const resolved = resolution.resolved;
+      const effectiveSpec =
+        resolved.effectiveStartRef !== undefined ||
+        resolved.effectiveEndRef !== undefined
+          ? {
+              ...spec,
+              startRef: resolved.effectiveStartRef ?? spec.startRef,
+              endRef: resolved.effectiveEndRef ?? spec.endRef,
+            }
+          : spec;
       try {
         const outcome = applySingleRange({
-          spec,
+          spec: effectiveSpec,
           messages: input.messages,
           state,
           runId: runIdOf(),
@@ -1036,38 +1074,18 @@ export function createCore(ports: Ports = {}): CompressionCore {
     }
     const state = { ...result.state, lastPassIds: inboundIds, deadRefs };
     const ccrEffect = result.effects.ccr as CcrEffect | undefined;
-    // #4521: between banner deliveries a compression round can stay armed for
-    // many requests (backoff, tier cadence, model-decided timing). During that
-    // window the model sees NO current refs and starts guessing beyond the
-    // highest allocated ref — every guess a failed round-trip. Emit a compact
-    // boundary line whenever a nudge plan carries offered ranges but its
-    // banner is not being delivered this turn; hosts append it as an ephemeral
-    // trailing user message (same carrier as the nudge, same cache safety).
-    let statusLine: string | undefined;
-    const nudge = result.effects.nudge;
-    // Two shapes authorize the refresh line: a real tiered arm whose banner
-    // is deferred this turn (tier !== null: pressure crossed a threshold but
-    // cadence/backoff holds it), or any plan after at least one banner was
-    // already shown (lastNudgeShownTokens > 0: the model HAS seen refs and
-    // this line only refreshes them). A fresh session's below-threshold plan
-    // (tier === null, nothing shown yet — e.g. an optimistic local estimate)
-    // must stay fully silent: same regime promise as the nudge itself
-    // (#196 regime scoping, #3910 lane baseline).
-    const bannerShown = (result.state.nudge?.lastNudgeShownTokens ?? 0) > 0 || Object.keys(result.state.nudge?.lastShownByTier ?? {}).length > 0;
-    if (nudge && !nudge.shouldInject && (nudge.tier !== null || bannerShown) && (nudge.compressibleRanges?.length ?? 0) > 0) {
-      const highest = highestUsedIndex(state.messageRefs);
-      const offered = nudge.compressibleRanges!
-        .slice(0, 3)
-        .map((r) => `${r.startRef}–${r.endRef} (${formatK(r.tokens)})`)
-        .join(", ");
-      const extra = nudge.compressibleRanges!.length > 3 ? `, +${nudge.compressibleRanges!.length - 3} more` : "";
-      statusLine = `[ACP status: highest allocated ref ${highest > 0 ? indexToRef(highest) : "none"} — refs above it are not minted yet, never guess them; compressible now: ${offered}${extra}; the newest messages stay protected. Use these refs directly; acp_status only if you need the full list.]`;
-    }
+    // #6928: the #4521 armed-but-silent refresh line ("[ACP status: …]",
+    // emitted on turns where a nudge plan is armed but its banner is not
+    // delivered) is removed. It fired precisely when the banner was withheld,
+    // so its "compressible now" list was always below-gate residue — a
+    // standing fold directive contradicting the same turns' compress receipt
+    // ("named for visibility, not as fold suggestions" / "No compressible
+    // ranges remain"). Ref-guessing backstops remain: the compress receipt and
+    // the unknown-ref refusal both report the session's highest allocated ref.
     return {
       messages: result.messages,
       state,
       nudge: result.effects.nudge,
-      statusLine,
       terminalEscape: result.effects.terminalEscape,
       truncationSkipped: result.effects.truncationSkipped,
       contentStore: ccrEffect?.store ?? contentStore,
@@ -1501,6 +1519,23 @@ const recommendNode: PipelineNode = {
       ctx.config,
       computeProtectedRefs(screenArray, io.state, ctx.config, ctx.countTokens),
     );
+    // Production 2026-11-09 mega-turn incident: the funnel can zero out BELOW
+    // the "nothing compressible" level — segments exist and hold messages, but
+    // every island dies at the merge gate or the screen, and the host only
+    // sees recommendedRanges=[] while its own message-level diagnostic still
+    // counts collectible material ("collectible>0 yet ranges=0" was
+    // undiagnosable from the host side for a full night). Warn (budgeted)
+    // with the stage-by-stage numbers so the killing stage is named directly.
+    if (contextRanges.compressible.length > 0 && recommendedRanges.length === 0) {
+      const segMsgs = contextRanges.compressible.reduce((s, r) => s + r.count, 0);
+      const minChars = ctx.config.compress.minCompressRange;
+      const subGate = contextRanges.compressible.filter(
+        (r) => (r.chars ?? r.tokens * 4) < minChars,
+      ).length;
+      warnScreenDrop(
+        `funnel zeroed with material present: segments=${contextRanges.compressible.length} (${segMsgs} msgs, ${subGate} below ${minChars}-char merge gate) → all died at merge/screen; host sees no-ranges`,
+      );
+    }
     const recommendation: Recommendation = {
       contextRanges,
       recommendedRanges,
@@ -1815,6 +1850,26 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
         noop: true,
       };
     }
+    // #7596: the integrity withdrawal (a visible tool-call must keep its
+    // reasoning run and its results) removed EVERY message of this fresh fold
+    // — the range sits astride the protected-zone boundary and the kernel
+    // keeps the whole turn intact rather than folding a split turn. Before
+    // this the fatal threw and the ATOMIC batch contract rolled back sibling
+    // ranges that would have folded fine; the model re-sent the same batch
+    // (full context re-read every time) until the breaker fired. Like the
+    // zone fatal above it is now a legal no-op: siblings still fold, and the
+    // warning points the model at older ranges instead of a guaranteed
+    // re-failure. Merge split fatals never carry `degradable` and still throw.
+    if (projection.fatal.kind === "split" && projection.fatal.degradable) {
+      const highest = highestUsedIndex(input.state.messageRefs);
+      return {
+        tokens: 0,
+        warnings: [
+          `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — the integrity gate keeps every visible tool call's reasoning run and its results together, and folding this range would split that turn at the protected-zone boundary, so the range was withdrawn in full instead of split. Nothing failed; do not resend this range as-is — it cannot fold until the whole turn ages out of the protected zone. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"} — target older ranges only.`,
+        ],
+        noop: true,
+      };
+    }
     throw projection.fatal.error;
   }
   const {
@@ -1903,11 +1958,22 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     // reason (e.g. a merge skipped because its turn cannot be closed now) —
     // surface those before the generic explanation.
     const highest = highestUsedIndex(input.state.messageRefs);
+    // Every resolvable message in the range is covered by an active block
+    // that is not fully inside the range — a same-batch sibling that claimed
+    // the seam tool pair, or a pre-existing block straddling the range edge.
+    // Name that class instead of the generic "protected or filtered" one.
+    // The wording must NOT claim same-batch involvement: the pre-existing
+    // straddling case lands here too, with no block created in this batch.
+    const allCovered =
+      effectiveMessageIds.size > 0 &&
+      [...effectiveMessageIds].every((id) => input.preExistingCoverage.has(id));
     return {
       tokens: 0,
       warnings: [
         ...warnings,
-        `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
+        allCovered
+          ? `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — every message in it is already covered by active block(s). Nothing failed; do not resend this range. To rewrite or merge those blocks, reference them by block ID instead.`
+          : `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
       ],
       noop: true,
     };
@@ -2042,6 +2108,49 @@ function validateCompressionRange(input: SingleRangeInput): void {
   // nothing left to fold.
 }
 
+// #6730: the three direction-distinct summary-length failures. The batch
+// rejection message must advise in the SAME direction as the failure that
+// fired — a "too short" summary must be told to GROW, never "shorten to fit
+// its cap". The old single generic string said "shorten or split ... to fit
+// its cap" for EVERY length failure, so a too-short summary got advice that
+// made it shorter, and the model retried into a guaranteed-fail loop (full
+// context re-read each time) until the circuit breaker fired.
+type SummaryLengthKind = "empty" | "tooShort" | "tooLong";
+
+// The guarded-file subset (verif/subset-guard.ts) excludes class declarations
+// and non-NEWABLE `new` targets, so this is a plain-Error factory plus a type
+// guard instead of a class — same shape and messages, no class.
+type SummaryLengthError = Error & { kind: SummaryLengthKind };
+
+function summaryLengthError(kind: SummaryLengthKind, message: string): SummaryLengthError {
+  const error = new Error(message) as SummaryLengthError;
+  error.name = "SummaryLengthError";
+  error.kind = kind;
+  return error;
+}
+
+function isSummaryLengthError(error: unknown): error is SummaryLengthError {
+  if (!(error instanceof Error) || error.name !== "SummaryLengthError") return false;
+  const kind = (error as SummaryLengthError).kind;
+  return kind === "empty" || kind === "tooShort" || kind === "tooLong";
+}
+
+/** Build the batch-rejection remediation text from the set of failure
+ *  directions actually present. Each direction gets advice pointing the SAME
+ *  way its validation failed; the "drop the range" exit is always offered. */
+function lengthRemediation(kinds: Set<SummaryLengthKind>): string {
+  const parts: string[] = [];
+  if (kinds.has("tooShort") || kinds.has("empty")) {
+    parts.push(
+      "expand each too-short/empty summary until it reaches its minimum — write out the key information the range actually contains (do NOT shorten it)",
+    );
+  }
+  if (kinds.has("tooLong")) {
+    parts.push("shorten or split each too-long summary to fit its cap");
+  }
+  return `Fix it and resend the whole batch: ${parts.join("; and ")}; or drop the offending range(s) and resend only the rest that validate.`;
+}
+
 function validateSummaryLength(
   spec: { summary: string; summaryMaxChars?: number },
   cfg: Config["compress"],
@@ -2050,7 +2159,8 @@ function validateSummaryLength(
   const summary = spec.summary?.trim() ?? "";
 
   if (summary.length === 0) {
-    throw new Error(
+    throw summaryLengthError(
+      "empty",
       "Summary is empty — provide a meaningful summary of the compressed range.",
     );
   }
@@ -2062,14 +2172,16 @@ function validateSummaryLength(
     cfg.minSummaryLength > 0 &&
     summary.length < cfg.minSummaryLength
   ) {
-    throw new Error(
+    throw summaryLengthError(
+      "tooShort",
       `Summary too short (${summary.length} chars, min ${cfg.minSummaryLength}). The summary must capture the compressed range's key information.`,
     );
   }
 
   const effectiveMax = spec.summaryMaxChars ?? cfg.maxSummaryLength;
   if (effectiveMax > 0 && summary.length > effectiveMax) {
-    throw new Error(
+    throw summaryLengthError(
+      "tooLong",
       `Summary too long (${summary.length} chars, max ${effectiveMax}). Strip noise — keep critical paths, decisions, errors, and code references. Or pass summaryMaxChars to increase the limit — don't lose critical info just to fit.`,
     );
   }

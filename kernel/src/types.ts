@@ -708,6 +708,22 @@ export interface CompressibleRange {
    *  has no index gap and the index check alone would let mergeRangesToThreshold
    *  bridge back into one doomed span bracketing the dead ref. */
   noMergeBefore?: boolean;
+  /** buildCompressibleRanges sets this when the gap immediately before this
+   *  range is SPAN-SAFE: composed exclusively of members the apply side
+   *  tolerates INSIDE a spanning fold — protected-tool exchanges
+   *  (config.protectedTools / always-protected list, carved by
+   *  filterProtectedToolMessages, "Bug 39") and integrity-withdrawn members
+   *  (the fold gate withdraws them again at apply; they stay visible, #564
+   *  reverse-split semantics). mergeRangesToThreshold bridges across such
+   *  gaps so sub-gate islands can accumulate to minCompressRange instead of
+   *  all dying below it (production 2026-11-09: a mega-turn with a protected
+   *  exchange every ~4 rounds fragmented every island to 3-5K chars,
+   *  mergeRangesToThreshold dropped them all → recommendedRanges=[] → the
+   *  host's emergency lane fell back to irreversible physical pruning while
+   *  the host's four-bucket diagnostic still showed 84 "collectible"
+   *  messages). Hard gaps (blocks, carriers, media, dead refs, unrefed
+   *  messages, soft zone) never set this — they keep splitting ranges. */
+  bridgeableGapBefore?: boolean;
 }
 
 export interface ProtectedRange {
@@ -834,14 +850,6 @@ export interface ProcessTurnResult {
   messages: CoreMessage[];
   state: CompressionState;
   nudge?: NudgeDecision;
-  /** Compact always-current boundary line, present only on turns where a
-   *  compression round is live (nudge plan with offered ranges) but the
-   *  advisory banner itself is NOT being delivered this request. Carries the
-   *  session's highest allocated ref and the currently offered ranges so the
-   *  model never has to guess refs between banner deliveries (#4521). Hosts
-   *  append it as an ephemeral trailing user message, same carrier as a
-   *  nudge. */
-  statusLine?: string;
   /** Terminal floor detected (#300): compression and truncation are both
    *  exhausted while usage stays at/above truncate.threshold. Emitted every
    *  event while the condition holds; hosts surface it once. */

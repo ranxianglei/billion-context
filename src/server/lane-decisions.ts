@@ -76,6 +76,49 @@ function observeDeclaredTools(parsed: unknown, protocol: LaneProtocol): Readonly
     return out;
 }
 
+// ②b Deferred-tools observation (#6958). Claude Code defers its MCP tools:
+// `mcp__bili__compress` never appears in tools[] until the client's ToolSearch
+// loads it; instead the request messages carry an announcement block
+// ("…deferred tools are now available via ToolSearch … mcp__bili__compress …").
+// Reading ONLY tools[] made the tool invisible to the dialect/reachability
+// decisions, so the nudge advertised the bare `compress` — which CC rejects
+// with "No such tool available" (14 field workers hard-failed, 13 never
+// folded, sessions pinned at 133–244K tokens, #6958). The extractor scans
+// message text for the announcement and returns the bili tool FULL names it
+// lists. Observation only — no naming is derived here.
+const DEFERRED_TOOLS_MARKER = "deferred tools are now available via ToolSearch";
+
+function messageTextOf(m: unknown): string | undefined {
+    if (m === null || typeof m !== "object") return undefined;
+    const rec = m as { content?: unknown; text?: unknown };
+    if (typeof rec.content === "string") return rec.content;
+    if (Array.isArray(rec.content)) {
+        return rec.content
+            .map((p) => (p !== null && typeof p === "object" ? (p as { text?: unknown }).text : p))
+            .filter((t): t is string => typeof t === "string")
+            .join(" ");
+    }
+    return typeof rec.text === "string" ? rec.text : undefined;
+}
+
+export function extractDeferredBiliToolNames(parsed: unknown): ReadonlySet<string> {
+    const out = new Set<string>();
+    const messages = parsed !== null && typeof parsed === "object" ? (parsed as { messages?: unknown }).messages : undefined;
+    if (!Array.isArray(messages)) return out;
+    for (const m of messages) {
+        const t = messageTextOf(m);
+        if (typeof t !== "string" || !t.includes(DEFERRED_TOOLS_MARKER)) continue;
+        // The announcement block runs from the marker to the first blank line
+        // (CC 2.1.x shape: one tool full name per line).
+        const block = t.slice(t.indexOf(DEFERRED_TOOLS_MARKER)).split("\n\n")[0];
+        for (const line of block.split("\n")) {
+            const c = line.trim();
+            if (/^mcp__bili__/.test(c) && c.length < 128) out.add(c);
+        }
+    }
+    return out;
+}
+
 // ①b WireClientProfile — proxy-lane clients carry no pluginAgent header;
 // their identity is OBSERVED from wire signals. Registry discipline as ①:
 // the wire-client header-name literals live ONLY here (the old
@@ -257,6 +300,11 @@ export function nudgeOn(i: NudgeGateInputs): boolean {
 export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     const profile = hostProfileFor(input.pluginAgent);
     const declaredTools = observeDeclaredTools(input.parsed, input.protocol);
+    // #6958: hosts may ANNOUNCE a bili tool as deferred (Claude Code's
+    // ToolSearch block in the messages) instead of declaring it in tools[] —
+    // "the host has this tool" means declared OR announced. Observed from
+    // this request's parsed body (single site; no caller changes).
+    const deferredBiliTools = extractDeferredBiliToolNames(input.parsed);
     // Reachability truth: in PROXY mode bili itself injects the tool
     // definitions into the outbound body, so the surface is structurally on.
     // In PLUGIN mode the host owns the tool table: reach when this request
@@ -279,6 +327,7 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     const compressReachable = !input.pluginMode
         || declaredTools.has("compress")
         || declaredTools.has(mcpBiliToolName("compress"))
+        || deferredBiliTools.has(mcpBiliToolName("compress"))
         || [...CODE_MODE_OMNIBUS_TOOL_NAMES].some((n) => declaredTools.has(n))
         || !profile.toolsHostScopedByDefault
         // #2155: a sticky plugin-bound round with NO lane header is the zombie
@@ -290,7 +339,14 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
         // (#4344's silent-bridge case always sends the header — unaffected.)
         || (input.pluginMode && input.pluginHeaderPresent === false);
     const compressSurfaceOn = input.shouldInject && compressReachable;
-    const mcpDialect = input.pluginMode && declaredTools.has(mcpBiliToolName("compress")) && !declaredTools.has("compress");
+    // #4344 dialect, extended by #6958 to the deferred announcement: the
+    // standing prompt must teach `mcp__bili__compress` whenever the host's
+    // callable name is the MCP one — declared in tools[] (zcode, #4344) OR
+    // announced deferred (Claude Code, #6958), and never when the bare
+    // `compress` is also declared (the bare name wins).
+    const mcpDialect = input.pluginMode
+        && (declaredTools.has(mcpBiliToolName("compress")) || deferredBiliTools.has(mcpBiliToolName("compress")))
+        && !declaredTools.has("compress");
     const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;
     const billingBlockWanted = profile.wantsBillingBlock || billingBlockObserved;
     return Object.freeze({

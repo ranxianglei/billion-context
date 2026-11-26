@@ -2,15 +2,20 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
 
-import { defaultConfig } from "acp-kernel";
+import { createCore, defaultConfig } from "acp-kernel";
+import { responsesToCoreWithToolImages as responsesToCore } from "../src/responses-tool-output.js";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
-import { CODEX_LOCAL_COMPACTION_SUMMARY_PREFIX } from "../src/codex-compact.ts";
+import { CODEX_LOCAL_COMPACTION_SUMMARY_PREFIX, CODEX_COMPACT_ID_PREFIX, CODEX_COMPACT_SENTINEL, nativeCompactionKey } from "../src/codex-compact.ts";
 
 // Issue #2372 regression: codex's LOCAL auto-compaction (rollout event
 // type:"compacted") never transits the proxy — no compaction_trigger item, no
@@ -72,10 +77,11 @@ function compactedInput() {
 type Harness = {
     url: string;
     bodies: string[];
+    store: SessionStore;
     close: () => Promise<void>;
 };
 
-async function startHarness(): Promise<Harness> {
+async function startHarness(dir?: string): Promise<Harness> {
     const bodies: string[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -108,7 +114,8 @@ async function startHarness(): Promise<Harness> {
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
 
-    _setStoreForTest(new SessionStore({ enabled: false }));
+    const store = new SessionStore({ dir, enabled: dir !== undefined });
+    _setStoreForTest(store);
     setRegistryForTest({});
     _resetSessionsForTest();
     const proxy = await startServer({
@@ -139,6 +146,7 @@ async function startHarness(): Promise<Harness> {
     return {
         url: `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`,
         bodies,
+        store,
         close: async () => {
             proxy.close();
             proxy.closeIdleConnections?.();
@@ -146,6 +154,7 @@ async function startHarness(): Promise<Harness> {
             upstream.close();
             upstream.closeIdleConnections?.();
             await once(upstream, "close");
+            store.closeQuietly();
         },
     };
 }
@@ -168,6 +177,110 @@ test("drift pin: codex local-compaction summary template header is versioned (#2
         CODEX_LOCAL_COMPACTION_SUMMARY_PREFIX,
         "Another language model started to solve this problem and produced a summary",
     );
+});
+
+test("opaque native compaction recovers a pending epoch with fewer than eight missing ids, once per checkpoint", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-native-checkpoint-"));
+    const h = await startHarness(dir);
+    try {
+        await seedFoldedSession(h);
+        const session = listSessions().find(s => s.meta.label === "codex-sess-a")!;
+        for (const block of session.state.blocks) {
+            block.effectiveMessageIds = block.effectiveMessageIds.slice(0, 4);
+            block.directMessageIds = block.directMessageIds.slice(0, 4);
+        }
+        session.metadata.foldEpochConfirmPending = true;
+        session.stats.lastInputTokens = 299_686;
+        session.stats.lastInputTokensSource = "usage";
+        const checkpoint = { type: "compaction", id: "native-checkpoint", encrypted_content: "opaque-native-checkpoint-payload" };
+        const input = [checkpoint, ...seedInput().slice(-2)];
+        const send = async (items: unknown[]) => {
+            const response = await fetch(h.url, {
+                method: "POST", headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+                body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "codex-sess-a", input: items }),
+            });
+            const body = await response.text(); assert.equal(response.status, 200, body);
+        };
+        await send(input);
+        assert.equal(session.state.blocks.length, 0, "native replacement consumes the stale fold epoch");
+        assert.equal(session.metadata.foldEpochConfirmPending, undefined, "preflight is no longer paused");
+        assert.ok(session.metadata.nativeCompactionAt);
+        assert.ok(h.bodies.at(-1)!.includes(checkpoint.encrypted_content), "native blob is forwarded verbatim");
+        const continued = [...input, ...Array.from({ length: 8 }, (_, i) => ({ type: "message", role: i % 2 ? "assistant" : "user", content: `Post-checkpoint message ${i}. ` + "retained decision ".repeat(200) }))];
+        await send(continued);
+        const messages = responsesToCore({ input: continued }).msgs;
+        const selected = messages.slice(-8, -5);
+        const folded = createCore().applyCompression({ messages, state: session.state,
+            config: { ...defaultConfig(30_000), preserveRecentMessages: 0, preserveRecentTokens: 0 },
+            ranges: [{ startRef: session.state.messageRefs.byRaw[selected[0]!.id]!, endRef: session.state.messageRefs.byRaw[selected[2]!.id]!, summary: "The new post-checkpoint work established three retained decisions and independent validation results for continuing the task." }],
+        });
+        session.state = folded.state;
+        assert.ok(session.state.blocks.some(block => block.active), "new work can be folded after recovery");
+        const before = { refs: { ...session.state.messageRefs.byRaw }, at: session.metadata.nativeCompactionAt, ids: session.state.blocks.map(block => block.blockId) };
+        await send(continued);
+        assert.deepEqual(session.state.messageRefs.byRaw, before.refs, "hot checkpoint echo keeps stable refs");
+        await h.store.writeNow(session);
+        const reloaded = h.store.loadSync(session.id)!;
+        assert.equal(reloaded.metadata.codexNativeCompactionKey, session.metadata.codexNativeCompactionKey, "checkpoint identity survives persistence");
+        // Cold loading may apply the existing one-time ledger alignment
+        // (#4316). The checkpoint must not reset those aligned refs again.
+        const alignedRefs = { ...reloaded.state.messageRefs.byRaw };
+        session.state = reloaded.state; session.metadata = reloaded.metadata; session.stats = reloaded.stats;
+        await send(continued);
+        assert.equal(session.metadata.nativeCompactionAt, before.at, "persisted checkpoint does not rebase twice");
+        assert.deepEqual(session.state.blocks.map(block => block.blockId), before.ids, "checkpoint echo preserves newer folds");
+        assert.ok(session.state.blocks.some(block => block.active));
+        assert.deepEqual(session.state.messageRefs.byRaw, alignedRefs, "persisted checkpoint preserves the loaded ref map");
+    } finally { await h.close(); rmrf(dir); }
+});
+
+test("native checkpoint identity excludes bili carriers and malformed input, and follows the last native checkpoint", () => {
+    const native = (encrypted_content: string) => ({ type: "compaction", encrypted_content });
+    const first = native("opaque-first"), last = native("opaque-last");
+    const bili = { ...native("bili"), id: `${CODEX_COMPACT_ID_PREFIX}echo` };
+    for (const input of [undefined, {}, [null], [native("")], [bili], [native(`${CODEX_COMPACT_SENTINEL}summary`)]]) {
+        assert.equal(nativeCompactionKey(input), undefined);
+    }
+    assert.notEqual(nativeCompactionKey([first]), nativeCompactionKey([last]));
+    assert.equal(nativeCompactionKey([first, last, bili]), nativeCompactionKey([last]));
+});
+
+test("a non-Codex opaque item does not reset active folds", async () => {
+    const h = await startHarness();
+    try {
+        await seedFoldedSession(h);
+        const session = listSessions().find(s => s.meta.label === "codex-sess-a")!;
+        const ids = session.state.blocks.map(block => block.blockId);
+        const response = await fetch(h.url, {
+            method: "POST", headers: { "content-type": "application/json", "user-agent": "ordinary-responses-client" },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "codex-sess-a", input: [
+                { type: "compaction", encrypted_content: "opaque-client-data" }, ...seedInput(),
+            ] }),
+        });
+        assert.equal(response.status, 200, await response.text());
+        assert.deepEqual(session.state.blocks.map(block => block.blockId), ids);
+        assert.equal(session.metadata.codexNativeCompactionKey, undefined);
+    } finally { await h.close(); }
+});
+
+test("first observing an older native checkpoint preserves fully covered folds", async () => {
+    const h = await startHarness();
+    try {
+        await seedFoldedSession(h);
+        const session = listSessions().find(s => s.meta.label === "codex-sess-a")!;
+        const ids = session.state.blocks.map(block => block.blockId);
+        const response = await fetch(h.url, {
+            method: "POST", headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "codex-sess-a", input: [
+                { type: "compaction", encrypted_content: "older-native-checkpoint" }, ...seedInput(),
+            ] }),
+        });
+        assert.equal(response.status, 200, await response.text());
+        assert.deepEqual(session.state.blocks.map(block => block.blockId), ids);
+        assert.ok(session.state.blocks.some(block => block.active));
+        assert.ok(session.metadata.codexNativeCompactionKey);
+        assert.equal(session.metadata.nativeCompactionAt, undefined);
+    } finally { await h.close(); }
 });
 
 test("e2e #2372: codex replaying [summary, retained tail] rebases the ACP state instead of drifting forever", async () => {

@@ -55,6 +55,17 @@ function streamOf(events: string[]): ReadableStream<Uint8Array> {
     });
 }
 
+function erroredStream(events: string[]): ReadableStream<Uint8Array> {
+    const enc = new TextEncoder();
+    let i = 0;
+    return new ReadableStream<Uint8Array>({
+        pull(controller) {
+            if (i < events.length) controller.enqueue(enc.encode(events[i++]));
+            else controller.error(new Error("simulated upstream read failure"));
+        },
+    });
+}
+
 function chatChunk(delta: Record<string, unknown>, extra: Record<string, unknown> = {}): string {
     return `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta, finish_reason: null }], ...extra })}\n\n`;
 }
@@ -166,7 +177,7 @@ test("responses pipe: retry that also dies at zero frames falls back to the #721
 // which is what makes a healed turn degenerate: nothing visible, terminal reached.
 const ECHO_TAG = "\x3cacp tokens=\"2\" type=\"text\"\x3em00001\x3c/acp\x3e";
 
-test("chat pipe: a healed stream that completes degenerate cannot spend a second re-issue (#2171 shared budget)", async () => {
+test("chat pipe: a healed stream that completes degenerate spends its OWN degenerate re-issue (#7666 independent budgets)", async () => {
     const out: string[] = [];
     let refetches = 0;
     const refetch = (): Promise<ReadableStream<Uint8Array> | null> => {
@@ -178,30 +189,34 @@ test("chat pipe: a healed stream that completes degenerate cannot spend a second
         ]));
     };
     await pipePluginChatWithStrip(streamOf([]), makeRes(out), "openai", makeSession(), undefined, refetch, "http://up");
-    assert.equal(refetches, 1, "truncation retry and degenerate-turn retry share ONE re-issue per request");
-    assert.ok(!out.join("").includes(ERROR_SENTINEL), "the degenerate completion passes through as today when the budget is spent");
+    assert.equal(refetches, 2, "#7666: the degenerate retry has its OWN budget — a #2171-healed stream may still spend one (owner ruling: the budgets are no longer shared)");
+    const body = out.join("");
+    assert.ok(!body.includes(ERROR_SENTINEL), "the #721 truncation sentinel is not involved in the degenerate terminal");
+    assert.ok(body.includes("the turn degenerated again after the continuation nudge"), "the second degenerate completion raises the #870 in-band error (N=1 keeps the historical sentence)");
 });
 
-test("responses pipe: a healed stream that completes degenerate cannot spend a second re-issue (#2171 shared budget)", async () => {
+test("responses pipe: a healed stream that completes degenerate spends its OWN degenerate re-issue (#7666 independent budgets)", async () => {
     const out: string[] = [];
     let refetches = 0;
     const sse = (type: string, payload: Record<string, unknown>) => `event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`;
     const refetch = (): Promise<ReadableStream<Uint8Array> | null> => {
         refetches += 1;
         return Promise.resolve(streamOf([
-            sse("response.created", { response: { id: "resp_2", status: "in_progress" } }),
-            sse("response.output_item.added", { output_index: 0, item: { id: "msg_2", type: "message", role: "assistant", content: [] } }),
-            sse("response.content_part.added", { item_id: "msg_2", output_index: 0, part: { type: "output_text", text: "" } }),
-            sse("response.output_text.delta", { item_id: "msg_2", output_index: 0, delta: ECHO_TAG }),
-            sse("response.output_text.done", { item_id: "msg_2", output_index: 0, text: "" }),
-            sse("response.content_part.done", { item_id: "msg_2", output_index: 0, part: { type: "output_text", text: "" } }),
-            sse("response.output_item.done", { output_index: 0, item: { id: "msg_2", type: "message", role: "assistant", status: "completed", content: [] } }),
-            sse("response.completed", { response: { id: "resp_2", status: "completed", output: [] } }),
+            sse("response.created", { response: { id: "resp_3", status: "in_progress" } }),
+            sse("response.output_item.added", { output_index: 0, item: { id: "msg_3", type: "message", role: "assistant", content: [] } }),
+            sse("response.content_part.added", { item_id: "msg_3", output_index: 0, part: { type: "output_text", text: "" } }),
+            sse("response.output_text.delta", { item_id: "msg_3", output_index: 0, delta: ECHO_TAG }),
+            sse("response.output_text.done", { item_id: "msg_3", output_index: 0, text: "" }),
+            sse("response.content_part.done", { item_id: "msg_3", output_index: 0, part: { type: "output_text", text: "" } }),
+            sse("response.output_item.done", { output_index: 0, item: { id: "msg_3", type: "message", role: "assistant", status: "completed", content: [] } }),
+            sse("response.completed", { response: { id: "resp_3", status: "completed", output: [] } }),
         ]));
     };
     await pipePluginResponsesWithStrip(streamOf([]), makeRes(out), makeSession(), undefined, refetch, "http://up");
-    assert.equal(refetches, 1, "truncation retry and degenerate-turn retry share ONE re-issue per request");
-    assert.ok(out.join("").includes("response.completed"), "the degenerate completion passes through as today when the budget is spent");
+    assert.equal(refetches, 2, "#7666: the degenerate retry has its OWN budget — a #2171-healed stream may still spend one (owner ruling: the budgets are no longer shared)");
+    const body = out.join("");
+    assert.ok(!body.includes(ERROR_SENTINEL), "this lane has no in-band error — the exhausted budget passes the turn through");
+    assert.ok(body.includes("resp_3"), "the second (degenerate) retry's lifecycle reaches the client");
 });
 
 test("chat pipe: a comment-only upstream stream (keep-alive pings, zero data frames) still retries (#2171)", async () => {
@@ -218,6 +233,36 @@ test("chat pipe: a comment-only upstream stream (keep-alive pings, zero data fra
     assert.equal(refetches, 1, "SSE comments carry no protocol events — the zero-visible predicate must hold");
     assert.ok(out.join("").includes("healed"));
     assert.ok(!out.join("").includes(ERROR_SENTINEL));
+});
+
+test("OMP-owned read error does not spend the proxy reasoning-only retry", async () => {
+    const out: string[] = [];
+    let refetches = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array> | null> => { refetches++; return Promise.resolve(streamOf([])); };
+    await pipePluginChatWithStrip(
+        erroredStream([chatChunk({ reasoning_content: "private reasoning" })]),
+        makeRes(out), "openai", makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true,
+    );
+    assert.equal(refetches, 0);
+    assert.ok(out.join("").includes(ERROR_SENTINEL));
+});
+
+test("OMP-owned truncation: chat pipe does not spend a proxy retry and returns the in-band error", async () => {
+    const out: string[] = [];
+    let refetches = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array> | null> => { refetches++; return Promise.resolve(streamOf([])); };
+    await pipePluginChatWithStrip(streamOf([]), makeRes(out), "openai", makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true);
+    assert.equal(refetches, 0);
+    assert.ok(out.join("").includes(ERROR_SENTINEL));
+});
+
+test("responses pipe: OMP-owned truncation does not spend a proxy retry and returns the in-band error", async () => {
+    const out: string[] = [];
+    let refetches = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array> | null> => { refetches++; return Promise.resolve(streamOf([])); };
+    await pipePluginResponsesWithStrip(streamOf([]), makeRes(out), makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, true);
+    assert.equal(refetches, 0);
+    assert.ok(out.join("").includes(ERROR_SENTINEL));
 });
 
 test("responses pipe: a comment-only upstream stream (keep-alive pings, zero data frames) still retries (#2171)", async () => {

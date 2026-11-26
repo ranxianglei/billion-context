@@ -15,7 +15,12 @@
 //     is the same no-op class,
 // (d) the armed-but-silent nudge window emits a status line naming the
 //     highest allocated ref and the offered ranges, so the model stops
-//     guessing refs it cannot see.
+//     guessing refs it cannot see,
+// (e) a clamped fold PERSISTS THE CLAMPED ENDPOINT on the block (startRef/
+//     endRef) — the phantom request was never allocated in this session and
+//     WILL be minted for an unrelated later message, so recording it would
+//     make the block's span alias that future message (non-clamped folds
+//     still record the requested refs verbatim).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -90,6 +95,10 @@ test("#4521: endId above highest allocated ref clamps down instead of refusing t
     r.result.warnings.some((w) => /clamped to it/.test(w) && /highest allocated ref \(m00004\)/.test(w)),
     `expected clamp warning, got: ${JSON.stringify(r.result.warnings)}`,
   );
+  assert.ok(
+    r.result.warnings.some((w) => /lands at m00004, the last visible message at or below the frontier/.test(w)),
+    `the clamp warning must name the ref the fold actually landed on, got: ${JSON.stringify(r.result.warnings)}`,
+  );
   const block = r.state.blocks.find((b) => b.active);
   assert.ok(block, "a block was created");
   assert.deepEqual(
@@ -97,6 +106,48 @@ test("#4521: endId above highest allocated ref clamps down instead of refusing t
     ["a1", "a2", "a3"],
     "the range folded up to the last visible message",
   );
+});
+
+test("#4521: a clamped fold persists the clamped endpoint on the block, not the phantom request", () => {
+  const core = createCore();
+  const messages = [text("u0", "user"), text("a1", "assistant"), text("a2", "assistant"), text("a3", "assistant")];
+  const state = seed(messages);
+
+  const r = core.applyCompression({
+    ranges: [{ startRef: "m00002", endRef: "m00099", summary: "work recap" }],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(r.result.errors.length, 0, r.result.errors.join("; "));
+  const block = r.state.blocks.find((b) => b.active);
+  assert.ok(block, "a block was created");
+  assert.equal(block.startRef, "m00002", "start endpoint was real — kept as requested");
+  assert.equal(
+    block.endRef,
+    "m00004",
+    "the phantom endRef m00099 must not be persisted: refs are minted in order, so m00099 would later be assigned to an unrelated message and the block span would alias it",
+  );
+});
+
+test("#4521: folds without clamping still persist the requested refs verbatim", () => {
+  const core = createCore();
+  const messages = [text("u0", "user"), text("a1", "assistant"), text("a2", "assistant"), text("a3", "assistant")];
+  const state = seed(messages);
+
+  const r = core.applyCompression({
+    ranges: [{ startRef: "m00002", endRef: "m00003", summary: "two messages" }],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(r.result.errors.length, 0, r.result.errors.join("; "));
+  const block = r.state.blocks.find((b) => b.active);
+  assert.ok(block, "a block was created");
+  assert.equal(block.startRef, "m00002");
+  assert.equal(block.endRef, "m00003");
 });
 
 test("#4521: startId above highest allocated ref keeps the hard refusal (real targeting error)", () => {
@@ -166,7 +217,7 @@ test("#4521: a range of pure protected tool pairs is the same no-op class", () =
   );
 });
 
-test("#4521: armed-but-silent nudge window emits a status line naming the highest ref and offered ranges", () => {
+test("#4521/#6928: armed-but-silent nudge window no longer emits a status line", () => {
   const core = createCore();
   const cfg = config();
   const messages = Array.from({ length: 40 }, (_, i) =>
@@ -178,18 +229,16 @@ test("#4521: armed-but-silent nudge window emits a status line naming the highes
   // threshold, no baseline yet) — the banner carries the refs.
   const warm = core.processTurn({ messages, state, config: cfg, tokenCount: 600_000 });
   assert.equal(warm.nudge?.shouldInject, true, "first-sight mass injects");
-  assert.equal(warm.statusLine, undefined, "no status line beside a delivered banner");
+  assert.equal("statusLine" in warm, false, "no statusLine property on the turn result");
   state = warm.state;
 
   // Next turn: growth 10K < 22.5K floor, usage 70% < 75% band → the round
   // stays armed (offered ranges exist) but the banner is withheld — the
-  // window where refs used to go stale in the model's view and compress
-  // calls guessed beyond the highest allocated ref.
+  // window where the #4521 refresh line used to fire on every turn, listing
+  // exactly the below-gate residue the receipt calls "not as fold
+  // suggestions" and ordering the model to fold it (#6928: removed).
   const idle = core.processTurn({ messages, state, config: cfg, tokenCount: 610_000 });
   assert.equal(idle.nudge?.shouldInject, false, `armed-but-silent window, got reason: ${idle.nudge?.reason}`);
   assert.ok((idle.nudge?.compressibleRanges?.length ?? 0) > 0, "plan carries offered ranges");
-  assert.ok(idle.statusLine, "status line emitted in the armed-but-silent window");
-  assert.match(idle.statusLine!, /highest allocated ref m00040/);
-  assert.match(idle.statusLine!, /compressible now: m\d+–m\d+/);
-  assert.match(idle.statusLine!, /never guess them/);
+  assert.equal("statusLine" in idle, false, "no statusLine in the armed-but-silent window (#6928)");
 });

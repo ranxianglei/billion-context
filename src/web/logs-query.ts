@@ -84,6 +84,10 @@ class Tail {
         this.seen += 1;
     }
 
+    clear(): void {
+        this.seen = 0;
+    }
+
     /** Selected rows kept, and the number discarded by the cap. */
     counts(): { kept: number; omitted: number } {
         const kept = Math.min(this.seen, this.cap);
@@ -253,9 +257,8 @@ async function windowSelection(
     readOpts: ReadLogLinesOptions,
 ): Promise<LogQueryResult> {
     const tail = new Tail(n);
-    // Lead-in rows accepted by the backward walk, oldest first, discarded the
-    // moment a row fails the walk (an accepted lead-in is contiguous).
-    let leadIn: string[] = [];
+    // Keep pending lead-in rows in the same bounded tail. Its count includes
+    // discarded rows, so omitted stays exact even before the first hit.
     let inherited = NaN;
     let inRange = false;
     let index = 0;
@@ -268,17 +271,13 @@ async function windowSelection(
         if (!inRange) {
             if (hit) {
                 inRange = true;
-                // Accepted lead-in rows are non-hits by construction: the hit
-                // branch would have consumed them otherwise.
-                for (const row of leadIn) tail.push(row, false);
-                leadIn = [];
                 tail.push(line, true);
             } else if (Number.isFinite(ts) && ts >= loT) {
-                leadIn.push(line);
+                tail.push(line, false);
             } else {
                 // The backward walk stops before this row: nothing held is
                 // contiguous with the upcoming hit any more.
-                leadIn = [];
+                tail.clear();
             }
         } else if (index <= lastHitIndex) {
             // Span between the hits: unconditionally inside the range.
@@ -297,6 +296,9 @@ async function windowSelection(
         index += 1;
     }
 
+    // Rotation can remove every hit between the two passes. Pending context
+    // alone was never selected, even if its timestamps still fit the window.
+    if (!inRange) tail.clear();
     const { lines, flags } = tail.take();
     const { omitted } = tail.counts();
     return { total, shown: lines.length, omitted, lines, isMatch: flags };

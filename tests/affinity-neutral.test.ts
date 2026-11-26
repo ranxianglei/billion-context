@@ -225,3 +225,82 @@ test("#2791: pre-upgrade (raw-hash) entries still match through the v1 fallback 
     assert.equal(crossed.via, "prefix", "re-noted entry must now match across wires");
     assert.equal(crossed.sessionId, "pfa-legacy000000001");
 });
+
+const parallelTools = [
+    { id: "parallel_a", name: "read_file", args: { path: "/src/a.ts" }, output: "first file contents" },
+    { id: "parallel_b", name: "read_file", args: { path: "/src/b.ts" }, output: "second file contents" },
+];
+
+function parallelToolRenders(): Record<string, Array<Record<string, unknown>>> {
+    const question = "Read both source files before comparing their exports.";
+    return {
+        openai: [
+            { role: "user", content: question },
+            { role: "assistant", content: null, tool_calls: parallelTools.map((t) => ({ id: t.id, type: "function", function: { name: t.name, arguments: JSON.stringify(t.args) } })) },
+            ...parallelTools.map((t) => ({ role: "tool", tool_call_id: t.id, content: t.output })),
+        ],
+        anthropic: [
+            { role: "user", content: [{ type: "text", text: question }] },
+            { role: "assistant", content: parallelTools.map((t) => ({ type: "tool_use", id: t.id, name: t.name, input: t.args })) },
+            { role: "user", content: parallelTools.map((t) => ({ type: "tool_result", tool_use_id: t.id, content: t.output })) },
+        ],
+        responses: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: question }] },
+            ...parallelTools.map((t) => ({ type: "function_call", call_id: t.id, name: t.name, arguments: JSON.stringify(t.args) })),
+            ...parallelTools.map((t) => ({ type: "function_call_output", call_id: t.id, output: t.output })),
+        ],
+        google: [
+            { role: "user", parts: [{ text: question }] },
+            { role: "model", parts: parallelTools.map((t) => ({ functionCall: { name: t.name, args: t.args } })) },
+            { role: "user", parts: parallelTools.map((t) => ({ functionResponse: { name: t.name, response: { output: t.output } } })) },
+        ],
+    };
+}
+
+for (const wire of ["anthropic", "responses", "google"]) {
+    test(`parallel tools: ${wire} preserves the complete neutral call and result sequence`, () => {
+        const renders = parallelToolRenders();
+        const expected = neutralTurns(renders.openai!);
+        const actual = neutralTurns(renders[wire]!);
+        assert.deepEqual(actual.map(neutralTurnCanonical), expected.map(neutralTurnCanonical));
+        assert.deepEqual(actual.filter((t) => t.kind === "tool").map((t) => t.text), parallelTools.map((t) => t.output));
+    });
+
+    test(`parallel tools: switching from openai to ${wire} retains the anonymous session`, () => {
+        const renders = parallelToolRenders();
+        const resolver = new PrefixAffinityResolver();
+        const first = resolver.resolve(renders.openai!)!;
+        resolver.note(first.sessionId, first.incomingDepth, first.tailHash, first.itemHashes, false, first.sketches, first.userFlags);
+        const switched = resolver.resolve([...renders[wire]!, { role: "user", content: "Now compare the exports." }])!;
+        assert.equal(switched.via, "prefix");
+        assert.equal(switched.sessionId, first.sessionId);
+        assert.equal(switched.incomingDepth, first.incomingDepth + 1);
+    });
+}
+
+test("parallel tools: Gemini retains every result body and trailing user text", () => {
+    const bodies = ["plain", { output: "wrapped" }, { count: 2, ok: true }, ["a", "b"], null];
+    const actual = neutralTurns([{ role: "user", parts: [
+        ...bodies.map((response) => ({ functionResponse: { name: "lookup", response } })),
+        { text: "Continue after all results." },
+    ] }]);
+    assert.deepEqual(actual.map((t) => [t.kind, t.text]), [
+        ["tool", "plain"], ["tool", "wrapped"], ["tool", '{"count":2,"ok":true}'],
+        ["tool", '["a","b"]'], ["tool", '{"name":"lookup","response":null}'],
+        ["user", "Continue after all results."],
+    ]);
+});
+
+test("parallel tools: Responses results separate consecutive call rounds", () => {
+    const turns = neutralTurns([
+        { type: "function_call", name: "first", arguments: "{}" },
+        { type: "function_call", name: "second", arguments: "{}" },
+        { type: "function_call_output", output: "first result" },
+        { type: "function_call_output", output: "second result" },
+        { type: "function_call", name: "third", arguments: "{}" },
+    ]);
+    assert.deepEqual(turns.map((t) => [t.kind, t.calls ?? t.text]), [
+        ["assistant", ["first\u0000{}", "second\u0000{}"]],
+        ["tool", "first result"], ["tool", "second result"], ["assistant", ["third\u0000{}"]],
+    ]);
+});

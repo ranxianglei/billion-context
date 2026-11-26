@@ -127,6 +127,166 @@ test("all candidates failing preserves state and refuses without borrowing main 
     }, (_req, res) => { calls++; res.writeHead(503); res.end("private-provider-error"); });
 });
 
+test("three external total failures arm the breaker and further calls dispatch nothing", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        const before = JSON.stringify(ctx.session.state);
+        for (let index = 0; index < 3; index++) await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal(calls, 6);
+        assert.equal((ctx.session.metadata.compressFailStreak as { n?: number } | undefined)?.n, 3);
+        const blocked = await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal(blocked.outcome, "refused");
+        assert.equal(blocked.text, "[Compression FAILED: external summary requests paused. Nothing compressed.] [COMPRESS CIRCUIT BREAKER: 3 consecutive compress failures in this session. External summary requests are paused; changing ranges does not repair a failed summary service. Continue the task without compressing. Requests may resume after the external summary configuration or resolved credentials change, or after 10 minutes of cooldown. One successful fold clears the failure streak.]");
+        assert.equal(calls, 6, "fourth call must stop before external HTTP dispatch");
+        assert.equal((ctx.session.metadata.compressFailStreak as { n: number }).n, 3, "blocked calls do not extend cooldown");
+        assert.equal(JSON.stringify(ctx.session.state), before);
+    }, (_req, res) => { calls++; res.writeHead(403); res.end("denied"); });
+});
+
+test("external failure repetition does not claim that changed visible content repairs the service", async () => {
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        await applyConfiguredCompression(args(ctx), ctx);
+        const result = await applyConfiguredCompression(args(ctx), ctx);
+        assert.match(result.text, /Repeat-failure guard/);
+        assert.doesNotMatch(result.text, /until the visible context changes|Repeating it deterministically/);
+    }, (_req, res) => { res.writeHead(403); res.end("denied"); });
+});
+
+test("external breaker resets on configuration change and a successful fold clears failures", async () => {
+    let calls = 0;
+    let healthy = false;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        for (let index = 0; index < 3; index++) await applyConfiguredCompression(args(ctx), ctx);
+        assert.match((await applyConfiguredCompression(args(ctx), ctx)).text, /CIRCUIT BREAKER/);
+        assert.equal(calls, 6);
+        healthy = true;
+        const targets = externalSummary.targets as Record<string, unknown>[];
+        targets[0].model = "repaired-model";
+        const result = await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal(result.outcome, "applied", result.text);
+        assert.equal(calls, 7);
+        assert.equal(ctx.session.metadata.compressFailStreak, undefined);
+        assert.equal(ctx.session.metadata.compressFailKeys, undefined);
+    }, (_req, res) => { calls++; if (healthy) success(res); else { res.writeHead(403); res.end("denied"); } });
+});
+
+test("external breaker resets when a rejecting summary length cap is repaired", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        ctx.config.compress.maxSummaryLength = 100;
+        for (let index = 0; index < 3; index++) await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal(calls, 6);
+        assert.match((await applyConfiguredCompression(args(ctx), ctx)).text, /CIRCUIT BREAKER/);
+        assert.equal(calls, 6);
+        ctx.config.compress.maxSummaryLength = 1000;
+        assert.equal((await applyConfiguredCompression(args(ctx), ctx)).outcome, "applied");
+        assert.equal(calls, 7);
+    }, (_req, res) => { calls++; success(res); });
+});
+
+for (const repairedCap of [1000, undefined]) test(`external breaker recovers when per-range summaryMaxChars becomes ${repairedCap ?? "unset"}`, async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        const limited = { content: [{ startId: ctx.session.state.messageRefs.byRaw.history, endId: ctx.session.state.messageRefs.byRaw.history, summaryMaxChars: 100 }] };
+        for (let index = 0; index < 3; index++) await applyConfiguredCompression(limited, ctx);
+        assert.equal(calls, 6);
+        assert.match((await applyConfiguredCompression(limited, ctx)).text, /CIRCUIT BREAKER/);
+        const repaired = repairedCap === undefined ? args(ctx) : { content: [{ ...limited.content[0], summaryMaxChars: repairedCap }] };
+        const result = await applyConfiguredCompression(repaired, ctx);
+        assert.equal(result.outcome, "applied", result.text);
+        assert.equal(calls, 7);
+        assert.equal(ctx.session.metadata.compressFailStreak, undefined);
+    }, (_req, res) => { calls++; success(res); });
+});
+
+test("ordinary parse failures do not count toward the external failure threshold", async () => {
+    let calls = 0;
+    let healthy = false;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        await applyConfiguredCompression({}, ctx);
+        await applyConfiguredCompression({}, ctx);
+        await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal((ctx.session.metadata.compressFailStreak as { n?: number } | undefined)?.n, 1);
+        healthy = true;
+        const result = await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal(result.outcome, "applied", result.text);
+        assert.equal(calls, 3);
+    }, (_req, res) => { calls++; if (healthy) success(res); else { res.writeHead(403); res.end("denied"); } });
+});
+
+test("ordinary failures break an external consecutive-failure streak", async () => {
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        await applyConfiguredCompression(args(ctx), ctx);
+        await applyConfiguredCompression(args(ctx), ctx);
+        await applyConfiguredCompression({}, ctx);
+        await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal((ctx.session.metadata.compressFailStreak as { n?: number } | undefined)?.n, 1);
+        assert.equal((ctx.session.metadata.compressFailStreak as { cause?: string } | undefined)?.cause, "external-summary");
+    }, (_req, res) => { res.writeHead(403); res.end("denied"); });
+});
+
+test("external breaker resets on resolved credential rotation without persisting credential bytes", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        for (let index = 0; index < 3; index++) await applyConfiguredCompression(args(ctx), ctx);
+        new SummaryCredentialStore().set("primary", "repaired-key");
+        assert.equal((await applyConfiguredCompression(args(ctx), ctx)).outcome, "applied");
+        assert.equal(calls, 7);
+        assert.doesNotMatch(JSON.stringify(ctx.session.metadata), /test-primary-key|repaired-key/);
+    }, (req, res) => {
+        calls++;
+        if (req.headers.authorization === "Bearer repaired-key") success(res);
+        else { res.writeHead(403); res.end("denied"); }
+    });
+});
+
+test("external breaker allows a retry after ten minutes and success clears the streak", async () => {
+    let healthy = false;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        for (let index = 0; index < 3; index++) await applyConfiguredCompression(args(ctx), ctx);
+        const streak = ctx.session.metadata.compressFailStreak as { lastAt: number } | undefined;
+        assert.ok(streak);
+        streak.lastAt = Date.now() - 10 * 60 * 1000 - 1;
+        healthy = true;
+        assert.equal((await applyConfiguredCompression(args(ctx), ctx)).outcome, "applied");
+        assert.equal(ctx.session.metadata.compressFailStreak, undefined);
+    }, (_req, res) => { if (healthy) success(res); else { res.writeHead(403); res.end("denied"); } });
+});
+
+test("an external success before the threshold clears the failure count", async () => {
+    let healthy = false;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal((ctx.session.metadata.compressFailStreak as { n?: number } | undefined)?.n, 1);
+        healthy = true;
+        assert.equal((await applyConfiguredCompression(args(ctx), ctx)).outcome, "applied");
+        assert.equal(ctx.session.metadata.compressFailStreak, undefined);
+        assert.equal(ctx.session.metadata.compressFailKeys, undefined);
+    }, (_req, res) => { if (healthy) success(res); else { res.writeHead(403); res.end("denied"); } });
+});
+
+test("invalid external configuration arms the breaker and recovers when repaired", async () => {
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context({ enabled: true, targets: {} });
+        for (let index = 0; index < 3; index++) await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal((ctx.session.metadata.compressFailStreak as { n?: number } | undefined)?.n, 3);
+        assert.match((await applyConfiguredCompression(args(ctx), ctx)).text, /CIRCUIT BREAKER/);
+        (ctx.config as Config & { externalSummary?: unknown }).externalSummary = externalSummary;
+        assert.equal((await applyConfiguredCompression(args(ctx), ctx)).outcome, "applied");
+        assert.equal(ctx.session.metadata.compressFailStreak, undefined);
+    }, (_req, res) => { success(res); });
+});
+
 test("SSE framing overhead does not consume the summary content budget", async () => {
     const text = "s".repeat(2000);
     await fixture(async (_base, externalSummary) => {
@@ -364,6 +524,74 @@ test("batch protection checks the aggregate range length instead of rejecting va
     }, (_req, res) => { calls++; success(res); });
 });
 
+test("external refolds index selected block ids once while preserving reference order", async (t) => {
+    let sentReference: Record<string, unknown> | undefined;
+    let blockIdReads = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        const count = 512;
+        const selected = 384;
+        ctx.messages = [
+            ...Array.from({ length: count }, (_, index): CoreMessage => ({
+                id: `reference-source-${index}`, role: "assistant", contentType: "text", text: `Source ${index}. ${RAW}`,
+            })),
+            ctx.messages[1],
+        ];
+        ctx.session.state = ctx.core.processTurn({ messages: ctx.messages, state: ctx.session.state, config: ctx.config, tokenCount: 200_000 }).state;
+        const seeded = ctx.core.applyCompression({
+            messages: ctx.messages, state: ctx.session.state, config: ctx.config,
+            ranges: ctx.messages.slice(0, count).map((message, index) => ({
+                startRef: ctx.session.state.messageRefs.byRaw[message.id], endRef: ctx.session.state.messageRefs.byRaw[message.id],
+                summary: `Historical summary ${index}. ${SUMMARY}`, topic: `topic-${index}`,
+            })),
+        });
+        assert.equal(seeded.result.blocksCreated, count, JSON.stringify(seeded.result));
+        ctx.session.state = seeded.state;
+        const lastId = seeded.state.blocks.at(-1)!.blockId;
+        const retired = ctx.core.applyCompression({
+            messages: ctx.messages, state: ctx.session.state, config: ctx.config,
+            ranges: [{ startRef: lastId, endRef: lastId, summary: SUMMARY, topic: "retained-distillation" }],
+        });
+        assert.equal(retired.result.blocksCreated, 1, JSON.stringify(retired.result));
+        ctx.session.state = retired.state;
+        const initial = ctx.session.state;
+        const selectedIds = new Set(initial.blocks.slice(0, selected).map((block) => block.blockId));
+        const expected = initial.blocks.filter((block) => block.active && !selectedIds.has(block.blockId))
+            .map(({ topic, summary }) => ({ topic, summary }));
+        const applyCompression = ctx.core.applyCompression.bind(ctx.core);
+        let preview = true;
+        ctx.core = { ...ctx.core, applyCompression(input) {
+            const result = applyCompression(input);
+            if (!preview) return result;
+            preview = false;
+            for (const block of result.state.blocks) {
+                if (block.summary.startsWith("external-probe-")) block.directBlockIds = new Proxy(block.directBlockIds, {
+                    get(target, key, receiver) {
+                        if (typeof key === "string" && /^\d+$/.test(key)) blockIdReads++;
+                        return Reflect.get(target, key, receiver);
+                    },
+                });
+            }
+            return result;
+        } };
+
+        const result = await applyConfiguredCompression({ content: [{
+            startId: initial.blocks[0].blockId, endId: initial.blocks[selected - 1].blockId, summary: "Retain the selected historical work.",
+        }] }, ctx);
+
+        assert.equal(result.outcome, "applied", result.text);
+        assert.deepEqual(sentReference?.otherSummaries, expected);
+        assert.deepEqual(sentReference?.currentContext, ctx.messages.slice(-5).map(({ role, text }) => ({ role, text })));
+        assert.equal(sentReference?.submittedSummaryHint, "Retain the selected historical work.");
+        t.diagnostic(`${blockIdReads} selected-block-id visits for ${count} source blocks`);
+        assert.ok(blockIdReads <= count * 8, `selected block ids were visited ${blockIdReads} times for ${count} source blocks`);
+    }, (_req, res, body) => {
+        const payload = JSON.parse((body.input as Array<{ content: string }>)[0].content) as { reference: string };
+        sentReference = JSON.parse(payload.reference) as Record<string, unknown>;
+        success(res);
+    });
+});
+
 test("inline restore refolds the original block even when originals have left the wire view", async () => {
     let calls = 0;
     await fixture(async (_base, externalSummary) => {
@@ -473,6 +701,29 @@ test("saturated pool drops every batch before dispatch: preflight reports calls>
         }
     }, (_req, res) => { endpointCalls++; success(res); });
     assert.equal(endpointCalls, 0, "a pure queue-drop must not touch the summary endpoint");
+});
+
+test("active compression queue drops do not arm the external service breaker", async () => {
+    let endpointCalls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context({ ...externalSummary, budget: { totalTimeoutMs: 100, targetTimeoutMs: 100 } });
+        const holders = [0, 1, 2, 3].map(() => _executorForTest.executeBatch(
+            [{ content: "pool holder", instructions: "hold the permit" }],
+            [{ summarize: () => new Promise<string>((resolve) => setTimeout(() => resolve("held"), 1500)) }],
+            { totalTimeoutMs: 30_000, targetTimeoutMs: 20_000, maxSummaryBytes: 65536 }));
+        try {
+            for (let index = 0; index < 3; index++) {
+                assert.equal((await applyConfiguredCompression(args(ctx), ctx)).outcome, "refused");
+            }
+            assert.equal(endpointCalls, 0);
+            assert.equal(ctx.session.metadata.compressFailStreak, undefined);
+            assert.equal(ctx.session.metadata.compressFailKeys, undefined);
+        } finally {
+            await Promise.all(holders);
+        }
+        assert.equal((await applyConfiguredCompression(args(ctx), ctx)).outcome, "applied");
+        assert.equal(endpointCalls, 1, "released queue must allow compression without a config change");
+    }, (_req, res) => { endpointCalls++; success(res); });
 });
 
 test("a dispatched-but-failing attempt is NOT a queue drop: attempts>0 keeps the backoff armable (#2662)", async () => {

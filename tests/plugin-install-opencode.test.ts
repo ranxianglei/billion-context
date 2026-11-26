@@ -373,3 +373,142 @@ test("#926 --with-mcp strips a stale pin from an existing entry but keeps the en
     assert.deepEqual(bili!.command, ["/usr/bin/node", "/opt/old/dist/mcp.js"]);
     assert.equal(bili!.enabled, true);
 });
+
+// #6816: the built-in Claude Agent provider (claude-agent/*) makes no HTTP
+// request from OpenCode, so the plugin's HTTP-hook routing never sees its
+// traffic — install must point it at the proxy via providers.claude-agent,
+// and remove must take the entry back out. RED first: no implementation yet.
+
+const CLAUDE_AGENT_URL = "http://127.0.0.1:18787/bili/https://api.anthropic.com";
+
+type OcProvidersCfg = {
+    plugin?: unknown;
+    plugins?: unknown;
+    providers?: Record<string, { settings?: Record<string, unknown> } & Record<string, unknown>>;
+};
+
+function withOc2x(t: import("node:test").TestContext, initial: OcProvidersCfg, version = "2.3.0"): { file: string; shimDir: string; read: () => OcProvidersCfg } {
+    const prevXdg = process.env.XDG_CONFIG_HOME;
+    const prevState = process.env.XDG_STATE_HOME;
+    const prevOpen = process.env.OPENCODE_CONFIG;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    delete process.env.OPENCODE_CONFIG;
+    const xdg = tempDir("bili-oc-6816-");
+    const state = tempDir("bili-oc-6816-state-");
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.XDG_STATE_HOME = state;
+    const bin = path.join(xdg, "fake-opencode");
+    fs.writeFileSync(bin, `#!/bin/sh\necho 'opencode ${version}'\n`);
+    fs.chmodSync(bin, 0o755);
+    process.env.BILI_CLIENT_BIN = bin;
+    t.after(() => {
+        if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdg;
+        if (prevState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevState;
+        if (prevOpen === undefined) delete process.env.OPENCODE_CONFIG;
+        else process.env.OPENCODE_CONFIG = prevOpen;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        rmrf(xdg);
+        rmrf(state);
+    });
+    const file = path.join(xdg, "opencode", "opencode.json");
+    const shimDir = path.join(xdg, "opencode", "plugins", "billion-context");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(initial, null, 2));
+    return { file, shimDir, read: () => JSON.parse(fs.readFileSync(file, "utf8")) as OcProvidersCfg };
+}
+
+function claudeAgentBaseUrl(cfg: OcProvidersCfg): unknown {
+    return cfg.providers?.["claude-agent"]?.settings?.baseURL;
+}
+
+test("#6816 install on a 2.x host routes the built-in Claude Agent provider through the live lane port", (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const { read } = withOc2x(t, {});
+    const out = pluginInstall("opencode");
+    assert.match(out, /claude-agent baseURL -> http:\/\/127\.0\.0\.1:18787\/bili\/https:\/\/api\.anthropic\.com/);
+    assert.equal(claudeAgentBaseUrl(read()), CLAUDE_AGENT_URL);
+
+    const again = pluginInstall("opencode");
+    assert.match(again, /claude-agent baseURL present/);
+    assert.equal(claudeAgentBaseUrl(read()), CLAUDE_AGENT_URL, "idempotent — no rewrite on second install");
+});
+
+test("#6816 install preserves other providers and existing claude-agent settings", (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const { read } = withOc2x(t, { providers: { anthropic: { settings: { apiKey: "k" } }, "claude-agent": { settings: { model: "opus" } } } });
+    pluginInstall("opencode");
+    const cfg = read();
+    assert.deepEqual(cfg.providers?.anthropic, { settings: { apiKey: "k" } }, "foreign provider untouched");
+    assert.deepEqual(cfg.providers?.["claude-agent"]?.settings, { model: "opus", baseURL: CLAUDE_AGENT_URL }, "existing settings kept, baseURL added");
+});
+
+test("#6816 install leaves a foreign claude-agent baseURL untouched", (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const foreign = "https://proxy.example.com/anthropic";
+    const { read } = withOc2x(t, { providers: { "claude-agent": { settings: { baseURL: foreign } } } });
+    const out = pluginInstall("opencode");
+    assert.match(out, /claude-agent baseURL untouched/);
+    assert.equal(claudeAgentBaseUrl(read()), foreign, "user's own proxy must never be clobbered");
+});
+
+test("#6816 install re-pins a stale bili baseURL port to the live lane port", (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const stale = "http://127.0.0.1:18788/bili/https://api.anthropic.com";
+    const { read } = withOc2x(t, { providers: { "claude-agent": { settings: { baseURL: stale } } } });
+    const out = pluginInstall("opencode");
+    assert.match(out, /claude-agent baseURL re-pinned/);
+    assert.equal(claudeAgentBaseUrl(read()), CLAUDE_AGENT_URL);
+});
+
+test("#6816 install on a 1.x host does not write the provider entry", (t) => {
+    // 1.x has no built-in Claude Agent provider — the entry would be dead config.
+    const { file } = withOcConfig(t, {});
+    const out = pluginInstall("opencode");
+    assert.match(out, /claude-agent baseURL skipped/);
+    const cfg = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    assert.equal(cfg.providers, undefined);
+});
+
+test("#6816 remove deletes only a bili baseURL and prunes empty parents", (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const { read } = withOc2x(t, { providers: { anthropic: { settings: { apiKey: "k" } } } });
+    pluginInstall("opencode");
+    assert.equal(claudeAgentBaseUrl(read()), CLAUDE_AGENT_URL);
+    const rem = pluginRemove("opencode");
+    assert.match(rem, /claude-agent baseURL removed/);
+    const cfg = read();
+    assert.equal(cfg.providers?.["claude-agent"], undefined, "empty provider pruned");
+    assert.deepEqual(cfg.providers?.anthropic, { settings: { apiKey: "k" } }, "foreign provider survives remove");
+});
+
+test("#6816 remove leaves a foreign claude-agent baseURL in place", (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const foreign = "https://proxy.example.com/anthropic";
+    const { file, shimDir, read } = withOc2x(t, { providers: { "claude-agent": { settings: { baseURL: foreign } } } });
+    // Give remove something installed to chew on: write the plugin entry in.
+    fs.writeFileSync(file, JSON.stringify({ plugins: [shimDir], providers: { "claude-agent": { settings: { baseURL: foreign } } } }, null, 2));
+    const out = pluginRemove("opencode");
+    assert.equal(claudeAgentBaseUrl(read()), foreign, "foreign baseURL is the user's, not ours to remove");
+    assert.doesNotMatch(out, /claude-agent baseURL removed/);
+});

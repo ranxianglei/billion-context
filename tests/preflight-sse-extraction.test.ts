@@ -31,6 +31,12 @@ for (const [protocol, body] of [
         assert.equal(extractSummaryFromSse(protocol, multiline), "complete summary");
         assert.equal(extractSummaryFromSse(protocol, multiline.replace(/\n/g, "\r\n")), "complete summary");
     });
+    test(`summary extraction ignores whitespace-only unknown SSE fields in ${protocol} events`, () => {
+        const multiline = body.replace(/^data: (.+)$/gm, (line, data: string) => data === "[DONE]" ? line :
+            JSON.stringify(JSON.parse(data), null, 2).split("\n").map((part) => `data: ${part}`).join("\n \n\t\n"));
+        assert.equal(extractSummaryFromSse(protocol, multiline), "complete summary");
+        assert.equal(extractSummaryFromSse(protocol, multiline.replace(/\n/g, "\r\n")), "complete summary");
+    });
 }
 
 test("multiline SSE keeps frame-level event types and failure terminals", () => {

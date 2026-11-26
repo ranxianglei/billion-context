@@ -1291,6 +1291,8 @@ export function readCrushConfig(env: NodeJS.ProcessEnv = process.env): CrushConf
  *  (readZedConfig); exotic relays ride --mitm-domain. Loopback providers
  *  (ollama, lmstudio) never appear here — they stay direct via NO_PROXY. */
 export const ZED_DEFAULT_MODEL_HOSTS = [
+    "cloud.zed.dev",
+    "llm-staging.zed.dev",
     "api.anthropic.com",
     "api.openai.com",
     "generativelanguage.googleapis.com",
