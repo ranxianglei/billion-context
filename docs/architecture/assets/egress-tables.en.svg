@@ -10,8 +10,8 @@
 <text x="52" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">reissued)</text>
 <text x="52" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">B rows: payload {entries, highWater}</text>
 <text x="52" y="200" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">= live view at that point + message frontier</text>
-<text x="52" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">compaction physically prunes rows below the</text>
-<text x="52" y="230" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">newest base (retention floor)</text>
+<text x="52" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">compaction prunes ONLY the state table;</text>
+<text x="52" y="230" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">the flow keeps every row (append-only, #7439)</text>
 <rect x="40" y="270" width="360" height="100" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
 <text x="52" y="290" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_state — read replica</text>
 <text x="52" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq); ordered by log_seq</text>

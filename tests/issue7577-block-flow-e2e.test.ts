@@ -27,13 +27,12 @@
  *      table replays to the live block set;
  *   5. fork-to-now copies all four tables (row counts + byte-equal views);
  *      the fold's D batch compacts IN its transaction (a B base row is
- *      appended and every row below it deleted — the retention floor), so a
- *      point fork BELOW the base copies nothing (pinned; admin.ts rejects
- *      such points with 400, the point-reconstruction materializer is the
- *      documented follow-up); a point fork AT the base watermark (= the
- *      block's pointer) yields the folded view plus the block, while the
- *      fork-to-now child has one more row — the point is real within the
- *      retained range.
+ *      appended and the STATE rows below it trimmed — the flow is
+ *      append-only, #7439), so a point fork BELOW the newest base
+ *      reconstructs the EXACT pre-fold view from the retained rows (pinned),
+ *      while a point fork AT the base watermark (= the block's pointer)
+ *      yields the folded view plus the block, and the fork-to-now child has
+ *      one more row — the point is real.
  */
 
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -236,12 +235,12 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
             assert.equal(n(childId), n(sid), `${t} row count carried over`);
         }
 
-        // ---------------- point fork: the retention floor, pinned ---------
-        // The fold's D batch compacts IN the same transaction (egressAppendTurn
-        // step 5): a B base row is appended and every flow/state row BELOW IT
-        // is deleted. So points at/before the base seq are unreconstructable —
-        // the documented limitation (admin.ts rejects them with 400 "earlier
-        // points need the point-reconstruction materializer (follow-up)").
+        // ---------------- point fork: BELOW the newest base ----------------
+        // Under the #7439 restoration the flow keeps every row it ever wrote,
+        // so a point at/before the base seq is reconstructable again: the fork
+        // copies the retained rows and rebuilds the state replica by replay.
+        // (The admin endpoint still refuses these points with 400 — a
+        // conservative gate on the public surface, not a data constraint.)
         const baseSeq = (dbv.prepare(`SELECT op_seq FROM egress_flow WHERE session_id = ? AND row_type = 'B' ORDER BY op_seq DESC LIMIT 1`).get(sid) as { op_seq: number } | undefined)?.op_seq;
         assert.ok(baseSeq !== undefined && baseSeq > wm1, "the fold wrote a compaction base past turn 1");
         assert.equal(ptrRow.flow_op_seq, baseSeq, "the block row's pointer IS the base point (save ran after the fold's own base write)");
@@ -249,7 +248,9 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         const floorSession = createSession(floorId);
         floorSession.metadata["egressAuthority"] = true;
         assert.ok(store.flushSync(floorSession), "below-base child session row persisted");
-        assert.equal(db2.egressPointForkSession(sid, floorId, wm1), false, "a point below the newest base has nothing left to copy");
+        assert.ok(db2.egressPointForkSession(sid, floorId, wm1), "a point below the newest base is copyable again — the flow keeps its rows (#7439)");
+        const floorView = egressStateView(dbv, floorId);
+        assert.deepEqual(VIEW_KEY(floorView), VIEW_KEY(row1), "the below-base child rebuilt turn 1's EXACT pre-fold view (81 originals, no summary) from the retained rows");
 
         // ---------------- point fork: AT the base watermark ----------------
         const foldId = "child-fold";

@@ -204,7 +204,7 @@ test("hard errors: missing anchor / missing or inverted endpoints / update targe
     }
 });
 
-test("compaction equivalence: view before == view after; both tables shrink to the base", () => {
+test("compaction equivalence: view before == view after; state shrinks to the base, flow keeps its history", () => {
     const H = open();
     try {
         const S = "sess-4";
@@ -229,14 +229,16 @@ test("compaction equivalence: view before == view after; both tables shrink to t
         egressStateCompact(H.db, S, before, 2_000);
         const after = egressStateView(H.db, S);
         assert.deepEqual(after, before, "compact base carries the stamped numbers inline");
-        // state: base + nothing below (the 12 ops are physically gone)
+        // state: base + nothing below (the 12 ops are physically gone —
+        // state is the bounded serving copy, #7439)
         const stateRows = (H.db.prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = ?").get(S) as { n: number }).n;
         assert.equal(stateRows, 1);
-        // flow: the base row replaces everything below it too (#7574 — it
-        // used to keep the full history AND gain one snapshot per fold, so a
-        // long session grew without bound)
+        // flow: append-only, NEVER pruned by compaction (#7439 ruling — the
+        // 12 ops stay, the base row is added: 12 + 1). Bounded-growth of the
+        // flow is a separate, deferred optimization (#7475), not a retention
+        // rule: pruning it broke point rollback and below-base forks.
         const flowRows = (H.db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(S) as { n: number }).n;
-        assert.equal(flowRows, 1);
+        assert.equal(flowRows, 13);
         // ops after compaction still replay on top of the base, numbers continue
         egressStateAppend(H.db, S, [
             { type: "I", msgid: "m11", after: "m10", ref: "m00012", tokens: 11, typeTag: "text", bytes: "h_m11" },
@@ -249,7 +251,7 @@ test("compaction equivalence: view before == view after; both tables shrink to t
     }
 });
 
-test("rollback: every point from the newest base on stays reconstructible from egress_flow", () => {
+test("rollback: every point — including points below the newest base — stays reconstructible from egress_flow", () => {
     const H = open();
     try {
         const S = "sess-5";
@@ -265,8 +267,8 @@ test("rollback: every point from the newest base on stays reconstructible from e
         snapshots.set(6, egressStateView(H.db, S));
         assert.equal(snapshots.get(6)![1].num, 2, "the +U did not change m2's canonical number");
         egressStateCompact(H.db, S, egressStateView(H.db, S), 10_000);
-        // the flow now starts at the base row (op_seq 7): the view it carries
-        // comes back byte-identical …
+        // the STATE table now starts at the base row (op_seq 7): the view it
+        // carries comes back byte-identical …
         assert.deepEqual(egressStateAt(H.db, S, 7), snapshots.get(6), "the base point");
         egressStateAppend(H.db, S, [
             { type: "I", msgid: "m6", after: "m5", ref: "m00006", tokens: 6, typeTag: "text", bytes: "h_m6" },
@@ -276,11 +278,10 @@ test("rollback: every point from the newest base on stays reconstructible from e
         assert.deepEqual(egressStateAt(H.db, S, 8), later, "a point after the base");
         // seq 0 = empty view
         assert.deepEqual(egressStateAt(H.db, S, 0), []);
-        // history before the newest base is not kept any more (#7574: the
-        // operator asked for a bounded log, not a second full copy of the
-        // session); such a point answers "empty", it never answers a wrong view
+        // the flow is append-only (#7439): points BELOW the newest base are
+        // still reconstructible byte-for-byte from the retained rows
         for (const seq of [1, 2, 3, 4, 5, 6]) {
-            assert.deepEqual(egressStateAt(H.db, S, seq), [], `seq ${seq} is below the base`);
+            assert.deepEqual(egressStateAt(H.db, S, seq), snapshots.get(seq), `seq ${seq} is below the base — the flow kept it`);
         }
     } finally {
         close(H);

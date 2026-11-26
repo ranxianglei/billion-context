@@ -153,13 +153,13 @@ const INSERT_FLOW = `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_t
 
 /** The canonical message frontier: the highest number ever ISSUED
  * (retired messages included — I rows only advance it, B/D/U never do).
- * MAX(log_seq) over the flow rows is the fast answer, but a compaction
- * physically removes the I rows its newest base subsumes (#7574), so the
- * moment right after a fold the flow can hold a base row ONLY — the
- * high-water then lives in the base payload (entries' inline numbers and
- * the explicit highWater field). Callers reading the frontier OUTSIDE the
- * append transaction must go through this fallback; the next append's
- * validation replay reports an unreadable base. */
+ * MAX(log_seq) over the flow rows is the answer (the flow is append-only —
+ * compaction never prunes it, #7439). The base-payload fallback below stays
+ * as a defensive read for DBs written by builds that pruned the flow below
+ * the newest base (df7ac0929 until the #7439 restoration): there, a session
+ * right after a fold can hold a base row ONLY, and the frontier then lives
+ * in the base payload (entries' inline numbers + explicit highWater field).
+ * The next append's validation replay reports an unreadable base. */
 export function egressMessageHighWater(db: SqliteDatabase, sessionId: string): number {
     const row = db
         .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o, COALESCE(MAX(log_seq), 0) AS n FROM egress_flow WHERE session_id = ?")
@@ -167,9 +167,9 @@ export function egressMessageHighWater(db: SqliteDatabase, sessionId: string): n
     const head = Number(row?.o) || 0;
     let high = Number(row?.n) || 0;
     if (high === 0 && head > 0) {
-        // No I row is left above the newest base (a compaction removes the
-        // rows it subsumes, retired ones included), so MAX(log_seq) no
-        // longer sees the highest number ever issued. The base carries it.
+        // Defensive: a pruned-legacy DB (see the doc above) physically lost
+        // its I rows above the newest base, so MAX(log_seq) no longer sees
+        // the highest number ever issued. The base carries it.
         const base = db
             .prepare("SELECT payload FROM egress_flow WHERE session_id = ? AND row_type = 'B' ORDER BY op_seq DESC LIMIT 1")
             .get(sessionId) as { payload: string } | undefined;
@@ -505,13 +505,14 @@ function writeOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], firstO
 }
 
 /** Persist a replayed view as the new base row in BOTH tables, then delete
- * in BOTH tables every row below it. The base carries the entries themselves
- * (bytes AND canonical numbers inline in the payload) and `highWater`, the
- * highest canonical number ever issued in this session: once the rows below
- * the base are gone it is the only place that number survives, and without
- * it the next insert would re-issue it. Base + later ops must reproduce the
- * current view WITHOUT any deleted row (that is the only constraint the
- * base form has). Runs inside the caller's transaction. */
+ * every row below it in the STATE table only. The FLOW table is append-only
+ * and is NEVER pruned by compaction (#7439 ruling: state = the bounded
+ * serving copy, flow = the complete history, every point reconstructible).
+ * The base carries the entries themselves (bytes AND canonical numbers inline
+ * in the payload) and `highWater`, the highest canonical number ever issued
+ * in this session. Base + later ops must reproduce the current view (that is
+ * the only constraint the base form has). Runs inside the caller's
+ * transaction. */
 function writeBase(db: SqliteDatabase, sessionId: string, view: EgressViewRow[], highWater: number, nowMs: number): number {
     for (const e of view) {
         // Renumber (2026-11-25): the system row carries 0; every real row >= 0
@@ -525,7 +526,6 @@ function writeBase(db: SqliteDatabase, sessionId: string, view: EgressViewRow[],
     const payload = JSON.stringify({ entries: view, watermark: seq, highWater });
     writeOp(db, sessionId, seq, null, "B", null, payload, null, nowMs);
     db.prepare("DELETE FROM egress_state WHERE session_id = ? AND op_seq < ?").run(sessionId, seq);
-    db.prepare("DELETE FROM egress_flow WHERE session_id = ? AND op_seq < ?").run(sessionId, seq);
     return seq;
 }
 

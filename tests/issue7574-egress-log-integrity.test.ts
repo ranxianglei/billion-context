@@ -128,13 +128,13 @@ test("a turn that deletes compacts in the same write: both tables hold the base 
         assert.deepEqual(ids(view), [SYS, "a", "sum", "e"]);
         const s = shape(H, S);
         assert.deepEqual(s.state, ["B"], "state: the base row, nothing else");
-        assert.deepEqual(s.flow, ["B"], "flow: the base row replaced the rows below it (it used to keep all of them and add one snapshot per fold)");
+        assert.deepEqual(s.flow, ["I", "I", "I", "I", "I", "I", "D", "I", "B"], "flow: append-only (#7439) — turn 1's six +I rows (system + a..e), then the fold's D + I, then the base");
         // the next message gets the next number, none is issued twice
         const high = Math.max(...view.map((r) => r.num));
         assert.equal(high, 6, "five messages (numbers 1..5) + the summary row = six numbers issued (the system row is number 0, outside the citation space — renumber 2026-11-25)");
         const grown = recordEgressTurn({ store: H.ops, sessionId: S, prev: view, conversation: [M("a", "1"), M("sum", "…", "assistant"), M("e", "5"), M("f", "6")], systemText: "sys", nowMs: 3 });
         assert.equal(grown.find((r) => r.msgid === "f")!.num, high + 1, "numbering continues after the base — none is issued twice");
-        assert.deepEqual(shape(H, S).flow, ["B", "I"]);
+        assert.deepEqual(shape(H, S).flow, ["I", "I", "I", "I", "I", "I", "D", "I", "B", "I"], "the flow never loses rows; only the state table compacts");
     } finally {
         close(H);
     }

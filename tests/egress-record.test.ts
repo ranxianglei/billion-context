@@ -116,9 +116,9 @@ test("recording: fold shape = -D range + +I summary, and the -D triggers compact
         let view = recordEgressTurn({ store, sessionId: S, prev: undefined, conversation: [M("a", "1"), M("b", "2"), M("c", "3"), M("d", "4"), M("e", "5")], systemText: "SYS", nowMs: 1000 });
         // fold: b..d replaced by one summary row
         const folded = [M("a", "1"), M("acp_summary_9", "…", "assistant"), M("e", "5")];
-        // read the op list through the store: the compaction that the -D
-        // triggers replaces the flow's history with the base row (#7574), so
-        // egress_flow no longer shows the single ops afterwards
+        // read the op list through the store: the compaction the -D triggers
+        // collapses the STATE table to the base row; the FLOW keeps its full
+        // history (append-only, #7439)
         const batches: EgressOp[][] = [];
         const spy: EgressOpLogStore = {
             ...store,
@@ -139,7 +139,7 @@ test("recording: fold shape = -D range + +I summary, and the -D triggers compact
         const stateRows = H.db.prepare("SELECT row_type FROM egress_state WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
         assert.deepEqual(stateRows.map((r) => r.row_type), ["B"], "the state table holds only the base row");
         const flowRows = H.db.prepare("SELECT row_type FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
-        assert.deepEqual(flowRows.map((r) => r.row_type), ["B"], "the flow dropped the rows the base replaced (#7574)");
+        assert.deepEqual(flowRows.map((r) => r.row_type), ["I", "I", "I", "I", "I", "I", "D", "I", "B"], "the flow is append-only: turn 1's six +I rows (system + a..e), then the fold's D + I, then the base (#7439)");
         assert.equal(egressStateView(H.db, S).length, 4, "view has the system row + a + summary + e");
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), view.map((r) => r.msgid), "view survives compaction byte-identical");
     } finally {

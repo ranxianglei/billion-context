@@ -281,24 +281,30 @@ test("C: after a REAL kernel fold the position frontier is MAX(log_seq), not the
         assert.equal(row2.length, 51, "system + 50 folded");
         await store.writeNow(persistable(ctx, folded));
 
-        // the split this test pins: the live view SHRANK, the frontier did not —
-        // and the #7574 compaction detail that makes it subtle: the fold's own
-        // writeBase PHYSICALLY removed the I rows it subsumed, so right after a
-        // fold the flow holds the B base row ONLY and raw MAX(log_seq) is 0.
-        // The frontier survives exclusively in the base payload's highWater —
-        // egressMessageHighWater is the rule (same as nextSeqs) that reads it.
+        // the split this test pins: the live view SHRANK, the frontier did not.
+        // The flow is append-only (#7439): the fold's compaction trims the STATE
+        // table below the new base, but the flow keeps every row it ever wrote,
+        // so raw MAX(log_seq) IS the frontier — and it equals the base
+        // payload's highWater (two independent carriers of the same fact).
         const view = egressStateView(vd(), sid);
         assert.equal(view.length, 51, "system row + the folded 50 — the live view SHRANK");
         const flowTypes = (vd().prepare("SELECT row_type FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(sid) as { row_type: string }[]).map((r) => r.row_type);
-        assert.deepEqual(flowTypes, ["B"], "the compaction left only the base row in the flow — everything it subsumed is physically gone");
+        // the flow keeps everything (append-only, #7439): turn 1's 81 I rows
+        // intact, then the fold's ops (the -D range for the covered originals,
+        // the -U re-renders of the 49 survivors, the -I summary), then the
+        // base. The STATE table in contrast is trimmed to the base row alone.
+        const expectedFlowTypes = [...Array(81).fill("I"), "D", ...Array(49).fill("U"), "I", "B"] as string[];
+        assert.deepEqual(flowTypes, expectedFlowTypes, "the flow keeps everything (append-only, #7439): turn 1's 81 I rows, then the fold's ops (1 D for the covered range, 49 U re-renders of the survivors, 1 I summary), then the base — only the STATE table is trimmed to the base");
+        const stateRows = (vd().prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = ?").get(sid) as { n: number }).n;
+        assert.equal(stateRows, 1, "the state table (the serving copy) is trimmed to the base row alone");
         const basePayload = JSON.parse((vd().prepare("SELECT payload FROM egress_flow WHERE session_id = ? AND row_type = 'B' ORDER BY op_seq DESC LIMIT 1").get(sid) as { payload: string }).payload) as { highWater: number };
-        assert.equal(basePayload.highWater, 81, "the system row is 0, the 80 originals 1..80, the fold's summary I-row 81 — the base carries the frontier");
+        assert.equal(basePayload.highWater, 81, "the system row is 0, the 80 originals 1..80, the fold's summary I-row 81 — the base carries the frontier too");
 
         // a steady-state turn echoing three LIVE ids: the verdict carries the
-        // FRONTIER as maxPos. Pre-fix (raw MAX(log_seq), no base fallback) this
-        // computed 0 the turn right after every fold — and every persisted
-        // witness from this session on would have lied about where the world's
-        // positions live; under the live-length math it would say 50.
+        // FRONTIER as maxPos. This computed 0 the turn right after every fold
+        // under the pruned-flow build (raw MAX(log_seq) with nothing left
+        // above the floor) — under the append-only flow it is the max log_seq
+        // of the retained rows, and under the live-length math it would say 50.
         const tail = view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).slice(-3).map((r) => r.msgid);
         const d = store.egressOpLogStore()!.snapStage0(sid, tail);
         assert.equal(d.decision.mode, "echo", "the live tail is all in the flow — echo");
