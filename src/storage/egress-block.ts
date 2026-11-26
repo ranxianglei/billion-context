@@ -55,6 +55,7 @@
  */
 
 import type { SqliteDatabase } from "./driver.js";
+import type { EgressViewRow } from "./egress-state.js";
 import type { CompressionState } from "acp-kernel";
 
 /**
@@ -67,7 +68,7 @@ import type { CompressionState } from "acp-kernel";
  * restart, then rewritten) and was 652.5KB of the measured 674KB kstate_json.
  * The residual is <2KB in practice (latches/records are small and bounded).
  */
-const KSTATE_RESIDUAL_FIELDS = [
+export const KSTATE_RESIDUAL_FIELDS = [
     "viewLatches", "emergencyTruncateLatch", "absorbed", "rules", "nudge",
     "stats", "terminalStreak", "nextRuleId", "deadRefs", "sweptOrphanCallIds",
     "renderDeferredRefs", "refLedgerAligned", "timestampsHighWaterRefSeq",
@@ -105,6 +106,137 @@ export function serializeKstateResidualFromKstateJson(kstateJson: string): strin
     return JSON.stringify(residual);
 }
 
+/** The in-memory kernel block set + its contents — the inputs the
+ *  egress-on block recorder needs (PR #7664 A). Structurally typed so the
+ *  server layer can pass Session fields directly. */
+export type EgressBlockLedgerInput = {
+    state: CompressionState;
+    blockContents: Map<string, { one: unknown | null; full: unknown }>;
+};
+
+/** #7664 (PR-A): build the block set for the ledger from the IN-MEMORY
+ *  kernel state — the unified-leg recorder's twin (store.ts ingest builds
+ *  the same snapshots from its incoming rows). Coordinates resolve against
+ *  the EGRESS flow view instead of unified rows (an egress-on session has
+ *  none): a covered msgid still live in the view carries its canonical
+ *  log_seq num; covered ids already D-retired by THIS turn (the fold shape)
+ *  keep their msgid bounds with 0/0 seqs — the "unknown bounds" shape
+ *  ingest uses for unresolvable coverage. The msgid bounds are the
+ *  self-contained keys (ruling 7439-2); seqs are best-effort evidence on
+ *  the egress clock. */
+export function buildEgressBlockSnapshots(ledger: EgressBlockLedgerInput, view: readonly EgressViewRow[]): Map<string, EgressBlockSnapshot> {
+    const numByMsgid = new Map<string, number>();
+    for (const r of view) if (r.num > 0) numByMsgid.set(r.msgid, r.num);
+    const out = new Map<string, EgressBlockSnapshot>();
+    for (const b of ledger.state.blocks) {
+        const c = ledger.blockContents.get(b.blockId);
+        const full = c?.full ?? (b.summary === undefined ? { count: 0 } : { text: b.summary, count: 0 });
+        const one = c?.one ?? null;
+        let startMsgid: string | null = null;
+        let endMsgid: string | null = null;
+        let startSeq = 0;
+        let endSeq = 0;
+        for (const id of b.effectiveMessageIds) {
+            const n = numByMsgid.get(id);
+            if (startMsgid === null) startMsgid = id;
+            endMsgid = id;
+            if (n === undefined || n <= 0) continue;
+            if (startSeq === 0 || n < startSeq) startSeq = n;
+            if (n > endSeq) endSeq = n;
+        }
+        out.set(b.blockId, {
+            tier: b.tier,
+            startMsgid,
+            startSeq,
+            endMsgid,
+            endSeq,
+            supersedesBlockId: null,
+            active: b.active,
+            reaped: false,
+            one: one === null ? null : JSON.stringify(one),
+            full: JSON.stringify(full),
+            // #7658 PR-B: the load-rebuild fields (see EgressBlockSnapshot).
+            summaryText: typeof b.summary === "string" ? b.summary : null,
+            runId: typeof b.runId === "string" ? b.runId : null,
+            effectiveMessageIds: Array.isArray(b.effectiveMessageIds) ? [...b.effectiveMessageIds] : null,
+            directMessageIds: Array.isArray(b.directMessageIds) ? [...b.directMessageIds] : null,
+            directBlockIds: Array.isArray(b.directBlockIds) ? [...b.directBlockIds] : null,
+            compressedTokens: typeof b.compressedTokens === "number" ? b.compressedTokens : null,
+            createdAt: typeof b.createdAt === "number" ? b.createdAt : null,
+            survivedCount: typeof b.survivedCount === "number" ? b.survivedCount : null,
+            generation: typeof b.generation === "number" ? b.generation : null,
+            expanded: b.expanded === true ? true : null,
+        });
+    }
+    return out;
+}
+
+/** #7658 PR-B: the egress-on LOAD REBUILD overlay. Returns only the fields
+ *  the op log can reconstruct — the caller Object.assigns the result onto the
+ *  stored state, so every field NOT covered here keeps its stored value (the
+ *  stored column remains the fallback of last resort; a failed REPLAY never
+ *  reaches here — the caller catches and keeps the stored state verbatim):
+ *  - the kstate residual sidecar from the LAST block-ledger row at/before the
+ *    watermark (only the fields the sidecar actually carries — a corrupt or
+ *    absent sidecar keeps the stored fields);
+ *  - state.blocks from the ledger replay (the self-contained snapshots incl.
+ *    the PR-B rebuild fields; pre-PR-B rows rebuild with empty coverage —
+ *    inert but present, same as the #3573 no-persisted-blocks shape);
+ *  - messageRefs derived from the LIVE message-flow rows (row.msgid IS the
+ *    kernel raw id, row.ref the padded ref; num 0 = not numbered yet);
+ *  - tsStamps from the flow rows' first-observed ts (#7577 D3, the same
+ *    derivation as store.egressTsStamps).
+ *  lastPassIds is deliberately NOT rebuilt — it is a self-heal field
+ *  (excluded from the sidecar by design; one 0.95-semantics pass on restart
+ *  rewrites it). */
+export function rebuildEgressKstateOverlay(
+    blockReplay: { blocks: Map<string, EgressBlockSnapshot>; kstate: string | null },
+    view: readonly EgressViewRow[],
+): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    if (blockReplay.kstate !== null) {
+        try {
+            const sidecar = JSON.parse(blockReplay.kstate) as Record<string, unknown>;
+            for (const field of KSTATE_RESIDUAL_FIELDS) {
+                if (sidecar[field] !== undefined) out[field] = sidecar[field];
+            }
+        } catch {
+            // corrupt sidecar: keep the stored fields for this turn.
+        }
+    }
+    if (blockReplay.blocks.size > 0) {
+        out["blocks"] = [...blockReplay.blocks.entries()].map(([blockId, s]) => ({
+            blockId,
+            runId: s.runId ?? "",
+            tier: s.tier,
+            topic: undefined,
+            summary: s.summaryText ?? "",
+            directMessageIds: s.directMessageIds ?? [],
+            effectiveMessageIds: s.effectiveMessageIds ?? [],
+            directBlockIds: s.directBlockIds ?? [],
+            compressedTokens: s.compressedTokens ?? 0,
+            createdAt: s.createdAt ?? 0,
+            survivedCount: s.survivedCount ?? 0,
+            generation: (s.generation ?? 1) as 1,
+            active: s.active,
+            ...(s.expanded === true ? { expanded: true } : {}),
+        }));
+    }
+    const byRaw: Record<string, string> = {};
+    const byRef: Record<string, string> = {};
+    const tsStamps: Record<string, number> = {};
+    for (const row of view) {
+        if (row.num <= 0 || row.msgid === undefined || row.msgid === "") continue;
+        const ref = typeof row.ref === "string" && row.ref.length > 0 ? row.ref : "m" + String(row.num).padStart(5, "0");
+        byRaw[row.msgid] = ref;
+        byRef[ref] = row.msgid;
+        if (row.ts !== undefined) tsStamps[row.msgid] = row.ts;
+    }
+    if (Object.keys(byRaw).length > 0) out["messageRefs"] = { byRaw, byRef };
+    if (Object.keys(tsStamps).length > 0) out["tsStamps"] = tsStamps;
+    return out;
+}
+
 export class EgressBlockCorruptError extends Error {
     constructor(readonly sessionId: string, readonly reason: string) {
         super(`egress-block corrupt (session=${sessionId}): ${reason}`);
@@ -128,6 +260,23 @@ export interface EgressBlockSnapshot {
     reaped: boolean;
     one: string | null;
     full: string;
+    /** #7658 PR-B: the kernel fields a LOAD REBUILD of state.blocks needs —
+     *  carried in the JSON payload (probe-first: old rows and legacy-leg
+     *  writers simply omit them, and parseSnapshot keeps null/empty
+     *  defaults). The msgid coverage is the self-contained identity;
+     *  everything else is display/behavior state. */
+    summaryText?: string | null | undefined;
+    runId?: string | null | undefined;
+    effectiveMessageIds?: string[] | null | undefined;
+    directMessageIds?: string[] | null | undefined;
+    directBlockIds?: string[] | null | undefined;
+    compressedTokens?: number | null | undefined;
+    createdAt?: number | null | undefined;
+    survivedCount?: number | null | undefined;
+    generation?: number | null | undefined;
+    /** Host-set decompress flag (CompressionBlock.expanded) — the ledger is
+     *  its only durable home (it is not in the kstate residual sidecar). */
+    expanded?: boolean | null | undefined;
 }
 
 interface EgressBlockInsertOp {
@@ -219,6 +368,17 @@ function parseSnapshot(sessionId: string, opSeq: number, payload: string): Egres
         reaped: p.reaped,
         one: typeof p.one === "string" ? p.one : null,
         full: p.full,
+        // #7658 PR-B rebuild fields — probe-first: pre-PR-B rows lack them.
+        summaryText: typeof p.summaryText === "string" ? p.summaryText : null,
+        runId: typeof p.runId === "string" ? p.runId : null,
+        effectiveMessageIds: Array.isArray(p.effectiveMessageIds) ? (p.effectiveMessageIds as string[]) : null,
+        directMessageIds: Array.isArray(p.directMessageIds) ? (p.directMessageIds as string[]) : null,
+        directBlockIds: Array.isArray(p.directBlockIds) ? (p.directBlockIds as string[]) : null,
+        compressedTokens: typeof p.compressedTokens === "number" ? p.compressedTokens : null,
+        createdAt: typeof p.createdAt === "number" ? p.createdAt : null,
+        survivedCount: typeof p.survivedCount === "number" ? p.survivedCount : null,
+        generation: typeof p.generation === "number" ? p.generation : null,
+        expanded: typeof p.expanded === "boolean" ? p.expanded : null,
     };
 }
 

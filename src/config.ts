@@ -1080,6 +1080,15 @@ export type ProxyOptions = {
      *  whose SDK cannot surface in-band errors. Env BILI_STREAM_ERROR_SHAPE
      *  wins over the file's compat.streamErrorShape. */
     streamErrorShape?: "protocol" | "completion";
+    /** #4913: how the plugin chat pipe terminates an EXHAUSTED degenerate-turn
+     *  retry — the second attempt after the continuation nudge (#732/#821)
+     *  also ended with no usable output (thinking/echo only, clean stop). "error"
+     *  (default) emits the #870 in-band stream error; "passthrough" passes the
+     *  empty turn through as a normal completion (pre-#870). Only the chat
+     *  pipe has this fatal branch — the proxy lane and the responses wire
+     *  already pass this condition through, so the knob is a no-op for them.
+     *  Env BILI_DEGENERATE_TURN wins over the file's compat.degenerateTurn. */
+    degenerateTurn?: "error" | "passthrough";
     /** Global-level image billing mode (#767); per-provider route entries
      *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto
      *  (= pixels for every host since #1843). */
@@ -1861,6 +1870,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         },
         compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {}, dropFields: parseCompatDropFields(fileConfig.compat?.dropFields) ?? [] },
         streamErrorShape: parseStreamErrorShape(env.BILI_STREAM_ERROR_SHAPE ?? fileConfig.compat?.streamErrorShape),
+        degenerateTurn: parseDegenerateTurn(env.BILI_DEGENERATE_TURN ?? fileConfig.compat?.degenerateTurn),
         imageBilling: parseImageBilling(fileConfig.imageBilling),
         imageTokenCap: parseImageTokenCap(fileConfig.imageTokenCap),
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
@@ -2196,7 +2206,7 @@ type FileConfig = {
      *  cache_control marks entirely (env BILI_NO_CACHE_CONTROL wins).
      *  `keepResponseId` (#2030): set `true` to preserve previous_response_id
      *  on rebuilt Responses requests (env ACP_KEEP_RESPONSE_ID=1 wins). */
-    compat?: { roles?: Record<string, string>; streamErrorShape?: string; dropFields?: string[]; noCacheControl?: boolean; keepResponseId?: boolean };
+    compat?: { roles?: Record<string, string>; streamErrorShape?: string; degenerateTurn?: string; dropFields?: string[]; noCacheControl?: boolean; keepResponseId?: boolean };
     /** Global image billing mode (#767): "auto" | "pixels" | "bytes".
      *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
      *  over both. See ProviderRoute.imageBilling. */
@@ -3326,6 +3336,10 @@ export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings 
 
 function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
     return value === "completion" ? "completion" : "protocol";
+}
+
+function parseDegenerateTurn(value: unknown): "error" | "passthrough" {
+    return value === "passthrough" ? "passthrough" : "error";
 }
 
 export function parsePromptCacheRouting(value: string | undefined): PromptCacheRouting {

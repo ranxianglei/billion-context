@@ -204,7 +204,7 @@ test("B: an egress-on session runs a STATELESS stage-0 — no l1 row ever, acros
         const r2 = runStage0({ sessionId: sid, msgs, incomingMsgIds: [...ids], pluginMode: true, convBound: true, ...STAGE0_BASE });
         assert.equal(d2.decision.mode, "echo", "the egress verdict is replay math, not ledger math");
         assert.equal(d2.decision.replay, true);
-        assert.equal(d2.decision.window.maxPos, 6, "frontier = MAX(log_seq): system takes 1, the 5 messages 2..6");
+        assert.equal(d2.decision.window.maxPos, 5, "frontier = MAX(log_seq): the system row is 0 (outside the citation space), the 5 messages 1..5");
         assert.ok(r2.pinned !== null && r2.pinned.length === 5, "the full-form pin re-stamps every turn (#6785) — the ECHO is the decision, not the pin");
 
         // turn 3: grown array — the new id lands AT the frontier, past it
@@ -212,8 +212,8 @@ test("B: an egress-on session runs a STATELESS stage-0 — no l1 row ever, acros
         const d3 = ustore()!.snapStage0(sid, [...ids, "m6"]);
         const r3 = runStage0({ sessionId: sid, msgs: msgs3, incomingMsgIds: [...ids, "m6"], pluginMode: true, convBound: true, ...STAGE0_BASE });
         assert.equal(d3.decision.mode, "anchor");
-        assert.deepEqual(d3.decision.newIdPos, [{ id: "m6", pos: 7 }], "the new id's position comes from MAX(log_seq)");
-        assert.equal(d3.decision.window.maxPos, 7);
+        assert.deepEqual(d3.decision.newIdPos, [{ id: "m6", pos: 6 }], "the new id's position comes from MAX(log_seq)");
+        assert.equal(d3.decision.window.maxPos, 6);
         assert.ok(r3.cohortRan && r3.pinned !== null);
         const row3 = recordEgressTurn({ store: ustore()!, sessionId: sid, prev: row1, conversation: msgs3 as unknown as CoreMessage[], systemText: "sys", nowMs: 1_005_000 });
         assert.equal(row3.length, 7);
@@ -234,7 +234,7 @@ test("B: an egress-on session runs a STATELESS stage-0 — no l1 row ever, acros
         const d4 = store.egressOpLogStore()!.snapStage0(sid, [...ids, "m6"]);
         const r4 = runStage0({ sessionId: sid, msgs: msgs3, incomingMsgIds: [...ids, "m6"], pluginMode: true, convBound: true, ...STAGE0_BASE });
         assert.equal(d4.decision.mode, "echo", "echo after restart — the op log is the authority");
-        assert.equal(d4.decision.window.maxPos, 7);
+        assert.equal(d4.decision.window.maxPos, 6);
         assert.equal(L1_COUNT(vd(), sid), 1, "still just the dormant turn-1 row");
         assert.equal(store.egressOpLogStore()!.snapR3Latched(sid), false, "not latched");
     } finally {
@@ -286,7 +286,7 @@ test("C: after a REAL kernel fold the position frontier is MAX(log_seq), not the
         const flowTypes = (vd().prepare("SELECT row_type FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(sid) as { row_type: string }[]).map((r) => r.row_type);
         assert.deepEqual(flowTypes, ["B"], "the compaction left only the base row in the flow — everything it subsumed is physically gone");
         const basePayload = JSON.parse((vd().prepare("SELECT payload FROM egress_flow WHERE session_id = ? AND row_type = 'B' ORDER BY op_seq DESC LIMIT 1").get(sid) as { payload: string }).payload) as { highWater: number };
-        assert.equal(basePayload.highWater, 82, "system 1, the 80 originals 2..81, the fold's summary I-row 82 — the base carries the frontier");
+        assert.equal(basePayload.highWater, 81, "the system row is 0, the 80 originals 1..80, the fold's summary I-row 81 — the base carries the frontier");
 
         // a steady-state turn echoing three LIVE ids: the verdict carries the
         // FRONTIER as maxPos. Pre-fix (raw MAX(log_seq), no base fallback) this
@@ -296,7 +296,7 @@ test("C: after a REAL kernel fold the position frontier is MAX(log_seq), not the
         const tail = view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).slice(-3).map((r) => r.msgid);
         const d = store.egressOpLogStore()!.snapStage0(sid, tail);
         assert.equal(d.decision.mode, "echo", "the live tail is all in the flow — echo");
-        assert.equal(d.decision.window.maxPos, 82, "maxPos = 82 (the base highWater) — NOT 0 (raw MAX(log_seq) post-compaction) and NOT 50 (the live count)");
+        assert.equal(d.decision.window.maxPos, 81, "maxPos = 81 (the base highWater) — NOT 0 (raw MAX(log_seq) post-compaction) and NOT 50 (the live count)");
         runStage0({ sessionId: sid, msgs: tail.map(bm), incomingMsgIds: tail, pluginMode: true, convBound: true, ...STAGE0_BASE });
     } finally {
         closeStore(store, dir, db);

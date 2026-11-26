@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
+import { rebuildCoreFromLog } from "./storage/egress-serve.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -1504,8 +1505,45 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     return out;
 }
 
+/** #7658 wiring 2: the egress op-log snapshot source. An egress-on
+ *  session's unified leg is frozen, so once the in-memory raw snapshot is
+ *  gone (dropOverCap under BILI_PUBLIC_SNAPSHOT_CAP_BYTES, or a cold
+ *  process whose reconstruction only sees the frozen-at-arm-point rows)
+ *  the flow is the ONLY place that still holds the full history — and it
+ *  is the content authority by ruling 7439-5, same source the lane serves
+ *  from. Last resort after the raw snapshot and the raw-tail
+ *  reconstruction, so sessions where those still work keep today's
+ *  behavior. */
+function egressOpLogSource(session: Session): CoreMessage[] | null {
+    if (session.metadata.egressAuthority !== true) return null;
+    const st = getStore().egressOpLogStore();
+    if (!st) return null;
+    // The view read is a FLOW REPLAY — it throws EgressStateCorruptError on a
+    // damaged log (the same hard-fail the lanes hit every request). This
+    // helper runs in the fork route OUTSIDE its structured-error try, so a
+    // damaged parent must degrade to "no source" (a clean 409
+    // SNAPSHOT_UNAVAILABLE from forkSnapshot) rather than an unhandled 500.
+    // The child's own recovery walk decides the copied log's health.
+    let view;
+    try {
+        view = st.egressStateView(session.id);
+    } catch (err) {
+        loggerLog("warn", `[plugin] egress op-log fork source unreadable for ${session.id} — fork falls through to the next source: ${String(err)}`);
+        return null;
+    }
+    return view.length > 0 ? rebuildCoreFromLog(view) : null;
+}
+
+/** #7658 wiring 2: ONE source chain for the snapshot identity AND the
+ *  child's inherited pluginSnapshot — the two must agree, so both ride
+ *  this helper (the fork route used to compute the first two links on its
+ *  own and null-slice when only the op-log fallback had a source). */
+function forkSourceOf(session: Session, source?: CoreMessage[] | null): CoreMessage[] | null {
+    return source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session) ?? egressOpLogSource(session);
+}
+
 function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
-    const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
+    const messages = forkSourceOf(session, source);
     if (!messages) {
         const capped = session.metadata.publicSnapshotCapped === true;
         const base = capped ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
@@ -1805,7 +1843,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
             // #5140 item 4: a cold non-retained parent has no resident snapshot;
             // stand in with the verified unified raw tail (no fresh model call).
-            const source = parent.pluginSnapshot ?? reconstructRawTailForFork(parent);
+            const source = forkSourceOf(parent);
             let snapshot: ReturnType<typeof forkSnapshot>;
             try { snapshot = forkSnapshot(parent, source); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
@@ -1926,7 +1964,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
             child.metadata.publicSnapshotTextComparable = true;
             child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
-            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
+            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens", "egressAuthority"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
             child.metadata.parentConversationId = request.parentConversationId;
             child.metadata.parentRevision = request.parentRevision;
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
@@ -2900,6 +2938,13 @@ export async function pipePluginChatWithStrip(
     // (pre-#7666 behavior); 0 = off; the zero-byte-cut budget (#2171) stays
     // independent of this one.
     degenerateRetryMaxAttempts?: number,
+    // #4913: how an EXHAUSTED degenerate-turn retry (the budget spent with no
+    // usable output) is terminated — "passthrough" passes the empty turn
+    // through as a normal completion (pre-#870, the shape the proxy lane and
+    // the responses wire already take); "error" (default, = omitted) emits the
+    // #870 in-band stream error. Threaded from ProxyOptions.degenerateTurn
+    // (compat.degenerateTurn / BILI_DEGENERATE_TURN).
+    degenerateTurn?: "error" | "passthrough",
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -3135,12 +3180,46 @@ export async function pipePluginChatWithStrip(
             return false;
         }
         if (res.destroyed || res.writableEnded) return false;
+        // A turn the model left genuinely bare — no thought, no stripped echo,
+        // no released markup — is the upstream's own empty answer, not a stall:
+        // re-issuing it double-bills an empty completion (#732/#821 keep the
+        // same boundary in the compress loop). A draft-tail turn is NOT bare:
+        // it delivered a full handoff draft, which is precisely the stall signal.
+        // #4913: this gate must run BEFORE the exhausted-retry branch below —
+        // it was written under it, where a spent retry budget made it
+        // unreachable, so a retry attempt the model left genuinely bare died
+        // as a fatal in-band error instead of taking the pass-through #2756
+        // documents for the same shape on the first pass. On the retry pass
+        // the per-attempt accumulators were reset when the retry took over
+        // (below), so this measures THIS attempt, not signals inherited from
+        // the first.
+        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !stalledTail) {
+            log?.(degenerateRetries > 0
+                ? `[plugin] degenerate terminal turn not retried (bare on the retry pass: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756/#4913) — passing the empty turn through`
+                : `[plugin] degenerate terminal turn not retried (bare: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
+            return false;
+        }
         if (degenerateRetries >= maxDegenerateRetries) {
-            // Every nudge re-issue degenerated too. An empty turn is
-            // indistinguishable from a model that produced nothing and the
-            // session reads as idle while it is dead, so the client gets an
-            // error the host would never surface (#870).
-            log?.(`[plugin] degenerate terminal turn again after ${degenerateRetries} continuation nudge(s); emitting an in-band error (#870)`);
+            // The retry budget is spent and the last attempt was NOT bare (the
+            // gate above): it really did produce thinking or stripped output
+            // and still ended with nothing the host can act on. Default
+            // terminal: an in-band error the host would never surface on its
+            // own — an empty turn is indistinguishable from a model that
+            // produced nothing and the session reads as idle while it is dead
+            // (#870).
+            // #4913: compat.degenerateTurn="passthrough" (env BILI_DEGENERATE_TURN
+            // wins) opts a host back into the pre-#870 shape — the empty turn
+            // passes through as a normal completion, the same terminal the
+            // proxy lane and the responses wire already take for this
+            // condition (they never had this fatal branch).
+            if (degenerateTurn === "passthrough") {
+                log?.(`[plugin] degenerate terminal turn again after ${degenerateRetries} continuation nudge(s): passing the empty turn through (compat.degenerateTurn="passthrough", #4913): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, stalledTail=${stalledTail}, visibleTextChars=${visibleTextChars}, answerChars=${answerChars}, finishReason=${reason}`);
+                return false;
+            }
+            // #4913: name the signal that qualified the attempt. The
+            // accumulators now measure this attempt only (reset below when the
+            // retry takes over), so "again" is measured, not inherited.
+            log?.(`[plugin] degenerate terminal turn again after ${degenerateRetries} continuation nudge(s); emitting an in-band error (#870): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, stalledTail=${stalledTail}, visibleTextChars=${visibleTextChars}, answerChars=${answerChars}, finishReason=${reason}`);
             // #5958: the terminal shape follows the configured streamErrorShape
             // (default protocol → a native error frame the host records as a
             // failure) instead of the old hard-wired completed-turn shape, which
@@ -3155,15 +3234,6 @@ export async function pipePluginChatWithStrip(
                 : `the turn degenerated again after ${degenerateRetries} continuation nudges`,
                 undefined, streamErrorShape, { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
             return true;
-        }
-        // A turn the model left genuinely bare — no thought, no stripped echo,
-        // no released markup — is the upstream's own empty answer, not a stall:
-        // re-issuing it double-bills an empty completion (#732/#821 keep the
-        // same boundary in the compress loop). A draft-tail turn is NOT bare:
-        // it delivered a full handoff draft, which is precisely the stall signal.
-        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !stalledTail) {
-            log?.(`[plugin] degenerate terminal turn not retried (bare: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
-            return false;
         }
         degenerateRetries += 1;
         const attemptNote = maxDegenerateRetries > 1 ? ` (attempt ${degenerateRetries}/${maxDegenerateRetries})` : " once";
@@ -3189,6 +3259,21 @@ export async function pipePluginChatWithStrip(
         // lastChunkMeta.finishReason by design, so a mid-retry flush would
         // otherwise hand the client a chunk carrying the stale reason.
         delete lastChunkMeta["finishReason"];
+        // #4913: per-attempt observability accumulators belong to the attempt
+        // they were set on. Without this reset the retry pass inherits the
+        // first attempt's signals (its thinking, its stripped echo, its
+        // released markup), so "degenerated again" reports the FIRST
+        // attempt's activity and the bare gate above false-qualifies a retry
+        // the model left bare. proseAcc deliberately keeps all attempts: the
+        // #361 tool-call-XML warn and the #3456 phantom-attachment scan are
+        // per-request by design; diag*/blocksForwarded/seenToolCalls are
+        // stream-level and stay untouched.
+        sawThinking = false;
+        sawStrippedEcho = false;
+        sawToolUse = false;
+        visibleTextChars = 0;
+        answerProse = "";
+        releasedMarkupChars = 0;
         retryIndexOffset = blocksForwarded;
         inRetry = true;
         // The first attempt's held filter state belongs to text the client never
