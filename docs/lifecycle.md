@@ -146,6 +146,7 @@
 | `BILI_STORAGE_ALLOW_LEGACY_DEGRADE` | 纯 SQLite 姿态下证实损坏拒启的逃生阀（#7156）：设 1/true/on 恢复旧契约（响亮告警后不挂索引启动、以 JSON 路径服务，尽管此时损坏索引是唯一持久副本）；缺省 off、不被任何配置值隐含 |
 | `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | storage.walJournalSizeLimitBytes——SQLite WAL 回收字节上限（#3250；垃圾/非正值落回文件/默认层，不让 typo 崩 boot） |
 | `BILI_MYSQL_DSN` | storage.mysql.dsn——mysql 引擎连接串（env > 文件 > ""；空 = mysql 不可用走 sqlite，#3388/#3931） |
+| `BILI_PERF_TELEMETRY` | `=0/false` 关闭 #5460 实时性能采集（缺省开）。DB 存储模式（sqlite/mysql）下每请求一行 + 30s 内存采样 → sessions 目录旁 `perf.sqlite`；纯 JSON 存储模式冻结不采集；写失败一次性降级停采，绝不影响服务 |
 
 ### 2.5 诊断
 
