@@ -394,8 +394,12 @@ two small node scripts that do the work around the client:
 
 - **Install:** `bili plugin install zcode` writes `~/.zcode/cli/config.json`:
   sets `hooks.enabled = true`, appends a `SessionStart` process hook
-  (`node <root>/dist/zcode/bootstrap-hook.js`) and registers a stdio MCP
-  server `mcp.servers.bili` (`node <root>/dist/zcode/mcp-entry.js`). A
+  (`<node> <root>/dist/zcode/bootstrap-hook.js`) and registers a stdio MCP
+  server `mcp.servers.bili` (`<node> <root>/dist/zcode/mcp-entry.js`), where
+  `<node>` is the ABSOLUTE path of the node binary bili runs under — ZCode
+  spawns the JSON `command` directly (no shell), so a bare `node` only
+  resolves through the client's own PATH and the spawn dies silently when
+  node is not there (#6891). A
   pre-existing user-owned `mcp.servers.bili` entry is never overwritten — the
   installer refuses loudly instead. No URL is frozen at install time; routing
   happens per session. Remove with `bili plugin remove zcode` (strips only
