@@ -448,6 +448,25 @@ export function isDshSingleShotSidecar(protocol: string | null, parsed: unknown)
     return users === 1 && userHasContent;
 }
 
+// Fork issue 11: Claude Code's one-shot helpers on a subagent lane (the
+// progress label, the WebFetch page summarizer). The caller gates on the
+// subagent agent-id split and the claude-code conversation source. A subagent
+// turn always carries its tool surface, so the dsh durable-state marker veto
+// of isDshSingleShotSidecar does not apply: a fetched page can contain them.
+export function isClaudeCodeSubagentHelper(protocol: string | null, parsed: unknown): boolean {
+    if (protocol !== "anthropic" || !parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    if (!systemCarrierTexts(p).some((t) => t.trim().length > 0)) return false;
+    if (!Array.isArray(p.messages) || p.messages.length !== 1) return false;
+    const entry = p.messages[0];
+    if (entry === null || typeof entry !== "object") return false;
+    const rec = entry as Record<string, unknown>;
+    if (rec.role !== "user") return false;
+    const c = rec.content;
+    return (typeof c === "string" && c.length > 0) || (Array.isArray(c) && c.length > 0);
+}
+
 // #5135: Claude Code's session-title sidecar (terminal CLI, proxy mode — no
 // x-bili-plugin stamp). It fires at session start UNDER THE SAME
 // x-claude-code-session-id as the first main turn, ~1ms ahead of it. Field
