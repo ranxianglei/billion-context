@@ -94,6 +94,16 @@ export interface ResolvedRange {
   protectedGaps: number[];
   snappedBoundaries: string[];
   reversedNote?: string;
+  /** Set ONLY when that endpoint was clamped from a phantom number (a ref
+   *  above this session's highest allocated ref) down to a visible anchor.
+   *  The raw requested ref does not exist in this ledger and WILL be minted
+   *  for an unrelated later message — persisting or displaying it as the
+   *  block's span aliases that future message. Callers that record the
+   *  resolved range (block creation) must use the effective ref. Other snap
+   *  classes (dead-ref, hidden-orphan) keep the raw ref: those numbers were
+   *  really allocated here and the kernel contract forbids re-issue. */
+  effectiveStartRef?: string;
+  effectiveEndRef?: string;
 }
 
 export function resolveBoundaries(
@@ -127,6 +137,10 @@ export function resolveBoundaries(
   if (endAnchor.snapped) snappedBoundaries.push(endAnchor.snapped);
   let startIndex = startAnchor.index;
   let endIndex = endAnchor.index;
+  // Label-based by construction: the swap below exchanges indices only, so
+  // each endpoint's clamped ref stays attached to the caller's label.
+  const effectiveStartRef = startAnchor.clampedRef;
+  const effectiveEndRef = endAnchor.clampedRef;
 
   let reversedNote: string | undefined;
   if (startIndex > endIndex) {
@@ -176,12 +190,17 @@ export function resolveBoundaries(
     protectedGaps,
     snappedBoundaries,
     reversedNote,
+    effectiveStartRef,
+    effectiveEndRef,
   };
 }
 
 interface AnchorResolution {
   index: number;
   snapped: string | null;
+  /** Ref the anchor actually landed on, set only by the phantom-frontier
+   *  clamp (see ResolvedRange.effectiveStartRef). */
+  clampedRef?: string;
 }
 
 function resolveAnchorIndex(
@@ -213,7 +232,7 @@ function resolveAnchorIndex(
         );
         if (neighbor !== null) {
           return {
-            index: neighbor,
+            index: neighbor.index,
             snapped: `${label}="${boundary.raw}" no longer backs any visible message (its content was pruned or removed by the client) — anchored to the nearest visible message instead, so the range folds slightly less than requested.`,
           };
         }
@@ -247,8 +266,9 @@ function resolveAnchorIndex(
           );
           if (neighbor !== null) {
             return {
-              index: neighbor,
+              index: neighbor.index,
               snapped: `${label}="${boundary.raw}" is above this session's highest allocated ref (${highest > 0 ? formatPaddedRef(highest) : "none"}) — clamped to it (refs are minted in order and never pre-allocated, so higher numbers do not exist yet). The range folds up to the last visible message.`,
+              clampedRef: neighbor.ref,
             };
           }
         }
@@ -288,7 +308,7 @@ function resolveAnchorIndex(
             ? "the next visible message after it"
             : "the previous visible message before it";
         return {
-          index: neighbor,
+          index: neighbor.index,
           snapped: `${label}="${boundary.raw}" is a hidden orphan compress call (no matching block) — snapped to ${dir} instead.`,
         };
       }
@@ -405,31 +425,32 @@ function inheritedContentIds(
 // Ref numbers are assigned in session order and never recycled, so the visible
 // list is an order-preserving subsequence: nearest-by-ref-number ==
 // nearest-by-position. Synthetic summary/retrieved messages carry no ref and
-// protected ones hold BLOCKED_REF, so both are skipped here.
+// protected ones hold BLOCKED_REF, so both are skipped here. Returns the
+// anchor's stored ref text as well: the phantom-frontier clamp needs it to
+// record the effective endpoint instead of the phantom request.
 function snapToNeighborVisible(
   state: CompressionState,
   indexByMessageId: Map<string, number>,
   refNumber: number,
   endpoint: "start" | "end",
-): number | null {
-  let bestIndex: number | null = null;
+): { index: number; ref: string } | null {
+  let best: { index: number; ref: string } | null = null;
   let bestRef: number | null = null;
   for (const [rawId, index] of indexByMessageId) {
     const refText = state.messageRefs.byRaw[rawId];
     if (!refText || refText === BLOCKED_REF) continue;
     const ref = refToIndex(refText);
     if (ref === null) continue;
-    if (endpoint === "start") {
-      if (ref > refNumber && (bestRef === null || ref < bestRef)) {
-        bestRef = ref;
-        bestIndex = index;
-      }
-    } else if (ref < refNumber && (bestRef === null || ref > bestRef)) {
+    const inFrontier = endpoint === "start" ? ref > refNumber : ref < refNumber;
+    if (!inFrontier) continue;
+    const better =
+      bestRef === null || (endpoint === "start" ? ref < bestRef : ref > bestRef);
+    if (better) {
       bestRef = ref;
-      bestIndex = index;
+      best = { index, ref: refText };
     }
   }
-  return bestIndex;
+  return best;
 }
 
 function formatPaddedRef(index: number): string {

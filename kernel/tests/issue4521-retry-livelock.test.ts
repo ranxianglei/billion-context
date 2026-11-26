@@ -15,7 +15,12 @@
 //     is the same no-op class,
 // (d) the armed-but-silent nudge window emits a status line naming the
 //     highest allocated ref and the offered ranges, so the model stops
-//     guessing refs it cannot see.
+//     guessing refs it cannot see,
+// (e) a clamped fold PERSISTS THE CLAMPED ENDPOINT on the block (startRef/
+//     endRef) — the phantom request was never allocated in this session and
+//     WILL be minted for an unrelated later message, so recording it would
+//     make the block's span alias that future message (non-clamped folds
+//     still record the requested refs verbatim).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -97,6 +102,48 @@ test("#4521: endId above highest allocated ref clamps down instead of refusing t
     ["a1", "a2", "a3"],
     "the range folded up to the last visible message",
   );
+});
+
+test("#4521: a clamped fold persists the clamped endpoint on the block, not the phantom request", () => {
+  const core = createCore();
+  const messages = [text("u0", "user"), text("a1", "assistant"), text("a2", "assistant"), text("a3", "assistant")];
+  const state = seed(messages);
+
+  const r = core.applyCompression({
+    ranges: [{ startRef: "m00002", endRef: "m00099", summary: "work recap" }],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(r.result.errors.length, 0, r.result.errors.join("; "));
+  const block = r.state.blocks.find((b) => b.active);
+  assert.ok(block, "a block was created");
+  assert.equal(block.startRef, "m00002", "start endpoint was real — kept as requested");
+  assert.equal(
+    block.endRef,
+    "m00004",
+    "the phantom endRef m00099 must not be persisted: refs are minted in order, so m00099 would later be assigned to an unrelated message and the block span would alias it",
+  );
+});
+
+test("#4521: folds without clamping still persist the requested refs verbatim", () => {
+  const core = createCore();
+  const messages = [text("u0", "user"), text("a1", "assistant"), text("a2", "assistant"), text("a3", "assistant")];
+  const state = seed(messages);
+
+  const r = core.applyCompression({
+    ranges: [{ startRef: "m00002", endRef: "m00003", summary: "two messages" }],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(r.result.errors.length, 0, r.result.errors.join("; "));
+  const block = r.state.blocks.find((b) => b.active);
+  assert.ok(block, "a block was created");
+  assert.equal(block.startRef, "m00002");
+  assert.equal(block.endRef, "m00003");
 });
 
 test("#4521: startId above highest allocated ref keeps the hard refusal (real targeting error)", () => {
