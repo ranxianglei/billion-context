@@ -19,7 +19,7 @@ import { stateDir } from "./paths.js";
 import { getStore } from "./persist.js";
 import type { CompressSettings } from "./config.js";
 import { ccrRetrievalTtlMs as knobCcrRetrievalTtlMs } from "./knobs.js";
-import type { PendingRetrieval, Session } from "./session.js";
+import { isDroppedContentStore, type PendingRetrieval, type Session } from "./session.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 export type CcrSettings = NonNullable<CompressSettings["ccr"]>;
@@ -131,9 +131,16 @@ export function contentStoreOf(session: Session): MessageContentStore {
 
 /** Adopt the store returned by kernel processTurn (append-only, first write
  *  wins — refs are never rewritten). Stats and the persist dirty flag move
- *  only when new entries appeared, so a no-growth turn costs nothing. */
+ *  only when new entries appeared, so a no-growth turn costs nothing —
+ *  #7223: when the kernel hands back the EXACT resident store object (its
+ *  store path is immutable: storeOriginal returns the input unchanged when
+ *  it adds nothing), that is proven no-growth and the adoption is a zero-
+ *  enumeration no-op. The exception is a still-folded lazy proxy: adopting
+ *  it is what pays the one narrow re-materialization (or the warn+throw on
+ *  lost backing), so it must keep the full path. */
 export function adoptContentStore(session: Session, store: MessageContentStore): void {
     const prev = session.contentStore;
+    if (prev === store && !isDroppedContentStore(prev)) return;
     // #4788 phase-2 dropped prev can be a lazy re-materialize proxy whose disk
     // proof vanished after the drop (envelope lost/corrupted). Touching it
     // throws by design (#2674 payload-first discipline) — but nothing READABLE
