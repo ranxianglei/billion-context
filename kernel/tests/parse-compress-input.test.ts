@@ -1387,6 +1387,39 @@ test("parseCompressArgs refuses to narrow a ref pair with an unrecognized separa
   assert.equal(single.ranges[0]?.endRef, "m00150");
 });
 
+// #6071 field (session-9dd7b2f0): CJK models join refs with Han range words
+// like 到/至. Those are \p{L}, so the original guard class never matched them
+// — "m07890到m07950 t" parsed as a SINGLE ref m07890 with topic "到m07950 t"
+// and silently folded one message of a many-message range instead of
+// rejecting loudly. Both directions pinned: Han-word + second ref rejects;
+// a Han topic NOT followed by a ref still parses as a single ref.
+test("parseCompressArgs refuses to narrow a ref pair joined by a Han-script word", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: "m07890到m07950 t\nsummary.",
+  });
+  assert.equal(ranges.length, 0);
+  assert.equal(diagnostics.kind, "no-valid-ranges");
+  assert.match(diagnostics.invalidReasons?.[0] ?? "", /separator not recognized/);
+  const zhi = parseCompressArgs({ content: "m00150至m00168 t\nsummary." });
+  assert.equal(zhi.diagnostics.kind, "no-valid-ranges");
+  // A mixed punct+Han run joins refs just as loudly.
+  const mixed = parseCompressArgs({ content: "m00150，到m00168 t\nsummary." });
+  assert.equal(mixed.diagnostics.kind, "no-valid-ranges");
+});
+
+test("single-ref headers with Han topics still parse when no second ref follows", () => {
+  // 到期 is an ordinary topic word — nothing ref-shaped behind it → single ref.
+  const due = parseCompressArgs({ content: "m00150 到期的任务\nsummary." });
+  assert.equal(due.ranges[0]?.startRef, "m00150");
+  assert.equal(due.ranges[0]?.endRef, "m00150");
+  // The guard extension is Han-only: Latin-letter topics were always safe and stay safe.
+  // (Topic must not start with the literal "to" separator — "tom00220" would join
+  // into a pair via the pre-existing word form.)
+  const latin = parseCompressArgs({ content: "m00150 xyz00220 notes\nsummary." });
+  assert.equal(latin.ranges[0]?.startRef, "m00150");
+  assert.equal(latin.ranges[0]?.endRef, "m00150");
+});
+
 // ---------------------------------------------------------------------------
 // stringified single entry (#5949 field)
 // ---------------------------------------------------------------------------
