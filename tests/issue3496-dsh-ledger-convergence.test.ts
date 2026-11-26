@@ -34,6 +34,9 @@ interface ProfileOpts {
     spec?: string;
     /** On-disk bundle copy version; undefined = no readable copy. */
     copyVersion?: string;
+    /** The on-disk copy's own direct deps (its package.json) — #7125 dep-map
+     *  cross-check. Absent = the copy declares no deps (cross-check skipped). */
+    copyDeps?: { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string> };
     pnpmLock?: string;
     npmLock?: unknown;
     /** Raw package.json content override (corrupt-file cases). */
@@ -53,7 +56,10 @@ function makeProfile(root: string, name: string, opts: ProfileOpts): string {
     if (opts.copyVersion !== undefined) {
         const copyDir = path.join(dir, "node_modules", "billion-context");
         mkdirSync(copyDir, { recursive: true });
-        writeFileSync(path.join(copyDir, "package.json"), JSON.stringify({ name: "billion-context", version: opts.copyVersion }) + "\n");
+        const copyDoc: Record<string, unknown> = { name: "billion-context", version: opts.copyVersion };
+        if (opts.copyDeps?.dependencies !== undefined) copyDoc.dependencies = opts.copyDeps.dependencies;
+        if (opts.copyDeps?.optionalDependencies !== undefined) copyDoc.optionalDependencies = opts.copyDeps.optionalDependencies;
+        writeFileSync(path.join(copyDir, "package.json"), JSON.stringify(copyDoc, null, 2) + "\n");
     }
     if (opts.pnpmLock !== undefined) writeFileSync(path.join(dir, "pnpm-lock.yaml"), opts.pnpmLock);
     if (opts.npmLock !== undefined) writeFileSync(path.join(dir, "package-lock.json"), JSON.stringify(opts.npmLock, null, 2) + "\n");
@@ -243,17 +249,22 @@ test("#3496: post-self-heal wedge (stale lock record) converges the lockfile, ma
         const kinds = dshProfileLedgerFindings(dir).map((f) => f.kind);
         assert.deepEqual(kinds, ["copy-vs-lock", "manifest-vs-lock"]);
         const before = profileFiles(dir);
-        const res = convergeDshLedger(dir, "0.1.197");
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
         assert.equal(res.error, undefined);
         assert.deepEqual(res.changed, ["pnpm-lock.yaml"]);
         assert.deepEqual(res.details.map((d) => [d.field, d.before, d.after]), [
             ["specifier", "^0.1.196", "^0.1.197"],
             ["version", "0.1.196", "0.1.197"],
+            ["snapshots: billion-context@0.1.197", "(missing)", "cloned from billion-context@0.1.196"],
+            ["packages: billion-context@0.1.197", "(missing)", "cloned from billion-context@0.1.196"],
         ]);
         const lock = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
         assert.match(lock, /specifier: \^0\.1\.197/);
         assert.match(lock, /version: 0\.1\.197/);
-        assert.ok(lock.includes("billion-context@0.1.196:"), "store bookkeeping sections stay untouched — pnpm reconciles them itself");
+        assert.ok(lock.includes("  billion-context@0.1.196:"), "old packages entry is kept");
+        assert.ok(lock.includes("  billion-context@0.1.196: {}"), "old snapshots entry is kept");
+        assert.ok(lock.includes("  billion-context@0.1.197: {}"), "new snapshots entry resolves the importer");
+        assert.match(lock, /  billion-context@0\.1\.197:\n    resolution: \{integrity: sha512-new==\}/, "new packages entry carries the new hash");
         assert.equal(readFileSync(path.join(dir, "package.json"), "utf8"), before["package.json"], "in-step manifest must not be rewritten");
         assert.deepEqual(dshProfileLedgerFindings(dir), [], "re-audit after convergence must be clean");
     } finally {
@@ -270,12 +281,13 @@ test("#3496: #3160 raw shape — phantom spec + hand-placed copy converge to the
         const dir = makeProfile(root, "phantom", { spec: "^1.2.9", copyVersion: "1.2.9", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
         const kinds = dshProfileLedgerFindings(dir).map((f) => f.kind).sort();
         assert.deepEqual(kinds, ["copy-vs-lock", "manifest-vs-lock"]);
-        const res = convergeDshLedger(dir, "1.2.9");
+        const res = convergeDshLedger(dir, "1.2.9", { integrity: "sha512-new==" });
         assert.equal(res.error, undefined);
         assert.deepEqual(res.changed, ["pnpm-lock.yaml"], "the declaration ADMITS the copy — bili keeps it, converges the record");
         const lock = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
         assert.match(lock, /specifier: \^1\.2\.9/);
         assert.match(lock, /version: 1\.2\.9/);
+        assert.ok(lock.includes("  billion-context@1.2.9: {}"), "the phantom version's snapshots entry is still recorded");
         assert.deepEqual(dshProfileLedgerFindings(dir), [], "ledgers agree — the residual risk (a version the registry lacks) is reported, see the --fix output contract");
     } finally {
         rmrf(root);
@@ -289,7 +301,7 @@ test("#3496: phantom spec + REAL newer copy — manifest AND lockfile converge (
         const dir = makeProfile(root, "full", { spec: "^1.2.9", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
         // copy-vs-manifest is the no-lockfile rung — with a lock present, two rungs fire.
         assert.deepEqual(dshProfileLedgerFindings(dir).map((f) => f.kind), ["copy-vs-lock", "manifest-vs-lock"]);
-        const res = convergeDshLedger(dir, "0.1.197");
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
         assert.equal(res.error, undefined);
         assert.deepEqual([...res.changed].sort(), ["package.json", "pnpm-lock.yaml"]);
         const manifest = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as { dependencies: Record<string, string> };
@@ -354,27 +366,30 @@ test("#3496: peer-suffixed lock version — real drift swaps the version part on
         const findings = dshProfileLedgerFindings(dir);
         assert.deepEqual(findings.map((f) => f.kind), ["copy-vs-lock", "manifest-vs-lock"]);
         assert.equal(findings[0]!.lockVersion, "0.1.196", "findings name the version, not the peer set");
-        const before = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
-        const res = convergeDshLedger(dir, "0.1.197");
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
         assert.equal(res.error, undefined);
         assert.deepEqual(res.changed, ["pnpm-lock.yaml"]);
         assert.deepEqual(res.details.map((d) => [d.field, d.before, d.after]), [
             ["specifier", "^0.1.196", "^0.1.197"],
             ["version", "0.1.196(@types/node@16.9.1)", "0.1.197(@types/node@16.9.1)"],
+            ["snapshots: billion-context@0.1.197(@types/node@16.9.1)", "(missing)", "cloned from billion-context@0.1.196(@types/node@16.9.1)"],
+            ["packages: billion-context@0.1.197", "(missing)", "cloned from billion-context@0.1.196"],
         ]);
         const after = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
-        // Exactly the two billion-context importer lines move; the version line
-        // stays bare (pnpm's own style — no quoting churn) and keeps its suffix.
-        const expected = before
-            .replace("        specifier: ^0.1.196", "        specifier: ^0.1.197")
-            .replace("        version: 0.1.196(@types/node@16.9.1)", "        version: 0.1.197(@types/node@16.9.1)");
-        assert.equal(after, expected);
+        // The two billion-context importer lines move (the version keeps its
+        // peer suffix); the store sections gain the new version's entries so
+        // the importer resolves — the old entries are kept.
+        assert.match(after, /specifier: \^0\.1\.197/);
+        assert.match(after, /version: 0\.1\.197\(@types\/node@16\.9\.1\)/);
+        assert.ok(after.includes("  billion-context@0.1.197(@types/node@16.9.1):"), "new suffixed snapshots entry");
+        assert.match(after, /  billion-context@0\.1\.197:\n    resolution: \{integrity: sha512-new==\}/, "new bare packages entry carries the new hash");
+        assert.ok(after.includes("  billion-context@0.1.196(@types/node@16.9.1):"), "old suffixed snapshots entry is kept");
+        assert.ok(after.includes("  billion-context@0.1.196:"), "old bare packages entry is kept");
         assert.ok(after.includes("        version: 1.2.3(@types/node@16.9.1)"), "another dependency's suffixed version is not ours to touch");
-        assert.ok(after.includes("  billion-context@0.1.196(@types/node@16.9.1):"), "store bookkeeping sections stay untouched (#3570)");
         assert.deepEqual(dshProfileLedgerFindings(dir), [], "re-audit after convergence must be clean");
         // Second pass is a no-op: the suffixed record is already in step.
         const mt = profileMtimes(dir);
-        const again = convergeDshLedger(dir, "0.1.197");
+        const again = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
         assert.deepEqual(again.changed, []);
         assertZeroWrites(dir, profileFiles(dir), mt);
     } finally {
@@ -433,12 +448,13 @@ test("#3496: pnpm v6–v8 top-level nested lockfile converges", () => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-f-"));
     try {
         const dir = makeProfile(root, "v6", { spec: "^1.2.9", copyVersion: "0.1.197", pnpmLock: pnpmLockV6("^0.1.196", "0.1.196") });
-        const res = convergeDshLedger(dir, "0.1.197");
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
         assert.equal(res.error, undefined);
         const lock = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
         assert.match(lock, /specifier: \^0\.1\.197/);
         assert.match(lock, /version: 0\.1\.197/);
-        assert.match(lock, /\/billion-context\/0\.1\.196:/, "packages map untouched");
+        assert.match(lock, /\/billion-context\/0\.1\.196:/, "old packages entry is kept");
+        assert.match(lock, /\/billion-context\/0\.1\.197:\n    resolution: \{integrity: sha512-new==\}/, "new packages entry carries the new hash");
         assert.deepEqual(dshProfileLedgerFindings(dir), []);
     } finally {
         rmrf(root);
@@ -492,7 +508,7 @@ test("#3496: dist-tag spec rides along — declaration kept, lockfile converges"
     try {
         const dir = makeProfile(root, "disttag", { spec: "latest", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
         const before = profileFiles(dir);
-        const res = convergeDshLedger(dir, "0.1.197");
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
         assert.equal(res.error, undefined);
         assert.deepEqual(res.changed, ["pnpm-lock.yaml"]);
         assert.equal(readFileSync(path.join(dir, "package.json"), "utf8"), before["package.json"], "'latest' is the user's declaration — never rewritten");
@@ -510,7 +526,7 @@ test("#3496: admitting range spec — kept, lockfile converges, quoted YAML roun
     const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-j-"));
     try {
         const dir = makeProfile(root, "range", { spec: ">=0.1.0", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
-        const res = convergeDshLedger(dir, "0.1.197");
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
         assert.equal(res.error, undefined);
         const lock = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
         assert.match(lock, /specifier: ">=0\.1\.0"/, "leading '>' is a YAML block indicator — must be quoted");
@@ -526,7 +542,7 @@ test("#3496: bare `*` spec — quoted in the lockfile (YAML alias indicator), ro
     const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-u-"));
     try {
         const dir = makeProfile(root, "star", { spec: "*", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
-        const res = convergeDshLedger(dir, "0.1.197");
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
         assert.equal(res.error, undefined);
         const lock = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
         assert.match(lock, /specifier: "\*"/, "a leading '*' would parse as a YAML alias token — must be quoted");
@@ -558,7 +574,7 @@ test("#3496: exact-style spec keeps exact style when converged", () => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-l-"));
     try {
         const dir = makeProfile(root, "exact", { spec: "0.1.190", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("0.1.190", "0.1.190") });
-        const res = convergeDshLedger(dir, "0.1.197");
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
         assert.equal(res.error, undefined);
         const manifest = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as { dependencies: Record<string, string> };
         assert.equal(manifest.dependencies["billion-context"], "0.1.197", "no caret invented where the user declared none");
@@ -623,6 +639,323 @@ test("#3496: desktop gating — detection excludes by default, includeDesktop re
         assert.deepEqual(dshProfileLedgerFindings(dir), [], "#3224 option A: the in-place writer's lane stays out of passive detection");
         const kinds = dshProfileLedgerFindings(dir, { includeDesktop: true }).map((f) => f.kind);
         assert.deepEqual(kinds, ["copy-vs-lock", "manifest-vs-lock"]);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
+// — #7125: the store sections must move with the importer record ——————————————————
+
+test("#7125: broken lockfile on the desktop profile (importer moved, store not) — invisible to passive detection, repaired by --fix", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i7125-a-"));
+    try {
+        // The exact #7125 shape: the importer record points at 0.1.197 but the
+        // store sections still only hold 0.1.196 — what the pre-fix auto-update
+        // left behind.
+        const brokenLock = [
+            "lockfileVersion: '9.0'",
+            "",
+            "settings:",
+            "  autoInstallPeers: true",
+            "  excludeLinksFromLockfile: false",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^0.1.197",
+            "        version: 0.1.197",
+            "      other-dep:",
+            "        specifier: ^1.2.3",
+            "        version: 1.2.3",
+            "",
+            "packages:",
+            "",
+            "  billion-context@0.1.196:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@0.1.196: {}",
+            "",
+        ].join("\n");
+        const dir = makeProfile(root, "desktop", { spec: "^0.1.197", copyVersion: "0.1.197", pnpmLock: brokenLock });
+        // The record and its resolution data disagree — detected by state read…
+        const state = readDshLedgerState(dir);
+        assert.equal(state.lockVersion, "0.1.197");
+        assert.equal(state.lockStoreBroken, true, "the store sections lack the recorded version's entries");
+        // …and by the audit, but ONLY when the desktop profile is included
+        // (#3224 option A: the in-place writer's lane stays out of passive detection).
+        assert.deepEqual(dshProfileLedgerFindings(dir), []);
+        assert.deepEqual(dshProfileLedgerFindings(dir, { includeDesktop: true }).map((f) => f.kind), ["lockfile-internal"]);
+        // Converging repairs the store WITHOUT moving the importer (already at the target).
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
+        assert.equal(res.error, undefined);
+        assert.deepEqual(res.changed, ["pnpm-lock.yaml"], "only the lockfile changes — manifest and importer are already in step");
+        assert.ok(res.details.some((d) => d.field === "snapshots: billion-context@0.1.197" && d.before === "(missing)"));
+        assert.ok(res.details.some((d) => d.field === "packages: billion-context@0.1.197" && d.before === "(missing)"));
+        assert.ok(!res.details.some((d) => d.field === "specifier" || d.field === "version"), "the importer is untouched");
+        const lock = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
+        assert.match(lock, /billion-context@0\.1\.197:\n    resolution: \{integrity: sha512-new==\}/);
+        assert.match(lock, /billion-context@0\.1\.197: \{\}/);
+        assert.match(lock, /billion-context@0\.1\.196:/, "the old store entry is kept");
+        // Re-audit (includeDesktop) is clean: the record and its resolution data now agree.
+        assert.deepEqual(dshProfileLedgerFindings(dir, { includeDesktop: true }), []);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
+test("#7125: converge without the new integrity fails soft when the source entry carries one — zero writes", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i7125-b-"));
+    try {
+        const dir = makeProfile(root, "nohash", { spec: "^0.1.196", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
+        const before = profileFiles(dir);
+        const beforeMt = profileMtimes(dir);
+        const res = convergeDshLedger(dir, "0.1.197"); // no integrity
+        assert.ok(res.error !== undefined, "the source entry's hash cannot be reused for the new version");
+        assert.ok(res.error!.includes("integrity"), "the failure names the missing integrity");
+        assertZeroWrites(dir, before, beforeMt);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
+test("#7125: dep-map cross-check — declared dep resolved from the store, undeclared dep dropped", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i7125-c-"));
+    try {
+        // The 0.1.196 snapshots entry carries a dep map (other-dep); the on-disk
+        // copy (0.1.197) declares some-dep instead. The store holds a unique
+        // some-dep entry to resolve it from.
+        const lock = [
+            "lockfileVersion: '9.0'",
+            "",
+            "settings:",
+            "  autoInstallPeers: true",
+            "  excludeLinksFromLockfile: false",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^0.1.196",
+            "        version: 0.1.196",
+            "",
+            "packages:",
+            "",
+            "  billion-context@0.1.196:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@0.1.196:",
+            "    dependencies:",
+            "      other-dep: 1.2.3",
+            "",
+            "  some-dep@1.0.0: {}",
+            "",
+        ].join("\n");
+        const dir = makeProfile(root, "deps", { spec: "^0.1.196", copyVersion: "0.1.197", pnpmLock: lock, copyDeps: { dependencies: { "some-dep": "^1.0.0" } } });
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
+        assert.equal(res.error, undefined);
+        const out = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
+        const count = (s: string, sub: string): number => s.split(sub).length - 1;
+        assert.equal(count(out, "other-dep: 1.2.3"), 1, "the undeclared dep is dropped from the cloned entry (kept only in the old one)");
+        assert.equal(count(out, "some-dep: 1.0.0"), 1, "the declared dep is resolved from the store and added once");
+        assert.match(out, /billion-context@0\.1\.197:\n    dependencies:\n      some-dep: 1\.0\.0/);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
+test("#7125: dep-map cross-check — an ambiguous store entry fails soft, zero writes", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i7125-d-"));
+    try {
+        const lock = [
+            "lockfileVersion: '9.0'",
+            "",
+            "settings:",
+            "  autoInstallPeers: true",
+            "  excludeLinksFromLockfile: false",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^0.1.196",
+            "        version: 0.1.196",
+            "",
+            "packages:",
+            "",
+            "  billion-context@0.1.196:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@0.1.196:",
+            "    dependencies:",
+            "      other-dep: 1.2.3",
+            "",
+            "  some-dep@1.0.0: {}",
+            "",
+            "  some-dep@2.0.0: {}",
+            "",
+        ].join("\n");
+        const dir = makeProfile(root, "ambig", { spec: "^0.1.196", copyVersion: "0.1.197", pnpmLock: lock, copyDeps: { dependencies: { "some-dep": "^1.0.0" } } });
+        const before = profileFiles(dir);
+        const beforeMt = profileMtimes(dir);
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
+        assert.ok(res.error !== undefined, "two store candidates for some-dep — cannot pick one");
+        assert.ok(res.error!.includes("some-dep"));
+        assertZeroWrites(dir, before, beforeMt);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
+test("#7125: dep-map cross-check — a surviving entry whose resolution contradicts the new declaration fails soft, zero writes", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i7125-e-"));
+    try {
+        // The 0.1.196 snapshot resolved zod to 4.1.8; the on-disk copy
+        // (0.1.197) declares EXACT 4.6.7 — the dependency's spec changed
+        // between versions without the name or bucket moving. Cloning the old
+        // resolution would record a dep the new manifest contradicts (a frozen
+        // install would faithfully install the wrong zod), so the patch must
+        // refuse instead.
+        const lock = [
+            "lockfileVersion: '9.0'",
+            "",
+            "settings:",
+            "  autoInstallPeers: true",
+            "  excludeLinksFromLockfile: false",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^0.1.196",
+            "        version: 0.1.196",
+            "",
+            "packages:",
+            "",
+            "  billion-context@0.1.196:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@0.1.196:",
+            "    dependencies:",
+            "      zod: 4.1.8",
+            "",
+            "  zod@4.1.8: {}",
+            "",
+        ].join("\n");
+        const dir = makeProfile(root, "depchange", { spec: "^0.1.196", copyVersion: "0.1.197", pnpmLock: lock, copyDeps: { dependencies: { zod: "4.6.7" } } });
+        const before = profileFiles(dir);
+        const beforeMt = profileMtimes(dir);
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
+        assert.ok(res.error !== undefined, "a contradicting cloned resolution must fail the patch");
+        assert.ok(res.error!.includes("zod"), `reason must name the dep: ${res.error}`);
+        assert.ok(res.error!.includes("4.1.8") && res.error!.includes("4.6.7"), `reason must carry both versions: ${res.error}`);
+        assertZeroWrites(dir, before, beforeMt);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
+test("#7125: dep-map cross-check — a surviving entry whose resolution SATISFIES the new declaration clones through", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i7125-f-"));
+    try {
+        // Negative gate: the range spec still admits the old resolution — no
+        // false positive, the clone proceeds as before.
+        const lock = [
+            "lockfileVersion: '9.0'",
+            "",
+            "settings:",
+            "  autoInstallPeers: true",
+            "  excludeLinksFromLockfile: false",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^0.1.196",
+            "        version: 0.1.196",
+            "",
+            "packages:",
+            "",
+            "  billion-context@0.1.196:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@0.1.196:",
+            "    dependencies:",
+            "      mysql2: 3.15.5",
+            "",
+            "  mysql2@3.15.5: {}",
+            "",
+        ].join("\n");
+        const dir = makeProfile(root, "depsat", { spec: "^0.1.196", copyVersion: "0.1.197", pnpmLock: lock, copyDeps: { dependencies: { mysql2: "^3.15.3" } } });
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
+        assert.equal(res.error, undefined, `satisfying resolution must not fail the patch: ${res.error}`);
+        const out = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
+        assert.match(out, /billion-context@0\.1\.197:\n    dependencies:\n      mysql2: 3\.15\.5/);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
+test("#7125: dep-map cross-check — an unjudgeable declared spec (dist-tag) stays silent", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i7125-g-"));
+    try {
+        // Same "err on fewer false positives" discipline as specAdmits: a
+        // dist-tag declaration cannot be semver-checked, so the clone
+        // proceeds as before.
+        const lock = [
+            "lockfileVersion: '9.0'",
+            "",
+            "settings:",
+            "  autoInstallPeers: true",
+            "  excludeLinksFromLockfile: false",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^0.1.196",
+            "        version: 0.1.196",
+            "",
+            "packages:",
+            "",
+            "  billion-context@0.1.196:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@0.1.196:",
+            "    dependencies:",
+            "      some-dep: 2.0.0",
+            "",
+            "  some-dep@2.0.0: {}",
+            "",
+        ].join("\n");
+        const dir = makeProfile(root, "deptest", { spec: "^0.1.196", copyVersion: "0.1.197", pnpmLock: lock, copyDeps: { dependencies: { "some-dep": "latest" } } });
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
+        assert.equal(res.error, undefined, `unjudgeable spec must not fail the patch: ${res.error}`);
     } finally {
         rmrf(root);
         rmrf(__cacheRoot);
@@ -726,7 +1059,7 @@ test("#3496: specAdmits — caret/tilde/exact, loose ^0.x, unjudgeable stays sil
 
 // — bili doctor --fix surface ———————————————————————————————————————————————————————
 
-test("#3496: fixDshLedgers walks every profile, fixes only the drifted, leaves the rest byte-identical", () => {
+test("#3496: fixDshLedgers walks every profile, fixes only the drifted, leaves the rest byte-identical", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-q-"));
     try {
         const wedged = makeProfile(root, "wedged", { spec: "^1.2.9", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
@@ -737,11 +1070,12 @@ test("#3496: fixDshLedgers walks every profile, fixes only the drifted, leaves t
         const beforeHealthyMt = profileMtimes(healthy);
         const beforePinnedMt = profileMtimes(pinned);
 
-        const rows = fixDshLedgers({ ...process.env, DSH_HOME: root });
+        const rows = await fixDshLedgers({ ...process.env, DSH_HOME: root }, { fetchVersionDoc: async () => ({ integrity: "sha512-test==" }) });
         assert.deepEqual(rows.map((r) => r.profile), ["wedged"]);
         const row = rows[0]!;
         assert.deepEqual([...row.changed].sort(), ["package.json", "pnpm-lock.yaml"]);
         assert.ok(row.details.some((d) => d.file === "package.json" && d.before === "^1.2.9" && d.after === "^0.1.197"));
+        assert.ok(row.details.some((d) => d.field === "packages: billion-context@0.1.197"), "the store section is synced so the importer resolves (#7125)");
         assert.deepEqual(row.residualFindings, [], "re-verification after the fix must be clean");
         assert.equal(row.error, undefined);
         assertZeroWrites(healthy, beforeHealthy, beforeHealthyMt);
@@ -753,11 +1087,11 @@ test("#3496: fixDshLedgers walks every profile, fixes only the drifted, leaves t
     }
 });
 
-test("#3496: fixDshLedgers refuses (with a visible reason) when the spec is outside rewrite authority", () => {
+test("#3496: fixDshLedgers refuses (with a visible reason) when the spec is outside rewrite authority", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-r-"));
     try {
         makeProfile(root, "tilde", { spec: "~1.2.9", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
-        const rows = fixDshLedgers({ ...process.env, DSH_HOME: root });
+        const rows = await fixDshLedgers({ ...process.env, DSH_HOME: root }, { fetchVersionDoc: async () => ({ integrity: "sha512-test==" }) });
         assert.equal(rows.length, 1);
         assert.ok(rows[0]!.error?.includes("rewrite authority"));
         assert.ok(rows[0]!.residualFindings.length > 0, "the drift stays reported until the human aligns the declaration");
@@ -767,24 +1101,24 @@ test("#3496: fixDshLedgers refuses (with a visible reason) when the spec is outs
     }
 });
 
-test("#3496: fixDshLedgers fail-soft — dsh home absent or empty yields no rows", () => {
+test("#3496: fixDshLedgers fail-soft — dsh home absent or empty yields no rows", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-s-"));
     try {
-        assert.deepEqual(fixDshLedgers({ ...process.env, DSH_HOME: path.join(root, "never-existed") }), []);
+        assert.deepEqual(await fixDshLedgers({ ...process.env, DSH_HOME: path.join(root, "never-existed") }), []);
         mkdirSync(path.join(root, "empty-home", "profiles"), { recursive: true });
-        assert.deepEqual(fixDshLedgers({ ...process.env, DSH_HOME: path.join(root, "empty-home") }), []);
+        assert.deepEqual(await fixDshLedgers({ ...process.env, DSH_HOME: path.join(root, "empty-home") }), []);
     } finally {
         rmrf(root);
         rmrf(__cacheRoot);
     }
 });
 
-test("#3496: renderLedgerFixReport prints every change and never claims false success", () => {
+test("#3496: renderLedgerFixReport prints every change and never claims false success", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-t-"));
     try {
         assert.match(renderLedgerFixReport([]), /nothing written/);
         makeProfile(root, "wedged", { spec: "^1.2.9", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
-        const rows = fixDshLedgers({ ...process.env, DSH_HOME: root });
+        const rows = await fixDshLedgers({ ...process.env, DSH_HOME: root }, { fetchVersionDoc: async () => ({ integrity: "sha512-test==" }) });
         const text = renderLedgerFixReport(rows);
         assert.match(text, /wedged/);
         assert.match(text, /converged/);

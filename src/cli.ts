@@ -859,7 +859,7 @@ export async function main(): Promise<void> {
                 // #3496: explicit repair pass — the read-only audit above stays
                 // read-only; --fix is the only thing that writes dsh-profile
                 // ledgers, and it prints every change it makes.
-                const fixes = fixDshLedgers();
+                const fixes = await fixDshLedgers(process.env, { resolveProxy: updaterResolveProxy });
                 report.ledgerFixes = fixes;
                 process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report) + "\n" + renderLedgerFixReport(fixes));
                 if (fixes.some((f) => f.error !== undefined || f.residualFindings.length > 0)) process.exitCode = 1;

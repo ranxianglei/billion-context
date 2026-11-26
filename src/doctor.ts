@@ -10,10 +10,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { isPidAlive, listInstances, procMainScript } from "./instance.js";
 import { PLUGIN_AGENTS, UPDATE_CHANNEL, claudeDesktopPresent, detectOpencodeMajor, inspectLanePresence, inspectOpencodeClaudeAgent, isBiliClaudeBaseUrl, opencodeClaudeAgentBaseUrl, type PluginAgent } from "./plugin-install.js";
-import { findInstallDir, fetchRegistryVersion, hostManagedInstall, isGitWorkingTree, isVersionNewer, lastUpdateCheckTime, normalizeUpdateTag, staleInstallStatus } from "./update.js";
+import { findInstallDir, fetchRegistryVersion, fetchVersionDoc, hostManagedInstall, isGitWorkingTree, isVersionNewer, lastUpdateCheckTime, normalizeUpdateTag, staleInstallStatus } from "./update.js";
 import { describeAdvisory, evaluateAdvisories, type AdvisoryEvaluation } from "./advisory.js";
 import { claudeRoutingWarningFile } from "./paths.js";
-import { dshProfileDirs } from "./dsh-channel.js";
+import { DSH_PACKAGE, dshProfileDirs } from "./dsh-channel.js";
 import { convergeDshLedger, dshProfileLedgerFindings, readDshLedgerState, type LedgerChangeDetail, type LedgerFinding } from "./dsh-ledger.js";
 
 type LaneVerdict = "ok" | "stale" | "frozen" | "broken" | "absent";
@@ -218,21 +218,40 @@ export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
  *  skip-condition profiles (local pin, no dep, no copy) get ZERO writes. The
  *  desktop profile IS included here — detection excludes it by design (#3224
  *  option A: bili is its in-place writer), but explicit repair must reach the
- *  very profile where the #3160 incident happened. Pure local file ops; never
- *  throws (dsh never ran → []). */
-export function fixDshLedgers(env: NodeJS.ProcessEnv = process.env): DshLedgerFixRow[] {
+ *  very profile where the #3160 incident happened.
+ *
+ *  #7125: a pnpm store entry needs the target version's SRI hash, so this pass
+ *  does ONE lightweight registry-doc GET per distinct drifted pnpm profile
+ *  (cached per version). When the fetch fails, convergence fails soft with a
+ *  reason and ZERO writes — strictly better than writing an inconsistent
+ *  lockfile. Never throws (dsh never ran → []). */
+export async function fixDshLedgers(
+    env: NodeJS.ProcessEnv = process.env,
+    opts: { resolveProxy?: (url: string) => string | undefined; fetchVersionDoc?: typeof fetchVersionDoc } = {},
+): Promise<DshLedgerFixRow[]> {
     let dirs: string[];
     try {
         dirs = dshProfileDirs(env);
     } catch {
         return [];
     }
+    const fetchDoc = opts.fetchVersionDoc ?? fetchVersionDoc;
+    const docCache = new Map<string, { tarball?: string; integrity?: string; shasum?: string } | undefined>();
     const rows: DshLedgerFixRow[] = [];
     for (const dir of dirs) {
         const profile = path.basename(dir);
         const findingsBefore = dshProfileLedgerFindings(dir, { includeDesktop: true });
         if (findingsBefore.length === 0) continue;
-        const res = convergeDshLedger(dir, readDshLedgerState(dir).copyVersion!);
+        const state = readDshLedgerState(dir);
+        const targetVersion = state.copyVersion!;
+        let integrity: string | undefined;
+        if (state.lockKind === "pnpm" && (state.lockStoreBroken === true || state.lockVersion !== targetVersion)) {
+            if (!docCache.has(targetVersion)) {
+                docCache.set(targetVersion, await fetchDoc({ resolveProxy: opts.resolveProxy }, DSH_PACKAGE, targetVersion));
+            }
+            integrity = docCache.get(targetVersion)?.integrity;
+        }
+        const res = convergeDshLedger(dir, targetVersion, { integrity });
         rows.push({
             profile,
             findingsBefore,
