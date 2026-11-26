@@ -1,13 +1,24 @@
-// #2749: in plugin mode the model's only persistent record of a folded block's
-// summary is the ~200-char display stub hideConsumedCompressCalls writes into
-// the re-sent call args (kernel/src/hide-consumed.ts SUMMARY_STUB_CHARS=200);
-// the full-text acp_summary anchor is stripped there in plugin mode (#1316).
+// #2749: in plugin mode the model's display record of a folded block's summary
+// is what hideConsumedCompressCalls leaves in the re-sent call args
+// (kernel/src/hide-consumed.ts SUMMARY_STUB_CHARS=200); the full-text
+// acp_summary anchor is stripped there in plugin mode (#1316).
 // Asked to summarize again (tier distillation / refold), a model can copy the
 // visible fragment verbatim and submit it as if it were the full summary —
 // minSummaryLength (50) accepts it and a large range folds under the truncated
 // record (worst variant: self-refold silently shrinks the block's canonical
 // summary). applyRanges now rejects any submitted summary that is byte-identical
 // to a currently-visible display stub (exact match only).
+//
+// #6965 re-scope: while the ORIGINATING bare-name call is visible, prune (#4311)
+// skips its block's anchor render — so stubbing that call's args would leave
+// the summary nowhere on the wire. Bare-name active calls now keep FULL args;
+// the display stub survives on ORPHAN bare-name calls (their range was never
+// folded into the cited block, so no anchor renders for them) and on
+// foreign-name carriers (whose host call id is absent from the view, so the
+// anchor DOES render beside them — #336 dedup still holds). The host guard
+// below therefore harvests stubs from orphan-emitted args; the structural band
+// (199/200 chars + U+2026, stream.ts visibleSummaryStubs) can never match the
+// now-visible full summaries.
 //
 // Acceptance mapping (issue #2749):
 //  - criterion 1 (canonical content/hash stable across save → history reduction
@@ -115,6 +126,27 @@ function nextRequestView(ctx: Ctx, callId: string, startRef: string, endRef: str
     return hideConsumedCompressCalls(ctx.session.state, view).messages;
 }
 
+/** #6965 view: originating call (FULL args) + an ORPHAN bare-name call quoting
+ *  the just-folded block with the same long summary. The orphan's range was
+ *  never actually folded under its own id ⇒ no anchor renders for it ⇒ the
+ *  kernel keeps its #336 display stub; quoting the active block exempts it
+ *  from the #3769 orphan sweep. This is the shape of a "stub visible in the
+ *  bare lane" after the re-scope. */
+function orphanStubView(ctx: Ctx, callId: string, startRef: string, endRef: string): CoreMessage[] {
+    const base = nextRequestView(ctx, callId, startRef, endRef);
+    const orphan: CoreMessage = {
+        id: "mc-orph",
+        role: "assistant",
+        contentType: "tool-call",
+        toolName: "compress",
+        toolCallId: "call-orphan",
+        text: JSON.stringify({ content: [{ startId: startRef, endId: endRef, summary: LONG_SUMMARY }] }),
+    };
+    ctx.session.state.messageRefs.byRaw["mc-orph"] = "m00091";
+    ctx.session.state.messageRefs.byRef["m00091"] = "mc-orph";
+    return hideConsumedCompressCalls(ctx.session.state, [...base, orphan]).messages;
+}
+
 test("#2749 canonical integrity pin: full summary survives save → history reduction → next request → full decompress byte-identical", () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     const ctx = makeCtx();
@@ -131,16 +163,17 @@ test("#2749 canonical integrity pin: full summary survives save → history redu
     assert.ok(out.startsWith("[Compressed m00001–m00004 → 1 block(s)"), out.split("\n")[0]);
     // (a) saved canonically in full — no trimming, no truncation.
     assert.equal(storedSummary(ctx.session.state, "b1"), LONG_SUMMARY);
-    // (b) the next request's VISIBLE copy is reduced to the 200-char stub…
+    // (b) #6965: the next request's VISIBLE copy of the originating bare-name
+    //     call keeps the FULL summary — #4311 suppresses the anchor render
+    //     while this call is visible, so stubbing the args would delete the
+    //     summary's only wire carrier (pre-#6965 this asserted STUB_200).
     const visible = nextRequestView(ctx, "call-b1", "m00001", "m00004");
     const visCall = visible.find((m) => m.toolCallId === "call-b1");
     assert.ok(visCall, "kept-visible compress call present in next request view");
     const visEntries = JSON.parse((visCall!.text ?? "").replace(/^[^{]*/, "")) as { content: Array<{ summary?: string }> };
     const visSummary = visEntries.content[0]!.summary!;
-    assert.equal(visSummary, STUB_200, "visible arg reduced to exactly the 200-char stub");
-    assert.equal(visSummary.length, 200);
-    assert.ok(visSummary.endsWith("…"));
-    // …while the canonical block summary is untouched by the reduction.
+    assert.equal(visSummary, LONG_SUMMARY, "visible arg keeps the full summary (#6965)");
+    // …while the canonical block summary is untouched by the outbound view.
     assert.equal(storedSummary(ctx.session.state, "b1"), LONG_SUMMARY, "canonical summary unchanged by outbound reduction");
     // (c) full decompress still restores the original content.
     const dec = resolveDecompress({ blockId: "b1", full: true }, ctx).text;
@@ -160,8 +193,9 @@ test("#2749 rejects a byte-identical stub re-submission; state unchanged, refusa
     ]);
     const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", topic: "T", summary: LONG_SUMMARY }] }, "call-b1"), ctx).text;
     assert.ok(ok.startsWith("[Compressed m00001–m00002 → 1 block(s)"), ok.split("\n")[0]);
-    // Next request: the model sees its own call reduced to the stub.
-    ctx.messages = nextRequestView(ctx, "call-b1", "m00001", "m00002").map((m) => ({ ...m }));
+    // Next request: the model sees its own call with FULL args plus an orphan
+    // twin of the same fold whose args carry the 200-char display stub.
+    ctx.messages = orphanStubView(ctx, "call-b1", "m00001", "m00002").map((m) => ({ ...m }));
     const beforeBlocks = ctx.session.state.blocks.length;
     const beforeSummary = storedSummary(ctx.session.state, "b1");
     // The model "recalls" only what it can see and folds the late tail under it.
@@ -186,8 +220,9 @@ test("#2749 self-refold under the block's own stub is blocked (silent-shrink wor
     ]);
     const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", topic: "T", summary: LONG_SUMMARY }] }, "call-b1"), ctx).text;
     assert.ok(ok.startsWith("[Compressed m00001–m00002 → 1 block(s)"), ok.split("\n")[0]);
-    ctx.messages = nextRequestView(ctx, "call-b1", "m00001", "m00002").map((m) => ({ ...m }));
-    // Re-fold the SAME span submitting the block's own stub as the new summary.
+    // #6965: the originating call's own args keep the full summary; the stub
+    // the model can copy comes from the orphan twin quoting the same block.
+    ctx.messages = orphanStubView(ctx, "call-b1", "m00001", "m00002").map((m) => ({ ...m }));
     const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: STUB_200 }] }), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED"), out.split("\n")[0]);
     assert.ok(out.includes("display stub"), out);
@@ -239,9 +274,11 @@ test("#2749 host harvest tracks kernel-emitted stubs (format-drift tripwire)", (
     ]);
     const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", topic: "T", summary: LONG_SUMMARY }] }, "call-b1"), ctx).text;
     assert.ok(ok.startsWith("[Compressed"), ok.split("\n")[0]);
-    const view = nextRequestView(ctx, "call-b1", "m00001", "m00002");
-    const visCall = view.find((m) => m.toolCallId === "call-b1")!;
-    const visEntries = JSON.parse((visCall.text ?? "").replace(/^[^{]*/, "")) as { content: Array<{ summary?: string }> };
+    // #6965: the stub the harvest tracks is the ORPHAN-emitted one (the
+    // originating bare-name call now keeps full args).
+    const view = orphanStubView(ctx, "call-b1", "m00001", "m00002");
+    const visOrphan = view.find((m) => m.toolCallId === "call-orphan")!;
+    const visEntries = JSON.parse((visOrphan.text ?? "").replace(/^[^{]*/, "")) as { content: Array<{ summary?: string }> };
     const kernelStub = visEntries.content[0]!.summary!;
     // The structural band assumption behind the harvest filter:
     assert.ok(kernelStub.length === 199 || kernelStub.length === 200, `kernel stub length ${kernelStub.length}`);

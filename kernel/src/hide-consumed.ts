@@ -155,6 +155,7 @@ function quotedRangeKeys(text: string | undefined): Set<string> {
 function rewriteCompressText(
   text: string | undefined,
   liveKeys: Set<string>,
+  stub: boolean,
 ): string | null {
   const parsed = parseCallText(text);
   if (!parsed) return null;
@@ -180,18 +181,34 @@ function rewriteCompressText(
 
   if (kept.length === 0) return null;
 
-  return prefix + serializeCompacted(obj, kept, contentWasString).text;
+  // Nothing filtered and no stub: re-serializing would at best be a no-op and
+  // at worst normalize bytes the provider already cached — keep the original.
+  if (kept.length === content.length && !stub) return null;
+
+  return prefix +
+    serializeCompacted(obj, kept, contentWasString, stub).text;
 }
 
-// Live compress-call args duplicate every range's full summary text while the
-// rendered acp_summary message already carries it — on long sessions the
-// duplication alone measured ~22K tokens (billion-context-pi #336). Keep a
-// leading stub for recall; the block remains the durable record.
+// Long-summary compaction of kept compress-call args (#336): where a RENDERED
+// acp_summary anchor rides the wire next to the call, the args duplicate the
+// block's full summary (measured ~22K tokens on long sessions, #336) and a
+// leading stub is enough for recall — the block remains the durable record.
+//
+// Scope (re-scoped by #6965): #4311 suppresses the anchor render exactly while
+// the ORIGINATING bare-name call is visible in the view, so for that call the
+// stub no longer deduplicates against anything — it deletes the summary's ONLY
+// wire carrier (plain-string args, which parseCallText cannot touch, always
+// kept the full text; the JSON-array shape lost it). Bare-name calls therefore
+// keep full summaries in their kept args. Foreign-name carriers (whose host
+// call id never enters prune's visibleCompressCallIds, so the anchor DOES
+// render beside them) and orphan calls (no block ⇒ no anchor ⇒ nothing but
+// tokens at stake) keep the stub.
 const SUMMARY_STUB_CHARS = 200;
 
-function compactEntry(entry: unknown): unknown {
+function compactEntry(entry: unknown, stub: boolean): unknown {
   if (!entry || typeof entry !== "object") return entry;
   const e = entry as Record<string, unknown>;
+  if (!stub) return entry;
   if (typeof e.summary !== "string" || e.summary.length <= SUMMARY_STUB_CHARS)
     return entry;
   return {
@@ -204,10 +221,11 @@ function serializeCompacted(
   obj: Record<string, unknown>,
   content: unknown[],
   contentWasString: boolean,
+  stub: boolean,
 ): { text: string; changed: boolean } {
   let changed = false;
   const compacted = content.map((entry) => {
-    const out = compactEntry(entry);
+    const out = compactEntry(entry, stub);
     if (out !== entry) changed = true;
     return out;
   });
@@ -217,7 +235,10 @@ function serializeCompacted(
   return { text: JSON.stringify({ ...obj, content: outContent }), changed };
 }
 
-function compactCompressText(text: string | undefined): string | null {
+function compactCompressText(
+  text: string | undefined,
+  stub: boolean,
+): string | null {
   const parsed = parseCallText(text);
   if (!parsed) return null;
   const { prefix, obj, content, contentWasString } = parsed;
@@ -225,6 +246,7 @@ function compactCompressText(text: string | undefined): string | null {
     obj,
     content,
     contentWasString,
+    stub,
   );
   return changed ? prefix + out : null;
 }
@@ -399,18 +421,25 @@ export function hideConsumedCompressCalls(
         }
         liveKeys = derived;
       }
+      // #6965: only stub where a rendered anchor rides beside the call (see
+      // the SUMMARY_STUB_CHARS note above): foreign-name carriers and orphan
+      // calls. A visible bare-name call is its block's SOLE full-summary
+      // carrier on the wire — #4311 suppresses the anchor render while it is
+      // visible, so stubbing its args would leave the summary nowhere.
+      const stub =
+        message.toolName !== COMPRESS_TOOL_NAME || info.fate === "orphan";
       if (
         liveKeys &&
         liveKeys.size > 0 &&
         !legacyLiveByCallId.has(message.toolCallId)
       ) {
-        const rewritten = rewriteCompressText(message.text, liveKeys);
+        const rewritten = rewriteCompressText(message.text, liveKeys, stub);
         if (rewritten !== null) {
           result.push({ ...message, text: rewritten });
           continue;
         }
       }
-      const compacted = compactCompressText(message.text);
+      const compacted = compactCompressText(message.text, stub);
       if (compacted !== null) {
         result.push({ ...message, text: compacted });
         continue;

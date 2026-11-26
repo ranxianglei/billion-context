@@ -65,7 +65,7 @@ function parsedContent(text: string | undefined): StubEntry[] {
   return (JSON.parse(text ?? "") as { content: StubEntry[] }).content;
 }
 
-test("fully-live compress call args get their long summaries stubbed", () => {
+test("fully-live BARE-name compress call args keep their full summaries (#6965)", () => {
   const longSummary = "x".repeat(5000);
   const callText = JSON.stringify({
     content: [
@@ -77,13 +77,39 @@ test("fully-live compress call args get their long summaries stubbed", () => {
   const { messages } = hideConsumedCompressCalls(state, [callWith(callText)]);
 
   assert.equal(messages.length, 1);
+  // #6965: while the originating bare-name call is visible, prune (#4311)
+  // suppresses the rendered anchor — the args are the summary's ONLY wire
+  // carrier, so the stub must not apply (it used to, deleting the full text).
+  assert.equal(messages[0]!.text, callText);
+});
+
+test("foreign-name carrier args are still stubbed (rendered anchor dedup, #336)", () => {
+  const longSummary = "y".repeat(5000);
+  const state = liveState(longSummary, "m00001", "m00050");
+  // The block's host call id is NOT in the view (that is why the foreign
+  // carrier exists) — prune renders the anchor, so the carrier's args keep
+  // the #336 stub.
+  const call: CoreMessage = {
+    id: "mc9",
+    role: "assistant",
+    contentType: "tool-call",
+    toolName: "acp_compress",
+    toolCallId: "call-f",
+    text: JSON.stringify({
+      content: [
+        { startId: "m00001", endId: "m00050", summary: longSummary },
+      ],
+    }),
+  };
+
+  const { messages } = hideConsumedCompressCalls(state, [call], (name) =>
+    name === "acp_compress");
+
+  assert.equal(messages.length, 1);
   const content = parsedContent(messages[0]!.text);
   assert.equal(content.length, 1);
   assert.equal(content[0]!.summary!.length, 200);
   assert.ok(content[0]!.summary!.endsWith("…"));
-  assert.ok(content[0]!.summary!.startsWith("xxxx"));
-  assert.equal(content[0]!.topic, "T");
-  assert.equal(content[0]!.startId, "m00001");
 });
 
 test("short summaries are left byte-identical; kept orphans with long summaries are stubbed", () => {
@@ -108,7 +134,7 @@ test("short summaries are left byte-identical; kept orphans with long summaries 
   assert.equal(parsedContent(orphanOut[0]!.text)[0]!.summary!.length, 200);
 });
 
-test("tag-prefixed compress call text is still parsed and stubbed (ref tag precedes the JSON)", () => {
+test("tag-prefixed BARE-name compress call text keeps the full summary (#6965)", () => {
   const longSummary = "z".repeat(3000);
   const state = liveState(longSummary, "m00001", "m00050");
   state.messageRefs.byRaw["mc1"] = "m00010";
@@ -126,7 +152,8 @@ test("tag-prefixed compress call text is still parsed and stubbed (ref tag prece
   const content = JSON.parse(text.slice(text.indexOf("{"))) as {
     content: { summary: string }[];
   };
-  assert.equal(content.content[0]!.summary.length, 200);
+  // Bare-name call visible ⇒ #4311 anchor skip ⇒ no stub (#6965).
+  assert.equal(content.content[0]!.summary.length, 3000);
 });
 
 test("tag-prefixed mixed call: consumed sibling entry is still dropped", () => {
@@ -225,6 +252,7 @@ test("parseCallText handles stringified content arrays and preserves the string 
   }[];
   assert.equal(entries.length, 1);
   assert.equal(entries[0]!.startId, "m1");
-  assert.ok(entries[0]!.summary.length <= 200, "summary stubbed");
-  assert.ok(entries[0]!.summary.endsWith("…"));
+  // Bare-name call: consumed sibling dropped, live entry keeps its full
+  // summary (no stub — #4311 anchor skip makes the args the sole carrier).
+  assert.equal(entries[0]!.summary, "x".repeat(300));
 });
