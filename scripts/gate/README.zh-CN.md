@@ -45,7 +45,7 @@ scripts/gate/bili-gate.sh --config ... --dry-run           # 只打印 docker �
 model,apiKey}`、`model2.{baseUrl,model,apiKey}`(Lane B)、`rev`、`skip`、
 `sourceRepo`、`mirror`(容器 clone 的本地裸 git 镜像——容器零出站,且可走宿主
 git 代理)、`gitProxy`、`npmRegistry`(构建依赖镜像;与容器内车道 registry
-无关)、`turnTimeoutMs`、`agents`(Lane P 集合)、`agentsR`(Lane R 集合,默认 `dsh,pi`;加 `claude` 跑 anthropic wire 车道)、`r.{corpusTokens,window,capRatio,cacheRatio}`、`network`
+无关)、`turnTimeoutMs`、`agents`(Lane P 集合)、`agentsR`(Lane R 集合,默认 `dsh,pi`;加 `claude` 跑 anthropic wire 车道)、`snapBase`(仅 P/R 车道:在 gate 的 bili.json 里打开候选的 egress op-log 平面——写 `rollout.features.egressPlane=true`;`storage.snapBase` 已在 bc51c9445 退役,平面没有按协议 cohort,任何开值 = 整平面开;缺省/`"off"` = 关,gate 行为逐字节不变;用于候选分支验证,如 #6785)、`laneScript`(仅 P 车道:强制指定 harness 脚本副本,如内置 `/gate-tools/plugin-lanes.mjs`——候选 checkout 早于 harness 修复时需要;默认优先用候选自己的 `scripts/gate/plugin-lanes.mjs`,内置副本兜底)、`snapshotRender`(填 `"1"` 在 P/R 车道 bili.json 写 `rollout.features.snapshotRender=true`——配置层,压过 0% rollout 默认;插件模式车道按设计仍由客户端权威)、`r.{corpusTokens,window,capRatio,cacheRatio}`、`network`
 (`host` | `bridge`;bridge 是 Docker Desktop 形态——把配置里的 URL 指向
 `host.docker.internal`)、`outDir`、`keep`。
 
@@ -150,7 +150,7 @@ google=`contents`),防止静默换线假绿;首个出站请求存
     + 每回合死于 ValidationError。整条车道不计入 gate,客户端放出该协议后
     自动转正,脚本不用改。
 
-不进默认 GATE_AGENTS 集,显式加入才跑:`GATE_AGENTS=dsh,dsh-responses,dsh-anthropic,dsh-google,dsh-proxy`。
+其中 `dsh-responses`、`dsh-anthropic`、`dsh-proxy` 不进默认 GATE_AGENTS 集,显式加入才跑(如 `GATE_AGENTS=dsh,dsh-responses,dsh-anthropic,dsh-proxy`);`dsh-google` 在默认集内——客户端表达不了该协议时自动降级 CLIENT-BLOCKED 且不计入统计,所以默认列上它没有代价。
 
 ## 车道流程
 

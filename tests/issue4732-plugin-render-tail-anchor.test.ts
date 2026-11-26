@@ -33,6 +33,7 @@ async function harness() {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = "full";
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY = "1";
     _resetSessionsForTest();
     _resetPluginStateForTest();

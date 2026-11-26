@@ -13,7 +13,7 @@ import { markWsLaneTransport, withFetchTransport } from "./fetch-transport.js";
 import { BILI_HOP_HEADER } from "./server/context-window.js";
 import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { BILI_TUNNEL_HEADER } from "./tunnel-guard.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings, sseEventData } from "./sse-util.js";
 import type { WsBridgeCodec, WsBridgeContext, WsBridgeSession } from "./ws-bridge.js";
 
 type JsonObject = Record<string, unknown>;
@@ -880,30 +880,29 @@ export class ResponsesWsSession implements WsBridgeSession {
                     let buffer = "";
                     for (;;) {
                         const { done, value } = await reader.read();
-                        if (done) break;
-                        buffer += decoder.decode(value, { stream: true });
+                        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
                         if (buffer.length > this.budget) throw new Error("Warmup output buffer limit exceeded");
+                        buffer = done ? finalizeSseLineEndings(buffer) : normalizeSseLineEndings(buffer);
                         for (;;) {
                             const index = buffer.indexOf("\n\n");
                             if (index < 0) break;
                             const block = buffer.slice(0, index);
                             buffer = buffer.slice(index + 2);
-                            for (const line of block.split("\n")) {
-                                if (!line.startsWith("data: ")) continue;
-                                const payload = line.slice(6);
-                                sendFrame(payload);
-                                let frame: unknown;
-                                try { frame = JSON.parse(payload); } catch { continue; }
-                                if (!object(frame)) continue;
-                                if (["response.completed", "response.failed", "response.incomplete", "error"].includes(String(frame.type))) {
-                                    sawTerminal = true;
-                                    // #3342: even a no-generation warmup must establish a usable
-                                    // client checkpoint, so a later previous_response_id
-                                    // continuation resolves instead of throwing not_found.
-                                    if (frame.type === "response.completed" && object(frame.response)) this.history.commit(body, frame.response);
-                                }
+                            const payload = sseEventData(block);
+                            if (payload === null) continue;
+                            sendFrame(payload);
+                            let frame: unknown;
+                            try { frame = JSON.parse(payload); } catch { continue; }
+                            if (!object(frame)) continue;
+                            if (["response.completed", "response.failed", "response.incomplete", "error"].includes(String(frame.type))) {
+                                sawTerminal = true;
+                                // #3342: even a no-generation warmup must establish a usable
+                                // client checkpoint, so a later previous_response_id
+                                // continuation resolves instead of throwing not_found.
+                                if (frame.type === "response.completed" && object(frame.response)) this.history.commit(body, frame.response);
                             }
                         }
+                        if (done) break;
                     }
                     if (!sawTerminal) {
                         this.history.clear();

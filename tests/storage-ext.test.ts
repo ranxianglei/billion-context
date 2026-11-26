@@ -174,7 +174,7 @@ test("v3 databases migrate to v11 in place, idempotently", async () => {
         const migrated = UnifiedStore.open(dbPath);
         try {
             const ver = (migrated as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 11, "open() runs migrateSchema: v3 → v11");
+            assert.equal(ver.user_version, 12, "open() runs migrateSchema: v3 → v12");
             migrated.setKv("probe", "alive", true);
             assert.deepEqual(migrated.getKv("probe", "alive"), true);
             assert.deepEqual(migrated.listSessionIds(), [], "existing v3 content untouched");
@@ -184,7 +184,7 @@ test("v3 databases migrate to v11 in place, idempotently", async () => {
         // Reopening a v11 database is a no-op (idempotent migration).
         const again = UnifiedStore.open(dbPath);
         const ver2 = (again as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-        assert.equal(ver2.user_version, 11);
+        assert.equal(ver2.user_version, 12);
         again.close();
     } finally {
         fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

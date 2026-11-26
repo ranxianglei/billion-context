@@ -166,7 +166,7 @@ test("#4521: a range of pure protected tool pairs is the same no-op class", () =
   );
 });
 
-test("#4521: armed-but-silent nudge window emits a status line naming the highest ref and offered ranges", () => {
+test("#4521/#6928: armed-but-silent nudge window no longer emits a status line", () => {
   const core = createCore();
   const cfg = config();
   const messages = Array.from({ length: 40 }, (_, i) =>
@@ -178,18 +178,16 @@ test("#4521: armed-but-silent nudge window emits a status line naming the highes
   // threshold, no baseline yet) — the banner carries the refs.
   const warm = core.processTurn({ messages, state, config: cfg, tokenCount: 600_000 });
   assert.equal(warm.nudge?.shouldInject, true, "first-sight mass injects");
-  assert.equal(warm.statusLine, undefined, "no status line beside a delivered banner");
+  assert.equal("statusLine" in warm, false, "no statusLine property on the turn result");
   state = warm.state;
 
   // Next turn: growth 10K < 22.5K floor, usage 70% < 75% band → the round
   // stays armed (offered ranges exist) but the banner is withheld — the
-  // window where refs used to go stale in the model's view and compress
-  // calls guessed beyond the highest allocated ref.
+  // window where the #4521 refresh line used to fire on every turn, listing
+  // exactly the below-gate residue the receipt calls "not as fold
+  // suggestions" and ordering the model to fold it (#6928: removed).
   const idle = core.processTurn({ messages, state, config: cfg, tokenCount: 610_000 });
   assert.equal(idle.nudge?.shouldInject, false, `armed-but-silent window, got reason: ${idle.nudge?.reason}`);
   assert.ok((idle.nudge?.compressibleRanges?.length ?? 0) > 0, "plan carries offered ranges");
-  assert.ok(idle.statusLine, "status line emitted in the armed-but-silent window");
-  assert.match(idle.statusLine!, /highest allocated ref m00040/);
-  assert.match(idle.statusLine!, /compressible now: m\d+–m\d+/);
-  assert.match(idle.statusLine!, /never guess them/);
+  assert.equal("statusLine" in idle, false, "no statusLine in the armed-but-silent window (#6928)");
 });

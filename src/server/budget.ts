@@ -4,9 +4,54 @@ import { estimateCoreMessages } from "../preflight.js";
 import { SELF_HEAL_SUPPRESS_CAP_MS, reductionKeyOf } from "../session-self-heal.js";
 import type { Session } from "../session.js";
 import { applyEstimateCalibration } from "../util.js";
-import { outputBudgetField, readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
-export { outputBudgetField, readOutputBudget, writeOutputBudget };
+// #6752: the output-budget field plumbing moved here from side-request.ts —
+// it is generic wire plumbing (used by the clamp, the restore path, and the
+// watermark fastpath), not side-lane logic, and the prepare modules must stay
+// decoupled from the side-lane engine (#1440 P2 cut 2). side-request.ts
+// re-exports these, so its existing importers are untouched.
+export type OutputBudgetField = "max_tokens" | "max_completion_tokens" | "max_output_tokens" | "generationConfig.maxOutputTokens";
+
+/** The declared output budget, proto-agnostically. Gemini nests it under
+ *  `generationConfig` (the dotted field name above), the OpenAI/Anthropic
+ *  families keep it flat, so every reader goes through these two accessors. */
+export function outputBudgetField(parsed: unknown): OutputBudgetField | null {
+    if (!parsed || typeof parsed !== "object") return null;
+    const p = parsed as Record<string, unknown>;
+    for (const field of ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const) {
+        if (typeof p[field] === "number" && (p[field] as number) > 0) return field;
+    }
+    const gen = p.generationConfig;
+    if (gen && typeof gen === "object") {
+        const v = (gen as Record<string, unknown>).maxOutputTokens;
+        if (typeof v === "number" && v > 0) return "generationConfig.maxOutputTokens";
+    }
+    return null;
+}
+
+export function readOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField): number | undefined {
+    if (field !== "generationConfig.maxOutputTokens") {
+        const v = parsed[field];
+        return typeof v === "number" ? v : undefined;
+    }
+    const gen = parsed.generationConfig;
+    if (!gen || typeof gen !== "object") return undefined;
+    const v = (gen as Record<string, unknown>).maxOutputTokens;
+    return typeof v === "number" ? v : undefined;
+}
+
+export function writeOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField, value: number): void {
+    // #2011: output-budget fields are integer-typed on every wire protocol. Coerce at this
+    // sole writer so NO caller can emit a fractional token count — the clamp path already
+    // floors, but this also guards the restore path and any future caller at the type boundary.
+    const tokens = Number.isInteger(value) ? value : Math.floor(value);
+    if (field !== "generationConfig.maxOutputTokens") {
+        parsed[field] = tokens;
+        return;
+    }
+    const gen = parsed.generationConfig;
+    parsed.generationConfig = { ...(gen && typeof gen === "object" ? (gen as Record<string, unknown>) : {}), maxOutputTokens: tokens };
+}
 
 // #453 hard backstop: cap the forwarded output budget so input+output can never
 // exceed the window on request-rebuilding upstreams (vLLM rejects an oversized
@@ -62,7 +107,21 @@ const OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT = 0.25;
 // nudge each turn once usage reaches this — kept under the default 0.75
 // over-limit line so it fills the pre-limit silent climb seen in #453/#14. Pure
 // host-side: renderNudgeText does not depend on shouldInject.
-const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
+export const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
+const DEFAULT_MAX_CONTEXT_LIMIT_PCT = 0.75;
+
+/** Resolve the effective host-side emergency escalation line (#453). Under the
+ *  default over-limit line (0.75), the escalation line sits 5 percentage points
+ *  below it (0.70) to cover the pre-limit silent zone. When an operator raises
+ *  maxContextLimitPct above the default (e.g. 0.78 or 0.85), shift the
+ *  escalation line proportionally (maxContextLimitPct - 0.05) so it never fires
+ *  at hardcoded 0.70 inside the operator's intended quiet band. */
+export function resolveEmergencyEscalationPct(maxContextLimitPct?: number): number {
+    if (typeof maxContextLimitPct === "number" && Number.isFinite(maxContextLimitPct) && maxContextLimitPct > DEFAULT_MAX_CONTEXT_LIMIT_PCT) {
+        return Math.max(EMERGENCY_NUDGE_ESCALATION_PCT, maxContextLimitPct - (DEFAULT_MAX_CONTEXT_LIMIT_PCT - EMERGENCY_NUDGE_ESCALATION_PCT));
+    }
+    return EMERGENCY_NUDGE_ESCALATION_PCT;
+}
 
 /** #2391: a budget view only; never forward this projection. OpenAI tool search
  * defers individual function schemas, while namespace descriptions stay visible.
@@ -169,6 +228,13 @@ export interface ThinkingMassInput {
      *  the inbound body because it captures the proxy-injected ACP content that
      *  was actually billed last turn. Ignored when not a positive finite number. */
     storedOverhead?: number;
+    /** Active per-route estimator scale k̂ (currentCalibrationFactor) + provenance
+     *  so the visible text+overhead baseline is compared against providerInputTokens
+     *  in billed units and the residual is stored back in local-estimate units,
+     *  preventing double multiplication when preflight/output-clamp apply k̂. */
+    calibrationFactor?: number;
+    calibrationOrigin?: string;
+    currentOrigin?: string;
 }
 
 /** Project the hidden thinking mass onto signature-only reasoning messages.
@@ -190,7 +256,11 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
     const overhead = typeof input.storedOverhead === "number" && Number.isFinite(input.storedOverhead) && input.storedOverhead > 0
         ? input.storedOverhead
         : countSystemAndToolsTokens(input.systemText, input.tools);
-    const gap = Math.max(0, input.providerInputTokens - estimateCoreMessages(msgs) - overhead - Math.max(0, input.imageTokens));
+    const effK = applyEstimateCalibration(1, input.calibrationFactor, input.calibrationOrigin, input.currentOrigin);
+    const localBase = estimateCoreMessages(msgs) + overhead;
+    const billedGap = Math.max(0, input.providerInputTokens - localBase * effK - Math.max(0, input.imageTokens));
+    if (billedGap <= 0) return 0;
+    const gap = Math.round(billedGap / effK);
     if (gap <= 0) return 0;
     const totalSig = targets.reduce((s, t) => s + t.sig, 0);
     let assigned = 0;
@@ -406,6 +476,17 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
     return !(typeof minBenefit === "number" && Number.isFinite(minBenefit) && minBenefit > 0 && (b.maxPending ?? 0) < minBenefit);
 }
 
+export function emergencyNudgeForConfig(
+    nudge: NudgeDecision | null | undefined,
+    loopConfig: { compress: { minCompressRange: number }; nudge: { maxContextLimitPct?: number } },
+): boolean {
+    return emergencyNudge(
+        nudge,
+        resolveEmergencyEscalationPct(loopConfig.nudge.maxContextLimitPct),
+        loopConfig.compress.minCompressRange,
+    );
+}
+
 /** #3461 problem 2: backoff for the EMERGENCY override. The pure check above
  * has no cadence of its own — once usage sits over the escalation line it
  * re-arms on EVERY request, so a headless client retrying a doomed request
@@ -427,15 +508,19 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
  * Kernel-driven injections (nudge.shouldInject=true) never pass through here —
  * call sites OR them in BEFORE the emergency arm, so normal cadence is
  * untouched. State lives in session.metadata.emergencyNudgeGate (survives
- * restarts with the snapshot, visible on /__bili/sessions like selfHeal). */
+ * restarts with the snapshot, visible on /__bili/sessions like selfHeal).
+ * The escalation line is config-aware (#7605): resolveEmergencyEscalationPct
+ * keeps the default 0.70 and tracks maxContextLimitPct - 0.05 once an operator
+ * raises the over-limit line above the 0.75 default. */
 export function emergencyNudgeArmed(
     session: Session,
     nudge: NudgeDecision | null | undefined,
     minCompressRange: number,
     tokenCount: number,
     growthStep?: number,
+    maxContextLimitPct?: number,
 ): boolean {
-    if (!emergencyNudge(nudge, undefined, minCompressRange)) return false;
+    if (!emergencyNudge(nudge, resolveEmergencyEscalationPct(maxContextLimitPct), minCompressRange)) return false;
     const now = Date.now();
     const key = reductionKeyOf(session);
     const raw = session.metadata["emergencyNudgeGate"];

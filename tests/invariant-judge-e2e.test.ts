@@ -9,16 +9,7 @@
 //       drop / mid-insertion) — proof the attribution layer has teeth live;
 //   (C) a REAL fold through preflight (tiny window) stays green end-to-end —
 //       including the fold-creating request, which is judged on the FINAL body
-//       (post-preflight) — and post-fold prefix corruption fires (I2 teeth live);
-//   (D) #4408: an AGENT-EXECUTED plugin fold (the host keeps its full history,
-//       bili compacts the outbound and forwards the client's compress pair,
-//       whose receipt text is the recognized carrier) stays green in steady
-//       state — pre-#4408 this shape produced spurious findings on every
-//       request (#4401 mass coverage findings + the pair itself flagged) —
-//       and the frozen prefix keeps its teeth;
-//   (E) #4408: a preflight fold edge with an unconsumable element planted
-//       between the matched prefix and the carrier (the v0.1.209 boundary
-//       residue, floor-3 "@4 / matched 4/5" signature) stays green.
+//       (post-preflight) — and post-fold prefix corruption fires (I2 teeth live).
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -54,7 +45,7 @@ function mulberry32(seed: number): () => number {
 
 type Msg = { role: "user" | "assistant"; content: string };
 
-async function harness(opts: { context?: number; upstreamBehavior?: (body: string, url: string) => unknown | null } = {}) {
+async function harness(opts: { context?: number } = {}) {
   const ctx = opts.context ?? 400000;
   _resetSessionsForTest();
   _resetPluginStateForTest();
@@ -62,25 +53,18 @@ async function harness(opts: { context?: number; upstreamBehavior?: (body: strin
   _setForTest({});
   const store = new SessionStore({ dir: join(root, "sessions"), enabled: false });
   _setStoreForTest(store);
+  const captured: string[] = [];
   const upstream = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
+      captured.push(Buffer.concat(chunks).toString());
       res.writeHead(200, { "content-type": "application/json" });
-      const url = req.url ?? "";
-      // #4408: a test may steer the fixture model per request body (e.g. make it
-      // issue a compress tool call); null falls through to the defaults below.
-      if (opts.upstreamBehavior) {
-        const custom = opts.upstreamBehavior(Buffer.concat(chunks).toString("utf8"), url);
-        if (custom !== null && custom !== undefined) {
-          res.end(JSON.stringify(custom));
-          return;
-        }
-      }
       // Substantive content: preflight compression asks THIS mock for summaries,
       // and the kernel rejects sub-minimum-size summaries (#3842 I2 live path).
       // Wire-aware: the fixture upstream answers in the lane's native shape so
       // anthropic/google traffic exercises their own codecs end to end.
+      const url = req.url ?? "";
       const substantive = `ok ${"lorem ipsum dolor sit amet ".repeat(18)}`;
       if (url.includes("/v1/messages")) {
         res.end(JSON.stringify({ id: "msg_fixture", type: "message", role: "assistant", model: "model-test", content: [{ type: "text", text: substantive }], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 10 } }));
@@ -122,7 +106,7 @@ async function harness(opts: { context?: number; upstreamBehavior?: (body: strin
     const r = await fetch(url, { method: "POST", headers, body });
     assert.equal(r.status, 200, await r.text());
   };
-  return { send, origin, upstreamUrl, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+  return { send, origin, upstreamUrl, captured, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 test("generator: zero false positives across seeded legitimate host behaviors", async () => {
@@ -243,6 +227,146 @@ test("I2 live path: real preflight fold stays green; post-fold corruption fires"
   }
 });
 
+// #4401: the production shape behind the 1104-warns-per-day I1 storm (dsh
+// Desktop long-lived IM-bridge sessions): folds executed through
+// /__bili/plugin/tool, the client re-sending its FULL history including every
+// riding compress pair, and stripKernelSummaries removing the kernel anchor
+// while that pair rides (#1567) — so the outbound carries NO acp_summary
+// marker at all. The armed live judge must read each steady-state request as a
+// clean fold (covered cells excused via host state) and still fire when an
+// uncovered cell goes missing.
+test("#4401 live path: plugin-tool fold + riding pair stays green; uncovered drop fires", async () => {
+  const h = await harness();
+  const seen: JudgeVerdict[] = [];
+  _setInvariantJudgeForTest(true, (v) => seen.push(v));
+  const history: Msg[] = [];
+  try {
+    for (let step = 0; step < 8; step++) {
+      const role: Msg["role"] = history.length % 2 === 0 ? "user" : "assistant";
+      history.push({ role, content: `turn ${step} ${"lorem ipsum dolor sit amet ".repeat(8)}` });
+      await h.send(history.map((m) => ({ ...m })));
+    }
+    assert.equal(seen.filter((v) => !v.ok).length, 0, JSON.stringify(seen.filter((v) => !v.ok).slice(0, 3)));
+
+    // client drives a fold through the plugin tool API (refs stable since turn 1)
+    const foldArgs = { content: [{ startId: "m00001", endId: "m00004", topic: "early turns", summary: "The first four turns discussed lorem ipsum filler in detail: turn 0 asked, turn 1 answered, turn 2 asked again, turn 3 answered with the same lorem ipsum padding repeated eight times per message." }] };
+    const r = await fetch(`${h.origin}/__bili/plugin/tool`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ conversationId: "invariant", tool: "compress", args: foldArgs }) });
+    const j = (await r.json()) as { ok: boolean; result?: string; error?: string };
+    assert.ok(j.ok, `compress rejected: ${r.status} ${j.error ?? ""}`);
+    assert.ok(j.result?.startsWith("[Compressed "), j.result?.slice(0, 120));
+
+    // next request: the client re-sends its FULL history INCLUDING the pair —
+    // the regime where the anchor is stripped and no marker rides the wire
+    const sendWithPair = () => fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-bili-plugin": "fixture", "x-bili-plugin-conversation": "invariant" },
+      body: JSON.stringify({ model: "model-test", max_tokens: 1024, stream: false, messages: [
+        ...history.map((m) => ({ role: m.role, content: m.content })),
+        { role: "assistant", content: null, tool_calls: [{ id: "judge_pair_a", type: "function", function: { name: "compress", arguments: JSON.stringify(foldArgs) } }] },
+        { role: "tool", tool_call_id: "judge_pair_a", content: j.result! },
+      ] }),
+    });
+    const resp = await sendWithPair();
+    const respText = await resp.text();
+    assert.equal(resp.status, 200, respText.slice(0, 300));
+    const last = seen.at(-1);
+    assert.ok(last, "post-fold request must be judged");
+    assert.equal(last!.ok, true, JSON.stringify(last!.violations));
+    assert.equal(last!.folded, true);
+    // 3, not 4: the fold covers turns 0-3, but the kernel's first-user-message
+    // pin (kernel/src/prune.ts, DESIGN.md §8.1) keeps the session's opening
+    // user message on the wire even when covered — it rides as a MATCHED twin,
+    // so only turns 1-3 are covered-exempt.
+    assert.equal(last!.covered, 3, JSON.stringify(last));
+
+    // Teeth: an UNCOVERED cell vanishing from the outbound still fires. Turn 7
+    // is uncovered; the pinned first user message must NOT be used here — it
+    // is covered, so its absence is correctly excused, not a violation. The
+    // fault rides the PAIR shape deliberately: without the pair, #1567's
+    // fail-safe re-carries the anchor and everything behind it goes free.
+    // Exit-core text retains the raw render tag prefix (`<acp …>mNNNNN</acp>\n…`),
+    // so the match is includes-based, not starts-based.
+    _setInvariantJudgeFaultForTest((c) => c.filter((m) => !(m.contentType === "text" && (m.text ?? "").includes("turn 7 "))));
+    const before = seen.filter((v) => !v.ok).length;
+    const faultResp = await sendWithPair();
+    await faultResp.arrayBuffer();
+    assert.ok(seen.filter((v) => !v.ok).length > before, "judge must fire on an uncovered drop");
+  } finally {
+    _setInvariantJudgeFaultForTest(null);
+    _setInvariantJudgeForTest(false);
+    await h.close();
+  }
+});
+
+// #4401/#5866 premise pin: the fixture above folds with a 197-char summary — just
+// under the kernel's 200-char stub threshold — so both halves of the re-sent pair
+// stayed byte-identical and the stub asymmetry was never exercised end to end.
+// With a >200-char summary the outbound call half is the kernel's exact stub while
+// the inbound carries the full text; the armed live judge must still read the
+// steady-state request as a clean fold.
+test("#4401/#5866 live path: >200-char plugin-fold summary is stubbed outbound and still judges green", async () => {
+  const h = await harness();
+  const seen: JudgeVerdict[] = [];
+  _setInvariantJudgeForTest(true, (v) => seen.push(v));
+  const history: Msg[] = [];
+  try {
+    for (let step = 0; step < 8; step++) {
+      const role: Msg["role"] = history.length % 2 === 0 ? "user" : "assistant";
+      history.push({ role, content: `turn ${step} ${"lorem ipsum dolor sit amet ".repeat(8)}` });
+      await h.send(history.map((m) => ({ ...m })));
+    }
+    assert.equal(seen.filter((v) => !v.ok).length, 0, JSON.stringify(seen.filter((v) => !v.ok).slice(0, 3)));
+
+    const foldArgs = { content: [{ startId: "m00001", endId: "m00006", topic: "early turns", summary: "lorem ipsum dolor sit amet ".repeat(16) }] };
+    const foldSummary = foldArgs.content[0]?.summary;
+    assert.equal(typeof foldSummary, "string");
+    assert.ok(foldSummary!.length > 200, `fixture must exceed the stub threshold, got ${foldSummary!.length}`);
+    const r = await fetch(`${h.origin}/__bili/plugin/tool`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ conversationId: "invariant", tool: "compress", args: foldArgs }) });
+    const j = (await r.json()) as { ok: boolean; result?: string; error?: string };
+    assert.ok(j.ok, `compress rejected: ${r.status} ${j.error ?? ""}`);
+    assert.ok(j.result?.startsWith("[Compressed "), j.result?.slice(0, 120));
+
+    // next request: full history INCLUDING the pair — the regime where the anchor
+    // is stripped and no acp_summary marker rides the wire
+    h.captured.length = 0;
+    const resp = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-bili-plugin": "fixture", "x-bili-plugin-conversation": "invariant" },
+      body: JSON.stringify({ model: "model-test", max_tokens: 1024, stream: false, messages: [
+        ...history.map((m) => ({ role: m.role, content: m.content })),
+        { role: "assistant", content: null, tool_calls: [{ id: "judge_pair_b", type: "function", function: { name: "compress", arguments: JSON.stringify(foldArgs) } }] },
+        { role: "tool", tool_call_id: "judge_pair_b", content: j.result! },
+      ] }),
+    });
+    const respText = await resp.text();
+    assert.equal(resp.status, 200, respText.slice(0, 300));
+
+    // The asymmetry really exists on the wire: the forwarded call half is the
+    // kernel's stub, not the client's verbatim args.
+    interface OutToolCall { function?: { name?: string; arguments?: string } }
+    interface OutMsg { tool_calls?: OutToolCall[] }
+    const outBody = [...h.captured].reverse().find((b) => b.includes("judge_pair_b"));
+    assert.ok(outBody, "forwarded pair request captured upstream");
+    const outMsgs = (JSON.parse(outBody!) as { messages?: OutMsg[] }).messages ?? [];
+    const outCall = outMsgs.flatMap((m) => m.tool_calls ?? []).find((tc) => tc.function?.name === "compress");
+    assert.ok(outCall?.function?.arguments, "compress call rides the outbound wire");
+    const sentArgs = JSON.stringify(foldArgs);
+    assert.notEqual(outCall!.function!.arguments, sentArgs, "outbound call half must differ from the client's verbatim args");
+    assert.ok(outCall!.function!.arguments!.includes("\u2026"), "kernel stub ellipsis present on the wire");
+
+    const last = seen.at(-1);
+    assert.ok(last, "post-fold request must be judged");
+    assert.equal(last!.ok, true, JSON.stringify(last!.violations));
+    assert.equal(last!.folded, true);
+    // 5, not 6: the fold covers turns 0-5, but the kernel's first-user-message
+    // pin keeps the session's opening user message on the wire as a MATCHED twin.
+    assert.equal(last!.covered, 5, JSON.stringify(last));
+  } finally {
+    _setInvariantJudgeForTest(false);
+    await h.close();
+  }
+});
+
 // #3938 (PR-A): the judge speaks every wire — the relay chokepoint re-parses the
 // OUTBOUND bytes through the lane's own codec, so each wire needs its own live
 // proof: zero false positives on legitimate growth + teeth on a defect.
@@ -270,124 +394,3 @@ for (const wire of ["anthropic", "google"] as const) {
     }
   });
 }
-
-type ToolCall = { id: string; type: string; function: { name: string; arguments: string } };
-type ChatResp = { choices?: Array<{ message?: { role?: string; content?: string | null; tool_calls?: ToolCall[] } }> };
-
-// #4408 — the blind spot named in the issue: an AGENT-EXECUTED plugin fold.
-// The host keeps its FULL history (folded originals ride every resend, client
-// bytes far exceed the upstream wire) and appends the compress pair; bili
-// compacts the outbound per the session's blocks, and on this wire the
-// compacted view carries NO recognized carrier (the kernel anchor is stripped
-// under the client pair, #1567). Pre-fix the judge read folded=false and
-// flagged every covered message (#4401: 1104 findings/day). Bidirectional
-// (#3617): steady state stays green AND the frozen prefix keeps its teeth.
-test("#4408 agent-executed plugin fold: compacted zero-carrier steady state stays green, frozen prefix keeps teeth", async () => {
-  const conv = "judge-fold-4408";
-  const GROW = 14;
-  const refRe = /\x3c(?:acp|dcp-message-id)[^>]*\x3e\s*(m\d+)\s*\x3c\/(?:acp|dcp-message-id)\x3e/g;
-  let foldArmed = false;
-  const h = await harness({
-    upstreamBehavior: (body) => {
-      if (!body.includes("FOLD-NOW") || foldArmed) return null;
-      const refs = [...body.matchAll(refRe)].map((m) => m[1] ?? "");
-      if (refs.length < GROW + 1) return null;
-      foldArmed = true;
-      const from = refs[1];
-      const to = refs[refs.length - 2];
-      if (!from || !to) return null;
-      return { id: "chat_fold", choices: [{ message: { role: "assistant", content: null, tool_calls: [{ id: "call_fold_1", type: "function", function: { name: "compress", arguments: JSON.stringify({ topic: "judge fold", content: [{ startId: from, endId: to, topic: "judge fold", summary: `Folded middle segment covering incremental turns. ${"Context preserved for continuity. ".repeat(16)}` }] }) } }] }, finish_reason: "tool_calls" }] };
-    },
-  });
-  const seen: JudgeVerdict[] = [];
-  _setInvariantJudgeForTest(true, (v) => seen.push(v));
-  const headers = { "content-type": "application/json", "x-bili-plugin": "fixture", "x-bili-plugin-conversation": conv };
-  const postModel = async (messages: unknown[]): Promise<ChatResp> => {
-    const r = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify({ model: "model-test", messages, max_tokens: 1024, stream: false }) });
-    const raw = await r.text();
-    assert.equal(r.status, 200, raw);
-    return JSON.parse(raw) as ChatResp;
-  };
-  try {
-    const history: unknown[] = [];
-    for (let step = 0; step < GROW; step++) {
-      history.push({ role: step % 2 === 0 ? "user" : "assistant", content: `turn ${step} ${"lorem ipsum dolor sit amet consectetur ".repeat(7)}` });
-      await postModel(history.slice());
-    }
-    assert.equal(seen.filter((v) => !v.ok).length, 0, JSON.stringify(seen.filter((v) => !v.ok).slice(0, 3)));
-    history.push({ role: "user", content: "FOLD-NOW please compress" });
-    const resp = await postModel(history.slice());
-    const tc = resp.choices?.[0]?.message?.tool_calls?.[0];
-    if (!tc || tc.function.name !== "compress") throw new Error(`expected compress tool call, got: ${JSON.stringify(resp)}`);
-    // Host executes the forwarded call through the documented endpoint (what
-    // dsh's shim does — KDD#7: the agent owns compression):
-    const exec = await fetch(`${h.origin}/__bili/plugin/tool`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ conversationId: conv, tool: "compress", args: JSON.parse(tc.function.arguments), toolCallId: tc.id }) });
-    const execJson = (await exec.json()) as { ok?: boolean; error?: string; result?: string };
-    assert.equal(exec.status, 200, JSON.stringify(execJson));
-    assert.equal(execJson.ok, true, JSON.stringify(execJson));
-    assert.ok(typeof execJson.result === "string" && execJson.result.startsWith("[Compressed"), JSON.stringify(execJson));
-    // The host persists the pair and KEEPS the folded originals in its own
-    // history — that is exactly what makes the next outbound compacted while
-    // the inbound still carries everything:
-    history.push({ role: "assistant", content: null, tool_calls: [tc] });
-    history.push({ role: "tool", tool_call_id: tc.id, content: execJson.result });
-    for (let k = 0; k < 3; k++) {
-      history.push({ role: k % 2 === 0 ? "user" : "assistant", content: `post-fold turn ${k} ${"lorem ipsum dolor sit amet consectetur ".repeat(7)}` });
-      await postModel(history.slice());
-    }
-    const bad = seen.filter((v) => !v.ok);
-    assert.equal(bad.length, 0, JSON.stringify(bad.slice(0, 3)));
-    const last = seen[seen.length - 1];
-    assert.ok(last && last.folded, "steady state must be judged folded");
-    assert.ok(last && last.total > last.matched, "covered cells must be walked and exempted, not merely absent from both sides");
-    // Teeth: the exemption must not disable the frozen prefix — mutate the one
-    // live pre-fold cell in the outbound only:
-    const before = seen.length;
-    _setInvariantJudgeFaultForTest((c) => c.map((m, i) => (i === 0 ? { ...m, text: `${m.text ?? ""} MUTATED` } : m)));
-    await postModel(history.slice());
-    assert.ok(seen.slice(before).some((v) => !v.ok), `frozen-prefix mutation must fire: ${JSON.stringify(seen.slice(before))}`);
-  } finally {
-    _setInvariantJudgeFaultForTest(null);
-    _setInvariantJudgeForTest(false);
-    await h.close();
-  }
-});
-
-// #4408 shape B (v0.1.209 claude-lane residue, floor 3): with a real preflight
-// fold, an unconsumable exit element (here: a reasoning item) planted between
-// the matched prefix and the carrier pushes the carrier back one slot, so the
-// first covered boundary cell(s) get walked BEFORE the break fires — pre-fix
-// each such request emitted spurious mid-history-drop findings (the stable
-// "@4 / matched 4-5" signature). Live pin: real session-state coverage flows
-// through the relay; the geometry must stay green.
-test("#4408 preflight fold edge: unconsumable element before the carrier keeps the fold green", async () => {
-  const h = await harness({ context: 8000 });
-  const seen: JudgeVerdict[] = [];
-  _setInvariantJudgeForTest(true, (v) => seen.push(v));
-  try {
-    const history: Msg[] = [];
-    let folded = false;
-    for (let step = 0; step < 80 && !folded; step++) {
-      const role: Msg["role"] = history.length % 2 === 0 ? "user" : "assistant";
-      history.push({ role, content: `turn ${step} ${"lorem ipsum dolor sit amet ".repeat(30)}` });
-      await h.send(history.map((m) => ({ ...m })));
-      folded = seen.some((v) => v.folded);
-    }
-    assert.ok(folded, "expected a preflight fold within 80 turns");
-    assert.equal(seen.filter((v) => !v.ok).length, 0, JSON.stringify(seen.filter((v) => !v.ok).slice(0, 3)));
-    const isSum = (m: CoreMessage) => m.summaryOfBlockId !== undefined || (m.text ?? "").includes("[Compressed conversation section]") || m.id.startsWith("acp_summary");
-    _setInvariantJudgeFaultForTest((c) => {
-      const a = [...c];
-      const s = a.findIndex(isSum);
-      if (s <= 0) return a;
-      a.splice(s, 0, { id: "spacer_reasoning_4408", role: "assistant", contentType: "reasoning", text: "planted thinking spacer" });
-      return a;
-    });
-    await h.send(history.map((m) => ({ ...m })));
-    assert.equal(seen.filter((v) => !v.ok).length, 0, JSON.stringify(seen.filter((v) => !v.ok).slice(0, 3)));
-  } finally {
-    _setInvariantJudgeFaultForTest(null);
-    _setInvariantJudgeForTest(false);
-    await h.close();
-  }
-});
