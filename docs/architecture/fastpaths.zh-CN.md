@@ -37,4 +37,4 @@
 
 ## 相关
 
-[lanes](./lanes.zh-CN.md) · [pipeline](./pipeline.zh-CN.md) · [identity](./identity.zh-CN.md) · [#5643 演进：四条收敛到快照表底座](https://github.com/ranxianglei/billion-context/issues/5643) · `tests/issue5403-watermark-fastpath.test.ts`
+[lanes](./lanes.zh-CN.md) · [pipeline](./pipeline.zh-CN.md) · [identity](./identity.zh-CN.md) · [#5643 演进：四条收敛到快照表底座](https://github.com/ranxianglei/billion-context/issues/5643) · [退役登记](../deprecations.zh-CN.md)（D-lane / `l1_world` / `conversations` 的退役门） · `tests/issue5403-watermark-fastpath.test.ts`
