@@ -46,6 +46,36 @@ import { scanMessagesSpans, type RawSpan } from "./fastpath-scan.js";
 export const PF_COUNT_HEADER = "x-bili-pf-count";
 export const PF_SEQ_HEADER = "x-bili-pf-seq";
 export const PF_TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
+// #5403 family, delta arm: the client claims body.messages is the TAIL SLICE
+// [T-L .. T-1] (anchor = element T-1 of the PREVIOUS turn included), with the
+// full logical count in x-bili-pf-count and per-element ids in x-bili-pf-tail-ids
+// (width exactly L). The server rebuilds the view from the seed prefix cores +
+// the re-parsed slice — the same FastpathHit the full-body lane produces, so
+// every downstream stage (stage0 pin, kernel, ingest, snapshot) is untouched.
+// Any unsatisfiable claim is a 400 re-anchor (DeltaReanchorError): the body
+// CANNOT be processed by the legacy path (the prefix bytes are absent), so the
+// only honest answer is "resend this turn in full form"; the client converges
+// within one round (the same one-round contract as every pf miss).
+export const PF_DELTA_HEADER = "x-bili-pf-delta";
+
+/** Thrown from prepare-openai when a delta request cannot be satisfied —
+ *  handle.ts maps it to the 400 re-anchor response (no pf-seq stamp, mode full). */
+export class DeltaReanchorError extends Error {
+    readonly reason: string;
+    constructor(reason: string) {
+        super(`pf delta re-anchor (${reason})`);
+        this.name = "DeltaReanchorError";
+        this.reason = reason;
+    }
+}
+
+/** A satisfiable delta claim: the verified hit plus the tail-id list it rode on. */
+interface DeltaVerdict {
+    readonly hit: FastpathHit;
+    readonly receivedTailIds?: string[];
+}
+
+const DELTA_WINDOW_MAX = 2048;
 // #5418 v3: UNIDENTIFIED slot marker — an element that carries no host id
 // (native-compaction summary, persona sidecar, foreign shape) travels as "?".
 // Wire literal duplicated per #3482 (agent bundles stay import-free leaves).
@@ -158,6 +188,9 @@ function parseTailIds(raw: string): string[] | null {
 
 /** Test-only accessor (#5826 review): pins tests/msgid-rule-parity.test.ts.
  *  Production callers use parseTailIds directly. */
+/** #7064 §8: the INCREMENTAL pin (stage0) parses the same header it pins
+ *  from — one parser, one rule, parity-pinned via _parseTailIdsForTest. */
+export function parseTailIdsForPin(raw: string): string[] | null { return parseTailIds(raw); }
 export function _parseTailIdsForTest(raw: string): string[] | null { return parseTailIds(raw); }
 
 function readSaved(sessionId: string): PFSavedState | null {
@@ -322,6 +355,18 @@ export function evaluateWatermarkFastpath(
         // histories the 8-element head fragment legitimately reaches INTO the
         // fresh tail region, whose content differs from nothing stashed yet —
         // positions >= coverage are verified by the window conversion itself.
+        // #7064 2×2 (2026-11-20 perf, 100k-session field data): the id field
+        // is EXCLUDED from the comparison. The stash re-seeds from the
+        // post-pin cores (prepare-openai rebinds originalMessages to
+        // s0.pinned before finalizeWatermarkTurn), whose ids live in the
+        // host-msgid/ledger namespace — structurally different from the
+        // fresh content-hash ids openaiToCore mints, on EVERY turn of a
+        // pinned session. Comparing ids therefore produced a permanent
+        // head-prefix-drift miss: the watermark fastpath never hit exactly
+        // for the 2×2 traffic it was designed for, and every turn paid the
+        // full legacy parse + re-anchor. Content drift is still caught: the
+        // same-body comparison below covers role/content, shape/length via
+        // head-shape, and remint-with-identical-bytes is not a rewrite.
         const headElements = Array.isArray((headFragment as { messages?: unknown }).messages)
             ? ((headFragment as { messages: unknown[] }).messages.filter((m): m is { role?: unknown } => typeof m === "object" && m !== null && (m as { role?: unknown }).role !== "system")).length
             : -1;
@@ -332,7 +377,7 @@ export function evaluateWatermarkFastpath(
             for (let hi = 0; hi < seedHead.length; hi++) {
                 const a = headCores.msgs[hi];
                 const b = seedHead[hi];
-                if (a.id !== b.id || JSON.stringify(a) !== JSON.stringify(b)) return miss("head-prefix-drift", false, tailIds);
+                if (headCoreContentDiffers(a, b)) return miss("head-prefix-drift", false, tailIds);
             }
         }
         const windowRaw = openaiToCore(windowFragment as OpenAIRequestBody);
@@ -405,6 +450,21 @@ function rekeyWindowCores(
 function baseOfRawId(id: string): string {
     const m = /^h_[0-9a-f]{16}(?:_\d+)?$/u.exec(id);
     return m === null ? id : id.slice(0, 18);
+}
+
+/** In-place head-edit check, IGNORING the `id` field. In a pinned session
+ *  (pluginLaneServerHistory) the seed cores carry host/ledger msgids while a
+ *  fresh openaiToCore parse mints content-hash ids, so the id namespace differs
+ *  structurally on every turn (#7345) — the id is not a content signal here.
+ *  Content/role/shape inequality is still caught via the full JSON minus the
+ *  id; a remint with identical bytes is not a rewrite. */
+function headCoreContentDiffers(a: CoreMessage, b: CoreMessage): boolean {
+    const strip = (c: CoreMessage): Record<string, unknown> => {
+        const rest: Record<string, unknown> = { ...c };
+        delete rest.id;
+        return rest;
+    };
+    return JSON.stringify(strip(a)) !== JSON.stringify(strip(b));
 }
 
 /** openaiToCore materializes user content-array images as distinct cores
@@ -510,6 +570,125 @@ export function finalizeWatermarkTurn(
     writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt, l: outcome.receivedTailIds });
     headers[PF_SEQ_HEADER] = String(T);
     return headers;
+}
+
+/**
+ * #5403 family, delta arm — evaluate ONE chat-completions request whose client
+ * declared `x-bili-pf-delta: 1` (body.messages = tail slice, full count in
+ * x-bili-pf-count). Returns null when the request does not claim delta (the
+ * full-body lane owns it), {hit} when every gate passes, or {reanchor} when
+ * the claim is unsatisfiable (the caller must 400 — the legacy path cannot
+ * process a prefix-less body).
+ *
+ * Gates (all must hold — any doubt is a re-anchor, never a partial trust):
+ *   rollout pluginDeltaResend on; plugin mode, not title-gen; a seed exists
+ *   for THIS model and is not multimodal-tainted; x-bili-pf-count is an
+ *   integer T; L = T - seed.stampT + 1 satisfies 1 ≤ L ≤ DELTA_WINDOW_MAX;
+ *   body.messages has EXACTLY L elements; x-bili-pf-tail-ids is shape-valid
+ *   with width exactly L and the anchor id continuous with the seed's last
+ *   tail-id list ("?" exempt); the structural scan of the (small) body agrees
+ *   on L; the anchor element re-parses byte-identical (id-excluded, #7064 2×2
+ *   namespace rule) to the stashed core at position stampT-1; no system/developer
+ *   element rides the slice (system lives in the seed's verified head).
+ *
+ * On a hit the window is re-parsed + rekeyed exactly like the full-body hit
+ * (K = stampT-1: the slice INCLUDES the anchor), the anchor's strip counts
+ * stay with the seed ledger (it was stripped on the previous turn — same
+ * convention as the full path's head fragment), and view = stashed prefix
+ * [0..stampT-2] + rekeyed slice = the canonical T-element array.
+ */
+export function evaluateDeltaResend(
+    parsed: OpenAIRequestBody,
+    bodyText: string,
+    req: http.IncomingMessage,
+    session: Session,
+    input: { pluginMode: boolean; titleGen: boolean; model: string },
+    log: (level: string, msg: string) => void,
+): DeltaVerdict | { readonly reanchor: string } | null {
+    const rawDelta = req.headers[PF_DELTA_HEADER];
+    if (rawDelta === undefined) return null;
+    const reanchor = (reason: string): { reanchor: string } => {
+        log("info", `[${session.id}] watermark delta re-anchor (${reason}) — 400, the client resends this turn in full form`);
+        return { reanchor: reason };
+    };
+    if (String(rawDelta) !== "1") return reanchor("delta-bad-value");
+    if (!featureEnabled("pluginDeltaResend")) return reanchor("rollout-off");
+    if (!input.pluginMode || input.titleGen) return reanchor("gate");
+    const tail: unknown[] | null = Array.isArray(parsed.messages) ? parsed.messages : null;
+    const seed = seeds.get(session);
+    if (seed === undefined) return reanchor("unseeded");
+    if (seed.model !== input.model) return reanchor("model");
+    if (seed.multimodal) return reanchor("seeded-multimodal");
+    // Stashed cores are CORE-space: openaiToCore hoists the leading
+    // system/developer run OUT of them, so cores.length = stampT − S (S =
+    // hoisted systems), never positionally indexable by wire element.
+    if (seed.cores.length === 0) return reanchor("seed-empty");
+    const rawStamp = req.headers[PF_COUNT_HEADER];
+    const T = typeof rawStamp === "string" && /^\d+$/.test(rawStamp.trim()) ? parseInt(rawStamp.trim(), 10) : NaN;
+    if (!Number.isInteger(T) || T < 1) return reanchor("no-count");
+    // The body carries the NEW elements [stampT .. T-1] ONLY (KDD#22 wire:
+    // tail-ids carry anchor+new, the body carries what the client is appending).
+    // L = T - stampT; the anchor is element stampT-1, already in the ledger.
+    const L = T - seed.stampT;
+    if (L < 1) return reanchor("behind");
+    if (L > DELTA_WINDOW_MAX) return reanchor("window-too-large");
+    if (tail === null || tail.length !== L) return reanchor("body-length");
+    const rawTailIds = req.headers[PF_TAIL_IDS_HEADER];
+    const tailIds = rawTailIds === undefined ? null : typeof rawTailIds === "string" ? parseTailIds(rawTailIds) : null;
+    // tail-ids = anchor + the L new ids (the real client's steady-state form).
+    if (tailIds === null || tailIds.length !== L + 1) return reanchor("tail-ids-shape");
+    // Anchor continuity: once the previous turn stamped a tail list, the
+    // list MUST open with the id it ended on — the same identity the full
+    // lane's overlap row verifies against the ledger. A tail-less seed (the
+    // first request of the session carries no pf headers by design) has no
+    // stamped prev: the FIRST delta turn opens unverified, and from then on
+    // every list is chained. An edited/deleted last message by construction
+    // forces the full form too (the client's declared anchor id would not
+    // match the ledger on the pin side).
+    const prevKnown = seed.lastTailIds !== undefined && seed.lastTailIds.length > 0 ? seed.lastTailIds[seed.lastTailIds.length - 1] : undefined;
+    if (prevKnown !== undefined && prevKnown !== PF_SLOT_UNKNOWN && tailIds[0] !== prevKnown) return reanchor("tail-ids-prev");
+    const scan = scanMessagesSpans(bodyText, "all");
+    if (scan === null || scan.total !== L) return reanchor("scan-broken");
+    // Strip + convert the new elements exactly as the full-body lane decodes
+    // its window (K = stampT); the anchor's strip counts stay with the seed
+    // ledger (they were counted on the previous turn). Rekey against the FULL
+    // stashed prefix so cluster ordinals and wireIndex match the legacy
+    // single full-body parse.
+    const windowFragment: { messages: unknown } = { messages: tail };
+    const windowCounts = stripRawStage(windowFragment, "openai");
+    const windowRaw = openaiToCore(windowFragment as OpenAIRequestBody);
+    if (windowRaw.systemText.trim() !== "") return reanchor("window-system-head");
+    if (windowRaw.msgs.length !== L) return reanchor("window-shape");
+    const rekeyedWindow = rekeyWindowCores(windowRaw.msgs, seed.stampT, seed.cores);
+    const view = [...seed.cores, ...rekeyedWindow] as CoreMessage[];
+    return {
+        hit: {
+            view,
+            windowCores: rekeyedWindow as CoreMessage[],
+            systemText: seed.systemText,
+            totalT: T,
+            fieldSpans: scan.fieldSpans,
+            windowMessages: windowFragment.messages as unknown[],
+            seedMultimodal: JSON.stringify(tail).includes('"image_url"'),
+            markerCounts: addStripCounts(seed.stripCounts, windowCounts),
+        },
+        receivedTailIds: tailIds,
+    };
+}
+
+/** Stamp-only turn (flag off, #7367): the x-bili-pf-seq heartbeat is the
+ *  client's watermark advance, NOT fastpath-only state. When
+ *  pluginFullResendWatermark is gated off the fastpath never evaluates, so
+ *  finalizeWatermarkTurn never runs and the stamp stops — the client's k2
+ *  freezes and its x-bili-pf-tail-ids grows one id per turn until it crosses
+ *  Node's 16 KB header limit and wedges the session. Emit the stamp whenever
+ *  T is measurable (the structural scan is the same zero-allocation pass the
+ *  fastpath uses) so the client's tail stays bounded. No seed, no saved
+ *  state: the fastpath re-establishes both on its first evaluated turn. */
+export function stampOnlyWatermarkTurn(bodyText: string): Record<string, string> {
+    const scan = scanMessagesSpans(bodyText, "all");
+    if (scan === null) return {};
+    return { [PF_SEQ_HEADER]: String(scan.total) };
 }
 
 /** Drop the in-process seed (e.g. an announced compaction was detected while

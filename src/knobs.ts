@@ -129,21 +129,32 @@ export function replayBaseDelayMs(): number {
     return Number.isFinite(v) && v >= 0 ? v : REPLAY_BASE_DELAY_MS;
 }
 
+/** BILI_PREFLIGHT_EMERGENCY_DIGEST > network.emergencyDigest > false (owner decision
+ *  2026-11-22: the #2383 CPU digest regime is a model-visible hard truncation —
+ *  default off; "1"/"true" env or an explicit file true restores it). */
+export function preflightEmergencyDigestEnabled(): boolean {
+    const envRaw = process.env.BILI_PREFLIGHT_EMERGENCY_DIGEST;
+    if (envRaw !== undefined) return envRaw === "1" || envRaw === "true";
+    return fileNetwork().emergencyDigest === true;
+}
+
 // --- #4204 egress-side 429 throttle governor ---
 
 const THROTTLE_429_MAX_CONSECUTIVE = 5;
 const THROTTLE_429_BASE_DELAY_MS = 2_000;
 const THROTTLE_429_MAX_DELAY_MS = 30_000;
 
-/** BILI_THROTTLE_429 > network.throttle429Enabled > true. The egress 429
- *  governor (#4204) is ON by default: consecutive upstream 429s put sends to
- *  that origin+credential on local backoff instead of amplifying a
- *  concurrency-style provider limit. "0"/"false" restores the legacy
- *  always-forward behavior. Read per request so the switch flips live. */
+/** BILI_THROTTLE_429 > network.throttle429Enabled > false. The egress 429
+ *  governor (#4204) is OFF by default (#6639/#5853): upstream 429s are
+ *  forwarded to the client untouched — the host owns the retry decision —
+ *  and bili only warns in the log. Opt in ("1"/"true" here, or
+ *  network.throttle429Enabled: true) for accounts where host retry storms
+ *  pin a shared concurrency-style provider limit (#4204). Read per request
+ *  so the switch flips live. */
 export function throttle429Enabled(): boolean {
     const envRaw = process.env.BILI_THROTTLE_429;
     if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
-    return fileNetwork().throttle429Enabled !== false;
+    return fileNetwork().throttle429Enabled === true;
 }
 
 /** BILI_THROTTLE_429_MAX_CONSECUTIVE > network.throttle429MaxConsecutive > 5.
@@ -284,12 +295,16 @@ const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
 const DEFAULT_HTTP_OUTBOUND_BYTES = 10 * 1024 * 1024;
-// #5794: the ingest cost band (decoded bytes) that may run the JSON.parse /
-// normalization sweep. 32 MiB ≈ the observed 51.2 MiB/29,619-msg incident
-// (5.5–7.2 s per round, 54.6% of local CPU, 747 s event-loop FATAL); any
-// parseable body ABOVE it is already ≥ ~8M tokens = 5–10× the largest model
-// window, so it can never succeed. 0 = no ingest cap (legacy).
-const DEFAULT_INGEST_BODY_BYTES = 32 * 1024 * 1024;
+// #5794 → #7426: disabled by default (0 = no ingest cap, all lanes). The original
+// 32 MiB cost band was a proxy for "beyond every model window", but on the re-send
+// lanes (opencode/dsh re-send the ENTIRE raw ledger every turn and bili folds it)
+// the RAW inbound byte count says nothing about the real (folded) context — it 413'd
+// a 33.5 MB opencode turn whose folded context was tiny. So the band is OFF for all
+// lanes by default (#7426, user decision). Set BILI_INGEST_BODY_BYTES /
+// network.ingestBodyBytes to re-enable the #5794 cost band if a specific deployment
+// hits the pre-fold parse CPU (51.2 MiB incident: 5.5–7.2 s/round, 54.6% CPU,
+// 747 s event-loop FATAL).
+const DEFAULT_INGEST_BODY_BYTES = 0;
 
 /** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
  *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
@@ -343,12 +358,13 @@ export function limitsHttpOutboundBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_HTTP_OUTBOUND_BYTES;
 }
 
-/** BILI_INGEST_BODY_BYTES > network.ingestBodyBytes > 32 MiB. Cost band for the
- *  JSON.parse + normalization sweep AFTER decode (the 51.2 MiB #5794 body spent
- *  seconds there per round). Bodies above it are refused before the sweep with
- *  an actionable 413; any parseable body over 32 MiB is ≥ ~8M tokens, i.e.
- *  beyond every real model window, so nothing valid is blocked. 0 disables the
- *  ingest cap (legacy parse-everything). */
+/** BILI_INGEST_BODY_BYTES > network.ingestBodyBytes > 0 (disabled). Cost band for
+ *  the JSON.parse + normalization sweep AFTER decode (#5794). DISABLED by default for
+ *  all lanes (#7426): on the re-send lanes (opencode/dsh) the raw inbound byte count is
+ *  not a valid "beyond model window" proxy — it 413'd a 33.5 MB opencode turn whose
+ *  folded context was tiny. Set BILI_INGEST_BODY_BYTES to re-enable the #5794 cost band
+ *  (any parseable body over 32 MiB is ≥ ~8M tokens, beyond every real model window).
+ *  0 = no ingest cap (parse-everything). */
 export function limitsIngestBytes(): number {
     const v = tInt("BILI_INGEST_BODY_BYTES", loadConfigFile().network?.ingestBodyBytes);
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_INGEST_BODY_BYTES;
@@ -990,6 +1006,7 @@ export function fileStorageWalJournalSizeLimit(): number | undefined {
     const v = loadConfigFile().storage?.walJournalSizeLimitBytes;
     return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
 }
+
 
 /** Tiered storage-migration switch (#2671): legacy | shadow | full | sqlite.
  *  Lives here per the env-var discipline — env tier BILI_STORAGE_UNIFIED

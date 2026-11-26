@@ -1,5 +1,5 @@
 import { defaultCountTokens, orderedRefPair, type CompressionBlock } from "acp-kernel";
-import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
+import { blockContentSnapshot, listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
 import { fileNameMatchesId, getStore, isValidRecord, _resetStoreForTest, relPathFor } from "../persist.js";
@@ -16,9 +16,10 @@ type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
+import { displaySessionTitle, firstBlockTopicLead } from "../session-title.js";
 import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
-import { dataDir } from "../paths.js";
+import { dataDir, sessionsDirRelocated } from "../paths.js";
 import { isExternalSummaryBlock } from "../external-summary-marker.js";
 import { readdirSync, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
@@ -27,7 +28,7 @@ import * as path from "node:path";
 /** #1420/#1937: read-only session browsing for the web UI. Merges the LIVE
  *  in-memory pool (bounded — evicted sessions are gone) with the on-disk
  *  corpus. #1937: the disk side is a BOUNDED SUMMARY INDEX — a directory walk
- *  over metadata only, per-file summaries cached by (mtime,size), and
+ *  over metadata only, per-file summaries cached by (mtime,size,price), and
  *  sequential decode of changed/new files whose parsed records are discarded
  *  right after extraction. List/overview paths never construct or retain full
  *  Session objects, so resident memory stays O(#sessions × ~1KB) regardless of
@@ -84,6 +85,9 @@ interface WebSessionSummary {
     hasLedger?: boolean;
     /** Display-name fallback: collapsed lead of the first compression block's topic/summary. */
     firstBlockHint?: string;
+    /** Parent session for a subagent/derived session, when the host stamped
+     *  metadata.derivedFromSessionId (or the legacy derivedFrom key). */
+    parentSessionId?: string;
     /** Which client produced this session: plugin agents stamp metadata.pluginAgent,
      *  non-plugin clients get a sniffed/UA-derived metadata.clientHint (server.ts #1426). */
     clientHint?: string;
@@ -361,6 +365,8 @@ type DiskEntry = {
     savedAt: number;
     /** null = undecodable/corrupt or renamed file — skipped (logged), never fatal. */
     summary: WebSessionSummary | null;
+    /** Resolved rates used to derive this summary's dollar fields. */
+    priceKey?: string;
 };
 
 // #4990: read surface rides the persist process singleton (getStore) — a
@@ -479,14 +485,14 @@ const DATA_DIR_INFRA_ENTRIES = new Set(["ca"]);
 
 /** #2180: a top-level ENOENT means "pristine" — no session file can exist
  *  anywhere — only when the DEFAULT layout is in effect: BILI_SESSIONS_DIR
- *  unset AND the XDG data root either absent or holding ONLY bili's own infra
+ *  unset AND no `sessions.dir` config key AND the XDG data root either absent or holding ONLY bili's own infra
  *  dirs (a fresh install where ensureRootCA() already ran). An explicit
  *  override pointing nowhere, or a data root containing anything else, stays
  *  loud (#1937): silence there would hide a moved/misconfigured path while
  *  real sessions sit elsewhere. */
 function isPristineSessionsRoot(error: unknown): boolean {
     if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") return false;
-    if (process.env.BILI_SESSIONS_DIR) return false;
+    if (sessionsDirRelocated()) return false;
     let entries: string[];
     try {
         statSync(dataDir());
@@ -497,8 +503,9 @@ function isPristineSessionsRoot(error: unknown): boolean {
     return entries.every((entry) => DATA_DIR_INFRA_ENTRIES.has(entry));
 }
 
-/** Single-flight index refresh. Steady-state cost is one stat per file; only
- *  new/changed files (mtime OR size moved) are decoded, one at a time with a
+/** Single-flight index refresh. Steady-state cost is one stat per file and
+ *  one price lookup per distinct model/origin; new/changed files or summaries
+ *  whose resolved prices changed are decoded, one at a time with a
  *  GC checkpoint between files, and the parsed record is dropped immediately
  *  after summary extraction. Top-level walk failure: serve the previous
  *  snapshot when one exists, else propagate (→ HTTP 500, visible in UI) —
@@ -524,6 +531,17 @@ async function refreshIndex(): Promise<void> {
         }
         const prev = byFile ?? new Map<string, DiskEntry>();
         const next = new Map<string, DiskEntry>();
+        const prices = new Map<string, string>();
+        const priceKey = (summary: WebSessionSummary, fresh = false): string => {
+            const modelKey = JSON.stringify([summary.model, summary.upstreamOrigin]);
+            let key = prices.get(modelKey);
+            if (fresh || key === undefined) {
+                const price = livePriceForModel(summary.model, summary.upstreamOrigin);
+                key = JSON.stringify(price ? [price.input, price.output, price.cacheRead, price.cacheWrite] : null);
+                prices.set(modelKey, key);
+            }
+            return key;
+        };
         const covered = liveCoveredPaths(dir);
         // #3199: shadow mode adopts fresh unified rows instead of decoding the
         // files they describe — cold-start cost drops from "decode the whole
@@ -538,13 +556,14 @@ async function refreshIndex(): Promise<void> {
         for (const f of files) {
             if (covered.has(f.abs)) continue;
             const p = prev.get(f.abs);
-            if (p && p.mtimeMs === f.mtimeMs && p.size === f.size) {
+            if (p && p.mtimeMs === f.mtimeMs && p.size === f.size && (!p.summary || p.priceKey === priceKey(p.summary))) {
                 next.set(f.abs, p);
                 continue;
             }
             const claim = claims?.get(path.basename(f.abs));
             if (claim && f.mtimeMs - claim.updatedAt <= SHADOW_ROW_STALE_WINDOW_MS) {
-                next.set(f.abs, { abs: f.abs, mtimeMs: f.mtimeMs, size: f.size, savedAt: claim.updatedAt, summary: summaryFromRow(claim) });
+                const summary = summaryFromRow(claim);
+                next.set(f.abs, { abs: f.abs, mtimeMs: f.mtimeMs, size: f.size, savedAt: claim.updatedAt, summary, priceKey: priceKey(summary, true) });
                 continue;
             }
             decodeCount++;
@@ -561,6 +580,9 @@ async function refreshIndex(): Promise<void> {
                     if (fileNameMatchesId(path.basename(f.abs), rec.id, proto, origin)) {
                         entry.savedAt = typeof rec.savedAt === "number" ? rec.savedAt : Date.now();
                         entry.summary = summaryFromRecord(rec);
+                        // A config reload can run during the file read. Stamp the
+                        // rates used now, not a memo from before that await.
+                        entry.priceKey = priceKey(entry.summary, true);
                     } else {
                         log("warn", `[acp-web] skipping ${relName}: filename does not match record id`);
                     }
@@ -663,10 +685,14 @@ function str(v: unknown): string | undefined {
  *  Host-aware like the pricing editor (`handlePricingGet`). */
 function livePriceForSummary(s: SummarySource): LivePrice | undefined {
     const model = typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? s.metadata.lastModel : undefined;
+    return livePriceForModel(model, s.meta.upstreamOrigin);
+}
+
+function livePriceForModel(model: string | undefined, upstreamOrigin: string | undefined): LivePrice | undefined {
     if (!model) return undefined;
     let host: string | undefined;
-    if (s.meta.upstreamOrigin) {
-        try { host = new URL(s.meta.upstreamOrigin).host; } catch { host = undefined; }
+    if (upstreamOrigin) {
+        try { host = new URL(upstreamOrigin).host; } catch { host = undefined; }
     }
     return resolveBillingPrice(model, host);
 }
@@ -929,14 +955,12 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             ? { w: livePrice.cacheWrite, r: livePrice.cacheRead, q: livePrice.output }
             : undefined;
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
-    let firstBlockHint = "";
-    const fb = s.state.blocks.find((b) => b.topic || b.summary);
-    if (fb && (fb.topic || fb.summary)) {
-        firstBlockHint = String(fb.topic || fb.summary).replace(/\s+/g, " ").trim();
-        if (firstBlockHint.length > 48) firstBlockHint = firstBlockHint.slice(0, 48) + "…";
-    }
+    const firstBlockHint = firstBlockTopicLead(s.state.blocks) ?? "";
     // #1426: which client this session came from (plugin stamp wins, then sniff/UA hint).
     const metaRec = s.metadata as Record<string, unknown>;
+    // Host-stamped parent for a subagent/derived session. New sessions
+    // stamp derivedFromSessionId; keep derivedFrom as the legacy fallback.
+    const parentSessionId = str(metaRec["derivedFromSessionId"]) ?? str(metaRec["derivedFrom"]);
     // #2155: active self-heal state (zombie plugin degrade / nudge
     // suppression) — surface it so the web list can badge the session.
     const shRaw = metaRec["selfHeal"];
@@ -963,12 +987,16 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // #3376: idle cache-keepalive state — memory-only, so live rows only.
     const keepalive = live ? keepaliveStatusFor(s.id) : undefined;
     const best = displayContextBest(s);
+    // Subagent dispatch prompts are identical across children, so an old
+    // set-once title may be pure boilerplate. displaySessionTitle falls back
+    // to the first block topic for display; a real host-provided title wins.
+    const displayTitle = displaySessionTitle(s.meta.hostTitle, s.meta.title, firstBlockHint);
     return {
         id: s.id,
         ...(best ? { contextBest: best } : {}),
         // #2322: a host-provided name (pi /name) outranks the derived
         // first-message title everywhere the row feeds (list, search, export).
-        ...((s.meta.hostTitle || s.meta.title) ? { title: s.meta.hostTitle || s.meta.title } : {}),
+        ...(displayTitle ? { title: displayTitle } : {}),
         // #1426: meta.label is auto-stamped with the session id on many clients —
         // treat label === id as "no title" so lists/details show 无标题 + block hint.
         ...(s.meta.label && s.meta.label !== s.id ? { label: s.meta.label } : {}),
@@ -996,6 +1024,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),
         ...(firstBlockHint ? { firstBlockHint } : {}),
+        ...(parentSessionId ? { parentSessionId } : {}),
         ...(hasFolds ? { grossSaved, netSaved, repayCost, summaryCost, foldCount } : {}),
         ...(typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? { model: s.metadata.lastModel } : {}),
         ...(costUsd !== undefined ? { costUsd } : {}),
@@ -1056,7 +1085,12 @@ async function mergedSummaries(): Promise<WebSessionSummary[]> {
     }
     if (!fromRows) {
         const files = await ensureIndex();
-        for (const e of files.values()) if (e.summary) out.set(e.summary.id, e.summary);
+        // The index already chooses each id's freshest savedAt, then mtime.
+        // Replaying every file here would let directory order pick a stale twin.
+        for (const abs of byId?.values() ?? []) {
+            const summary = files.get(abs)?.summary;
+            if (summary) out.set(summary.id, summary);
+        }
     }
     for (const s of listSessions()) out.set(s.id, summaryOf(s, true));
     return [...out.values()].sort((a, b) => b.lastSeen.localeCompare(a.lastSeen));
@@ -1076,6 +1110,9 @@ interface SessionPageQuery {
     protocol?: string;
     client?: string;
     state?: SessionPageState;
+    /** "top" excludes derived sessions; "child" keeps only sessions with a
+     *  parentSessionId. Unknown values are ignored, like the other facets. */
+    kind?: "top" | "child";
     page?: number;
     pageSize: number;
 }
@@ -1113,6 +1150,8 @@ export async function buildSessionPage(query: SessionPageQuery): Promise<Session
         }
         if (protocol && (s.protocol ?? "unknown").toLowerCase() !== protocol) return false;
         if (client && (s.clientHint ?? "").toLowerCase() !== client) return false;
+        if (query.kind === "top" && s.parentSessionId) return false;
+        if (query.kind === "child" && !s.parentSessionId) return false;
         if (query.state === "live" && (!s.live || s.restored)) return false;
         if (query.state === "history" && s.live && !s.restored) return false;
         return true;
@@ -1729,7 +1768,7 @@ function snapshotRefIndexFor(session: Session, block: CompressionBlock): Map<str
     if (direct.length === 0) return null;
     let content: BlockContent | undefined;
     try {
-        content = session.blockContents.get(block.blockId);
+        content = blockContentSnapshot(session.blockContents, block);
     } catch {
         return null;
     }
@@ -1883,7 +1922,7 @@ export async function buildBlockContent(id: string, blockId: string, view: Block
     if (!block) return { ok: false, reason: "unknown-block" };
     let content: BlockContent | undefined;
     try {
-        content = session.blockContents.get(blockId);
+        content = blockContentSnapshot(session.blockContents, block);
     } catch (error) {
         // #3917: a corrupt/unreadable content store must not 500 the panel —
         // report it as "no snapshot" and let the UI explain.

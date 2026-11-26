@@ -1,6 +1,8 @@
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
+import { parse as jsoncParse, type ParseError } from "jsonc-parser";
 import path from "node:path";
+import { log as loggerLog } from "./logger.js";
 
 /** XDG base-directory paths for billion-context.
  *
@@ -79,11 +81,75 @@ export function dataDir(): string {
     return path.join(xdg("XDG_DATA_HOME", ".local/share"), "billion-context");
 }
 
-/** Sessions dir: one JSON file per session. */
+/** Sessions dir: one JSON file per session. Resolution order: BILI_SESSIONS_DIR
+ *  env (override tier, #2030 precedence) > the `sessions.dir` config-file key
+ *  (relocates index.db + session JSON + CCR stores off a capacity-constrained
+ *  drive — e.g. a Windows C: — without touching the shell environment) > the
+ *  XDG data dir default. The file tier is resolved here (not in config.ts /
+ *  knobs.ts) because paths.ts is the leaf every consumer already imports and
+ *  config.ts imports paths.ts (a back-import would cycle); the parse is
+ *  JSONC-tolerant exactly like parseBiliConfig. */
 export function sessionsDir(): string {
     const env = process.env.BILI_SESSIONS_DIR;
     if (env && env.length > 0) return path.resolve(env);
+    const fromFile = sessionsDirFromConfigFile();
+    if (fromFile !== undefined) return fromFile;
     return path.join(dataDir(), "sessions");
+}
+
+/** True when the sessions dir is off its XDG default (env OR file key set) —
+ *  the "default layout" tests in the web layer must see both relocation
+ *  channels, not just the env one. */
+export function sessionsDirRelocated(): boolean {
+    if (process.env.BILI_SESSIONS_DIR) return true;
+    return sessionsDirFromConfigFile() !== undefined;
+}
+
+let sessionsDirFileCache: { raw: string | undefined; dir: string | undefined } | undefined;
+
+function sessionsDirFromConfigFile(): string | undefined {
+    const file = configFile();
+    let raw: string | undefined;
+    try {
+        raw = readFileSync(file, "utf8").replace(/^\uFEFF/, "");
+    } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+            // A present-but-unreadable config must not crash a boot that would
+            // otherwise run on defaults — same posture as loadConfigFile.
+            loggerLog("warn", `[paths] sessions.dir lookup: could not read config ${file}: ${String(e)}`);
+        }
+        sessionsDirFileCache = { raw: undefined, dir: undefined };
+        return undefined;
+    }
+    const cached = sessionsDirFileCache;
+    if (cached && cached.raw === raw) return cached.dir;
+    let dir: string | undefined;
+    let value: unknown;
+    try {
+        value = JSON.parse(raw);
+    } catch {
+        // Same JSONC fallback as parseBiliConfig (config.ts:2728) — comments
+        // and trailing commas are legal in this file.
+        const errors: ParseError[] = [];
+        value = jsoncParse(raw, errors, { allowTrailingComma: true });
+        if (errors.length > 0) value = undefined;
+    }
+    const entry = (value as { sessions?: { dir?: unknown } } | null)?.sessions?.dir;
+    if (typeof entry === "string" && entry.trim().length > 0) {
+        const resolved = path.resolve(entry.trim());
+        if (existsSync(resolved) && !statSync(resolved).isDirectory()) {
+            // Refuse LOUDLY instead of falling back to the XDG default: the
+            // whole point of this key is moving storage off a full drive — a
+            // silent fallback would recreate the exact disk-capacity failure
+            // the user configured around.
+            throw new Error(`bili: sessions.dir points at a FILE, not a directory: ${resolved} — point it at a directory (or remove the key)`);
+        }
+        dir = resolved;
+    } else if (entry !== undefined && entry !== null) {
+        loggerLog("warn", `[paths] ignoring sessions.dir: expected a non-empty directory path string, got ${JSON.stringify(entry)}`);
+    }
+    sessionsDirFileCache = { raw, dir };
+    return dir;
 }
 
 /** Root cache dir: transient/ephemeral data (update-check throttle, etc.). */
