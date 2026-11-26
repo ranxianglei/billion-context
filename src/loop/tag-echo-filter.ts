@@ -191,7 +191,7 @@ const SELF_CLOSE = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?\\/>");
 // ref): a dead unit NEVER consumes the whitespace around it (it is content),
 // in either mode, so chunk-split parity needs no cross-push whitespace
 // memory.
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "(?:\\s*(?:[\\u2013\\u2014,\\-]\\s*)?(?:m\\d{0,3})?)?\\s*|(?<![\\w>])\\s*m\\d{0,3})$");
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|\x3c\\/[aA][cC][pP][a-zA-Z_]{0,32}|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "(?:\\s*(?:[\\u2013\\u2014,\\-]\\s*)?(?:m\\d{0,3})?)?\\s*|(?<![\\w>])\\s*m\\d{0,3})$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
 // The mangled \x3c<name>=… form counts too: once the `=` is there the tail is
@@ -201,6 +201,42 @@ const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$|\x3c" + NAME + "\\s*=\
 // plus truncated attrs — a truncated imitation close, never prose. Mirrors
 // TRUNC_OPEN on the close side.
 const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
+// #7163: mangled render-tag names that drift BEYOND the acplike letter-mutation
+// set — the field-attested shapes carry a DIGIT or HYPHEN inside the name
+// (`ac1-K`, `a1p`, `ac-p`) or append EXTRA letters/underscores to the acp stem
+// (`acpute_summary`, `acpsummary`, `acpx`). The kernel never emits any of these
+// (its emitter is the paired `<acp tokens=… type=… [time=…]>mNNNNN</acp>` form),
+// so a close/open carrying one is a model imitation by definition. Two shapes:
+// (a) a close whose name is the acp stem plus extra letters/underscores — no
+// legitimate HTML element is ever named `acp…`, so the whole close dies in
+// place; (b) a close OR open that carries an ACP-specific attribute (`tokens=`,
+// `type=`, `time=`) — those attribute names are ACP-protocol-only, never in
+// real HTML, so an attrs-bearing tag with a non-acplike name is echo markup
+// regardless of how the name drifted. The name class stays bounded (≤32) and
+// the attribute must be quoted, so prose like `see m00022</p>` or a genuine
+// `<div tokens="5">`-free document is untouched. Runs in the whole-text pass
+// right after the lone open/close passes; the streaming path reuses the same
+// sources (see stripPass + the flush normalization below).
+//
+// (a) is EXACT ENUMERATION of the field-attested extra-letter shapes, NOT a
+// character-class generalization (#2190 round-3 decontamination): a class like
+// `acp[a-zA-Z_]+` would also swallow the kernel's own `acp_*` text-protocol
+// tags (`</acp_status>`, `</acp_search>`, `</acp_compress>`, `</acp_decompress>`,
+// `</acp_tool_call>` — all `acp` + underscore + word) and real prose words
+// that share the `acp` stem (`acpipe`, #2190 golden). Both are pinned to pass
+// through untouched, so only the attested mangled names are enumerated; a new
+// shape earns inclusion the same way the acplike drift names do (clean
+// attestation → residue audit).
+const MANGLED_EXTRA_NAMES = [
+    "[aA][cC][pP][xX]",
+    "[aA][cC][pP][sS][uU][mM][mM][aA][rR][yY]",
+    "[aA][cC][pP]_[sS][uU][mM][mM][aA][rR][yY]",
+    "[aA][cC][pP][uU][tT][eE]_[sS][uU][mM][mM][aA][rR][yY]",
+];
+const MANGLED_EXTRA_CLOSE = new RegExp("\x3c\\/(?:" + MANGLED_EXTRA_NAMES.join("|") + ")\x3e", "g");
+const ACP_ATTR = "(?:[tT][oO][kK][eE][nN][sS]|[tT][yY][pP][eE]|[tT][iI][mM][eE])";
+const MANGLED_ATTR_CLOSE = new RegExp("\x3c\\/[^<>]{1,32}\\s[^<>]*" + ACP_ATTR + "=\"[^\x3c\x3e\"]*\"[^<>]*\x3e", "g");
+const MANGLED_ATTR_OPEN = new RegExp("\x3c[a-zA-Z0-9_-]{1,16}\\s[^<>]*" + ACP_ATTR + "=\"[^\x3c\x3e\"]*\"[^<>]*\x3e", "g");
 
 // #2348 v4 corpus (owner EMIT-COUNTS): the `</ap` missing-`>` family (213
 // ref-adjacent hits, 4th most common attested shape) ends a turn with a bare
@@ -537,6 +573,9 @@ function stripPass(text: string, dropToolCallEmission: boolean, requestText: str
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(MANGLED_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
+        .replace(MANGLED_EXTRA_CLOSE, "")
+        .replace(MANGLED_ATTR_CLOSE, "")
+        .replace(MANGLED_ATTR_OPEN, "")
     // #2862: dead ref-close units (ref + unterminated close head, mid-text or
     // at EOF). Position matters twice: BEFORE the truncate passes — TRUNC_CLOSE
     // eats the \x3c/name tail first and would leave the bare ref behind (the
@@ -1360,8 +1399,14 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
             // drop it in place, no swallow (a following close dies via
             // LONE_CLOSE on its own).
             const g = MANGLED_OPEN.exec(buf);
+            // #7163: mangled render-tag names beyond the acplike letter set —
+            // digit/hyphen names (ac1-K, a1p) and acp-stem+extra-letters closes
+            // (acpute_summary). Complete units, dropped in place like LONE_CLOSE.
+            const ec = MANGLED_EXTRA_CLOSE.exec(buf);
+            const ac = MANGLED_ATTR_CLOSE.exec(buf);
+            const ao = MANGLED_ATTR_OPEN.exec(buf);
             let m: RegExpExecArray | null = null;
-            for (const cand of [p, s, o, c, r, g]) {
+            for (const cand of [p, s, o, c, r, g, ec, ac, ao]) {
                 if (cand && (m === null || cand.index < m.index)) m = cand;
             }
             // An opening whose attribute list never terminates (see
