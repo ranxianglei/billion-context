@@ -145,7 +145,10 @@ test("guards reject hostile keys and oversize values", async () => {
                 assert.throws(() => store.setSessionExt("s", "bad\u0007key", 1), /control characters/);
                 assert.throws(() => store.setKv("".padEnd(300, "n"), "k", 1), /at most 256/);
                 assert.throws(() => store.setKv("ns", "k", undefined), /JSON-serializable/);
-                assert.throws(() => store.setKv("ns", "k", { big: "x".repeat(5 * 1024 * 1024) }), /4194304 bytes/);
+                // #7378: setKv no longer rejects oversize values — it routes them
+                // to the content CAS (covered in kv-cas-routing.test.ts). The
+                // oversize guard still applies to setSessionExt (inline by design).
+                assert.throws(() => store.setSessionExt("s", "k", { big: "x".repeat(5 * 1024 * 1024) }), /4194304 bytes/);
             } finally {
                 store.closeQuietly();
             }

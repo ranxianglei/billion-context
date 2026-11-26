@@ -39,7 +39,7 @@ import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
 import { mkdirSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
-import { sha256Hex, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
+import { sha256Hex, rewriteArchiveLog, validateExtKey, serializeExtValue, casRefOf, makeCasRef, EXT_VALUE_MAX_BYTES } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
@@ -2475,12 +2475,51 @@ export class MysqlBackend implements StorageBackend {
     async setKv(namespace: string, key: string, value: unknown): Promise<void> {
         validateExtKey(namespace, "namespace");
         validateExtKey(key, "key");
-        const valueJson = serializeExtValue(value);
+        const json = JSON.stringify(value);
+        if (json === undefined) {
+            throw new Error("[storage] extension values must be JSON-serializable (undefined/functions are not)");
+        }
+        // #7378: release the old CAS ref on overwrite (if any) so the refcount
+        // stays balanced — putContent bumps, releaseContent drops it.
+        const [oldRows] = (await this.pool.query(
+            "SELECT value_json FROM kv_store WHERE namespace = ? AND kv_key = ?",
+            [namespace, key],
+        )) as unknown as Row[][];
+        let oldCasHash: string | null = null;
+        if (oldRows.length > 0) {
+            try {
+                oldCasHash = casRefOf(JSON.parse(str(oldRows[0].value_json)));
+            } catch {
+                oldCasHash = null;
+            }
+        }
+        const valueJsonToStore =
+            Buffer.byteLength(json, "utf8") > EXT_VALUE_MAX_BYTES
+                ? makeCasRef(await this.putContent(this.pool, json))
+                : json;
         await this.pool.query(
             "INSERT INTO kv_store (namespace, kv_key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
                 "ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)",
-            [namespace, key, valueJson, Date.now()],
+            [namespace, key, valueJsonToStore, Date.now()],
         );
+        if (oldCasHash !== null) {
+            await this.releaseContent(this.pool, oldCasHash);
+        }
+    }
+
+    /** #7378: resolve a kv value_json — inline JSON, or a CAS ref whose payload
+     *  is fetched from the content CAS. A missing CAS blob (orphan) falls back
+     *  to the ref itself with a warning; it never throws. */
+    private async resolveKvValue(valueJson: string): Promise<unknown> {
+        const parsed = JSON.parse(valueJson);
+        const hash = casRefOf(parsed);
+        if (hash === null) return parsed;
+        const content = await this.getContent(this.pool, hash);
+        if (content === null) {
+            loggerLog("warn", `[#7378] kv CAS blob missing for hash ${hash} — returning the ref as-is (orphan; the payload is lost)`);
+            return parsed;
+        }
+        return JSON.parse(content);
     }
 
     async getKv(namespace: string, key: string): Promise<unknown> {
@@ -2490,7 +2529,7 @@ export class MysqlBackend implements StorageBackend {
             "SELECT value_json FROM kv_store WHERE namespace = ? AND kv_key = ?",
             [namespace, key],
         )) as unknown as Row[][];
-        return rows.length === 0 ? undefined : JSON.parse(str(rows[0].value_json));
+        return rows.length === 0 ? undefined : this.resolveKvValue(str(rows[0].value_json));
     }
 
     async listKv(namespace?: string, keyPrefix?: string): Promise<{ namespace: string; key: string; value: unknown; updatedAt: number }[]> {
@@ -2511,16 +2550,33 @@ export class MysqlBackend implements StorageBackend {
             (where.length > 0 ? " WHERE " + where.join(" AND ") : "") +
             " ORDER BY namespace, kv_key";
         const [rows] = (await this.pool.query(sql, args)) as unknown as Row[][];
-        return rows.map((r) => ({ namespace: str(r.namespace), key: str(r.kv_key), value: JSON.parse(str(r.value_json)), updatedAt: num(r.updated_at) }));
+        return Promise.all(
+            rows.map(async (r) => ({ namespace: str(r.namespace), key: str(r.kv_key), value: await this.resolveKvValue(str(r.value_json)), updatedAt: num(r.updated_at) })),
+        );
+    }
+
+    /** #7378: release the CAS ref a kv row holds (if any) before it is deleted. */
+    private async releaseKvCasRef(valueJson: string | undefined): Promise<void> {
+        if (valueJson === undefined) return;
+        try {
+            const hash = casRefOf(JSON.parse(valueJson));
+            if (hash !== null) await this.releaseContent(this.pool, hash);
+        } catch {
+            /* unparseable row — nothing to release */
+        }
     }
 
     async deleteKv(namespace: string, key?: string): Promise<number> {
         validateExtKey(namespace, "namespace");
         if (key !== undefined) validateExtKey(key, "key");
         if (key === undefined) {
+            const [rows] = (await this.pool.query("SELECT value_json FROM kv_store WHERE namespace = ?", [namespace])) as unknown as Row[][];
+            for (const r of rows) await this.releaseKvCasRef(str(r.value_json));
             const [r] = (await this.pool.query("DELETE FROM kv_store WHERE namespace = ?", [namespace])) as unknown as [{ affectedRows: number }, unknown];
             return r.affectedRows;
         }
+        const [rows] = (await this.pool.query("SELECT value_json FROM kv_store WHERE namespace = ? AND kv_key = ?", [namespace, key])) as unknown as Row[][];
+        if (rows.length > 0) await this.releaseKvCasRef(str(rows[0].value_json));
         const [r] = (await this.pool.query("DELETE FROM kv_store WHERE namespace = ? AND kv_key = ?", [namespace, key])) as unknown as [{ affectedRows: number }, unknown];
         return r.affectedRows;
     }

@@ -428,7 +428,7 @@ export interface IngestSessionInput {
  *  namespace by convention like "r3:" / "web:" / "lane:"), hostile by
  *  accident is what we guard, not hostile by design. */
 const EXT_KEY_MAX = 256;
-const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
+export const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
 
 export function validateExtKey(value: string, what: string): void {
     if (typeof value !== "string" || value.length === 0 || value.length > EXT_KEY_MAX) {
@@ -451,6 +451,24 @@ export function serializeExtValue(value: unknown): string {
         throw new Error(`[storage] extension value exceeds ${EXT_VALUE_MAX_BYTES} bytes — store large payloads in the content CAS instead`);
     }
     return json;
+}
+
+/** #7378: when a kv value exceeds the inline cap, the kv row stores a small
+ *  CAS ref and the payload lives in the content CAS (refcount-managed, so GC
+ *  and delete-on-zero keep it leak-free). The hash is validated as 64 lowercase
+ *  hex before resolution so a user value that happens to match the shape is not
+ *  misread as a ref. */
+const CAS_REF_KEY = "$biliCas";
+const CAS_HASH_RE = /^[0-9a-f]{64}$/;
+
+export function casRefOf(value: unknown): string | null {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const ref = (value as Record<string, unknown>)[CAS_REF_KEY];
+    return typeof ref === "string" && CAS_HASH_RE.test(ref) ? ref : null;
+}
+
+export function makeCasRef(hash: string): string {
+    return JSON.stringify({ [CAS_REF_KEY]: hash });
 }
 
 /** Escapes LIKE metacharacters for the ESCAPE '\\' clause used by listKv. */
@@ -3827,13 +3845,36 @@ export class UnifiedStore {
     setKv(namespace: string, key: string, value: unknown): void {
         validateExtKey(namespace, "namespace");
         validateExtKey(key, "key");
-        const valueJson = serializeExtValue(value);
-        this.db
-            .prepare(
-                "INSERT INTO kv_store (namespace, key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
-                    "ON CONFLICT (namespace, key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
-            )
-            .run(namespace, key, valueJson, Date.now());
+        const json = JSON.stringify(value);
+        if (json === undefined) {
+            throw new Error("[storage] extension values must be JSON-serializable (undefined/functions are not)");
+        }
+        this.db.transaction(() => {
+            // #7378: release the old CAS ref on overwrite (if any) so the refcount
+            // stays balanced — putContent bumps, releaseContent drops it.
+            const oldRow = this.db
+                .prepare("SELECT value_json FROM kv_store WHERE namespace = ? AND key = ?")
+                .get(namespace, key) as { value_json: string } | undefined;
+            let oldCasHash: string | null = null;
+            if (oldRow !== undefined) {
+                try {
+                    oldCasHash = casRefOf(JSON.parse(oldRow.value_json));
+                } catch {
+                    oldCasHash = null;
+                }
+            }
+            const valueJsonToStore =
+                Buffer.byteLength(json, "utf8") > EXT_VALUE_MAX_BYTES ? makeCasRef(this.putContent(json)) : json;
+            this.db
+                .prepare(
+                    "INSERT INTO kv_store (namespace, key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
+                        "ON CONFLICT (namespace, key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+                )
+                .run(namespace, key, valueJsonToStore, Date.now());
+            if (oldCasHash !== null) {
+                this.releaseContent(oldCasHash);
+            }
+        });
     }
 
     getKv(namespace: string, key: string): unknown {
@@ -3842,7 +3883,7 @@ export class UnifiedStore {
         const row = this.db
             .prepare("SELECT value_json FROM kv_store WHERE namespace = ? AND key = ?")
             .get(namespace, key) as { value_json: string } | undefined;
-        return row === undefined ? undefined : JSON.parse(row.value_json);
+        return row === undefined ? undefined : this.resolveKvValue(row.value_json);
     }
 
     listKv(namespace?: string, keyPrefix?: string): { namespace: string; key: string; value: unknown; updatedAt: number }[] {
@@ -3864,7 +3905,19 @@ export class UnifiedStore {
             " ORDER BY namespace, key";
         return (
             this.db.prepare(sql).all(...(args as never[])) as { namespace: string; key: string; value_json: string; updated_at: number }[]
-        ).map((r) => ({ namespace: r.namespace, key: r.key, value: JSON.parse(r.value_json), updatedAt: r.updated_at }));
+        ).map((r) => ({ namespace: r.namespace, key: r.key, value: this.resolveKvValue(r.value_json), updatedAt: r.updated_at }));
+    }
+
+    /** #7378: release the CAS ref a kv row holds (if any) before it is deleted,
+     *  so the refcount drops and delete-on-zero can reclaim the blob. */
+    private releaseKvCasRef(valueJson: string | undefined): void {
+        if (valueJson === undefined) return;
+        try {
+            const hash = casRefOf(JSON.parse(valueJson));
+            if (hash !== null) this.releaseContent(hash);
+        } catch {
+            /* unparseable row — nothing to release */
+        }
     }
 
     /** Deletes one key of a namespace, or the whole namespace when the key
@@ -3873,9 +3926,15 @@ export class UnifiedStore {
     deleteKv(namespace: string, key?: string): number {
         validateExtKey(namespace, "namespace");
         if (key === undefined) {
+            const rows = this.db.prepare("SELECT value_json FROM kv_store WHERE namespace = ?").all(namespace) as { value_json: string }[];
+            for (const r of rows) this.releaseKvCasRef(r.value_json);
             return Number(this.db.prepare("DELETE FROM kv_store WHERE namespace = ?").run(namespace).changes);
         }
         validateExtKey(key, "key");
+        const row = this.db
+            .prepare("SELECT value_json FROM kv_store WHERE namespace = ? AND key = ?")
+            .get(namespace, key) as { value_json: string } | undefined;
+        this.releaseKvCasRef(row?.value_json);
         return Number(this.db.prepare("DELETE FROM kv_store WHERE namespace = ? AND key = ?").run(namespace, key).changes);
     }
 
@@ -4191,6 +4250,22 @@ export class UnifiedStore {
             | undefined;
         if (!row) return null;
         return Buffer.from(row.bytes).toString("utf8");
+    }
+
+    /** #7378: resolve a kv value_json — inline JSON, or a CAS ref whose payload
+     *  is fetched from the content CAS. A missing CAS blob (orphan) falls back
+     *  to the ref itself with a warning; it never throws, so a single corrupt
+     *  row cannot break the whole hydrate. */
+    private resolveKvValue(valueJson: string): unknown {
+        const parsed = JSON.parse(valueJson);
+        const hash = casRefOf(parsed);
+        if (hash === null) return parsed;
+        const content = this.getContent(hash);
+        if (content === null) {
+            loggerLog("warn", `[#7378] kv CAS blob missing for hash ${hash} — returning the ref as-is (orphan; the payload is lost)`);
+            return parsed;
+        }
+        return JSON.parse(content);
     }
 
     /** Scalar drift arbitration without reading or decoding block CAS views.
