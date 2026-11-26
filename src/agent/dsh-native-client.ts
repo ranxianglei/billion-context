@@ -205,7 +205,10 @@ function parseCtxStatus(raw: unknown): CtxStatus | undefined {
         panelPresent: o.panel !== undefined,
         sessionId: typeof o.sessionId === "string" && o.sessionId.length > 0 ? o.sessionId : null,
         conversationId: typeof o.conversationId === "string" && o.conversationId.length > 0 ? o.conversationId : null,
-        viaFallback: o.viaFallback === true,
+        // #6968: the wire key is `fallback` (src/plugin.ts handlePluginStatus),
+        // not `viaFallback` — the internal variable name. Reading the wrong
+        // key made sessionOurs a constant true and the ownership gate dead.
+        viaFallback: o.fallback === true,
     };
 }
 
