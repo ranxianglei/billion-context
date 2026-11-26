@@ -742,7 +742,7 @@ export function screenRecommendedUnits(
   state: CompressionState,
   config: Config,
   protectedRefs: Set<string>,
-  /** #7729: inherited from createCore's Ports. Omitted = the screen's legacy
+  /** #7791: inherited from createCore's Ports. Omitted = the screen's legacy
    *  `console.warn` leg, so direct callers keep working unchanged. */
   warn: WarnSink = consoleWarnSink,
 ): CompressibleRange[] {
@@ -838,7 +838,7 @@ export function screenRecommendedUnits(
 
 export type WarnSink = (message: string) => void;
 
-/** The pre-#7729 console leg, named so guarded files can reference it without
+/** The pre-#7791 console leg, named so guarded files can reference it without
  *  an in-file `console` access (verif/subset-guard.ts treats console as an
  *  environment read; the sink itself is an injected, uninterpreted port). */
 export const consoleWarnSink: WarnSink = (message: string) => console.warn(message);
@@ -849,7 +849,7 @@ export const consoleWarnSink: WarnSink = (message: string) => console.warn(messa
 // production incident produced 28 no-range events/day). Exported for the
 // recommend pipeline node's funnel-zero warn (same channel, same budget).
 //
-// #7729: the counter is keyed by SINK, not by module. It used to be a plain
+// #7791: the counter is keyed by SINK, not by module. It used to be a plain
 // module global, so two cores in one process (tests, or a host that keeps a
 // second core alive) shared one budget and each could silence the other's
 // diagnostics.

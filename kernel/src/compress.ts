@@ -77,7 +77,7 @@ import type {
 
 export interface Ports {
   countTokens?: (text: string) => number;
-  /** #7729: durable sink for the kernel's own mid-turn diagnostics (screen
+  /** #7791: durable sink for the kernel's own mid-turn diagnostics (screen
    *  funnel drops, config-validation warnings). The kernel stays I/O-free, so
    *  it used to reach the outside world through `console.warn` — and hosts
    *  that EMBED the kernel inside an interactive agent process (pi/omp/dsh
@@ -85,7 +85,7 @@ export interface Ports {
    *  appending kernel diagnostics to the input-box line (#2827/#5706/#5940
    *  are the same defect class from other sources). Hosts now inject a sink
    *  and route these lines into their own durable log. Omitted = legacy
-   *  `console.warn` (CLI hosts, tests) — byte-identical to pre-#7729 output. */
+   *  `console.warn` (CLI hosts, tests) — byte-identical to pre-#7791 output. */
   warn?: (message: string) => void;
   /** #4313 (toggle, PR #5236): enable immutable message timestamps — first-
    *  sight stamp minting into state.tsStamps and the <acp> tag's time
@@ -357,7 +357,7 @@ function applyRefolds(input: {
 
 export function createCore(ports: Ports = {}): CompressionCore {
   const countTokens = ports.countTokens ?? defaultCountTokens;
-  // #7729: one diagnostic sink per core. Hosts that embed the kernel inside an
+  // #7791: one diagnostic sink per core. Hosts that embed the kernel inside an
   // interactive agent process inject their durable-log writer here; everything
   // else keeps the byte-identical `console.warn` behavior.
   const warn: WarnSink = ports.warn ?? consoleWarnSink;
@@ -1544,7 +1544,7 @@ const createRecommendNode = (warn: WarnSink): PipelineNode => ({
     // counts collectible material ("collectible>0 yet ranges=0" was
     // undiagnosable from the host side for a full night). Warn (budgeted)
     // with the stage-by-stage numbers so the killing stage is named directly.
-    // #7729: only an UNEXPLAINED zeroing is a diagnostic. When no segment clears
+    // #7791: only an UNEXPLAINED zeroing is a diagnostic. When no segment clears
     // the merge gate there is nothing to advertise and "host sees no-ranges" is
     // the correct, everyday outcome of a short conversation — warning there made
     // every ordinary turn of every short session emit an [acp-kernel] line (the

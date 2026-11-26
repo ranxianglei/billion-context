@@ -1,4 +1,4 @@
-// #7729: kernel mid-turn diagnostics must be routable OFF the process console,
+// #7791: kernel mid-turn diagnostics must be routable OFF the process console,
 // and the funnel-zero diagnostic must only fire for an UNEXPLAINED zeroing.
 //
 // Two defect layers pinned here, both directions (#3617 gate discipline):
@@ -59,7 +59,7 @@ function runTurn(messages: CoreMessage[], opts: { withSink: boolean; applyView?:
 }
 
 // Short conversation, CJK so chars ≈ tokens: the everyday shape whose islands
-// all sit below the 5000-char merge gate. Pre-#7729 this warned every turn.
+// all sit below the 5000-char merge gate. Pre-#7791 this warned every turn.
 const SHORT = mk([
   ["u0", "user", 800], ["a1", "assistant", 1200],
   ["u2", "user", 800], ["a3", "assistant", 1200],
@@ -79,18 +79,18 @@ const LONG = mk([
 ]);
 const LONG_HEAD = LONG.slice(0, 4);
 
-test("#7729: a short conversation whose islands are all sub-gate emits NO diagnostic (everyday shape)", () => {
+test("#7791: a short conversation whose islands are all sub-gate emits NO diagnostic (everyday shape)", () => {
   const { delivered, consoleLines } = runTurn(SHORT, { withSink: true });
   assert.deepEqual(delivered, [], "nothing to advertise is not a fault");
   assert.deepEqual(consoleLines, []);
 });
 
-test("#7729: the same short conversation stays silent on the legacy console leg", () => {
+test("#7791: the same short conversation stays silent on the legacy console leg", () => {
   const { consoleLines } = runTurn(SHORT, { withSink: false });
   assert.deepEqual(consoleLines, [], "the narrowing applies to the default leg too");
 });
 
-test("#7729: units that clear the gate and then die at the screen DO warn, through the sink", () => {
+test("#7791: units that clear the gate and then die at the screen DO warn, through the sink", () => {
   const { delivered, consoleLines } = runTurn(LONG, { withSink: true, applyView: LONG_HEAD });
   assert.equal(delivered.length, 1, `expected exactly one diagnostic, got ${delivered.length}`);
   assert.match(delivered[0]!, /^\[acp-kernel\] screenRecommendedUnits funnel zeroed with material present/);
@@ -98,13 +98,13 @@ test("#7729: units that clear the gate and then die at the screen DO warn, throu
   assert.deepEqual(consoleLines, [], "nothing reaches the process console once a sink is wired");
 });
 
-test("#7729: an unwired core keeps the legacy console.warn leg byte-identical", () => {
+test("#7791: an unwired core keeps the legacy console.warn leg byte-identical", () => {
   const { consoleLines } = runTurn(LONG, { withSink: false, applyView: LONG_HEAD });
   assert.equal(consoleLines.length, 1, "legacy callers still see the diagnostic");
   assert.match(consoleLines[0]!, /^\[acp-kernel\] screenRecommendedUnits funnel zeroed with material present/);
 });
 
-test("#7729: the screen-drop budget is per sink, not module-global", () => {
+test("#7791: the screen-drop budget is per sink, not module-global", () => {
   const a: string[] = [];
   const b: string[] = [];
   const sinkA = (m: string): void => { a.push(m); };
@@ -115,13 +115,13 @@ test("#7729: the screen-drop budget is per sink, not module-global", () => {
   assert.equal(a.length, 40, "sink A was capped at the budget, before the stride re-arms at 100");
 });
 
-test("#7729: warnScreenDrop delivers through the supplied sink only", () => {
+test("#7791: warnScreenDrop delivers through the supplied sink only", () => {
   const sink: string[] = [];
   warnScreenDrop((m) => sink.push(m), "dropped unit m00001..m00002: test");
   assert.deepEqual(sink, ["[acp-kernel] screenRecommendedUnits dropped unit m00001..m00002: test"]);
 });
 
-test("#7729: screenRecommendedUnits threads its sink into every drop diagnostic", () => {
+test("#7791: screenRecommendedUnits threads its sink into every drop diagnostic", () => {
   const sink: string[] = [];
   const kept = screenRecommendedUnits(
     [{ startRef: "zz-invalid", endRef: "m00002", count: 2, tokens: 6000 }],
