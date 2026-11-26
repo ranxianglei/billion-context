@@ -8,7 +8,9 @@
 // lanes (pi / oh-my-pi / opencode) are ordinary stable-versioned clients that
 // do not auto-drift like that, so per decision on #4545 only dsh is wired —
 // but this module is deliberately lane-generic so a second check can be
-// added later with one constant and one call site.
+// added later with one constant and one call site. #6588 adds the dsh lane's
+// host-posture probe here (isDshGoHost): same species of soft, once-per-
+// process note.
 //
 // The guard is SOFT and one-directional: when the resolved client version is
 // STRICTLY NEWER than the newest build we test against for that lane, emit
@@ -121,4 +123,13 @@ export function emitNewerClientBuildNote(
     logHostEvent("warn", "[native-client]", msg);
     console.warn(msg);
     return true;
+}
+
+/** Host posture (#6588): the DSH Go Android host stamps its runtime root on
+ *  every process it launches inside the proot rootfs — the only signal that
+ *  reaches this lane there. Blank values mean "not stamped" (fail open to
+ *  silence); the caller owns the once-per-process flag. */
+export function isDshGoHost(env: Record<string, string | undefined> = process.env): boolean {
+    const root = env.DSH_GO_RUNTIME_ROOT;
+    return typeof root === "string" && root.trim().length > 0;
 }

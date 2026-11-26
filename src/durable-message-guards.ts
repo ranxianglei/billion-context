@@ -115,6 +115,47 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
+/** dsh workspace-instructions REVISION identity: the reconciliation shapes of
+ *  the #2447 carrier — @deepseek-ai/dsh-agent-instructions' changedSectionText
+ *  emits one message per changed file, framed by the same
+ *  \x3csystem-reminder\x3e wrapper but with a lowercase marker (or a different
+ *  verb) than the baseline's `Instructions from:`:
+ *    `Updated instructions from: <path>`      — file content edited
+ *    `Additional instructions from: <path>`   — a file discovered LATER (its
+ *                                               content was never in the
+ *                                               baseline at all)
+ *    `Instructions removed: <path>`           — the file no longer applies
+ *  These are NOT ordinary consumable history, which is what the earlier
+ *  case-sensitive match assumed. baselineIdentity excludes file CONTENT
+ *  (lib/index.js:39: projectRoot + discovery/budget config only), so a
+ *  mid-session edit never re-emits a baseline — the revision is the ONLY
+ *  carrier of the change. Folding it leaves the pinned, superseded baseline in
+ *  context and drops the correction: the model keeps obeying rules the user
+ *  already rewrote, and cannot tell it lost the update. That is strictly worse
+ *  than folding both (then the model at least knows it has no rules).
+ *
+ *  IDENTITY IS PER PATH, deliberately not one shared `durable/agents-md`
+ *  bucket: the default policy is latest-per-identity (protectedLatestTools),
+ *  so a shared bucket would let the newest revision DEMOTE the baseline — and
+ *  a baseline merges EVERY discovered file into one message, while a revision
+ *  carries only its own file. On a multi-file session that trade loses rules:
+ *  measured on a real base+d1 pair, the baseline carried 2 files (global +
+ *  project root) and the `Additional` revision carried 1, so a shared bucket
+ *  would have gone from "keep 2, lose 1" to "keep 1, lose 2". Per-path
+ *  identities keep each file's newest version and bound the pinned set to
+ *  "one baseline + one revision per touched file".
+ *
+ *  `durable/*` still matches the suffixed path: matchToolPath compares only
+ *  the first segment for a `<prefix>/*` pattern. Matched case-sensitively on
+ *  purpose: the three shapes are fixed DSH template literals, so case folding
+ *  would only grow the false-positive surface. #2766 role gate as above. */
+function agentsMdRevisionPath(text: string): string | undefined {
+    const m = /^\s*\x3csystem-reminder\x3e\s*(?:(?:Updated|Additional)\s+instructions\s+from|Instructions\s+removed)\s*:[ \t]*([^\n]+)/.exec(text);
+    if (m === null) return undefined;
+    const path = m[1]!.trim();
+    return path.length > 0 ? `durable/agents-md-update/${path}` : undefined;
+}
+
 /** dsh workspace-instructions identity (#2447): the durable AGENTS.md baseline
  *  message injected by @deepseek-ai/dsh-agent-instructions — global
  *  (~/.dsh/AGENTS.md) and project instructions merged into ONE user-role
@@ -123,22 +164,27 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
  *  createUserMessage). The host re-emits the baseline only when
  *  baselineIdentity (projectRoot + discovery/budget config, NOT file contents)
  *  changes, so one fold of it silently kills hard constraints like "read X
- *  before any web access" forever. Match the `Instructions from:` section
- *  label INSIDE the \x3csystem-reminder\x3e frame (#7153) — a human pasting a
- *  rule file ("Instructions from: AGENTS.md" quoted in prose) is ordinary
- *  history, not the baseline: matching it would pin the paste and take the
- *  identity over from the real baseline under latest-per-identity.
- *  The label match stays case-sensitive on purpose — reconciliation change
- *  messages use lowercase variants ("Updated instructions from:") that remain
- *  ordinary consumable history. At most ~one such baseline lives per session
- *  (replacements are rare identity changes), so pinning every match is
- *  bounded. #2766: assistant-role messages are never carriers (see
- *  dshSkillCatalogPath). */
+
+ *  before any web access" forever. Marker-over-wrapper rationale as #2419.
+ *  At most ~one such baseline lives per session (replacements are rare
+ *  identity changes), so pinning every match is bounded. #2766: assistant-role
+ *  messages are never carriers (see dshSkillCatalogPath).
+ *
+ *  THE SAME CARRIER HAS A SECOND SHAPE — its REVISIONS (see
+ *  agentsMdRevisionPath above): the baseline projects to `durable/agents-md`,
+ *  each mid-session revision to its own per-path identity. The baseline marker
+ *  stays case-sensitive for a different reason than before: the revision
+ *  shapes are classified FIRST, because a revision body can itself contain the
+ *  uppercase label (a user documenting bili's matching string puts
+ *  `Instructions from:` inside their own AGENTS.md) and would otherwise be
+ *  mistaken for a baseline. */
 export function dshWorkspaceInstructionsPath(msg: CoreMessage): string | undefined {
-    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string"
-        && opensSystemReminderFrame(msg.text) && msg.text.includes("Instructions from:")
-        ? "durable/agents-md"
-        : undefined;
+    if (msg.role === "assistant" || msg.contentType !== "text" || typeof msg.text !== "string") return undefined;
+    // #7153: require the <system-reminder> frame so a human pasting a rule file
+    // ("Instructions from: AGENTS.md" quoted in prose) stays ordinary history;
+    // agentsMdRevisionPath enforces the leading frame for revisions itself.
+    if (!opensSystemReminderFrame(msg.text)) return undefined;
+    return agentsMdRevisionPath(msg.text) ?? (msg.text.includes("Instructions from:") ? "durable/agents-md" : undefined);
 }
 
 /** dsh mcp-catalog identity (#2446): the durable MCP-server catalog injected
@@ -488,17 +534,22 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
- *  exact marker strings of the twelve dsh classifiers above (fifteen markers:
- *  the runtime-context family contributes two — the pre-0.2.2-rc.3 "Current
- *  runtime context" literal and the 0.2.2-rc.3 lead-in without its trailing
- *  colon, which both the first-snapshot and re-send intros share, #7085 — the
- *  mnemon family contributes two, the image-offload family contributes two), so a
- *  unified-store row can be screened with cheap substring checks BEFORE
- *  JSON.parse (rows may carry megabytes of base64 media). Lockstep with the
- *  classifiers is enforced in tests/issue5142-expected-rebase.test.ts. */
+ *  exact marker strings of the twelve dsh classifiers above (eighteen markers:
+ *  the workspace-instructions family contributes four, the runtime-context
+ *  family two — the pre-0.2.2-rc.3 "Current runtime context" literal and the
+ *  0.2.2-rc.3 lead-in without its trailing colon, which both the
+ *  first-snapshot and re-send intros share, #7085 — the mnemon family
+ *  contributes two, the agent-relay family two, the image-offload family
+ *  two), so a unified-store row can be screened with cheap substring checks
+ *  BEFORE JSON.parse (rows may carry megabytes of base64 media). Lockstep
+ *  with the classifiers is enforced in
+ *  tests/issue5142-expected-rebase.test.ts. */
 export const dshCarrierRawMarkers: readonly string[] = [
     "\x3cavailable_skills\x3e",
     "Instructions from:",
+    "Updated instructions from:",
+    "Additional instructions from:",
+    "Instructions removed:",
     "Current runtime context",
     "The following information describes your current session",
     "\x3cmcp_catalog\x3e",

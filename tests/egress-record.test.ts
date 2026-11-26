@@ -96,7 +96,9 @@ test("recording: turn1 = full +I batch; turn2 tail append = exactly one +I", () 
 
         const t2 = [t1[0], t1[1], M("c", "three")];
         view = recordEgressTurn({ store: H.store, sessionId: S, prev: view, conversation: t2, systemText: "SYS", nowMs: 2000 });
-        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND log_seq > 3").get(S) as { c: number };
+        // Renumber (2026-11-25): turn1's rows are system=0, a=1, b=2 (the
+        // system row no longer consumes number 1) — the new tail row is 3.
+        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND log_seq > 2").get(S) as { c: number };
         assert.equal(added.c, 1, "tail append records exactly ONE new op row");
         const last = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? ORDER BY log_seq DESC LIMIT 1").get(S) as { row_type: string; msgid: string };
         assert.deepEqual({ row_type: last.row_type, msgid: last.msgid }, { row_type: "I", msgid: "c" });
@@ -181,10 +183,19 @@ test("recording: nudge-shaped churn is EXCLUDED (ephemeral rows never recorded)"
     }
 });
 
-test("#3617 negative direction: rollout key OFF by default → gate never opens", () => {
-    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
-    assert.equal(featureEnabled("egressPlane"), false, "egressPlane defaults to 0 — the prepare-openai gate (featureEnabled) sees nothing and records zero rows");
-    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
-    assert.equal(featureEnabled("egressPlane"), true);
-    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+test("#3617 negative direction: the plane can be forced OFF → gate never opens", () => {
+    const saved = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
+    try {
+        // this ci:full branch bakes egressPlane to 100 — the rollback path is
+        // the forced "0" (the env always wins over the baked-in percent):
+        // with the env at 0 the prepare-openai gate (featureEnabled) sees it OFF and
+        // records no rows. The documented force-on is env "1" or config true.
+        assert.equal(featureEnabled("egressPlane"), false, "forced 0 resolves OFF even against the branch default 100");
+        process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+        assert.equal(featureEnabled("egressPlane"), true, "explicit 1 (the documented force-on) opens the gate");
+    } finally {
+        if (saved === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+        else process.env.BILI_ROLLOUT_EGRESS_PLANE = saved;
+    }
 });
