@@ -1558,7 +1558,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // request, no loops; the error body is buffered so the passthrough below
     // re-reads the same bytes (same pattern as the #552 ladder above).
     if (
-        prepared &&
+        prepared && !prepared.preserveProviderCacheKey &&
         req.method !== "GET" &&
         req.method !== "HEAD" &&
         typeof wireBody === "string" &&

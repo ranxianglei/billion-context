@@ -130,7 +130,21 @@ test("non-omp agents are never stamped", () => {
 test("an existing prompt_cache_key is never overwritten", () => {
     withIntercept(true, () => withEnv(PROXY_ORIGIN, () => {
         const out = stampPromptCacheKey(makeEvent({ prompt_cache_key: "user-set" }), makeCtx("http://10.0.0.8:8199/v1"), "omp");
-        assert.equal(out, undefined);
+        assert.equal(out?.prompt_cache_key, "user-set");
+        assert.equal(out?.biliOmpSessionId, "sess-1579");
+    }));
+});
+
+test("OMP HTTP Responses binds the request owner without manufacturing a provider key", () => {
+    withIntercept(true, () => withProxyEnv({ BILLION_CONTEXT_PROXY: PROXY_ORIGIN }, () => {
+        const ctx = makeCtx("http://10.0.0.8:8199/relay", { api: "openai-responses" });
+        for (const payload of [{ input: [] }, { input: "hello", prompt_cache_key: "parent-key" }, { previous_response_id: "resp_1" }]) {
+            const event = { payload };
+            assert.deepEqual(stampPromptCacheKey(event, ctx, "omp", "captured-child"), { ...payload, biliOmpSessionId: "captured-child" });
+            assert.equal(stampPromptCacheKey(event, ctx, "omp", null), undefined, "a session that appeared after dispatch cannot claim the turn");
+            assert.equal(stampPromptCacheKey(event, ctx, "pi"), undefined);
+            assert.equal(stampPromptCacheKey(event, makeCtx("http://10.0.0.8:8199/v1", { api: "openai-codex-responses" }), "omp"), undefined);
+        }
     }));
 });
 

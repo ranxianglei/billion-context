@@ -37,8 +37,17 @@ after(() => {
 // the session and its compression state. Requests WITHOUT a client-provided
 // identity are rejected with 400 (content-fingerprint sessions disabled).
 
-function responsesSse(): string {
+function responsesSse(toolCallId?: string): string {
     const block = (type: string, data: Record<string, unknown>): string => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+    if (toolCallId !== undefined) {
+        const call = { type: "function_call", id: toolCallId, call_id: toolCallId, name: "acp_status", arguments: "{}", status: "completed" };
+        return block("response.created", { response: { id: "resp_1", status: "in_progress" } })
+            + block("response.output_item.added", { output_index: 0, item: { ...call, arguments: "", status: "in_progress" } })
+            + block("response.function_call_arguments.delta", { output_index: 0, item_id: toolCallId, delta: "{}" })
+            + block("response.function_call_arguments.done", { output_index: 0, item_id: toolCallId, arguments: "{}" })
+            + block("response.output_item.done", { output_index: 0, item: call })
+            + block("response.completed", { response: { id: "resp_1", status: "completed", output: [call], usage: { input_tokens: 10, output_tokens: 3 } } });
+    }
     const item = { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text: "ok" }] };
     return (
         block("response.created", { response: { id: "resp_1", status: "in_progress" } }) +
@@ -81,16 +90,28 @@ interface MockUpstream {
     port: number;
     /** Headers of the most recent POST, lowercased — for passthrough assertions (#2779). */
     lastHeaders?: Record<string, string>;
+    lastBody?: Record<string, unknown>;
+    rejectCacheKey?: string;
+    nextResponseToolCallId?: string;
     close(): Promise<void>;
 }
 
 async function startMockUpstream(): Promise<MockUpstream> {
     let lastHeaders: Record<string, string> | undefined;
+    let lastBody: Record<string, unknown> | undefined;
+    let rejectedKey: string | undefined;
+    let nextResponseToolCallId: string | undefined;
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
             if (req.method === "POST") {
+                lastBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+                if (rejectedKey !== undefined && lastBody.prompt_cache_key === rejectedKey) {
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { message: "unsupported prompt_cache_key" } }));
+                    return;
+                }
                 lastHeaders = {};
                 for (const [k, v] of Object.entries(req.headers)) {
                     if (v !== undefined) lastHeaders[k.toLowerCase()] = Array.isArray(v) ? v.join(", ") : v;
@@ -104,7 +125,10 @@ async function startMockUpstream(): Promise<MockUpstream> {
             }
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
             if (url.endsWith("/v1/messages")) res.end(anthropicSse());
-            else if (url.endsWith("/responses")) res.end(responsesSse());
+            else if (url.endsWith("/responses")) {
+                res.end(responsesSse(nextResponseToolCallId));
+                nextResponseToolCallId = undefined;
+            }
             else if (url.endsWith("/chat/completions")) res.end(chatSse());
             else res.end(responsesSse());
         });
@@ -116,6 +140,9 @@ async function startMockUpstream(): Promise<MockUpstream> {
         server,
         port,
         get lastHeaders() { return lastHeaders; },
+        get lastBody() { return lastBody; },
+        set rejectCacheKey(key: string | undefined) { rejectedKey = key; },
+        set nextResponseToolCallId(id: string | undefined) { nextResponseToolCallId = id; },
         close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
     };
 }
@@ -307,6 +334,86 @@ test("e2e session identity: openai prompt_cache_key survives bearer rotation (#2
         assert.equal(sessions[0]!.id, "pck-omp-1");
         assert.equal(sessions[0]!.protocol, "openai");
         assert.equal(sessions[0]!.requests, 2);
+    } finally {
+        await h.close();
+    }
+});
+
+test("OMP forks retain distinct model and native tool sessions when their provider cache key is shared", async () => {
+    const h = await startHarness();
+    const parent = "omp-fork-parent";
+    const first = "omp-fork-first";
+    const second = "omp-fork-second";
+    const native = { "x-bili-host-recovery-owner": "omp" };
+    const admin = `http://127.0.0.1:${h.proxyPort}/__bili/plugin`;
+    const pluginPost = (path: string, body: Record<string, unknown>) => fetch(`${admin}/${path}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    try {
+        for (const owner of [parent, first, second]) {
+            const registered = await pluginPost("register", { conversationId: owner, agent: "omp", identity: true, ...(owner === parent ? {} : { parentConversationId: parent }) });
+            assert.equal(registered.status, 200, await registered.text());
+            if (owner === parent) {
+                await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent }), native);
+            } else if (owner === second) {
+                await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent, session_id: second }), native);
+            }
+            if (owner === parent) h.upstreams[0]!.nextResponseToolCallId = "omp-parent-call";
+            await post(h, 0, "/v1/responses", responsesBody({
+                prompt_cache_key: parent, biliOmpSessionId: owner,
+                tools: ["read", "acp_status"].map(name => ({ type: "function", name, parameters: { type: "object", properties: {} } })),
+            }), { ...native, "session-id": parent });
+            const sent = h.upstreams[0]!.lastBody!;
+            assert.equal(sent.prompt_cache_key, parent);
+            assert.equal(h.upstreams[0]!.lastHeaders!["session-id"], parent);
+            assert.ok(!("biliOmpSessionId" in sent));
+        }
+        // Unstamped shared-parent, conflicting legacy ids, and a contradicting
+        // plugin header must all reach the provider without charging any ledger.
+        await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent }), { ...native, "session-id": parent });
+        await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent, session_id: second }), { ...native, "session-id": first });
+        await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent, biliOmpSessionId: second, biliOmpSyntheticPck: false, biliMsgIds: ["private"], biliLedgerSeqs: [1] }), { ...native, "x-bili-plugin-conversation": first });
+        assert.deepEqual(h.upstreams[0]!.lastBody, responsesBody({ prompt_cache_key: parent }));
+        assert.deepEqual(Object.fromEntries((await getSessions(h)).map(s => [s.id, s.requests])), { [parent]: 2, [first]: 1, [second]: 2 });
+        for (const owner of [parent, first, second]) {
+            const status = await fetch(`${admin}/status?conversationId=${owner}`);
+            assert.equal(status.status, 200);
+            assert.equal((await status.json() as { sessionId: string }).sessionId, owner);
+            const tool = await pluginPost("tool", { conversationId: owner, nativeCaller: true, tool: "acp_status", args: {} });
+            assert.equal(tool.status, 200);
+            assert.equal((await tool.json() as { conversationId: string }).conversationId, owner);
+        }
+        const conflict = await pluginPost("tool", { conversationId: first, nativeCaller: true, toolCallId: "omp-parent-call", tool: "acp_status", args: {} });
+        assert.equal(conflict.status, 409);
+        assert.equal((await conflict.json() as { code: string }).code, "TOOL_CONVERSATION_CONFLICT");
+    } finally {
+        await h.close();
+    }
+});
+
+test("OMP keeps provider cache key provenance on prepared, chained, and retry paths", async () => {
+    const h = await startHarness();
+    const owner = "omp-key-owner";
+    const headers = { "x-bili-host-recovery-owner": "omp", "x-bili-plugin": "omp", "x-bili-plugin-conversation": owner };
+    const upstream = h.upstreams[0]!;
+    try {
+        for (const [path, body] of [["/v1/chat/completions", chatBody], ["/v1/responses", responsesBody]] as const) {
+            for (const fields of [{}, { prompt_cache_key: owner, biliOmpSyntheticPck: true }, { prompt_cache_key: owner }, { prompt_cache_key: "shared-key" }]) {
+                await post(h, 0, path, body({ ...fields, biliOmpSessionId: owner }), headers);
+                assert.equal(upstream.lastBody!.prompt_cache_key, fields.biliOmpSyntheticPck ? undefined : fields.prompt_cache_key);
+                assert.ok(!("biliOmpSessionId" in upstream.lastBody!));
+                assert.ok(!("biliOmpSyntheticPck" in upstream.lastBody!));
+            }
+            upstream.rejectCacheKey = "rejected-provider-key";
+            const rejected = await postRaw(h, 0, path, body({ prompt_cache_key: "rejected-provider-key", biliOmpSessionId: owner }), headers);
+            assert.equal(rejected.status, 400, await rejected.text());
+            assert.equal(upstream.lastBody!.prompt_cache_key, "rejected-provider-key");
+        }
+        for (const handle of [{ previous_response_id: "resp-previous" }, { conversation: "conv-existing" }]) {
+            const delta = responsesBody({ ...handle, prompt_cache_key: "shared-key" });
+            await post(h, 0, "/v1/responses", { ...delta, biliOmpSessionId: owner }, headers);
+            assert.deepEqual(upstream.lastBody, delta);
+        }
     } finally {
         await h.close();
     }

@@ -2067,6 +2067,8 @@ export type Prepared = {
      *  merges them onto the upstream response headers. */
     responseExtraHeaders?: Record<string, string>;
     responsesTextProtocol?: boolean;
+    /** OMP supplied the provider cache key independently of its ledger owner. */
+    preserveProviderCacheKey?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
@@ -3144,10 +3146,13 @@ export function scrubMsgIdFields(bodyBuffer: Buffer, log: (level: string, msg: s
     const p = parsed as Record<string, unknown>;
     const hasIds = Object.prototype.hasOwnProperty.call(p, MSG_IDS_BODY_FIELD);
     const hasSeqs = Object.prototype.hasOwnProperty.call(p, MSG_SEQS_BODY_FIELD);
-    if (!hasIds && !hasSeqs) return bodyBuffer;
+    if (!hasIds && !hasSeqs && !("biliOmpSessionId" in p) && !("biliOmpSyntheticPck" in p)) return bodyBuffer;
+    if (p.biliOmpSyntheticPck === true && p.prompt_cache_key === p.biliOmpSessionId) delete p.prompt_cache_key;
+    delete p.biliOmpSessionId;
+    delete p.biliOmpSyntheticPck;
     if (hasIds) delete p[MSG_IDS_BODY_FIELD];
     if (hasSeqs) delete p[MSG_SEQS_BODY_FIELD];
-    log("debug", "stripped biliMsgIds/biliLedgerSeqs from verbatim forward (#6539)");
+    log("debug", "stripped private plugin fields from verbatim forward");
     return Buffer.from(JSON.stringify(p), "utf8");
 }
 

@@ -63,7 +63,7 @@ import { Readable } from "node:stream";
 import { anthropicToCore, coreToAnthropic, type BiliMessage } from "acp-kernel/wire";
 import { getStore } from "./persist.js";
 import { peekSession } from "./session.js";
-import { pluginAgentHeader, pluginReportedModel } from "./plugin.js";
+import { hasRegisteredOmpChild, pluginAgentHeader, pluginReportedModel } from "./plugin.js";
 import { headerValue, readBody } from "./server.js";
 import { featureEnabled } from "./rollout.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "./msgid-pin.js";
@@ -831,6 +831,12 @@ export async function handleIncrementalTurn(
     }
     const conversationId = typeof payload.conversationId === "string" ? payload.conversationId.trim() : "";
     if (!conversationId || conversationId.length > 512) return jsonReply(res, 400, { error: "conversationId must be a non-empty string (≤512 chars)" });
+    // Legacy native deltas copied the PCK into both ids. A shared parent
+    // cannot accept one of those deltas before the host identifies its owner.
+    if (agent === "omp" && originalPath !== undefined && (req.headers["x-bili-plugin-conversation"] !== conversationId
+        || (payload.biliOmpSessionId !== undefined ? payload.biliOmpSessionId !== conversationId : hasRegisteredOmpChild(conversationId)))) {
+        return jsonReply(res, 409, { error: "OMP incremental turn requires matching host session proof; resend full history" });
+    }
     const sinceSeq = typeof payload.sinceSeq === "number" && Number.isInteger(payload.sinceSeq) && payload.sinceSeq >= 0 ? payload.sinceSeq : -1;
     if (sinceSeq === -1) return jsonReply(res, 400, { error: "sinceSeq must be a non-negative integer" });
     const resync = payload.resync === true;
@@ -937,6 +943,7 @@ export async function handleIncrementalTurn(
         persistLaneState(sessionId, entry.system, entry.systemSet, entry.marks, log);
 
         const body: Record<string, unknown> = { ...forwarded };
+        if (agent === "omp" && payload.biliOmpSessionId === conversationId) body.biliOmpSessionId = conversationId;
         // #5155: the messages array is spliced from the pre-serialized prefix
         // (#5155 laneItemsForTurn) — only the delta rides the renderer.
         const itemsStr = laneItemsForTurn(entry, resync ? 0 : msgsBefore);

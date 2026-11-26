@@ -430,7 +430,7 @@ test("#3304 omp adapter: planned turn stashes the ORIGINAL init.body under its t
         const lane = await fakeLane(true);
         try {
             _setOmpOriginForTest(lane.base);
-            const origText = JSON.stringify({ model: "claude-test", max_tokens: 64, prompt_cache_key: "omp-sid-1", messages: [{ role: "user", content: "hi" }] });
+            const origText = JSON.stringify({ model: "claude-test", max_tokens: 64, biliOmpSessionId: "omp-sid-1", messages: [{ role: "user", content: "hi" }] });
             const init: RequestInit = { method: "POST", headers: { "content-type": "application/json" }, body: origText };
             await ompIncrementalBeforeSend(UPSTREAM_URL, init);
             const headers = init.headers as Headers;
