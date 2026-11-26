@@ -1,4 +1,5 @@
 import { sha256Hex } from "./store.js";
+import { log as loggerLog } from "../logger.js";
 import type { MessageContentStore, StoredEntry } from "acp-kernel";
 
 /**
@@ -115,7 +116,13 @@ export function hydrateSlimCcrStore(
     // A ledger row whose CAS body was lost (getCcrEntries maps a missing
     // body to "") would otherwise be silently DROPPED by the JSON.parse
     // catch below — serving a partial store. Degrade instead.
-    if (rows.some((r) => r.content === "")) return null;
+    if (rows.some((r) => r.content === "")) {
+        // #7576: one lost CAS body empties the WHOLE session's tool-output
+        // library (never a partial store) — log it so the degradation is not
+        // silent (the file lane stays authority; this is a warn, not an error).
+        loggerLog("warn", `[slim] hydrateSlimCcrStore: a ledger row's CAS body is missing — degrading the whole content store to the file lane (never a partial store) (#7576)`);
+        return null;
+    }
     // Envelope/ledger key-set coverage: every byRef key the column
     // declares must have a ledger row, or the hydrated byRef is a strict
     // subset of the column's — a partial store the file lane would serve
