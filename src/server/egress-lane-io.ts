@@ -251,7 +251,9 @@ export function resolveEgressAuthority(args: {
  * bootstrapping → the client core exactly once, legacy / unreadable
  * record-only turn → skip (the flow must not advance with untrusted or
  * unverifiable bytes). A corrupt log point or a concurrent writer skips
- * this turn (warn); the next turn re-derives from the stored view. Returns
+ * this turn (warn): a corrupt point does NOT advance the log, so serving
+ * degrades to the client's own bytes until the point is repaired or the
+ * session is reset. Returns
  * the core the lane should serve (the swapped core, or the client core on a
  * bootstrap turn), or null = keep the lane's own core. */
 export function recordAuthorityTurn(
@@ -280,7 +282,7 @@ export function recordAuthorityTurn(
         if (err instanceof EgressConcurrentWriteError) {
             log("warn", `[${sessionId}] egress op-log recording skipped this turn (another request on this session recorded first): ${String(err)}`);
         } else {
-            log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
+            log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — the log does NOT advance on this turn; serving degrades to the client's own bytes until the point is repaired or the session is reset): ${String(err)}`);
         }
     }
     if (outcome.bootstrapping) return outcome.recordCore;

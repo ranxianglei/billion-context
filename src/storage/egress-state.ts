@@ -20,10 +20,13 @@
  *   op_seq  — row-ordering key, assigned to EVERY row (B/I/D/U). Primary key
  *             (session_id, op_seq); all ordering / watermark / truncate
  *             semantics run on op_seq.
- *   log_seq — the CANONICAL MESSAGE NUMBER: set ONLY on I rows (one number
- *             per message, session-scoped, never re-issued — the high-water
- *             includes retired messages). U/D/B rows carry NULL: an update or
- *             a deletion occupies no new number. A fork copies BOTH tables
+ *   log_seq — the CANONICAL MESSAGE NUMBER: set on I rows (one number per
+ *             message, session-scoped, never re-issued — the high-water
+ *             includes retired messages) and, since the number-lifecycle
+ *             reconciliation (#7758), on the U rows that re-pin a row's
+ *             number (0 = the row lost its citation; the old number retires
+ *             and is never re-issued). D/B rows and content-only U rows
+ *             carry NULL: they occupy no new number. A fork copies BOTH tables
  *             wholesale to the new session_id (egressFork) — the child
  *             inherits the parent's full number space and its retired marks,
  *             so the child's next number continues where the parent stopped.
@@ -65,7 +68,10 @@
  *                                       number
  *   D  delete-range    msgid NULL      {"start": msgid, "end": msgid}  inclusive
  *   U  update-content  msgid required  {"role"?} + bytes column (the new
- *                                       bytes; detected by byte inequality)
+ *                                       bytes; detected by byte inequality);
+ *                                       log_seq = the re-pinned number when
+ *                                       the row's citation changed (#7758),
+ *                                       NULL for a content-only update
  *
  * Anchors are MSGIDS, never display positions — positions shift under other
  * ops, msgids do not (KDD#11: content may change, msgid does not). Any
@@ -108,16 +114,19 @@ export const EGRESS_SYSTEM_MSGID = "egress-system";
 
 /** One row of the current view. The ref (mNNNNN) is the kernel-space
  * display identity, never hash and never re-issued (kernel contract).
- * `num` is the canonical session-scoped message number (ruling 7439): real
- * rows always carry num >= 1 — EXCEPT the system row, which carries 0 by
- * construction (renumber 2026-11-25: the citation space starts at 1; the
- * system row is bookkeeping, not a message). An in-process row built before
- * its I row is appended may carry 0 (unnumbered) for a REAL message and is
- * stamped by the replay at record time — a real message must never STORE a
- * 0. `bytes` is the message's FINAL core JSON (post reasoning-drop /
- * image-rescale, pre outbound convert); for the system row it is the
- * system text itself. The row is self-contained: replay + serve need
- * nothing beyond this pair of tables. */
+ * `num` is the canonical session-scoped message number (ruling 7439): the
+ * system row carries 0 by construction (renumber 2026-11-25: the citation
+ * space starts at 1; the system row is bookkeeping, not a message). A real
+ * row carries its kernel citation number while it is cited, and 0 when it
+ * has no citation — either an in-process row built before its I row (stamped
+ * by the replay's dense fallback at record time) or a STORED row that lost
+ * its citation (number-lifecycle reconciliation, #7758: a protected row the
+ * kernel no longer numbers). A number is one-shot: when a row's number
+ * retires (→ 0) the number is dead and never re-issued — the high water
+ * includes every retired number. `bytes` is the message's FINAL core JSON
+ * (post reasoning-drop / image-rescale, pre outbound convert); for the
+ * system row it is the system text itself. The row is self-contained:
+ * replay + serve need nothing beyond this pair of tables. */
 export interface EgressViewRow {
     /** Canonical session-scoped message number (0 = not numbered yet). */
     num: number;
@@ -152,7 +161,9 @@ const INSERT_STATE = `INSERT INTO egress_state (session_id, op_seq, log_seq, row
 const INSERT_FLOW = `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
 
 /** The canonical message frontier: the highest number ever ISSUED
- * (retired messages included — I rows only advance it, B/D/U never do).
+ * (retired messages included — I rows advance it, and since #7758 a U that
+ * re-pins a number to a HIGHER one does too; B/D and content-only U never
+ * do).
  * MAX(log_seq) over the flow rows is the fast answer, but a compaction
  * physically removes the I rows its newest base subsumes (#7574), so the
  * moment right after a fold the flow can hold a base row ONLY — the
@@ -193,8 +204,9 @@ export function egressMessageHighWater(db: SqliteDatabase, sessionId: string): n
 function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: number } {
     // egress_flow is the record and a superset of egress_state after every
     // compaction, so the flow maxima ARE the session's high-waters: the
-    // op_seq ordering cursor and the canonical message-number cursor (I
-    // rows only — B/D/U carry NULL and never advance it).
+    // op_seq ordering cursor and the canonical message-number cursor (I rows
+    // — and, since #7758, the U rows that re-pin a number — advance it; B/D
+    // and content-only U carry NULL and never do).
     // #7577 (owner ruling 2026-11-24): DUAL CLOCKS — the block lifecycle log
     // numbers itself (egress_block_flow.op_seq dense within its own table,
     // see egress-block.ts); its rows carry flow_op_seq as a POINTER to this
@@ -248,6 +260,12 @@ interface UpdateOp {
     role?: string;
     /** System row only: the new client raw system text (see InsertOp). */
     sysIn?: string;
+    /** Number-lifecycle reconciliation (#7758): the row's NEW canonical
+     *  number — the current kernel citation fact. 0 = the row lost its
+     *  citation (the old number retires and is never re-issued); > 0 = the
+     *  row was (re-)cited at that number. Absent = a content-only update
+     *  (the number is untouched). */
+    num?: number;
 }
 export type EgressOp = InsertOp | DeleteOp | UpdateOp;
 
@@ -269,7 +287,13 @@ function egressViewHighWater(view: EgressViewRow[]): number {
  * replayed view is exactly the stamped view the tables would produce.
  * `startHigh` overrides high-water(prev): the append passes the cursor it
  * read from the flow, which includes numbers of rows a compaction retired
- * from the view. */
+ * from the view.
+ * A U op that carries a `num` (#7758) re-pins the target row's number: the
+ * old number retires (leaving the live set) and the new one is validated
+ * like a citation — a collision with a row still LIVE is corrupt (thrown);
+ * 0 = the row lost its citation. The batch high-water scan counts the U's
+ * number too, so a dense fallback lands above every number the batch
+ * assigns, I or U. */
 export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?: number, sessionId = "diff"): EgressViewRow[] {
     const view: EgressViewRow[] = prev.map((r) => ({ ...r }));
     const idxOf = (msgid: string): number => view.findIndex((r) => r.msgid === msgid);
@@ -288,9 +312,32 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
     const liveNums = new Set<number>();
     for (const r of view) if (r.num > 0) liveNums.add(r.num);
     let maxCited = 0;
-    for (const op of ops) if (op.type === "I" && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
     for (const op of ops) {
-        if (op.type === "I") {
+        // #7758: a U that re-pins a number counts in the batch high water too
+        // (a dense fallback must land above every number the batch assigns,
+        // I or U, regardless of op order).
+        if ((op.type === "I" || op.type === "U") && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
+    }
+    // #7758: two-pass U processing. A re-home U (0→N) may be ordered before
+    // the demote U (N→0) that frees N in the same batch (the diff emits U ops
+    // in view order), so the retire must happen before any assign. Pass 1
+    // processes D (retire+splice), I (insert), and U (retire old number) in
+    // array order; pass 2 assigns the U new numbers + updates bytes. The D
+    // and I ops stay in array order (a D may delete a row an earlier I
+    // inserted); only the U ops split across the two passes.
+    for (const op of ops) {
+        if (op.type === "D") {
+            const s = idxOf(op.start);
+            const e = idxOf(op.end);
+            if (s < 0) throw new EgressStateCorruptError(sessionId, `delete start ${op.start} missing`);
+            if (e < 0) throw new EgressStateCorruptError(sessionId, `delete end ${op.end} missing`);
+            if (s > e) throw new EgressStateCorruptError(sessionId, "delete range inverted");
+            for (let i = s; i <= e; i++) {
+                const r = view[i];
+                if (r !== undefined && r.num > 0) liveNums.delete(r.num);
+            }
+            view.splice(s, e - s + 1);
+        } else if (op.type === "I") {
             if (idxOf(op.msgid) >= 0) throw new EgressStateCorruptError(sessionId, `duplicate msgid ${op.msgid}`);
             // `after: null` = the first row of the new view → the front.
             // #7574: idxOf answers -1 for a missing anchor, so the old
@@ -320,29 +367,39 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
             if (op.role !== undefined) entry.role = op.role;
             if (op.ts !== undefined) entry.ts = op.ts;
             view.splice(at + 1, 0, entry);
-        } else if (op.type === "D") {
-            const s = idxOf(op.start);
-            const e = idxOf(op.end);
-            if (s < 0) throw new EgressStateCorruptError(sessionId, `delete start ${op.start} missing`);
-            if (e < 0) throw new EgressStateCorruptError(sessionId, `delete end ${op.end} missing`);
-            if (s > e) throw new EgressStateCorruptError(sessionId, "delete range inverted");
-            for (let i = s; i <= e; i++) {
-                const r = view[i];
-                if (r !== undefined && r.num > 0) liveNums.delete(r.num);
-            }
-            view.splice(s, e - s + 1);
         } else {
             const i = idxOf(op.msgid);
             if (i < 0) throw new EgressStateCorruptError(sessionId, `update target ${op.msgid} missing`);
-            view[i] = { ...view[i], bytes: op.bytes, ...(op.role !== undefined ? { role: op.role } : {}) };
+            const target = view[i];
+            if (typeof op.num === "number") {
+                const isSystem = op.msgid === EGRESS_SYSTEM_MSGID;
+                if (op.num < 0 || (isSystem && op.num !== 0)) {
+                    throw new EgressStateCorruptError(sessionId, `update ${op.msgid} carries an invalid number ${op.num}`);
+                }
+                if (target.num > 0) liveNums.delete(target.num);
+            }
         }
+    }
+    for (const op of ops) {
+        if (op.type !== "U") continue;
+        const i = idxOf(op.msgid);
+        const target = view[i];
+        if (typeof op.num === "number") {
+            if (op.num > 0) {
+                if (liveNums.has(op.num)) throw new EgressStateCorruptError(sessionId, `cited number ${op.num} is already live (msgid ${op.msgid})`);
+                liveNums.add(op.num);
+                num = Math.max(num, op.num);
+            }
+            target.num = op.num;
+        }
+        view[i] = { ...target, bytes: op.bytes, ...(op.role !== undefined ? { role: op.role } : {}) };
     }
     return view;
 }
 
 /** Deterministic diff between two consecutive views (owner design, 4 upper
  * cases: tail append / nudge appear+vanish / fold replace / content edit).
- * The diff keys on msgid + bytes only — `num` is never an input (it is
+ * The diff keys on msgid + bytes — `num` is never a POSITION input (it is
  * assigned at append/replay time; an in-process `next` may carry 0s).
  *
  * Spine = a monotonically increasing subsequence of `next` whose msgids
@@ -353,11 +410,19 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
  * in NEXT order with the preceding row as anchor. egressReplay(prev, diff)
  * always reproduces `next` exactly (modulo the stamp-only num field).
  *
+ * Number-lifecycle reconciliation (#7758, `{ reconcileNum: true }`): a spine
+ * row whose EFFECTIVE number changed (old.num>0?old.num:0 vs
+ * r.num>0?r.num:0) ALSO emits a +U carrying the new number — even when the
+ * bytes are unchanged. 9→0 retires the number (the row lost its citation),
+ * 0→N re-pins it, N→M follows a re-numbering. Off (the default) the diff is
+ * byte-for-byte the old behavior — callers without a refs ledger must not
+ * reconcile (a num of 0 there means "unknown", not "uncited").
+ *
  * Moves (same msgid, new position) are deliberately expressed as D+I — there
  * is no M op; the msgid stays the identity through both ops, and the NEW
  * number the D+I assigns is the message's number from then on (the old
  * number stays retired — never re-issued). */
-export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[]): EgressOp[] {
+export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[], opts?: { reconcileNum?: boolean }): EgressOp[] {
     const prevIdx = new Map<string, number>();
     prev.forEach((r, i) => { if (!prevIdx.has(r.msgid)) prevIdx.set(r.msgid, i); });
     const prevByMsg = new Map<string, EgressViewRow>();
@@ -384,12 +449,18 @@ export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[]): Eg
         }
     }
     if (runStart !== null) ops.push({ type: "D", start: runStart, end: runEnd! });
+    const reconcileNum = opts?.reconcileNum === true;
     for (const r of next) {
         if (spine.has(r.msgid)) {
             const old = prevByMsg.get(r.msgid)!;
-            if (old.bytes !== r.bytes) {
+            // #7758: the effective number — 0 when the row has no citation
+            // (either never cited or demoted). A change is a re-pin even when
+            // the bytes are unchanged.
+            const numChanged = reconcileNum && (old.num > 0 ? old.num : 0) !== (r.num > 0 ? r.num : 0);
+            if (old.bytes !== r.bytes || numChanged) {
                 const u: UpdateOp = { type: "U", msgid: r.msgid, bytes: r.bytes };
                 if (r.role !== undefined) u.role = r.role;
+                if (numChanged) u.num = r.num > 0 ? r.num : 0;
                 ops.push(u);
             }
         }
@@ -420,17 +491,21 @@ function writeOp(db: SqliteDatabase, sessionId: string, opSeq: number, logSeq: n
  * op ALSO gets its canonical number — the kernel citation number when the op
  * carries an explicit `num` (renumber 2026-11-25), the dense high-water+1
  * fallback otherwise (the cursor starts past every number ever issued,
- * retired ones included) — D/U ops occupy op_seq slots but no numbers.
+ * retired ones included). A U op that re-pins a row's number (#7758) stores
+ * the new number in log_seq (0 = demotion) and advances the cursor past it;
+ * a content-only U and every D op occupy an op_seq slot but no number.
  * The system row (no citation) stores log_seq 0. The caller has already
  * validated the batch against the log as it is. */
 function writeOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], firstOpSeq: number, firstNum: number, nowMs: number): void {
     let num = firstNum - 1;
     // Mirror egressReplay exactly (it already validated the batch): the
     // dense fallback for an uncited row lands ABOVE every number the batch
-    // cites, and a cited row below the cursor is legal when its slot is
-    // retired (fold re-homing).
+    // assigns (I or U), and a cited row below the cursor is legal when its
+    // slot is retired (fold re-homing).
     let maxCited = 0;
-    for (const op of ops) if (op.type === "I" && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
+    for (const op of ops) {
+        if ((op.type === "I" || op.type === "U") && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
+    }
     for (let i = 0; i < ops.length; i++) {
         const op = ops[i];
         const opSeq = firstOpSeq + i;
@@ -459,9 +534,16 @@ function writeOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], firstO
         } else if (op.type === "D") {
             writeOp(db, sessionId, opSeq, null, "D", null, JSON.stringify({ start: op.start, end: op.end }), null, nowMs);
         } else {
+            // #7758: a re-pinning U stores the new number in log_seq (0 =
+            // demotion — the row loses its citation; the number retires) and
+            // advances the cursor past it, so the high water (MAX(log_seq))
+            // sees a promotion and a dense fallback never re-collides. A
+            // content-only U (no num) stores NULL, as before.
+            const opNum = typeof op.num === "number" ? op.num : null;
+            if (opNum !== null && op.msgid !== EGRESS_SYSTEM_MSGID && opNum > 0) num = Math.max(num, opNum);
             const payload: Record<string, unknown> = { role: op.role };
             if (op.sysIn !== undefined) payload["sysIn"] = op.sysIn;
-            writeOp(db, sessionId, opSeq, null, "U", op.msgid, JSON.stringify(payload), op.bytes, nowMs);
+            writeOp(db, sessionId, opSeq, opNum, "U", op.msgid, JSON.stringify(payload), op.bytes, nowMs);
         }
     }
 }
@@ -476,8 +558,10 @@ function writeOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], firstO
  * base form has). Runs inside the caller's transaction. */
 function writeBase(db: SqliteDatabase, sessionId: string, view: EgressViewRow[], highWater: number, nowMs: number): number {
     for (const e of view) {
-        // Renumber (2026-11-25): the system row carries 0; every real row >= 1.
-        if (typeof e.num !== "number" || (e.msgid === EGRESS_SYSTEM_MSGID ? e.num !== 0 : e.num < 1)) {
+        // Renumber (2026-11-25): the system row carries 0; a real row carries
+        // its citation number, or 0 when it has no citation (#7758: a demoted
+        // row can sit in a base — its number is retired, not re-issued).
+        if (typeof e.num !== "number" || (e.msgid === EGRESS_SYSTEM_MSGID ? e.num !== 0 : e.num < 0)) {
             throw new EgressStateCorruptError(sessionId, `compact base entry ${e.msgid} has no canonical number`);
         }
     }
@@ -582,8 +666,10 @@ function readStateRows(db: SqliteDatabase, sessionId: string): EgressStateRow[] 
 
 /** Standalone compaction (kept for tests and tools; a recorded turn
  * compacts inside `egressAppendTurn`). One transaction. Throws if any
- * entry is unnumbered (a programming error — the stamped replay view is
- * the only input that may reach here). Returns the base row's op_seq. */
+ * entry has a negative number or the system row is non-zero (a programming
+ * error — the stamped replay view is the only input that may reach here).
+ * A real row may carry 0 (#7758: it lost its citation — the number is
+ * retired, not re-issued). Returns the base row's op_seq. */
 export function egressStateCompact(
     db: SqliteDatabase,
     sessionId: string,
@@ -739,7 +825,9 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
             }
             for (const e of view) {
                 const shapeOk = typeof e.msgid === "string" && typeof e.ref === "string" && typeof e.bytes === "string" && typeof e.num === "number";
-                const numOk = e.msgid === EGRESS_SYSTEM_MSGID ? e.num === 0 : e.num >= 1;
+                // #7758: a real entry may carry 0 (a demoted row — it lost
+                // its citation); the system row must be exactly 0.
+                const numOk = e.msgid === EGRESS_SYSTEM_MSGID ? e.num === 0 : e.num >= 0;
                 if (!shapeOk || !numOk) throw new EgressStateCorruptError(sessionId, `base at op_seq=${row.op_seq} has malformed entries`);
             }
             continue;
@@ -789,6 +877,15 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
             }
             const i = idxOf(row.msgid);
             if (i < 0) throw new EgressStateCorruptError(sessionId, `update target ${row.msgid} missing at op_seq=${row.op_seq}`);
+            // #7758: a re-pinning U carries the new number in log_seq (0 =
+            // demotion). Validate it the way a citation is validated.
+            if (typeof row.log_seq === "number") {
+                const isSystem = row.msgid === EGRESS_SYSTEM_MSGID;
+                if (row.log_seq < 0 || (isSystem && row.log_seq !== 0)) {
+                    throw new EgressStateCorruptError(sessionId, `update at op_seq=${row.op_seq} carries an invalid number ${row.log_seq}`);
+                }
+                view[i].num = row.log_seq;
+            }
             view[i] = {
                 ...view[i],
                 bytes: row.bytes,
