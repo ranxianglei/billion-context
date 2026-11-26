@@ -776,6 +776,23 @@ function isDshDesktopBiliCopy(installDir: string, real: string, env: NodeJS.Proc
     return dshDesktopCopyPathMatches(installDir, real, anchor, `/node_modules/${DSH_PACKAGE}`, process.platform === "win32");
 }
 
+/** #2082: true when `installDir` is the dsh DESKTOP profile copy that bili
+ *  owns in place (#1575). The self-update lanes use it to arm the boot smoke:
+ *  a proxy running FROM that copy takes the plain self-update path
+ *  (hostManagedInstall exempts the layout), yet it swaps the very copy a
+ *  running dsh respawns its plugin from — the same exposure
+ *  refreshDshDesktopCopy gates. */
+function isDshDesktopInstall(installDir: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+    if (!installDir) return false;
+    let real = installDir;
+    try {
+        real = realpathSync(installDir);
+    } catch {
+        // nonexistent or unreadable — evaluate the literal path
+    }
+    return isDshDesktopBiliCopy(installDir, real, env);
+}
+
 /** #1234/#2199: true when `installDir` is the OpenCode v2 plugin-manager CACHE
  *  copy of billion-context — under $XDG_CACHE_HOME/opencode (default
  *  ~/.cache/opencode) at .../node_modules/billion-context. A bare
@@ -1740,7 +1757,10 @@ export async function checkForUpdate(opts: UpdateOptions, force = false, checkOn
             return;
         }
         try {
-            const result = await installViaTarball(target, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
+            // #2082: when this proxy runs FROM the dsh desktop copy, the
+            // self-update swaps the copy dsh respawns from — same boot smoke
+            // as the refreshDshDesktopCopy lane.
+            const result = await installViaTarball(target, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl), process.env, { bootSmoke: isDshDesktopInstall(installDir) });
             if (result.ok) {
                 await clearInstallBackoff(bkey);
                 await persistLastInstall(currentVersion, target, force ? "manual" : "auto-update");
@@ -2047,22 +2067,13 @@ export async function installViaTarball(
         }
     }
 
-    // Back up the current install before overwriting. If anything fails after
-    // the copy (partial copy, version drift, corrupted entry), the backup is
-    // restored so the previously working version keeps running.
+    // #6309: the atomic swap renames the current install ASIDE into backupDir,
+    // and that rename requires backupDir to be absent (ENOTEMPTY otherwise) —
+    // so the file backup is created only on the fallback merge-copy path,
+    // into a fresh destination. A pre-existing non-empty backup both kills
+    // the atomic path and makes the re-copy over it trip libuv's self-copy
+    // guard on npm's relative node_modules/.bin symlinks (gate Lane X, 2026-11-14).
     const backupDir = path.join(workDir, "backup");
-    if (!pnpmOldLink) {
-        // The pnpm-link lane needs no file backup: the displaced artifact IS
-        // the link itself (kept at pnpmOldLink) and the store contents it
-        // points into were never touched.
-        try {
-            await cp(installDir, backupDir, { recursive: true, force: true });
-        } catch (e) {
-            // Fail closed: without a backup we refuse to overwrite the running
-            // install — the current version keeps working.
-            return { ok: false, error: `backup of current install failed (install left untouched): ${String(e)}` };
-        }
-    }
 
     const restoreFromBackup = async (): Promise<string | null> => {
         try {
@@ -2079,21 +2090,53 @@ export async function installViaTarball(
         }
     };
 
-    // Copy staging over install dir using Node's built-in fs.cp (Node 16.7+).
-    // Cross-platform — no dependency on the `cp` binary (absent on Windows).
-    // `recursive: true` + the trailing `/.` semantics: fs.cp copies the
-    // *contents* of stagingDir into installDir, merging without nesting.
-    let copyError: string | null = null;
+    // #6309: prefer an atomic directory swap. Copy staging next to the
+    // install dir on the same volume, then rename the current install aside
+    // and rename the prepared copy into place. The old copy is the rollback
+    // source and is only removed after verification. If rename is not
+    // possible (common on Windows while the running install holds handles),
+    // fall back to the previous merge-copy path.
+    const swapCandidate = `${installDir}.update-new-${Date.now()}`;
+    let copiedForSwap = false;
+    let renamedBackup = false;
     try {
-        await cp(stagingDir, installDir, { recursive: true, force: true });
-    } catch (e) {
-        copyError = `failed to copy to install dir: ${String(e)}`;
-    } finally {
+        await cp(stagingDir, swapCandidate, { recursive: true, force: true });
+        copiedForSwap = true;
+        await rename(installDir, backupDir);
+        renamedBackup = true;
+        try {
+            await rename(swapCandidate, installDir);
+        } catch (e) {
+            const swapError = String(e);
+            await rename(backupDir, installDir);
+            renamedBackup = false;
+            throw new Error(swapError);
+        }
         await rm(stagingDir, { recursive: true, force: true });
-    }
-    if (copyError !== null) {
-        const rb = await restoreFromBackup();
-        return { ok: false, error: rb ?? copyError };
+    } catch {
+        if (copiedForSwap) await rm(swapCandidate, { recursive: true, force: true });
+        if (!pnpmOldLink && !renamedBackup) {
+            // File backup for the merge-copy path, created into a FRESH
+            // destination — re-copying over the existing backup tree trips
+            // libuv's self-copy guard on npm's relative .bin symlinks.
+            try {
+                await cp(installDir, backupDir, { recursive: true, force: true });
+            } catch (e) {
+                return { ok: false, error: `backup of current install failed (install left untouched): ${String(e)}` };
+            }
+        }
+        let copyError: string | null = null;
+        try {
+            await cp(stagingDir, installDir, { recursive: true, force: true });
+        } catch (e) {
+            copyError = `failed to copy to install dir: ${String(e)}`;
+        } finally {
+            await rm(stagingDir, { recursive: true, force: true });
+        }
+        if (copyError !== null) {
+            const rb = await restoreFromBackup();
+            return { ok: false, error: rb ?? copyError };
+        }
     }
 
     // Final verification: version must match and every declared entry must
@@ -2131,7 +2174,7 @@ export async function installViaTarball(
 
     // Success: the backup is no longer needed, and neither is the displaced
     // pnpm link (the store copy underneath it was left byte-identical).
-    await rm(backupDir, { recursive: true, force: true });
+    if (!pnpmOldLink) await rm(backupDir, { recursive: true, force: true });
     if (pnpmOldLink) {
         try {
             await unlink(pnpmOldLink);
@@ -2268,7 +2311,8 @@ export async function forceInstallVersion(
         // install between the pre-lock read and lock acquisition.
         const diskUnderLock = await readDiskVersion(installDir);
         if (diskUnderLock === targetVersion) return { ok: true };
-        const result = await installViaTarball(targetVersion, doc.tarball, installDir, doc.integrity, doc.shasum, egressDispatcher(opts, doc.tarball));
+        // #2082: same boot smoke as the other lanes when the target is the dsh desktop copy.
+        const result = await installViaTarball(targetVersion, doc.tarball, installDir, doc.integrity, doc.shasum, egressDispatcher(opts, doc.tarball), process.env, { bootSmoke: isDshDesktopInstall(installDir) });
         if (result.ok) {
             const channel = installSource ?? `advisory:${advisoryId}`;
             await persistLastInstall(diskUnderLock ?? opts.currentVersion, targetVersion, channel);

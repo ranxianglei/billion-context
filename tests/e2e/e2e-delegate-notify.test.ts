@@ -27,8 +27,9 @@
 // new turn from idle.
 //
 // Gated by ACP_TEST_E2E_NATIVE=1 (same gate as e2e-native-pi.test.ts; needs
-// `npm run build` first — the pi package loads dist/agent/pi-native.js, which
-// inlines the vendored pi-subagents source). Skips when the pi CLI is absent.
+// `npm run build` first — the pi package loads dist/agent/billion-context.js, a
+// re-export of pi-native.js (which inlines the vendored pi-subagents source).
+// Skips when the pi CLI is absent.
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -42,7 +43,7 @@ import { assertPortDead } from "../port-race.js";
 
 const PI_BIN = process.env.E2E_PI_BIN ?? "pi";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
-const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/pi-native.js");
+const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/billion-context.js");
 const FAKE_UPSTREAM = path.join(import.meta.dirname, "fake-upstream-chat.mjs");
 const TMO_MS = Number(process.env.E2E_TMO ?? 180_000);
 const QUIET_MS = 12_000; // sustained quiescence before declaring the scenario done
@@ -90,6 +91,9 @@ function cleanEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
     if (key.startsWith("BILI") || key.startsWith("BILLION_CONTEXT") || key.startsWith("ACP_")) delete env[key];
   }
   for (const key of ["NODE_EXTRA_CA_CERTS", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "NODE_OPTIONS", "NODE_TEST_CONTEXT"]) delete env[key];
+  // ci:full branch: keep the egress plane off this legacy-persistence lane — see the
+  // e2e-native-pi scope note (egress-on sessions freeze the JSON surface).
+  env.BILI_ROLLOUT_EGRESS_PLANE = "0";
   return { ...env, ...extra } as NodeJS.ProcessEnv;
 }
 
@@ -264,6 +268,12 @@ async function runScenario(name: string, prompt: string, totalDirectives: number
       XDG_CACHE_HOME: ctx.xdg.cache,
       XDG_STATE_HOME: ctx.xdg.state,
       XDG_DATA_HOME: ctx.xdg.data,
+      // The scripted filler issues 9 identical fast `sleep 2` calls; the
+      // repetition guard's rapidity ladder (warn 3 / refuse 5 / abort 6) then
+      // trips on fast runners (no round reaches the 5s long-poll reset) and
+      // aborts the turn mid-scenario — a runner-speed coin flip. The guard is
+      // covered by its own unit suite and is orthogonal to #2320/#2546 here.
+      BILI_GUARDRAIL_REPETITION: "0",
       ...(cliEntry ? { PI_CLI_PATH: cliEntry } : {}),
     });
     pi = new RpcClient(ctx.piCwd, env);
@@ -386,7 +396,7 @@ function scenarioSkip(): string | false {
   if (process.env.ACP_TEST_E2E_NATIVE !== "1") {
     return "set ACP_TEST_E2E_NATIVE=1 (real pi RPC lane + local fake upstream; deterministic, zero tokens)";
   }
-  if (!fs.existsSync(PI_NATIVE_ENTRY)) return "dist/agent/pi-native.js missing — run `npm run build` first";
+  if (!fs.existsSync(PI_NATIVE_ENTRY)) return "dist/agent/billion-context.js missing — run `npm run build` first";
   if (!piAvailable()) return `${PI_BIN} CLI not available`;
   return false;
 }

@@ -32,7 +32,7 @@ process.env.NODE_ENV = "test";
 
 const PI_BIN = process.env.E2E_PI_BIN ?? "pi";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
-const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/pi-native.js");
+const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/billion-context.js");
 const TMO = Number(process.env.E2E_TMO ?? 180_000);
 const WORK_ROOT = path.join(process.cwd(), "tmp");
 fs.mkdirSync(WORK_ROOT, { recursive: true });
@@ -52,7 +52,7 @@ function piAvailable(): boolean {
 const skipReason = !run
     ? "set ACP_TEST_E2E_PI_WS=1 (real pi + local mock WS upstream; deterministic, zero tokens)"
     : !fs.existsSync(PI_NATIVE_ENTRY)
-        ? "dist/agent/pi-native.js missing — run `npm run build` first"
+        ? "dist/agent/billion-context.js missing — run `npm run build` first"
         : !piAvailable()
             ? `pi binary "${PI_BIN}" not found on PATH`
             : undefined;
@@ -257,6 +257,10 @@ function cleanEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     for (const key of Object.keys(env)) {
         if (key.startsWith("BILI") || key.startsWith("BILLION_CONTEXT") || key.startsWith("ACP_")) delete env[key];
     }
+    // #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+    // off) — this suite asserts the legacy JSON persistence surface, so pin
+    // the dual-write writer explicitly.
+    env.BILI_STORAGE_JSON_WRITER = "on";
     // NODE_TEST_CONTEXT stands down pi-native inside node:test; the spawned pi
     // is a real client, not a test context (same rationale as e2e-native-pi).
     for (const key of ["NODE_EXTRA_CA_CERTS", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "NODE_OPTIONS", "NODE_TEST_CONTEXT"]) delete env[key];
@@ -342,6 +346,10 @@ function piRun(
             cwd: ctx.piCwd,
             env: {
                 ...cleanEnv(opts.extraEnv),
+                // Pure-SQLite is the default storage writer now (2026-11-13):
+                // this lane asserts the JSONL session envelopes — pin dual-write
+                // so coverage does not depend on the default.
+                BILI_STORAGE_JSON_WRITER: "1",
                 PI_CODING_AGENT_DIR: ctx.piAgentDir,
                 XDG_CONFIG_HOME: ctx.xdg.config,
                 XDG_CACHE_HOME: ctx.xdg.cache,

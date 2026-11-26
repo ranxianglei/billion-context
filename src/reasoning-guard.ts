@@ -346,6 +346,7 @@ async function consumeRound(
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     let buf = "";
+    let completed = false;
     const drainOnce = (): { terminal: Record<string, unknown> } | null => {
         let idx: number;
         while ((idx = buf.indexOf("\n\n")) !== -1) {
@@ -361,7 +362,7 @@ async function consumeRound(
     try {
         for (;;) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done) { completed = true; break; }
             buf += decoder.decode(value, { stream: true });
             buf = normalizeSseLineEndings(buf);
             const term = drainOnce();
@@ -374,6 +375,10 @@ async function consumeRound(
     } catch (e) {
         return { error: e instanceof Error ? e.message : String(e) };
     } finally {
+        // A terminal event ends the round before HTTP EOF; release its body
+        // before a continuation needs that upstream connection. A tee's
+        // cancellation may wait for its other consumer, so never await it here.
+        if (!completed) void reader.cancel().catch(() => {});
         reader.releaseLock();
     }
 }

@@ -32,12 +32,19 @@ import semver from "semver";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
 import type { FetchOptions } from "./fetch-util.js";
+import { boundedLine } from "./text-safe.js";
 import { CHECK_INTERVAL_MS, egressDispatcher, findInstallDir, readDiskVersion, registryUrlFor } from "./update.js";
 
 const RELEASE_NOTES_PACKAGE = "billion-context-release-notes";
 const SUPPORTED_SCHEMA = 1;
 /** Producer-side cap (release-notes/README): the doc keeps ~20 entries. */
 const MAX_RELEASE_NOTES_ENTRIES = 20;
+/** Producer-side cap (release-notes/README + the release-notes workflow):
+ *  summary / summaryZh are one line of at most 400 chars. The client enforces
+ *  the same bound when it parses the document, because acp_status prints
+ *  every span summary as its own line into model context: line breaks are
+ *  flattened and over-long text is truncated (the entry is kept). */
+const CAP_RELEASE_NOTE_SUMMARY = 400;
 
 type ReleaseTier = "routine" | "recommended" | "critical";
 
@@ -118,8 +125,8 @@ export function parseReleaseNotesDoc(raw: unknown): { entries: ReleaseNoteEntry[
         const e = item as Record<string, unknown>;
         const version = typeof e.version === "string" ? e.version.trim() : "";
         const tier = e.tier === "recommended" || e.tier === "routine" || e.tier === "critical" ? e.tier : undefined;
-        const summary = typeof e.summary === "string" ? e.summary.trim() : "";
-        const summaryZh = typeof e.summaryZh === "string" ? e.summaryZh.trim() : "";
+        const summary = typeof e.summary === "string" ? boundedLine(e.summary, CAP_RELEASE_NOTE_SUMMARY) : "";
+        const summaryZh = typeof e.summaryZh === "string" ? boundedLine(e.summaryZh, CAP_RELEASE_NOTE_SUMMARY) : "";
         const minVersion = typeof e.minVersion === "string" ? e.minVersion.trim() : "";
         const maxVersion = typeof e.maxVersion === "string" ? e.maxVersion.trim() : "";
         if (!semver.valid(version) || tier === undefined || !summary) continue;

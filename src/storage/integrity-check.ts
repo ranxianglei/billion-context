@@ -89,14 +89,27 @@ function statKeyOf(dbPath: string): { db: StatKeyPart | null; wal: StatKeyPart |
     return { db: statPart(dbPath), wal: statPart(`${dbPath}-wal`) };
 }
 
+function isStatKeyPart(value: unknown): value is StatKeyPart {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const part = value as Partial<StatKeyPart>;
+    return typeof part.s === "number" && Number.isSafeInteger(part.s) && part.s >= 0
+        && typeof part.m === "number" && Number.isFinite(part.m);
+}
+
 /** Read + validate the sidecar. Malformed/absent → null (a plain cache
  * miss — never a boot failure). */
 export function readIntegrityCache(dbPath: string): IntegrityCache | null {
     const file = integrityCachePath(dbPath);
     if (!existsSync(file)) return null;
     try {
-        const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<IntegrityCache>;
-        if (parsed.v !== 1 || typeof parsed.ok !== "boolean") return null;
+        const value: unknown = JSON.parse(readFileSync(file, "utf8"));
+        if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+        const parsed = value as Partial<IntegrityCache>;
+        if (parsed.v !== 1 || typeof parsed.ok !== "boolean"
+            || typeof parsed.schema !== "number" || !Number.isSafeInteger(parsed.schema) || parsed.schema < 0
+            || !isStatKeyPart(parsed.db) || (parsed.wal !== null && !isStatKeyPart(parsed.wal))
+            || typeof parsed.at !== "number" || !Number.isFinite(parsed.at) || parsed.at < 0
+            || (parsed.detail !== undefined && typeof parsed.detail !== "string")) return null;
         return parsed as IntegrityCache;
     } catch {
         return null;
@@ -162,8 +175,9 @@ const isBunRuntime = typeof process !== "undefined" && process.versions != null 
 const openReadOnly = isBunRuntime
     ? (p) => new (require(BUN_SQLITE_SPEC).Database)(p, { readonly: true })
     : (p) => new (require(SQLITE_SPEC).DatabaseSync)(p, { readOnly: true });
+let db;
 try {
-    const db = openReadOnly(workerData.path);
+    db = openReadOnly(workerData.path);
     const rows = db.prepare("PRAGMA quick_check").all();
     db.close();
     const verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
@@ -178,6 +192,13 @@ try {
     const c = String((err && err.code) || "").toUpperCase();
     const corrupt = c === "SQLITE_CORRUPT" || c === "SQLITE_NOTADB" || m.includes("database disk image is malformed") || m.includes("file is not a database");
     parentPort.postMessage(corrupt ? { ok: false, corrupt: true, error: m } : { ok: false, error: m });
+    // #6785 CI: the read-only handle must be released on the error path too —
+    // a throwing quick_check left it open until the worker thread tore down, and
+    // a concurrent rmSync of the test's temp dir raced that teardown (EPERM on
+    // windows-latest). The verdict is already posted above, so close is best-effort.
+    if (db) {
+        try { db.close(); } catch { /* verdict already posted; close is best-effort */ }
+    }
 }
 `;
 
@@ -251,7 +272,12 @@ const inflight = new Set<string>();
  * 2026-10-30 owner policy: background findings are ALARMS ONLY, never
  * boot-blockers — no cache write on failure), and tells the caller's store
  * instance so a clean close can refresh the PASS cache key. */
-export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok: boolean) => void): void {
+export function scheduleBackgroundIntegrityCheck(
+    dbPath: string,
+    onVerdict?: (ok: boolean) => void,
+    foreignWriter?: () => number | null,
+    onForeignSeen?: (pid: number) => void,
+): void {
     const size = statPart(dbPath)?.s ?? 0;
     loggerLog("info", `[storage] background quick_check started for ${dbPath} (${(size / (1024 * 1024)).toFixed(1)} MiB over the ${Math.round(effectiveSyncThreshold() / (1024 * 1024))} MiB sync threshold) — serving continues; the verdict lands in /__bili/status (#4609)`);
     inflight.add(dbPath);
@@ -291,7 +317,18 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
                 const verdict = String(msg.verdict ?? "");
                 if (verdict === "ok") {
                     recordIntegrityOutcome(dbPath, true, 0);
-                    writeIntegrityCache(dbPath, true);
+                    // #7156 review: an ok verdict stamped while a live foreign
+                    // writer was active is exactly the incident's poisoning —
+                    // the wedged predecessor kept writing after the scan read
+                    // the file, so "ok" describes a state that already changed.
+                    // Defer to the next boot's fresh scan instead of caching.
+                    const foreign = foreignWriter?.() ?? null;
+                    if (foreign === null) {
+                        writeIntegrityCache(dbPath, true);
+                    } else {
+                        onForeignSeen?.(foreign);
+                        loggerLog("info", `[storage] background quick_check for ${dbPath} found ok, but live foreign writer pid ${foreign} was still active — NOT caching the ok verdict (the file may have changed outside this process's writes); the next boot re-scans fresh (#7156)`);
+                    }
                     onVerdict?.(true);
                 } else {
                     // A real integrity failure found post-open: record loudly as an

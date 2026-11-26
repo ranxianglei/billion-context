@@ -77,6 +77,20 @@ function cleanEnv(): NodeJS.ProcessEnv {
         if (key.startsWith("BILI") || key.startsWith("BILLION_CONTEXT") || key.startsWith("ACP_") || key.startsWith("DSH_") || key.startsWith("ZCODE")) delete env[key];
     }
     for (const key of ["NODE_EXTRA_CA_CERTS", "NODE_OPTIONS", "NODE_TEST_CONTEXT", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"]) delete env[key];
+    // #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+    // off) — this suite asserts the legacy JSON persistence surface (raw
+    // conversation keys persisting sessions), so pin the dual-write writer.
+    env.BILI_STORAGE_JSON_WRITER = "on";
+    // The egress plane (default ON on this ci:full evidence branch) arms
+    // these real dsh lanes and freezes the legacy JSON persistence surface
+    // (index-only), and egress-serve replays the recorded transcript across
+    // the mid-session model/protocol switches this suite exercises — both
+    // effects are pinned by the egress suites (egress-fork-host-e2e,
+    // storage-engine-proofs). This suite's contract is the LEGACY
+    // persistence + no-fork-on-switch behavior, so run it off the plane,
+    // the same discipline as e2e-native-dsh / e2e-native-pi /
+    // e2e-delegate-notify (commit 5c73de3).
+    env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     return env;
 }
 
@@ -400,6 +414,11 @@ function buildRig(tag: string, withAutoReview: boolean): Rig {
 
     const env: NodeJS.ProcessEnv = {
         ...cleanEnv(),
+        // Pure-SQLite is the default storage writer now (2026-11-13): this lane
+        // asserts the JSONL session envelopes — pin dual-write (same reason as
+        // the other client e2e lanes); pure-sqlite semantics are covered by the
+        // unit tests and the real-model gate.
+        BILI_STORAGE_JSON_WRITER: "1",
         HOME: home,
         TMPDIR: tmp,
         DSH_HOME: dshHome,

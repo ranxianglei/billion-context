@@ -1,245 +1,160 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
+import { test } from "node:test";
+import type { ServerResponse } from "node:http";
 import { pipePluginChatWithStrip, pipePluginResponsesWithStrip } from "../src/plugin.ts";
 
-// #2328 Q2/Q4: the plugin-lane strip pipes now attach termination
-// diagnostics (meta) to the in-band upstream_stream_truncated error frame and
-// to the log line, and classify the cut:
-//  - no-terminal-seen: EOF/read-error with no terminal bytes in flight.
-//  - terminal-bytes-unrecognized: the dangling partial event at the cut
-//    carries the opening bytes of the wire's own terminal ([DONE],
-//    message_stop, finishReason chunk, response.completed family).
-// This is what makes "the upstream never finished the turn" distinguishable
-// from "the terminal arrived but its bytes never completed" (#2347 forensics)
-// without needing a raw-SSE dump.
-
-function makeRes(chunks: string[]) {
+function makeRes(writes: string[]): ServerResponse {
     return {
-        writes: chunks,
-        write(b: Buffer | string) {
-            chunks.push(typeof b === "string" ? b : b.toString("utf8"));
+        write(chunk: Buffer | string) {
+            writes.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
             return true;
         },
-        end(b?: Buffer | string) {
-            if (b !== undefined) chunks.push(typeof b === "string" ? b : b.toString("utf8"));
+        end(chunk?: Buffer | string) {
+            if (chunk !== undefined) writes.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
         },
         once() {},
         destroyed: false,
         writableEnded: false,
-    } as unknown as import("node:http").ServerResponse;
+    } as unknown as ServerResponse;
 }
 
-function streamOf(events: string[], then?: "error"): ReadableStream<Uint8Array> {
-    const enc = new TextEncoder();
-    let i = 0;
+function streamOf(events: string[], failure?: Error): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder();
+    let index = 0;
     return new ReadableStream<Uint8Array>({
         pull(controller) {
-            if (i < events.length) {
-                controller.enqueue(enc.encode(events[i]));
-                i += 1;
-            } else if (then === "error") {
-                controller.error(new Error("upstream socket reset mid-stream"));
-            } else {
-                controller.close();
-            }
+            if (index < events.length) controller.enqueue(encoder.encode(events[index++]!));
+            else if (failure) controller.error(failure);
+            else controller.close();
         },
     });
 }
 
-/** Pull the first data-frame JSON that carries the truncation code. */
-function truncationMeta(writes: string[], at: "top" | "nested"): Record<string, unknown> | undefined {
-    for (const w of writes) {
-        for (const frame of w.split("\n\n")) {
-            const m = frame.match(/^(?:event: [^\n]+\n)?data: (.*)$/s);
-            if (!m) continue;
-            try {
-                const ev = JSON.parse(m[1]!) as Record<string, unknown>;
-                if (at === "top" && ev["code"] === "upstream_stream_truncated") return ev["meta"] as Record<string, unknown>;
-                if (at === "nested") {
-                    const err = ev["error"] as Record<string, unknown> | undefined;
-                    // google's error object carries a numeric code (503) +
-                    // gRPC status instead of the string code.
-                    if (err && (err["code"] === "upstream_stream_truncated" || err["status"] === "UNAVAILABLE")) return err["meta"] as Record<string, unknown>;
-                }
-            } catch {
-                /* not a JSON frame */
-            }
+function truncationErrorFrame(writes: string[]): Record<string, unknown> {
+    for (const frame of writes.join("").split("\n\n")) {
+        const dataLine = frame.split(/\r?\n/).find((line) => line.startsWith("data: "));
+        const data = dataLine?.slice("data: ".length);
+        if (!data || data === "[DONE]") continue;
+        try {
+            const event = JSON.parse(data) as Record<string, unknown>;
+            const error = event["error"] as Record<string, unknown> | undefined;
+            const nestedError = error?.["error"] as Record<string, unknown> | undefined;
+            if (event["code"] === "upstream_stream_truncated" || error?.["code"] === "upstream_stream_truncated" || error?.["status"] === "UNAVAILABLE" || nestedError?.["code"] === "upstream_stream_truncated") return event;
+        } catch {
+            continue;
         }
     }
-    return undefined;
+    throw new Error("Expected an upstream truncation SSE frame");
 }
 
-const openaiChunk = (fr: string | null) => `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, delta: fr === null ? { content: "hi" } : {}, finish_reason: fr }] })}\n\n`;
+function diagFromLogs(logs: string[]): Record<string, unknown> {
+    const line = logs.find((entry) => entry.includes("upstream stream truncated"));
+    const serialized = line?.match(/; diag=(\{.*\})\]$/)?.[1];
+    if (!serialized) throw new Error("Expected truncation diagnostics in local logs");
+    return JSON.parse(serialized) as Record<string, unknown>;
+}
 
-test("chat pipe (openai): dangling `data: [DO` at EOF classifies as terminal-bytes-unrecognized", async () => {
-    const out: string[] = [];
+const openaiChunk = (text: string) => `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })}\n\n`;
+
+test("OpenAI truncation keeps transport causes and trace IDs in local logs only", async () => {
+    const writes: string[] = [];
+    const logs: string[] = [];
+    const socketError = Object.assign(new Error("other side closed"), { name: "SocketError", code: "UND_ERR_SOCKET" });
+    const failure = new TypeError("terminated", { cause: socketError });
+
+    await pipePluginChatWithStrip(
+        streamOf([openaiChunk("partial")], failure),
+        makeRes(writes),
+        "openai",
+        undefined,
+        (line) => logs.push(line),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+            status: 200,
+            contentType: "text/event-stream",
+            requestId: "01a1bf31-7f88-7c2c-a1b8-62b2ecd1d3a5",
+            opencodeLogId: "log-7f88",
+            cfRay: "a57b139e8f1bb5af-LHR",
+        },
+    );
+
+    const event = truncationErrorFrame(writes);
+    const error = event["error"] as Record<string, unknown>;
+    assert.equal(error["code"], "upstream_stream_truncated");
+    assert.equal(error["meta"], undefined);
+    assert.ok(!writes.join("").includes("other side closed"));
+
+    const diag = diagFromLogs(logs);
+    assert.deepEqual(diag["readErrorCause"], [{ name: "SocketError", code: "UND_ERR_SOCKET" }]);
+    assert.equal(diag["upstreamRequestId"], "01a1bf31-7f88-7c2c-a1b8-62b2ecd1d3a5");
+    assert.equal(diag["upstreamLogId"], "log-7f88");
+    assert.equal(diag["upstreamCfRay"], "a57b139e8f1bb5af-LHR");
+    assert.equal(diag["upstreamStatus"], 200);
+    assert.equal(diag["upstreamContentType"], "text/event-stream");
+    assert.ok(!JSON.stringify(diag).includes("other side closed"));
+});
+
+test("Responses EOF records classification locally and emits no diagnostic metadata", async () => {
+    const writes: string[] = [];
+    const logs: string[] = [];
+    const sse = (type: string, data: Record<string, unknown>) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+
+    await pipePluginResponsesWithStrip(
+        streamOf([
+            sse("response.created", { response: { id: "resp_1" } }),
+            sse("response.output_text.delta", { output_index: 0, delta: "hi" }),
+        ]),
+        makeRes(writes),
+        undefined,
+        (line) => logs.push(line),
+    );
+
+    const event = truncationErrorFrame(writes);
+    assert.equal(event["code"], "upstream_stream_truncated");
+    assert.equal(event["meta"], undefined);
+    const diag = diagFromLogs(logs);
+    assert.equal(diag["classification"], "no-terminal-seen");
+    assert.equal(diag["cause"], "eof");
+});
+
+test("Google truncation retains its protocol error shape without exposing diagnostics", async () => {
+    const writes: string[] = [];
     const logs: string[] = [];
     await pipePluginChatWithStrip(
-        streamOf([openaiChunk(null), "data: [DO"]),
-        makeRes(out),
-        "openai",
-        undefined,
-        (m) => logs.push(m),
-    );
-    const meta = truncationMeta(out, "nested");
-    assert.ok(meta, "error frame carries meta");
-    assert.equal(meta!["classification"], "terminal-bytes-unrecognized");
-    assert.equal(meta!["cause"], "eof");
-    assert.equal(meta!["protocol"], "openai");
-    assert.equal(meta!["eofBufferBytes"], "data: [DO".length);
-    assert.equal(meta!["eofBufferHead"], "data: [DO");
-    assert.deepEqual(meta!["lastEventTypes"], ["chunk"]);
-    assert.equal(meta!["events"], 1);
-    assert.ok((meta!["bytes"] as number) > 0);
-    assert.equal(meta!["retryZeroByteCutSpent"], false);
-    assert.equal(meta!["retryDegenerateSpent"], false);
-    // wire shape: openai meta nests inside `error`, and the [DONE] tail still
-    // follows the error frame (#721 contract unchanged).
-    assert.ok(out.join("").includes("data: [DONE]"));
-    // log line: one grep-able line with the classification + full diag.
-    const line = logs.find((l) => l.includes("upstream stream truncated"));
-    assert.ok(line, "log line emitted");
-    assert.ok(line!.includes("classification=terminal-bytes-unrecognized"));
-    assert.ok(line!.includes("cause=eof"));
-    assert.ok(line!.includes("diag="));
-});
-
-test("chat pipe (anthropic): clean EOF with no terminal classifies as no-terminal-seen", async () => {
-    const out: string[] = [];
-    await pipePluginChatWithStrip(
-        streamOf([
-            `event: message_start\ndata: ${JSON.stringify({ type: "message_start" })}\n\n`,
-            `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } })}\n\n`,
-        ]),
-        makeRes(out),
-        "anthropic",
-    );
-    const meta = truncationMeta(out, "nested");
-    assert.ok(meta, "error frame carries meta");
-    assert.equal(meta!["classification"], "no-terminal-seen");
-    assert.equal(meta!["cause"], "eof");
-    assert.equal(meta!["eofBufferBytes"], 0);
-    assert.equal(meta!["eofBufferHead"], undefined);
-    assert.deepEqual(meta!["lastEventTypes"], ["message_start", "content_block_delta"]);
-    assert.ok((meta!["visibleChars"] as number) >= 2);
-    assert.ok(out.join("").includes("event: error"));
-});
-
-test("chat pipe (google): meta rides the UNAVAILABLE error object and counts unparseable forwards", async () => {
-    const out: string[] = [];
-    await pipePluginChatWithStrip(
-        streamOf([
-            // one parseable chunk, then one unparseable frame (forwarded raw),
-            // then EOF with nothing terminal in flight.
-            `data: ${JSON.stringify({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: "hi" }] } }] })}\n\n`,
-            "data: {{{not-json\n\n",
-        ]),
-        makeRes(out),
+        streamOf([`data: ${JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: "hi" }] } }] })}\n\n`]),
+        makeRes(writes),
         "google",
+        undefined,
+        (line) => logs.push(line),
     );
-    const meta = truncationMeta(out, "nested");
-    assert.ok(meta, "error frame carries meta");
-    assert.equal(meta!["classification"], "no-terminal-seen");
-    assert.equal(meta!["unparseableForwarded"], 1);
-    assert.deepEqual(meta!["lastEventTypes"], ["chunk", "unparseable"]);
-    const frame = out.join("");
-    // Gemini's error object carries a numeric code + gRPC status, no string
-    // code (see emitUpstreamTruncation) — UNAVAILABLE identifies the frame.
-    assert.ok(frame.includes('"status":"UNAVAILABLE"'));
-    assert.ok(frame.includes('"code":503'));
+
+    const event = truncationErrorFrame(writes);
+    const error = event["error"] as Record<string, unknown>;
+    assert.equal(error["code"], 503);
+    assert.equal(error["status"], "UNAVAILABLE");
+    assert.equal(error["meta"], undefined);
+    assert.equal(diagFromLogs(logs)["classification"], "no-terminal-seen");
 });
 
-test("chat pipe: upstreamMeta threads HTTP status/content-type into the diag", async () => {
-    const out: string[] = [];
+test("Anthropic truncation keeps provider error shape without client diagnostics", async () => {
+    const writes: string[] = [];
+    const logs: string[] = [];
     await pipePluginChatWithStrip(
-        streamOf([openaiChunk(null)]),
-        makeRes(out),
-        "openai",
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        { status: 200, contentType: "text/event-stream" },
-    );
-    const meta = truncationMeta(out, "nested");
-    assert.ok(meta);
-    assert.equal(meta!["upstreamStatus"], 200);
-    assert.equal(meta!["upstreamContentType"], "text/event-stream");
-});
-
-test("responses pipe: dangling response.completed head classifies as terminal-bytes-unrecognized", async () => {
-    const out: string[] = [];
-    const sse = (e: string, d: Record<string, unknown>) => `event: ${e}\ndata: ${JSON.stringify({ type: e, ...d })}\n\n`;
-    await pipePluginResponsesWithStrip(
-        streamOf([
-            sse("response.created", { response: { id: "resp_1" } }),
-            sse("response.output_item.added", { output_index: 0, item: { type: "message", id: "msg_1" } }),
-            sse("response.content_part.added", { item_id: "msg_1", output_index: 0 }),
-            sse("response.output_text.delta", { item_id: "msg_1", output_index: 0, delta: "he" }),
-            'event: response.completed\ndata: {"type":"response.comp',
-        ]),
-        makeRes(out),
-    );
-    const meta = truncationMeta(out, "top");
-    assert.ok(meta, "error frame carries meta");
-    assert.equal(meta!["classification"], "terminal-bytes-unrecognized");
-    assert.equal(meta!["cause"], "eof");
-    assert.equal(meta!["protocol"], "responses");
-    assert.ok((meta!["eofBufferHead"] as string).includes("response.comp"));
-    assert.deepEqual(meta!["lastEventTypes"], [
-        "response.created",
-        "response.output_item.added",
-        "response.content_part.added",
-        "response.output_text.delta",
-    ]);
-    assert.equal(meta!["heldEvents"], 0);
-    assert.ok((meta!["visibleChars"] as number) >= 2);
-});
-
-test("responses pipe: clean EOF after deltas classifies as no-terminal-seen", async () => {
-    const out: string[] = [];
-    const sse = (e: string, d: Record<string, unknown>) => `event: ${e}\ndata: ${JSON.stringify({ type: e, ...d })}\n\n`;
-    await pipePluginResponsesWithStrip(
-        streamOf([
-            sse("response.created", { response: { id: "resp_1" } }),
-            sse("response.output_item.added", { output_index: 0, item: { type: "message", id: "msg_1" } }),
-            sse("response.content_part.added", { item_id: "msg_1", output_index: 0 }),
-            sse("response.output_text.delta", { item_id: "msg_1", output_index: 0, delta: "hi" }),
-        ]),
-        makeRes(out),
-    );
-    const meta = truncationMeta(out, "top");
-    assert.ok(meta);
-    assert.equal(meta!["classification"], "no-terminal-seen");
-    assert.equal(meta!["eofBufferBytes"], 0);
-});
-
-test("responses pipe: upstream read error records cause=read-error", async () => {
-    const out: string[] = [];
-    const sse = (e: string, d: Record<string, unknown>) => `event: ${e}\ndata: ${JSON.stringify({ type: e, ...d })}\n\n`;
-    await pipePluginResponsesWithStrip(
-        streamOf([sse("response.output_text.delta", { item_id: "msg_1", output_index: 0, delta: "x" })], "error"),
-        makeRes(out),
-    );
-    const meta = truncationMeta(out, "top");
-    assert.ok(meta);
-    assert.equal(meta!["cause"], "read-error");
-    assert.equal(meta!["classification"], "no-terminal-seen");
-});
-
-test("chat pipe (anthropic): dangling message_stop head classifies as terminal-bytes-unrecognized", async () => {
-    const out: string[] = [];
-    await pipePluginChatWithStrip(
-        streamOf([
-            `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } })}\n\n`,
-            "event: message_stop\ndata: {\"type\":\"mess",
-        ]),
-        makeRes(out),
+        streamOf([`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } })}\n\n`]),
+        makeRes(writes),
         "anthropic",
+        undefined,
+        (line) => logs.push(line),
     );
-    const meta = truncationMeta(out, "nested");
-    assert.ok(meta);
-    assert.equal(meta!["classification"], "terminal-bytes-unrecognized");
+
+    const event = truncationErrorFrame(writes);
+    const error = event["error"] as Record<string, unknown>;
+    assert.equal(error["code"], "upstream_stream_truncated");
+    assert.equal(error["meta"], undefined);
+    const diag = diagFromLogs(logs);
+    assert.equal(diag["protocol"], "anthropic");
+    assert.equal(diag["cause"], "eof");
 });

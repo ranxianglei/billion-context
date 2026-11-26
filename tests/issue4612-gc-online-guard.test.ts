@@ -164,11 +164,17 @@ test("#4612: zero-ref sweep deletes every garbage row in batches with progress l
         // line lands every 10th batch plus always on the final batch
         const raw = new DatabaseSync(dbPath);
         try {
+            // One transaction: 21,000 autocommit inserts would pay one fsync
+            // per row (WAL + synchronous=FULL) — ~17 min on slow-fsync disks,
+            // past the runner timeout (#4599). BEGIN/COMMIT collapses it to a
+            // single fsync without changing the resulting row set.
+            raw.exec("BEGIN");
             const ins = raw.prepare("INSERT INTO content (hash, byte_len, refcount, algo, bytes) VALUES (?, ?, 0, 'sha256', ?)");
             for (let i = 0; i < N; i++) {
                 const body = Buffer.from(`zero-ref body ${i}`);
                 ins.run(`4612-zero-ref-${i}`, body.length, body);
             }
+            raw.exec("COMMIT");
         } finally {
             raw.close();
         }

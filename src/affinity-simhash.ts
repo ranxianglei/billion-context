@@ -54,22 +54,15 @@ function fnv1a32(text: string, basis: number): number {
  *  so a short message still yields a stable, comparable sketch. */
 export function simhashHex(canonical: string): string {
     const tokens = canonical.match(/[\p{L}\p{N}_]+/gu) ?? [];
-    const features: string[] = [];
-    if (tokens.length < 2) {
-        for (const t of tokens) features.push(t);
-    } else {
-        for (let i = 0; i + 1 < tokens.length; i++) features.push(`${tokens[i]}\u0001${tokens[i + 1]}`);
-    }
-    if (features.length === 0) {
-        // No word tokens at all (pure punctuation/whitespace): hash the raw
-        // string so even that degenerate case is deterministic and comparable.
-        features.push(canonical);
-    }
-    const stride = Math.max(1, Math.ceil(features.length / MAX_FEATURES));
+    const featureCount = Math.max(1, tokens.length - 1);
+    const stride = Math.max(1, Math.ceil(featureCount / MAX_FEATURES));
     const v = new Int16Array(64);
-    for (let f = 0; f < features.length; f += stride) {
-        const h1 = fnv1a32(features[f]!, 2166136261);
-        const h2 = fnv1a32(features[f]!, 2166136261 ^ 0x9e3779b9);
+    for (let f = 0; f < featureCount; f += stride) {
+        // Construct only sampled shingles, not an additional full-size array
+        // for a long message. No-token inputs still hash the raw string.
+        const feature = tokens.length < 2 ? (tokens[0] ?? canonical) : `${tokens[f]}\u0001${tokens[f + 1]}`;
+        const h1 = fnv1a32(feature, 2166136261);
+        const h2 = fnv1a32(feature, 2166136261 ^ 0x9e3779b9);
         for (let b = 0; b < 64; b++) {
             const bit = b < 32 ? (h1 >>> b) & 1 : (h2 >>> (b - 32)) & 1;
             v[b] += bit === 1 ? 1 : -1;

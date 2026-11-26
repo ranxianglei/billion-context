@@ -5,6 +5,9 @@ README 三种使用方式背后的机制级说明。README 里每种方式只保
 ## 被拒请求的 token 计量
 
 上下文溢出恢复分别处理上游窗口上限、被拒请求的总量、输入消息量和回复预留量。解析器同时识别 OpenAI/DeepSeek 的括号句式（`requested N tokens (M in the messages, C in the completion)`）及 SGLang/LiteLLM 的冒号句式（`requested a total of N tokens: M tokens from the input messages and C tokens for the completion`）。明确的输入计数进入现有校准环；回复计数触发现有的输出余量预留。只有窗口上限或拆分不完整的错误不会产生虚构计量。插件模式与代理模式共用该解析，不改写声明的模型窗口。
+
+当 400/413 给出完整且一致的 token 计数，并且输入本身能放进窗口时，中继可以按实测剩余空间缩减回复额度，并用同一份输入重试一次。中继会核对报告的回复预留量与实际请求字段，并为显式思考预算保留空间。重新折叠后的请求也可以按同样规则恢复。配置了出站改写的请求继续走现有的重新折叠流程，因为改写可能让两次发送的输入不同。
+
 ## 来源短视图之后的 fork 恢复
 
 fork 继承依据子会话重放内容判断保留的压缩块，不直接沿用来源上一次请求的 `active` 标记。来源的一次短请求可能暂时停用某个块，而子会话重放时包含它覆盖的完整原文。完整存在的保留块独立复制并激活；明确解压的块、被高层块消费的子块及跨越 fork 边界的块不会独立激活。被继承高层块的子块作为非活动记录随行。规划和继承均不修改来源会话。
@@ -177,3 +180,19 @@ chat wire 上 bili 自己 vs 客户端自带:插件车道上,请求体里等于�
 诚实边界:(1) 一旦多模态尾部(含 `image_url` 的 content array)进入缓存,该段历史此后整段降级回 legacy 全量轮——kernel 按位置区分 user 图片消息在尾部与在历史中部的渲染,冻结缓存无法做到位置无关地复现 legacy 字节;纯文本工作负载(#5403 报告者的形态)不受影响。(2) 每次命中会现解析头部 8 个元素,只为做 system-run 校验。(3) 两个 `x-bili-pf-*` 头都在转发上游前剥掉(`UPSTREAM_HOP_HEADERS`)——协议头绝不漏进模型流量。
 
 实测(出处:`tests/issue5403-watermark-fastpath.test.ts`,同语料 hermetic 双代理 A/B):命中轮完全跳过全量解析/转换/钉存;含一个 multipart 图片落位回合的 8 回合语料上,常驻 `lastMessages` 8684 B → 1210 B(7.2×);全程出站字节与 legacy 逐字一致(仅 kernel `time="…"` 属性归一);两个阶段捕获到的上游请求里均无 `x-bili-pf-*`。单元覆盖:`tests/fastpath.test.ts`(verdict 阶梯全表,含熔断 TTL 解除后重播种)、`tests/fastpath-scanner.test.ts`(对抗 JSON 表、深度上限、surrogate 对、5 万元素规模)、`tests/lane-decisions-matrix.test.ts`(门矩阵,双向)。
+
+## Delta 重发 —— 水位快路径的尾切片形态
+
+上面的水位快路径只省了服务端对重发前缀的重复处理,客户端每轮仍然把**整个**历史上传。Delta 重发把上传也去掉:稳态轮客户端只发**新增**元素。
+
+线上形态(客户端 → 代理,共四个头,body 只剩尾部):`x-bili-pf-delta: 1` + `x-bili-pf-count: T`(新的元素总数)+ `x-bili-pf-tail-ids` = 锚点+新增的宿主 msgid,宽度恰好 L+1(L = T − stampT 个新元素,`tail-ids[0]` 锚定上一轮最后一个元素),`body.messages` = **恰好**这 L 个新元素(`[T-L .. T-1]`,无前置、无锚点)。锚点元素本身不在 body 里,只走头。
+
+服务端:`x-bili-pf-delta` 存在时 `evaluateDeltaResend`(src/server/fastpath.ts)在全量车道**之前**跑。重建:`view = 存好的前缀 cores + rekeyWindowCores(解析出的尾部)` → 产出与全量车道完全一致的 `FastpathHit` → 下游(stage-0 pin、kernel processTurn、ingest、快照、账本窗口)走的都是未改动的全量车道代码。
+
+重锚阶梯——任何不成立的声明返回 400 `pf_delta_reanchor` + `x-bili-msgid-mode: full`,**且不打** `x-bili-pf-seq`;客户端本轮改发全量形态,一个来回内收敛(KDD#15 一轮收敛)。门序:头值 / 灰度 / plugin 模式 / 有无种子 / model 一致 / 非多模态种子 / count 在场 / L ∈ [1..2048] / body 长度 == L / tail-ids 宽度 == L+1 / **锚点连续性**(有已知上一清单后强制:`tail-ids[0]` 必须等于上一轮最后一个申报 id;无尾清单的种子允许第一轮 delta 不验证开局,之后逐链)/ body 扫描总数 == L / 窗口转换形状。不做锚点字节重解析:锚点身份由账本/pin 侧(2×2 通道)校验,绝不用上一轮字节复核。
+
+编辑/删除上一轮**最后一条**消息会断锚链 → 400 重锚 → 全量形态。改写**更早**的历史不会:账本/pin 重叠检查在下一轮经 KDD#22「截断尾」降级(全量信号、重锚)接住,永不 400。
+
+灰度:`rollout.features.pluginDeltaResend`(默认 0 —— **关**)。delta body 对未上车的服务端不可处理,故保持 0 直到客户端发送端就位;env 覆盖 `BILI_ROLLOUT_PLUGIN_DELTA_RESEND`。带 `x-bili-pf-delta` 的请求打到灰度关的服务端得到同样的 400 重锚(rollout-off 门)——绝不静默错解。所有 pf-* 头保持上游 hop(转发模型前剥掉)。
+
+实测(10w 条原始会话,loopback):全量重发 15.9s/轮 → 12.7s/轮(入站 155MB → KB 量级;残余成本是整份渲染视图的出站重建——真实压缩场景见下)。压缩稳态(上下文 ≈ 10w token ≈ 400KB body):36ms/轮 全量 → 21ms/轮 delta;≈ 30w token ≈ 1.2MB body:128ms → 53ms。1w 条原始会话:880ms → 550ms。
