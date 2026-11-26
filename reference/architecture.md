@@ -185,6 +185,8 @@ billion-context/
 │   ├── external-summary-surface.ts # Tool/schema and client-facing summary contract
 │   ├── external-summary-marker.ts # Zero-import marker contract for externally summarized blocks
 │   ├── update.ts                 # Self-updater (load-bearing — no-op release protocol) + install lanes
+│   ├── update-pin.ts             # Pin state machine (.pin.json) — hold a version against auto-upgrade (#6804/#7806)
+│   ├── git-install.ts            # bili install <ref>: install from any git ref (PR/branch/tag) + auto-pin (#7806)
 │   ├── advisory.ts               # Critical-defect advisory watcher (#1481)
 │   ├── plugin-advisory.ts        # dsh cost-advisory detection + TTL cache (#2462)
 │   ├── host-plugin-notice.ts     # Known host-side metering plugin notice + dismiss state (#2861)
