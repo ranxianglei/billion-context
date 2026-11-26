@@ -1848,10 +1848,15 @@ export async function* runCompressLoop(
                     // verify signatures. #5495: same fatality on an Anthropic-wire
                     // upstream that makes thinking mandatory WITHOUT signing it —
                     // a "must be passed back" 400 must propagate, not strip-retry.
+                    // #6964: the strip-retry recovers a 400 that rejected the replayed
+                    // thinking — nothing else. A 401/403/404/429 (an expired OAuth
+                    // Bearer mid-turn, a forbidden route, a rate-limit) is NOT a
+                    // thinking-replay rejection; stripping and re-sending the SAME
+                    // doomed credentials only burns a second request before surfacing
+                    // the same error. Gate the retry to 400 exactly.
                     if (
                         !(e instanceof UpstreamHttpError) ||
-                        e.status < 400 ||
-                        e.status >= 500 ||
+                        e.status !== 400 ||
                         degradedRetried ||
                         isThinkingModifiedError(e) ||
                         isReasoningRequiredError(e) ||

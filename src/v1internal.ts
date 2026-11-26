@@ -133,6 +133,12 @@ export function wrapV1ResponseJson(json: string): string {
     try {
         const obj = JSON.parse(json) as unknown;
         if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+            const o = obj as Record<string, unknown>;
+            // #6964: a top-level `error` frame is a gRPC-gateway stream error, NOT a
+            // GenerateContentResponse — wrapping it in `response` hides the error from
+            // the client (no top-level `error`, no `candidates`) and the whole turn dies
+            // silently as a blank message. Pass it through in its native top-level shape.
+            if ("error" in o && !("candidates" in o) && !("usageMetadata" in o)) return json;
             return JSON.stringify({ response: obj, traceId: "", metadata: {} });
         }
     } catch { /* not JSON */ }

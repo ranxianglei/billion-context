@@ -211,6 +211,35 @@ test("response json/frame envelope helpers are idempotent and pass-through safe"
     assert.deepEqual(JSON.parse(payload), gcr("y"));
 });
 
+// #6964: a top-level `error` frame (the gRPC-gateway stream error the google
+// adapter's emitError produces) must NOT be wrapped into `response` — wrapping it
+// hides the error from the client (no top-level `error`, no `candidates`) and the
+// whole turn dies silently as a blank message. Pin the pass-through AND that a
+// genuine response is still enveloped (the fix is scoped, not blanket).
+test("#6964: wrapV1ResponseJson passes a top-level error frame through, still wraps a real response", () => {
+    const errFrame = JSON.stringify({ error: { code: 500, message: "upstream error 401: expired Bearer", status: "INTERNAL" } });
+    assert.equal(wrapRespJson(errFrame), errFrame, "top-level error frame is NOT wrapped into response");
+
+    // The SSE path (installV1ResponseFramer → wrapV1SseFrame) must keep the error
+    // at the top level of the data payload too.
+    const errSse = wrapV1SseFrame(sse({ error: { code: 500, message: "upstream error 401: expired Bearer", status: "INTERNAL" } }));
+    const errPayload = errSse.split("\n").find((l) => l.startsWith("data:"))!.slice(5).trim();
+    const errObj = JSON.parse(errPayload) as Record<string, unknown>;
+    assert.ok("error" in errObj, "error stays at the top level of the SSE data payload");
+    assert.equal(errObj.response, undefined, "the error is NOT nested inside a response envelope");
+
+    // A genuine response (has candidates / usageMetadata, no top-level error) is
+    // still enveloped — the pass-through is scoped to error-shaped frames only.
+    const wrappedResp = JSON.parse(wrapRespJson(JSON.stringify(gcr("z")))) as Record<string, unknown>;
+    assert.deepEqual(wrappedResp.response, gcr("z"), "a real response is still wrapped");
+
+    // An error frame that ALSO carries response fields is ambiguous — treated as a
+    // response (wrapped), matching the conservative guard.
+    const hybrid = JSON.stringify({ error: { code: 500, message: "x", status: "INTERNAL" }, usageMetadata: { promptTokenCount: 1 } });
+    const wrappedHybrid = JSON.parse(wrapRespJson(hybrid)) as Record<string, unknown>;
+    assert.ok("response" in wrappedHybrid, "an error frame carrying response fields is enveloped (conservative)");
+});
+
 test("v1UnwrapStream unwraps an SSE stream and a JSON body", async () => {
     const enc = new TextEncoder();
     const sseBody = new ReadableStream<Uint8Array>({
