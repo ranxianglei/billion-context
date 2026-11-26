@@ -838,6 +838,24 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
             register.base = undefined;
             register.retryAt = 0;
         }
+        // #7176: the DEVICE the model channel rides must be released too.
+        // readyOrigin() short-circuits on state.origin (native-intercept
+        // :1137), so leaving a proven-dead target bound there kept every later
+        // model request rewritten onto it and failing — the documented
+        // "model requests go direct (uncompressed)" degradation could never
+        // run, and the only way out was the proxy returning. spawnFallback
+        // already drops it (with the preset unfreeze it needs, because it then
+        // spawns); this branch must NOT spawn (#1365: a second instance serves
+        // tools while the model channel stays pinned, and every bili tool call
+        // 404s), so only the origin plane is cleared: the preset env stays, the
+        // re-check loop keeps probing via maybeRetry, and traffic degrades to
+        // direct until the target answers again.
+        if (state.origin === pinned || state.origin === attachOrigin) {
+            state.origin = undefined;
+            persistClientEvent(
+                `attach target ${pinned} is down — model requests degrade to direct (uncompressed) until it answers again; bili tools stay unbound (the channel is pinned, so no second instance is spawned)`,
+            );
+        }
         return undefined;
     }
     return spawnFallback(attachOrigin, `attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`, gen);
