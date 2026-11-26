@@ -183,6 +183,47 @@ test("recording: nudge-shaped churn is EXCLUDED (ephemeral rows never recorded)"
     }
 });
 
+test("recording with refs ledger: protection rows lose their dense numbers and the kernel's re-citation lands (cited-vs-dense divergence)", () => {
+    const H = open();
+    try {
+        const S = "sess-rcite";
+        // turn 1: the compress call + result are protected (BLOCKED — no
+        // kernel citation), so their rows are dense-allocated; "a" is cited
+        const t1 = [M("a", "one"), M("p1", "two", "assistant"), M("p2", "three")];
+        let view = recordEgressTurn({
+            store: H.store, sessionId: S, prev: undefined, conversation: t1, systemText: "SYS", nowMs: 1000,
+            refMap: { byRaw: { a: "m00002", p1: "BLOCKED", p2: "BLOCKED" } },
+        });
+        assert.deepEqual(view.map((r) => r.num), [0, 2, 3, 4], "a is cited 2; the two protection rows are dense 3/4");
+        // turn 2: the protection cleared in a different order — the fresh
+        // reply "r" was cited by the kernel counter at 3 (it never saw the
+        // dense numbers), while p1/p2 stay protected for this turn
+        const t2 = [M("a", "one"), M("p1", "two", "assistant"), M("p2", "three"), M("r", "four", "assistant")];
+        view = recordEgressTurn({
+            store: H.store, sessionId: S, prev: view, conversation: t2, systemText: "SYS", nowMs: 2000,
+            refMap: { byRaw: { a: "m00002", p1: "BLOCKED", p2: "BLOCKED", r: "m00003" } },
+        });
+        const byMsg = new Map(view.map((r) => [r.msgid, r.num]));
+        assert.equal(byMsg.get("r"), 3, "the kernel's citation lands on the slot the demotion retired");
+        assert.equal(byMsg.get("p1"), 0, "p1 demoted to 0 — its dense number is retired");
+        assert.equal(byMsg.get("p2"), 0);
+        // no rows were lost: the log advanced, not froze
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?").get(S) as { c: number }).c, 7, "turn 1's 4 +I rows + turn 2's two demote-U + one +I");
+        // turn 3: p1/p2 finally leave protection and the kernel cited them
+        // at 5/6 — the rows re-home onto their citations
+        const t3 = t2.map((m) => m);
+        view = recordEgressTurn({
+            store: H.store, sessionId: S, prev: view, conversation: t3, systemText: "SYS", nowMs: 3000,
+            refMap: { byRaw: { a: "m00002", p1: "m00005", p2: "m00006", r: "m00003" } },
+        });
+        const byMsg3 = new Map(view.map((r) => [r.msgid, r.num]));
+        assert.equal(byMsg3.get("p1"), 5, "re-homing onto the kernel citation");
+        assert.equal(byMsg3.get("p2"), 6);
+    } finally {
+        close(H);
+    }
+});
+
 test("#3617 negative direction: the plane can be forced OFF → gate never opens", () => {
     const saved = process.env.BILI_ROLLOUT_EGRESS_PLANE;
     process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";

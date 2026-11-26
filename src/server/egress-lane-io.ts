@@ -313,7 +313,7 @@ export function recordAuthorityTurn(
         if (err instanceof EgressConcurrentWriteError) {
             log("warn", `[${sessionId}] egress op-log recording skipped this turn (another request on this session recorded first): ${String(err)}`);
         } else {
-            log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
+            log("warn", `[${sessionId}] egress op-log recording skipped this turn (the log does not replay — serving degraded to client bytes; the log will not advance until the corruption is resolved): ${String(err)}`);
         }
     }
     if (outcome.bootstrapping) return outcome.recordCore;

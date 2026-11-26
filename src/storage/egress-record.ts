@@ -269,7 +269,10 @@ export function recordEgressTurn(args: {
         prev = store.egressStateView(sessionId);
     }
     const next = buildEgressViewRows(conversation, systemText, refMap);
-    const ops = diffEgressView(prev, next);
+    // trackNums: the next rows were stamped against the live refs ledger —
+    // a spine row's num change is a kernel citation-fact change (demote /
+    // re-cite / re-homing) and must reach the log as a +U carrying num.
+    const ops = diffEgressView(prev, next, refMap !== undefined);
     let stamped: EgressViewRow[];
     if (ops.length === 0) {
         stamped = prev;

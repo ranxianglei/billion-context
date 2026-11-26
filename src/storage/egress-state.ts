@@ -248,6 +248,9 @@ interface UpdateOp {
     role?: string;
     /** System row only: the new client raw system text (see InsertOp). */
     sysIn?: string;
+    /** New canonical number (0 = uncited — the row's old number is retired,
+     * never re-issued). Absent = the row keeps its number. */
+    num?: number;
 }
 export type EgressOp = InsertOp | DeleteOp | UpdateOp;
 
@@ -288,7 +291,10 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
     const liveNums = new Set<number>();
     for (const r of view) if (r.num > 0) liveNums.add(r.num);
     let maxCited = 0;
-    for (const op of ops) if (op.type === "I" && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
+    for (const op of ops) {
+        if (op.type === "I" && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
+        if (op.type === "U" && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
+    }
     for (const op of ops) {
         if (op.type === "I") {
             if (idxOf(op.msgid) >= 0) throw new EgressStateCorruptError(sessionId, `duplicate msgid ${op.msgid}`);
@@ -334,7 +340,17 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
         } else {
             const i = idxOf(op.msgid);
             if (i < 0) throw new EgressStateCorruptError(sessionId, `update target ${op.msgid} missing`);
-            view[i] = { ...view[i], bytes: op.bytes, ...(op.role !== undefined ? { role: op.role } : {}) };
+            const row = view[i];
+            if (typeof op.num === "number") {
+                if (row.num > 0) liveNums.delete(row.num);
+                if (op.num > 0) {
+                    if (liveNums.has(op.num)) throw new EgressStateCorruptError(sessionId, `cited number ${op.num} is already live (msgid ${op.msgid})`);
+                    liveNums.add(op.num);
+                }
+                row.num = op.num;
+                num = Math.max(num, op.num);
+            }
+            view[i] = { ...row, bytes: op.bytes, ...(op.role !== undefined ? { role: op.role } : {}) };
         }
     }
     return view;
@@ -342,22 +358,34 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
 
 /** Deterministic diff between two consecutive views (owner design, 4 upper
  * cases: tail append / nudge appear+vanish / fold replace / content edit).
- * The diff keys on msgid + bytes only — `num` is never an input (it is
- * assigned at append/replay time; an in-process `next` may carry 0s).
+ * The diff keys on msgid + bytes; a spine row's effective num (0 = uncited)
+ * is a third input that can flip it to a +U carrying `num` (see below).
  *
  * Spine = a monotonically increasing subsequence of `next` whose msgids
  * appear in `prev` (greedy pointer scan, O(n+m); any monotone sub-spine
  * replays equivalently, the greedy one is what this implementation picks).
- * Spine rows with CHANGED BYTES (direct inequality — no hash) emit +U;
+ * Spine rows with CHANGED BYTES (direct inequality — no hash) OR a changed
+ * effective num (0 = uncited — a kernel protection row that lost or gained
+ * its citation) emit +U (with `num` set on a num change, so the log follows
+ * the kernel citation facts; a demoted number is retired, never re-issued);
  * everything else emits -D (maximal contiguous runs in PREV order) plus +I
  * in NEXT order with the preceding row as anchor. egressReplay(prev, diff)
- * always reproduces `next` exactly (modulo the stamp-only num field).
+ * always reproduces `next` exactly (including num).
  *
  * Moves (same msgid, new position) are deliberately expressed as D+I — there
  * is no M op; the msgid stays the identity through both ops, and the NEW
  * number the D+I assigns is the message's number from then on (the old
  * number stays retired — never re-issued). */
-export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[]): EgressOp[] {
+/**
+ * `trackNums` = the `next` rows were stamped against a live refs ledger
+ * (recordEgressTurn passes `refMap !== undefined`): a spine row whose
+ * effective num changed is a REAL kernel citation-fact change (demote /
+ * re-cite / re-homing) and emits a +U carrying the new num. Without a
+ * ledger every next row carries 0 and the comparison would demote the whole
+ * spine every turn — so num tracking is OFF and the diff keys on msgid +
+ * bytes only, as before.
+ */
+export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[], trackNums = false): EgressOp[] {
     const prevIdx = new Map<string, number>();
     prev.forEach((r, i) => { if (!prevIdx.has(r.msgid)) prevIdx.set(r.msgid, i); });
     const prevByMsg = new Map<string, EgressViewRow>();
@@ -387,9 +415,12 @@ export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[]): Eg
     for (const r of next) {
         if (spine.has(r.msgid)) {
             const old = prevByMsg.get(r.msgid)!;
-            if (old.bytes !== r.bytes) {
+            const oldNum = trackNums && typeof old.num === "number" && old.num > 0 ? old.num : 0;
+            const newNum = trackNums && typeof r.num === "number" && r.num > 0 ? r.num : 0;
+            if (old.bytes !== r.bytes || oldNum !== newNum) {
                 const u: UpdateOp = { type: "U", msgid: r.msgid, bytes: r.bytes };
                 if (r.role !== undefined) u.role = r.role;
+                if (oldNum !== newNum) u.num = newNum;
                 ops.push(u);
             }
         }
@@ -430,7 +461,10 @@ function writeOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], firstO
     // cites, and a cited row below the cursor is legal when its slot is
     // retired (fold re-homing).
     let maxCited = 0;
-    for (const op of ops) if (op.type === "I" && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
+    for (const op of ops) {
+        if (op.type === "I" && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
+        if (op.type === "U" && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
+    }
     for (let i = 0; i < ops.length; i++) {
         const op = ops[i];
         const opSeq = firstOpSeq + i;
@@ -461,6 +495,10 @@ function writeOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], firstO
         } else {
             const payload: Record<string, unknown> = { role: op.role };
             if (op.sysIn !== undefined) payload["sysIn"] = op.sysIn;
+            if (op.num !== undefined) {
+                payload["num"] = op.num;
+                num = Math.max(num, op.num);
+            }
             writeOp(db, sessionId, opSeq, null, "U", op.msgid, JSON.stringify(payload), op.bytes, nowMs);
         }
     }
@@ -476,8 +514,10 @@ function writeOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], firstO
  * base form has). Runs inside the caller's transaction. */
 function writeBase(db: SqliteDatabase, sessionId: string, view: EgressViewRow[], highWater: number, nowMs: number): number {
     for (const e of view) {
-        // Renumber (2026-11-25): the system row carries 0; every real row >= 1.
-        if (typeof e.num !== "number" || (e.msgid === EGRESS_SYSTEM_MSGID ? e.num !== 0 : e.num < 1)) {
+        // Renumber (2026-11-25): the system row carries 0; every real row >= 0
+        // (0 = uncited: a BLOCKED/protection row that lost its kernel citation
+        // — its dense placeholder is retired, never re-issued).
+        if (typeof e.num !== "number" || (e.msgid === EGRESS_SYSTEM_MSGID ? e.num !== 0 : e.num < 0)) {
             throw new EgressStateCorruptError(sessionId, `compact base entry ${e.msgid} has no canonical number`);
         }
     }
@@ -739,7 +779,7 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
             }
             for (const e of view) {
                 const shapeOk = typeof e.msgid === "string" && typeof e.ref === "string" && typeof e.bytes === "string" && typeof e.num === "number";
-                const numOk = e.msgid === EGRESS_SYSTEM_MSGID ? e.num === 0 : e.num >= 1;
+                const numOk = e.msgid === EGRESS_SYSTEM_MSGID ? e.num === 0 : e.num >= 0;
                 if (!shapeOk || !numOk) throw new EgressStateCorruptError(sessionId, `base at op_seq=${row.op_seq} has malformed entries`);
             }
             continue;
@@ -793,6 +833,7 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
                 ...view[i],
                 bytes: row.bytes,
                 ...(p.role !== undefined ? { role: p.role as string } : {}),
+                ...(typeof p.num === "number" ? { num: p.num as number } : {}),
             };
         } else {
             throw new EgressStateCorruptError(sessionId, `unknown row_type ${String(row.row_type)} at op_seq=${row.op_seq}`);

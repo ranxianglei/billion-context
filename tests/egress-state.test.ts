@@ -29,6 +29,7 @@ import {
     egressStateAt,
     egressFork,
     EgressStateCorruptError,
+    EGRESS_SYSTEM_MSGID,
     diffEgressView,
     egressReplay,
     type EgressOp,
@@ -330,6 +331,99 @@ test("diff: case U — content edit of an existing row is a +U, position and tri
     assert.equal(replayed[0].ref, "ma", "+U must not touch the ref");
     assert.equal(replayed[0].tokens, 3, "+U must not touch tokens");
     assert.equal(replayed[0].num, 0, "+U must not touch the canonical number");
+});
+
+// ---- num lifecycle (cited-vs-dense divergence, 2026-11-26) --------------
+// A protection (BLOCKED) row that never carried a kernel citation is dense-
+// allocated at insert time; when the protection clears (or the row loses its
+// citation) the kernel counter — which never saw the dense number — may
+// cite that slot again. The log must follow the kernel citation facts:
+// the row demotes to 0 (its number RETIRED, never re-issued) via a +U that
+// carries the new number, and the new citation lands on the freed slot.
+
+test("diff: a spine row that loses its citation emits a +U with num 0", () => {
+    const R = (msgid: string, num: number): EgressViewRow => ({ num, msgid, ref: "m" + msgid, tokens: 3, type: "text", bytes: "h_" + msgid });
+    const prev = [R("a", 2), R("p1", 91), R("p2", 92)];
+    const next = [{ ...R("p1", 0) }, { ...R("p2", 0) }, R("r", 91)];
+    assert.deepEqual(diffEgressView(prev, next, true), [
+        { type: "D", start: "a", end: "a" },
+        { type: "U", msgid: "p1", bytes: "h_p1", num: 0 },
+        { type: "U", msgid: "p2", bytes: "h_p2", num: 0 },
+        { type: "I", msgid: "r", after: "p2", ref: "mr", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 },
+    ]);
+    const replayed = egressReplay(prev, diffEgressView(prev, next, true), 92);
+    assert.deepEqual(norm(replayed), norm(next));
+    assert.equal(replayed[2].num, 91, "the new citation takes the slot the demotion retired");
+});
+
+test("diff+replay: re-citing a slot held by a STILL-cited live row still throws (true corruption)", () => {
+    const R = (msgid: string, num: number): EgressViewRow => ({ num, msgid, ref: "m" + msgid, tokens: 3, type: "text", bytes: "h_" + msgid });
+    const prev = [R("a", 91)];
+    const next = [{ ...R("a", 91) }, R("r", 91)];
+    const ops = diffEgressView(prev, next, true);
+    assert.deepEqual(ops, [{ type: "I", msgid: "r", after: "a", ref: "mr", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 }]);
+    assert.throws(() => egressReplay(prev, ops, 91), (e: unknown) => e instanceof EgressStateCorruptError && /cited number 91 is already live/.test(e.message));
+});
+
+test("diff: a spine row that gains a citation below the high water emits a +U with it (retired slot re-homing)", () => {
+    const R = (msgid: string, num: number): EgressViewRow => ({ num, msgid, ref: "m" + msgid, tokens: 3, type: "text", bytes: "h_" + msgid });
+    const prev = [R("a", 0), R("b", 92)];
+    const next = [{ ...R("a", 5) }, { ...R("b", 92) }];
+    assert.deepEqual(diffEgressView(prev, next, true), [{ type: "U", msgid: "a", bytes: "h_a", num: 5 }]);
+    const replayed = egressReplay(prev, diffEgressView(prev, next, true), 92);
+    assert.equal(replayed[0].num, 5, "a retired slot is legal to re-cite");
+});
+
+test("append: a U with num persists through state replay, compaction, and the dense cursor never re-issues the retired slot", () => {
+    const H = open();
+    const S = "s-numlifecycle";
+    try {
+        // seed: system + a cited row at 2 and a dense pair at 91/92 (the
+        // shape the live repro produced: protection rows dense-allocated)
+        egressStateAppend(H.db, S, [
+            { type: "I", msgid: EGRESS_SYSTEM_MSGID, after: null, ref: "", tokens: 1, typeTag: "system", bytes: "h_sys" },
+            { type: "I", msgid: "a", after: EGRESS_SYSTEM_MSGID, ref: "m00002", tokens: 2, typeTag: "text", bytes: "h_a", num: 2 },
+            { type: "I", msgid: "p1", after: "a", ref: "", tokens: 3, typeTag: "text", bytes: "h_p1" },
+            { type: "I", msgid: "p2", after: "p1", ref: "", tokens: 3, typeTag: "text", bytes: "h_p2" },
+        ], 1_000);
+        const seeded = egressStateView(H.db, S);
+        assert.deepEqual(seeded.map((r) => r.num), [0, 2, 3, 4], "dense allocation, before the repro shape");
+        // bring it into the repro shape with an explicit num on the cites
+        egressStateAppend(H.db, S, [
+            { type: "U", msgid: "p1", bytes: "h_p1", num: 91 },
+            { type: "U", msgid: "p2", bytes: "h_p2", num: 92 },
+        ], 2_000);
+        assert.deepEqual(egressStateView(H.db, S).map((r) => r.num), [0, 2, 91, 92], "the U-with-num lands in the stored view");
+        // the fix turn: both protection rows lose their citation; the fresh
+        // reply cites 91 (the kernel counter never saw 91/92)
+        egressStateAppend(H.db, S, [
+            { type: "U", msgid: "p1", bytes: "h_p1", num: 0 },
+            { type: "U", msgid: "p2", bytes: "h_p2", num: 0 },
+            { type: "I", msgid: "r", after: "p2", ref: "m00091", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 },
+        ], 3_000);
+        assert.deepEqual(egressStateView(H.db, S).map((r) => r.num), [0, 2, 0, 0, 91], "demote + re-cite lands");
+        // compact (fold): the base now carries num-0 entries
+        const beforeCompact = egressStateView(H.db, S);
+        egressStateCompact(H.db, S, beforeCompact, 4_000);
+        assert.deepEqual(egressStateView(H.db, S), beforeCompact, "compaction is view-preserving with num-0 entries");
+        const basePoint = egressStateAt(H.db, S, Number.MAX_SAFE_INTEGER);
+        assert.deepEqual(basePoint, beforeCompact, "the flow replays the base point byte-identically, num-0 entries included");
+        // dense continues above the base high-water (91). Whether an
+        // uncited row lands on a once-dense-allocated slot (92) is safe by
+        // construction: such a slot was never a kernel citation, and any
+        // later kernel citation of it arrives alongside the holder's own
+        // +U demotion (its kernel citation fact is 0), which frees the slot
+        // earlier in the same batch.
+        egressStateAppend(H.db, S, [
+            { type: "I", msgid: "x", after: "r", ref: "", tokens: 1, typeTag: "text", bytes: "h_x" },
+        ], 5_000);
+        const view = egressStateView(H.db, S);
+        assert.equal(view[view.length - 1].num, 92, "dense continues above the base high water");
+        // flow rollback: the point after the base still reconstructs
+        assert.deepEqual(egressStateAt(H.db, S, Number.MAX_SAFE_INTEGER).map((r) => r.num), view.map((r) => r.num), "the flow point after the base");
+    } finally {
+        close(H);
+    }
 });
 
 test("diff: move = D+I (no M op), msgid survives both ops", () => {
