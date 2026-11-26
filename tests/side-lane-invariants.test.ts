@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-// trustStampedId is GA-on by default (#7439). This suite pins the legacy
-// |sub: fork behavior — force the feature OFF so it keeps asserting the
-// pre-retirement path (issue2944-neutral-skeleton idiom).
-process.env.BILI_ROLLOUT_TRUST_STAMPED_ID = "0";
+// 2026-11-23, #7525 GA: the BILI_ROLLOUT_TRUST_STAMPED_ID=0 pin is retired
+// with the fork ladder — the suites below now assert the GA contract
+// (stamped id rides verbatim; only lane tokens and #970 agent-header splits
+// mint |sub: lanes).
 
 import http from "node:http";
 import { once } from "node:events";
@@ -209,43 +209,6 @@ test("(C) splitSessionWarnings: design persona forks excluded, drift shapes fire
     assert.ok(!mixed[0].sessions.some((s) => s.id.includes("design")), "the marked child itself stays out of the warning");
 });
 
-test("(D) a design dsh persona fork (auto-review) does NOT trip the split canary", async () => {
-    const h = await harness();
-    try {
-        const conv = "persona";
-        // main turn anchors the raw key
-        await h.dshSend(conv, [mainMsg(0)], "main", "MAIN OPERATING SYSTEM", 256);
-        // dsh auto-review classifyRisk shape: same conversation id, fixed
-        // REVIEW_POLICY system, full-budget model turn (NOT a side request —
-        // budget 300, no tools, no side agent) → keyed by design onto
-        // `|sub:<fp>` (#1916/#1307/#1314) and rides the main pipeline there.
-        // #2241: the blob is the FLATTENED transcript as a fresh user
-        // message — it does NOT byte-exactly continue the raw key's chain, so
-        // the continuity-aware anchor still forks it (a replay that DID
-        // continue the chain is the same conversation evolving, not a persona).
-        // #5656: the ONE-MESSAGE review shape now rides the stateless side
-        // lane (isDshSingleShotSidecar — no tools + single-shot body); the
-        // design fork lane is pinned here with a persona that carries its own
-        // round-trip history (an assistant answer between two blobs — not
-        // single-shot, still chain-disjoint, still a designed fork).
-        await h.dshSend(conv, [
-            { role: "user", content: "Conversation transcript (flattened):\nuser: main turn 0\nProposed tool call: bash rm -rf /tmp/x. Decide SAFE or UNSAFE." },
-            { role: "assistant", content: "UNSAFE" },
-            { role: "user", content: "Conversation transcript (flattened):\nuser: main turn 0\nProposed tool call: npm install left-pad. Decide SAFE or UNSAFE." },
-        ], undefined, "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
-        const all = listSessions();
-        const kids = all.filter((s) => s.id.startsWith(conv + "|") || s.id.includes(conv + "|sub:"));
-        assert.equal(kids.length, 1, `expected exactly one persona-fork child, got ${all.map((s) => s.id).join(", ")}`);
-        assert.ok((kids[0].stats?.requests ?? 0) >= 1, "the review turn rode the child's main pipeline");
-        assert.equal(kids[0].metadata.personaNamespace, true, "the child is stamped as a designed split");
-        assert.equal(splitSessionWarnings(all).length, 0, "healthy persona traffic must not cry wolf");
-        const status = (await h.request("/__bili/status")).body as { splitSessions?: unknown[] };
-        assert.deepEqual(status.splitSessions, [], "/__bili/status stays clean for design persona forks");
-    } finally {
-        await h.close();
-    }
-});
-
 test("(E) side requests never claim the persona anchor on the responses wire (#2203 parity)", async () => {
     const h = await harness();
     try {
@@ -267,9 +230,10 @@ test("(E) side requests never claim the persona anchor on the responses wire (#2
         let kids = all.filter((s) => s.id.startsWith(conv + "|"));
         assert.equal(kids.length, 0, `side request must not mint a persona fork, got ${all.map((s) => s.id).join(", ")}`);
         assert.equal(main.stats.requests, 1, "side request counts nowhere");
-        // full-budget review persona still forks (the #2203 fix itself) and
-        // stays canary-clean — #5656: the fork leg needs a round-trip history
-        // now (a single-blob review rides the stateless side lane).
+        // full-budget review persona with round-trip history: pre-GA this
+        // minted a `|sub:<fp>` design fork (the #2203 fix itself); under the
+        // #7525 GA contract the stamped id rides the raw key verbatim — no
+        // fork, and the turn counts on the shared session.
         await h.dshRespSend(conv, [
             { role: "user", content: "REVIEW: tool call risk assessment" },
             { role: "assistant", content: "UNSAFE" },
@@ -277,9 +241,9 @@ test("(E) side requests never claim the persona anchor on the responses wire (#2
         ], "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
         all = listSessions();
         kids = all.filter((s) => s.id.startsWith(conv + "|"));
-        assert.equal(kids.length, 1, `expected exactly one persona-fork child, got ${all.map((s) => s.id).join(", ")}`);
-        assert.equal(kids[0].metadata.personaNamespace, true, "fork stamped as a designed split");
-        assert.equal(splitSessionWarnings(all).length, 0, "healthy persona traffic must not cry wolf");
+        assert.equal(kids.length, 0, `full-budget persona rides the raw key under GA (no fork), got ${all.map((s) => s.id).join(", ")}`);
+        assert.equal(main.stats.requests, 2, "the full-budget persona turn counts on the shared raw-key session");
+        assert.equal(splitSessionWarnings(all).length, 0, "GA verbatim traffic must not cry wolf");
     } finally {
         await h.close();
     }
@@ -306,9 +270,9 @@ test("(E2) empty-persona dsh traffic rides the raw key — no persona machine, n
         assert.ok(all.some((s) => s.id === conv2), "raw key claimed verbatim (responses)");
         assert.equal(all.filter((s) => s.id.startsWith(conv2 + "|")).length, 0,
             `empty-instructions traffic must not mint lanes, got ${all.map((s) => s.id).join(", ")}`);
-        // And a NON-empty persona on the same harness still forks (guard does
-        // not over-suppress): reuse (E)'s shapes once — #5656: with a
-        // round-trip history (the single-shot shape now rides the side lane).
+        // And a NON-empty persona on the same harness rides the raw key under
+        // GA (pre-GA it minted a design fork; #7525: stamped id is verbatim
+        // regardless of the persona system) — reuse (E)'s shapes once.
         const conv3 = "persona-live";
         await h.dshSend(conv3, [mainMsg(0)], undefined, "MAIN OPERATING SYSTEM", 256, [{ name: "bash", description: "run a shell command", input_schema: { type: "object", properties: {} } }]);
         await h.dshSend(conv3, [
@@ -317,8 +281,8 @@ test("(E2) empty-persona dsh traffic rides the raw key — no persona machine, n
             { role: "user", content: "Aux persona task two." },
         ], undefined, "You generate short titles.", 256);
         all = listSessions();
-        assert.equal(all.filter((s) => s.id.startsWith(conv3 + "|")).length, 1,
-            `non-empty persona side traffic still forks, got ${all.map((s) => s.id).join(", ")}`);
+        assert.equal(all.filter((s) => s.id.startsWith(conv3 + "|")).length, 0,
+            `non-empty persona traffic mints no lane under GA, got ${all.map((s) => s.id).join(", ")}`);
     } finally {
         await h.close();
     }
@@ -529,7 +493,7 @@ test("(K2) side-lane meter guard: an anchor written by a request far smaller tha
 // sideRequestLike=true (tiny tool-less budget, no agent header) stays verbatim on
 // the raw key and observation-transparent, while sideRequestLike=false (full
 // budget) rides the order resolver and forks its own |sub:<fp> lane.
-test("(L) #4352 anthropic persona gate is side-vetoed: side shape stays verbatim, full-budget shape forks", async () => {
+test("(L) #4352 anthropic persona gate is side-vetoed: BOTH shapes ride the raw key (GA)", async () => {
     const h = await harness();
     try {
         const conv = "cc4352";
@@ -557,16 +521,18 @@ test("(L) #4352 anthropic persona gate is side-vetoed: side shape stays verbatim
         assert.equal(resolveConversation(conv).session!.stats.requests, 1, "side call never counts on the parent");
         assert.equal(listSessions().length, sessions, "side call must not fork a |sub lane");
 
-        // full-budget shape: the SAME sub persona system + disjoint history → the
-        // resolver DOES engage (proof the verbatim above is the sideRequestLike
-        // conjunct, not a dead gate): a |sub:<fp> lane appears, parent untouched.
+        // full-budget shape: the SAME sub persona system + disjoint history.
+        // Pre-GA this minted a `|sub:<fp>` design fork (proof the verbatim
+        // above was the sideRequestLike conjunct, not a dead gate); under the
+        // #7525 GA contract the stamped id rides verbatim even at full budget
+        // (no agent-id header → no #970 split either): NO new session.
         await ccSend("You are a file search specialist for the parent session.", [
             { role: "user", content: "sub-user-1" },
             { role: "assistant", content: "sub-assistant-1" },
             { role: "user", content: "sub-user-2" },
         ], 1024);
-        assert.equal(listSessions().length, sessions + 1, "full-budget sub persona forks its own |sub lane");
-        assert.equal(resolveConversation(conv).session!.stats.requests, 1, "the fork lane counts nowhere on the parent");
+        assert.equal(listSessions().length, sessions, "full-budget sub persona rides the raw key under GA (no fork)");
+        assert.equal(resolveConversation(conv).session!.stats.requests, 2, "the full-budget turn counts on the shared raw-key session");
     } finally {
         await h.close();
     }

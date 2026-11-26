@@ -8,9 +8,10 @@ import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
-import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { isSubagentPrompt } from "../session-title.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
@@ -42,14 +43,60 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore } from "../persist.js";
+import { FoundationRejectError } from "../snapshot/plane.js";
+import { runStage0 } from "../snapshot/stage0.js";
 import { applyImageRescalePass } from "../image-rescale.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, outputBudgetField, readOutputBudget, writeOutputBudget } from "./budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudgeArmed, emergencyNudgeForConfig } from "./budget.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, stampOnlyWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
+import { recordEgressTurn, EgressAuthorityRejectError } from "../storage/egress-record.js";
+import type { EgressViewRow } from "../storage/egress-state.js";
+// Structural mirror of egress-record.ts's EgressSourceMsg (kept private
+// there by the unused-export gate): the recording seam only reads this shape.
+interface EgressRecordSourceMsg {
+    id: string;
+    role: string;
+    contentType?: unknown;
+    text?: unknown;
+}
+import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
+import { resolveEgressAuthority, egressAuthorityArmed, egressBlockLedgerFor } from "./egress-lane-io.js";
+import { EgressConcurrentWriteError } from "../storage/egress-state.js";
+import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
+
+/** #7398: put the conversation array back into a body whose parse handle.ts
+ *  deferred. Everything else is kept EXACTLY as it stands on `parsed`.
+ *
+ *  Under the deferral gate `parsed` is the span-scan synthesis (every
+ *  top-level field decoded, `messages` = null marker), and handle.ts has
+ *  since mutated it in place: the dsh client-extension strip (#7168/#7439),
+ *  stale chain-carrier removal, the leaked-tool veto, the #6752 output-budget
+ *  restore, and — at the top of prepareOpenai — the bili msg-id/seqs body
+ *  fields deleted so the real upstream never sees them. Rebuilding the
+ *  top-level object from the raw wire text (what this function replaced)
+ *  resurrected every one of those: a watermark hit forwarded a stripped
+ *  `dsh_session_log` again and a starved max_tokens until #6752 special-cased
+ *  the budget. Taking the fields from `parsed` and only `messages` from the
+ *  wire covers all of them, present and future.
+ *
+ *  `wireOrder` is the wire key order (JSON.parse order, duplicate keys keep
+ *  their first position) so the re-serialized body stays byte-identical to
+ *  the non-deferred path — a moved `messages` key would cost the upstream
+ *  prefix cache the whole conversation. A key `parsed` no longer carries was
+ *  removed on purpose and stays removed. */
+function materializeDeferredBody(parsed: OpenAIRequestBody, wireOrder: Iterable<string>, messages: unknown): OpenAIRequestBody {
+    const top = parsed as unknown as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of wireOrder) {
+        if (key === "messages") out[key] = messages;
+        else if (key in top) out[key] = top[key];
+    }
+    return out as unknown as OpenAIRequestBody;
+}
 
 export async function prepareOpenai(
     parsed: OpenAIRequestBody,
@@ -69,6 +116,7 @@ export async function prepareOpenai(
     billingUpstream?: string,
     decide?: DecideConfig,
     bodyText?: string,
+    bodyParseDeferred = false,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -78,7 +126,30 @@ export async function prepareOpenai(
     // host body stamps (pi incremental lane) or the #5825 handle-seam
     // re-stamp of stamped-header/harvested ids.
     const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    // #5874 2×2: the seqs carrier (biliLedgerSeqs) — the M2 incremental
+    // join evidence. An optimization channel, not an identity channel:
+    // malformed/absent → the M2 fast path is disabled (the full-resend
+    // matchWorld path still works); it never 400s. (Stamped once msgs
+    // exists, below.)
+    const incomingSeqsRaw = incomingSeqsOf(parsed);
+    delete parsed[MSG_SEQS_BODY_FIELD];
     delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    // #7064 §8: the INCREMENTAL pin reuses the watermark's bounded tail-ids
+    // header — the same bytes that ride the wire for the hit verdict pin the
+    // prefix when the full list is absent. Three-state handoff to stage 0
+    // (undefined = header absent, null = malformed → degrade, array = valid,
+    // "?" slots kept). The fastpath re-parses the header itself for its own
+    // verdict — one parser, one rule (parseTailIdsForPin).
+    // #6785 review note (owner): this parse is DELIBERATELY ungated by
+    // pluginMsgIdIncremental — a flag-OFF server must still READ a client's
+    // tail-ids declaration, because the rollback self-heal signal ("full")
+    // is derived from it (stage 0's tail-ids branch). Gating the parse
+    // behind the flag would strand upgraded clients after a rollback.
+    const rawTailIdsHeader = req.headers[PF_TAIL_IDS_HEADER];
+    const incomingTailIds: string[] | null | undefined =
+        rawTailIdsHeader === undefined ? undefined
+        : typeof rawTailIdsHeader === "string" ? parseTailIdsForPin(rawTailIdsHeader)
+        : null;
     // Real wire element count; a watermark hit overrides it with the measured
     // total T (see the #5403/#5418 block below).
     let inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
@@ -100,6 +171,19 @@ export async function prepareOpenai(
     let nudgeStampsBefore: Prepared["nudgeStampsBefore"];
     let rebuiltMessages = parsed.messages;
     let toolsOut = parsed.tools;
+    // #7398 seg 4: the legacy core-portion elements (captured at the
+    // :coreToOpenai chain) — the shadow comparison target for serve-from-log.
+    let legacyCoreElements: unknown = undefined;
+    let egressBaseRows: EgressViewRow[] | null = null;
+    let egressBaseSeq = 0;
+    let egressSwapApplied = false;
+    let egressBootstrap = false;
+    let egressArmed = false;
+    let egressServedFromLog = false;
+    // The EXACT array fed to the outbound chain (post reasoning-drop / ccr /
+    // image-rescale) — segment 3 records this, not processedMessages, so the
+    // log view is position-for-position what outbound saw.
+    let egressRecordSource: readonly EgressRecordSourceMsg[] | undefined;
     // #2483: single source for the effective render strategy — processTurn, the
     // diag log and Prepared must all report what was actually rendered (the
     // log label used to hardcode "text-only" and lie under renderNone).
@@ -141,34 +225,38 @@ export async function prepareOpenai(
     const wpModel = typeof parsed.model === "string" ? parsed.model : "";
     if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
         wpFullText = bodyText;
-        wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
-        log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
-        if (wpOutcome.hit) {
-            wpHit = wpOutcome.hit;
-            // #6752: handle.ts already ran restoreOutputBudget on `parsed` —
-            // the rebind below re-parses scalar fields from the raw wire text,
-            // which would silently discard the restored budget (the log claims
-            // the restore while the wire still carries the client's shrunk
-            // value). Carry the restored budget across the rebind.
-            const budgetField = outputBudgetField(parsed);
-            const restoredBudget =
-                budgetField !== null
-                    ? readOutputBudget(parsed as Record<string, unknown>, budgetField)
-                    : undefined;
-            const fields: Record<string, unknown> = {};
-            for (const [key, span] of wpHit.fieldSpans) {
-                // "messages" keeps its WIRE POSITION (the scanner records it
-                // position-only); every other field is re-parsed from its own
-                // span so no bytes of the prefix are ever decoded.
-                if (key === "messages") fields[key] = wpHit.windowMessages;
-                else fields[key] = JSON.parse(bodyText.slice(span.start, span.end));
-            }
-            if (budgetField !== null && restoredBudget !== undefined) {
-                writeOutputBudget(fields, budgetField, restoredBudget);
-            }
-            parsed = fields as OpenAIRequestBody;
-            inboundMessageCount = wpHit.totalT;
+        // Delta arm first: a delta claim is EXCLUSIVE — the body carries only
+        // the tail slice, so the full-body lane cannot evaluate it at all. A
+        // satisfiable claim yields the same FastpathHit the full lane would;
+        // an unsatisfiable one throws the 400 re-anchor (handle.ts).
+        const wpDelta = evaluateDeltaResend(parsed, bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
+        if (wpDelta !== null) {
+            if ("reanchor" in wpDelta) throw new DeltaReanchorError(wpDelta.reanchor);
+            wpOutcome = { hit: wpDelta.hit, measuredT: wpDelta.hit.totalT, decision: "delta-hit", creditedMiss: false, receivedTailIds: wpDelta.receivedTailIds };
+            log("debug", `[${session.id}] fastpath ${wpOutcome.decision} T=${wpDelta.hit.totalT}`);
+        } else {
+            wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
+            log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
         }
+    }
+    // #7398 perf: the deferral gate in handle.ts skipped the full JSON.parse
+    // (150-600ms on a 155MiB resend), so `parsed` is still the span-scan
+    // synthesis — every top-level field decoded, the conversation array left
+    // as the null marker. Two ways to materialize it, both keeping every
+    // OTHER field exactly as it stands on `parsed` (see materializeDeferredBody):
+    //   hit   — the window view; no prefix byte is ever decoded;
+    //   else  — the gate stayed closed (non-plugin lane, title-gen, rollout
+    //           flag off) or the lanes missed: the legacy path needs the whole
+    //           array, parsed exactly once here. A throw equals the legacy
+    //           parse failure (same catch in handle.ts).
+    if (wpOutcome?.hit) {
+        wpHit = wpOutcome.hit;
+        parsed = materializeDeferredBody(parsed, wpHit.fieldSpans.keys(), wpHit.windowMessages);
+        inboundMessageCount = wpHit.totalT;
+    } else if (bodyParseDeferred && !Array.isArray(parsed.messages) && bodyText !== undefined) {
+        const full = JSON.parse(bodyText) as OpenAIRequestBody;
+        parsed = materializeDeferredBody(parsed, Object.keys(full), full.messages);
+        inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
     }
     // Full-body text for the whole-wire image accounting (window-only bodies
     // would under-count pre-existing images).
@@ -180,6 +268,12 @@ export async function prepareOpenai(
     const markerCounts = wpHit !== undefined ? { ...wpHit.markerCounts, strippedMs: 0 } : stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
+    // #7064 §8: hoisted so the end-of-prepare response-header block can stamp
+    // the pin-mode signal (stage 0 runs inside the try below).
+    let s0PinMode: "full" | "incremental" | null = null;
     try {
         // Kernel 0.0.37 hoists the contiguous leading system/developer prefix
         // OUT of the fold space: system content is host runtime state and
@@ -187,6 +281,14 @@ export async function prepareOpenai(
         // otherwise the proxy would forward payloads without any system.
         const converted = wpHit !== undefined ? { msgs: wpHit.view, systemText: wpHit.systemText } : openaiToCore(parsed);
         let msgs = converted.msgs;
+        // #5874 2×2: stamp the M2 seqs carrier onto the converted array
+        // (parallel to messages; malformed/absent → null → M2 fast path
+        // disabled, the full-resend path still works).
+        const incomingSeqs: number[] | null =
+            incomingSeqsRaw !== undefined && incomingSeqsRaw.length === msgs.length && validateMsgSeqs(incomingSeqsRaw, msgs.length).ok
+                ? incomingSeqsRaw
+                : null;
+        if (incomingSeqs !== null) applyMsgSeqStamps(msgs, incomingSeqs);
         let systemText = converted.systemText;
         openaiSystemText = systemText;
         wpSeedSystemText = systemText;
@@ -200,25 +302,94 @@ export async function prepareOpenai(
             openaiSystemText = outcome.outbound;
         }
         originalMessages = msgs;
-        // #4491/#5825 parity: pin identity to client-supplied ids (plugin
-        // lanes only — pure proxy traffic has no msgid channel and stays on
-        // snapshot render D), the SAME gated contract as the anthropic twin.
-        // Skipped on watermark hits on purpose: fastpath turns reuse the
-        // seed stash's prefix view whose rows were already pinned when it was
-        // materialized, and the decoded tail window is SHORTER than the
-        // stamped list, so count-parity there would fail by design — pinning
-        // only adds noise.
-        if (wpHit === undefined && pluginMode && incomingMsgIds !== undefined) {
-            if (featureEnabled("pluginLaneServerHistory")) {
-                const v = validateMsgIds(incomingMsgIds, msgs.length);
-                if (v.ok) {
-                    msgs = applyMsgIdPin(msgs, v.ids);
+        // #4491/#5825 + #5874 2×2 stage 0 (brief 19544722 / #6181): the
+        // SHARED pin + world-match + kernel-input assembly for cohort
+        // traffic (src/snapshot/stage0.ts — the responses lane runs the
+        // SAME helper, same red gate, same one-round-convergence
+        // contract). Runs BEFORE processTurn, so a thrown
+        // FoundationRejectError (R3) carries zero kernel side effects
+        // (the server funnel maps it to the hard 400); every other fault
+        // → the legacy full path (one-round convergence).
+        const s0 = runStage0({
+            sessionId,
+            lane: "openai",
+            msgs,
+            incomingMsgIds,
+            incomingSeqs,
+            incomingTailIds,
+            pluginMode,
+            // Identity consolidation (discussions/7591): egress-on sessions
+            // carry no conversations row — the in-memory metadata field is
+            // the row's source of truth, use it instead of the store lookup.
+            // Predicate mirrors the row write verbatim (ingest.ts namespace =
+            // the pluginAgent when a non-empty string, else "proxy") so the
+            // two cannot drift apart.
+            convBound: session.metadata["egressAuthority"] === true ? (typeof session.metadata["pluginAgent"] === "string" && session.metadata["pluginAgent"] !== "") : undefined,
+            wpHit,
+            log,
+        });
+        s0PinMode = s0.pinMode;
+        if (s0.pinned !== null) {
+            msgs = s0.pinned;
+            originalMessages = msgs;
+        }
+        // #7064 D3 (尾锚常活): the stage-0 cursor may have advanced BEFORE
+        // processTurn — bump the session revision so the per-turn snapshot
+        // flush below (snapFlush epoch proof) observes the advance. A fork
+        // taken between the cursor write and the flush otherwise reads a
+        // STALE parent revision and lands the child on the wrong lane.
+        if (s0.anchorAdvanced) markDirty(session);
+        // Ruling 7439-5 (owner strategy decision, discussions/7439 §1) — the
+        // server egress flow is the SOLE authority over conversation content.
+        // This is the ONE prepare-layer seam where the client's resend is
+        // demoted to what it is after turn 1: the identity/order channel (the
+        // probe below) and the byte source for NEW messages only. On a pinned
+        // plugin-lane turn with a live op-log flow, every EXISTING row below
+        // carries the bytes the SERVER recorded last turn; a client byte edit
+        // under a stable msgid is a divergence event (logged + warned), the
+        // server bytes win, and — because the outbound is served from the same
+        // log below — the client converges on its next echo. Legitimate client
+        // edits need the egress update API (follow-up, not in this PR). This
+        // OVERRIDES the pre-PR plugin-lane stance (snapshot-render.ts: "plugin
+        // lane: client-authoritative by design"). Scope is deliberately the
+        // PINNED plugin lane (both modes reasoned): bare proxy clients are
+        // tamper-evident by construction — their ids ARE content hashes, so a
+        // byte edit changes the id and already lands in the rewrite/drift
+        // gates — and proxy-lane kernel input must stay the RAW history (the
+        // kernel folds internally; a post-fold replay view would double-fold
+        // and trip #1001/#2432/#4521). The proxy lane gets ruling 5 on the
+        // EGRESS side (outbound served from the log); the pinned plugin lane
+        // gets it end-to-end (kernel input + outbound).
+        // Degrade (never guess, never client-as-authority): store missing or
+        // an unrebuildable view → the swap simply does not happen this turn
+        // (record still runs — see below — and the next turn re-attempts).
+        // Hard failure (ruling 7439-5's one non-negotiable): NO healthy flow
+        // point at all → the request fails, it does NOT run on client bytes
+        // (a divergent client being served as authority is the exact
+        // condition the ruling forbids); the marker latches for the operator
+        // and the client's retry hits the same error until recovery.
+        // Bootstrap: an armed turn with an EMPTY flow is the turn-1 cold start
+        // the ruling allows — the client bytes enter the flow exactly once
+        // (the record below), from turn 2 the log is the content source.
+        egressArmed = egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: isTitleGen });
+        if (egressArmed) {
+            // The single shared authority seam (egress-lane-io): latch,
+            // recover, hard-fail, bootstrap / swap / legacy — one code path
+            // for all four lanes. This lane sits PRE-kernel: the swapped
+            // core becomes kernel input, and the record is deferred to the
+            // post-kernel segment below with this turn's exact outbound
+            // array (egressRecordSource), diffed against auth.base.
+            const st = getStore().egressOpLogStore();
+            if (st) {
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: msgs, log, armed: true });
+                egressBaseRows = auth.base;
+                egressBaseSeq = auth.baseSeq;
+                egressBootstrap = auth.bootstrapping;
+                if (auth.swappedCore !== null) {
+                    msgs = auth.swappedCore;
                     originalMessages = msgs;
-                } else {
-                    log("warn", `[${sessionId}] [msgid] openai-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
+                    egressSwapApplied = true;
                 }
-            } else {
-                log("info", `[${sessionId}] [msgid] openai-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
             }
         }
         // #3756 snapshot render: the outbound prefix renders from the unified
@@ -227,6 +398,7 @@ export async function prepareOpenai(
         // No-op returns `msgs` when the lane is inactive/degraded.
         // reconcileFoldCoverage below still observes the CLIENT view.
         const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.
@@ -353,6 +525,47 @@ export async function prepareOpenai(
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
         adoptContentStore(session, turn.contentStore);
+        // In-request ledger flush: the transcript up to THIS user message is
+        // durable before the model call (#3397 durability-before-render) and
+        // the stage-0 envelope / M2 evidence read a current ledger.
+        // snapshotMessages first: the persist build reads session.lastMessages
+        // — and it stays the RAW client resend (never the D-lane view: its
+        // synthetic acp_summary anchor is not a transcript message). The
+        // watermark window pin is preserved.
+        // #7366: on a pinned HIT turn the ledger window must carry the
+        // DECLARED ids, not the window cores' fresh content-hash ids.
+        // wpHit.windowCores is the tail fragment re-converted by openaiToCore
+        // (fresh h_… mints), while s0.pinned is the SAME view with the id
+        // field re-stamped to the client-declared host msgids (stage 0).
+        // Ingesting the raw window cores wrote h_… into the ledger for every
+        // post-seed row (msg_id is write-once — INSERT OR IGNORE on
+        // (session_id, seq)), so the next turn's KDD#22 tail-overlap check
+        // compared declared host ids against h_… rows → guaranteed drift →
+        // full form every turn. pinned is element-wise a map of the same
+        // view (ids only), so its tail slice aligns position-for-position
+        // with windowCores; the length guard falls back to the legacy cores
+        // on any shape anomaly, and unpinned turns are byte-identical.
+        const ledgerWindow =
+            wpHit !== undefined && s0.pinned !== null && s0.pinned.length === wpHit.totalT
+                ? s0.pinned.slice(s0.pinned.length - wpHit.windowCores.length)
+                : wpHit?.windowCores;
+        snapshotMessages(session, ledgerWindow ?? originalMessages);
+        // #7064 ledger drain: on a watermark-HIT turn that snapshot is the
+        // ~2-row tail WINDOW — a verified suffix of the ledger (head check +
+        // pf-seq vouch for the prefix), NOT the complete log. Claiming rawness
+        // (lastMessagesFolded=false) makes the save present it as the raw tail,
+        // and the #3285 authoritative-set sweep then retires every prefix row
+        // the window omits — draining the msgid pin ledger (snapMsgIdLiveIds)
+        // to the window, so tryIncrementalPin sees ledger≈2 and the KDD#22
+        // tail form degrades to the full form every turn (full-list body +
+        // 100k id validation + path=full ingest, alternating with window turns).
+        // Mark the tail non-raw: persist presents the envelope view, the sweep
+        // stays off, and the ledger keeps the watermark-protected prefix live
+        // (KDD#21 水位线以下存活行). Every consumer of the flag already treats
+        // "pruned view, not raw log" as the skip-sweep / skip-append contract
+        // (persist tail selection, ingest tail_json, handoff stash, export).
+        if (wpHit !== undefined) session.lastMessagesFolded = true;
+        snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -382,7 +595,7 @@ export async function prepareOpenai(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title) || isSubagentPrompt(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
@@ -404,7 +617,7 @@ export async function prepareOpenai(
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
-        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange);
+        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudgeForConfig(turn.nudge, loopConfig);
         // #3482 Step 2.5: the ONE nudge gate (lane-decisions). No compaction trigger
         // and no intercept health window on this wire — those differences are
         // explicit inputs on the responses lane. The standalone `shouldInject`
@@ -419,7 +632,7 @@ export async function prepareOpenai(
             breakerArmed: compressBreakerArmed(session),
             autoFoldEngaged: autoFoldEngaged(loopConfig, session),
             growthFoldingArmed: growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)),
-            modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
+            modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor, loopConfig.nudge.maxContextLimitPct)),
         });
         const caLine = recordNudgeObservation(sessionId, turn, tokenCount, config.modelContextLimit, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool));
         if (caLine) log("info", caLine);
@@ -470,14 +683,10 @@ export async function prepareOpenai(
         // Client-origin mid system/developer messages (DSH tool_addition and
         // friends) are conversation data — they re-emit verbatim through the
         // kernel's rawOpenaiMessage sidecar and must never change voice (#4159).
-        rebuiltMessages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
-
-        // ONLY the static compress prompt goes into the system message — the
-        // system prompt is the prefix-cache anchor and must be byte-stable
-        // across turns. The nudge (which changes every turn: token count,
-        // growth %, dynamic example) is appended as a trailing user message
-        // instead, mirroring pai-acp's design. Putting the nudge in system
-        // would invalidate the cache every turn.
+        // #7398 seg 4b: egress serve-from-log decision. The sysParts block that
+        // used to follow this line is computed FIRST (moved up) because the
+        // op-log recording stores the outbound system text and the rebuild
+        // replaces the conversation elements below.
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
         let acpStandingPushed = false;
@@ -492,15 +701,53 @@ export async function prepareOpenai(
         if (acpStandingPushed && detectGenerationBoundary(session, processedMessages, log)) sysParts.push(GENERATION_BOUNDARY_NOTE);
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         if (blockOpsActive) sysParts.push(buildBlockOpsSystemPrompt("function"));
+        openaiOutboundSystem = sysParts.join("\n\n");
+        if (!isTitleGen && featureEnabled("egressPlane") && !(egressArmed && !egressSwapApplied)) {
+            const st = getStore().egressOpLogStore();
+            if (st) {
+                try {
+                    const view = recordEgressTurn({
+                        store: st,
+                        sessionId,
+                        prev: egressBaseRows ?? undefined,
+                        baseSeq: egressBaseSeq,
+                        conversation: egressMessages,
+                        systemText: openaiOutboundSystem,
+                        nowMs: Date.now(),
+                        blockLedger: egressBlockLedgerFor(session),
+                        refMap: session.state.messageRefs,
+                    });
+                    const reb = rebuildOutboundFromLog(view);
+                    if (reb !== null) {
+                        rebuiltMessages = reb.elements;
+                        egressServedFromLog = true;
+                        log("info", `[${sessionId}] egress-serve: served ${view.length} rows from op-log`);
+                    }
+                } catch (err) {
+                    egressServedFromLog = false;
+                    log("warn", `[${sessionId}] egress-serve rebuild failed — legacy kept: ${String(err)}`);
+                }
+            }
+        }
+        if (!egressServedFromLog) {
+            rebuiltMessages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
+        }
+        legacyCoreElements = rebuiltMessages;
+        egressRecordSource = egressMessages;
+
+        // ONLY the static compress prompt goes into the system message — the
+        // system prompt is the prefix-cache anchor and must be byte-stable
+        // across turns. The nudge (which changes every turn: token count,
+        // growth %, dynamic example) is appended as a trailing user message
+        // instead, mirroring pai-acp's design. Putting the nudge in system
+        // would invalidate the cache every turn.
+        // sysParts was computed above (seg 4b serve decision needs it).
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (sysNotes.length > 0) {
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
         }
-        // #532: capture what bili injects outside the fold space (client system
-        // + compress prompt). A head system message already in the rebuilt view
-        // is classified by the kernel breakdown — counting only these parts
-        // avoids double-counting it.
-        openaiOutboundSystem = sysParts.join("\n\n");
+        // #532: openaiOutboundSystem was captured above (seg 4b moved it up so
+        // the op-log recording stores the outbound system text).
         if (injectTools) {
             toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOpsActive ? blockOps.openai : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
@@ -593,6 +840,15 @@ export async function prepareOpenai(
             attachedRetrievalNoteIds = retrNotes.map((n) => n.id);
         }
     } catch (err) {
+        // #6181 B1: the R3 identity fault is a HARD reject, not a degrade —
+        // rethrow it to the server funnel (400 + x-bili-snapshot:identity)
+        // BEFORE the generic 503; zero kernel side effects by construction
+        // (it throws before processTurn).
+        if (err instanceof FoundationRejectError) throw err;
+        // Ruling 7439-5: an unreadable op-log on a pinned session is a hard
+        // fail (500 + x-bili-egress: unreadable) — the generic forward
+        // below would send the CLIENT'S bytes, which the ruling forbids.
+        if (err instanceof EgressAuthorityRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         if (attachedRetrievals.length > 0) dropRetrievals(session, attachedRetrievals.map((i) => i.ref), "prepare failed; forwarded unprocessed");
         processedMessages = [];
@@ -668,18 +924,12 @@ export async function prepareOpenai(
     // #5403/#5418: on a watermark hit pin only this turn's window — the
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
-    snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
-    // #7346: on a HIT the pin is this turn's window (the new tail), NOT the
-    // complete raw log. snapshotMessages stamps it raw (folded=false), so the
-    // save presents the window as the full log and the #3285 authoritative-set
-    // sweep retires every verified prefix row the window omits — a 100k-session
-    // ledger drained to the ~2-row window each turn. Mark the pin non-raw so
-    // the save ingests the window through the bounded envelope view and does
-    // NOT sweep the prefix.
-    if (wpHit !== undefined) session.lastMessagesFolded = true;
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
     let wpResponseHeaders: Record<string, string> | undefined;
     if (wpFullText !== undefined && wpOutcome !== null && wpTurnStrip !== undefined) {
         wpResponseHeaders = finalizeWatermarkTurn(session, wpOutcome, {
@@ -688,16 +938,77 @@ export async function prepareOpenai(
             rawSystemText: wpHit !== undefined ? wpHit.systemText : wpSeedSystemText,
             turnStripCounts: wpTurnStrip,
         });
-        if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
-    } else if (bodyText !== undefined && pluginMode && !isTitleGen && !featureEnabled("pluginFullResendWatermark")) {
-        // #7367: flag off — the fastpath never evaluates, but the x-bili-pf-seq
-        // heartbeat still must flow or the client's watermark freezes and its
-        // tail-ids grow past the 16 KB header limit. Stamp-only: no seed, no
-        // saved state (the fastpath re-establishes both when it next runs).
-        wpResponseHeaders = stampOnlyWatermarkTurn(bodyText);
+        // #7064 §8: the pin-mode signal rides WITH the watermark headers —
+        // the client relearns the mode exactly when it relearns T (same
+        // chokepoint, one round-trip). "incremental" is gated on the flag
+        // (off ⇒ the upgrade never travels); the "full" DOWNGRADE signal
+        // travels even when the flag is off — that is the rollback
+        // self-heal (#6785 review fix): an already-upgraded client must be
+        // told to go back to the full form when the flag is rolled back,
+        // or it keeps suppressing the full list while the server pins
+        // nothing (silent pin loss until compaction/restart).
+        if (s0PinMode === "full" || (featureEnabled("pluginMsgIdIncremental") && s0PinMode !== null)) {
+            wpResponseHeaders[MSGID_MODE_HEADER] = s0PinMode;
+        }
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
+    // #7398 seg 3: record this turn's outbound conversation view as sparse
+    // ops (rollout-gated, default off — zero rows, zero cost). Skipped when
+    // the serve path already ran or when the authority seam ran but did not
+    // swap (ruling 7439-5: never advance the flow with untrusted client
+    // bytes); a corrupt log skips this turn and self-heals next.
+    // The bootstrap exception (ruling 7439-5 turn 1): an armed turn with an
+    // empty flow records the client view ONCE — that is the cold start, not
+    // "untrusted bytes advancing the flow" (there is no flow to advance
+    // against; from turn 2 the armed gate is fully enforced again).
+    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog && !(egressArmed && !egressSwapApplied && !egressBootstrap)) {
+        try {
+            const st = getStore().egressOpLogStore();
+            if (st) {
+                recordEgressTurn({
+                    store: st,
+                    sessionId,
+                    prev: egressBaseRows ?? undefined,
+                    baseSeq: egressBaseSeq,
+                    conversation: egressRecordSource ?? (processedMessages.length > 0 ? processedMessages : originalMessages),
+                    systemText: openaiOutboundSystem ?? openaiSystemText,
+                    nowMs: Date.now(),
+                    blockLedger: egressBlockLedgerFor(session),
+                    refMap: session.state.messageRefs,
+                });
+            }
+        } catch (err) {
+            if (err instanceof EgressConcurrentWriteError) {
+                log("warn", `[${sessionId}] egress op-log recording skipped this turn (another request on this session recorded first): ${String(err)}`);
+            } else {
+                log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
+            }
+        }
+    }
+    // #7398 seg 4a: SHADOW comparison — rebuild the outbound core portion
+    // from the log and byte-compare against the legacy elements. NO
+    // swap: the pipeline always sends the legacy bytes; this measures the
+    // identity rate the swap will rely on (rollout egressPlane, default 0;
+    // reads the hydrated flow view — on a bootstrap turn that is the view
+    // the record above just wrote, i.e. an exact self-compare).
+    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog) {
+        try {
+            const st = getStore().egressOpLogStore();
+            const view = egressBaseRows ?? (st ? st.egressStateView(sessionId) : undefined);
+            if (st && view && legacyCoreElements !== undefined) {
+                const reb = rebuildOutboundFromLog(view);
+                if (reb === null) {
+                    log("info", `[${sessionId}] egress-serve shadow: unrebuildable (log gap or out-of-scope row) — legacy kept`);
+                } else {
+                    const same = JSON.stringify(reb.elements) === JSON.stringify(legacyCoreElements);
+                    log("info", `[${sessionId}] egress-serve shadow: ${same ? "IDENTICAL" : "DIVERGENT"} (${view.length} rows)`);
+                }
+            }
+        } catch (err) {
+            log("warn", `[${sessionId}] egress-serve shadow comparison failed: ${String(err)}`);
+        }
+    }
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 

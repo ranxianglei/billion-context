@@ -230,14 +230,14 @@ test("watermark: envelope re-render without rawTail never rides the delta (#2960
 
             // Stale-convergence path shape: record(disk) with NO rawTail, the
             // envelope's folded re-render presenting the SAME identities in a
-            // DIFFERENT order and the same length. The empty delta must be
-            // refused (hasRawTail gate) so the full ingest rebuilds tailSeqs
-            // in the envelope's order — otherwise the served view stays on
-            // the raw ordering and diverges from the disk record.
+            // DIFFERENT order and the same length. The #7474 reanchor (KDD #23,
+            // "OFF 臂同受益") now rides here — byte-equivalent to the full path
+            // (same served view, same watermark) — so the served view must
+            // follow the envelope render order, not the stale raw ordering.
             const envRender = [msgs[0], carrier, msgs[1], msgs[2]];
             legacy = mkLegacy("wm-render", envRender);
             shadow.record(legacy);
-            assert.equal(stats(shadow).deltaIngests, 0, "envelope render must not ride the delta");
+            assert.equal(stats(shadow).deltaIngests, 1, "envelope render rides the reanchor delta (#7474 KDD #23)");
             const served = view(store, "wm-render");
             assert.ok(served.lastMessages);
             assert.deepEqual(served.lastMessages.map((m) => m.id), ["h_msg0", "acp_summary_b1", "h_msg1", "h_msg2"], "served view must follow the envelope render order");
@@ -260,14 +260,15 @@ test("watermark: delta survives a fold (holes above the trusted tip)", () => {
             assert.equal(stats(shadow).deltaIngests, 0);
 
             // Fold: m2..m5 collapse into a new summary message; the tail
-            // SHRINKS below the trusted length — full ingest, and the
-            // summary lands ABOVE the surviving old rows (abs 8).
+            // SHRINKS below the trusted length — the #7474 reanchor (KDD #23)
+            // rides (byte-equivalent to the full path), and the summary lands
+            // ABOVE the surviving old rows (abs 8).
             const summary = { id: "h_summary", role: "user", contentType: "text", text: "summary of 2..5" } as CoreMessage;
             const tail1 = [tail0[0], tail0[1], summary, tail0[6], tail0[7]];
             shadow.record(mkLegacy("wm-fold", tail1));
-            assert.equal(stats(shadow).deltaIngests, 0, "shorter tail cannot delta");
+            assert.equal(stats(shadow).deltaIngests, 1, "fold rides the reanchor delta (#7474 KDD #23)");
             const mark1 = store.ingestWatermark("wm-fold");
-            assert.ok(mark1, "full ingest re-establishes the watermark at the fold");
+            assert.ok(mark1, "reanchor re-establishes the watermark at the fold (#7474 KDD #23)");
             assert.deepEqual(mark1.tailSeqs, [0, 1, 8, 6, 7], "tail pointers carry the holes verbatim");
             assert.equal(mark1.seq, 7, "watermark = seq of the LAST tail message, not the max");
 
@@ -276,7 +277,7 @@ test("watermark: delta survives a fold (holes above the trusted tip)", () => {
             const tail2 = [...tail1, msg(8), msg(9)];
             ingestSerializations.count = 0;
             shadow.record(mkLegacy("wm-fold", tail2));
-            assert.equal(stats(shadow).deltaIngests, 1, "post-fold append takes the delta path");
+            assert.equal(stats(shadow).deltaIngests, 2, "post-fold append takes the delta path (fold + append)");
             assert.equal(ingestSerializations.count, 3, "probe + 2 new messages");
             const mark2 = store.ingestWatermark("wm-fold");
             assert.ok(mark2);
@@ -613,7 +614,7 @@ test("watermark: sampled verification still catches drift through the delta path
     }
 });
 
-test("watermark: v4 database migrates to v11 additively; newer user_version no-ops", async () => {
+test("watermark: v4 database migrates to v12 additively; newer user_version no-ops", async () => {
     const dir = tmpdir("bili-wm-migrate-");
     try {
         const dbPath = path.join(dir, "index.db");
@@ -642,7 +643,7 @@ test("watermark: v4 database migrates to v11 additively; newer user_version no-o
         const store = UnifiedStore.open(dbPath);
         try {
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 11, "open() migrates v4 → v11");
+            assert.equal(ver.user_version, 12, "open() migrates v4 → v12");
             const row = store.getSessionRow("v4-sess");
             assert.ok(row, "legacy session row survives the migration");
             assert.equal(row!.lastIngestedSeq, null, "legacy rows read back with a NULL watermark (≡ full ingest)");
@@ -680,7 +681,7 @@ test("watermark: v4 database migrates to v11 additively; newer user_version no-o
         const older = UnifiedStore.open(dbPath);
         try {
             const ver2 = (older as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver2.user_version, 11, "newer user_version is left untouched");
+            assert.equal(ver2.user_version, 12, "newer user_version is left untouched");
             assert.ok(older.getSessionRow("v4-sess"), "rows stay readable");
         } finally {
             older.close();

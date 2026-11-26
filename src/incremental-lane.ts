@@ -530,6 +530,12 @@ function persistLaneState(sessionId: string, system: unknown, systemSet: boolean
 
 export function loadSystem(sessionId: string): unknown {
     try {
+        // Renumber (2026-11-25): egress-on sessions carry the client's raw
+        // system (A) in the op log's system row (sysIn) — the authoritative
+        // copy (survives kstate retirement, fork-verbatim). The inc:system
+        // ext row stays as the legacy read for everything else.
+        const viaOpLog = getStore().egressOpLogStore()?.egressSystemInput?.(sessionId);
+        if (viaOpLog !== null && viaOpLog !== undefined) return viaOpLog;
         return getStore().getSessionExt(sessionId, EXT_KEY_SYSTEM);
     } catch {
         return undefined;
@@ -939,7 +945,20 @@ export async function handleIncrementalTurn(
         // stamp the canonical ids so prepare pins exactly what the lane owns
         // (content-derived when the client sent none; client-pinned when it
         // did). The pipeline strips the field before forwarding upstream.
-        if (featureEnabled("pluginLaneServerHistory")) {
+        //
+        // #6680 (rolling cache marks): a body that carries client cache_control
+        // marks must re-enter EXACTLY as it does with the rollout off — no
+        // stamps. The id/seq stamps make the kernel's first-sight pass
+        // re-render the marked content into <acp>mNNNNN</acp> markers, which
+        // drops the wire-level cache_control breakpoints (and drifts the ACP
+        // refs) — tests/opencode-rolling-cache-marks.test.ts. coreToAnthropic
+        // splices entry.marks into the assembled items, so a non-empty marks
+        // map is the precise signal that this body carries marks. Skipping the
+        // stamps on mark turns is a safe degrade to the pre-GA behavior; the
+        // lane still owns the canonical ids (entry.msgs) and non-mark turns
+        // keep pinning.
+        const markChannelActive = entry.marks.size > 0;
+        if (featureEnabled("pluginLaneServerHistory") && !markChannelActive) {
             body[MSG_IDS_BODY_FIELD] = entry.msgs.map((m) => m.id);
             // #4316 PR2/3: seq stamps ride the same internal transport. The
             // canonical prefix carries its stamps from the unified rows

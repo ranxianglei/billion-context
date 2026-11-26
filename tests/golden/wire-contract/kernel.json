@@ -3,13 +3,13 @@
     "ACP_TOOLS_ANTHROPIC": [
       {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
         "input_schema": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -70,7 +70,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -118,13 +118,13 @@
         "type": "function",
         "function": {
           "name": "compress",
-          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
           "parameters": {
             "type": "object",
             "properties": {
               "content": {
                 "type": "string",
-                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
               }
             }
           }
@@ -194,7 +194,7 @@
               },
               "view": {
                 "type": "string",
-                "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+                "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
               },
               "tool": {
                 "type": "string",
@@ -245,13 +245,13 @@
       {
         "type": "function",
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
         "parameters": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -315,7 +315,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -419,7 +419,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -466,13 +466,13 @@
     "ACP_TOOLS_GOOGLE": [
       {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
         "parameters": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -533,7 +533,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -580,13 +580,13 @@
   "individual": {
     "COMPRESS_TOOL": {
       "name": "compress",
-      "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+      "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
       "input_schema": {
         "type": "object",
         "properties": {
           "content": {
             "type": "string",
-            "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+            "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
           }
         }
       }
@@ -595,13 +595,13 @@
       "type": "function",
       "function": {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
         "parameters": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -610,26 +610,26 @@
     "COMPRESS_TOOL_RESPONSES": {
       "type": "function",
       "name": "compress",
-      "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+      "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
       "parameters": {
         "type": "object",
         "properties": {
           "content": {
             "type": "string",
-            "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+            "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
           }
         }
       }
     },
     "COMPRESS_TOOL_GOOGLE": {
       "name": "compress",
-      "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
+      "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
       "parameters": {
         "type": "object",
         "properties": {
           "content": {
             "type": "string",
-            "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
+            "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown. Batch multiple ranges into ONE call — do not split into one call per range."
           }
         }
       }
@@ -830,7 +830,7 @@
           },
           "view": {
             "type": "string",
-            "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
           },
           "tool": {
             "type": "string",
@@ -869,7 +869,7 @@
             },
             "view": {
               "type": "string",
-              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
             },
             "tool": {
               "type": "string",
@@ -908,7 +908,7 @@
           },
           "view": {
             "type": "string",
-            "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
           },
           "tool": {
             "type": "string",
@@ -945,7 +945,7 @@
           },
           "view": {
             "type": "string",
-            "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            "description": "\"ranges\" (default) for the compressible-ranges listing; \"messages\" for a per-message drill-down"
           },
           "tool": {
             "type": "string",

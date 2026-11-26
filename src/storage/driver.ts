@@ -54,13 +54,11 @@ export interface SqliteDatabase {
     transaction<T>(fn: () => T): T;
     /** Deferred snapshot: readers do not reserve the writer lock. */
     readTransaction<T>(fn: () => T): T;
-    inTransaction?(): boolean | undefined;
     close(): void;
     readonly open: boolean;
 }
 
 interface BetterSqlite3Database {
-    readonly inTransaction?: boolean;
     exec(sql: string): unknown;
     prepare(sql: string): SqliteStatement & { readonly source?: string };
     /** better-sqlite3 wraps fn and returns the wrapped (callable) function,
@@ -109,7 +107,6 @@ interface OpenedDatabase {
 
 function wrapBetterSqlite3(db: BetterSqlite3Database): SqliteDatabase {
     return {
-        inTransaction: () => db.inTransaction,
         exec: (sql) => void db.exec(sql),
         prepare: (sql) => db.prepare(sql),
         // BEGIN IMMEDIATE, not the default deferred: the multi-process
@@ -200,7 +197,6 @@ function openNodeSqlite(path: string): SqliteDatabase {
     return {
         exec: (sql) => void db.exec(sql),
         prepare: (sql) => adaptNodeSqliteStatement(db.prepare(sql)),
-        inTransaction: () => typeof db.isTransaction === "boolean" ? db.isTransaction : typeof db.getAutoCommit === "function" ? !db.getAutoCommit() : depth > 0 ? true : undefined,
         transaction: (fn) => transaction(fn, false),
         readTransaction: (fn) => transaction(fn, true),
         close: () => void db.close(),
@@ -216,7 +212,6 @@ interface NodeSqliteStatement {
     all(...args: unknown[]): unknown[];
 }
 export interface NodeSqliteDatabase {
-    readonly isTransaction?: boolean;
     exec(sql: string): unknown;
     prepare(sql: string): NodeSqliteStatement;
     getAutoCommit(): boolean;
@@ -245,7 +240,6 @@ interface BunSqliteStatement {
 }
 
 export interface BunSqliteDatabase {
-    readonly inTransaction?: boolean;
     exec(sql: string): unknown;
     prepare(sql: string): BunSqliteStatement;
     /** bun mirrors better-sqlite3's shape: wraps fn and returns the callable
@@ -354,7 +348,6 @@ function openBunSqlite(path: string): SqliteDatabase {
     return {
         exec: (sql) => void db.exec(sql),
         prepare: (sql) => adaptBunSqliteStatement(db.prepare(sql), bunNamedParamForms(sql)),
-        inTransaction: () => db.inTransaction,
         transaction: (fn) => mode(fn, "immediate"),
         readTransaction: (fn) => mode(fn, "deferred"),
         close: () => {
