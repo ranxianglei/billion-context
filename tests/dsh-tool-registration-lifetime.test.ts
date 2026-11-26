@@ -53,7 +53,7 @@ function host() {
         };
         return { ctx, dispose: () => { for (const dispose of disposers.splice(0)) dispose(); } };
     }
-    return { definitions, owner };
+    return { definitions, owner, fireChange: changed };
 }
 
 function reset() {
@@ -89,12 +89,13 @@ test("same-context restart re-registers all tools and disposal clears readiness"
     assert.equal(registry.definitions.size, 0, "disposed activation must never resurrect its tools");
 });
 
-test("borrowed registrations survive new-owner disposal and heal after old-owner disposal", async () => {
+test("borrowed registrations survive new-owner disposal and heal after old-owner disposal", async (t) => {
     const registry = host();
     const oldOwner = registry.owner();
     const newOwner = registry.owner();
     mock.method(globalThis, "fetch", async () => manifest());
     reset();
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     await apply(oldOwner.ctx);
     await _stateToolsReadyForTest();
     const borrowed = registry.definitions.get("compress");
@@ -102,6 +103,8 @@ test("borrowed registrations survive new-owner disposal and heal after old-owner
     await _stateToolsReadyForTest();
     assert.equal(registry.definitions.get("compress"), borrowed);
     oldOwner.dispose();
+    // #7705: the active owner's restore is now coalesced — advance the window.
+    t.mock.timers.tick(50);
     assert.deepEqual([...registry.definitions.keys()].sort(), [...names].sort());
     assert.notEqual(registry.definitions.get("compress"), borrowed);
     assert.equal(_registerStateForTest().toolsReady, true);
@@ -118,6 +121,7 @@ test("borrowed registrations survive new-owner disposal and heal after old-owner
     assert.equal(registry.definitions.get("compress"), definition, "foreign registration keeps its original lifetime");
     foreignOwner.dispose();
     assert.equal(registry.definitions.size, 0);
+    t.mock.timers.reset();
 });
 
 test("a late old manifest cannot register tools or clear the new activation's pending flight", async () => {
@@ -185,7 +189,7 @@ class TestTools extends Service {
     }
 }
 
-test("#6702 real Cordis fibers own registration lifetime across restart, adoption and teardown", async () => {
+test("#6702 real Cordis fibers own registration lifetime across restart, adoption and teardown", async (t) => {
     const ctx = new Context();
     const owners: PluginContext[] = [];
     let tools: TestTools | undefined;
@@ -198,6 +202,9 @@ test("#6702 real Cordis fibers own registration lifetime across restart, adoptio
         },
     };
     try {
+        // #7705: tools/change restores are coalesced on a fixed window — drive
+        // the window with fake timers so the assertions observe the restore.
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         await ctx.plugin({ apply(owner) {
             owner.provide("commands", { register() {} });
             owner.provide("agents", { currentInitiator: () => ({ session: { id: "lifetime-session" } }) });
@@ -248,6 +255,9 @@ test("#6702 real Cordis fibers own registration lifetime across restart, adoptio
         const replacementBorrower = await load(biliPlugin);
         await _stateToolsReadyForTest();
         await foreign.dispose();
+        // #7705: the active borrower's restore of the removed foreign tool is
+        // coalesced — advance the window before asserting it landed.
+        t.mock.timers.tick(50);
         assert.deepEqual(liveNames(), names, "the active borrower restores registrations removed with the old owner");
         assert.notEqual(tools?.get("compress"), foreignDefinition);
         await replacementBorrower.dispose();
@@ -282,7 +292,82 @@ test("#6702 real Cordis fibers own registration lifetime across restart, adoptio
         assert.deepEqual(liveNames(), names);
         await pending.dispose();
         assert.deepEqual(liveNames(), [], "final disposal leaves no registrations behind");
+        t.mock.timers.reset();
     } finally {
         await ctx.fiber.dispose();
     }
+});
+
+// #7705: the cold-boot tools/change cascade ran restoreTools synchronously on
+// every event (each a full ctx.tools.get sweep), and restoreTools re-scanned
+// visibility after the loop even when nothing had been registered. These pin
+// the fixed-window coalescing and the loop-only visibility check.
+
+const biliDefinition = (name: string): Definition => ({
+    name, description: name,
+    parameters: { type: "object", properties: {} },
+    output: { schema: {}, render: () => [{ type: "text", text: name }] },
+    execute: async () => name,
+});
+
+test("#7705 fixed-window coalescing: a tools/change burst restores once per window, not once per event", async (t) => {
+    const registry = host();
+    const owner = registry.owner();
+    mock.method(globalThis, "fetch", async () => manifest());
+    reset();
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await apply(owner.ctx);
+    await _stateToolsReadyForTest();
+    // The first register during apply armed a coalescing window — let it land.
+    t.mock.timers.tick(50);
+    let getCalls = 0;
+    const originalGet = owner.ctx.tools.get;
+    if (originalGet === undefined) throw new Error("host must expose tools.get");
+    owner.ctx.tools.get = (name: string) => { getCalls++; return originalGet(name); };
+    // A startup burst: 5 tools/change events in one window must collapse into a
+    // single restore (the pre-fix code ran restoreTools synchronously per event).
+    for (let i = 0; i < 5; i++) registry.fireChange();
+    t.mock.timers.tick(50);
+    assert.equal(getCalls, names.length, "one coalesced restore, not one per event");
+    assert.equal(_registerStateForTest().toolsReady, true);
+    t.mock.timers.reset();
+});
+
+test("#7705 registeredAny optimization: no redundant second ctx.tools.get sweep when every tool is already visible", async () => {
+    const registry = host();
+    const owner = registry.owner();
+    // Pre-register every tool (the adoption case): restoreTools must confirm
+    // visibility in the loop only, without the post-loop toolsAreReady() re-scan.
+    for (const name of names) owner.ctx.tools.register(biliDefinition(name));
+    let getCalls = 0;
+    const originalGet = owner.ctx.tools.get;
+    if (originalGet === undefined) throw new Error("host must expose tools.get");
+    owner.ctx.tools.get = (name: string) => { getCalls++; return originalGet(name); };
+    mock.method(globalThis, "fetch", async () => manifest());
+    reset();
+    await apply(owner.ctx);
+    await _stateToolsReadyForTest();
+    assert.equal(getCalls, names.length, "loop-only visibility check, no second sweep");
+    assert.equal(_registerStateForTest().toolsReady, true);
+});
+
+test("#7705 a pending coalescing window is dropped on owner disposal", async (t) => {
+    const registry = host();
+    const owner = registry.owner();
+    mock.method(globalThis, "fetch", async () => manifest());
+    reset();
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await apply(owner.ctx);
+    await _stateToolsReadyForTest();
+    // Let apply's window land, then arm a fresh one and dispose before it fires.
+    t.mock.timers.tick(50);
+    let getCalls = 0;
+    const originalGet = owner.ctx.tools.get;
+    if (originalGet === undefined) throw new Error("host must expose tools.get");
+    owner.ctx.tools.get = (name: string) => { getCalls++; return originalGet(name); };
+    registry.fireChange();
+    owner.dispose();
+    t.mock.timers.tick(50);
+    assert.equal(getCalls, 0, "a disposed owner must not run a pending coalesced restore");
+    t.mock.timers.reset();
 });
