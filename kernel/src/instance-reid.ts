@@ -13,6 +13,31 @@ function clusterRoot(id: string): string | null {
   return m ? `h_${m[1]}` : null;
 }
 
+function reasoningCompanionWillBePruned(
+  messages: CoreMessage[],
+  index: number,
+  coveredBases: Set<string>,
+  prior: Set<string>,
+): boolean {
+  let j = index;
+  while (
+    j + 1 < messages.length &&
+    messages[j + 1]!.contentType === "reasoning"
+  ) {
+    j++;
+  }
+  const companion = messages[j + 1];
+  if (
+    companion === undefined ||
+    companion.role !== "assistant" ||
+    (companion.contentType !== "text" && companion.contentType !== "tool-call")
+  ) {
+    return true;
+  }
+  if (!coveredBases.has(baseIdOf(companion.id))) return false;
+  return prior.has(companion.id) || clusterRoot(companion.id) === null;
+}
+
 /**
  * Re-mint live messages whose id collides with an already-FOLDED copy of the same
  * content (billion-context #1476), WITHOUT un-covering the folded originals' own
@@ -114,6 +139,16 @@ export function remintCoveredLiveIds(
       // prefix cache and let summarized content escape prune (#462).
       if (prior.has(id)) continue;
       if (!exactCovered && !(exactCoveredInactive && rootContinues)) continue;
+      // Hosts that strip thinking blocks on one turn (e.g. model switch or
+      // keep:0) and restore them on the next leave a covered reasoning core
+      // absent from `prior` while its folded companion stayed in `prior`;
+      // re-minting it would leak historical thinking past prune.
+      if (
+        messages[i]!.contentType === "reasoning" &&
+        reasoningCompanionWillBePruned(messages, i, coveredBases, prior)
+      ) {
+        continue;
+      }
       while (
         coveredBases.has(`${root}_${k}`) ||
         inactiveBases.has(`${root}_${k}`) ||

@@ -155,7 +155,7 @@ test("#4666 sqlite: v8 migration collapses wireIndex-split duplicates and refund
         check = openSqliteDatabase(path.join(dir, "index.db")).db;
 
         const ver = check.prepare("PRAGMA user_version").get() as { user_version: number };
-        assert.equal(ver.user_version, 11, "stamped to v11 (v10 ts column + v11 FK child indexes, #5539)");
+        assert.equal(ver.user_version, 12, "stamped to v12 (v10 ts column + v11 FK child indexes, #5539 + v12 snapshot-table foundation, #5874)");
 
         // Exactly the lowest-seq arrival of each (msg_id, identity) group.
         const survivors = check

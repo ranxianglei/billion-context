@@ -19,12 +19,18 @@
 //     client restarts on every failed bootstrap round, so a fresh process must
 //     continue the previous process's window (and a REUSED pid must NOT
 //     inherit the dead occupant's history — birth-stamp key);
-//   - kill failure → fall through to the normal spawn ladder (never worse
-//     than today), ledger entry kept, takeover retried on the next cycle;
+//   - #7156: while the holder is still ALIVE, every bring-up that has not yet
+//     escalated REFUSES to spawn a second same-lane writer (actionable error
+//     naming the pid + remedy) — drifting a child over the shared store is
+//     what corrupted the incident index. The forced-takeover cycle is the
+//     only path to a spawn; a FAILED kill keeps the refusal alive (ledger
+//     kept, retry on the next cycle);
 //   - regression guards: healthy OLDER holder still routes through #3544
 //     rotation ONLY, healthy NEWER holder still adopted (#4125), SAME-build
 //     BUSY holder attached and NEVER killed (#4811), user-zone / foreign-lane
-//     / foreign-port / attachUrl holders all untouched.
+//     / foreign-port holders all untouched. An explicit attach target is NO
+//     LONGER exempt: it gets the same supervised takeover (#7156 — the
+//     incident's cc-lane pin was exactly this cell).
 //
 // Hermeticity: XDG_STATE_HOME is redirected to a scratch dir BEFORE any test
 // runs, so probeLiveInstances' REAL registry view (discoverLiveInstances),
@@ -87,6 +93,12 @@ interface World {
     connectable: boolean;
     gracefulShutdown: boolean;
     killReleases: boolean;
+    /** #7156: the gate's safety condition is PROCESS DEATH, not port release.
+     *  The holder mock runs under process.pid (alive by default); a successful
+     *  shutdown/SIGKILL "dies" by landing here. Every other pid is dead, as in
+     *  the real kill(0) probe. */
+    deadPids: Set<number>;
+    gateRefusals: number;
     shutdownCalls: string[];
     shutdownTimeouts: Array<number | undefined>;
     signalCalls: number[];
@@ -102,6 +114,8 @@ function makeWorld(opts: { gracefulShutdown: boolean; killReleases: boolean }): 
         connectable: true,
         gracefulShutdown: opts.gracefulShutdown,
         killReleases: opts.killReleases,
+        deadPids: new Set(),
+        gateRefusals: 0,
         shutdownCalls: [],
         shutdownTimeouts: [],
         signalCalls: [],
@@ -175,11 +189,20 @@ function makeDeps(w: World, holder: ProxyInstanceFile): Deps {
         resolveAttachExternal: () => false,
         resolveAttachPolicy: () => "own-lane",
         attachLanePriority: () => [],
+        // #7156: mirror the fetchHealthInfo mock so the pre-spawn second-writer
+        // gate stays hermetic (its default would be a REAL HTTP probe).
+        fetchHealthInfoNoReuse: async (origin: string) => (origin === holder.origin ? undefined : { ok: false }),
+        // #7156: scripted liveness — only the holder (process.pid) can be
+        // alive, and it "dies" when the escalation actually releases it.
+        isPidAlive: (pid: number) => pid === process.pid ? !w.deadPids.has(pid) : false,
         requestInstanceShutdown: async (origin: string, timeoutMs?: number) => {
             w.shutdownCalls.push(origin);
             w.shutdownTimeouts.push(timeoutMs);
             w.order.push("shutdown");
-            if (w.gracefulShutdown) w.connectable = false;
+            if (w.gracefulShutdown) {
+                w.connectable = false;
+                w.deadPids.add(holder.pid); // graceful release → the drain is instant in the mock
+            }
             return true;
         },
         isConnectable: async (origin: string) => origin === holder.origin && w.connectable,
@@ -187,7 +210,10 @@ function makeDeps(w: World, holder: ProxyInstanceFile): Deps {
         killWedgedHolder: (pid: number) => {
             w.killCalls.push(pid);
             w.order.push("kill");
-            if (w.killReleases) w.connectable = false;
+            if (w.killReleases) {
+                w.connectable = false;
+                w.deadPids.add(holder.pid); // SIGKILL took the process down
+            }
         },
         wedgedLedgerPath: () => ledgerFile,
         // Deterministic birth stamp: stable per pid within a world unless a row
@@ -215,7 +241,10 @@ async function runCycle(
     return ensureProxyRunning(opts, deps);
 }
 
-/** Runs bring-up cycles GAP_MS apart until pred() holds; returns the last handle. */
+/** Runs bring-up cycles GAP_MS apart until pred() holds; returns the last handle.
+ *  #7156: cycles the second-writer gate refuses now THROW instead of spawning —
+ *  the gate's refusal is expected bookkeeping, not a test failure, so it is
+ *  counted on the world and swallowed here. */
 async function cycleUntil(
     w: World,
     holder: ProxyInstanceFile,
@@ -226,11 +255,33 @@ async function cycleUntil(
     let handle: Awaited<ReturnType<typeof runCycle>> | undefined;
     for (let i = 1; i <= maxCycles; i++) {
         if (i > 1) w.clock.advance(GAP_MS);
-        handle = await runCycle(w, holder, overrides);
+        try {
+            handle = await runCycle(w, holder, overrides);
+        } catch (err) {
+            if (err instanceof Error && err.message.includes("refusing to spawn a second same-lane writer")) {
+                w.gateRefusals += 1;
+                continue;
+            }
+            throw err;
+        }
         if (pred()) break;
     }
     assert.ok(handle, `expected a handle within ${maxCycles} cycles`);
     return handle;
+}
+
+/** #7156: a bring-up the second-writer gate refused — the actionable error,
+ *  not a test failure. */
+async function assertRejectsSecondWriter(w: World, holder: ProxyInstanceFile, overrides?: { opts?: Record<string, unknown>; deps?: Partial<Deps> }) {
+    let err: unknown;
+    try {
+        await runCycle(w, holder, overrides);
+    } catch (e) {
+        err = e;
+    }
+    assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second same-lane writer"),
+        `expected the #7156 second-writer refusal, got: ${err instanceof Error ? err.message : String(err)}`);
+    w.gateRefusals += 1;
 }
 
 const watchingLines = (w: World) => w.diagMsgs.filter((m) => m.includes("patience before forced takeover"));
@@ -339,11 +390,12 @@ test("#5955 full path: graceful shutdown frees the port, no signal/kill needed",
     assert.equal(w.signalCalls.length, 0, "graceful release needs no signal");
     assert.equal(w.killCalls.length, 0, "graceful release needs no kill");
     assert.deepEqual(w.order.filter((s) => s !== "spawn"), ["shutdown"]);
-    assert.equal(w.spawnCalls, 4, "each pre-escalation cycle spawns; the escalating cycle binds the freed port");
+    assert.equal(w.spawnCalls, 1, "#7156: the gate refuses the pre-escalation cycles; only the escalating cycle spawns");
+    assert.equal(w.gateRefusals, 3, "every pre-escalation bring-up refused instead of drifting a second writer");
     assert.equal(handle.port, PORT);
     assert.ok(handle.child, "the escalated cycle must spawn a live child");
     assert.equal(startLines(w).length, 1, "patience-window start announced once, user-visibly");
-    assert.equal(watchingLines(w).length, 2, "non-escalating cycles logged the observability line");
+    assert.equal(watchingLines(w).length, 2, "the non-fresh pre-escalation cycles logged the observability line");
     assert.equal(fs.existsSync(ledgerFile), false, "successful takeover clears the persisted ledger");
 });
 
@@ -355,7 +407,8 @@ test("#5955 full path: unresponsive holder → shutdown, then SIGTERM, then hard
     assert.deepEqual(w.order.filter((s) => s !== "spawn"), ["shutdown", "signal", "kill"], "escalation ladder order");
     assert.deepEqual(w.signalCalls, [holder.pid]);
     assert.deepEqual(w.killCalls, [holder.pid]);
-    assert.equal(w.spawnCalls, 4);
+    assert.equal(w.spawnCalls, 1, "#7156: refused until the holder actually died");
+    assert.equal(w.gateRefusals, 3);
     assert.equal(handle.port, PORT);
     assert.ok(handle.child);
     assert.equal(fs.existsSync(ledgerFile), false, "successful forced takeover clears the persisted ledger");
@@ -370,20 +423,19 @@ test("#5955 escalation pays a SHORT BUSY budget, not the graceful ladder", async
     // time — and the POST must never wait out the 3s graceful default.
     const w = makeWorld({ gracefulShutdown: false, killReleases: true });
     const holder = wedgedHolder();
-    let handle: Awaited<ReturnType<typeof runCycle>> | undefined;
     for (let i = 1; i <= 3; i++) {
         if (i > 1) w.clock.advance(GAP_MS);
-        handle = await runCycle(w, holder);
+        await assertRejectsSecondWriter(w, holder);
     }
     assert.equal(w.killCalls.length, 0, "still patient before the window elapses");
 
     w.clock.advance(GAP_MS);
     const t0 = w.clock.now();
-    handle = await runCycle(w, holder);
+    const handle = await runCycle(w, holder);
     const escalationMs = w.clock.now() - t0;
 
     assert.equal(w.killCalls.length, 1, "the escalating cycle still ends in the hard kill");
-    assert.equal(handle?.port, PORT);
+    assert.equal(handle.port, PORT);
     assert.equal(w.shutdownTimeouts.length, 1, "exactly one graceful shutdown request before the kill");
     const budget = w.shutdownTimeouts[0];
     assert.equal(typeof budget, "number", "the BUSY shutdown POST gets an explicit budget");
@@ -414,30 +466,42 @@ test("#5955 hard kill: a pid already reaped by taskkill is silent, real failures
     );
 });
 
-test("#5955 full path: kill fails → fall through to normal spawn, ledger kept, retry next cycle", async () => {
+test("#5955 full path: kill fails → the gate keeps refusing, ledger kept, retry next cycle", async () => {
     const w = makeWorld({ gracefulShutdown: false, killReleases: false });
     const holder = wedgedHolder();
-    const handle = await cycleUntil(w, holder, () => w.killCalls.length === 2, 8);
+    // #7156: the holder OUTLIVES every escalation — no cycle may ever reach
+    // the spawn ladder. The final cycle (a failed escalation) is also a
+    // refusal, so nothing is "returned": the point is what did NOT happen.
+    for (let i = 1; i <= 8; i++) {
+        if (i > 1) w.clock.advance(GAP_MS);
+        try {
+            await runCycle(w, holder);
+            assert.fail("bring-up behind a surviving holder must be refused");
+        } catch (err) {
+            assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second same-lane writer"),
+                `expected the #7156 refusal on cycle ${i}, got: ${err instanceof Error ? err.message : String(err)}`);
+            w.gateRefusals += 1;
+        }
+    }
 
-    assert.equal(w.shutdownCalls.length, 2, "one escalation attempt per qualifying cycle");
-    assert.equal(w.signalCalls.length, 2);
-    assert.equal(w.killCalls.length, 2);
-    assert.equal(w.spawnCalls, 5, "every cycle still spawns — never worse than today while the holder survives");
-    assert.equal(handle.port, PORT);
-    assert.ok(handle.child);
+    assert.equal(w.shutdownCalls.length, 5, "one escalation attempt per cycle from the point the window is fully elapsed (c4..c8) — the patience gate has no more teeth, so the ladder keeps trying");
+    assert.equal(w.signalCalls.length, 5);
+    assert.equal(w.killCalls.length, 5);
+    assert.equal(w.spawnCalls, 0, "no spawn behind a holder that outlives the hard kill");
+    assert.equal(w.gateRefusals, 8, "every bring-up refused while the holder survives");
     assert.equal(startLines(w).length, 1);
-    assert.equal(watchingLines(w).length, 2, "only the pre-escalation cycles logged the watching line");
+    assert.equal(watchingLines(w).length, 2, "only the non-fresh pre-escalation cycles (c2, c3) logged the watching line");
     const entries = readLedger();
     assert.equal(Object.keys(entries).length, 1, "surviving occupant keeps its ledger entry for the retry");
-    // Five bring-ups, five observations — but the ledger's documented worst case
-    // is a lost read-modify-write (wedged-takeover ledger contract in
+    // Eight bring-ups, eight observations — but the ledger's documented worst
+    // case is a lost read-modify-write (wedged-takeover ledger contract in
     // src/launcher.ts: "the worst case loses one observation ... which is
-    // safe"), so tolerate exactly that one
-    // loss instead of turning an fs-timing hiccup into a CI flake. Anything
-    // below 4 means observations are NOT bridging the gap (the patience window
-    // would restart every cycle and the takeover could never fire).
+    // safe"), so tolerate exactly that one loss instead of turning an
+    // fs-timing hiccup into a CI flake. Anything below 7 means observations
+    // are NOT bridging the gap (the patience window would restart every cycle
+    // and the takeover could never fire).
     const observed = Object.values(entries)[0].observations;
-    assert.ok(observed === 5 || observed === 4, `observations accumulate across failed escalations (got ${observed}, expected 5, or 4 for the documented one-observation loss)`);
+    assert.ok(observed === 8 || observed === 7, `observations accumulate across failed escalations (got ${observed}, expected 8, or 7 for the documented one-observation loss)`);
 });
 
 test("#5955 full path: port:0 bring-up resolves the sticky lane port lazily", async () => {
@@ -457,15 +521,17 @@ test("#5955 full path: port:0 bring-up resolves the sticky lane port lazily", as
     assert.ok(zonePortCalls >= 1, "sticky resolver touched only because a real wedged-cell holder existed");
     assert.equal(handle.port, PORT, "after takeover the spawn binds the lane's preferred port");
     assert.ok(handle.child);
+    assert.equal(w.spawnCalls, 1, "#7156: refused until the takeover cycle");
 });
 
 test("#5955 full path: observations persist across client restarts (file ledger)", async () => {
     const holder = wedgedHolder();
     const clock = makeClock();
-    // "Process 1": one bring-up cycle in its own memory.
+    // "Process 1": one bring-up cycle in its own memory — the gate refuses it
+    // (#7156) but the wedge step records its observation before the refusal.
     const w1 = makeWorld({ gracefulShutdown: false, killReleases: false });
     w1.clock = clock;
-    await runCycle(w1, holder);
+    await assertRejectsSecondWriter(w1, holder);
     const key = `${ORIGIN}#${holder.pid}#stamp-${holder.pid}`;
     const after1 = readLedger();
     assert.equal(Object.keys(after1).length, 1);
@@ -475,7 +541,7 @@ test("#5955 full path: observations persist across client restarts (file ledger)
     clock.advance(GAP_MS);
     const w2 = makeWorld({ gracefulShutdown: false, killReleases: false });
     w2.clock = clock;
-    await runCycle(w2, holder);
+    await assertRejectsSecondWriter(w2, holder);
     const after2 = readLedger();
     assert.equal(after2[key].observations, 2, "the restarted client continues the previous process's window");
     assert.equal(after2[key].firstBusyAt, after1[key].firstBusyAt, "the window keeps counting from the first sighting");
@@ -486,13 +552,15 @@ test("#5955 full path: reused pid gets a fresh window (birth-stamp key)", async 
     const holder = wedgedHolder();
     const w = makeWorld({ gracefulShutdown: false, killReleases: false });
     let stamp = "boot-old";
-    await runCycle(w, holder, { deps: { processBirthStamp: async () => stamp } });
+    await assertRejectsSecondWriter(w, holder, { deps: { processBirthStamp: async () => stamp } });
     w.clock.advance(GAP_MS);
-    await runCycle(w, holder, { deps: { processBirthStamp: async () => stamp } });
+    await assertRejectsSecondWriter(w, holder, { deps: { processBirthStamp: async () => stamp } });
     // The OS hands the SAME pid to a brand-new process (different birth time).
     stamp = "boot-new";
     w.clock.advance(GAP_MS);
-    const handle = await runCycle(w, holder, { deps: { processBirthStamp: async () => stamp } });
+    // Still refused: the newborn occupant starts a FRESH patience window
+    // (one observation), so the gate keeps the second writer away.
+    await assertRejectsSecondWriter(w, holder, { deps: { processBirthStamp: async () => stamp } });
 
     const entries = readLedger();
     assert.equal(Object.keys(entries).length, 2, "old-stamp and new-stamp keys coexist (dead-pid prune cleans up later)");
@@ -500,18 +568,21 @@ test("#5955 full path: reused pid gets a fresh window (birth-stamp key)", async 
     assert.equal(entries[`${ORIGIN}#${holder.pid}#boot-new`].observations, 1, "reused pid starts at observation 1");
     assert.equal(w.shutdownCalls.length, 0, "never force-take-over a newborn instance on inherited history");
     assert.equal(startLines(w).length, 2, "the new occupant's patience window is announced again");
-    assert.equal(handle.port, PORT);
 });
 
 test("#5955 negative: healthy OLDER holder still routes through #3544 rotation ONLY", async () => {
     const w = makeWorld({ gracefulShutdown: true, killReleases: false });
     const holder = wedgedHolder();
+    // The rotated-out process dies the moment its listener closes — the gate's
+    // drain-wait sees a dead pid and lets the spawn through (a live drained
+    // process would be refused for up to the grace window instead).
     const handle = await runCycle(w, holder, {
         deps: {
             fetchHealthInfo: async (origin: string) => origin === holder.origin
                 ? { ok: true, instanceId: "zombie-instance", pid: process.pid, watchdog: { armed: true }, version: "0.0.1" }
                 : { ok: false },
             fetchHealthInfoNoReuse: async () => ({ ok: false }),
+            isPidAlive: () => false,
         },
     });
 
@@ -556,16 +627,27 @@ test("#5955 negative: SAME-build BUSY holder is attached and NEVER killed (#4811
     assert.equal(watchingLines(w).length, 0);
 });
 
-test("#5955 negative: user-zone BUSY holder untouched", async () => {
+test("#5955 negative: user-zone BUSY holder untouched (but #7675 refuses the second writer)", async () => {
+    // Pre-#7675 this row allowed the spawn to proceed behind the live
+    // user-zone holder (the child ladders to +1 in the field — the silent
+    // second-writer drift #7675 closes). The holder itself is STILL
+    // untouched: no shutdown, no signals, no wedge ledger. What changed is
+    // the launch outcome: an actionable refusal instead of a drifted child.
     const w = makeWorld({ gracefulShutdown: true, killReleases: false });
     const holder = { ...wedgedHolder(), lane: undefined, launchToken: undefined };
-    const handle = await runCycle(w, holder);
+    let err: unknown;
+    try {
+        await runCycle(w, holder);
+    } catch (e) {
+        err = e;
+    }
 
-    assert.equal(w.spawnCalls, 1);
+    assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second writer"),
+        `#7675: the live no-lane holder must be refused, not spawned behind: ${err instanceof Error ? err.message : "handle"}`);
+    assert.equal(w.spawnCalls, 0);
     assert.equal(w.shutdownCalls.length, 0);
     assert.equal(w.signalCalls.length, 0);
     assert.equal(w.killCalls.length, 0);
-    assert.equal(handle.port, PORT);
     assert.equal(watchingLines(w).length, 0);
 });
 
@@ -593,15 +675,29 @@ test("#5955 negative: BUSY holder on a different port untouched", async () => {
     assert.equal(watchingLines(w).length, 0);
 });
 
-test("#5955 negative: explicit attach target skips the takeover step entirely", async () => {
+test("#5955/#7156: explicit attach target gets the supervised takeover, no second writer", async () => {
+    // The #7156 incident's cc-lane pin was EXACTLY this cell: an explicit
+    // attachUrl pointing at a live (foreign-bytes, BUSY) same-lane holder. The
+    // old attach-mode exemption skipped the whole wedge cell — the client
+    // respawned forever behind the zombie and the second writer corrupted
+    // the shared store. Now the pin is released by the same supervised
+    // ladder (the client re-pins to the new origin after every bring-up), and
+    // until the holder is gone every bring-up refuses instead of spawning.
     const w = makeWorld({ gracefulShutdown: true, killReleases: false });
     const holder = wedgedHolder();
-    const handle = await runCycle(w, holder, { deps: { resolveAttachUrl: () => ORIGIN } });
+    const handle = await cycleUntil(
+        w,
+        holder,
+        () => w.shutdownCalls.length === 1,
+        6,
+        { deps: { resolveAttachUrl: () => ORIGIN } },
+    );
 
-    assert.equal(w.spawnCalls, 1);
-    assert.equal(w.shutdownCalls.length, 0);
+    assert.equal(w.spawnCalls, 1, "no spawn before the holder is gone");
+    assert.equal(w.gateRefusals, 3, "attach-mode bring-ups refuse too — no exemption (#7156)");
+    assert.equal(w.shutdownCalls.length, 1);
     assert.equal(w.signalCalls.length, 0);
     assert.equal(w.killCalls.length, 0);
     assert.equal(handle.port, PORT);
-    assert.equal(watchingLines(w).length, 0);
+    assert.equal(startLines(w).length, 1, "the wedge cell observes attach-mode bring-ups now");
 });

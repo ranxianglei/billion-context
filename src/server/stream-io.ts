@@ -31,6 +31,63 @@ export async function readStreamToBuffer(stream: ReadableStream<Uint8Array>, max
     return Buffer.concat(chunks);
 }
 
+/** Buffer a response only while it fits the inspection budget. On overflow,
+ *  replay the retained prefix and continue streaming without dropping bytes. */
+export async function bufferStreamIfFits(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<Buffer | ReadableStream<Uint8Array>> {
+    const reader = stream.getReader();
+    const chunks: Buffer[] = [];
+    let kept = 0;
+    let handedOff = false;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) return Buffer.concat(chunks, kept);
+            if (value.byteLength === 0) continue;
+            if (kept + value.byteLength <= maxBytes) {
+                chunks.push(Buffer.from(value));
+                kept += value.byteLength;
+                continue;
+            }
+            let ended = false;
+            const replay = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    for (const chunk of chunks) controller.enqueue(chunk);
+                    chunks.length = 0;
+                    controller.enqueue(value);
+                },
+                async pull(controller) {
+                    try {
+                        const next = await reader.read();
+                        if (ended) return;
+                        if (next.done) {
+                            ended = true;
+                            reader.releaseLock();
+                            controller.close();
+                        } else {
+                            controller.enqueue(next.value);
+                        }
+                    } catch (error) {
+                        if (!ended) {
+                            ended = true;
+                            reader.releaseLock();
+                            controller.error(error);
+                        }
+                    }
+                },
+                async cancel(reason) {
+                    ended = true;
+                    try { await reader.cancel(reason); }
+                    finally { reader.releaseLock(); }
+                },
+            });
+            handedOff = true;
+            return replay;
+        }
+    } finally {
+        if (!handedOff) reader.releaseLock();
+    }
+}
+
 export function bufferToStream(buf: Buffer): ReadableStream<Uint8Array> {
     return new ReadableStream<Uint8Array>({
         start(controller) {

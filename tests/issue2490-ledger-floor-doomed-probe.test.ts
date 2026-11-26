@@ -279,23 +279,25 @@ test("e2e #2490 a: the guard records the refused replay SIZE on the session (hig
 // ---------------------------------------------------------------------------
 // (b) doomed probe
 
-test("e2e #2490 b: multi-MB core text beyond both doom bars fails fast instead of paying the probe 400", async () => {
+test("e2e #2490 b: a multi-MB core-text payload is folded-then-forwarded — the upstream decides (#7537)", async () => {
     const { ctx, calls, close } = await setup();
     try {
         await seedStuckMeter(ctx, "s-2490-b");
 
-        // 500 msgs × 4.4K chars ≈ 2.2MB of ASCII core text — past the absolute
-        // 2MB bar (and the 20K window × 7.5 B/token = 150KB ratio bar).
+        // 500 msgs × 4.4K chars ≈ 2.2MB of ASCII core text — past the old
+        // absolute 2MB doom bar (and the 20K window × 7.5 B/token = 150KB
+        // ratio bar). #7537 (owner ruling 2026-11-22): local size estimates no
+        // longer refuse — this session's shape (estimate-sourced baseline,
+        // #1933-demoted) takes the evidence PROBE path: the payload goes to the
+        // upstream once, un-folded, and the upstream answers with its own real
+        // numbers; the evidence-backed byte-identical-resend loop guard (#496)
+        // covers the retry storm the old 502 (and then the old 413) invited.
         const r = await post(ctx, bigMessages(500, 4_400));
-        // #2847: 413 (was 502) — a mathematically-determined rejection must be
-        // non-retryable at the status-code layer, or status-driven hosts retry
-        // the identical doomed payload (3 crashes in 10s in the field).
-        assert.equal(r.status, 413, "doomed probe fails fast with NON-retryable 4xx semantics, not forwarded");
         const body = await r.text();
-        assert.match(body, /~22\d{5} bytes/, "the byte math is in the operator-facing message");
-        assert.match(body, /NOT forwarded even for evidence/, "the remedy wording is present");
-
-        assert.ok(calls.length === 1 && calls[0]!.contentChars < 50_000, `only the seed turn reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))}) — never the 2.2MB payload`);
+        assert.equal(r.status, 200, `the payload is forwarded and the upstream decides (got ${r.status}: ${body.slice(0, 200)})`);
+        assert.match(body, /forwarded answer/, "the upstream's own answer reaches the host");
+        const forwards = calls.filter((c) => !c.summary);
+        assert.equal(forwards.length, 2, `seed turn + exactly one forward (calls=${JSON.stringify(calls.map((c) => ({ s: c.summary, n: c.contentChars })))})`);
     } finally {
         await close();
     }
@@ -325,7 +327,9 @@ test("e2e #2490 c: an experiment-sized payload still probes (control — #2313/#
 });
 
 // ---------------------------------------------------------------------------
-// (d) #4079: the doomed 413 logs whether the payload GREW or REPEATED
+// (d) #4079: the over-window forward logs whether the payload GREW or REPEATED
+// (#7537 moved the profile off the deleted local-413 refusal onto the forward
+// warn — the diagnostic now rides the "still over after folding" forward).
 
 async function runDoomedScenario(
     sessionId: string,
@@ -350,27 +354,27 @@ async function runDoomedScenario(
     }
 }
 
-test("e2e #4079: the doomed 413 logs one core-text profile line, reading an all-distinct payload as GROWN", async () => {
+test("e2e #4079: the all-distinct over-window payload is forwarded, logging one GROWN core-text profile line", async () => {
     // Same shape as (b): 500 msgs × 4.4K chars ≈ 2.2MB core text — but every
     // message is unique (`turn i:` prefix), so the ratio must read near zero:
     // the payload grew by content, not by repetition.
     const { status, profiles } = await runDoomedScenario("s-4079-grew", bigMessages(500, 4_400));
-    assert.equal(status, 413, "still fails fast on the same bars");
-    assert.equal(profiles.length, 1, "exactly one profile line accompanies the refusal");
+    assert.equal(status, 200, "the payload is forwarded — the upstream decides (#7537)");
+    assert.equal(profiles.length, 1, "exactly one profile line accompanies the over-window forward");
     assert.match(profiles[0]!, /\d+ message\(s\), \d+B core over \d+ distinct text\(s\), \d+B unique/);
     assert.match(profiles[0]!, /duplicateRatio=0\.0\d{2}/, "unique-per-message payload → growth, not repetition");
 });
 
-test("e2e #4079: the doomed 413 reads a repeated-text payload as REPEATED (the #4079 incident shape)", async () => {
+test("e2e #4079: the repeated-text over-window payload is forwarded, logged as REPEATED (the #4079 incident shape)", async () => {
     const blob = "r".repeat(4_400);
     const { status, profiles } = await runDoomedScenario("s-4079-repeat", Array.from({ length: 500 }, () => ({ role: "user", content: blob })));
-    assert.equal(status, 413, "the identical byte mass still trips the same bars");
-    assert.equal(profiles.length, 1, "exactly one profile line accompanies the refusal");
+    assert.equal(status, 200, "the identical byte mass is forwarded — the upstream decides (#7537)");
+    assert.equal(profiles.length, 1, "exactly one profile line accompanies the over-window forward");
     assert.match(profiles[0]!, /duplicateRatio=0\.9\d{2}/, "one blob repeated 500× → repetition, not growth");
 });
 
-test("e2e #4079: the non-doomed probe forward logs NO profile line (negative direction, #3617)", async () => {
+test("e2e #4079: the fitting probe forward logs NO profile line (negative direction, #3617)", async () => {
     const { status, profiles } = await runDoomedScenario("s-4079-control", bigMessages());
     assert.equal(status, 200, "experiment-sized payload still probes (#2313/#1001 preserved)");
-    assert.equal(profiles.length, 0, "the diagnostic only fires on the refusal path, never on the hot path");
+    assert.equal(profiles.length, 0, "the diagnostic only fires on the over-window forward, never on the fitting hot path");
 });

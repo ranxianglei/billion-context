@@ -1,7 +1,7 @@
 import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
 import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
-import { maybeRunInvariantJudge } from "../invariant-judge.js";
+import { activeBlockCoveredIds, maybeRunInvariantJudge } from "../invariant-judge.js";
 import { repairResponsesAssistantOrdering, reanchorSeparatorManifest, separatorManifestAnchored, type SeparatorSlot } from "./responses-ordering.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
@@ -13,10 +13,11 @@ import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, lastForwardedBody, noteCalibrationPair, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { rewrapCommandcodeBody } from "../commandcode-wire.js";
+import { rewrapZedEnvelope } from "../zed-wire.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
 import { builtinCompatRoles, builtinRoleRestorePoints, withRestoredRoles } from "../kiro.js";
@@ -48,7 +49,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { describeCoreTextDuplication, formatForwardFieldSizes, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -76,7 +77,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
-import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
+import { awaitDrain, bufferStreamIfFits, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
 import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Retry the same input when the provider proved only its output reservation overflows. */
@@ -718,6 +719,12 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             wireBody = JSON.stringify(rewrapCommandcodeBody(JSON.parse(wireBody) as Record<string, unknown>, prepared.commandcode.meta));
         } catch { /* malformed flat body — pass through unchanged */ }
     }
+    // zed cloud wire: same final-boundary rewrap for the /completions envelope.
+    if (prepared?.zed && typeof wireBody === "string") {
+        try {
+            wireBody = JSON.stringify(rewrapZedEnvelope(JSON.parse(wireBody) as Record<string, unknown>, prepared.zed.meta));
+        } catch { /* malformed inner body — pass through unchanged */ }
+    }
     // #1421/#1683: outbound chain checkpoint — when egress stamping is enabled
     // (chainEgressStamp, DEFAULT OFF), every request THIS instance actually
     // processed leaves with a request-level stamp, so a downstream bili applies
@@ -778,7 +785,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // retry that dropped it would present flat OpenAI where the client's wire
     // expects the CLI envelope.
     const ccMetaForResend = prepared?.commandcode?.meta;
-    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active || ccMetaForResend !== undefined
+    const zedMetaForResend = prepared?.zed?.meta;
+    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active || ccMetaForResend !== undefined || zedMetaForResend !== undefined
         ? (b: Record<string, unknown>): Record<string, unknown> => {
             let out = b;
             if (compatProtocol && compatRoles) applyCompatRolesJson(out, compatProtocol, compatRoles);
@@ -787,6 +795,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // #3129: re-nest the rebuilt inner request into the CloudCode envelope.
             out = v1Active ? wrapV1Internal(out, v1Meta) : out;
             if (ccMetaForResend !== undefined) out = rewrapCommandcodeBody(out, ccMetaForResend);
+            if (zedMetaForResend !== undefined) out = rewrapZedEnvelope(out, zedMetaForResend);
             return out;
         }
         : undefined;
@@ -963,6 +972,18 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         }
         applyResign(headers, wireBody);
     }
+    // #7587: make telemetry-bloat visible at the point where the final bytes
+    // are known. Parsing every request would be wasteful, so this runs only
+    // for debug sessions or oversized bodies — exactly the cases where the
+    // breakdown pays for itself.
+    const wireBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : wireBody.byteLength;
+    if (opts.debug || wireBytes >= 1024 * 1024) {
+        try {
+            const wireText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+            const sizes = formatForwardFieldSizes(JSON.parse(wireText));
+            if (sizes) log("info", `[${prepared?.session.id ?? "passthrough"}] [forward] field sizes: ${sizes}`);
+        } catch { /* non-JSON bodies keep the existing behavior */ }
+    }
     try {
         checkOutboundBody(wireBody);
     } catch (err) {
@@ -1039,28 +1060,19 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             const fuseMeasured = measuredOutbound(prepared);
             const fuseRawTokens = fuseMeasured?.tokens;
             if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
-                log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
-                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
-                log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
-                if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
-                else {
-                    res.writeHead(413, { "content-type": "application/json" });
-                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
-                }
-                return;
+                // #7537 (owner ruling 2026-11-22): no estimate-based refusal —
+                // the bar here is a local window value that is often wrong-
+                // small. Log the measurement as evidence and forward; the
+                // upstream answers with its own real numbers (annotated in
+                // the upstream size-error branch below, same issue).
+                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; the #554 meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
+                log("info", `[${prepared.session.id}] egress window fuse profile (duplication): ${describeCoreTextDuplication(fuseMsgs)}`);
             }
             const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
             if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
-                const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
-                log("warn", `413: [${prepared.session.id}] egress window fuse core-text profile: ${describeCoreTextDuplication(fuseMsgs)}`);
-                const fuseMessage = `outbound core text alone is ~${fuseBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${fuseFloorTokens} tokens vs the effective model window ${declaredWindow} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); no upstream can accept it, so the send was stopped at the egress fuse instead of being forwarded (#4068/#4079). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
-                log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
-                if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
-                else {
-                    res.writeHead(413, { "content-type": "application/json" });
-                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
-                }
-                return;
+                // #7537: byte-math profile over the local window bar — log and
+                // forward, same ruling as above.
+                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound core text alone is ~${fuseBytes} bytes (≥ ~${Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN)} tok at the densest observed density, #2122) vs the effective model window ${declaredWindow} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
             }
         }
     }
@@ -1185,6 +1197,17 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             imageTokens: est.imageTokens,
             calibrated: scaledText !== est.textOverhead,
         });
+        // #5952: the calibration pair for THIS send — the final wire text
+        // estimate (no image reserve) + the image reserve of the same body,
+        // so the settle that bills this body trains the text multiplier only
+        // from text-only evidence, even when a concurrent request overwrote
+        // the shared prepare slot in between.
+        noteCalibrationPair(prepared.session, {
+            estimate: est.textOverhead,
+            imageTokens: est.imageTokens,
+            origin: normalizeUpstreamOrigin(upstreamUrl),
+            model: typeof sentParsed?.model === "string" && sentParsed.model !== "" ? sentParsed.model : (prepared.model ?? prepared.google?.model),
+        });
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").
         const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input ?? sentParsed.contents) : null;
@@ -1241,6 +1264,9 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // which would accuse the client of an insertion bili itself made.
             ...(separatorOwnershipUnknown ? { separatorOwnershipUnknown: true } : {}),
             ...(renderTailStart !== undefined ? { renderTailStart } : {}),
+            // #4401: active-block coverage — in the plugin carrier regime the
+            // covered cells' absence is the fold itself, not a drop.
+            coveredIds: activeBlockCoveredIds(prepared.session.state),
         });
         const sentSlot = lastForwardedBody(prepared.session);
         if (sentSlot !== undefined && ownedSeparatorCores !== undefined) sentSlot.ownedSeparatorCores = ownedSeparatorCores;
@@ -1756,6 +1782,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // probe-forward gate) treat the arm as current-route evidence
             // instead of demoting it against a stale settle origin.
             s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl);
+            if (typeof reqModel === "string" && reqModel !== "") s.stats.lastInputTokensModel = reqModel;
             // #1110: record the arm SEPARATELY so the side-request guard
             // can read it without ever touching the nudge baseline. The guard
             // keeps the CEILING even when the baseline books a measured or
@@ -1832,6 +1859,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 s.stats.lastInputTokensSource = "overflow-arm";
                 s.stats.overflowArmTokens = arm; // #1110: guard reads this, not the baseline
                 s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl); // #2313: same-route evidence, see the window branch above
+                if (typeof reqModel === "string" && reqModel !== "") s.stats.lastInputTokensModel = reqModel;
             }
             log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of judging window ${judging} and payload estimate), nothing learned (#987): ${info.message}`);
         }
@@ -2159,6 +2187,32 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // here depends on it.
         const terminalCause = rejectionDiagnosticSuffix(bodyText);
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}${terminalCause}`);
+        // #7537 (owner ruling 2026-11-22): local estimate-refusals are gone —
+        // when the UPSTREAM itself rejects the body as too large, its verdict
+        // is authoritative. bili logs its own measurement as evidence and marks
+        // the response non-retryable via HEADERS so status-code-driven hosts
+        // don't retry-loop an unchanged body the upstream already rejected
+        // (burning rate limits). Log always; headers only for non-stream, not-
+        // yet-sent responses. The upstream BODY passes through byte-identical:
+        // verbatim pass-through is a pinned contract (#1195 B,
+        // request-input-lifetime), so no body merge. The anti-loop protection
+        // for the truly-doomed payload lives in preflight's evidence branch
+        // (deterministic exhaustion against a proven wall → local 413 after
+        // the arm stamps, #496/#767/#857).
+        const SIZE_ERROR_RE = /request entity too large|payload.*too (large|big)|body too (large|big)|too many (tokens|messages|bytes)|exceeds? (the |a |your )?(maximum|limit|allowed|context)|context (length|window|size)|input is too long|maximum context length|token (limit|count|budget)|content is too long|message\[?s?\]?.*(too long|exceed)/i;
+        const upstreamSizeVerdict = upstream.status === 413 || (upstream.status === 400 && SIZE_ERROR_RE.test(bodyText));
+        if (prepared && upstreamSizeVerdict) {
+            const sizeMeasured = measuredOutbound(prepared);
+            const declaredWindow = typeof prepared.session.metadata.effectiveContextLimit === "number" && prepared.session.metadata.effectiveContextLimit > 0
+                ? prepared.session.metadata.effectiveContextLimit
+                : 0;
+            const inboundBytes = typeof wireBody === "string" ? wireBody.length : wireBody ? wireBody.length : 0;
+            log("warn", `[${errSid}] upstream size verdict ${upstream.status} (authoritative per #7537): bili measured outbound ~${sizeMeasured?.tokens?.toLocaleString("en-US") ?? "n/a"} TEXT tokens${sizeMeasured?.breakdown ? ` (${measuredBreakdownClause(sizeMeasured.breakdown)})` : ""}, inbound ${inboundBytes.toLocaleString("en-US")} bytes, effective window ${declaredWindow.toLocaleString("en-US")} (model=${prepared.model ?? "unknown"}); marking non-retryable via headers to stop host retry loops — the upstream body passes through verbatim`);
+            if (!res.headersSent && req.method !== "GET" && req.method !== "HEAD") {
+                respHeaders["x-bili-cause"] = "upstream-size";
+                respHeaders["x-bili-retryable"] = "false";
+            }
+        }
         if (prepared?.session && prepared.nudgeStampsBefore && upstream.status >= 400 && upstream.status < 500) rejectNudge(prepared.session, prepared.nudgeStampsBefore, upstream.status);
         // #4204: feed this send's FINAL verdict. A model-scoped KeyRing 429 is
         // selected only by its structured code plus exact request-model match;
@@ -2240,10 +2294,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         clearUpstreamTimer();
         if (prepared?.resetAfterSuccess) {
             log("warn", `[${prepared.session.id}] native compact response had no body; rebase NOT scheduled`);
-        } else {
+        } else if (req.method !== "HEAD") {
             // #821: a 2xx with a null body (e.g. upstream answered 204/304) is a
             // SILENT empty response — the client receives zero SSE chunks and
             // reports an "empty stream" with no trace in the log. Name it.
+            // HEAD is excluded: a HEAD response carries no body by definition
+            // (RFC 9110 §9.3.2), so a 200 HEAD with a null body is normal, not
+            // the #821 anomaly — health probes (e.g. HEAD /api/hello) would
+            // otherwise log a warn on every request (#7072).
             loggerLog("warn", `[${prepared?.session.id ?? "unknown"}] ← upstream ${upstream.status} returned a null body; responding empty to client`);
         }
         return;
@@ -2265,6 +2323,10 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     let targetOrigin: string | undefined;
     try { targetOrigin = new URL(upstreamUrl).origin; } catch { targetOrigin = undefined; }
     let dumpRaw: Promise<void> | undefined;
+    // #7666: three-level resolved degenerate-retry budget (global → provider →
+    // model), shared by every plugin strip pipe below (plugin-mode streamed,
+    // reset-after-success, title-gen).
+    const degenerateRetryCfg = resolveCompress(opts.routes, upstreamUrl, throttleModel, opts.compress).degenerateRetry;
     // Plugin mode: the agent's native loop owns the tool surface — pass the
     // response through VERBATIM (a model-emitted compress call must reach the
     // plugin untouched) while sniffing usage so lastInputTokens (the input to
@@ -2292,6 +2354,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // leaked a live idle timer. (#721/#2563: the SSE pipes themselves no
         // longer rethrow an upstream cut — they emit an in-band truncation
         // signal, or end raw for permitlist hosts that own the handling.)
+        let clearFakeRetryTimer: (() => void) | undefined;
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
             // #1295: the JSONL wire has no fake-completion shape to detect —
@@ -2304,7 +2367,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // fake completion. The agent owning compression does not change this:
                 // the retry is a proxy→upstream HTTP call whose base must be what
                 // upstream just accepted (aligned with the proxy lane below).
-                const resolvedBuf = await resolveFakeCompletion(pluginBody, {
+                const resolved = await resolveFakeCompletion(pluginBody, {
                     protocol: prepared.protocol,
                     wireBody,
                     upstreamUrl,
@@ -2315,7 +2378,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     log,
                     model: prepared.model ?? prepared.google?.model,
                 });
-                pluginBody = bufferToStream(resolvedBuf);
+                pluginBody = resolved.body;
+                clearFakeRetryTimer = resolved.clearTimer;
             }
             // #2347: raw-dump twin of the tee below — this branch returns
             // before reaching it, so plugin-mode turns need their own.
@@ -2374,6 +2438,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                             signal: clientAbort.signal,
                             log,
                             label: prepared.session.id,
+                            nudges: degenerateRetryCfg?.nudges,
                         }),
                         targetOrigin,
                         absorbInstructed,
@@ -2381,6 +2446,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         upstreamMeta,
                         reply,
                         hostOwnsTruncationRecovery,
+                        degenerateRetryCfg?.maxAttempts,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -2404,6 +2470,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                             signal: clientAbort.signal,
                             log,
                             label: prepared.session.id,
+                            nudges: degenerateRetryCfg?.nudges,
                         }),
                         targetOrigin,
                         absorbInstructed,
@@ -2412,6 +2479,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         reply,
                         opts.streamErrorShape,
                         hostOwnsTruncationRecovery,
+                        degenerateRetryCfg?.maxAttempts,
+                        opts.degenerateTurn,
                     );
                 }
             } else {
@@ -2421,7 +2490,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             clearUpstreamTimer();
             // #2347: finish the dump before the turn closes — its value is the
             // full upstream tail, which the client may have stopped reading early.
-            if (dumpRaw) await dumpRaw;
+            try { if (dumpRaw) await dumpRaw; }
+            finally { clearFakeRetryTimer?.(); }
         }
         return;
     }
@@ -2457,6 +2527,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // response (any turn, not just compress-injected). Buffering is required:
     // the retry re-requests before the client sees the fake completion.
     let responseBody: ReadableStream<Uint8Array> = upstream.body;
+    let clearFakeRetryTimer: (() => void) | undefined;
     // #411: every body-consuming path below must clear the upstream idle timer
     // even when it throws (client abort / upstream cut) — previously an abort
     // skipped the trailing clearUpstreamTimer and leaked a live idle
@@ -2464,13 +2535,13 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     try {
         // #1295: commandcode streams terminate with their own finish event —
         // no fake-completion shape exists to buffer-and-retry (#371 off).
-        if (prepared !== null && prepared.stream && !prepared.commandcode && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
+        if (prepared !== null && prepared.stream && !prepared.commandcode && !prepared.zed && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
             // #1900: retry from wireBody — the exact bytes this request's main
             // attempt shipped (post wireTransform and any same-request re-send),
             // never the raw client body: upstream may have rejected those raw
             // bytes earlier in this session, and a 400'd hint would present the
             // fake completion instead of a corrected turn.
-            const resolvedBuf = await resolveFakeCompletion(upstream.body, {
+            const resolved = await resolveFakeCompletion(upstream.body, {
                 protocol: prepared.protocol,
                 wireBody,
                 wrapBody: v1Active ? v1Wrap : undefined,
@@ -2482,7 +2553,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 log,
                 model: prepared.model ?? prepared.google?.model,
             });
-            responseBody = bufferToStream(resolvedBuf);
+            responseBody = resolved.body;
+            clearFakeRetryTimer = resolved.clearTimer;
         }
     // #2347: dump the FINAL upstream body for every prepared streaming turn,
     // regardless of rewriter branch — the previous tee sat INSIDE the useRewriter
@@ -2523,7 +2595,13 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             opencodeLogId: upstream.headers.get("x-opencode-log-id") ?? undefined,
             cfRay: upstream.headers.get("cf-ray") ?? undefined,
         };
-        if (prepared && prepared.resetAfterSuccess) {
+        if (prepared && prepared.zed) {
+            // zed cloud wire: NDJSON response — raw byte passthrough, no
+            // parsing, no usage accounting (request side is the only side bili
+            // rewrites on this lane; an in-stream loop is structurally
+            // unreachable, #3177 reasoning).
+            await pipeThrough(responseBody, res);
+        } else if (prepared && prepared.resetAfterSuccess) {
             const [toClient, toObserve] = responseBody.tee();
             const observed = observeResponsesTerminalState(toObserve, prepared.stream);
             const tagLog = (msg: string) => log("info", `[${prepared.session.id}] ${msg}`);
@@ -2549,6 +2627,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: prepared.session.id,
+                        nudges: degenerateRetryCfg?.nudges,
                     }),
                     undefined,
                     undefined,
@@ -2556,6 +2635,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     upstreamMeta,
                     reply,
                     hostOwnsTruncationRecovery,
+                    degenerateRetryCfg?.maxAttempts,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -2602,6 +2682,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: p.session.id,
+                        nudges: degenerateRetryCfg?.nudges,
                     }),
                     undefined,
                     undefined,
@@ -2609,6 +2690,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     upstreamMeta,
                     reply,
                     hostOwnsTruncationRecovery,
+                    degenerateRetryCfg?.maxAttempts,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -2629,6 +2711,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: p.session.id,
+                        nudges: degenerateRetryCfg?.nudges,
                     }),
                     undefined,
                     undefined,
@@ -2637,6 +2720,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     reply,
                     opts.streamErrorShape,
                     hostOwnsTruncationRecovery,
+                    degenerateRetryCfg?.maxAttempts,
+                    opts.degenerateTurn,
                 );
             }
         } else if (
@@ -2921,7 +3006,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // `total` is always the true context size (see util.ts).
                 const rawUsage = prepared.protocol === "google" ? json.usageMetadata ?? json.usage : json.usage;
                 const u = (rawUsage ?? {}) as Record<string, unknown>;
-                const { total, cached, creation } = usageTotals(prepared.protocol, u);
+                const { total, cached, creation, context } = usageTotals(prepared.protocol, u);
                 const out = usageOutputTotal(prepared.protocol, u);
                 // #1547: settle through the shared path — stats AND the cache
                 // ledger. Before this, this branch updated stats only, so
@@ -2932,7 +3017,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 const billed = typeof total === "number" ? total : 0;
                 if (billed > 0 || reportedCached !== null) {
                     // Use the send-time capture; settlement is not another send.
-                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation });
+                    // Model stamp (identity fast path): prepared.model is only
+                    // populated on some lanes — fall back to the same
+                    // body-derived derivation the throttle uses.
+                    const settleModel = typeof prepared.model === "string" && prepared.model !== "" ? prepared.model
+                        : typeof prepared.google?.model === "string" && prepared.google.model !== "" ? prepared.google.model
+                        : typeof requestModelFromBody(wireBody, req) === "string" && requestModelFromBody(wireBody, req) !== "" ? requestModelFromBody(wireBody, req)
+                        : undefined;
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation, model: settleModel, context });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);
@@ -2979,13 +3071,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // the full upstream tail, which the client may have stopped reading
         // early. Idempotent where the rewriter lane already awaited it in its
         // own finally; this covers the non-rewriter branch's throw paths too.
-        if (dumpRaw) await dumpRaw;
+        try { if (dumpRaw) await dumpRaw; }
+        finally { clearFakeRetryTimer?.(); }
     }
 }
 
 // #371: buffer the raw upstream response, detect a fake completion (tool-call
 // XML, no real tool block), and — bounded per turn and per session — re-request
-// upstream with a corrective hint. Returns the bytes to stream to the client
+// upstream with a corrective hint. Returns the body to stream to the client
 // (the retry's response when a retry recovered, else the original). The session
 // streak (metadata.fakeCompletionStreak) counts consecutive fake-completion
 // turns: it gates retries (skip once >= cap) and resets to 0 on a clean turn.
@@ -3018,8 +3111,11 @@ async function resolveFakeCompletion(
          *  must go back out inside the CloudCode envelope. */
         wrapBody?: (body: string | Buffer) => string | Buffer;
     },
-): Promise<Buffer> {
-    let buffer = await readStreamToBuffer(stream, fakeBufCap());
+): Promise<{ body: ReadableStream<Uint8Array>; clearTimer?: () => void }> {
+    const buffered = await bufferStreamIfFits(stream, fakeBufCap());
+    // An incomplete inspection cannot classify this turn or change its streak.
+    if (!Buffer.isBuffer(buffered)) return { body: buffered };
+    let buffer = buffered;
     const max = maxFakeCompletionRetries();
     const sid = opts.session.id;
     const priorStreak = (opts.session.metadata.fakeCompletionStreak as number | undefined) ?? 0;
@@ -3047,14 +3143,20 @@ async function resolveFakeCompletion(
                 opts.log("warn", `[${sid}] fake-completion retry failed: ${String(e)}; presenting original`);
                 break;
             }
+            let handedOff = false;
             try {
                 if (!r.response.ok || !r.response.body) {
                     opts.log("warn", `[${sid}] fake-completion retry rejected (HTTP ${r.response.status}); presenting original`);
                     break;
                 }
-                buffer = await readStreamToBuffer(r.response.body, fakeBufCap());
+                const retried = await bufferStreamIfFits(r.response.body, fakeBufCap());
+                if (!Buffer.isBuffer(retried)) {
+                    handedOff = true;
+                    return { body: retried, clearTimer: r.clearTimer };
+                }
+                buffer = retried;
             } finally {
-                r.clearTimer();
+                if (!handedOff) r.clearTimer();
             }
             if (!isFakeCompletion(opts.protocol, buffer.toString("utf8"))) break;
         }
@@ -3062,5 +3164,5 @@ async function resolveFakeCompletion(
     const stillFake = isFakeCompletion(opts.protocol, buffer.toString("utf8"));
     opts.session.metadata.fakeCompletionStreak = stillFake ? priorStreak + 1 : 0;
     markDirty(opts.session);
-    return buffer;
+    return { body: bufferToStream(buffer) };
 }

@@ -24,7 +24,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { emitNudgeInjected, onNudgeInjected, _resetNudgeDebugForTest, nudgeDebugMeta, nudgeTurnKey, type NudgeDebugEvent } from "../src/nudge-debug.ts";
 import { debugEnabled } from "../src/knobs.ts";
-import { createBiliPlugin } from "../src/agent/pi.ts";
+import { createBiliPlugin, nudgeNotifyText } from "../src/agent/pi.ts";
 
 // ---------- bus unit ----------
 
@@ -147,6 +147,29 @@ test("pi wiring: the nudge terminal-notify hook subscribes on the pi host only",
         if (savedEnv === undefined) delete process.env.ACP_DEBUG;
         else process.env.ACP_DEBUG = savedEnv;
     }
+});
+
+test("nudge notification is strict-fidelity: label prefix + verbatim text, nothing appended", () => {
+    // The whole point of the 2026-11-17 change: the human in pi sees exactly
+    // the wire text the model read — no display-only "suggested call" tacked
+    // on (it read as part of the injection and advertised the non-canonical
+    // {startId,endId} array shape). Pin the exact string so a re-added
+    // example line fails here.
+    const text = "Compressible ranges (1, oldest first):\n  m00150–m00220  5 msgs  12.3K [tool 80% | text 20%]";
+    assert.equal(
+        nudgeNotifyText({ emergency: false, text }),
+        `[ACP nudge → context]\n${text}`,
+        "non-emergency: prefix + verbatim text, no appended example",
+    );
+    assert.equal(
+        nudgeNotifyText({ emergency: true, text }),
+        `[ACP nudge → context] [EMERGENCY]\n${text}`,
+        "emergency: EMERGENCY marker between prefix and text",
+    );
+    const out = nudgeNotifyText({ emergency: false, text });
+    assert.ok(!out.includes("Example:"), "no display-only example line");
+    assert.ok(!out.includes("startId"), "no object-array salvage shape advertised");
+    assert.ok(out.endsWith(text), "verbatim text is the final thing shown");
 });
 
 // ---------- e2e: emitted text === the wire text actually sent upstream ----------

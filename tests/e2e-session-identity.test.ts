@@ -279,7 +279,11 @@ test("e2e session identity: anthropic x-claude-code-session-id survives x-api-ke
 test("e2e session identity: anthropic x-mavis-session-id survives x-api-key rotation (#1050)", async () => {
     const h = await startHarness();
     try {
-        const body = anthropicBody();
+        // #6884: a real mcode main turn carries the agent's tool surface; a
+        // tools-less single-user body on the mcode lane is exactly the
+        // one-shot auxiliary shape bili now demotes, so the fixture keeps the
+        // (identity-irrelevant) tool to stay a main turn.
+        const body = { ...anthropicBody(), tools: [{ type: "function", function: { name: "bash", description: "run a command", parameters: { type: "object", properties: {} } } }] };
         await post(h, 0, "/v1/messages", body, { "x-api-key": "sk-mm-old", "x-mavis-session-id": "mcode-sess-1" });
         await post(h, 0, "/v1/messages", body, { "x-api-key": "sk-mm-new", "x-mavis-session-id": "mcode-sess-1" });
         const sessions = await getSessions(h);
