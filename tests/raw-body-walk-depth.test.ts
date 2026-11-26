@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { defaultCountTokens } from "acp-kernel";
-import { estimateRawBodyBreakdown, estimateRawBodyTokens } from "../src/preflight.ts";
+import { estimateRawBodyBreakdown, estimateRawBodyTokens, PROMPT_BODY_KEYS } from "../src/preflight.ts";
 
 // #6038: client-controlled request bodies may nest far beyond safe recursion
 // depth; the raw-body token walks must survive them without changing any
@@ -81,6 +81,113 @@ test("shallow plumbing: exclusion set, key inheritance and bucket split stay int
 
 test("non-object top-level bodies land whole in the other bucket", () => {
     const bd = estimateRawBodyBreakdown("plain string body");
-    assert.deepEqual(bd, { total: t("plain string body"), messages: 0, tools: 0, system: 0, other: t("plain string body") });
+    assert.deepEqual(bd, { total: t("plain string body"), messages: 0, tools: 0, system: 0, other: t("plain string body"), prompt: 0 });
     assert.equal(estimateRawBodyTokens("plain string body"), t("plain string body"));
+});
+
+// #7013: the wire-format's PROMPT mass is what a window-fit gate prices.
+// Non-prompt fields (telemetry uploads, config scalars) ride the wire but
+// consume NO window — they must sit in `other` (and `total`) but NOT in
+// `prompt`. The fix keys off PROMPT_BODY_KEYS per wire format, never a
+// hardcoded exclusion of one plugin's field in the window-fit pricing.
+// (Top-level DSH transport fields `dsh_*` go further: excluded from `total`
+// entirely by the NON_MODEL_TOP_LEVEL_KEYS rule — see
+// raw-body-dsh-extensions.test.ts — so they never reach `other` either.)
+
+test("#7013: openai prompt mass = messages + tools (system rides inside messages)", () => {
+    const body = {
+        system: "in-body system rides inside messages for openai",
+        messages: [{ role: "user", content: "hello message" }],
+        tools: [{ name: "search", description: "find things fast" }],
+        dsh_session_log: { entries: ["telemetry one", "telemetry two"] },
+        metadata: { note: "structural note" },
+    };
+    const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.openai);
+    // messages bucket: "user" + "hello message"; tools bucket: "search" + "find things fast".
+    const expectedPrompt = t("user") + t("hello message") + t("search") + t("find things fast");
+    assert.equal(bd.prompt, expectedPrompt);
+    // The non-prompt top-level system + metadata land in other/total but NOT prompt
+    // (dsh_session_log is excluded from total by the dsh_* rule — see the block note).
+    assert.equal(bd.prompt, bd.messages + bd.tools);
+    assert.ok(bd.other > 0, "metadata is non-prompt mass (system lands in the system bucket)");
+    assert.equal(bd.total, bd.messages + bd.tools + bd.system + bd.other);
+    assert.ok(bd.total > bd.prompt, "total includes non-prompt mass the prompt mass excludes");
+    assert.equal(bd.total, estimateRawBodyTokens(body), "total invariant holds with promptKeys");
+});
+
+test("#7013: anthropic prompt mass includes top-level system", () => {
+    const body = {
+        system: "top-level anthropic system",
+        messages: [{ role: "user", content: "hello" }],
+        tools: [{ name: "n", description: "d" }],
+        metadata: "big telemetry blob",
+    };
+    const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.anthropic);
+    assert.equal(bd.prompt, bd.messages + bd.tools + bd.system);
+    assert.ok(bd.other > 0 && bd.total > bd.prompt);
+});
+
+test("#7013: google prompt mass = contents + systemInstruction + tools", () => {
+    const body = {
+        contents: [{ role: "user", parts: [{ text: "hello" }] }],
+        systemInstruction: "google system",
+        tools: [{ name: "n", description: "d" }],
+        metadata: "big telemetry blob",
+    };
+    const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.google);
+    // google's prompt keys (contents/systemInstruction) land in the `other`
+    // bucket (the split is on the openai/anthropic key names), so assert the
+    // prompt mass against the direct leaf count, not the bucket sum.
+    const expectedPrompt = t("user") + t("hello") + t("google system") + t("n") + t("d");
+    assert.equal(bd.prompt, expectedPrompt);
+    assert.ok(bd.other > 0 && bd.total > bd.prompt, "metadata is non-prompt mass");
+});
+
+test("#7013: responses prompt mass = input + instructions + tools", () => {
+    const body = {
+        input: [{ role: "user", content: "hello" }],
+        instructions: "responses instructions",
+        tools: [{ name: "n", description: "d" }],
+        metadata: "big telemetry blob",
+    };
+    const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.responses);
+    const expectedPrompt = t("user") + t("hello") + t("responses instructions") + t("n") + t("d");
+    assert.equal(bd.prompt, expectedPrompt);
+    assert.ok(bd.other > 0 && bd.total > bd.prompt, "metadata is non-prompt mass");
+});
+
+test("#7013: a giant dsh_session_log upload does not doom a fitting prompt", () => {
+    // The issue's repro: ~100K-token prompt + an 8 MiB dsh_session_log upload.
+    // Top-level dsh_* fields are excluded from `total` by the NON_MODEL_TOP_LEVEL_KEYS
+    // rule (see raw-body-dsh-extensions.test.ts) and are never in the prompt mass, so
+    // the window-fit gate (which prices prompt) sees only the fitting prompt.
+    const promptText = "x".repeat(400_000); // ~100K tokens
+    const telemetry = "t".repeat(8_000_000); // ~2M tokens of dsh_session_log upload
+    const body = {
+        messages: [{ role: "user", content: promptText }],
+        dsh_session_log: telemetry,
+    };
+    const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.openai);
+    assert.equal(bd.prompt, t("user") + t(promptText));
+    assert.equal(bd.total, bd.prompt, "dsh_session_log contributes zero to total");
+    assert.ok(bd.prompt < 200_000, "prompt mass stays within a realistic window");
+});
+
+test("#7013: a giant non-prompt telemetry upload does not inflate the prompt mass", () => {
+    // The general mechanism (non-DSH non-prompt fields): the upload lands in
+    // other/total but NOT in prompt, so the window-fit gate (which prices prompt)
+    // does not 413 a fitting prompt on a large non-prompt upload.
+    const promptText = "x".repeat(400_000); // ~100K tokens
+    const telemetry = "t".repeat(8_000_000); // ~2M tokens of non-prompt upload
+    const body = {
+        messages: [{ role: "user", content: promptText }],
+        telemetry_upload: telemetry,
+    };
+    const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.openai);
+    assert.equal(bd.prompt, t("user") + t(promptText));
+    assert.equal(bd.other, t(telemetry));
+    assert.ok(bd.total > 2 * bd.prompt, "total dwarfs the prompt mass by the upload");
+    // The window-fit gate compares bd.prompt (not bd.total) against the window,
+    // so a fitting prompt no longer 413s on the upload.
+    assert.ok(bd.prompt < 200_000, "prompt mass stays within a realistic window");
 });

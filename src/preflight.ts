@@ -27,7 +27,7 @@ import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
-import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
+import { applyEstimateCalibration, currentCalibrationFactor, type WireProtocol } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 import { preflightEmergencyDigestEnabled } from "./knobs.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
@@ -563,45 +563,74 @@ export function estimateRawBodyTokens(parsed: unknown): number {
     return tokens;
 }
 
+// #7013: the wire-format's PROMPT keys — the top-level fields the upstream's
+// tokenizer actually counts against the model window. Everything else (telemetry
+// uploads like DSH's `dsh_session_log`, config scalars, cache directives) rides
+// the wire but consumes NO window, so a window-fit judgment must price only
+// these — NOT a hardcoded exclusion of one plugin's field (the next plugin that
+// registers a different upload field would recur the #7013 bug). The keys mirror
+// what each prepare lane feeds its core converter: openai (messages — system
+// rides inside it — + tools), anthropic (messages + tools + top-level system),
+// google (contents + systemInstruction + tools), responses (input + instructions
+// + tools).
+export const PROMPT_BODY_KEYS: Record<WireProtocol, ReadonlySet<string>> = {
+    openai: new Set(["messages", "tools"]),
+    anthropic: new Set(["messages", "tools", "system"]),
+    google: new Set(["contents", "systemInstruction", "tools"]),
+    responses: new Set(["input", "instructions", "tools"]),
+};
+
 /** #5000 item 3: which DIMENSION carries the outbound mass. The doom messages
  *  must say whether it is messages[] (a giant paste / tool result), tools[]
  *  (84 schemas in #5000), the system prompt, or structural other — "trim the
  *  oversized content" is actively misleading for a 55.2 MiB body whose
  *  messages[] is only 1.44 MiB. Same walk + same exclusions as
  *  estimateRawBodyTokens, split on the TOP-LEVEL field, so `total` always
- *  equals estimateRawBodyTokens(parsed) exactly. */
+ *  equals estimateRawBodyTokens(parsed) exactly. #7013: `prompt` is the mass
+ *  under the wire-format's prompt keys — what the window-fit gates price. */
 export interface RawBodyBreakdown {
     total: number;
     messages: number;
     tools: number;
     system: number;
     other: number;
+    /** #7013: mass under the wire-format's prompt keys (PROMPT_BODY_KEYS) —
+     *  what the upstream tokenizer counts against the model window. Non-prompt
+     *  fields (telemetry uploads, config scalars) sit in `other` but NOT here.
+     *  0 when no promptKeys were supplied to the walk. */
+    prompt: number;
 }
 
-export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
+export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlySet<string>): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
-    const pending: [unknown, string | undefined, number][] = [];
+    let prompt = 0;
+    const pending: [unknown, string | undefined, number, boolean][] = [];
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
             if (isNonModelTopLevelKey(k)) continue;
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
-            pending.push([v, k, bucket]);
+            const isPrompt = promptKeys ? promptKeys.has(k) : false;
+            pending.push([v, k, bucket, isPrompt]);
         }
     } else {
-        pending.push([parsed, undefined, 3]);
+        pending.push([parsed, undefined, 3, false]);
     }
     while (pending.length > 0) {
-        const [value, key, bucket] = pending.pop()!;
+        const [value, key, bucket, isPrompt] = pending.pop()!;
         if (typeof value === "string") {
-            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) {
+                const t = defaultCountTokens(value);
+                buckets[bucket] += t;
+                if (isPrompt) prompt += t;
+            }
             continue;
         }
         if (Array.isArray(value)) {
-            for (const item of value) pending.push([item, key, bucket]);
+            for (const item of value) pending.push([item, key, bucket, isPrompt]);
             continue;
         }
         if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket]);
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket, isPrompt]);
         }
     }
     return {
@@ -610,6 +639,7 @@ export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
         tools: buckets[1],
         system: buckets[2],
         other: buckets[3],
+        prompt,
     };
 }
 
