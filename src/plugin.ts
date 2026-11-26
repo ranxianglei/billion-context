@@ -1728,6 +1728,26 @@ function livePersonaDescendant(parent: Session, maxCited?: number): Session | un
     return cands[0];
 }
 
+/** #7075: stale persona descendant that holds the cited refs — the #6883
+ *  purpose-header transition shape: pre-#6883 traffic minted refs in a
+ *  `|sub:` fork, post-#6883 compress forwards stamp the raw id and the
+ *  purpose header routes them to the parent. The fork went stale (no model
+ *  traffic for >10 min) so `livePersonaDescendant`'s freshness filter
+ *  excludes it, but its ref space still holds the refs the compress cites.
+ *  No freshness gate — the refs are the discriminator, not recency. */
+function stalePersonaWithRefs(parent: Session, maxCited: number): Session | undefined {
+    if (parent.id.includes("|sub:") || maxCited <= 0) return undefined;
+    const prefix = `${parent.id}|sub:`;
+    for (const s of listSessions()) {
+        if (!s.id.startsWith(prefix)) continue;
+        if ((s.stats?.requests ?? 0) === 0) continue;
+        if (!holdsRefs(s)) continue;
+        if (highestMintedRefNum(s) < maxCited) continue;
+        return s;
+    }
+    return undefined;
+}
+
 /** #2601: pick the witness session when it is a fresh `|sub:` fork of the
  *  stale parent — the #2601 incident shape: the host-stamped native caller
  *  (raw id) conflicts with the outbound witness because the tool call was
@@ -2484,11 +2504,19 @@ export async function handlePluginTool(
             // #3397: among several live forks, the args' cited refs pick the
             // fork whose ref space can hold them (recency alone chased dsh's
             // chatty sidecar persona instead of the owner conversation).
-            const live = livePersonaDescendant(session, maxCitedRefNum(bodyArgs));
+            const cited = maxCitedRefNum(bodyArgs);
+            const live = livePersonaDescendant(session, cited);
             if (live) {
                 session = live;
                 routedBy = "native";
                 deps.log("info", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" resolves to a stale persona parent — following live fork "${live.id}" (#2601)`);
+            } else {
+                const stale = stalePersonaWithRefs(session, cited);
+                if (stale) {
+                    session = stale;
+                    routedBy = "native";
+                    deps.log("info", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" — live fork not fresh, following stale fork "${stale.id}" that holds cited refs (max m${String(cited).padStart(5, "0")}) (#7075)`);
+                }
             }
         }
     } else if (witnessIds.size === 1) {
@@ -5652,4 +5680,8 @@ export function _resetPluginStateForTest(): void {
 export function _rememberedForTest(): ReadonlyMap<string, NonNullable<NonNullable<Session["transient"]>["pluginMessages"]>> {
     return new Map(listSessions().flatMap((session) => session.transient?.pluginMessages
         ? [[session.id, session.transient.pluginMessages] as const] : []));
+}
+
+export function _stalePersonaWithRefsForTest(parent: Session, maxCited: number): Session | undefined {
+    return stalePersonaWithRefs(parent, maxCited);
 }
