@@ -2813,7 +2813,7 @@ export function warnResponsesReasoningPairs(
  *  block with recorded refs needs exact matching) and each call's args are
  *  parsed at most ONCE, whereas the old per-block scan reparsed them for
  *  every block. */
-function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureRangePairs: () => Map<string, Set<string>> } {
+function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureRangePairs: () => Map<string, Set<string>>; ensureRangeSummaries: () => Map<string, Map<string, Set<string>>> } {
     const callIds = new Set<string>();
     const compressCalls: BiliMessage[] = [];
     for (const m of messages) {
@@ -2822,33 +2822,56 @@ function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; com
         if (m.toolName === COMPRESS_TOOL_NAME) compressCalls.push(m);
     }
     let rangePairs: Map<string, Set<string>> | null = null;
-    const ensureRangePairs = (): Map<string, Set<string>> => {
-        if (!rangePairs) {
-            rangePairs = new Map<string, Set<string>>();
-            for (const c of compressCalls) {
-                let parsed: unknown;
-                try {
-                    parsed = JSON.parse(c.text ?? "");
-                } catch {
-                    continue;
-                }
-                const obj = parsed as { startId?: string; endId?: string; content?: unknown };
-                const ranges: Array<{ startId?: string; endId?: string }> = Array.isArray(obj?.content) ? (obj.content as Array<{ startId?: string; endId?: string }>) : [obj];
-                for (const r of ranges) {
-                    if (typeof r?.startId !== "string" || !r.startId || typeof r?.endId !== "string" || !r.endId) continue;
-                    let ends = rangePairs.get(r.startId);
-                    if (!ends) { ends = new Set<string>(); rangePairs.set(r.startId, ends); }
-                    ends.add(r.endId);
-                }
+    let rangeSummaries: Map<string, Map<string, Set<string>>> | null = null;
+    const ensureRangeData = (): void => {
+        if (rangePairs && rangeSummaries) return;
+        rangePairs = new Map<string, Set<string>>();
+        rangeSummaries = new Map<string, Map<string, Set<string>>>();
+        for (const c of compressCalls) {
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(c.text ?? "");
+            } catch {
+                continue;
+            }
+            const obj = parsed as { startId?: string; endId?: string; summary?: unknown; content?: unknown };
+            const ranges: Array<{ startId?: string; endId?: string; summary?: unknown }> = Array.isArray(obj?.content) ? (obj.content as Array<{ startId?: string; endId?: string; summary?: unknown }>) : [obj];
+            for (const r of ranges) {
+                if (typeof r?.startId !== "string" || !r.startId || typeof r?.endId !== "string" || !r.endId) continue;
+                let ends = rangePairs.get(r.startId);
+                if (!ends) { ends = new Set<string>(); rangePairs.set(r.startId, ends); }
+                ends.add(r.endId);
+                const summary = typeof r.summary === "string" ? r.summary : "";
+                let sumEnds = rangeSummaries.get(r.startId);
+                if (!sumEnds) { sumEnds = new Map<string, Set<string>>(); rangeSummaries.set(r.startId, sumEnds); }
+                let summaries = sumEnds.get(r.endId);
+                if (!summaries) { summaries = new Set<string>(); sumEnds.set(r.endId, summaries); }
+                summaries.add(summary);
             }
         }
-        return rangePairs;
     };
-    return { callIds, compressCalls, ensureRangePairs };
+    const ensureRangePairs = (): Map<string, Set<string>> => {
+        ensureRangeData();
+        return rangePairs!;
+    };
+    const ensureRangeSummaries = (): Map<string, Map<string, Set<string>>> => {
+        ensureRangeData();
+        return rangeSummaries!;
+    };
+    return { callIds, compressCalls, ensureRangePairs, ensureRangeSummaries };
+}
+
+// #5866: extract the body (everything after the first topic line) of a kernel
+// summary anchor. The kernel renders anchors as `<topic-line>\n<body>` (or just
+// the topic line when the body is empty); a simplified anchor with no newline
+// yields its whole text as the body.
+function extractAnchorBody(text: string): string {
+    const idx = text.indexOf("\n");
+    return idx === -1 ? text : text.slice(idx + 1);
 }
 
 export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
-    const { callIds, compressCalls, ensureRangePairs } = buildCarrierIndex(messages);
+    const { callIds, compressCalls, ensureRangePairs, ensureRangeSummaries } = buildCarrierIndex(messages);
     const carried = new Set<string>();
     for (const b of state.blocks) {
         if (!b.active || !b.compressCallId) continue;
@@ -2864,9 +2887,26 @@ export function stripKernelSummaries(messages: BiliMessage[], state: Compression
         const present = isPluginFoldCallId(b.compressCallId)
             ? (!b.startRef || !b.endRef ? compressCalls.length > 0 : ensureRangePairs().get(b.startRef)?.has(b.endRef) ?? false)
             : callIds.has(b.compressCallId);
-        if (present) {
-            carried.add(`acp_summary_${b.blockId}`);
+        if (!present) continue;
+        // #5866 option A: integrity-aware anchor stripping for plugin folds.
+        // The re-sent compress call is only a full carrier while it still
+        // carries the FULL summary verbatim. After the first post-fold turn,
+        // hideConsumedCompressCalls stubs the call's summary to a 200-char
+        // prefix, so the call no longer carries the full text — the in-place
+        // anchor must then be the sole full carrier and MUST be kept. Strip
+        // only when some matching call's summary is verbatim-equal to the
+        // anchor's body; otherwise keep the anchor.
+        if (isPluginFoldCallId(b.compressCallId) && b.startRef && b.endRef) {
+            const anchorId = `acp_summary_${b.blockId}`;
+            const anchor = messages.find((m) => m.id === anchorId);
+            if (anchor) {
+                const anchorBody = extractAnchorBody(anchor.text ?? "");
+                const callSummaries = ensureRangeSummaries().get(b.startRef)?.get(b.endRef);
+                const fullCarrier = callSummaries ? Array.from(callSummaries).some((s) => s.trim() === anchorBody) : false;
+                if (!fullCarrier) continue;
+            }
         }
+        carried.add(`acp_summary_${b.blockId}`);
     }
     return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_") || !carried.has(m.id));
 }
