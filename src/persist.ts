@@ -2091,7 +2091,10 @@ export class SessionStore {
         const matchedCcr = new Set<string>();
         for (const id of [...byId.keys()].sort()) {
             const files = byId.get(id)!;
-            // Boot's survivor rule: newest savedAt wins, lexicographic path breaks ties.
+            // Survivor rule for the one-shot import: newest savedAt wins, lexicographic path breaks ties.
+            // Deliberately simplified vs boot's full rule (loadNamespacedPool, which also orders by requests desc,
+            // nextBlockId desc, and exact-route-first); the ahead-probe re-imports on the next live open, so the
+            // final state converges to boot's pick regardless of which file is imported here.
             const rep = [...files].sort((a, b) => b.savedAt - a.savedAt || a.file.localeCompare(b.file))[0];
             // #5599 guard: which #1097 sidecars pair with this id's route files.
             const pairedCcr = new Set(
