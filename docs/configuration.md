@@ -1096,7 +1096,7 @@ Format (fields are additive; unknown fields are ignored). Keys are `minDelay`/`m
 ```jsonc
 {
   "schemaVersion": 1,
-  "default": { "minDelay": "15m", "maxDelay": "2d" },
+  "default": { "minDelay": "15m", "maxDelay": "7d" },
   "overrides": [
     { "range": ">=0.1.200", "maxDelay": "1h" },
     { "version": "0.1.199", "maxDelay": "1m" }
