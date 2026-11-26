@@ -18,7 +18,6 @@ const OPTIONAL_FIELDS: Partial<CompressionState> = {
   deadRefs: ["m00004"],
   refLedgerAligned: true,
   timestampsHighWaterRefSeq: 7,
-  suppressMintingOnce: true,
   lastPassIds: ["msg-1"],
 };
 
@@ -35,6 +34,23 @@ test("#2388 hydration carries every CompressionState field, optional included", 
     );
   }
   assert.deepEqual(merged, rich);
+});
+
+test("#5608-B hydration never carries the one-shot honest-NULL arm across a restart", () => {
+  const rich: CompressionState = {
+    ...createInitialState(),
+    ...OPTIONAL_FIELDS,
+    suppressMintingOnce: true,
+  };
+  const merged = mergeCompressionState(JSON.parse(JSON.stringify(rich)));
+  // Process-lifetime only (types.ts; the host's mergeState drops it too):
+  // re-arming honest-NULL after a restart would eat genuine first-sight mints
+  // of truly new messages on the first post-restart pass.
+  assert.equal(
+    "suppressMintingOnce" in merged,
+    false,
+    "suppressMintingOnce must not survive hydration",
+  );
 });
 
 test("#2388 hydration still fills defaults for a partial record", () => {
