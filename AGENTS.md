@@ -295,6 +295,8 @@ Before changes: (1) `npm run typecheck` clean, (2) `npm test` green, (3) underst
 
 Commit convention: `feat:` / `fix:` / `refactor:` / `test:` / `docs:` / `release:`.
 
+**Commit attribution markers are mandatory (行为约束).** Every non-merge commit's message must carry a marker line declaring its author: agent commits `Attribution: ai <provider>/<model-id>` (e.g. `Attribution: ai anthropic/claude-opus-4-5`), human commits `Attribution: human`. Provenance for the log reader — the same discipline as the §7.2 `(ai: <provider>/<model-id>)` comment self-declaration, extended from posted comments to the commit itself; a silent mix of authors in git history is unauditable. CI lane `commit-attribution` fails any PR whose merge-base already carries this rule and whose commits lack the marker (PRs written before this rule merged are exempt — the gate binds new PRs).
+
 ## 7. Review & Auto-Merge Discipline
 
 > Distilled from a full-history review of AI auto-dev across billion-context / billion-context-pi / acp-kernel (#801). Goal: ~90% of bugfixes mergeable without rework, without drifting off direction. Evidence appendix (baseline data, per-issue provenance, second-round analysis): [docs/auto-merge-guardrails.md](docs/auto-merge-guardrails.md) — the authoritative OPERATIVE rule text stays here in §7.

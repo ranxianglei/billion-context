@@ -1,0 +1,34 @@
+name: Commit Attribution
+
+# Every non-merge commit in a PR must declare who authored it (AGENTS.md §6,
+# Commit attribution markers): `Attribution: ai <provider>/<model-id>` for
+# agent-authored commits, `Attribution: human` for human-authored ones —
+# same provenance discipline as the (ai: provider/model-id) comment
+# self-declaration in §7.2, extended to git history.
+#
+# Enforcement is anchored on the PR's MERGE-BASE: the check reads AGENTS.md
+# at the merge-base commit and only fails when that version already carries
+# the rule. PRs written before this gate merges are skipped with a note;
+# new PRs (and PRs rebased past the rule) are checked in full.
+#
+# Zero dependencies: the checker talks to the GitHub REST API with the
+# workflow token — no checkout beyond the script itself, no install.
+on:
+  pull_request:
+
+jobs:
+  commit-attribution:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check commit attribution markers
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/check-commit-attribution.mjs
