@@ -89,6 +89,16 @@ concurrency:
   # runs; scheduled runs queue behind each other instead.
   cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
+# #7785: a `labeled` arm may only fire for the CI labels themselves —
+# ci:full widens the matrix, ci:force re-arms CI on a PR past the 72h stale
+# gate. Any other label must not create a run at all: previously every label
+# burned one gate/plan job per workflow before being skipped inside it.
+if: |
+  github.event_name != 'pull_request' ||
+  github.event.action != 'labeled' ||
+  github.event.label.name == 'ci:full' ||
+  github.event.label.name == 'ci:force'
+
 jobs:
   # Three-layer CI (#3295) plan: decide the matrix scope BEFORE paying for
   # legs. One cheap ubuntu job picks one of three scopes:
@@ -147,10 +157,27 @@ jobs:
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_TITLE: ${{ github.event.pull_request.title }}
+          # #7785: stale-PR gate input (empty on non-PR events).
+          PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
           HEAD_SHA: ${{ github.sha }}
           FULL_INPUT: ${{ inputs.full }}
         run: |
           set -euo pipefail
+          # #7785: stale-PR gate — a PR older than STALE_HOURS pays no CI on
+          # ordinary pushes (bots keep pushing dead branches; each push queued
+          # a full core matrix — 2026-11-26 flood: 109 queued runs, 15-day
+          # waits). GitHub expressions cannot do date arithmetic, so the age
+          # check lives here (GNU date on ubuntu runners). The ci:full label
+          # and the release-PR heuristics below OUTRANK the stale skip.
+          STALE=0
+          STALE_HOURS=72
+          if [ "$EVENT" = "pull_request" ] && [ -n "${PR_CREATED_AT:-}" ]; then
+            CREATED=$(date -u -d "$PR_CREATED_AT" +%s 2>/dev/null || echo "")
+            NOW=$(date -u +%s)
+            if [ -n "$CREATED" ] && [ $(( NOW - CREATED )) -gt $(( STALE_HOURS * 3600 )) ]; then
+              STALE=1
+            fi
+          fi
           # #4351: the suite grew ~399 -> ~860 files in three weeks while the
           # core shape stayed frozen at its ~650-file design point (#3295), so
           # its heaviest legs became the wall-clock floor: the ubuntu-24
@@ -200,10 +227,13 @@ jobs:
           scope=core
           case "$EVENT" in
             pull_request)
-              # a `labeled` event fires for EVERY label; only ci:full itself
-              # may (re)run — otherwise a random label would shadow the last
-              # full-matrix result with a core one.
-              if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then
+              # a `labeled` event may only re-run for the CI labels (the
+              # workflow-level if already drops every other label before a run
+              # exists — #7785); ci:full widens the matrix, ci:force re-arms
+              # CI on a stale PR. Defense in depth if the trigger filter is
+              # ever bypassed: anything else skips instead of shadowing the
+              # last full-matrix result with a core one.
+              if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ] && [ "$LABEL_EVENT" != "ci:force" ]; then
                 scope=skip
               elif grep -qw ci:full <<<"$PR_LABELS"; then
                 scope=full
@@ -231,6 +261,12 @@ jobs:
                 || case "${PR_TITLE:-}" in "[PR] release"*|"release v"[0-9]*) true ;; *) false ;; esac
               then
                 scope=full
+              elif [ "$STALE" = "1" ] && ! grep -qw ci:force <<<"$PR_LABELS"; then
+                # #7785: stale-PR gate — the matrix is skipped; re-arm with the
+                # ci:force label. Skipped checks do not satisfy
+                # required-status-checks, so a stale PR cannot merge on a
+                # stale green.
+                scope=skip
               fi
               ;;
             workflow_dispatch)

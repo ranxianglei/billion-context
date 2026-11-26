@@ -24,6 +24,16 @@ concurrency:
   # runs; scheduled runs queue behind each other instead.
   cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
+# #7785: a `labeled` arm may only fire for the CI labels themselves —
+# ci:full widens the matrix, ci:force re-arms CI on a PR past the 72h stale
+# gate. Any other label must not create a run at all: previously every label
+# burned one gate/plan job per workflow before being skipped inside it.
+if: |
+  github.event_name != 'pull_request' ||
+  github.event.action != 'labeled' ||
+  github.event.label.name == 'ci:full' ||
+  github.event.label.name == 'ci:force'
+
 jobs:
   # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
   # or on the 30-min cron when master moved since the last green scheduled run.
@@ -48,7 +58,7 @@ jobs:
           run=true
           if [ "$EVENT" = "pull_request" ]; then
             # only the ci:full label itself may trigger; other label events skip
-            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then run=false
+            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ] && [ "$LABEL_EVENT" != "ci:force" ]; then run=false
             elif ! grep -qw ci:full <<<"$PR_LABELS"; then run=false; fi
           elif [ "$EVENT" = "schedule" ]; then
             LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci-registry.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
