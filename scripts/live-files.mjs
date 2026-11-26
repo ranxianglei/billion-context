@@ -165,6 +165,11 @@ export const LIVE_FILES = [
     // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
     // for the tripwire, like #5046/#4612.
     "tests/storage-backup-repair.test.ts",
+    // #7540: the kernel-guard declaration gate test spawns ONE bare
+    // `node scripts/kernel-guard-declare.mjs` child via execFileSync —
+    // synchronous, binds no port, does no network I/O, so no zone band is
+    // needed — the entry is for the SPAWN_RE tripwire alone, like #3890/#5114
+    "tests/kernel-guard-declare.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

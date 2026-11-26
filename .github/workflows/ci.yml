@@ -481,6 +481,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Verify kernel boundary rules (#2092)
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -495,7 +498,13 @@ jobs:
             echo "✓ kernel release branch ($BRANCH) — kernel version changes allowed"
             exit 0
           fi
-          # Rule 1: any PR touching kernel/** must declare 'kernel-change:' in its body.
+          # Rule 1: any PR touching kernel/** must declare a STANDALONE
+          # 'kernel-change: <reason>' line in its body. The match is anchored to
+          # a declaration-shaped line (scripts/kernel-guard-declare.mjs), not a
+          # substring grep — a body that merely MENTIONS the marker (a
+          # pending-authorization note, a quote, docs) must NOT satisfy the gate
+          # (#7542: the old substring grep let PR #7536's "intentionally NOT
+          # added" note through as a false green).
           # #4828: kernel/package-lock.json is GENERATED state, not kernel source —
           # agents' test-prep installs churn it without any intent to change the
           # kernel (8 PRs tripped this gate on lockfile-only diffs). The human gate
@@ -510,12 +519,12 @@ jobs:
             # human gate has already happened out-of-band; skip only the
             # body check there. Version-discipline rules below still run.
             if [[ "${EVENT_NAME:-pull_request}" != "workflow_dispatch" ]] \
-              && ! printf '%s' "$PR_BODY" | grep -q 'kernel-change:'; then
-              echo "::error::This PR modifies kernel/ ($KERNEL_TOUCHED) but does not declare 'kernel-change: <reason>' in its body."
+              && ! printf '%s' "$PR_BODY" | node scripts/kernel-guard-declare.mjs; then
+              echo "::error::This PR modifies kernel/ ($KERNEL_TOUCHED) but does not declare a standalone 'kernel-change: <reason>' line in its body."
               echo "Kernel changes are human-gated: owner approval plus explicit declaration required. See AGENTS.md 'Kernel Boundary'."
               exit 1
             fi
-            echo "✓ kernel-change marker present"
+            echo "✓ kernel-change declaration present"
           fi
           # Rule 2: version discipline — kernel source/build-config changes require a
           # kernel/package.json version bump, and a bump requires source changes.
