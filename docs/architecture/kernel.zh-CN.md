@@ -15,6 +15,7 @@
 - **消息 id 永不复用。** 内容哈希 id 与 ref 编号（`mNNNNN`）永远只指一条消息——即使它已死（被编辑/截断/折叠）；模型可以引用它见过的任何编号。
 - **无损往返；受保护工具硬排除；规范节点顺序。** 结构性不变量，人工闸口。
 - **人工评审，永远。** 任何 `kernel/**` 改动与 `src/update.ts` 同档：永不自动合并；PR 正文必须写 `kernel-change: <reason>`（CI `kernel-guard`）。
+- **诊断走注入的 sink，绝不走进程 console（#7729）。** 内核保持无 I/O，回合中的诊断（屏幕丢弃预算、配置校验）经 `Ports.warn` 交给宿主——CLI 车道默认 `console.warn`，bili 的车道走 `src/kernel-warn-channel.ts`：inline 车道只写 bili.log（内嵌宿主里 stderr 就是 TUI），server 车道走 tee logger。
 
 ## 工作机制
 

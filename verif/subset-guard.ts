@@ -135,6 +135,9 @@ const GLOBAL_FNS = new Set([
   "String", "Number", "Boolean", "Object", "Array",
   // function-typed parameters (injected ports, uninterpreted):
   "countTokens", "predicate", "isCompressTool",
+  // #7729: the core's diagnostic sink — a plain callback into the host's log,
+  // off every verified path (same class as countTokens).
+  "warn",
 ]);
 
 /** Namespace roots (Math.x etc.) handled via NAMESPACE_MEMBERS. */

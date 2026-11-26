@@ -100,6 +100,7 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
+import { kernelWarnSink } from "./kernel-warn-channel.js";
 import { configureLogRetention } from "./log-retention.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
@@ -545,7 +546,13 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     }
     // #4313 toggle (PR #5236): resolved ONCE per instance — stamping/rendering
     // are baked into the pipeline nodes, so changing the flag needs a restart.
-    const core = createCore(resolveMessageTimestamps(opts.compress) ? { timestamps: true } : undefined);
+    // #7729: the kernel's own diagnostics must not reach a terminal through a raw
+    // console call — the sink decides per lane (inline lanes are embedded in a
+    // host TUI; this lane's stderr legs are the logger's business).
+    const core = createCore({
+        ...(resolveMessageTimestamps(opts.compress) ? { timestamps: true } : {}),
+        ...kernelWarnSink(opts.inlineLane === true ? "inline" : "server"),
+    });
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
     // #300: per-server identity stamped into the x-bili-hop marker on outbound

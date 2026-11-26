@@ -742,6 +742,9 @@ export function screenRecommendedUnits(
   state: CompressionState,
   config: Config,
   protectedRefs: Set<string>,
+  /** #7729: inherited from createCore's Ports. Omitted = the screen's legacy
+   *  `console.warn` leg, so direct callers keep working unchanged. */
+  warn: WarnSink = consoleWarnSink,
 ): CompressibleRange[] {
   if (units.length === 0) return units;
   const coverage = collectCoverage(state);
@@ -775,6 +778,7 @@ export function screenRecommendedUnits(
       // still return false, the unit is never advertised.
       if (!(err instanceof BoundaryNotFoundError)) {
         warnScreenDrop(
+          warn,
           `dropped unit ${unit.startRef}..${unit.endRef} after projection error: ${
             err instanceof Error ? err.message : String(err)
           }`,
@@ -790,6 +794,7 @@ export function screenRecommendedUnits(
       // projection-error warn above) so a total screen wipe is attributable.
       if (projection?.fatal) {
         warnScreenDrop(
+          warn,
           `dropped unit ${unit.startRef}..${unit.endRef}: ${projection.fatal.error.message}`,
         );
       }
@@ -800,6 +805,7 @@ export function screenRecommendedUnits(
       projection.consumedBlockIds.length === 0
     ) {
       warnScreenDrop(
+        warn,
         `dropped unit ${unit.startRef}..${unit.endRef}: nothing foldable in span (filteredIds=0, consumedBlocks=0)`,
       );
       return false;
@@ -821,6 +827,7 @@ export function screenRecommendedUnits(
       evaluateRefold(state, unit).kind !== "refold"
     ) {
       warnScreenDrop(
+        warn,
         `dropped unit ${unit.startRef}..${unit.endRef}: consumes only active block(s), not a refold`,
       );
       return false;
@@ -829,21 +836,30 @@ export function screenRecommendedUnits(
   });
 }
 
+export type WarnSink = (message: string) => void;
+
+/** The pre-#7729 console leg, named so guarded files can reference it without
+ *  an in-file `console` access (verif/subset-guard.ts treats console as an
+ *  environment read; the sink itself is an injected, uninterpreted port). */
+export const consoleWarnSink: WarnSink = (message: string) => console.warn(message);
+
 // Budgeted warn channel for screen-stage drops: the first SCREEN_DROP_WARN_BUDGET
-// drops in the process are logged verbatim, afterwards only every Nth (a run of
-// doomed units over a long session must stay observable without flooding the
-// host log — the production incident produced 28 no-range events/day). Exported
-// for the recommend pipeline node's funnel-zero warn (same channel, same budget).
+// drops are logged verbatim, afterwards only every Nth (a run of doomed units
+// over a long session must stay observable without flooding the host log — the
+// production incident produced 28 no-range events/day). Exported for the
+// recommend pipeline node's funnel-zero warn (same channel, same budget).
+//
+// #7729: the counter is keyed by SINK, not by module. It used to be a plain
+// module global, so two cores in one process (tests, or a host that keeps a
+// second core alive) shared one budget and each could silence the other's
+// diagnostics.
 const SCREEN_DROP_WARN_BUDGET = 40;
 const SCREEN_DROP_WARN_STRIDE = 100;
-let screenDropWarnCount = 0;
-export function warnScreenDrop(detail: string): void {
-  screenDropWarnCount += 1;
-  if (
-    screenDropWarnCount > SCREEN_DROP_WARN_BUDGET &&
-    screenDropWarnCount % SCREEN_DROP_WARN_STRIDE !== 0
-  ) {
-    return;
-  }
-  console.warn(`[acp-kernel] screenRecommendedUnits ${detail}`);
+const screenDropWarnCounts = new WeakMap<WarnSink, number>();
+
+export function warnScreenDrop(warn: WarnSink, detail: string): void {
+  const n = (screenDropWarnCounts.get(warn) ?? 0) + 1;
+  screenDropWarnCounts.set(warn, n);
+  if (n > SCREEN_DROP_WARN_BUDGET && n % SCREEN_DROP_WARN_STRIDE !== 0) return;
+  warn(`[acp-kernel] screenRecommendedUnits ${detail}`);
 }

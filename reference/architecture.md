@@ -55,6 +55,7 @@ billion-context/
 │   ├── event-loop-watchdog.ts    # Worker-thread event-loop wedge detector: self-exit after 5 min of continuous main-loop silence (#4762)
 │   ├── paths.ts                  # XDG paths (config/cache/state) + relocation env vars
 │   ├── logger.ts                 # Tee logger: state-dir file + stderr
+│   ├── kernel-warn-channel.ts    # Kernel diagnostic sink per lane: inline → bili.log, server → tee logger (#7729)
 │   ├── log-retention.ts          # Private-log generations: 48h target under a hard byte budget, 0600, honest coverage
 │   ├── log-retention-coverage.ts # Retention coverage reader: measured span from the oldest retained line, continuity always unknown
 │   ├── log-file-lines.ts         # Streaming line reader over the retained generations (bounded memory, per-file error reporting)
