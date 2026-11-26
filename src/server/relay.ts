@@ -427,10 +427,24 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // Antigravity inside the CloudCode envelope it arrived in. String-level for
     // the direct fetch sites; object-level via wireTransform below for loop re-sends.
     const v1Active = v1Meta !== undefined && prepared !== null;
+    // #6963: a continuationToken is bound to the EXACT inner bytes upstream
+    // last saw, so every v1 egress records its inner on the session (latest-
+    // wins, in-memory only) for the continuation leg to replay. countTokens
+    // egress never mints continuation tokens and must not clobber the cache.
+    const v1CountTokensEgress = typeof req.url === "string" && req.url.split("?")[0]?.endsWith("/v1internal:countTokens");
+    const noteV1EgressInner = (innerJson: string): void => {
+        if (v1CountTokensEgress) return;
+        const s = prepared;
+        if (s === null) return;
+        const t = s.session.transient ??= {};
+        t.v1ContinuationReplay = { body: innerJson, at: Date.now() };
+    };
     const v1Wrap = (b: string | Buffer): string | Buffer => {
         if (!v1Active || typeof b !== "string") return b;
         try {
-            return JSON.stringify(wrapV1Internal(JSON.parse(b) as Record<string, unknown>, v1Meta));
+            const inner = JSON.parse(b) as Record<string, unknown>;
+            noteV1EgressInner(b);
+            return JSON.stringify(wrapV1Internal(inner, v1Meta));
         } catch {
             return b;
         }
@@ -793,7 +807,10 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             if (steerCfg && steerCfg.enabled && steerProtocol) applyOutputSteeringJson(out, steerProtocol, steerCfg);
             if (compatDropPaths.length > 0) dropCompatFieldsJson(out, compatDropPaths);
             // #3129: re-nest the rebuilt inner request into the CloudCode envelope.
-            out = v1Active ? wrapV1Internal(out, v1Meta) : out;
+            if (v1Active) {
+                noteV1EgressInner(JSON.stringify(out));
+                out = wrapV1Internal(out, v1Meta);
+            }
             if (ccMetaForResend !== undefined) out = rewrapCommandcodeBody(out, ccMetaForResend);
             if (zedMetaForResend !== undefined) out = rewrapZedEnvelope(out, zedMetaForResend);
             return out;

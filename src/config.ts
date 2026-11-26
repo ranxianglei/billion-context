@@ -765,6 +765,12 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
     { match: /^gpt-4o/i, limit: 128_000 },
     { match: /^gpt-4-turbo/i, limit: 128_000 },
     { match: /^o[13]-/i, limit: 200_000 },
+    // Antigravity (CloudCode) model line: gemini-4-* plus the
+    // orchestrator/agent/worker/latest/lite ids served on cloudcode-pa.googleapis.com
+    // all carry the 1M window (#6963) — the 200K fallback clamped
+    // maxOutputTokens to the 4K floor at ~168K input and stranded turns at ~227K.
+    { match: /^gemini-4/i, limit: 1_048_576 },
+    { match: /^gemini-(?:pro|flash)-(?:orchestrator|worker|agent|latest|lite)/i, limit: 1_048_576 },
     { match: /^gemini-3/i, limit: 1_048_576 },
     { match: /^gemini-2\.5/i, limit: 1_000_000 },
     { match: /^gemini-1\.5/i, limit: 1_000_000 },

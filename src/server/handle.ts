@@ -65,7 +65,7 @@ import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError }
 import { matchModelEndpoint } from "../model-endpoints.js";
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
-import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
+import { extractConversationId, findV1Continuation, isV1BackgroundSideRequest, isV1InternalRequest, spliceV1ContinuationInner, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
@@ -3267,6 +3267,47 @@ async function handleRequest(
                 respondFailFast: boolean,
                 overflowWindow?: number,
             ) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = async (respondFailFast, overflowWindow) => {
+                // #6963: a v1internal continuation leg (continuationToken present)
+                // must reach upstream BYTE-IDENTICAL to the input the token was
+                // minted for — bili's own leg-1 egress. Re-running the stateful
+                // pipeline (nudge / status line / ACP tag re-render / output
+                // clamp) mutates the body and upstream 400s the leg ("does not
+                // match the continuation token"). Replay the cached egress inner,
+                // splicing back only the client's fresh maxOutputTokens and the
+                // token itself. Cache miss (restart / first leg) falls through to
+                // the full pipeline — pre-fix behavior.
+                const v1ParsedInner = (typeof parsed === "object" && parsed !== null ? parsed : null) as Record<string, unknown> | null;
+                const v1Cont = v1Meta !== undefined && protocol === "google" && !countTokens && v1ParsedInner !== null
+                    ? findV1Continuation(v1Meta, v1ParsedInner)
+                    : undefined;
+                if (v1Cont !== undefined) {
+                    const v1Replay = session.transient?.v1ContinuationReplay;
+                    let replayInner: Record<string, unknown> | undefined;
+                    if (v1Replay !== undefined && v1ParsedInner !== null) {
+                        try {
+                            replayInner = spliceV1ContinuationInner(JSON.parse(v1Replay.body) as Record<string, unknown>, v1ParsedInner, v1Cont);
+                        } catch {
+                            log("warn", `[${session.id}] v1internal continuation replay: cached egress inner is not valid JSON — running full pipeline`);
+                        }
+                    }
+                    if (replayInner !== undefined && v1Replay !== undefined) {
+                        const outbound = JSON.stringify(replayInner);
+                        log("info", `[${session.id}] v1internal continuation leg: replaying cached egress inner (${v1Replay.body.length} bytes, age ${Date.now() - v1Replay.at}ms), pipeline skipped`);
+                        const replayPrepared: Prepared = {
+                            body: outbound,
+                            parsedBody: replayInner,
+                            session,
+                            processedMessages: [],
+                            originalMessages: [],
+                            protocol: "google",
+                            stream: googlePathKind(urlPath) === "stream-generate",
+                            compressInjected: false,
+                            model: v1Model ?? googleModel,
+                        };
+                        return { body: outbound, prepared: replayPrepared };
+                    }
+                    log("warn", `[${session.id}] v1internal continuation leg without usable cached egress inner (restart?) — running full pipeline; upstream may reject the leg`);
+                }
                 const runPrepareInner = async (): Promise<Prepared> => {
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).

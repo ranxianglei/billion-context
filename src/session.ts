@@ -382,6 +382,14 @@ export type Session = {
          *  the TTL lapses. In-memory only — a restart replants nothing, and a
          *  restart also drops the truncated stream it described. */
         truncatedUpstream?: { at: number; protocol: string; cause: "eof" | "read-error" };
+        /** #6963: the exact inner request bytes the last v1internal egress
+         *  carried — what upstream minted any continuationToken for. A
+         *  continuation leg replays them byte-identical (splicing back only
+         *  the fresh maxOutputTokens and the token): re-running the stateful
+         *  pipeline would mutate the body and upstream 400s the leg ("does
+         *  not match the continuation token"). Latest-wins, in-memory only —
+         *  a restart lapses to the pre-fix pipeline behavior (cache miss). */
+        v1ContinuationReplay?: { body: string; at: number };
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
