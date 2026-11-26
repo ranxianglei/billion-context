@@ -111,6 +111,8 @@
 | `BILI_CA_FILE` | network.caFile，默认无——附加 PEM 根证书与内置根 **MERGE**（企业 MITM/DLP 重签上游证书被拒 SELF_SIGNED_CERT_IN_CHAIN 时，#3776；不替换内置根） |
 | `BILI_RECEIVE_BODY_BYTES` / `BILI_DECODED_BODY_BYTES` | network.receive/decodedBodyBytes，5 GiB / 10 GiB——单请求入站/解码后内存上限（#3128：曾硬编码 100 MiB，多 GB 单请求被 reset） |
 | `BILI_OUTBOUND_BODY_BYTES` | network.outboundBodyBytes，5 GiB——重建后转发上游的硬上限（#3128） |
+| `BILI_MAX_LARGE_DECODED_REQUESTS` | network.maxLargeDecodedRequests，2——超带解码请求的并发准入槽位上限（503 request_body_busy 预算；#5794 分带机制，#7277 起可配置；0 = 拒绝一切超带体） |
+| `BILI_LARGE_DECODED_ADMISSION_BYTES` | network.largeDecodedAdmissionBytes，32 MiB——解码字节数超过此值才占用一个准入槽位的成本带（原硬编码，#7277 起可配置；与 BILI_RECEIVE_BODY_BYTES 取小） |
 | `BILI_WS_OUTBOUND_BYTES` | network.wsOutboundBytes，10 MiB——WS 车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3701：网关对大帧 close 1009；0 关闭预发送削减；HTTP 车道不受影响） |
 | `BILI_HTTP_OUTBOUND_BYTES` | network.httpOutboundBytes，10 MiB——普通/代理/pi 原生 HTTP 中继车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3909：图片密集会话按字节/像素解码 CPU 被上游拒收、token 折叠不触发；仅在无受管传输时生效，受管 HTTP/dsh-inline 从不裁减 #3701 Finding 1；0 关闭） |
 | `BILI_INGEST_BODY_BYTES` | network.ingestBodyBytes，0（#7426 起默认对所有车道关闭；重发车道原始入站字节≠上下文）——解码后进入 JSON.parse+归一化清扫的成本带（#5794：51.2 MiB 体每轮吞 5.5–7.2s 事件循环 → 747s FATAL；超带的**文本为主**体即 413，因为任何可解析的 32 MiB+ 文本体 ≥ ~8M token、超过一切真实窗口；带图片的体豁免——像素按设计不进 token 计量，由槽位预算/收件上限/车道 shed 治理（#496/#3909/#3701）；0 关闭） |

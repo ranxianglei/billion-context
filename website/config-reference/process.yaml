@@ -186,9 +186,25 @@ entries:
     default: "5368709120"
     env: BILI_RECEIVE_BODY_BYTES
     group: process
-    desc_en: "Max inbound wire bytes read into memory per request before a 413 at the receive stage. Raised from a hardcoded 100 MiB to 5 GiB (#3128 owner decision) so multi-gigabyte single requests are accepted instead of the socket being reset. Also the threshold above which a decoded request consumes one of two shared large-decode admission slots. WebSocket lanes keep the fixed 100 MiB surface."
-    desc_zh: "单请求读入内存的入站 wire 字节上限，超限在 receive 阶段返回 413。由硬编码 100 MiB 提升到 5 GiB（#3128 owner 决定），使多 GB 单请求被接受而非断连。同时也是解码请求占用两个共享大解码准入槽位的阈值。WebSocket lane 保持固定 100 MiB 表面。"
-    desc_ja: "受信ステージで 413 を返す前に、リクエストごとにメモリに読み込む最大ワイヤーバイト数。ハードコードされた 100 MiB から 5 GiB に引き上げられ (#3128 オーナー決定)、マルチギガバイトの単一リクエストがソケットリセットされることなく受け入れられるようになった。また、デコードされたリクエストが共有される 2 つの大型デコードアドミッションスロットの 1 つを消費する閾値でもある。WebSocket レーンは固定の 100 MiB のサーフェスを維持する。"
+    desc_en: "Max inbound wire bytes read into memory per request before a 413 at the receive stage. Raised from a hardcoded 100 MiB to 5 GiB (#3128 owner decision) so multi-gigabyte single requests are accepted instead of the socket being reset. Also the threshold above which a decoded request consumes one shared large-decode admission slot (effective band = min of this and network.largeDecodedAdmissionBytes). WebSocket lanes keep the fixed 100 MiB surface."
+    desc_zh: "单请求读入内存的入站 wire 字节上限，超限在 receive 阶段返回 413。由硬编码 100 MiB 提升到 5 GiB（#3128 owner 决定），使多 GB 单请求被接受而非断连。同时也是解码请求占用共享大解码准入槽位的阈值（实际带 = 本值与 network.largeDecodedAdmissionBytes 取小）。WebSocket lane 保持固定 100 MiB 表面。"
+    desc_ja: "受信ステージで 413 を返す前に、リクエストごとにメモリに読み込む最大ワイヤーバイト数。ハードコードされた 100 MiB から 5 GiB に引き上げられ (#3128 オーナー決定)、マルチギガバイトの単一リクエストがソケットリセットされることなく受け入れられるようになった。また、デコードされたリクエストが共有大型デコードアドミッションスロット (有効帯 = 本値と network.largeDecodedAdmissionBytes の较小値) を 1 つ消費する閾値でもある。WebSocket レーンは固定の 100 MiB のサーフェスを維持する。"
+  - key: network.maxLargeDecodedRequests
+    type: number
+    default: "64"
+    env: BILI_MAX_LARGE_DECODED_REQUESTS
+    group: process
+    desc_en: "How many OVER-BAND decoded requests may be admitted at once — the 503 request_body_busy budget (#5794 banding, #7277 configurability). A decoded body over min(network.receiveBodyBytes, network.largeDecodedAdmissionBytes) consumes one slot until it finishes; the next gets 503 retry-after. Default 64 (owner ruling 2026-11-24: effectively-off — only bodies above the 1 GiB band count); 0 refuses every over-band body. Widen when long in-flight upstream streams (multi-minute 6M-token sessions) hold all slots and later large requests 503 with no way to recover (the #7277 third-request-503 symptom)."
+    desc_zh: "同时最多允许多少个超带解码请求——即 503 request_body_busy 的预算（#5794 分带，#7277 可配置）。解码体超过 min(network.receiveBodyBytes, network.largeDecodedAdmissionBytes) 就占一个槽位直到该请求结束，之后的请求拿到 503 retry-after。默认 64（2026-11-24 owner 拍板：实际放开——只有超过 1GiB 带的 body 才计数）；0 = 拒绝一切超带体。当超长流式上游请求（几分钟的 6M-token 会话）占满全部槽位、后续大请求 503 且无从恢复时（#7277 第三条大请求必 503 的症状），调大它。"
+    desc_ja: "同時にアドミッション可能なバンド超過デコードリクエストの上限——503 request_body_busy の予算 (#5794 の帯分け、#7277 の設定可能化)。min(network.receiveBodyBytes, network.largeDecodedAdmissionBytes) を超えるデコードボディは要求が完了するまで 1 つのスロットを消費し、その後のリクエストは 503 retry-after を受ける。デフォルト 64 (2026-11-24 オーナー裁定: 実質オフ——1 GiB を超えるボディのみカウント); 0 = すべてのバンド超過ボディを拒否。長時間実行中のストリーミング応答 (数分級の 6M トークンセッション) が全スロットを占有し、後続の大リクエストが回復不能に 503 する (#7277 の 3 本目的大リクエストが必ず 503 の症状) 場合は引き上げる。"
+  - key: network.largeDecodedAdmissionBytes
+    type: number
+    default: "1073741824"
+    env: BILI_LARGE_DECODED_ADMISSION_BYTES
+    group: process
+    desc_en: "Decoded bytes above which a request consumes one large-decode admission slot (#5794; was hardcoded 32 MiB, now configurable via #7277; default raised to 1 GiB by owner ruling 2026-11-24 so effectively only >1 GiB bodies count). A body this size costs seconds of single-threaded ingest+parse, which is what the slot budget protects. Also bounded by network.receiveBodyBytes — the smaller wins (an operator-set smaller receive cap stays strictly stricter)."
+    desc_zh: "解码字节数超过该值即占用一个大解码准入槽位（#5794；原硬编码 32 MiB，#7277 起可配置；默认值经 2026-11-24 owner 拍板提到 1GiB，实际效果是只有 >1GiB 的 body 才计数）。这个量级的体要花数秒的单线程摄入口+解析时间，正是槽位预算要保护的对象。同时受 network.receiveBodyBytes 约束——两者取小（运维调小的接收上限保持更严格）。"
+    desc_ja: "デコードバイト数がこの値を超えると 1 つの大型デコードアドミッションスロットを消費する (#5794; 従来は 32 MiB ハードコード、#7277 で設定可能に; デフォルトは 2026-11-24 のオーナー裁定で 1 GiB に引き上げ、実質 1 GiB を超えるボディのみカウント)。このサイズのボディはシングルスレッドの取り込み+パースに数秒かかり、スロット予算が守る対象はまさにそこ。network.receiveBodyBytes とも交互に効く——小さい方が勝つ (オペレータが受信上限を小さく設定すれば、そちらが厳しく効いたまま)。"
   - key: network.decodedBodyBytes
     type: number
     default: "10737418240"

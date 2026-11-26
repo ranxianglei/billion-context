@@ -2453,8 +2453,24 @@ type FileConfig = {
         allowPrivateHttpProviders?: boolean;
         /** Per-request inbound wire byte budget (#3128; was hardcoded 100 MiB, now default 5 GiB).
          *  Env BILI_RECEIVE_BODY_BYTES wins. Also the threshold above which a decoded request
-         *  consumes one of two shared large-decode admission slots. WebSocket lanes keep 100 MiB. */
+         *  consumes one shared large-decode admission slot (effective band = the smaller of this
+         *  and largeDecodedAdmissionBytes). WebSocket lanes keep 100 MiB. */
         receiveBodyBytes?: number;
+        /** How many OVER-BAND decoded requests may be admitted at once — the 503 request_body_busy
+         *  budget (#5794 banding, #7277 configurability). A decoded body over
+         *  min(receiveBodyBytes, largeDecodedAdmissionBytes) consumes one slot until it finishes;
+         *  the next gets 503 retry-after. Env BILI_MAX_LARGE_DECODED_REQUESTS wins. Default 64
+         *  (owner ruling 2026-11-24: effectively-off — only >1 GiB bodies count as over-band);
+         *  0 refuses every over-band body (long in-flight upstream streams can hold all slots
+         *  for minutes — widen when your hosts send large bodies while a big stream is running). */
+        maxLargeDecodedRequests?: number;
+        /** Decoded bytes above which a request consumes one large-decode admission slot (#5794;
+         *  was hardcoded 32 MiB, now #7277). A body this size costs seconds of single-threaded
+         *  ingest+parse, which is what the slot budget protects. Env
+         *  BILI_LARGE_DECODED_ADMISSION_BYTES wins. Default 1 GiB (owner ruling 2026-11-24:
+         *  effectively-off); also bounded by
+         *  receiveBodyBytes (the smaller wins). */
+        largeDecodedAdmissionBytes?: number;
         /** Per-request DECODED byte budget after content-encoding expansion (#3128; default 10 GiB = 2x receive). Env BILI_DECODED_BODY_BYTES wins. */
         decodedBodyBytes?: number;
         /** Per-request rebuilt-outbound byte budget forwarded upstream (#3128; default 5 GiB). Env BILI_OUTBOUND_BODY_BYTES wins. */

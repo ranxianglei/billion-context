@@ -15,7 +15,7 @@ import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peek
 import { stampBillingPrice } from "../billing.js";
 import { recordClientUa } from "../client-ua-registry.js";
 import { codexAlignedWindow, codexWindowNetsOutputHeadroom } from "../codex-models.js";
-import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
+import { DecodedRequestAdmission, DecodedRequestBusyError, largeDecodedBudgetStatus } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
@@ -620,9 +620,11 @@ async function handleRequest(
     } catch (err) {
         if (decodingSignal.aborted || res.destroyed) return;
         if (err instanceof DecodedRequestBusyError) {
-            log("warn", "503: large decoded request budget is busy");
+            const budget = largeDecodedBudgetStatus();
+            const heldForS = budget.oldestHeldMs === undefined ? "-" : Math.round(budget.oldestHeldMs / 1000) + "s";
+            log("warn", `503: large decoded request budget is busy — held ${budget.held}/${budget.cap} slots, oldest slot held for ${heldForS}, band ${budget.bandBytes} bytes (widen: BILI_MAX_LARGE_DECODED_REQUESTS / BILI_LARGE_DECODED_ADMISSION_BYTES or network.maxLargeDecodedRequests / network.largeDecodedAdmissionBytes, #7277)`);
             res.writeHead(503, { "content-type": "application/json", "retry-after": "1" });
-            res.end(JSON.stringify({ error: { type: "request_body_busy", stage: "decode", message: err.message } }));
+            res.end(JSON.stringify({ error: { type: "request_body_busy", stage: "decode", message: `${err.message} (held ${budget.held}/${budget.cap} slots; oldest slot held for ${heldForS})` } }));
             return;
         }
         if (err instanceof BodyTooLargeError || err instanceof DecompressedTooLargeError || err instanceof IngestBodyTooLargeError) {

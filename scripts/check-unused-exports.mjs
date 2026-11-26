@@ -103,6 +103,11 @@ const WAIVERS = new Map([
     // consume them through applyEgressTransforms' parameter types); keep the
     // exports so the user-plugin contract stays named at its definition site.
     ["src/egress-transforms.ts", new Set(["EgressTransformMatch", "EgressTransformCtx", "EgressTransformResult", "EgressTransformModule"])],
+    // #7277 admission status: the 503 refusal status payload interface is
+    // referenced only inside src/request-body-budget.ts (handle.ts consumes
+    // it structurally through largeDecodedBudgetStatus()'s return); keep the
+    // export so the status shape stays named at its definition site.
+    ["src/request-body-budget.ts", new Set(["LargeDecodedBudgetStatus"])],
 ]);
 
 const findings = [];

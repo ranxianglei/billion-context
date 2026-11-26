@@ -187,7 +187,9 @@
 | `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | アウトバウンドエグレスプロキシを介した接続の最大生存時間。これを超えると再接続を強制する (古い NAT マッピングを回避するため)。 |
 | `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | レスポンス完了後のプロキシ起因のクローズに対するグレースフルクローズの予算: ソケットはピアの FIN/TLS close_notify を待って保持され、期限時に破棄される (reason=linger-backstop)。 |
 | `network.allowPrivateHttpProviders` | boolean | false | BILI_ALLOW_PRIVATE_HTTP_PROVIDERS | オプトイン (#2984): プライベートネットワーク (RFC1918, 127/8, リンクローカル, ULA, *.local/.lan/.internal) 上のプレーン HTTP プロバイダーを、エージェントレジストリのインテークおよびサマリーエンドポイントのガードに許可する。デフォルトでは無効 — プレーンテキストはループバックのみ許可; 公開 IP/ドメインおよび CGNAT (100.64/10) は常に拒否される。1/true で有効化。 |
-| `network.receiveBodyBytes` | number | 5368709120 | BILI_RECEIVE_BODY_BYTES | 受信ステージで 413 を返す前に、リクエストごとにメモリに読み込む最大ワイヤーバイト数。ハードコードされた 100 MiB から 5 GiB に引き上げられ (#3128 オーナー決定)、マルチギガバイトの単一リクエストがソケットリセットされることなく受け入れられるようになった。また、デコードされたリクエストが共有される 2 つの大型デコードアドミッションスロットの 1 つを消費する閾値でもある。WebSocket レーンは固定の 100 MiB のサーフェスを維持する。 |
+| `network.receiveBodyBytes` | number | 5368709120 | BILI_RECEIVE_BODY_BYTES | 受信ステージで 413 を返す前に、リクエストごとにメモリに読み込む最大ワイヤーバイト数。ハードコードされた 100 MiB から 5 GiB に引き上げられ (#3128 オーナー決定)、マルチギガバイトの単一リクエストがソケットリセットされることなく受け入れられるようになった。また、デコードされたリクエストが共有大型デコードアドミッションスロット (有効帯 = 本値と network.largeDecodedAdmissionBytes の较小値) を 1 つ消費する閾値でもある。WebSocket レーンは固定の 100 MiB のサーフェスを維持する。 |
+| `network.maxLargeDecodedRequests` | number | 64 | BILI_MAX_LARGE_DECODED_REQUESTS | 同時にアドミッション可能なバンド超過デコードリクエストの上限——503 request_body_busy の予算 (#5794 の帯分け、#7277 の設定可能化)。min(network.receiveBodyBytes, network.largeDecodedAdmissionBytes) を超えるデコードボディは要求が完了するまで 1 つのスロットを消費し、その後のリクエストは 503 retry-after を受ける。デフォルト 64 (2026-11-24 オーナー裁定: 実質オフ——1 GiB を超えるボディのみカウント); 0 = すべてのバンド超過ボディを拒否。長時間実行中のストリーミング応答 (数分級の 6M トークンセッション) が全スロットを占有し、後続の大リクエストが回復不能に 503 する (#7277 の 3 本目的大リクエストが必ず 503 の症状) 場合は引き上げる。 |
+| `network.largeDecodedAdmissionBytes` | number | 1073741824 | BILI_LARGE_DECODED_ADMISSION_BYTES | デコードバイト数がこの値を超えると 1 つの大型デコードアドミッションスロットを消費する (#5794; 従来は 32 MiB ハードコード、#7277 で設定可能に; デフォルトは 2026-11-24 のオーナー裁定で 1 GiB に引き上げ、実質 1 GiB を超えるボディのみカウント)。このサイズのボディはシングルスレッドの取り込み+パースに数秒かかり、スロット予算が守る対象はまさにそこ。network.receiveBodyBytes とも交互に効く——小さい方が勝つ (オペレータが受信上限を小さく設定すれば、そちらが厳しく効いたまま)。 |
 | `network.decodedBodyBytes` | number | 10737418240 | BILI_DECODED_BODY_BYTES | コンテンツエンコーディング展開 (gzip/deflate/br/zstd) 後の最大デコードバイト数。デコード中に増分チェックされる (デコードステージ 413)。デフォルトは受信予算の 2 倍で、従来の decode=2x-wire の関係を反映し、デコンプレッションボムから守る。 |
 | `network.outboundBodyBytes` | number | 5368709120 | BILI_OUTBOUND_BODY_BYTES | 上流に転送される再構築リクエストの最大バイト数 (転送ステージ 413)。最終ボディ文字列の UTF-8 バイト数としてカウントされる。fetch 前にチェックされるため、予算超過の再構築は上流のウォッチドッグ割り当てに到達しない。 |
 | `network.wsOutboundBytes` | number | 10485760 | BILI_WS_OUTBOUND_BYTES | WebSocket レーン専用のソフトバイト予算 (#3701): 最終シリアライズされた Responses WS フレームがこれを超過した場合、まず OUTBOUND COPY から古い画像が除去される (プレースホルダーノートとしてアーカイブ — 元画像はセッションストレージに残り、ツールアームされたレーンでは read_original_image / decompress で復元可能 — 注入ツールを拒否する codex スタイルのレーンはサイズのみ注釈を保持)、その後残ったものは jimp maxDim ラダーを通じて有界にダウンスケールされる。それでもフレームが収まらず、イベント前に上流が 1009 でクローズした場合、同じリクエスト内で厳密に小さい再送信が 1 回試行される。0 に設定すると除去を無効化 (従来のそのまま送信する動作)。HTTP レーンには影響しない — ハード拒否上限は network.outboundBodyBytes のまま。 |
@@ -2009,9 +2011,11 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_INGEST_BODY_BYTES` | `network.ingestBodyBytes` | 0 |
 | `BILI_INVARIANT_JUDGE` | `diagnostics.invariantJudge` | true |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
+| `BILI_LARGE_DECODED_ADMISSION_BYTES` | `network.largeDecodedAdmissionBytes` | 1073741824 |
 | `BILI_LOG_BUDGET_BYTES` | `diagnostics.logBudgetBytes` | 268435456 (256 MiB, floor 1 MiB) |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_LOG_RETENTION_HOURS` | `diagnostics.logRetentionHours` | 48 (floor 1) |
+| `BILI_MAX_LARGE_DECODED_REQUESTS` | `network.maxLargeDecodedRequests` | 64 |
 | `BILI_MAX_MESSAGES` | `network.maxMessages` | 0 |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
