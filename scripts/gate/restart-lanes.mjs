@@ -71,7 +71,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { buildCorpus, CODEWORDS } from "./plugin-lanes.mjs";
+import { buildCorpus, CODEWORDS, gateRolloutCfg } from "./plugin-lanes.mjs";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const WORK = process.env.RESTART_LANES_WORK || path.join(process.env.WORKDIR || process.cwd(), "restart-lanes");
@@ -85,6 +85,8 @@ const MODEL1 = {
   key: process.env.MODEL1_API_KEY || "gate-local",
 };
 const MODEL_IDS = String(MODEL1.model).split(",").map((s) => s.trim()).filter(Boolean);
+
+const laneCfg = (providers) => ({ providers, compress: { preserveRecentTokens: 0 }, ...gateRolloutCfg() });
 const MODEL_MAIN = MODEL_IDS[0];
 const AGENTS = (process.env.GATE_AGENTS_R || process.env.GATE_AGENTS || "dsh,pi")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -287,7 +289,7 @@ async function runLane(agent) {
   const biliJson = path.join(xdgConfig, "billion-context", "billion-context.json");
   const biliProviders = { [recUrl]: { models: Object.fromEntries(MODEL_IDS.map((m) => [m, { context: BIG_WINDOW, output: 4096 }])) } };
   fs.mkdirSync(path.dirname(biliJson), { recursive: true });
-  fs.writeFileSync(biliJson, JSON.stringify({ providers: biliProviders, compress: { preserveRecentTokens: 0 } }, null, 2));
+  fs.writeFileSync(biliJson, JSON.stringify(laneCfg(biliProviders), null, 2));
   fs.writeFileSync(path.join(laneDir, "work", "corpus.md"), buildCorpus(CORPUS_TOKENS));
 
   const rec = spawn("node", [path.join(HERE, "upstream-recorder.mjs")], {
@@ -387,9 +389,25 @@ async function runLane(agent) {
     // Small window is bili-side (provider context in bili.json); a manually
     // started proxy re-reads config only on restart (prefix lanes need a
     // fresh proxy per phase — Lane P rule). Returns the new proxy pid.
+    const claudeExtraModels = [];
+    const harvestClaudeModels = () => {
+      // bili's window lookup is keyed by the MODEL ID THE CLIENT REQUESTS
+      // (src/server/handle.ts resolveModelEntry) — claude-code sends its own
+      // defaults (claude-sonnet-4-5-*, claude-haiku-4-5-*), never MODEL1's
+      // upstream ids. A models map keyed only by MODEL_IDS silently misses
+      // (source=registry-peek 200k, no fold) — 2026-11-15 clauder run: all
+      // 3 fold assertions red. Same mechanism as plugin-lanes' harvestWireModels.
+      try {
+        for (const m of fs.readFileSync(biliLog, "utf8").matchAll(/\[window\] model=([^\s]+) source=/g)) {
+          if (!MODEL_IDS.includes(m[1]) && !claudeExtraModels.includes(m[1])) claudeExtraModels.push(m[1]);
+        }
+      } catch {}
+    };
     claudeSetWindow = async (w) => {
-      for (const m of Object.values(biliProviders[recUrl].models)) m.context = w;
-      fs.writeFileSync(biliJson, JSON.stringify({ providers: biliProviders, compress: { preserveRecentTokens: 0 } }, null, 2));
+      harvestClaudeModels();
+      const allIds = [...new Set([...MODEL_IDS, ...claudeExtraModels])];
+      biliProviders[recUrl] = { models: Object.fromEntries(allIds.map((m) => [m, { context: w, output: 4096 }])) };
+      fs.writeFileSync(biliJson, JSON.stringify(laneCfg(biliProviders), null, 2));
       const oldPid = claudeProxy ? claudeProxy.pid : null;
       await stopClaudeProxy();
       await startClaudeProxy();

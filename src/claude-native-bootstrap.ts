@@ -33,7 +33,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "./launcher.js";
 import { resolveClaudeNativePort } from "./config.js";
-import { postIdentityRegister } from "./agent/shared.js";
+import { postIdentityRegister, runSessionStartHook } from "./agent/shared.js";
 import { lanePreferredPort } from "./instance.js";
 import { claudeNativeInstalled, isBiliClaudeBaseUrl, repinClaudeManagedBaseUrl } from "./plugin-install.js";
 import { claudeRoutingWarningFile } from "./paths.js";
@@ -331,6 +331,8 @@ export function isClaudeHostArgv(argv: string[]): boolean {
         return stripQuotes(parts[parts.length - 1] ?? "");
     };
     if (/^claude(\.exe)?$/i.test(base(argv[0] ?? ""))) return true;
+    // Native installs run <data dir>/claude/versions/<version>; Remote Control spawns its children by that path.
+    if (/[\\/]claude[\\/]versions[\\/]\d+\.\d+\.\d+(\.exe)?$/i.test(stripQuotes(argv[0] ?? ""))) return true;
     if (/^(node|bun|deno)(\.exe)?$/i.test(base(argv[0] ?? ""))) {
         return argv.slice(1).some((arg) => /^claude(\.exe)?$/i.test(base(arg)) || /@anthropic-ai[\\/]claude-code/.test(arg));
     }
@@ -543,26 +545,23 @@ export function hookMainWithDeps(deps: {
     runImpl?: (payload: string) => Promise<void>;
     exit?: (code: number) => void;
     drainTimeoutMs?: number;
+    backstopMs?: number;
 } = {}): void {
     const input = deps.input ?? process.stdin;
     const runImpl = deps.runImpl ?? run;
-    const exit = deps.exit ?? ((code: number) => process.exit(code));
-    const destroyInput = (): void => {
-        try {
-            (input as { destroy?: () => void }).destroy?.();
-        } catch {
-            // already closed
-        }
-    };
     let payload = "";
     let started = false;
     const start = (): void => {
         if (started) return;
         started = true;
         clearTimeout(timer);
-        void runImpl(payload).finally(() => {
-            destroyInput();
-            exit(0);
+        // #2943: stdin destroy + process.exit in the same tick races libuv's
+        // Windows async-handle close and aborts before Claude sees exit 0.
+        // Shared helper tears stdin down and lets the loop drain naturally.
+        runSessionStartHook(() => runImpl(payload), {
+            input: input as { destroy?: () => void },
+            exit: deps.exit,
+            backstopMs: deps.backstopMs,
         });
     };
     const timer = setTimeout(start, deps.drainTimeoutMs ?? HOOK_STDIN_DRAIN_TIMEOUT_MS);

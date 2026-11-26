@@ -125,6 +125,15 @@ export function messageImageBytes(m: CoreMessage): RestorableImage[] {
     // there, so the index must too (#1995 nested-tool-image parity).
     const ri = mm.rawResponsesItem;
     if (isObj(ri)) {
+        // A split Responses image core still points at the WHOLE wire item.
+        // Its imageBase64 sidecar identifies this occurrence's own pixels;
+        // walking the carrier would bind every sibling image to every ref.
+        // A URL-only occurrence has no carried bytes, even if a sibling does.
+        if (mm.imagePart === true) {
+            return typeof mm.imageBase64 === "string"
+                ? [{ mediaType: mm.imageMediaType ?? "image/png", b64: mm.imageBase64, bytes: b64Bytes(mm.imageBase64) }]
+                : [];
+        }
         const arr = ri.type === "function_call_output" || ri.type === "custom_tool_call_output"
             ? (Array.isArray(ri.output) ? ri.output : undefined)
             : (Array.isArray(ri.content) ? ri.content : undefined);

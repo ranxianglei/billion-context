@@ -7,7 +7,9 @@
  */
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import type { ServerResponse } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
+import { once } from "node:events";
 import { getChangelog, latestChangelog, _resetChangelogForTest } from "../src/web/changelog.ts";
 
 const GH = "https://api.github.com/repos/ranxianglei/billion-context/releases?per_page=20";
@@ -118,6 +120,98 @@ test("HTTP 500 fails soft like a network error", async () => {
     globalThis.fetch = fetchStub({}, 500);
     const data = await getChangelog();
     assert.deepEqual(data, { releases: [], error: "offline" });
+});
+
+for (const status of [429, 503]) {
+    test(`HTTP ${status} cancels an unread response and retains the last good changelog`, async () => {
+        globalThis.fetch = fetchStub([ghRelease(0)]);
+        const good = await getChangelog();
+        let cancelled = 0;
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) { controller.enqueue(new TextEncoder().encode("upstream error")); },
+            cancel() { cancelled += 1; },
+        });
+        globalThis.fetch = (async () => new Response(body, { status })) as typeof fetch;
+        const failed = await getChangelog({ force: true });
+        assert.deepEqual(failed, { releases: good.releases, error: "offline" });
+        assert.equal(cancelled, 1, "the rejected HTTP body must not retain its transport");
+    });
+}
+
+test("an unread HTTP error body is closed on the actual connection", async t => {
+    let closed!: () => void;
+    const bodyClosed = new Promise<void>(resolve => { closed = resolve; });
+    const server = createServer((_req, res) => {
+        res.on("close", closed);
+        res.writeHead(503, { "content-type": "text/plain" });
+        res.write("temporarily unavailable");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    t.after(async () => {
+        server.closeAllConnections();
+        await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    });
+    const local = `http://127.0.0.1:${(server.address() as AddressInfo).port}/releases`;
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+        assert.equal(String(input), GH);
+        return origFetch(local, init);
+    }) as typeof fetch;
+    assert.deepEqual(await getChangelog(), { releases: [], error: "offline" });
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+        const ended = await Promise.race([
+            bodyClosed.then(() => true),
+            new Promise<boolean>(resolve => { deadline = setTimeout(() => resolve(false), 1_000); }),
+        ]);
+        assert.equal(ended, true, "rejecting the status must close a body that never ends");
+    } finally {
+        clearTimeout(deadline);
+    }
+});
+
+test("a successful changelog consumes its response without cancelling it", async () => {
+    let cancelled = 0;
+    const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+            controller.enqueue(new TextEncoder().encode(JSON.stringify([ghRelease(0)])));
+            controller.close();
+        },
+        cancel() { cancelled += 1; },
+    });
+    globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+    assert.equal((await getChangelog()).releases[0]?.tag, "v0.9.100");
+    assert.equal(cancelled, 0);
+});
+
+test("a failed cancellation cannot replace the cached offline result", async () => {
+    let cancelled = 0;
+    const body = new ReadableStream<Uint8Array>({
+        cancel() { cancelled += 1; throw new Error("fixture cancellation failure"); },
+    });
+    globalThis.fetch = (async () => new Response(body, { status: 429 })) as typeof fetch;
+    assert.deepEqual(await getChangelog(), { releases: [], error: "offline" });
+    assert.equal(cancelled, 1);
+    await new Promise<void>(resolve => setImmediate(resolve));
+});
+
+test("releasing an unread tee branch does not wait for its other consumer", async () => {
+    const source = new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new TextEncoder().encode("busy")); },
+    });
+    const [body, other] = source.tee();
+    globalThis.fetch = (async () => new Response(body, { status: 503 })) as typeof fetch;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+        const result = await Promise.race([
+            getChangelog(),
+            new Promise<undefined>(resolve => { deadline = setTimeout(() => resolve(undefined), 1_000); }),
+        ]);
+        assert.deepEqual(result, { releases: [], error: "offline" }, "cleanup must not turn an HTTP rejection into a wait for a sibling stream");
+    } finally {
+        clearTimeout(deadline);
+        await other.cancel();
+    }
 });
 
 test("non-array / non-object payloads fail soft", async () => {
