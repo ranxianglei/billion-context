@@ -226,15 +226,14 @@ test("e2e #6069: history replaced under the same session id, then grown past the
         const foldedBefore = summaryCalls();
 
         // 3. The new history grows past the window.
+        // #7537: the payload is ALWAYS forwarded; the one-shot fold gate
+        // (master) blocks a second preflight fold, so the turn rides through
+        // unfolded — the upstream's verdict is authoritative.
         const grown = [...replaced, ...wireHistory("GROWN", 16, 250)];
-        assert.equal(await send(grown), 200, "the over-window turn is folded and forwarded, not refused");
-        assert.ok(summaryCalls() > foldedBefore, "preflight summarized the new history");
+        assert.equal(await send(grown), 200, "the over-window turn is forwarded, not refused");
         const forwarded = calls.filter((c) => c.stream).at(-1);
         assert.ok(forwarded, "a forward happened");
-        assert.ok(forwarded.body.includes(E2E_SUMMARY), "the new summary is in the forwarded payload");
-        assert.ok(!forwarded.body.includes("OLD_1_content_"), "nothing of the replaced history is forwarded");
         assert.ok(forwarded.body.includes("GROWN_15_content_"), "the newest turn stays verbatim");
-        assert.equal(epochConfirmPending(session()), false, "the fresh fold starts the new epoch: the latch clears");
 
         // 4. The session keeps working.
         assert.equal(await send([...grown, { role: "assistant", content: "ok" }, { role: "user", content: "next question" }]), 200);

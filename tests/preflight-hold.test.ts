@@ -198,7 +198,7 @@ test("#568: stream + slow preflight → early 200 + SSE keep-alive, then the rea
     }
 });
 
-test("#568: stream + slow preflight 429 → early-committed 200 carries the error in-band, nothing forwarded", async () => {
+test("#568: stream + slow preflight 429 → payload forwarded, upstream 200 is the verdict (#7537)", async () => {
     const calls: Call[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -234,14 +234,10 @@ test("#568: stream + slow preflight 429 → early-committed 200 carries the erro
             { "content-type": "application/json", "x-acp-session": "hold-stream-429-sess" },
             JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation() }),
         );
-        // The hold already committed 200 before the 429 landed — the client
-        // gets the structured error IN-BAND instead of a hang/abort.
-        assert.equal(r.status, 200, "status was committed early and cannot become 503 anymore");
+        // #7537: the payload is ALWAYS forwarded; the upstream 200 is the verdict.
+        assert.equal(r.status, 200, "payload is forwarded, upstream 200 is the verdict");
         assert.equal(r.headers["x-bili-preflight"], "compressing");
-        assert.ok(r.body.includes("event: error"), "SSE error event delivered in-band");
-        assert.ok(r.body.includes("preflight_compress_failed"), "structured error code preserved in-band");
-        assert.ok(r.body.includes("rate limited") || r.body.includes("429"), "the cause is named");
-        assert.equal(calls.filter((c) => c.raw.includes('"stream":true')).length, 0, "the over-window payload was NOT forwarded");
+        assert.ok(calls.filter((c) => c.raw.includes('"stream":true')).length >= 1, "the payload was forwarded");
         assert.ok(calls.filter((c) => !c.raw.includes('"stream":true')).length >= 1, "the (slow, 429'd) summarization call happened");
     } finally {
         proxy.close();
@@ -253,7 +249,7 @@ test("#568: stream + slow preflight 429 → early-committed 200 carries the erro
     }
 });
 
-test("#568: Responses protocol + slow preflight 429 → early-committed 200, in-band error event", async () => {
+test("#568: Responses protocol + slow preflight 429 → payload forwarded, upstream 200 is the verdict (#7537)", async () => {
     const calls: Call[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -289,10 +285,9 @@ test("#568: Responses protocol + slow preflight 429 → early-committed 200, in-
             { "content-type": "application/json", "x-acp-session": "hold-resp-429-sess" },
             JSON.stringify({ model: "gpt-resp", stream: true, session_id: "hold-resp-429-sess", instructions: "You are the test coding agent.", input }),
         );
-        assert.equal(r.status, 200, "status was committed early and cannot become 503 anymore");
-        assert.ok(r.body.includes("event: error"), "Responses-API error event delivered in-band");
-        assert.ok(r.body.includes("preflight_compress_failed"), "structured error code preserved in-band");
-        assert.equal(calls.filter((c) => !c.raw.includes('"stream":false')).length, 0, "nothing was forwarded");
+        // #7537: the payload is ALWAYS forwarded; the upstream 200 is the verdict.
+        assert.equal(r.status, 200, "payload is forwarded, upstream 200 is the verdict");
+        assert.ok(calls.filter((c) => !c.raw.includes('"stream":false')).length >= 1, "the payload was forwarded");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();

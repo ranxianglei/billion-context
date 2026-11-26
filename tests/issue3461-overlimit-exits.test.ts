@@ -139,7 +139,7 @@ function okSse(inputTokens: number): string {
 
 type Msg = { role: string; content: unknown };
 
-test("#3461 e2e: a payload that can never fit fails fast 413 non-retryable, cooldown replays without upstream calls", async () => {
+test("#3461 e2e: a payload that can never fit is forwarded, upstream 200 is the verdict (#7537)", async () => {
     _resetSessionsForTest();
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -180,43 +180,27 @@ test("#3461 e2e: a payload that can never fit fails fast 413 non-retryable, cool
     });
     try {
         // Turn 1: normal-sized payload, succeeds, arms the usage-grade baseline
-        // and route evidence (so turn 2 takes the sizing path, not the
-        // fresh-session forward-once arbitration).
+        // and route evidence.
         const smallSystem = "You are a helpful assistant.";
         const r1 = await post(smallSystem, [{ role: "user", content: "go?" }]);
         assert.equal(r1.status, 200, "turn 1 succeeds");
         await r1.text();
-        // Identity-fast-path guard: turn 1 settles a genuine same-origin usage
-        // baseline, which alone would open the trusted fast path (recorded
-        // upstream reality outranks local doom-math). This fixture pins the
-        // evidence-judged 413 contract, so declare the overflow wall —
-        // statedWall > 0 demotes the fast path and the wall equals the
-        // configured window, so the judge's limit is unchanged.
         getSession(id)!.stats.overflowArmTokens = WINDOW;
 
-        // Turn 2: the client swaps in an oversized system prompt (~60k chars ≈
-        // well over the 4k window) on top of the short history. The system
-        // prompt is never foldable and the three history messages sit inside
-        // the protected recent zone — no combination of folds closes the gap,
-        // so the walk exhausts deterministically.
+        // #7537: no local 413 — the payload is ALWAYS forwarded and the
+        // upstream's response is the authoritative verdict.
         const hugeSystem = "S".repeat(60_000);
         const r2 = await post(hugeSystem, [{ role: "user", content: "go?" }, { role: "assistant", content: "ok" }, { role: "user", content: "again?" }]);
-        const j2 = (await r2.json()) as Record<string, unknown>;
-        assert.equal(r2.status, 413, `deterministic exhaustion must answer 413 (pre-#3461: 502), got ${r2.status}: ${JSON.stringify(j2)}`);
-        const err = j2["error"] as Record<string, unknown>;
-        assert.match(String(err?.["message"]), /NOT forwarded/, "the diagnostic says the payload was not forwarded");
-        assert.match(String(err?.["message"]), /exhaust|window|session/i, "the diagnostic carries the exhaustion reason");
+        assert.equal(r2.status, 200, "payload is forwarded, upstream 200 is the verdict");
+        await r2.text();
+        assert.ok(upstreamCalls >= 2, `the payload was forwarded (upstreamCalls=${upstreamCalls})`);
 
-        // Turn 3 (#4079): identical payload re-runs the deterministic exhaustion
-        // check — same local 413, no marker, and still zero upstream traffic.
+        // Turn 3: same payload again — also forwarded.
         const before = upstreamCalls;
         const r3 = await post(hugeSystem, [{ role: "user", content: "go?" }, { role: "assistant", content: "ok" }, { role: "user", content: "again?" }]);
-        assert.equal(r3.status, 413, "the deterministic 413 verdict replays");
+        assert.equal(r3.status, 200, "resend is also forwarded");
         await r3.text();
-        assert.equal(upstreamCalls, before, "a deterministic local refusal must not touch the upstream");
-        const s = listSessions().find((x) => x.id === id);
-        assert.ok(s, "session exists");
-        assert.equal(s!.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker is written anymore");
+        assert.ok(upstreamCalls > before, "resend reached the upstream");
     } finally {
         await new Promise<void>((r) => proxy.close(() => r()));
         await new Promise<void>((r) => server.close(() => r()));

@@ -156,7 +156,7 @@ test("#574 regression: oldest range's summary unusable → preflight moves to th
     }
 });
 
-test("#574 truthful exhaustion: every range's summary unusable → honest 502 (full walk or provably-futile bail), no forward, no blocks", async () => {
+test("#574 truthful exhaustion: every range's summary unusable → payload forwarded, bounded walk (#7537)", async () => {
     const { server: upstream, calls } = makeUpstream(() => false);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
@@ -172,18 +172,13 @@ test("#574 truthful exhaustion: every range's summary unusable → honest 502 (f
             headers: { "content-type": "application/json", "x-acp-session": "multi-range-exhaust-sess" },
             body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(16, "t2-exhaust") }),
         });
-        assert.equal(r.status, 502, "nothing compressible → fail-fast 502");
-        const json = JSON.parse(await r.text()) as { error?: { code?: string; retryable?: boolean; message?: string } };
-        assert.equal(json.error?.code, "preflight_compress_failed");
-        assert.equal(json.error?.retryable, false);
-        // #1841: the verdict may now be the futility bail (provably cannot
-        // close the gap → stop early with a quantified detail) instead of the
-        // full walk-to-end exhaustion — both are honest, neither claims success.
-        assert.match(json.error?.message ?? "", /(futile round|no range could be compressed)/i, `exhaustion names the multi-range attempt (got: ${json.error?.message})`);
+        // #7537: the payload is ALWAYS forwarded; the upstream 200 is the verdict.
+        assert.equal(r.status, 200, "payload is forwarded, upstream 200 is the verdict");
+        await r.text();
 
         const summaryCalls = calls.filter((c) => !c.stream);
-        assert.ok(summaryCalls.length >= 2, `preflight moved past the bad oldest range before stopping (got ${summaryCalls.length}; legacy made exactly 1)`);
-        assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded");
+        assert.ok(summaryCalls.length >= 1, `preflight made summary calls (got ${summaryCalls.length})`);
+        assert.equal(calls.filter((c) => c.stream).length, 1, "the payload was forwarded");
 
         const s = listSessions()[0];
         const activeBlocks = (s?.state.blocks ?? []).filter((b) => b.active);
@@ -198,21 +193,12 @@ test("#574 truthful exhaustion: every range's summary unusable → honest 502 (f
     }
 });
 
-test("#574 budget cap: many unusable ranges → the base cap (entry overshoot < 1.06x keeps the #1933 raise off) bounds the walk, budget-exhausted detail", async () => {
+test("#574 budget cap: many unusable ranges → payload forwarded, bounded walk (#7537)", async () => {
     const { server: upstream, calls } = makeUpstream(() => false);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
 
-    // #1841 note: with a tiny window (~20x overshoot) the futility gate now
-    // stops the walk BEFORE the budget (that ordering is pinned in
-    // tests/issue1841-preflight-futility.test.ts). To keep THIS test pinning
-    // the budget-exhausted path, the window sits just under the payload
-    // (~1.04x): the required deficit (~9K) stays far below the remaining
-    // foldable pool (~190K × 1.2) at every point, so the futility gate never
-    // fires and the BASE cap (overshoot < 1.06x → no #1933 raise, pinned
-    // raised separately in tests/preflight-round-budget.test.ts) is the
-    // binding bound: 8 failed ranges × 2 calls (whole + minimum size) = 16.
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 230_000 } });
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
@@ -221,17 +207,11 @@ test("#574 budget cap: many unusable ranges → the base cap (entry overshoot < 
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "multi-range-budget-sess" },
-            // #1933 sizing: 200 turns -> ~55 viable ranges, so the base-16
-            // cap runs out while compressible ranges remain visible (the walk
-            // is bounded by the budget, not by exhausting the pool).
             body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(200, "t3-budget") }),
         });
-        assert.equal(r.status, 502, "still over-window after the budget → fail-fast 502");
-        const json = JSON.parse(await r.text()) as { error?: { code?: string; retryable?: boolean; message?: string } };
-        assert.equal(json.error?.code, "preflight_compress_failed");
-        assert.equal(json.error?.retryable, false);
-        assert.match(json.error?.message ?? "", /summarization budget/i, `the budget variant is reported (got: ${json.error?.message})`);
-        assert.match(json.error?.message ?? "", /compressible range\(s\) still visible/, `reports how many compressible ranges remain (got: ${json.error?.message})`);
+        // #7537: the payload is ALWAYS forwarded; the upstream 200 is the verdict.
+        assert.equal(r.status, 200, "payload is forwarded, upstream 200 is the verdict");
+        await r.text();
 
         // #1933/#574: the BASE cap bounds the walk (overshoot < 1.06x keeps the
         // raise off; the raised variant is pinned in preflight-round-budget).
@@ -240,7 +220,7 @@ test("#574 budget cap: many unusable ranges → the base cap (entry overshoot < 
         const summaryCalls = calls.filter((c) => !c.stream);
         assert.ok(summaryCalls.length >= MAX_SUMMARY_CALLS_PER_PREFLIGHT && summaryCalls.length <= MAX_SUMMARY_CALLS_PER_PREFLIGHT + 2,
             `the base call cap bounds the walk (got ${summaryCalls.length})`);
-        assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded");
+        assert.equal(calls.filter((c) => c.stream).length, 1, "the payload was forwarded");
 
         const s = listSessions()[0];
         const activeBlocks = (s?.state.blocks ?? []).filter((b) => b.active);

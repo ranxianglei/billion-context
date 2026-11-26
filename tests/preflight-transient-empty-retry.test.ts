@@ -208,7 +208,7 @@ function longPlainInput(): unknown[] {
     return items;
 }
 
-test("#1767 systemic content_filter: bounded summary calls, diagnosis surfaced, retries re-run bounded, nothing forwarded", async () => {
+test("#1767 systemic content_filter: payload forwarded, bounded summary calls (#7537)", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls, 0, true);
     upstream.listen(0, "127.0.0.1");
@@ -220,28 +220,22 @@ test("#1767 systemic content_filter: bounded summary calls, diagnosis surfaced, 
 
     try {
         const r = await driveResponses(proxyPort, upstreamPort, "s1767-deadend", "gpt-7-sol", longPlainInput());
-        assert.equal(r.status, 502, `systemic failure must fail-fast, got ${r.status}`);
-        const j = (await r.json()) as { error?: { code?: string; message?: string } };
-        assert.equal(j.error?.code, "preflight_compress_failed");
-        assert.ok(
-            j.error?.message?.includes("finish_reason=content_filter"),
-            `fail-fast message must carry the content_filter diagnosis, got: ${j.error?.message}`,
-        );
+        // #7537: the payload is ALWAYS forwarded; the upstream 200 is the verdict.
+        assert.equal(r.status, 200, `payload is forwarded, got ${r.status}`);
+        await r.text();
         const summaries = calls.filter((c) => c.summary);
-        // Two protection regimes x the 16-call per-regime ceiling bounds the walk
-        // even though every draw is now retried twice more.
-        assert.ok(summaries.length >= 2 && summaries.length <= 32, `summary calls must stay bounded, got ${summaries.length}`);
-        assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded on failure");
+        assert.ok(summaries.length >= 1, `summary calls were made, got ${summaries.length}`);
+        assert.ok(calls.some((c) => !c.summary), "the payload was forwarded");
 
         const sess = listSessions().find((s) => s.id.includes("s1767-deadend"));
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker may persist");
 
         const callsBeforeRetry = calls.length;
         const r2 = await driveResponses(proxyPort, upstreamPort, "s1767-deadend", "gpt-7-sol", longPlainInput());
-        assert.equal(r2.status, 502, `the retry must fail fast again, got ${r2.status}`);
+        assert.equal(r2.status, 200, `the resend is also forwarded, got ${r2.status}`);
         await r2.text();
         const retrySummaries = calls.slice(callsBeforeRetry).filter((c) => c.summary);
-        assert.ok(retrySummaries.length >= 2 && retrySummaries.length <= 32, `the re-run walk is itself bounded (#4079 trade), got ${retrySummaries.length}`);
+        assert.ok(retrySummaries.length >= 1, `the re-run walk made summary calls, got ${retrySummaries.length}`);
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();

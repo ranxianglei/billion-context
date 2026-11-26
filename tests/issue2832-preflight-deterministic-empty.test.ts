@@ -233,14 +233,15 @@ async function driveUntilArmed(
     for (let turn = 1; turn <= maxTurns; turn++) {
         const r = await driveChat(proxyPort, upstreamPort, session, model, input);
         const body = await r.text();
-        assert.equal(r.status, 502, `turn ${turn} must fail-fast while the relay is broken, got ${r.status}: ${body.slice(0, 300)}`);
+        // #7537: the payload is ALWAYS forwarded; the upstream 200 is the verdict.
+        assert.equal(r.status, 200, `turn ${turn} must forward while the relay is broken, got ${r.status}: ${body.slice(0, 300)}`);
         if (probeStateOf(session)?.dead === true) return turn;
         await sleep(500);
     }
     throw new Error(`verdict did not arm within ${maxTurns} turns (last state: ${JSON.stringify(probeStateOf(session))})`);
 }
 
-test("#2832 systemic deterministic empties: bounded strikes, sticky verdict, one canary per turn, nothing forwarded", { timeout: 180_000 }, async () => {
+test("#2832 systemic deterministic empties: bounded strikes, sticky verdict, payload forwarded (#7537)", { timeout: 180_000 }, async () => {
     const calls: Call[] = [];
     const failMode = { current: true };
     const upstream = makeUpstream(calls, failMode);
@@ -256,28 +257,22 @@ test("#2832 systemic deterministic empties: bounded strikes, sticky verdict, one
         const armedTurn = await driveUntilArmed(proxyPort, upstreamPort, "s2832-dead", "muse-spark-1.3-contributor", input, 6);
         assert.ok(armedTurn <= 3, `three strikes must arm the verdict within three turns, took ${armedTurn}`);
 
-        // OLD behavior burned 1 draw + 2 retries per span plus the #726
-        // halving cascade for EVERY span of EVERY range EVERY turn (the
-        // incident: 6+ probes in one minute, unbounded across ranges). NEW
-        // behavior pays at most one strike per probe-able range per turn.
         const summariesArmed = calls.filter((c) => c.summary).length;
         assert.ok(summariesArmed >= 3 && summariesArmed <= 6, `total strikes must be bounded (3 to arm, one regime-headroom margin), got ${summariesArmed}`);
-        assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded while the relay is broken");
+        // #7537: the payload is ALWAYS forwarded, even while the relay is broken.
+        assert.ok(calls.some((c) => !c.summary), "the payload was forwarded");
 
         const st = probeStateOf("s2832-dead");
         assert.equal(st!.dead, true, "verdict armed");
         assert.ok(st!.key.includes("muse-spark-1.3-contributor"), "verdict key carries the model");
 
-        // Next turn (no cooldown anymore, #4079): a carried verdict spends EXACTLY ONE canary
-        // probe (old behavior re-burned the full retry budget per span).
+        // Next turn: a carried verdict spends EXACTLY ONE canary probe.
         await sleep(500);
         const r2 = await driveChat(proxyPort, upstreamPort, "s2832-dead", "muse-spark-1.3-contributor", input);
-        assert.equal(r2.status, 502, `carried verdict must still fail-fast, got ${r2.status}`);
-        const j2 = (await r2.json()) as { error?: { code?: string; message?: string } };
-        assert.equal(j2.error?.code, "preflight_compress_failed");
+        assert.equal(r2.status, 200, `carried verdict still forwards, got ${r2.status}`);
+        await r2.text();
         const summariesAfterCanary = calls.filter((c) => c.summary).length;
         assert.equal(summariesAfterCanary, summariesArmed + 1, `a carried verdict allows exactly ONE canary probe per turn, got +${summariesAfterCanary - summariesArmed}`);
-        assert.ok(!calls.slice(summariesArmed).some((c) => !c.summary), "still nothing forwarded");
         assert.equal(probeStateOf("s2832-dead")?.dead, true, "a failed canary keeps the verdict armed");
     } finally {
         proxy.close();
@@ -290,7 +285,7 @@ test("#2832 systemic deterministic empties: bounded strikes, sticky verdict, one
     }
 });
 
-test("#2832 self-healed relay: the canary clears the verdict and folding resumes", { timeout: 180_000 }, async () => {
+test("#2832 self-healed relay: the canary clears the verdict and folding resumes (#7537)", { timeout: 180_000 }, async () => {
     const calls: Call[] = [];
     const failMode = { current: true };
     const upstream = makeUpstream(calls, failMode);

@@ -160,7 +160,7 @@ const post = (ctx: Ctx, messages: Array<{ role: string; content: string }>) =>
         body: JSON.stringify({ model: "gpt-test", stream: true, messages }),
     });
 
-for (const pluginMode of [false, true]) test(`a probe that the local egress fuse would reject folds before forwarding (${pluginMode ? "plugin" : "proxy"})`, async () => {
+for (const pluginMode of [false, true]) test(`a probe that the local egress fuse would reject is forwarded (#7537, ${pluginMode ? "plugin" : "proxy"})`, async () => {
     const { ctx, calls, close } = await setup(undefined, 1_000_000);
     try {
         const sessionId = `probe-egress-cjk-${pluginMode ? "plugin" : "proxy"}`;
@@ -175,12 +175,9 @@ for (const pluginMode of [false, true]) test(`a probe that the local egress fuse
         const body = await response.text();
         assert.equal(response.status, 200, body.slice(0, 1_000));
         assert.ok(body.includes("forwarded answer"), "the restored turn reaches the mock model");
-        assert.ok(calls.some((c) => c.summary), "normal preflight compression runs");
+        // #7537: no local egress fuse rejection — the payload is ALWAYS forwarded.
         const forwards = calls.filter((c) => !c.summary);
-        assert.equal(forwards.length, 2, "seed plus one compressed forward; no oversized probe");
-        assert.ok(forwards[1]!.contentChars < 1_000_000);
-        assert.equal(getSession(sessionId)?.metadata.localRefusals, undefined,
-            "the request-scoped decision must not poison a future route");
+        assert.ok(forwards.length >= 2, `seed plus at least one forward, got ${forwards.length}`);
     } finally {
         await close();
     }

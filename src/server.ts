@@ -3441,10 +3441,11 @@ const PREFLIGHT_KEEPALIVE_MS = 15_000;
 // core text against two bars — window×7.5 (densest live-route billing observed,
 // ~6.8 B/token, #2122) AND an absolute 2MB floor. Module-scoped so both the
 // estimate-only probe (#2313) and the fresh-session forward-once (#3146) share
-// the exact same doom math. Exported for the relay egress fuse (#4079) — the
-// same "no tokenizer at the densest observed density can fit this" bars.
-export const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
-export const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
+// the exact same doom math. #7537 dropped the relay egress fuse's measured-body
+// + byte-floor 413 (only its count gate remains), so these are no longer
+// exported — the relay no longer imports them.
+const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
+const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
 
 function preflightHoldGraceMs(): number {
     return knobPreflightHoldGraceMs();
@@ -3906,11 +3907,11 @@ interface MeasuredOutbound {
 // of the body carries the mass, so "trim the oversized content" tells the
 // operator WHERE (a 55.2 MiB #5000 body with 1.44 MiB of messages[] means the
 // mass is tools[], not a giant paste).
-export function measuredBreakdownClause(b: RawBodyBreakdown): string {
+function measuredBreakdownClause(b: RawBodyBreakdown): string {
     return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
 }
 
-export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {
+function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {
     let parsed: unknown = prepared.parsedBody;
     if (parsed === undefined) {
         const raw = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
