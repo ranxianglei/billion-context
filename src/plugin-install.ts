@@ -2107,8 +2107,13 @@ function isOursZcodeMcpServer(server: unknown): boolean {
 /** Managed-block apply for ~/.zcode/cli/config.json (#1145). Pure over the
  *  parsed doc: enables hooks, upserts our SessionStart entry, and owns ONLY
  *  mcp.servers.bili when it already points at our dist — a user's own "bili"
- *  server throws instead of being clobbered (§7.3). */
-function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry: string; mcpEntry: string }): { data: Record<string, unknown>; notes: string[] } {
+ *  server throws instead of being clobbered (§7.3).
+ *
+ *  nodeCommand is the ABSOLUTE node path (#6891): the ZCode binary spawns this
+ *  JSON command directly — no shell — so a bare `node` only resolves through
+ *  the client process's own PATH, which need not include node. The #1902
+ *  bare-node rule is for the shell-string hooks (claude/kimi) only. */
+function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry: string; mcpEntry: string; nodeCommand: string }): { data: Record<string, unknown>; notes: string[] } {
     const data = structuredClone(doc);
     const notes: string[] = [];
     const hooks = zcodeAsPlain(data.hooks) ?? {};
@@ -2120,7 +2125,7 @@ function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry
     const sessionStart = Array.isArray(events.SessionStart) ? [...(events.SessionStart as unknown[])] : [];
     const kept = sessionStart.filter((e) => !isOursZcodeHookEntry(e));
     if (kept.length !== sessionStart.length) notes.push("replaced a previous bili SessionStart entry");
-    kept.push({ hooks: [{ type: "process", command: "node", args: [opts.hookEntry] }] });
+    kept.push({ hooks: [{ type: "process", command: opts.nodeCommand, args: [opts.hookEntry] }] });
     events.SessionStart = kept;
     hooks.events = events;
     data.hooks = hooks;
@@ -2129,7 +2134,7 @@ function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry
     if (servers.bili !== undefined && !isOursZcodeMcpServer(servers.bili)) {
         throw new Error(`${zcodeUserConfigFile()} already defines mcp.servers.bili owned by something else — rename or remove it first; refusing to overwrite`);
     }
-    servers.bili = { type: "stdio", command: "node", args: [opts.mcpEntry] };
+    servers.bili = { type: "stdio", command: opts.nodeCommand, args: [opts.mcpEntry] };
     mcp.servers = servers;
     data.mcp = mcp;
     return { data, notes };
@@ -2172,7 +2177,7 @@ function zcodeInstall(): string {
     requireDistFile(hookEntry);
     requireDistFile(mcpEntry);
     const file = zcodeUserConfigFile();
-    const { data, notes } = applyZcodeManagedConfig(readJson(file), { hookEntry, mcpEntry });
+    const { data, notes } = applyZcodeManagedConfig(readJson(file), { hookEntry, mcpEntry, nodeCommand: process.execPath });
     writeJson(file, data);
     return `wrote the billion-context hook+MCP into ${file}${notes.length > 0 ? ` (${notes.join("; ")})` : ""} — start a new ZCode session to activate`;
 }
@@ -2410,6 +2415,10 @@ interface LanePresence {
     form: "npm" | "local-path" | "managed-block" | "none";
     copyVersion?: string;
     profiles?: Array<{ name: string; spec?: string; pinned: boolean; bundleInstalled: boolean; copyVersion?: string }>;
+    /** Advisory spawn-command notes (e.g. a bare PATH-resolved token the
+     *  client may not resolve, #6891) — surfaced as doctor warnings; they
+     *  never change the verdict. */
+    spawnWarnings?: string[];
 }
 
 function laneAbsent(): LanePresence {
@@ -2734,14 +2743,41 @@ export function inspectLanePresence(agent: PluginAgent): LanePresence {
             if (path.isAbsolute(a) && /\.(js|ts)$/.test(a)) out.targets.push(a);
         }
     };
+    // #6891: the entry's spawn command is what the ZCode binary executes.
+    // Absolute → existence-checked target (node binary gone → broken verdict);
+    // bare token → resolved through the CLIENT process's PATH, which we cannot
+    // inspect — advisory warning only, the lane still works when node IS on
+    // that PATH, so the verdict must not flip.
+    const checkCommand = (face: string, command: unknown): void => {
+        if (typeof command !== "string" || command.length === 0) return;
+        if (path.isAbsolute(command)) {
+            if (!out.targets.includes(command)) out.targets.push(command);
+        } else {
+            out.spawnWarnings = [...(out.spawnWarnings ?? []), `${face} command "${command}" is a bare PATH-resolved token — if node is not on the ZCode process's PATH the spawn dies silently and compression never activates; rerun 'bili plugin install zcode' to pin the absolute node path (#6891)`];
+        }
+    };
+    // dist args first (targets[0] must stay a dist entry — rootFromDistFile
+    // derives the install root from it), node commands after.
+    const commands: Array<[string, unknown]> = [];
     if (Array.isArray(sessionStart)) {
         for (const e of sessionStart as unknown[]) {
             if (!isOursZcodeHookEntry(e)) continue;
             const hooks = zcodeAsPlain(e)?.hooks;
-            if (Array.isArray(hooks)) for (const h of hooks as unknown[]) collectArgs(zcodeAsPlain(h)?.args);
+            if (Array.isArray(hooks)) {
+                for (const h of hooks as unknown[]) {
+                    const hh = zcodeAsPlain(h);
+                    collectArgs(hh?.args);
+                    commands.push(["SessionStart hook", hh?.command]);
+                }
+            }
         }
     }
-    if (hasMcp) collectArgs(zcodeAsPlain(mcpBili)?.args);
+    if (hasMcp) {
+        const s = zcodeAsPlain(mcpBili);
+        collectArgs(s?.args);
+        commands.push(["MCP server", s?.command]);
+    }
+    for (const [face, command] of commands) checkCommand(face, command);
     const first = out.targets[0];
     if (first !== undefined) out.copyVersion = pkgVersionAt(rootFromDistFile(first));
     return out;

@@ -79,8 +79,21 @@
    language_server 遵循 `HTTPS_PROXY` 且不锁定证书,把
    `daily-cloudcode-pa.googleapis.com`(Antigravity 真实默认端点;裸
    `cloudcode-pa` 名称在 `/v1internal:*` 上 400,#3129)加进 `"mitm".domains`
-   并信任 bili 根 CA 即可。桌面端与 IDE 扩展共用同一条 language_server 通道;启动器只驱动
-  CLI —— 桌面用户可手动导出 `CLOUD_CODE_URL`,或直接用上面的 MITM 配方。
+   并信任 bili 根 CA 即可。桌面端与 IDE 扩展共用同一条 language_server 通道;
+   `bili antigravity-desktop`(#4675)通过完全相同的 lane 驱动桌面二进制(见下)。
+ - **`bili antigravity-desktop`** —— Google Antigravity **桌面端**(IDE 应用)
+   (#4675)。桌面端启动的 Go `language_server` 与 `agy` 完全相同,遵循同一个
+   `CLOUD_CODE_URL` 钩子,因此该启动器复用 `bili antigravity` 完全相同的环境
+   lane —— 只是换掉被启动的二进制。它探测标准桌面安装路径(Windows 为
+   `%LOCALAPPDATA%\Programs\antigravity\Antigravity.exe`,其次
+   `%PROGRAMFILES%\antigravity\Antigravity.exe`;macOS 为
+   `/Applications/Antigravity.app/Contents/MacOS/Antigravity`;Linux 为
+   `/usr/bin/antigravity`,其次 `~/.local/share/antigravity/antigravity`);自定义
+   位置用 `--bin`/`BILI_CLIENT_BIN` 覆盖优先。桌面端是单实例应用:若已有实例在
+   运行,新进程只会聚焦已有窗口后退出(从而拆掉启动器的代理)—— 先关闭已打开的
+   Antigravity 窗口。若要把手动启动的实例挂到运行中的 `bili start` 守护进程上:
+   `export CLOUD_CODE_URL="http://localhost:8787/bili/https://daily-cloudcode-pa.googleapis.com"`,
+   再从该 shell 启动应用(或用上面的 MITM 配方)。
 
 四者都没有 native 模式:均无环内工具注入接缝(gemini-cli 扩展只到自定义命令,
 fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>/` 下的
@@ -102,7 +115,7 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
 
 三种对齐模式:`/bili/` URL 前缀、GUI「设置 → 网络」证书 MITM(HTTP 代理 + 根 CA 路径)、原生插件模式(`bili plugin install zcode`,#1145)。ZCode 的扩展面是 Claude-Code 形状但纯声明式:`~/.zcode/cli/config.json` 里的用户级 hooks 与 stdio MCP server,没有进程内 JS 接缝。所以原生通道随包带两个小 node 脚本,在客户端外围干活:
 
-- **安装:** `bili plugin install zcode` 写 `~/.zcode/cli/config.json`:置 `hooks.enabled = true`、追加一条 `SessionStart` process hook(`node <root>/dist/zcode/bootstrap-hook.js`)、注册 stdio MCP server `mcp.servers.bili`(`node <root>/dist/zcode/mcp-entry.js`)。已存在的用户自有 `mcp.servers.bili` 条目**绝不覆盖** —— 安装器会响亮地拒绝。安装时不冻结任何 URL;路由按会话发生。卸载:`bili plugin remove zcode`(只剥离 bili 自己的条目、由 bili 启用的 `hooks.enabled` 予以还原、provider store 从快照恢复)。
+- **安装:** `bili plugin install zcode` 写 `~/.zcode/cli/config.json`:置 `hooks.enabled = true`、追加一条 `SessionStart` process hook(`<node> <root>/dist/zcode/bootstrap-hook.js`)、注册 stdio MCP server `mcp.servers.bili`(`<node> <root>/dist/zcode/mcp-entry.js`),其中 `<node>` 是 bili 所运行的 node 二进制的**绝对路径**——ZCode 直接 spawn JSON 里的 `command`(无 shell),裸 `node` 只能靠客户端自己的 PATH 解析,PATH 里没有 node 时 spawn 会静默失败(#6891)。已存在的用户自有 `mcp.servers.bili` 条目**绝不覆盖** —— 安装器会响亮地拒绝。安装时不冻结任何 URL;路由按会话发生。卸载:`bili plugin remove zcode`(只剥离 bili 自己的条目、由 bili 启用的 `hooks.enabled` 予以还原、provider store 从快照恢复)。
 - **卸载后的已开会话(#2155):**`bili plugin remove zcode` 无法触及已开着的客户端窗口 —— 它们的 MCP 子进程已死,但代理侧的会话绑定(session metadata)仍在。这类僵尸会话在连续 5 轮“有 nudge、无插件头、线上无 bili 工具、零压缩”后被检测到,随即**自愈降级为代理模式** —— ACP 工具改由代理线上回注、压缩重新由代理接管(nudge 保留)。若线上注入不可用(`compress.injectTool=false`)则改为静默 nudge,直到出现一次压缩缩减自动解除。插件头重现(客户端重启/重装)即在同一请求内恢复 plugin 模式。remove 命令在近 10 分钟内见过活跃会话时会打印提示;web UI 会为这类会话挂“自愈”徽标。
 - **每会话自举:** 每个 ZCode 会话把 MCP 子进程作为直接子进程拉起;启动时附着到健康代理(`BILLION_CONTEXT_PROXY`)或在临时端口自拉起,然后在 mkdir 锁文件下对生效的 provider store 做幂等 JSON 手术:每个可路由 provider 条目的 `baseURL` 变为 `http://127.0.0.1:<port>/bili/<上游>`(你设的自定义 baseURL 原样保留在包装之内)。两代 store 都处理:legacy `~/.zcode/v2/config.json`(`provider.<id>.options.baseURL`)与 v3.14+ personal store `~/.zcode/v2/provider_config.json`(`config.providerConfigRules.providerRules[].config.api.baseUrl`)—— 两者并存时以新 store 为准(其中哪些条目路由、哪些被跳过见下方路由范围)。原始文件按每次用户编辑快照到 `<file>.bili-bak`(快照永远反映你最后一次真实状态,绝不记录 bili 自己的写入);其余所有键逐字节保留。旧世代客户端在启动时加载 provider 配置 —— 安装后重启一次 ZCode;新版构建可在会话中途感知路由变化(约 1 s 轮询)。`SessionStart` hook 机会性地跑同一套自举(仅附着 —— 绝不 spawn);它的非阻塞竞态被设计为可容忍:第一轮可以走 wire 模式,不变量是 `baseURL` 永不指向死端口。
 - **Plugin 模式盖章:** MCP 子进程对着存活代理清单核验 ACP 工具列表之后,才给路由条目加 `headers["x-bili-plugin"] = "zcode"` —— 此前流量走 wire 模式。工具调用经每次调用的 `conversation_id` 参数绑定(#760)。

@@ -7755,6 +7755,80 @@ test("resolveClientCommand: antigravity/mcode honor the injectable platform para
     }
 });
 
+test("resolveClientCommand: antigravity-desktop probes standard desktop install paths (#4675)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-agydesk-home-"));
+    const localAppData = fs.mkdtempSync(path.join(os.tmpdir(), "bili-agydesk-lad-"));
+    const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), "bili-agydesk-pf-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    try {
+        process.env.HOME = home;
+        // os.homedir() reads USERPROFILE on win32, not HOME — seal it so the
+        // non-win32 expectations hold on every host (CI runs on Windows).
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = home;
+        // win32: %LOCALAPPDATA%\Programs\antigravity\Antigravity.exe is preferred.
+        const winLocal = path.join(localAppData, "Programs", "antigravity", "Antigravity.exe");
+        fs.mkdirSync(path.dirname(winLocal), { recursive: true });
+        fs.writeFileSync(winLocal, "");
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz", LOCALAPPDATA: localAppData, PROGRAMFILES: programFiles }, "win32", { desktop: true }),
+            { command: winLocal, prefixArgs: [] },
+        );
+        // win32: falls back to %PROGRAMFILES%\antigravity\Antigravity.exe when the
+        // LOCALAPPDATA candidate is absent (no LOCALAPPDATA in env → home fallback).
+        const winPf = path.join(programFiles, "antigravity", "Antigravity.exe");
+        fs.mkdirSync(path.dirname(winPf), { recursive: true });
+        fs.writeFileSync(winPf, "");
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz", PROGRAMFILES: programFiles }, "win32", { desktop: true }),
+            { command: winPf, prefixArgs: [] },
+        );
+        // darwin: /Applications/Antigravity.app/Contents/MacOS/Antigravity (the
+        // bare first candidate is returned when the app is not installed).
+        // Expected value built with path.join (same as the #2260 test) so the
+        // host-independent platform injection holds on Windows runners too —
+        // the production darwin branch path.joins, which yields backslashes
+        // on a win32 host.
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz" }, "darwin", { desktop: true }),
+            { command: path.join("/Applications", "Antigravity.app", "Contents", "MacOS", "Antigravity"), prefixArgs: [] },
+        );
+        // linux: /usr/bin/antigravity is the first candidate (returned when absent).
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz" }, "linux", { desktop: true }),
+            { command: "/usr/bin/antigravity", prefixArgs: [] },
+        );
+        // linux: falls back to ~/.local/share/antigravity/antigravity when
+        // /usr/bin/antigravity is absent.
+        const linuxLocal = path.join(home, ".local", "share", "antigravity", "antigravity");
+        fs.mkdirSync(path.dirname(linuxLocal), { recursive: true });
+        fs.writeFileSync(linuxLocal, "");
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz" }, "linux", { desktop: true }),
+            { command: linuxLocal, prefixArgs: [] },
+        );
+        // BILI_CLIENT_BIN (--bin) override still wins for the desktop lane.
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz", BILI_CLIENT_BIN: "/custom/Antigravity" }, "win32", { desktop: true }),
+            { command: "/custom/Antigravity", prefixArgs: [] },
+        );
+        // the CLI lane is unchanged: without { desktop: true } it still resolves agy.
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz", LOCALAPPDATA: localAppData }, "win32"),
+            { command: path.join(localAppData, "agy", "bin", "agy"), prefixArgs: [] },
+        );
+    } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        rmrf(home);
+        rmrf(localAppData);
+        rmrf(programFiles);
+    }
+});
+
 test("runLaunch mcode: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_CA_CERTS), discovered host whitelist, model windows (#1050)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-launch-"));
     const prevHome = process.env.HOME;
