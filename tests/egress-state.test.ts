@@ -31,6 +31,7 @@ import {
     EgressStateCorruptError,
     diffEgressView,
     egressReplay,
+    EGRESS_SYSTEM_MSGID,
     type EgressOp,
     type EgressViewRow,
 } from "../src/storage/egress-state.ts";
@@ -441,6 +442,149 @@ test("fork: whole-table copy — the child inherits the parent number space and 
         const none = egressFork(H.db, "stranger", C);
         assert.equal(none, 0, "fork from a session without egress rows is a no-op");
         assert.throws(() => egressFork(H.db, P, P), /conflicting fork lineage/);
+    } finally {
+        close(H);
+    }
+});
+
+// ---- number-lifecycle reconciliation (#7758) ---------------------------
+
+test("U-with-num: the frozen-log repro — dense placeholders retire, the kernel citation lands (self-heal)", () => {
+    const H = open();
+    try {
+        const S = "sess-7758-repro";
+        // Turn 1: system + two cited messages (a=1, b=2).
+        egressStateAppend(H.db, S, [
+            { type: "I", msgid: EGRESS_SYSTEM_MSGID, after: null, ref: "", tokens: 0, typeTag: "system", bytes: "h_sys" },
+            { type: "I", msgid: "a", after: EGRESS_SYSTEM_MSGID, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a", num: 1 },
+            { type: "I", msgid: "b", after: "a", ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_b", num: 2 },
+        ], 1_000);
+        // Turn 2 (the compress round): the compress tool call + result have NO
+        // refs entry (protected) → dense fallback 3, 4.
+        egressStateAppend(H.db, S, [
+            { type: "I", msgid: "cc", after: "b", ref: "", tokens: 1, typeTag: "tool", bytes: "h_cc" },
+            { type: "I", msgid: "cr", after: "cc", ref: "", tokens: 1, typeTag: "tool", bytes: "h_cr" },
+        ], 2_000);
+        const view = egressStateView(H.db, S);
+        assert.deepEqual(view.map((r) => r.msgid), [EGRESS_SYSTEM_MSGID, "a", "b", "cc", "cr"]);
+        assert.deepEqual(view.map((r) => r.num), [0, 1, 2, 3, 4]);
+
+        // Turn 3 (the next round): the compress pair is still in the client
+        // view (resend) but still has no refs → next-view num 0 (demotion).
+        // A NEW assistant message is cited at 3 (the kernel counter never saw
+        // the pair, so its next number is 3). WITHOUT reconciliation the I(3)
+        // collides with the dense cc=3 and the log freezes; WITH it the pair
+        // retires 3/4 and the citation lands.
+        const ops = diffEgressView(
+            view,
+            [
+                { ...view[0] },
+                { ...view[1] },
+                { ...view[2] },
+                { ...view[3], num: 0 },
+                { ...view[4], num: 0 },
+                { num: 3, msgid: "new", ref: "m00003", tokens: 1, type: "text", bytes: "h_new" },
+            ],
+            { reconcileNum: true },
+        );
+        assert.deepEqual(ops, [
+            { type: "U", msgid: "cc", bytes: "h_cc", num: 0 },
+            { type: "U", msgid: "cr", bytes: "h_cr", num: 0 },
+            { type: "I", msgid: "new", after: "cr", ref: "m00003", tokens: 1, typeTag: "text", bytes: "h_new", num: 3 },
+        ]);
+        egressStateAppend(H.db, S, ops, 3_000);
+        const after = egressStateView(H.db, S);
+        assert.deepEqual(after.map((r) => r.msgid), [EGRESS_SYSTEM_MSGID, "a", "b", "cc", "cr", "new"]);
+        assert.deepEqual(after.map((r) => r.num), [0, 1, 2, 0, 0, 3]);
+        assert.equal(after.find((r) => r.msgid === "new")!.num, 3, "the kernel citation landed");
+    } finally {
+        close(H);
+    }
+});
+
+test("U-with-num: a re-pin to a number still held by a LIVE row is corrupt (thrown, nothing written)", () => {
+    const H = open();
+    try {
+        const S = "sess-7758-collide";
+        egressStateAppend(H.db, S, [
+            { type: "I", msgid: EGRESS_SYSTEM_MSGID, after: null, ref: "", tokens: 0, typeTag: "system", bytes: "h_sys" },
+            { type: "I", msgid: "a", after: EGRESS_SYSTEM_MSGID, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a", num: 1 },
+            { type: "I", msgid: "b", after: "a", ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_b", num: 2 },
+            { type: "I", msgid: "cc", after: "b", ref: "", tokens: 1, typeTag: "tool", bytes: "h_cc" },
+        ], 1_000);
+        assert.deepEqual(egressStateView(H.db, S).map((r) => r.num), [0, 1, 2, 3]);
+        // Re-pin a from 1 to 3 — but cc still holds 3 (LIVE). Corrupt.
+        assert.throws(
+            () => egressStateAppend(H.db, S, [{ type: "U", msgid: "a", bytes: "h_a2", num: 3 }], 2_000),
+            (e: unknown) => e instanceof EgressStateCorruptError && /cited number 3 is already live/.test(e.message),
+        );
+        // nothing was written; the session is on its last healthy point
+        assert.deepEqual(egressStateView(H.db, S).map((r) => r.num), [0, 1, 2, 3]);
+    } finally {
+        close(H);
+    }
+});
+
+test("U-with-num: 0→N promotion is legal when the target slot is free", () => {
+    const H = open();
+    try {
+        const S = "sess-7758-promote";
+        egressStateAppend(H.db, S, [
+            { type: "I", msgid: EGRESS_SYSTEM_MSGID, after: null, ref: "", tokens: 0, typeTag: "system", bytes: "h_sys" },
+            { type: "I", msgid: "a", after: EGRESS_SYSTEM_MSGID, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a", num: 1 },
+            { type: "I", msgid: "b", after: "a", ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_b", num: 2 },
+            { type: "I", msgid: "cc", after: "b", ref: "", tokens: 1, typeTag: "tool", bytes: "h_cc" },
+        ], 1_000);
+        // Demote cc (3→0).
+        egressStateAppend(H.db, S, [{ type: "U", msgid: "cc", bytes: "h_cc", num: 0 }], 2_000);
+        assert.equal(egressStateView(H.db, S).find((r) => r.msgid === "cc")!.num, 0, "cc demoted");
+        // Promote cc back to 5 (a free slot, above the high water).
+        egressStateAppend(H.db, S, [{ type: "U", msgid: "cc", bytes: "h_cc", num: 5 }], 3_000);
+        assert.equal(egressStateView(H.db, S).find((r) => r.msgid === "cc")!.num, 5, "cc re-pinned to 5");
+    } finally {
+        close(H);
+    }
+});
+
+test("U-with-num: full-chain roundtrip — state replay / compaction base / flow replay agree; the dense cursor never reuses a retired number", () => {
+    const H = open();
+    try {
+        const S = "sess-7758-roundtrip";
+        // Turn 1: system + a(1), b(2) cited; cc(3), cr(4) dense.
+        egressStateAppend(H.db, S, [
+            { type: "I", msgid: EGRESS_SYSTEM_MSGID, after: null, ref: "", tokens: 0, typeTag: "system", bytes: "h_sys" },
+            { type: "I", msgid: "a", after: EGRESS_SYSTEM_MSGID, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a", num: 1 },
+            { type: "I", msgid: "b", after: "a", ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_b", num: 2 },
+            { type: "I", msgid: "cc", after: "b", ref: "", tokens: 1, typeTag: "tool", bytes: "h_cc" },
+            { type: "I", msgid: "cr", after: "cc", ref: "", tokens: 1, typeTag: "tool", bytes: "h_cr" },
+        ], 1_000);
+        // Turn 2 (self-heal): cc, cr demote; new cited at 3.
+        egressStateAppend(H.db, S, [
+            { type: "U", msgid: "cc", bytes: "h_cc", num: 0 },
+            { type: "U", msgid: "cr", bytes: "h_cr", num: 0 },
+            { type: "I", msgid: "new", after: "cr", ref: "m00003", tokens: 1, typeTag: "text", bytes: "h_new", num: 3 },
+        ], 2_000);
+        const expected = egressStateView(H.db, S);
+        assert.deepEqual(expected.map((r) => r.msgid), [EGRESS_SYSTEM_MSGID, "a", "b", "cc", "cr", "new"]);
+        assert.deepEqual(expected.map((r) => r.num), [0, 1, 2, 0, 0, 3]);
+
+        // Compact: the base carries the demoted 0s and the re-pinned 3 inline.
+        egressStateCompact(H.db, S, expected, 3_000);
+        assert.deepEqual(egressStateView(H.db, S), expected, "state replay after compact == before");
+
+        // Flow replay (rollback reconstruction at the base) agrees.
+        const baseSeq = (H.db.prepare("SELECT MAX(op_seq) AS o FROM egress_flow WHERE session_id = ?").get(S) as { o: number }).o;
+        assert.deepEqual(egressStateAt(H.db, S, baseSeq), expected, "flow replay at the base == expected");
+
+        // The dense cursor never reuses a retired number: a new UNCITED row
+        // lands above the high water (3 was retired by the demotion, 4 too).
+        egressStateAppend(H.db, S, [
+            { type: "I", msgid: "zz", after: "new", ref: "", tokens: 1, typeTag: "text", bytes: "h_zz" },
+        ], 4_000);
+        const zz = egressStateView(H.db, S).find((r) => r.msgid === "zz")!;
+        assert.ok(zz.num > 4, `the dense fallback lands above every retired number (got ${zz.num})`);
+        assert.notEqual(zz.num, 3, "never reuses the retired 3");
+        assert.notEqual(zz.num, 4, "never reuses the retired 4");
     } finally {
         close(H);
     }

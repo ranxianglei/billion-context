@@ -957,7 +957,9 @@ export async function prepareOpenai(
     // ops (rollout-gated, default off — zero rows, zero cost). Skipped when
     // the serve path already ran or when the authority seam ran but did not
     // swap (ruling 7439-5: never advance the flow with untrusted client
-    // bytes); a corrupt log skips this turn and self-heals next.
+    // bytes); a corrupt log skips this turn — the log does NOT advance on a
+    // corrupt point, so serving degrades to the client's own bytes until the
+    // point is repaired or the session is reset.
     // The bootstrap exception (ruling 7439-5 turn 1): an armed turn with an
     // empty flow records the client view ONCE — that is the cold start, not
     // "untrusted bytes advancing the flow" (there is no flow to advance
@@ -982,7 +984,7 @@ export async function prepareOpenai(
             if (err instanceof EgressConcurrentWriteError) {
                 log("warn", `[${sessionId}] egress op-log recording skipped this turn (another request on this session recorded first): ${String(err)}`);
             } else {
-                log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
+                log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — the log does NOT advance on this turn; serving degrades to the client's own bytes until the point is repaired or the session is reset): ${String(err)}`);
             }
         }
     }

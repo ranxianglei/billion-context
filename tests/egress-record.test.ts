@@ -183,6 +183,58 @@ test("recording: nudge-shaped churn is EXCLUDED (ephemeral rows never recorded)"
     }
 });
 
+test("#7758: three rounds — protected rows demote, the kernel citation lands, re-home after protection lifts (end-to-end self-heal)", () => {
+    const H = open();
+    try {
+        const S = "sess-7758-e2e";
+        const store = H.store;
+        const batches: EgressOp[][] = [];
+        const spy: EgressOpLogStore = {
+            ...store,
+            egressAppendTurn: (sid, ops, baseSeq, nowMs) => {
+                batches.push(ops);
+                return store.egressAppendTurn(sid, ops, baseSeq, nowMs);
+            },
+        };
+        // Round 1: a, b cited (1, 2).
+        let view = recordEgressTurn({ store: spy, sessionId: S, prev: undefined, conversation: [M("a", "1"), M("b", "2", "assistant")], systemText: "SYS", nowMs: 1000, refMap: { byRaw: { a: "m00001", b: "m00002" } } });
+        assert.deepEqual(view.map((r) => r.num), [0, 1, 2]);
+
+        // Round 2 (the compress round): cc, cr (the compress tool call + result)
+        // have NO refs entry (protected) → dense fallback 3, 4.
+        view = recordEgressTurn({ store: spy, sessionId: S, prev: view, conversation: [M("a", "1"), M("b", "2", "assistant"), M("cc", "cc", "tool"), M("cr", "cr", "tool")], systemText: "SYS", nowMs: 2000, refMap: { byRaw: { a: "m00001", b: "m00002" } } });
+        assert.deepEqual(view.map((r) => r.msgid), [EGRESS_SYSTEM_MSGID, "a", "b", "cc", "cr"]);
+        assert.deepEqual(view.map((r) => r.num), [0, 1, 2, 3, 4]);
+
+        // Round 3 (the next round): cc, cr still protected (no refs) → demote
+        // to 0; new is cited at 3 (the kernel counter never saw the pair).
+        // WITHOUT reconciliation the I(3) collides with the dense cc=3 and the
+        // log freezes; WITH it the pair retires 3/4 and the citation lands.
+        view = recordEgressTurn({ store: spy, sessionId: S, prev: view, conversation: [M("a", "1"), M("b", "2", "assistant"), M("cc", "cc", "tool"), M("cr", "cr", "tool"), M("new", "3", "assistant")], systemText: "SYS", nowMs: 3000, refMap: { byRaw: { a: "m00001", b: "m00002", new: "m00003" } } });
+        assert.deepEqual(view.map((r) => r.msgid), [EGRESS_SYSTEM_MSGID, "a", "b", "cc", "cr", "new"]);
+        assert.deepEqual(view.map((r) => r.num), [0, 1, 2, 0, 0, 3]);
+        const ops = batches[2];
+        assert.ok(ops !== undefined && ops.length > 0, "round 3 was recorded (the log did NOT freeze)");
+        const uNums: { msgid: string; num: number }[] = [];
+        for (const o of ops) {
+            if (o.type === "U" && typeof o.num === "number") uNums.push({ msgid: o.msgid, num: o.num });
+        }
+        assert.deepEqual(uNums, [{ msgid: "cc", num: 0 }, { msgid: "cr", num: 0 }], "the compress pair demoted (U-with-num)");
+        const ins = ops.filter((o) => o.type === "I");
+        assert.equal(ins.length, 1, "exactly one new row");
+        assert.equal(ins[0].msgid, "new");
+        assert.equal(ins[0].num, 3, "the kernel citation landed at 3");
+
+        // Round 4 (protection lifts): cc, cr are now cited (the kernel numbers
+        // them 4, 5 — continuing past the retired 3). They re-home to their
+        // citations.
+        view = recordEgressTurn({ store: spy, sessionId: S, prev: view, conversation: [M("a", "1"), M("b", "2", "assistant"), M("cc", "cc", "tool"), M("cr", "cr", "tool"), M("new", "3", "assistant")], systemText: "SYS", nowMs: 4000, refMap: { byRaw: { a: "m00001", b: "m00002", new: "m00003", cc: "m00004", cr: "m00005" } } });
+        assert.deepEqual(view.map((r) => r.num), [0, 1, 2, 4, 5, 3], "cc, cr re-homed to their citations");
+    } finally {
+        close(H);
+    }
+});
+
 test("#3617 negative direction: the plane can be forced OFF → gate never opens", () => {
     const saved = process.env.BILI_ROLLOUT_EGRESS_PLANE;
     process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";

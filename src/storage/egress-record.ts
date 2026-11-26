@@ -211,7 +211,13 @@ export function recordEgressTurn(args: {
         prev = store.egressStateView(sessionId);
     }
     const next = buildEgressViewRows(conversation, systemText, refMap);
-    const ops = diffEgressView(prev, next);
+    // #7758: reconcile a row's number only when the refs ledger was actually
+    // consulted — a num of 0 there means "no citation" (the row lost its
+    // number). Without byRaw, a 0 means "unknown" (the caller has no ledger),
+    // so a demotion would be invented out of nothing: keep the old
+    // msgid+bytes-only diff.
+    const reconcileNum = refMap?.byRaw !== undefined;
+    const ops = diffEgressView(prev, next, { reconcileNum });
     let stamped: EgressViewRow[];
     if (ops.length === 0) {
         stamped = prev;
