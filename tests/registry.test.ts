@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { contextFromRegistry, peekRegistryContext, providerFromHost, newerFallback, bundledSnapshotLookup, bundledRegistryForTestsOnly, _resetForTest, _setForTest } from "../src/registry.ts";
+import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, providerFromHost, newerFallback, bundledSnapshotLookup, bundledRegistryForTestsOnly, _resetForTest, _setForTest } from "../src/registry.ts";
 
 test("providerFromHost maps minimax domains", () => {
     assert.equal(providerFromHost("api.minimax.chat"), "minimax");
@@ -235,4 +235,30 @@ test("roster lookup is case-insensitive on exact keys and the relay scan (#2074)
     assert.equal(peekRegistryContext("MiniMax-M3", "api.minimax.chat"), 1_048_576);
     // Genuinely absent models still miss.
     assert.equal(peekRegistryContext("nope-xyz", "relay.example"), undefined);
+});
+
+
+test("relay suffix lookup preserves nested ids, case collisions and table replacement", () => {
+    _resetForTest();
+    const rows = {
+        "relayA/Family/Model": { limit: { context: 1000, output: 100 } },
+        "relayB/family/model": { limit: { context: 2000, output: 80 } },
+        "RELAYB/FAMILY/MODEL": { limit: { context: 3000, output: 90 } },
+        "relayC/Other/Model": { limit: { context: 4000, output: 200 } },
+        "relayD/Family/OtherModel": { limit: { context: 9000, output: 900 } },
+        "relayE/Family/Modeling": { limit: { context: 8000, output: 800 } },
+    };
+    _setForTest(rows);
+    for (let repeat = 0; repeat < 2; repeat++) {
+        assert.equal(peekRegistryContext("Family/Model", "relay.example"), 3000);
+        assert.equal(peekRegistryOutputLimit("FAMILY/MODEL", "relay.example"), 100);
+        assert.equal(peekRegistryContext("model-thinking", "relay.example"), 4000);
+        assert.equal(peekRegistryOutputLimit("model", "relay.example"), 200);
+        assert.equal(peekRegistryContext("odel", "relay.example"), undefined);
+        assert.equal(peekRegistryContext("Family/Model", "api.openai.com"), undefined);
+        assert.equal(peekRegistryContext("relayB/family/model", "relay.example"), 2000);
+    }
+    _setForTest({ "new/Family/Model": { limit: { context: 7000, output: 700 } } });
+    assert.equal(peekRegistryContext("family/model", "relay.example"), 7000);
+    assert.equal(peekRegistryOutputLimit("model", "relay.example"), 700);
 });

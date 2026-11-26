@@ -142,6 +142,10 @@ export const LIVE_FILES = [
     "tests/pack-install.test.ts",
     // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
     "tests/ci-janitor-fork-heads.test.ts",
+    // Spawns short-lived `bash -c` children executing the extracted ci.yml plan
+    // script with env fixtures; results land in mkdtemp dirs — no ports, no
+    // credentials, no long-lived listeners, safe under --test-concurrency.
+    "tests/ci-stale-pr-gate.test.ts",
     // Heap-bounded log readers in isolated children; private files, no sockets.
     "tests/web-logs-query.test.ts",
     // Native-zstd absence is simulated in an isolated Node child; it binds
@@ -150,6 +154,17 @@ export const LIVE_FILES = [
     // One Linux-only Node child reads fixture system CAs and exits within 10s;
     // no child ports or network I/O. In-process HTTPS fixtures use listen(0).
     "tests/upstream-ca-default-trust.test.ts",
+    // #7156: the close-time cache-refresh gate test spawns ONE bare `node -e`
+    // dummy child purely as a live PID holder for the <db>.lock fixture — no
+    // ports, no servers, mkdtemp-isolated per test, SIGKILL'd in t.after, so
+    // the zone band is irrelevant; the entry is for the tripwire, like
+    // #5046/#4612.
+    "tests/storage-integrity-cache.test.ts",
+    // #7156: the only child is spawnSync("true") in freshDeadPid() — a
+    // guaranteed-dead pid for the stale-lock fixture; no ports, no servers,
+    // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
+    // for the tripwire, like #5046/#4612.
+    "tests/storage-backup-repair.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

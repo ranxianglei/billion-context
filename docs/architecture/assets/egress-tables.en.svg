@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="470" viewBox="0 0 1240 470"><defs><marker id="ah" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L10,3 L0,6 z" fill="#3a5a8a"/></marker></defs>
+<rect width="1240" height="470" fill="#ffffff"/>
+<text x="40" y="36" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="16" font-weight="bold" fill="#1a2b4a">Egress plane tables (dual clocks + one-way pointer)</text>
+<rect x="40" y="70" width="360" height="170" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="52" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_flow — message op log (authority)</text>
+<text x="52" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq), dense above the</text>
+<text x="52" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">retention floor (#7574)</text>
+<text x="52" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">row_type: I insert / D delete / U update / B base</text>
+<text x="52" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">I rows: msgid + log_seq (canonical, never</text>
+<text x="52" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">reissued)</text>
+<text x="52" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">B rows: payload {entries, highWater}</text>
+<text x="52" y="200" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">= live view at that point + message frontier</text>
+<text x="52" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">compaction physically prunes rows below the</text>
+<text x="52" y="230" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">newest base (retention floor)</text>
+<rect x="40" y="270" width="360" height="100" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="52" y="290" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_state — read replica</text>
+<text x="52" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq); ordered by log_seq</text>
+<text x="52" y="325" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Replayed from flow in the same tx, every write</text>
+<text x="52" y="340" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">snapPinLiveIds / serving reads hit it; bounded</text>
+<rect x="460" y="70" width="360" height="170" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="472" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_block_flow — block history (own number pool)</text>
+<text x="472" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq) — its own clock</text>
+<text x="472" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">row_type: I born / U changed / B compacted</text>
+<text x="472" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">snapshot: {tier, startMsgid, startSeq,</text>
+<text x="472" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">endMsgid, endSeq, supersedesBlockId,</text>
+<text x="472" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">active, reaped, one, full}</text>
+<text x="472" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">one = block full text (full = complete JSON)</text>
+<text x="472" y="200" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">kstate sidecar: residual field list</text>
+<rect x="460" y="270" width="360" height="90" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="472" y="290" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_block_state — latest snapshot per block</text>
+<text x="472" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, block_id); same pointer</text>
+<text x="472" y="325" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">On-demand decompress reads here, not the flow</text>
+<rect x="880" y="70" width="320" height="110" rx="8" fill="#e8f6ec" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="892" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">sessions.r3_latched_at (#7617)</text>
+<text x="892" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">R3 identity-fault latch; NULL/0 = not latched</text>
+<text x="892" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Dual carrier: reads ?? legacy l1_world column</text>
+<text x="892" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Clear resets BOTH carriers</text>
+<rect x="880" y="220" width="320" height="140" rx="8" fill="#f3f3f3" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="892" y="240" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">conversations (retiring)</text>
+<text x="892" y="260" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Host-identity claim table</text>
+<text x="892" y="275" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress-on no longer needs a claim (stateless)</text>
+<text x="892" y="290" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Physical DROP on the retirement register</text>
+<text x="892" y="305" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">(deprecations.md)</text>
+<line x1="400" y1="320" x2="456" y2="320" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/><path d="M 640 70 L 640 44 L 220 44 L 220 70" fill="none" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="430" y="34" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" text-anchor="middle" font-weight="bold">flow_op_seq = flow.MAX(op_seq) at write time</text><text x="430" y="42" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#7a3b0f" text-anchor="middle">non-decreasing, so &lt;= X is a prefix; point forks filter block rows by it</text>
+<rect x="880" y="390" width="320" height="60" rx="8" fill="#fff6e6" stroke="#3a5a8a" stroke-width="1.5"/>
+<text x="892" y="410" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">Why dual clocks</text>
+<text x="892" y="430" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Shared clock: fold block rows land 2 op_seqs past</text>
+<text x="892" y="445" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">flow rows → broke the density invariant (rejected)</text>
+</svg>

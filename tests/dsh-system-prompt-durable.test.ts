@@ -41,7 +41,6 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getSession, _resetSessionsForTest } from "../src/session.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
-import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import {
     dshSystemPromptPath,
     durableMessageToolPaths,
@@ -242,7 +241,7 @@ describe("dshSystemPromptPath units", () => {
     test("the twelve user-channel identities resolve exactly as before", () => {
         const samples: Array<[string, string]> = [
             ["\x3csystem-reminder\x3e \x3cavailable_skills\x3e updated catalog \x3c/available_skills\x3e", "durable/skill-catalog"],
-            ["Instructions from: /home/x/.dsh/AGENTS.md", "durable/agents-md"],
+            ["\x3csystem-reminder\x3e Instructions from: /home/x/.dsh/AGENTS.md", "durable/agents-md"],
             ["Current runtime context. This snapshot supersedes earlier runtime-context snapshots.", "durable/runtime-context"],
             ["\x3cmcp_catalog\x3e registered servers \x3c/mcp_catalog\x3e", "durable/mcp-catalog"],
             ["Time sampled while preparing turn 9, step 1: 2026-11-01T00:00:00Z", "oneshot/time-context"],
@@ -412,12 +411,12 @@ describe("fold geometry through the wire codec (latest-per-identity)", () => {
     test("the four durable carriers keep their own latest slot next to the prompt", () => {
         const config = dshConfig();
         const msgs: CoreMessage[] = [
-            mk("c1", "user", "\x3cavailable_skills\x3e v1 \x3c/available_skills\x3e"),
-            mk("c2", "user", "Instructions from: /repo/AGENTS.md"),
+            mk("c1", "user", "\x3csystem-reminder\x3e \x3cavailable_skills\x3e v1 \x3c/available_skills\x3e"),
+            mk("c2", "user", "\x3csystem-reminder\x3e Instructions from: /repo/AGENTS.md"),
             mk("c3", "user", "\x3cmcp_catalog\x3e fs \x3c/mcp_catalog\x3e"),
             mk("c4", "user", "Current runtime context. sandbox=on"),
             mk("p1", "system", PROMPT_V2),
-            mk("c5", "user", "\x3cavailable_skills\x3e v2 \x3c/available_skills\x3e"),
+            mk("c5", "user", "\x3csystem-reminder\x3e \x3cavailable_skills\x3e v2 \x3c/available_skills\x3e"),
             // A prompt that documents the harness' own markers must not demote
             // the real carriers above.
             mk("p2", "system", `${PROMPT_V3} The catalog arrives as \x3cavailable_skills\x3e; workspace rules as "Instructions from:"; state as "Current runtime context"; servers as \x3cmcp_catalog\x3e.`),
@@ -441,7 +440,7 @@ describe("fold geometry through the wire codec (latest-per-identity)", () => {
         const { res, folded } = fold(msgs, config, "m00001", "m00006");
         assert.equal(res.result.blocksCreated, 1, `got errors=${JSON.stringify(res.result.errors)} warnings=${JSON.stringify(res.result.warnings)}`);
         assert.deepEqual([...folded].sort(), ["o1", "o2"], "#3953 keeps everything at/after the live request visible, prompt included");
-        assert.ok(res.result.warnings.some((w) => w.startsWith("Excluded") && w.includes("Last-user anchor: m00003")), `receipt names the anchor ref, got: ${JSON.stringify(res.result.warnings)}`);
+        assert.ok(res.result.warnings.some((w) => w.startsWith("Excluded") && w.includes("Last-user anchor (historical quote, NOT a new user message): m00003")), `receipt names the anchor ref, got: ${JSON.stringify(res.result.warnings)}`);
     });
 
     test("whole-identity takeover still wins: a user-configured durable pattern replaces the default", () => {
@@ -506,7 +505,6 @@ async function startRig(): Promise<Rig> {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetSessionOrderForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
