@@ -91,7 +91,13 @@ export function installWebSocketBridge(
     /** #300/#3073: this server's per-instance identity for the x-bili-hop chain stamp (see WsBridgeContext.instanceId). */
     instanceId?: string,
 ): (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean {
-    const wss = new WebSocketServer({ noServer: true, maxPayload: limitsReceiveBytes(), perMessageDeflate: false });
+    // #7047: `wss` is re-created lazily by the upgrade handler when it detects
+    // the wss was closed by a ladder re-listen (see `wssDead` below) — the
+    // #2941 post-bind ladder re-listens the SAME server object, and the 'close'
+    // backstop kills the wss (the ws library never reopens a closed
+    // WebSocketServer), so a fresh wss on the next upgrade keeps the lane alive.
+    let wss = new WebSocketServer({ noServer: true, maxPayload: limitsReceiveBytes(), perMessageDeflate: false });
+    let wssDead = false;
     const sessions = new Set<{ session: WsBridgeSession; peer: WebSocket }>();
     const pendingUpgrades = new Set<Duplex>();
     let closing = false;
@@ -115,6 +121,7 @@ export function installWebSocketBridge(
         for (const { session } of sessions) session.shutdown("server-close");
         for (const peer of wss.clients) peer.terminate();
         wss.close();
+        wssDead = true;
     });
     return (source, socket, head) => {
         const admitted = isLoopbackAddress(source.socket.remoteAddress);
@@ -127,6 +134,22 @@ export function installWebSocketBridge(
             return upstream === undefined ? [] : [{ codec: candidate, upstream, conversationId }];
         })[0] : undefined;
         if (!claim) return false;
+        // #7047: the #2941 post-bind ladder closes the bound port and
+        // re-listens the SAME server object. The 'close' backstop has run
+        // (wssDead) and an upgrade can only arrive after that backstop if the
+        // server re-listened ('close' fires only once every connection is
+        // gone; server.listening flips back to true on the re-listen and is
+        // still false while a real shutdown close is in flight) — so the
+        // shutdown latch no longer applies: reset it and re-arm the wss (the
+        // ws library never reopens a closed WebSocketServer; without this
+        // every later upgrade would 503, completeUpgrade: _state > RUNNING).
+        // The 'listening' event can't be used: attemptListen (server.ts)
+        // strips all 'listening' listeners before each listen.
+        if (wssDead && server.listening) {
+            wssDead = false;
+            closing = false;
+            wss = new WebSocketServer({ noServer: true, maxPayload: limitsReceiveBytes(), perMessageDeflate: false });
+        }
         if (closing) { socket.destroy(); return true; }
         const { codec, upstream, conversationId } = claim;
         // HTTP has already handed this socket to the upgrade listener, but it
