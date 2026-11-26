@@ -1092,58 +1092,6 @@
           "summary"
         ]
       }
-    },
-    "RETRIEVE_TOOL": {
-      "name": "acp_retrieve",
-      "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text inline — very large originals are exported to a file instead, and the result then carries the exported file's path. The placeholder stays in context. Unknown refs return not-found.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "ref": {
-            "type": "string",
-            "description": "mNNNNN ref shown in the 📦 [acp-stored …] placeholder"
-          }
-        },
-        "required": [
-          "ref"
-        ]
-      }
-    },
-    "RETRIEVE_TOOL_OPENAI": {
-      "type": "function",
-      "function": {
-        "name": "acp_retrieve",
-        "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text inline — very large originals are exported to a file instead, and the result then carries the exported file's path. The placeholder stays in context. Unknown refs return not-found.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "ref": {
-              "type": "string",
-              "description": "mNNNNN ref shown in the 📦 [acp-stored …] placeholder"
-            }
-          },
-          "required": [
-            "ref"
-          ]
-        }
-      }
-    },
-    "RETRIEVE_TOOL_RESPONSES": {
-      "type": "function",
-      "name": "acp_retrieve",
-      "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text inline — very large originals are exported to a file instead, and the result then carries the exported file's path. The placeholder stays in context. Unknown refs return not-found.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "ref": {
-            "type": "string",
-            "description": "mNNNNN ref shown in the 📦 [acp-stored …] placeholder"
-          }
-        },
-        "required": [
-          "ref"
-        ]
-      }
     }
   },
   "behavior": {
@@ -1194,13 +1142,6 @@
       "crush": {
         "enabled": false,
         "minReduction": 0.1
-      },
-      "ccr": {
-        "enabled": false,
-        "toolName": "acp_retrieve",
-        "minToolTokens": 4000,
-        "excludeTools": [],
-        "maxHeadChars": 96
       }
     },
     "defaultPrompts": {
@@ -1217,7 +1158,6 @@
       "ACP_STATUS_TOOL_NAME": "acp_status",
       "ACP_CACHE_TOOL_NAME": "acp_cache",
       "ABSORB_TOOL_NAME": "absorb",
-      "RETRIEVE_TOOL_NAME": "acp_retrieve",
       "RULE_TOOL_NAME": "acp_rule"
     },
     "markers": {

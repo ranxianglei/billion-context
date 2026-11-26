@@ -12,7 +12,6 @@
     "acp_cache",
     "absorb",
     "acp_rule",
-    "acp_retrieve",
     "acp_read_original_image"
   ],
   "tools": {
@@ -48,17 +47,9 @@
               "type": "boolean",
               "description": "Restore all the way to original messages"
             },
-            "startId": {
-              "type": "string",
-              "description": "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled). Omit both to restore the whole block; empty values count as omitted."
-            },
-            "endId": {
-              "type": "string",
-              "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
-            },
             "imageRef": {
               "type": "string",
-              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
+              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId."
             }
           },
           "required": [
@@ -183,22 +174,6 @@
         }
       },
       {
-        "name": "acp_retrieve",
-        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
-        "input_schema": {
-          "type": "object",
-          "properties": {
-            "ref": {
-              "type": "string",
-              "description": "The stored message id to retrieve (an mNNNNN ref from an [acp-stored] placeholder)."
-            }
-          },
-          "required": [
-            "ref"
-          ]
-        }
-      },
-      {
         "name": "acp_read_original_image",
         "description": "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.",
         "input_schema": {
@@ -252,17 +227,9 @@
                 "type": "boolean",
                 "description": "Restore all the way to original messages"
               },
-              "startId": {
-                "type": "string",
-                "description": "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled). Omit both to restore the whole block; empty values count as omitted."
-              },
-              "endId": {
-                "type": "string",
-                "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
-              },
               "imageRef": {
                 "type": "string",
-                "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
+                "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId."
               }
             },
             "required": [
@@ -405,25 +372,6 @@
       {
         "type": "function",
         "function": {
-          "name": "acp_retrieve",
-          "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "ref": {
-                "type": "string",
-                "description": "The stored message id to retrieve (an mNNNNN ref from an [acp-stored] placeholder)."
-              }
-            },
-            "required": [
-              "ref"
-            ]
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
           "name": "acp_read_original_image",
           "description": "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.",
           "parameters": {
@@ -477,7 +425,7 @@
             },
             "imageRef": {
               "type": "string",
-              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
+              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId."
             }
           },
           "required": [
