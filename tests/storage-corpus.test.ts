@@ -56,7 +56,7 @@ const CASE_META: Record<string, { protocol: string; id: string }> = {
     "fork-receipt": { protocol: "chat", id: "corpus-fork-receipt" },
     "fork-retained": { protocol: "chat", id: "corpus-fork-retained" },
     "image": { protocol: "anthropic", id: "corpus-image" },
-    "ccr": { protocol: "responses", id: "corpus-ccr" },
+    
     "twinfile": { protocol: "openai", id: "corpus-twin" },
     "zstd": { protocol: "anthropic", id: "corpus-folded" },
 };
@@ -170,14 +170,6 @@ test("storage corpus: image case carries base64 media; legacy image-compression 
     );
 });
 
-test("storage corpus: ccr sibling file holds the two #1097 originals", () => {
-    const files = manifest["ccr"]!.files;
-    const sibling = files.find((f) => f.endsWith(".content-store.json"));
-    assert.ok(sibling, `ccr case must ship a content-store.json sibling (files: ${files.join(", ")})`);
-    const parsed = JSON.parse(fs.readFileSync(path.join(CORPUS_ROOT, "ccr", sibling), "utf8")) as { byRef?: Record<string, unknown>; byHash?: Record<string, string> };
-    assert.equal(Object.keys(parsed.byRef ?? {}).length, 2, "both CCR originals must be in the sibling store");
-    assert.equal(Object.keys(parsed.byHash ?? {}).length, 2);
-});
 
 test("storage corpus: twinfile — namespaced wins with meta, flat fallback without (#2671 ①)", () => {
     const notes = manifest["twinfile"]!.notes!;

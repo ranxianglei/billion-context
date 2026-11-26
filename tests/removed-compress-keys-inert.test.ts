@@ -100,7 +100,7 @@ test("#6132: removed fold-point keys warn INERT once at every level (top-level, 
 
 test("#3344: configs without the removed keys stay silent", () => {
     const { captured, stop } = captureLogs();
-    withConfigFile(`{"compress":{"ccr":{"enabled":true}}}`, () => {
+    withConfigFile(`{"compress":{"rules":{"enabled":true}}}`, () => {
         loadConfigFile();
         assert.equal(familyWarns(captured).length, 0);
     });

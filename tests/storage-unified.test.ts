@@ -61,7 +61,7 @@ const CASE_META: Record<string, { protocol: string; id: string }> = {
     "fork-receipt": { protocol: "chat", id: "corpus-fork-receipt" },
     "fork-retained": { protocol: "chat", id: "corpus-fork-retained" },
     "image": { protocol: "anthropic", id: "corpus-image" },
-    "ccr": { protocol: "responses", id: "corpus-ccr" },
+    
     "twinfile": { protocol: "openai", id: "corpus-twin" },
     "zstd": { protocol: "anthropic", id: "corpus-folded" },
 };
@@ -252,7 +252,7 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
     const prev = process.env.BILI_STORAGE_UNIFIED;
     process.env.BILI_STORAGE_UNIFIED = "1";
     try {
-        for (const name of ["folded", "fork-receipt", "deadrefs", "ccr"]) {
+        for (const name of ["folded", "fork-receipt", "deadrefs"]) {
             const meta = CASE_META[name]!;
             // Copy the corpus case out first: loading in place would converge
             // lastSeen and save back into the golden corpus (and open a shadow

@@ -114,7 +114,7 @@ test("#1097: marker-protocol responses wire — oversized tool result stays verb
         assert.equal(h.captured.length, 1, `expected exactly one upstream request, got ${h.captured.length}`);
         const body = h.captured[0]!;
         assert.ok(!body.includes(PLACEHOLDER_MARK), "marker-protocol wire must not carry a store placeholder");
-        assert.ok(!body.includes("acp_retrieve"), "acp_retrieve must not be declared or referenced on the marker-protocol wire");
+        assert.ok(!body.includes("acp_retrieve"), "acp_retrieve must not be declared or referenced on the marker-protocol wire (removed #7755)");
         const line = "big-output-line-0123456789abcdef";
         assert.ok(body.includes(`${line}\\n${line}`), "original tool result must stay verbatim");
         assert.ok(body.length > BIG_OUTPUT.length, "full tool result payload missing from the outbound body");

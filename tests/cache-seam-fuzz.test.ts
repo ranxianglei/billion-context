@@ -8,7 +8,7 @@
 //   (b) the kernel's emergency-truncation marker (#728/#1492 estimate band), or
 //   (c) the trailing volatile slots (chain checkpoint / nudge, last 3).
 // Plus: the tools array must be byte-identical on EVERY pair (element-0
-// prefix), and CCR placeholders must be stable per ref when CCR is armed.
+// prefix), and placeholders must be stable per ref.
 //
 // Deterministic: default seed 1592, three scenarios, always runs in CI;
 // ACP_TEST_FUZZ=1 widens to 12 scenarios, ACP_TEST_FUZZ_SEED overrides the
@@ -42,7 +42,6 @@ interface Scenario {
     plan: Array<number | undefined>;
     gapless: boolean;
     absorbPct: number;
-    ccr: boolean;
     toolsOnClient: boolean;
 }
 
@@ -71,7 +70,6 @@ function genScenario(rnd: () => number, seed: number): Scenario {
         plan,
         gapless: rnd() < 0.5,
         absorbPct: rnd() < 0.5 ? 0.05 : 0,
-        ccr: rnd() < 0.5,
         toolsOnClient: rnd() < 0.6,
     };
 }
@@ -182,7 +180,7 @@ async function drive(sc: Scenario, sessionId: string): Promise<string[]> {
                 injectTool: true,
                 injectNudge: true,
                 absorb: { enabled: true, contextThresholdPct: sc.absorbPct },
-                ...(sc.ccr ? { ccr: { enabled: true, minToolTokens: 50 } } : {}),
+                
             },
             promptCache: { routing: "auto" },
             sessionHeader: "x-acp-session",
@@ -298,19 +296,6 @@ test(`cache-seam fuzz: ${scenarios} randomized scenarios (seed ${baseSeed})`, { 
         let folds = foldsIn(bodies);
         for (let i = 1; i < bodies.length; i++) assertPairSeamStable(bodies[i - 1]!, bodies[i]!, `seed ${sc.seed} pair ${i}->${i + 1}`);
         assert.ok(folds >= 1, `scenario ${JSON.stringify(sc)}: no fold ever fired — rig degenerate after retries`);
-        if (sc.ccr) {
-            // per-ref placeholder stability (see cache-seam-probes P3)
-            const refRe = /\[acp-stored #(m\d+) /g;
-            const seen = new Map<string, string>();
-            bodies.forEach((b, i) => {
-                for (const m of msgsOf(JSON.parse(b) as Item)) {
-                    const j = JSON.stringify(m);
-                    if (!j.includes("[acp-stored")) continue;
-                    let mm: RegExpExecArray | null; refRe.lastIndex = 0;
-                    while ((mm = refRe.exec(j)) !== null) {
-                        const prev = seen.get(mm[1]!);
-                        if (prev === undefined) seen.set(mm[1]!, j);
-                        else assert.equal(j, prev, `seed ${sc.seed} body ${i}: placeholder ${mm[1]} mutated`);
                     }
                 }
             });

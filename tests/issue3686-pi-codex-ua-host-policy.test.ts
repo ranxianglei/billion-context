@@ -17,7 +17,7 @@ import { instructionsFingerprintApplies } from "../src/session-id.ts";
 // #3686: a native pi request explicitly stamped x-bili-plugin: pi may ship a
 // Codex-shaped User-Agent for relay compatibility. The UA-only isCodexClient
 // then activated the CODEX-ONLY HOST POLICY (0.9 preflight health bar, forge/
-// reconcile lanes, CCR/image disarm, compact-trigger dispatch, codex-table
+// reconcile lanes, image disarm, compact-trigger dispatch, codex-table
 // window alignment, instructions-fingerprint keying) on a pi session — the
 // observed real-session symptom was repeated premature compression near
 // 0.9×budget with costly failing summary calls. Host policy must follow the

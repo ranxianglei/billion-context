@@ -106,7 +106,7 @@ const CLOSE_TAG = LT + "/acp" + GT;
 const CHAIN_PREFIX = LT + "bili-chain v=";
 const NUDGE_PREFIX = "This is an efficiency nudge";
 const IMGNOTE_PREFIX = "[Downscaled screenshots:";
-const RETRNOTE_PREFIX = "[billion-context] Earlier acp_retrieve";
+const RETRNOTE_PREFIX = "[billion-context] Earlier retrieval";
 const SUM_MARKER = "[Compressed conversation section]";
 const TAG_RE = new RegExp(`^${LT}acp tokens="[0-9]+(\\.[0-9])?K?" type="text"${GT}(m[0-9]+)${CLOSE_TAG}\n`);
 

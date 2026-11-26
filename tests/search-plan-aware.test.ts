@@ -1,7 +1,7 @@
-// #1336 CCR v3: plan-aware search re-ranking (deterministic tier), steering
+// #1336: plan-aware search re-ranking (deterministic tier), steering
 // output, retrieve-quality stats, plus an anthropic-wire run proving the
 // steering section rides the search tool result with client cache_control
-// breakpoints kept stable (mirrors the CCR v2 e2e coverage discipline).
+// breakpoints kept stable (mirrors the e2e coverage discipline).
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";

@@ -1,4 +1,4 @@
-// #1359: absorb plugin-lane tool-name divergence (same class as #1345/#1360 CCR).
+// #1359: absorb plugin-lane tool-name divergence (same class as #1345/#1360).
 // The manifest must advertise the SAME name the per-session gate adjudicates.
 // Plugin lane governs the whole absorb block by the BASE config (provider/model
 // overrides are proxy-lane-only); proxy lane follows the per-request merged block.

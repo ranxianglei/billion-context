@@ -9,7 +9,7 @@
  *   T2 all nine fields round-trip through planIngest → state_fields rows →
  *      loadLegacyView with their values byte-intact;
  *   T3 steady state: an unchanged re-ingest rewrites zero state_fields rows
- *      (applyStateFields compares value_json per row, like the ccr slim skip).
+ *      (applyStateFields compares value_json per row, like the store slim skip).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";

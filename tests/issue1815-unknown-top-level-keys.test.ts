@@ -139,7 +139,7 @@ test("#1815: the full documented top-level surface produces no warning (#2062)",
                 sessions: { max: 64 }, plugin: { snapshotCapBytes: 1048576 },
                 update: { checkIntervalMs: 180000 }, diagnostics: { dumpBody: false },
                 fakeCompletion: { retries: 0 }, codexCompact: "intercept",
-                ccrRetrievalTtlMs: 600000, decompressTmpCap: 50,
+                decompressTmpCap: 50,
             }),
             () => {
                 loadRoutes();

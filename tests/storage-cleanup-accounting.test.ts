@@ -13,7 +13,7 @@ process.env.BILI_PERSIST_ZSTD = "0";
 function input(id = "target", rich = false): IngestSessionInput {
     const view = JSON.stringify({ text: "shared block 海🌊", count: 2 });
     const media = Buffer.from("shared image bytes").toString("base64");
-    const content = "shared CCR original 海🌊";
+    const content = "shared original 海🌊";
     return {
         session: {
             sessionId: id, protocol: "openai", createdAt: 1, updatedAt: 2, nextBlockId: 2, nextRunId: 2,
@@ -126,7 +126,7 @@ test("shared content held by another session survives", (t) => {
     assert.equal(store.getMessages("other").length, 2);
 });
 
-test("message, media, paired block views and CCR references match actual CAS deletion", (t) => {
+test("message, media, paired block views and references match actual CAS deletion", (t) => {
     const { store, db } = fixture(t);
     store.ingestSession(input("target", true));
     const before = casBytes(db);

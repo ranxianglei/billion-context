@@ -23,7 +23,7 @@ import { UnifiedStore } from "../src/storage/store.ts";
  *      never brick the proxy on construction or on save/load.
  *   4. restoreReplica refuses to overwrite a live session id (409 upstream).
  *   5. restoreReplica materializes the content-store sidecar for the restored
- *      id so CCR originals survive the next live save + restart cycle
+ *      id so originals survive the next live save + restart cycle
  *      (buildRecord drops forkContentStore without a fork receipt).
  */
 
