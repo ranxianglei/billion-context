@@ -225,25 +225,54 @@ test("A3: the identity transaction deletes the arm turn's dead l1 row and spares
 // A4: the kv 256-char cap + frozen whitelist
 // ---------------------------------------------------------------------------
 
-test("A4: setKv enforces the 256-char cap; whitelisted keys pass; the tripwire names the offender", () => {
-    const dir = mkdtempSync(join(testRoot, "a4-"));
-    const store = openLegacyStore(dir);
-    try {
-        // the cap counts the STORED (JSON-stringified) value: 254 x's
-        // stringify to exactly 256 chars (quotes included)
-        store.setKv("notices", "ok", "x".repeat(KV_VALUE_MAX_CHARS - 2));
-        assert.throws(
-            () => store.setKv("notices", "big", "x".repeat(KV_VALUE_MAX_CHARS - 1)),
-            (err: Error) => err.message.includes("kv value too large") && err.message.includes("notices|big"),
-        );
-        for (const entry of KV_VALUE_WHITELIST) {
-            const [ns, key] = entry.split("|");
-            store.setKv(ns, key, "y".repeat(10_000));
-            assert.ok(store.getKv(ns, key) !== undefined, `${entry} is whitelisted`);
+test("A4: the 256-char cap is eg-plane discipline — on with the flag, off without (legacy keeps the 4 MB budget)", () => {
+    const saved = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    const capAt = (dir: string, plane: string) => {
+        process.env.BILI_ROLLOUT_EGRESS_PLANE = plane;
+        const store = UnifiedStore.open(join(dir, "index.db"));
+        try {
+            // the cap counts the STORED (JSON-stringified) value: 254 x's
+            // stringify to exactly 256 chars (quotes included)
+            store.setKv("notices", "ok", "x".repeat(KV_VALUE_MAX_CHARS - 2));
+            assert.throws(
+                () => store.setKv("notices", "big", "x".repeat(KV_VALUE_MAX_CHARS - 1)),
+                (err: Error) => err.message.includes("kv value too large") && err.message.includes("notices|big"),
+            );
+            for (const entry of KV_VALUE_WHITELIST) {
+                const [ns, key] = entry.split("|");
+                store.setKv(ns, key, "y".repeat(10_000));
+                assert.ok(store.getKv(ns, key) !== undefined, `${entry} is whitelisted`);
+            }
+        } finally {
+            try { store.close(); } catch { /* already closed */ }
         }
+    };
+    const legacyAt = (dir: string) => {
+        process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
+        const store = UnifiedStore.open(join(dir, "index.db"));
+        try {
+            // no 256-char cap in legacy mode: pre-existing large values stay
+            // writable (owner ruling 2026-11-26 — non-eg must not break);
+            // the historical 4 MB byte budget still applies.
+            store.setKv("notices", "legacy-big", "x".repeat(KV_VALUE_MAX_CHARS + 1));
+            assert.equal((store.getKv("notices", "legacy-big") as string).length, KV_VALUE_MAX_CHARS + 1);
+            assert.throws(
+                () => store.setKv("notices", "huge", "x".repeat(5 * 1024 * 1024)),
+                /4194304 bytes/,
+            );
+        } finally {
+            try { store.close(); } catch { /* already closed */ }
+        }
+    };
+    const dirA = mkdtempSync(join(testRoot, "a4-cap-"));
+    const dirB = mkdtempSync(join(testRoot, "a4-legacy-"));
+    try {
+        capAt(dirA, "1");
+        legacyAt(dirB);
     } finally {
-        try { store.close(); } catch { /* already closed */ }
-        rmBestEffort(dir);
+        if (saved === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE; else process.env.BILI_ROLLOUT_EGRESS_PLANE = saved;
+        rmBestEffort(dirA);
+        rmBestEffort(dirB);
     }
 });
 

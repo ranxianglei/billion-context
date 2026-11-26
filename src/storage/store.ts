@@ -37,6 +37,7 @@ import {
     type EgressViewRow,
 } from "./egress-state.js";
 import { featureEnabled } from "../rollout.js";
+import { egressPlaneGateOn } from "../knobs.js";
 import {
     diffBlockSet,
     egressBlockAppend,
@@ -469,7 +470,7 @@ export function assertKvValueSize(namespace: string, key: string, value: unknown
     const json = JSON.stringify(value);
     const size = json === undefined ? 0 : json.length;
     if (size > KV_VALUE_MAX_CHARS) {
-        throw new Error(`[storage] kv value too large: ${namespace}|${key} = ${size} chars (max ${KV_VALUE_MAX_CHARS} — retire the payload or add a registered whitelist entry, discussions/7735)`);
+        throw new Error(`[storage] kv value too large: ${namespace}|${key} = ${size} chars (max ${KV_VALUE_MAX_CHARS} — eg-plane cap: retire the payload or add a registered whitelist entry, discussions/7735)`);
     }
 }
 
@@ -3943,7 +3944,10 @@ export class UnifiedStore {
     }
 
     setKv(namespace: string, key: string, value: unknown): void {
-        assertKvValueSize(namespace, key, value);
+        // KDD #25: the 256-char cap is eg-plane discipline only (the egress
+        // plane is SQLite-only; legacy mode keeps the historical 4 MB budget —
+        // pre-existing legacy keys may already hold large values).
+        if (egressPlaneGateOn()) assertKvValueSize(namespace, key, value);
         validateExtKey(namespace, "namespace");
         validateExtKey(key, "key");
         const valueJson = serializeExtValue(value);
