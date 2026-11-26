@@ -30,14 +30,6 @@ function carrierOf(session: Session): PendingRetrieval[] {
     return session.pendingRetrievals ?? [];
 }
 
-/** Snapshot the currently-queued items WITHOUT removing them. Plugin-lane
- *  prepares attach these to the outgoing request; the items stay in the queue
- *  until commit/drop, so an overflow-refold re-prepare re-sends them and a
- *  concurrent same-session request is resolved by ref-set filtering. */
-export function snapshotPendingRetrievals(session: Session): PendingRetrieval[] {
-    return carrierOf(session).slice();
-}
-
 /** Confirmed upstream success: remove the delivered refs from the carrier.
  *  Idempotent (a concurrent prior removal is a no-op). */
 export function commitRetrievals(session: Session, refs: Iterable<string>): void {
