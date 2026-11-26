@@ -370,8 +370,10 @@ function bindMethods(ctx: Context): void {
       const bv = typeof s.c === "string" ? s.c : undefined;
       if (av !== undefined && bv !== undefined && from === undefined)
         return lit(c, String(av.indexOf(bv)), "Int", av.indexOf(bv));
+      // str.indexof is 3-ary in SMT-LIB ((s sub start)); the JS 2-arg form
+      // defaults start to 0 — a 2-child term is rejected by the solver.
       return from === undefined
-        ? c.app2("str.indexof", this, s, "Int")
+        ? c.app3("str.indexof", this, s, lit(c, "0", "Int", 0), "Int")
         : c.app3("str.indexof", this, s, from, "Int");
     },
     contains(s) {
