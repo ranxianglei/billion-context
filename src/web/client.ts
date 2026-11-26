@@ -4378,7 +4378,18 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         });
         document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") hideQTip(); });
         window.addEventListener("hashchange", hideQTip);
-        if (dlBtn) dlBtn.addEventListener("click", () => {
+        if (dlBtn) dlBtn.addEventListener("click", async () => {
+            // #7233: let the server write to Downloads and reveal the file. Fall
+            // back to the original blob download if the route is unavailable
+            // (older server, or a write/reveal failure).
+            try {
+                const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(String(d.id)) + "/handoff/export", { method: "POST" });
+                const savedPath = r && typeof r.path === "string" ? r.path : "";
+                toast(r && r.revealed === false
+                    ? t("det.handoff_exported_no_reveal", { path: savedPath })
+                    : t("det.handoff_exported", { path: savedPath }), "ok");
+                return;
+            } catch { }
             const url = URL.createObjectURL(new Blob([md], { type: "text/markdown;charset=utf-8" }));
             const a = document.createElement("a");
             a.href = url;

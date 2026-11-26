@@ -154,6 +154,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `opencode.inline` | boolean | false | BILI_OPENCODE_INLINE | OpenCode inline lane (#3278 port; OPT-IN — the default stays the spawned proxy, per owner decision on #4687): the opencode plugin's compression runs IN-PROCESS — no spawned proxy, no ephemeral port, no MITM certs; model traffic and the /__bili/ tool surface are served by an in-process engine through a pseudo-origin (verified on the Bun host). Set true (or BILI_OPENCODE_INLINE=1) to enable. Resolved env > file; an explicit inline choice always beats an announced attach target, an absent choice falls back to attach/spawn as before. `bili opencode-inline` is the one-command lane. |
 | `plugin.snapshotCapBytes` | number | 104857600 (100 MiB) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | Caps the raw wire-history snapshot retained per plugin session for the public fork API (#2017 D-B); beyond it the session fails closed (409) instead of retaining an unbounded raw copy. Default raised from 16 MiB (#2394 G3); 0 disables retention entirely. |
 | `snapshot.shadow` | boolean | true | BILI_SNAPSHOT_SHADOW | Snapshot-render SHADOW observability switch (#3756 follow-up): compute the snapshot view on every armed proxy turn WITHOUT using it (outbound bytes stay the legacy path), classify the diff against what was actually sent, and record per-session counters surfaced by the web panel + the snapshot-shadow diagnostics topic. ON by default (the render lane itself stays rollout-gated at 0%, so the shadow lane is pure observation). |
+| `handoff.reveal` | boolean | false | — | After the web panel's handoff .md export writes the file to the OS Downloads folder, optionally reveal it in the file manager (explorer /select on Windows, open -R on macOS, xdg-open <dir> elsewhere). A reveal failure (headless host, no file manager) never fails the export — the file is still written and its path shown in the toast. Opt in with true; it stays off by default for headless/bot profiles (#7233). |
 
 **MITM lane**
 
@@ -2686,6 +2687,12 @@ bili export <id> --full --output handoff.md
 ```
 
 Then start a new conversation in the client (direct to upstream) and paste the handoff doc as the opening context.
+
+### Handoff export from the web UI (#7233)
+
+The handoff pane's existing **Download .md** button keeps its position and filename, but the server now writes the same Markdown to the OS Downloads folder and then optionally reveals it in the file manager (`explorer /select,<path>`, `open -R <path>`, or `xdg-open <dir>`). If the reveal cannot run (headless host, permissions), the file is still written and the toast shows its path. Set `handoff.reveal` to `true` to opt in; the default is `false`, so headless/bot profiles keep the old behavior.
+
+This is the recovery path: export the handoff, open a new session in that workspace, and attach the file — without hunting through Downloads for a UUID name.
 
 ### Codex subagents get their own compression namespace (#150)
 

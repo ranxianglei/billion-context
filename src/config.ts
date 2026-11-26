@@ -2607,6 +2607,9 @@ type FileConfig = {
      *  (no env tier); hot-reloaded via POST /__bili/config/reload. See
      *  docs/configuration.md "Egress transforms". */
     egressTransforms?: unknown;
+    /** #7233: browser handoff export -> Downloads + reveal the file. Default on;
+     *  set `{ "reveal": false }` for headless/bot profiles. */
+    handoff?: { reveal?: boolean };
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -2663,6 +2666,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "cacheKeepalive",
     // #6003 phase 2: user-registerable egress body-rewrite pipeline.
     "egressTransforms",
+    // #7233: handoff export reveal.
+    "handoff",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -2789,6 +2794,13 @@ export function loadConfigFile(): FileConfig {
     if (raw === undefined || value === undefined) return {};
     configFileCache = { raw, value };
     return value;
+}
+
+/** #7233 option C: reveal-after-export is opt-in. */
+export function handoffRevealEnabled(): boolean {
+    const block = loadConfigFile().handoff;
+    return Boolean(block && typeof block === "object" && !Array.isArray(block)
+        && (block as { reveal?: unknown }).reveal === true);
 }
 
 /** #2960⑥ (config epoch): stable identity of the config FILE SOURCE right now —
