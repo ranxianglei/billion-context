@@ -264,33 +264,37 @@ export type CompressSettings = {
      *  level wins PER FIELD across global → provider → model, like every
      *  other compress field. */
     minPressureBenefitTokens?: number;
-    /** Phantom-pressure guard: when the decision meter for this round is a
-     *  LOCAL ESTIMATE rather than a billing sample (the host passed no usage
-     *  report — e.g. right after an aborted turn or a short cache TTL that
-     *  voided sample delivery), the pressure band (usage ≥ maxContextLimit /
-     *  emergency threshold) defers its nudge one round instead of firing
-     *  EMERGENCY/OVER-LIMIT rewrites off a char-bound reading that
-     *  structurally runs ~3x billed. The very next request carries a fresh
-     *  billing report, so deferring costs at most one round; the hard
-     *  overflow backstops stay armed either way. Billed readings keep
-     *  byte-identical behavior and non-pressure tiers are unaffected.
-     *  Default true; set false to restore estimate-driven pressure injection.
-     *  Maps to kernel `nudge.requireUsageSampleForPressure`. Deepest level
-     *  wins PER FIELD, like every other compress field. */
-    requireUsageSampleForPressure?: boolean;
-    /** #5865 estimate-hold backstop: how many CONSECUTIVE rounds with an
-     *  estimate-grade meter reading (no billing sample) may hold the
-     *  pressure-band injection before it falls back to firing on the estimate
-     *  anyway. Bounds the #5860 phantom-pressure hold so an upstream that
-     *  NEVER reports usage (anonymous zero-baseline / silent-backend sessions,
-     *  where the local estimate is the only pressure signal) cannot starve its
-     *  automatic compression forever. Default 2 (covers the aborted-turn +
-     *  follow-up ghost windows while capping starvation at two missed rounds);
-     *  0 disables the hold entirely. Maps to kernel
-     *  `nudge.maxEstimateHoldRounds`; only consulted while
-     *  requireUsageSampleForPressure is on. Deepest level wins PER FIELD, like
-     *  every other compress field. */
-    maxEstimateHoldRounds?: number;
+     /** Phantom-pressure guard: when the decision meter for this round is a
+      *  LOCAL ESTIMATE rather than a billing sample (the host passed no usage
+      *  report — e.g. right after an aborted turn or a short cache TTL that
+      *  voided sample delivery), the pressure band (usage ≥ maxContextLimit /
+      *  emergency threshold) defers its nudge one round and the emergency
+      *  truncate watermark (truncate.threshold) holds its clips (#6882)
+      *  instead of firing EMERGENCY/OVER-LIMIT rewrites or latching truncation
+      *  off a char-bound reading that structurally runs ~3x billed. The very
+      *  next request carries a fresh billing report, so the hold costs at most
+      *  one round; already-latched truncate clips still replay byte-for-byte
+      *  and the preflight output clamps stay armed either way. Billed readings
+      *  keep byte-identical behavior and non-pressure tiers are unaffected.
+      *  Default true; set false to restore estimate-driven pressure injection
+      *  AND estimate-driven truncation.
+      *  Maps to kernel `nudge.requireUsageSampleForPressure`. Deepest level
+      *  wins PER FIELD, like every other compress field. */
+     requireUsageSampleForPressure?: boolean;
+     /** #5865 estimate-hold backstop: how many CONSECUTIVE rounds with an
+      *  estimate-grade meter reading (no billing sample) may hold the
+      *  pressure-band injection and the emergency-truncate watermark (#6882)
+      *  before they fall back to acting on the estimate anyway. Bounds the
+      *  #5860 phantom-pressure hold so an upstream that
+      *  NEVER reports usage (anonymous zero-baseline / silent-backend sessions,
+      *  where the local estimate is the only pressure signal) cannot starve its
+      *  automatic compression forever. Default 2 (covers the aborted-turn +
+      *  follow-up ghost windows while capping starvation at two missed rounds);
+      *  0 disables the hold entirely. Maps to kernel
+      *  `nudge.maxEstimateHoldRounds`; only consulted while
+      *  requireUsageSampleForPressure is on. Deepest level wins PER FIELD, like
+      *  every other compress field. */
+     maxEstimateHoldRounds?: number;
     /** Per-tier nudge growth thresholds in tokens (#2376): independent token
       *  trigger sizes for the T1/T2/T3 mass paths, e.g. keep T1 aggressive for
       *  long tasks while letting T2 distill earlier/later. Each UNSET tier

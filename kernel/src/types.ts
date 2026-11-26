@@ -521,23 +521,29 @@ export interface NudgeConfig {
    *  left no usage report) structurally run high, and acting on them
    *  rewrites content off a bad meter; deferring costs at most one round
    *  because the very next request carries a fresh billing report.
-   *  Default true; set false to restore estimate-driven pressure injection.
-   *  Non-pressure tiers (growth/cadence arms) are unaffected either way. */
+   *  The same guard covers the emergency-truncate watermark (#6882): a
+   *  crossing of truncate.threshold on an estimate reading is held under the
+   *  same backstop instead of latching clips off a meter the bill never saw
+   *  (already-latched clips still replay byte-for-byte).
+   *  Default true; set false to restore estimate-driven pressure injection
+   *  AND estimate-driven truncation. Non-pressure tiers (growth/cadence
+   *  arms) are unaffected either way. */
   requireUsageSampleForPressure?: boolean;
   /** #5865 ruling (estimate-hold backstop): while that guard is on, a run of
    *  consecutive ESTIMATE-grade readings is only held for at most
    *  `maxEstimateHoldRounds` rounds; from the following round onward the
-   *  pressure band acts on the estimate again (legacy behavior). Without the
-   *  bound, an upstream that NEVER reports usage (anonymous zero-baseline /
-   *  silent-backend sessions — see #728/#553, where the local estimate is
-   *  the only pressure signal) would be deferred forever: every round is
-   *  estimate-grade and the "next request carries a fresh billing report"
-   *  premise never materializes. Default 2: covers the observed double-ghost
-   *  windows (aborted turn + its follow-up before the aborted cycle's report
-   *  can land) while capping worst-case starvation at two missed
-   *  opportunities. 0 disables the hold entirely (the pressure band fires on
-   *  the very first estimate round — same practical effect as
-   *  requireUsageSampleForPressure=false for the pressure band). */
+   *  pressure band AND the emergency-truncate watermark (#6882) act on the
+   *  estimate again (legacy behavior). Without the bound, an upstream that
+   *  NEVER reports usage (anonymous zero-baseline / silent-backend sessions —
+   *  see #728/#553, where the local estimate is the only pressure signal)
+   *  would be deferred forever: every round is estimate-grade and the "next
+   *  request carries a fresh billing report" premise never materializes.
+   *  Default 2: covers the observed double-ghost windows (aborted turn + its
+   *  follow-up before the aborted cycle's report can land) while capping
+   *  worst-case starvation at two missed opportunities. 0 disables the hold
+   *  entirely (the pressure band and the truncate watermark fire on the very
+   *  first estimate round — same practical effect as
+   *  requireUsageSampleForPressure=false for both). */
   maxEstimateHoldRounds?: number;
 }
 

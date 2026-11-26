@@ -117,7 +117,7 @@ import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeRe
 import type { CommandcodeEnvelopeMeta } from "./commandcode-wire.js";
 import type { ZedEnvelopeMeta } from "./zed-wire.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
-import { emitPreflightError } from "./stream-error.js";
+import { emitPreflightError, preflightFailFastBody } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
@@ -1354,7 +1354,6 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             //  — on by default; affinitySimhash: false / BILI_AFFINITY_SIMHASH=0
             //  restores the pre-#2265 exact-hash-only resolution (hot kill-switch).
             setSimhashAdoptionEnabled(opts.affinitySimhash ?? true);
-            hydratePrefixAffinity();
             // #2941: never clobber a live pointer on this port — a foreign
             // instance health-verified as serving here keeps it; our registry
             // entry below still records us for lane-aware discovery.
@@ -1611,6 +1610,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         server.on("listening", installProcessHandlers);
         server.listen(port, opts.host, claimOrAnnounce);
     };
+    hydratePrefixAffinity();
     attemptListen(opts.port);
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
     // bad host) surface as an 'error' event on the server. Without a listener
@@ -3569,6 +3569,37 @@ function beginPreflightHold(res: http.ServerResponse, prepared: Prepared, log: (
     return () => clearInterval(iv);
 }
 
+/** #3978: terminate a committed preflight response when bili decides not to
+ *  forward. Once #568 has committed early headers, the client holds a 200 and
+ *  an open stream; a later no-forward decision cannot writeHead another status.
+ *  Two exits never terminated at all: the abort branch (respond:false
+ *  short-circuits the consumer, which then writes nothing) and the overflow-
+ *  refold re-run (respondFailFast=false suppresses it), after which forward()'
+ *  upstream-400 relay hit ERR_HTTP_HEADERS_SENT on the committed socket. The
+ *  other three exits ARE already terminated by the consumer's in-band branch —
+ *  terminating here instead just moves that one step earlier so every exit has
+ *  ONE termination point. The frames stay the established in-band contract
+ *  (#568/#1455 protocol-native shapes, so client SDKs parse them natively):
+ *  emitPreflightError for SSE, preflightFailFastBody appended after the
+ *  whitespace padding for non-streaming (still one valid JSON document). No-op
+ *  unless headers are actually committed and the socket still lives, so
+ *  uncommitted exits keep their normal status-code response path; after a
+ *  successful frame the existing respond:!writableEnded self-corrects to false. */
+function commitPreflightTerminalFrame(res: http.ServerResponse, prepared: Prepared, message: string, retryable: boolean, log: (level: string, msg: string) => void): boolean {
+    if (!res.headersSent || res.destroyed || res.writableEnded) return false;
+    try {
+        if (prepared.stream) {
+            emitPreflightError(res, prepared.protocol, { message, retryable }, (m) => log("warn", m));
+        } else {
+            res.write(preflightFailFastBody(message, retryable));
+            res.end();
+        }
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 // #1647: sibling of the #568 hold, covering the STREAMING phase. After the 2xx
 // commit, bili keeps consuming upstream bytes that never reach the client — the
 // rewriter/strip pipes swallow SSE comment pings (`: ping`, which llama.cpp &
@@ -3944,7 +3975,7 @@ function responsesPreflightMeter(prepared: Prepared, limit: number) {
 
 export async function preflightCompressIfNeeded(
     prepared: Prepared,
-    runPrepare: () => Promise<Prepared>,
+    runPrepare: (recoverOverflow: boolean) => Promise<Prepared>,
     req: http.IncomingMessage,
     inboundBody: Buffer,
     res: http.ServerResponse,
@@ -4460,6 +4491,7 @@ export async function preflightCompressIfNeeded(
             shrinkNote +
             ` This request's over-window payload was NOT forwarded to the upstream.`;
         log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
+        commitPreflightTerminalFrame(res, prepared, message, retryable, log);
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
@@ -4566,14 +4598,23 @@ export async function preflightCompressIfNeeded(
         streamSummaryOff,
     };
     let result: PreflightResult;
+    const rebuildAfterFold = async (): Promise<Prepared> => {
+        const estimateHoldStreak = session.state.nudge.estimateHoldStreak;
+        try {
+            const rebuilt = await runPrepare(!payloadFitsWindow && !imageArbitration);
+            session.stats.requests -= 1;
+            return rebuilt;
+        } finally {
+            session.state.nudge.estimateHoldStreak = estimateHoldStreak;
+        }
+    };
     // #5974: when the corrective pass below folds nothing, its probe rebuild IS the final outbound — reuse it instead of paying for another prepare over a multi-MB body.
     let pendingRebuild: Prepared | undefined;
     try {
         result = await preflightCompress(preflightDeps, prepared.originalMessages);
         // #5974 (#4543-①): view-vs-reconstruction convergence. The walk's fit exit judges on its own blind processTurn(originalMessages) view, which can undershoot the full-pipeline reconstruction — fold-reconcile id churn re-enters unfolded mass the two pipelines disagree about. When the fresh rebuild measures over the window while the view exited early-fit with foldable mass left, run ONE corrective second pass seeded with the measured divergence as its exit bar: the fit judgment is forced through the post-reconstruction single source of truth (issue expectation clause ②). Bounded: the divergence must clear max(10K tok, 2% of window), unknown-baseline sessions keep their legacy upper-bound regime (#553), and a corrective pass that folds nothing falls through unchanged to the arms below.
         if (result.compressedRanges > 0 && !unknownBaseline && result.failure === undefined && result.rangesRemaining > 0) {
-            const probe = await runPrepare();
-            session.stats.requests -= 1;
+            const probe = await rebuildAfterFold();
             pendingRebuild = probe;
             const probeMsgs = probe.processedMessages.length > 0 ? probe.processedMessages : probe.originalMessages;
             const probeTextSize = estimateCoreMessages(probeMsgs) + overheadEstimate;
@@ -4645,12 +4686,7 @@ export async function preflightCompressIfNeeded(
     if (result.compressedRanges > 0) {
         // #5974: the corrective probe above may already hold the final rebuild —
         // reuse it (a prepare pass over a multi-MB CJK body is not free).
-        const rebuilt = pendingRebuild ?? await runPrepare();
-        if (pendingRebuild === undefined) {
-            // runPrepare re-incremented stats.requests; the rebuild is internal
-            // to this single client request.
-            session.stats.requests -= 1;
-        }
+        const rebuilt = pendingRebuild ?? await rebuildAfterFold();
         pendingRebuild = undefined;
         outbound = rebuilt;
         // #1987: anchor the usage baseline to what ACTUALLY ships — the rebuilt
@@ -4735,7 +4771,8 @@ export async function preflightCompressIfNeeded(
         session.stats.preflightRuns = (session.stats.preflightRuns ?? 0) + 1;
         markDirty(session);
         const detail = f?.kind === "aborted" ? f.detail : "the client disconnected during preflight compression";
-        log("warn", `[${session.id}] preflight aborted (${detail}); not forwarding`);
+        const frameSent = commitPreflightTerminalFrame(res, prepared, detail, false, log);
+        log("warn", `[${session.id}] preflight aborted (${detail}); not forwarding${frameSent ? "; terminal frame sent, stream ended" : res.headersSent ? "; headers committed, terminal frame not sent (socket gone)" : ""}`);
         return { failFast: true, status: 0, message: detail, retryable: false, respond: false };
     }
     if (fits) {

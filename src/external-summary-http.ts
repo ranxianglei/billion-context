@@ -234,7 +234,6 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
             const inputTokens = defaultCountTokens(system) + defaultCountTokens(content);
             const payload = summaryPayload(plan.protocol, plan.model, system, content, plan.stream ?? false, true, url.hostname, plan.contextWindow);
             if (plan.outputTokens !== undefined) {
-                if (plan.contextWindow !== undefined && defaultCountTokens(system) + defaultCountTokens(content) + 256 + plan.outputTokens > plan.contextWindow) throw new Error("External summary input exceeds the target context budget");
                 if (plan.protocol === "google") {
                     const generationConfig = payload.generationConfig as Record<string, unknown>;
                     generationConfig.maxOutputTokens = plan.outputTokens;
@@ -267,6 +266,18 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
             // Elapsed is evaluated at each failure site below — joining it once up
             // here would freeze it near zero for every attempt of the retry loop.
             const diagnostics = (): string => [`elapsed=${Math.round(performance.now() - startedAt)}ms`, ...staticDiagBits].join(", ");
+            // #7569: the budget guard rejects BEFORE any dispatch — log the
+            // rejection with the numbers that produced it, then throw. Without
+            // this line the operator sees only a bare `t0:error` and cannot tell
+            // a budget rejection from a network failure, nor which knob to change
+            // (contextWindow / outputTokens / range size). The executor records
+            // the same message in the attempt detail but does not re-warn it
+            // (warnedByCandidate — the numbers only exist here).
+            if (plan.outputTokens !== undefined && plan.contextWindow !== undefined
+                && inputTokens + 256 + plan.outputTokens > plan.contextWindow) {
+                loggerLog("warn", `[external-summary] candidate ${plan.model} rejected before dispatch: input exceeds target context budget (input≈${inputTokens}tok, window=${plan.contextWindow}tok, outputTokens=${plan.outputTokens}, ${diagnostics()})`);
+                throw new Error("External summary input exceeds the target context budget");
+            }
             let attempt = 0;
             for (;;) {
                 attempt += 1;

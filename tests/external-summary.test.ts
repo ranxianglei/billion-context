@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { ExternalSummaryExecutor, externalSummaryFailureAdvice, type SummaryBudget, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
 import { setLogCapture } from "../src/logger.ts";
 
@@ -109,13 +109,51 @@ test("external summary: a target timeout aborts transport and tries the next can
     assert.equal(result.status, "success");
 });
 
-test("external summary: total deadline prevents spending the remaining chain", async () => {
+function summaryClock(t: TestContext): (ms: number) => Promise<void> {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    t.mock.method(performance, "now", () => Date.now());
+    return async (ms) => {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        t.mock.timers.tick(ms);
+    };
+}
+
+test("external summary: the batch deadline is a shared pot — the next candidate gets the remaining budget instead of starving (#6885)", async (t) => {
+    const advance = summaryClock(t);
     let backup = 0;
-    const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async (_request, signal) => new Promise<string>((_resolve, reject) => {
+    const job = new ExternalSummaryExecutor(1).execute(work, [{ summarize: async (_request, signal) => new Promise<string>((_resolve, reject) => {
         signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
     }) }, { summarize: async () => { backup++; return "backup"; } }], { ...budget, totalTimeoutMs: 15 });
+    await advance(7);
+    const result = await job;
+    assert.equal(result.status, "success");
+    assert.equal(backup, 1, "the remaining candidate gets the remaining budget instead of starving to zero");
+    assert.deepEqual(result.attempts.map((item) => item.outcome), ["timeout", "success"]);
+});
+
+test("external summary: a shrunk target window reports the actual budget, not the nominal one (#6885)", async (t) => {
+    const advance = summaryClock(t);
+    const job = new ExternalSummaryExecutor(1).execute(work, [{ summarize: async (_request, signal) => new Promise<string>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    }) }, successful("backup")], { ...budget, totalTimeoutMs: 15 });
+    await advance(7);
+    const result = await job;
+    assert.equal(result.status, "success");
+    const reported = Number((result.attempts[0].detail ?? "").match(/^target-timeout (\d+)ms/)?.[1]);
+    assert.equal(reported, 7, "the reported budget is the shrunk window");
+});
+
+test("external summary: the total deadline still bounds the chain when every candidate is slow (#6885)", async (t) => {
+    const advance = summaryClock(t);
+    const hang: SummaryCandidate = { summarize: async (_request, signal) => new Promise<string>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    }) };
+    const job = new ExternalSummaryExecutor(1).execute(work, [hang, { ...hang }], { ...budget, totalTimeoutMs: 15 });
+    await advance(7);
+    await advance(8);
+    const result = await job;
+    assert.deepEqual(result.attempts.map((item) => item.outcome), ["timeout", "timeout"], "every candidate got a real share of the pot");
     assert.equal(result.status, "deadline");
-    assert.equal(backup, 0);
 });
 
 test("external summary: aggregate concurrency bounds distinct operations", async () => {
@@ -246,9 +284,21 @@ test("external summary #6885: a non-fetch rejection keeps its safe cause in the 
     const lines: string[] = [];
     setLogCapture((level, msg) => { if (level === "warn") lines.push(msg); });
     try {
+        const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => { throw new Error("External summary response did not complete"); } }], budget);
+        assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error", detail: "External summary response did not complete" }] });
+        assert.equal(lines.filter((line) => line.includes("External summary response did not complete")).length, 1);
+    } finally { setLogCapture(null); }
+});
+
+test("external summary #7569: the context-budget guard rejection keeps its cause in the attempt without a second warn", async () => {
+    const lines: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") lines.push(msg); });
+    try {
         const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => { throw new Error("External summary input exceeds the target context budget"); } }], budget);
         assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error", detail: "External summary input exceeds the target context budget" }] });
-        assert.equal(lines.filter((line) => line.includes("External summary input exceeds the target context budget")).length, 1);
+        // The HTTP candidate owns this warn — it carries the input/window/output
+        // numbers the executor does not have; the executor must not re-warn it.
+        assert.equal(lines.filter((line) => line.includes("External summary input exceeds the target context budget")).length, 0);
     } finally { setLogCapture(null); }
 });
 

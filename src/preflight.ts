@@ -22,7 +22,7 @@ import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBa
 import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES, UPSTREAM_FIRST_BYTE_TIMEOUT_CODE } from "./upstream-fail.js";
-import { lastCompressSuffix, type Session } from "./session.js";
+import { lastCompressSuffix, markDirty, type Session } from "./session.js";
 import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
@@ -172,6 +172,25 @@ const EMERGENCY_FOLD_COVERAGE = MAX_PREFLIGHT_ROUNDS * 2 * CHUNK_FRACTION;
 // covers ~250x the window at observed per-fold savings (~0.5-0.6x window) —
 // far beyond any realistic resend size.
 const EMERGENCY_ROUND_CAP = 512;
+// #3573: client-patience wall budget for the LLM fold path. A summarization
+// round costs 25-44s against a real upstream regardless of range size (#2682
+// measurement), while the common client timeout class (dsh ~60s) only fits
+// ONE such round — pre-fix the marathon kept admitting rounds until the
+// client disconnected mid-round, wasting the in-flight summary call and
+// leaving the user with an opaque 60s hang. Admission now stops BEFORE a
+// round that would blow the budget (estimate: next round costs 2x the last
+// one's measured wall time); the attempt's completed folds are already
+// persisted, so the client's retry resumes from the smaller view and the
+// marathon converges across attempts instead of dying on the same wall. The
+// first round is always admitted (nothing measured yet), the digest regime is
+// exempt (CPU-only, converges in seconds by design), and fast-upstream
+// sessions never notice: their whole preflight finishes far under the budget.
+const PREFLIGHT_WALL_BUDGET_MS = 50_000;
+let preflightWallBudgetOverrideMs: number | null = null;
+/** Test seam (#3091 pattern): override the wall-clock admission budget; null = production behavior. */
+export function _setPreflightWallBudgetForTest(ms: number | null): void {
+    preflightWallBudgetOverrideMs = ms;
+}
 // Per-entry head-fragment length in digest form A (form B strips heads when
 // even that does not fit the bounds).
 const DIGEST_HEAD_CHARS = 120;
@@ -1923,6 +1942,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         );
     };
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true, hadFoldableCandidates: false };
+    const adoptMeasuredTurn = (turn: ReturnType<CompressionCore["processTurn"]>): void => {
+        turn.state.nudge.estimateHoldStreak = deps.session.state.nudge.estimateHoldStreak;
+        deps.session.state = turn.state;
+        adoptContentStore(deps.session, turn.contentStore);
+    };
     // #4288: set when the round-top fit exit fired — the walk ended in a
     // forward decision, and no later verdict may override it (see the final
     // failure stamp below).
@@ -2058,6 +2082,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         probeDead = false;
     };
     let rangesTried = 0;
+    // #3573: wall-clock tracking for client-patience round admission.
+    const wallStart = Date.now();
+    let lastRoundMs = 0;
+    let lastRoundStart = 0;
+    let wallBudgetHit = false;
+    let wallStopAfterRounds = 0;
     // #2657×#2678 fusion: set when a round's whole external-summary batch died
     // in the shared pool's queue (deadline, zero dispatched attempts). Later
     // rounds would queue behind the same holders with fresh budgets each,
@@ -2164,7 +2194,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const tiersEnabled = (deps.config as ResolvedKernelConfig).tiers?.enabled !== false;
     let tierRecoveryAttempted = false;
     const eligibleForTierRecovery = (): boolean => {
-        if (!tiersEnabled || tierRecoveryAttempted || deps.signal?.aborted || emergencyFold) return false;
+        if (!tiersEnabled || tierRecoveryAttempted || deps.signal?.aborted || emergencyFold || wallBudgetHit) return false;
         if (summaryCalls >= summaryBudget) return false;
         const active = deps.session.state.blocks.filter((b) => b.active);
         return active.filter((b) => b.tier === 1).length >= 2 || active.filter((b) => b.tier === 2).length >= 2;
@@ -2183,8 +2213,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 tokenCount: currentTokens, renderTags: "text-only", contentStore: contentStoreOf(deps.session),
             });
             measuredNudge = turn.nudge;
-            deps.session.state = turn.state;
-            adoptContentStore(deps.session, turn.contentStore);
+            adoptMeasuredTurn(turn);
             const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
             refreshImages(view);
             const est = applyEstimateCalibration(estimateCoreMessages(view) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve;
@@ -2389,6 +2418,25 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             break;
         }
         if (poolQueueDrop) break;
+        // #3573: client-patience admission (LLM fold path only). Rounds that
+        // make upstream calls are admitted only while the wall clock leaves
+        // room for the next one — see PREFLIGHT_WALL_BUDGET_MS above. Stopping
+        // here is progress, not failure: every completed fold is persisted, so
+        // the caller's fit gate either forwards the now-fitting payload or
+        // fails fast and the client retry resumes from the smaller view.
+        const admissionNow = Date.now();
+        if (lastRoundStart > 0) lastRoundMs = admissionNow - lastRoundStart;
+        if (round > 0 && !emergencyFold) {
+            const elapsedMs = admissionNow - wallStart;
+            const estNextMs = lastRoundMs > 0 ? lastRoundMs * 2 : 0;
+            if (elapsedMs + estNextMs > (preflightWallBudgetOverrideMs ?? PREFLIGHT_WALL_BUDGET_MS)) {
+                wallBudgetHit = true;
+                wallStopAfterRounds = round;
+                deps.log("warn", `[preflight] stopping after round ${round}: ${elapsedMs}ms elapsed + ~${estNextMs}ms for the next round exceeds the wall budget (${preflightWallBudgetOverrideMs ?? PREFLIGHT_WALL_BUDGET_MS}ms) — ${result.compressedRanges} fold(s) from this attempt are persisted; the client retry resumes from the smaller view (#3573)`);
+                break;
+            }
+        }
+        lastRoundStart = admissionNow;
         // #4528: each round re-runs the full O(messages) kernel pass over the
         // resent history; yield between rounds so UI/API requests on the same
         // listener are served instead of queueing behind the whole compression
@@ -2406,8 +2454,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             renderTags: "text-only",
             contentStore: contentStoreOf(deps.session),
         });
-        deps.session.state = turn.state;
-        adoptContentStore(deps.session, turn.contentStore);
+        adoptMeasuredTurn(turn);
         // Absorbed pairs are hidden on the wire, so the fit check must see the
         // same reduced payload prepare* will actually forward.
         turn.messages = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
@@ -2764,6 +2811,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             deps.session.stats.lastInputTokens += defaultCountTokens(summary);
             appliedThisRound += 1;
             result.compressedRanges += 1;
+            // #3978: persist each committed fold as it lands — a client-disconnect
+            // abort early-returns before any post-loop markDirty, and a retry under a
+            // new session id continues only if the parent's partial blocks are loadable.
+            markDirty(deps.session);
             return true;
         };
         // #2678/#2667: fold several disjoint ranges in ONE external-summary call
@@ -3790,7 +3841,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // minCompressRange" for a range that died before any summary call).
             const unusableNote = lastUnusableDetail ? ` Last unusable summary: ${safePrefix(lastUnusableDetail, 300)}.` : "";
             const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
-            if (budgetHit) {
+            if (wallBudgetHit) {
+                // #3573: the marathon stopped on the client-patience wall clock, not on a
+                // round or summary budget — say so. The payload may still overflow the
+                // window, but it CAN fit after more folding: every landed fold is persisted,
+                // so the client retry resumes from a smaller view. Never fall through to the
+                // "budget exhausted" wording below — and never into the relaxed deterministic
+                // branch (a 413 terminal verdict would kill exactly this stop's
+                // retry-convergence story); this stop is retryable by design.
+                failure = { kind: "exhausted", retryable: true, detail: `stopped at the client-patience wall budget after ${wallStopAfterRounds} round(s): ${result.compressedRanges} fold(s) from this attempt are persisted — the next request resumes from the smaller view and keeps folding (#3573)` };
+            } else if (budgetHit) {
                 failure = { kind: "exhausted", detail: `the preflight summarization budget (${summaryBudget} calls per protection regime) was exhausted before the payload fit the window${unusableNote}${skipNote}` };
             } else if (relaxed && result.compressedRanges > 0) {
                 // #3461: "folded everything compressible" is only a structural

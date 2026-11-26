@@ -117,15 +117,18 @@ export interface ProcessTurnInput {
    *     after an aborted turn or a cache-TTL expiry that left no usage
    *     report). Such readings structurally run high relative to what will
    *     actually be billed.
-   * Feeds the phantom-pressure guard: with nudge.requireUsageSampleForPressure
-   * (default on) an ESTIMATE reading never arms the pressure band outright —
-   * the injection is deferred one round until a usage-grade reading lands,
-   * which costs nothing in practice (the next request carries the report).
-   * The #5865 backstop bounds that deferral to nudge.maxEstimateHoldRounds
-   * (default 2) consecutive estimate rounds so a backend that NEVER reports
-   * usage cannot starve its pressure nudges forever. Omit for legacy behavior
-   * (guard off). Non-pressure tiers are unaffected.
-   */
+    * Feeds the phantom-pressure guard: with nudge.requireUsageSampleForPressure
+    * (default on) an ESTIMATE reading never arms the pressure band outright —
+    * the injection is deferred one round until a usage-grade reading lands,
+    * which costs nothing in practice (the next request carries the report).
+    * The #5865 backstop bounds that deferral to nudge.maxEstimateHoldRounds
+    * (default 2) consecutive estimate rounds so a backend that NEVER reports
+    * usage cannot starve its pressure nudges forever. The same guard covers
+    * the emergency-truncate watermark (#6882): a crossing on an estimate
+    * reading is held under the same backstop instead of latching clips off a
+    * meter the bill never saw. Omit for legacy behavior (guard off).
+    * Non-pressure tiers are unaffected.
+    */
   tokenCountSource?: "usage" | "estimate";
   /**
    * Which messages get an <acp> ref tag injected into their text
@@ -1692,6 +1695,47 @@ const emergencyTruncateNode: PipelineNode = {
           terminalStreak: 0,
           emergencyTruncateLatch:
             latchLive.length > 0 ? latchLive : undefined,
+        },
+      };
+    }
+    // #6882: the truncate watermark is the same phantom-pressure surface as
+    // the pressure band — an ESTIMATE-grade meter reading structurally
+    // overstates what will be billed (observed 1.75–1.87× after a stream
+    // interruption), and a watermark crossing on such a reading latches clips
+    // the bill never saw: content destroyed plus a burned prefix cache. The
+    // guard is the ONE the pressure band already uses (decideNudge): while the
+    // estimate-hold backstop (nudge.maxEstimateHoldRounds, default 2) allows,
+    // the watermark decision waits one round for the usage-grade reading the
+    // next request carries. Already-latched clips still replay byte-for-byte
+    // above; the round is UNJUDGED, so terminalStreak is neither reset nor
+    // incremented. Billed readings ("usage", incl. the overflow arm), legacy
+    // callers (source omitted), and nudge.requireUsageSampleForPressure =
+    // false keep byte-identical behavior.
+    const estimateHoldStreak = io.state.nudge.estimateHoldStreak ?? 0;
+    const maxEstimateHoldRounds = Math.max(
+      0,
+      Math.floor(ctx.config.nudge.maxEstimateHoldRounds ?? 2),
+    );
+    const heldOnEstimate =
+      ctx.tokenCountSource === "estimate" &&
+      ctx.config.nudge.requireUsageSampleForPressure !== false &&
+      estimateHoldStreak <= maxEstimateHoldRounds;
+    if (heldOnEstimate) {
+      return {
+        ...io,
+        messages,
+        state: {
+          ...io.state,
+          // Unjudged round: the streak rides through untouched (the
+          // below-threshold branch resets it, the truncation branch
+          // increments it — this one changes neither).
+          terminalStreak: io.state.terminalStreak,
+          emergencyTruncateLatch:
+            latchLive.length > 0 ? latchLive : undefined,
+        },
+        effects: {
+          ...io.effects,
+          truncationSkipped: `emergency-truncate held at ${Math.round(usage * 100)}% usage: the meter reading is estimate-grade (no billing sample landed this cycle) and the estimate-hold backstop allows (estimate round ${estimateHoldStreak} of ${maxEstimateHoldRounds}) — the watermark decision waits for a usage-grade reading; already-latched clips still replay byte-for-byte`,
         },
       };
     }

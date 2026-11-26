@@ -33,7 +33,7 @@ import { recordConflict } from "../conflict-watch.js";
 import { getStore } from "../persist.js";
 import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
-import { emitPreflightError } from "../stream-error.js";
+import { emitPreflightError, preflightFailFastBody } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, preferZedThreadIdIdentity, qoderSideTaskConversation, zcodeMemoryConversation } from "../session-id.js";
 import { preferKiroConversationIdentity } from "../kiro.js";
@@ -3267,7 +3267,11 @@ async function handleRequest(
                 respondFailFast: boolean,
                 overflowWindow?: number,
             ) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = async (respondFailFast, overflowWindow) => {
-                const runPrepareInner = async (): Promise<Prepared> => {
+                const runPrepareInner = async (recoverOverflow: boolean): Promise<Prepared> => {
+                    const failureShrinkArmed = session.stats.lastInputTokensSource === "estimate" && session.stats.emergencyShrinkAt !== undefined;
+                    const prepareConfig = recoverOverflow || failureShrinkArmed
+                        ? { ...reqConfig, nudge: { ...reqConfig.nudge, requireUsageSampleForPressure: false } }
+                        : reqConfig;
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
                     tickPostRebuildAnchor(session);
@@ -3368,7 +3372,7 @@ async function handleRequest(
                         // v1internal dialect the model rides in the envelope meta
                         // instead of the path — fall back to it so Prepared carries
                         // a real model (the loop's synthetic frames read it back).
-                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
+                        return await prepareGoogle(work as GoogleRequestBody, opts, core, prepareConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
                     }
                     // #6181 B3: a PLUGIN-lane chained round whose input
                     // carries no ARRAY content (absent or empty — a
@@ -3397,9 +3401,9 @@ async function handleRequest(
                         (work as ResponsesRequestBody).previous_response_id!.length > 0 &&
                         (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0);
                     const preparedOut = protocol === "anthropic"
-                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
+                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, prepareConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
-                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText, bodyParseDeferred)
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, prepareConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText, bodyParseDeferred)
                           : pureChainContinuation
                             ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
                             : responsesCompact
@@ -3407,7 +3411,7 @@ async function handleRequest(
                             // prepareResponsesCompact falls back to the raw bodyBuffer —
                             // forward it unchanged (byte-identical passthrough).
                             ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide);
+                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, prepareConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide);
                     // The resolved model rides with the prepared request: on the
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
@@ -3427,8 +3431,8 @@ async function handleRequest(
                 };
                 // #1295: stamp the envelope meta onto every Prepared for this
                 // request (initial AND preflight re-prepares both flow through).
-                const runPrepare = async (): Promise<Prepared> => {
-                    const p = await runPrepareInner();
+                const runPrepare = async (recoverOverflow = false): Promise<Prepared> => {
+                    const p = await runPrepareInner(recoverOverflow);
                     if (ccMeta !== undefined) p.commandcode = { meta: ccMeta };
                     if (wireFamily === "zed" && zedMeta !== undefined) p.zed = { meta: zedMeta };
                     return p;
@@ -3641,14 +3645,7 @@ async function handleRequest(
                                     emitPreflightError(res, prepared!.commandcode ? "commandcode" : prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
                                 } else {
                                     try {
-                                        res.end(JSON.stringify({
-                                            error: {
-                                                type: "server_error",
-                                                code: "preflight_compress_failed",
-                                                message: outcome.message,
-                                                retryable: outcome.retryable,
-                                            },
-                                        }));
+                                        res.end(preflightFailFastBody(outcome.message, outcome.retryable));
                                     } catch { /* client gone */ }
                                 }
                             } else {
@@ -3659,14 +3656,7 @@ async function handleRequest(
                                     "content-type": "application/json",
                                     ...(outcome.status === 503 ? { "retry-after": "30" } : {}),
                                 });
-                                res.end(JSON.stringify({
-                                    error: {
-                                        type: "server_error",
-                                        code: "preflight_compress_failed",
-                                        message: outcome.message,
-                                        retryable: outcome.retryable,
-                                    },
-                                }));
+                                res.end(preflightFailFastBody(outcome.message, outcome.retryable));
                             }
                         }
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
