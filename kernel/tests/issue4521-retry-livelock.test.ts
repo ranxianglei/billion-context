@@ -95,6 +95,10 @@ test("#4521: endId above highest allocated ref clamps down instead of refusing t
     r.result.warnings.some((w) => /clamped to it/.test(w) && /highest allocated ref \(m00004\)/.test(w)),
     `expected clamp warning, got: ${JSON.stringify(r.result.warnings)}`,
   );
+  assert.ok(
+    r.result.warnings.some((w) => /lands at m00004, the last visible message at or below the frontier/.test(w)),
+    `the clamp warning must name the ref the fold actually landed on, got: ${JSON.stringify(r.result.warnings)}`,
+  );
   const block = r.state.blocks.find((b) => b.active);
   assert.ok(block, "a block was created");
   assert.deepEqual(

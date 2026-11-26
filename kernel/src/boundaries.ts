@@ -267,7 +267,7 @@ function resolveAnchorIndex(
           if (neighbor !== null) {
             return {
               index: neighbor.index,
-              snapped: `${label}="${boundary.raw}" is above this session's highest allocated ref (${highest > 0 ? formatPaddedRef(highest) : "none"}) — clamped to it (refs are minted in order and never pre-allocated, so higher numbers do not exist yet). The range folds up to the last visible message.`,
+              snapped: `${label}="${boundary.raw}" is above this session's highest allocated ref (${highest > 0 ? formatPaddedRef(highest) : "none"}) — clamped to it (refs are minted in order and never pre-allocated, so higher numbers do not exist yet); the fold lands at ${neighbor.ref}, the last visible message at or below the frontier.`,
               clampedRef: neighbor.ref,
             };
           }
