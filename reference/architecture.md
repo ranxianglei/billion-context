@@ -38,6 +38,8 @@ billion-context/
 │   │   ├── dsh-authored-compaction.ts #   Bili-authored dsh compaction: answers the summarize call locally (#3733)
 │   │   ├── fastpath.ts           #   Watermark fastpath: full-resend turns decode head + tail only (#5403)
 │   │   ├── fastpath-scan.ts      #   Zero-decode structural span scan of chat-completions bodies (#5403)
+│   │   ├── fastpath-v6-render.ts #   #5664 fastpath v6 render-snapshot plane: steady rounds append one captured row per new element; any recast kills the plane for that sid
+│   │   ├── fastpath-v6.ts        #   #5643 fastpath v6: (sessionid,msgid) composite-identity incremental fast lane — hit turns transform only the new element spans
 │   │   ├── lane-decisions.ts     #   Single resolver for per-lane gating decisions (#3417)
 │   │   ├── pi-subagent-channel.ts #   Channel fallback for pi-subagent children missing ACP tools (#2268)
 │   │   ├── snapshot-render.ts    #   Snapshot render: outbound prefix from server transcript (#3756) + egress stable-prefix cache splice/cut (#5874 v2)

@@ -51,6 +51,7 @@ import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-prov
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
 import { executeThreadsReforge, threadsBetaToDecline } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
+import { FastpathV6IdentityFault } from "./fastpath-v6.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { opencodeForkParent } from "../opencode-fork-lineage.js";
 import { consumePluginRegisterFor, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
@@ -3770,22 +3771,35 @@ async function handleRequest(
             if (guardScheme !== undefined && !resignArmable && !guardResign.enabled) {
                 clearSignedRefusal(guardScheme);
             }
+            // #5643 §3.2: fastpath v6 identity hard-gate refusal → structured
+            // 400 (never a 5xx, never a silent fallback). Caught HERE —
+            // outside the pipeline, because the pipeline's tail treats a null
+            // result as "forward the raw body", which would leak an already-
+            // refused request to the model endpoint. The evaluate path wrote
+            // zero data-plane state before throwing, so a fixed retry lands
+            // clean. `forwarded = true` suppresses that tail pass-through.
             // #5403 family delta arm: a prefix-less tail-slice body cannot be
             // processed by the legacy path — the re-anchor is a 400 the client
             // answers by resending THIS turn in full form (one-round
             // convergence, the same contract as every pf miss). No pf-seq
             // stamp; mode relearned as "full" via the header.
-            let pendingForward;
+            let pendingForward: { body: string | Buffer; prepared: Prepared | null } | null = null;
             try {
                 pendingForward = await withSessionLock(session, () => runPreparedPipeline!(true));
             } catch (err) {
-                if (err instanceof DeltaReanchorError && !res.destroyed && !res.writableEnded) {
+                if (err instanceof FastpathV6IdentityFault && !res.headersSent && res.writable !== false) {
+                    loggerLog("error", `[${sessionId}] fastpath v6 identity fault refused: ${err.detail}`);
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify(err.toJSON()));
+                    forwarded = true;
+                } else if (err instanceof DeltaReanchorError && !res.destroyed && !res.writableEnded) {
                     log("warn", `[${session.id}] watermark delta re-anchor 400 (${err.reason}) — client resends in full form`);
                     res.writeHead(400, { "content-type": "application/json", [MSGID_MODE_HEADER]: "full" });
                     res.end(JSON.stringify({ error: { type: "pf_delta_reanchor", message: err.reason } }));
                     return;
+                } else {
+                    throw err;
                 }
-                throw err;
             }
             if (pendingForward) {
                 forwarded = true;
@@ -3801,7 +3815,19 @@ async function handleRequest(
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
                     ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
-                          const next = await withSessionLock(session, () => runPreparedPipeline!(false, realWindow));
+                          const next = await withSessionLock(session, () => runPreparedPipeline!(false, realWindow)).catch((e): { body: string | Buffer; prepared: Prepared | null } | null => {
+                              // Refold re-runs prepare → the v6 hard gate can
+                              // fire a SECOND time mid-request. Fail open: hand
+                              // back the original overflow 400 untouched rather
+                              // than turning a fold attempt into a new error
+                              // shape (the first turn's rejection already told
+                              // the client what to fix).
+                              if (e instanceof FastpathV6IdentityFault) {
+                                  loggerLog("error", `[${sessionId}] fastpath v6 identity fault during overflow refold — original 400 passes through: ${e.detail}`);
+                                  return null;
+                              }
+                              throw e;
+                          });
                           if (!next || String(next.body) === String(pendingForward.body)) return null;
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;

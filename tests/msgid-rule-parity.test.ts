@@ -18,6 +18,10 @@ import { collectRequestIds } from "../src/request-membership.js";
 import { PF_SLOT_UNKNOWN, pfCaptureIds, pfLearnStamp, pfRequestHeaders } from "../src/agent/pf-channel.js";
 import { ENVELOPE_MSG_IDS_FIELD, _hostMsgIdsOfForTest, _pfSlotIdsOfForTest } from "../src/agent/dsh-native.js";
 import { _screenMsgIdsForTest } from "../src/agent/incremental-client.js";
+// #5855 re-land: the client-side "?" placeholder was REMOVED by the F2 ruling
+// (owner 2026-11-04, PR #5652 review follow-up) — collectors clear the whole
+// table on any hole. The constant survives ONLY on the server wire-decode side
+// (legacy/v5 traffic may still carry "?" segments), hence the fastpath import.
 import { _parseTailIdsForTest } from "../src/server/fastpath.js";
 
 const GOOD = "h_deadbeefcafe0001";
@@ -43,7 +47,7 @@ const CF_CASE: EntryCase = { name: "unicode format U+200B (\\p{C} only)", value:
 const DUP_ALONE: EntryCase = { name: "duplicate / alone", value: [GOOD, GOOD], inboundPasses: true }; // lenient-only again: no dedupe gate
 const DUP_MIXED: EntryCase = { name: "duplicate / mixed", value: [GOOD, GOOD2, GOOD], inboundPasses: true };
 
-const LONG_LIST = Array.from({ length: 2049 }, (_, i) => `bulk_${i}_abcdef00`); // > pf-channel MAX_IDS (2048); the strict validators have NO cap today
+const LONG_LIST = Array.from({ length: 2049 }, (_, i) => `bulk_${i}_abcdef00`); // the strict validators have NO cap; under v6 (#5855) this is INSIDE pf-channel's raised 16384 capture cap (cap pinned separately below)
 
 function objForm(values: unknown[]): Array<{ id?: unknown }> {
     return values.map((v) => ({ id: v }));
@@ -109,11 +113,14 @@ test("structural cases: non-array / empty / width mismatch / bulk cap (#5826 par
     assert.equal(_parseTailIdsForTest(""), null, "parseTailIds empty string -> no segments");
 });
 
-test("per-slot screening: bad slots ride ?, never poison neighbours (#5826 parity)", () => {
-    // pfSlotIdsOf (dsh watermark capture): position preserved, bad -> "?".
-    assert.deepEqual(_pfSlotIdsOfForTest(objForm([GOOD, "a b", GOOD2])), [GOOD, PF_SLOT_UNKNOWN, GOOD2], "pfSlotIdsOf mixed");
-    assert.deepEqual(_pfSlotIdsOfForTest(objForm(["a b"])), [PF_SLOT_UNKNOWN], "pfSlotIdsOf all-bad still returns the slot list (channel decides absence)");
+test("per-slot screening: F2 whole-table clear on any hole (#5826 parity, re-pinned for #5855 v6 re-land)", () => {
+    // pfSlotIdsOf (dsh watermark capture): F2 ruling (owner 2026-11-04) — one
+    // hole ⇒ the WHOLE table is absent; "?" never travels from the collector
+    // anymore (pre-v6 verdict [GOOD, "?", GOOD2] / ["?"] deliberately replaced).
+    assert.equal(_pfSlotIdsOfForTest(objForm([GOOD, "a b", GOOD2])), undefined, "pfSlotIdsOf mixed: one hole clears the table (F2)");
+    assert.equal(_pfSlotIdsOfForTest(objForm(["a b"])), undefined, "pfSlotIdsOf all-bad: whole table absent (F2)");
     // NOTE: duplicates DO travel here — dedupe lives in pfCaptureIds (asserted next).
+    assert.deepEqual(_pfSlotIdsOfForTest(objForm([GOOD, GOOD])), [GOOD, GOOD], "pfSlotIdsOf has no dedupe gate (collector-level)");
 
     // collectRequestIds (settlement evidence): LENOIENT by design — skips
     // bad entries without voiding the rest (its ids never enter the identity
