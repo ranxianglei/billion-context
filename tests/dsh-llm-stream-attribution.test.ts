@@ -10,7 +10,7 @@
  * loses: retry chains, agentless side-calls, disposed initiator scopes.
  */
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, before } from "node:test";
@@ -25,6 +25,7 @@ import {
     apply,
     forkChildVerdict,
     _resetRegisterForTest,
+    _resetCompactionCoverageNoteForTest,
     _settleNativeForTest,
     _stateBeforeSendForTest,
     _nativeStateForTest,
@@ -448,6 +449,49 @@ test("#6880: the dispatch purpose is captured into the scope and stamped per fet
             await it.next();
             assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], "conversation", `junk purpose ${JSON.stringify(String(junk).slice(0, 20))} degrades to the sentinel, never the raw value`);
             assert.equal(stamps.at(-1)?.["x-bili-plugin-conversation"], "sess-junk");
+        }
+    });
+});
+
+// #6770: the durable profile note that used to carry the coverage reading stays
+// silent wherever profileContext.startedBundles cannot be read (the observed
+// state on every host we checked), so the reading rides the first routed
+// request instead. This pins the wiring itself — that it fires, and that it
+// fires exactly once per process.
+test("#6770: compaction overlay coverage is logged once on the first routed request", { timeout: 15_000 }, async () => {
+    await withSetup(async (handle) => {
+        const previousState = process.env.XDG_STATE_HOME;
+        const state = mkdtempSync(join(tmpdir(), "dsh-coverage-note-"));
+        process.env.XDG_STATE_HOME = state;
+        const logFile = join(state, "billion-context", "bili.log");
+        const coverageLines = (): number =>
+            existsSync(logFile) ? readFileSync(logFile, "utf8").split("compaction overlay coverage").length - 1 : 0;
+        const gate = _stateTakeoverGateForTest();
+        assert.ok(gate, "takeover gate is installed after apply()");
+        const base = async function* (): AsyncIterable<number> {
+            await gate(MODEL_URL, { bytes: 200 }, { headers: {} });
+            yield 1;
+        };
+        try {
+            _resetCompactionCoverageNoteForTest();
+            handle.setInitiator("sess-coverage");
+            for await (const _chunk of runWaterfall(handle.events, { sessionId: "sess-coverage" }, base)) {
+                /* drain */
+            }
+            assert.equal(coverageLines(), 1, "the first routed request carries the coverage readout");
+            assert.match(
+                readFileSync(logFile, "utf8"),
+                /no preset entry rewritten in this process/,
+                "an untouched overlay reports the lazy-resolution frame, not a bare zero",
+            );
+            for await (const _chunk of runWaterfall(handle.events, { sessionId: "sess-coverage" }, base)) {
+                /* drain */
+            }
+            assert.equal(coverageLines(), 1, "a second routed request must not repeat the reading (once per process)");
+        } finally {
+            if (previousState === undefined) delete process.env.XDG_STATE_HOME;
+            else process.env.XDG_STATE_HOME = previousState;
+            rmSync(state, { recursive: true, force: true });
         }
     });
 });
