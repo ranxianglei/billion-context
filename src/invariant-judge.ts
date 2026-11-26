@@ -257,11 +257,13 @@ function isTruncatedTwin(a: CoreMessage, b: CoreMessage): boolean {
 // #5049 item 2: egress shed (#3701/#4124) archives outbound images to a
 // placeholder NOTE in the outbound copy only — the inbound twin stays the
 // image. Note shape is emitted by exactly one producer (src/egress-shed.ts
-// shedNote): `[image: <mime> <WxH> <mNNNNN> omitted for size limit]`, every
-// bit a space-free token. Anchored full-string match, not a substring scan
-// (#1456 discipline): user/model text merely CONTAINING the phrase does not
-// qualify.
-const SHED_NOTE_RE = /^\[image: [^\s\[\]]+(\s[^\s\[\]]+)* omitted for size limit\]$/;
+// shedNote): `[image: <mime> <WxH> <mNNNNN> omitted for size limit]`, each
+// bit a space-free token — any of mime/WxH/ref may be absent (a malformed
+// media type + undecodable dims + missing ref yields zero bits, i.e. two
+// spaces), so the token run is optional. Anchored full-string match, not a
+// substring scan (#1456 discipline): user/model text merely CONTAINING the
+// phrase does not qualify.
+const SHED_NOTE_RE = /^\[image: (?:[^\s\[\]]+(?:\s[^\s\[\]]+)*)? omitted for size limit\]$/;
 
 // Directional structural proof that b is the sanctioned archive of a: b must
 // be EXACTLY a shed note and a must be an image core (all four wire codecs

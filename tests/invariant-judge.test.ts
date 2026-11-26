@@ -66,6 +66,16 @@ test("I1 egress-shed archived image twin is exempt (#5049 item 2)", () => {
   assert.equal(v.matched, 2);
 });
 
+test("I1 shed note with ZERO bits (malformed media type, no dims, no ref) is exempt (#5049 item 2)", () => {
+  // shedNote yields `[image:  omitted for size limit]` (two spaces) when mime,
+  // dims and ref are all absent — the token run is optional, so the degenerate
+  // note still matches the single-producer format and the image twin is clean.
+  const entry = [mk("user", "text", "[image]", { imagePart: true })];
+  const exit = [mk("user", "text", "[image:  omitted for size limit]")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+});
+
 test("I1 shed note among stable neighbors stays clean (realistic mixed cell)", () => {
   const entry = [mk("user", "text", "look at this"), mk("user", "text", "[image]", { imagePart: true }), mk("user", "text", "and this too")];
   const exit = [mk("user", "text", "look at this"), mk("user", "text", SHED_NOTE), mk("user", "text", "and this too")];
