@@ -578,13 +578,22 @@ export interface RawBodyBreakdown {
     other: number;
 }
 
+/** #7175: the message-array and system-prompt field names across the hosted
+ *  wire shapes — the breakdown must attribute the mass of bodies that carry
+ *  their conversation in `input` (responses) or `contents` (gemini) and their
+ *  system text in `instructions`/`systemInstruction`, not just the openai
+ *  `messages`/`system`. `total` is unchanged (every top-level key still lands
+ *  in exactly one bucket); only the per-dimension attribution moves. */
+const MESSAGE_ARRAY_KEYS = new Set(["messages", "input", "contents"]);
+const SYSTEM_PROMPT_KEYS = new Set(["system", "instructions", "systemInstruction"]);
+
 export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
     const pending: [unknown, string | undefined, number][] = [];
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
             if (isNonModelTopLevelKey(k)) continue;
-            const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
+            const bucket = MESSAGE_ARRAY_KEYS.has(k) ? 0 : k === "tools" ? 1 : SYSTEM_PROMPT_KEYS.has(k) ? 2 : 3;
             pending.push([v, k, bucket]);
         }
     } else {
