@@ -115,12 +115,17 @@ test("#3890 shutdown backstop extends while a connection is alive, then exits wh
             else await new Promise((r) => setTimeout(r, 100));
         }
         assert.ok(port > 0, `fixture reported READY (stderr tail: ${stderr.slice(-500)})`);
-        // A bare held socket: registered in connRecords, never requests, never
-        // FINs until destroyed — deterministic liveConns≥1 without depending on
-        // keep-alive reaper timing.
+        // A request whose body never completes: the server has dispatched it
+        // (the automatic 100 Continue proves it) and it stays live until the
+        // socket is destroyed, without depending on upstream timing. An idle
+        // socket no longer holds the drain.
         held = new net.Socket();
         held.connect(port, "127.0.0.1");
         await once(held, "connect");
+        held.write("POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n");
+        let interim = "";
+        while (!interim.includes("100 Continue")) interim += String((await once(held, "data"))[0]);
+        held.write("{");
         const res = await fetch(`http://127.0.0.1:${port}/__bili/shutdown`, { method: "POST" });
         assert.equal(res.status, 202, "admin shutdown accepted");
         // Pre-fix: force-exit at ~10s with liveConns=1. Post-fix: the window
