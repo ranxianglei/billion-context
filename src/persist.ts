@@ -970,6 +970,61 @@ export class SessionStore {
         return out;
     }
 
+    /** #6795 CLI-ls: metadata-only legacy enumeration for `bili sessions ls`.
+     *  Walks the JSON tree, parses each file ONCE, extracts just
+     *  {id, savedAt, label, protocol, origin} and drops the record
+     *  immediately — peak heap is the largest single file, never the corpus.
+     *  loadAll() is the OOM shape (#1937 web / #4677 migration on the CLI
+     *  lane): it materializes every session and, in full mode, the index
+     *  view of each one. Read-only by design — unlike the boot path, corrupt
+     *  files are skipped, never quarantined (ls must not move operator files).
+     *  Enumeration mirrors the kernel loadAll contract: recursive walk,
+     *  filename-ownership check (canonical / flat / .fb spill),
+     *  newest-savedAt wins on duplicates. */
+    async enumerateLegacyMeta(): Promise<Map<string, { savedAt: number; label?: string; protocol?: string; upstreamOrigin?: string }>> {
+        const out = new Map<string, { savedAt: number; label?: string; protocol?: string; upstreamOrigin?: string }>();
+        if (!this.enabled || !existsSync(this.sessionsDir)) return out;
+        const files = await walkJsonFiles(this.sessionsDir);
+        for (const file of files) {
+            const base = path.basename(file);
+            if (base.endsWith(".content-store.json")) continue; // CCR companions are not sessions (foreignFile parity)
+            let raw: unknown;
+            try {
+                const bytes = readFileSync(file);
+                try {
+                    raw = JSON.parse(bytes.toString("utf8"));
+                } catch {
+                    raw = JSON.parse(this.readCodec.decode(bytes));
+                }
+            } catch {
+                continue; // corrupt/undecodable: boot's loadAll quarantines these; ls only lists
+            }
+            const payload = raw && typeof raw === "object" && "payload" in raw ? raw.payload : raw;
+            if (!isValidRecord(payload)) continue;
+            // Ownership mirrors kernel StateStore.loadAll: the filename must
+            // be the record's canonical name, its flat fallback, or a .fb
+            // spill of either — renamed/foreign files are never attributed.
+            const relBase = path.basename(relPathFor(payload.id, payload.meta?.protocol ?? payload.protocol, payload.meta?.upstreamOrigin ?? payload.upstreamOrigin));
+            const flatBase = flatFileNameFor(payload.id);
+            if (base !== relBase && base !== flatBase) {
+                if (!base.endsWith(".fb.json")) continue;
+                const canonical = `${base.slice(0, -".fb.json".length)}.json`;
+                if (canonical !== relBase && canonical !== flatBase) continue;
+            }
+            const savedAt = payload.savedAt;
+            const existing = out.get(payload.id);
+            if (!existing || savedAt >= existing.savedAt) {
+                out.set(payload.id, {
+                    savedAt,
+                    label: payload.meta?.label,
+                    protocol: payload.meta?.protocol ?? payload.protocol,
+                    upstreamOrigin: payload.meta?.upstreamOrigin ?? payload.upstreamOrigin,
+                });
+            }
+        }
+        return out;
+    }
+
     /** Single-pass boot (#401): ONE loadAll walk+parse, then the #286
      *  identity migration over the SAME parsed map (no extra directory
      *  walk), then hydration into Sessions. initSessions calls this instead
