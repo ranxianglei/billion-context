@@ -66,6 +66,16 @@ export interface BiliMessage extends CoreMessage {
    *  pairs; without it the request is rejected. Stored alongside the
    *  reasoning text so coreToAnthropic can reattach it. */
   thinkingSignature?: string;
+  /** #5495/#7684: this reasoning core came from an Anthropic WIRE thinking
+   *  block (parsed by anthropicToCore, or accumulated by the compress loop
+   *  on an anthropic lane). Unsigned upstreams on that lane (DeepSeek's
+   *  /anthropic endpoint) accepted the block without a signature and REQUIRE
+   *  it passed back verbatim — so coreToAnthropic re-emits it as a thinking
+   *  block even without thinkingSignature. An unsigned reasoning core
+   *  WITHOUT this marker is cross-lane (e.g. openai reasoning_content
+   *  re-rendered onto the anthropic wire after a model switch) and degrades
+   *  to a visible text block instead. */
+  anthropicThinking?: true;
   /** Google/Gemini thought signature (thoughtSignature). Gemini 3 validates
    *  the signature of every replayed thought part, so a reasoning core
    *  carries it here for coreToGoogle to reattach. */

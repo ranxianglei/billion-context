@@ -159,9 +159,14 @@ test("same-lane regression: signed anthropic thinking stays a thinking block", (
   assert.equal(thinking.signature, "sig_123");
 });
 
-test("same-lane regression: unsigned anthropic thinking degrades to text (was: rejected upstream)", () => {
+test("same-lane regression: unsigned anthropic thinking relays verbatim as a thinking block (#5495)", () => {
+  // An upstream that does NOT sign (DeepSeek's /anthropic endpoint) accepted
+  // this block without a signature and REQUIRES it passed back verbatim
+  // ("content[].thinking ... must be passed back"). The anthropicToCore parse
+  // marks the core, so coreToAnthropic re-emits the thinking block — it must
+  // NOT degrade to text (degradation is the cross-lane rule only).
   const body: AnthropicRequestBody = {
-    model: "claude-x",
+    model: "deepseek-x",
     messages: [
       { role: "user", content: "think" },
       { role: "assistant", content: [{ type: "thinking", thinking: "no sig" }] },
@@ -169,6 +174,9 @@ test("same-lane regression: unsigned anthropic thinking degrades to text (was: r
   };
   const wire = coreToAnthropic(anthropicToCore(body).msgs);
   const blocks = blocksOf(wire as AnyBlock[]);
-  assert.equal(blocks.filter((b) => b.type === "thinking").length, 0);
-  assert.ok(blocks.some((b) => b.type === "text" && b.text === "no sig"));
+  const thinking = blocks.find((b) => b.type === "thinking");
+  assert.ok(thinking, "same-lane unsigned thinking block missing from the re-render");
+  assert.equal(thinking.thinking, "no sig");
+  assert.ok(!("signature" in thinking) || thinking.signature === "", "no signature invented");
+  assert.equal(blocks.filter((b) => b.type === "text" && b.text === "no sig").length, 0, "same-lane reasoning must not degrade to text");
 });

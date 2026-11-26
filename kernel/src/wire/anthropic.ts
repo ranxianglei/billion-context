@@ -208,6 +208,7 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
             role: "assistant",
             contentType: "reasoning",
             text: b.thinking,
+            anthropicThinking: true,
             ...(b.signature ? { thinkingSignature: b.signature } : {}),
           });
           break;
@@ -687,9 +688,17 @@ export function coreToAnthropic(
             thinking: m.text ?? "",
             signature: m.thinkingSignature,
           });
+        } else if (m.anthropicThinking && (m.text ?? "").length > 0) {
+          // Same-lane round-trip (#5495): this core came from an Anthropic
+          // wire thinking block — an unsigned upstream (DeepSeek /anthropic)
+          // accepted it without a signature and REQUIRES it passed back
+          // verbatim ("content[].thinking ... must be passed back"). Re-emit
+          // as a thinking block, never as text.
+          current.blocks.push({ type: "thinking", thinking: m.text ?? "" });
         } else if ((m.text ?? "").length > 0) {
-          // Unsigned reasoning (cross-lane, or a lane whose model emits no
-          // signatures): the Anthropic API rejects unsigned thinking blocks,
+          // Unsigned reasoning of FOREIGN origin (cross-lane re-render,
+          // e.g. openai reasoning_content after a model switch): the
+          // Anthropic API rejects unsigned thinking blocks it did not issue,
           // so degrade to a visible text block — pi's requiresThinkingAsText
           // parity. Same-lane signed behavior is unchanged.
           current.blocks.push({ type: "text", text: m.text ?? "" });

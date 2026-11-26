@@ -134,15 +134,12 @@ test("issue #221: re-request rejected 400 → degraded retry without thinking re
     }
 });
 
-// #5495 established "unsigned ⇒ relay verbatim"; #7684 (kernel 0.0.211) then
-// changed the RENDER: an unsigned reasoning block reaching coreToAnthropic is
-// degraded to a visible text block, because the Anthropic API rejects unsigned
-// thinking blocks and the kernel cannot tell a same-lane unsigned upstream
-// (DeepSeek /anthropic) from a cross-lane re-render — one safe default for
-// both. Same-lane SIGNED behavior is unchanged. The pin below records the
-// current contract: the thinking CONTENT is carried back (as visible text),
-// not as a thinking block.
-test("issue #221/#5495 → #7684: unsigned thinking with NO signing evidence degrades to visible text on re-render (content preserved)", async () => {
+// #5495 supersedes the original #221 pin here: "unsigned ⇒ always dropped" was
+// the buggy generalization — an Anthropic-wire upstream that does NOT sign
+// (DeepSeek /anthropic) REQUIRES the unsigned block passed back. The drop now
+// keys on per-attempt signing evidence (see core.ts requiresThinkingSignature):
+// no signature seen this attempt ⇒ unsigned relay ⇒ replay verbatim.
+test("issue #221/#5495: unsigned thinking with NO signing evidence in the attempt replays verbatim (unsigned relay)", async () => {
     const captured: CapturedRequest[] = [];
     let fetchCalls = 0;
     const orig = globalThis.fetch;
@@ -158,8 +155,7 @@ test("issue #221/#5495 → #7684: unsigned thinking with NO signing evidence deg
             captured,
         );
         assert.equal(fetchCalls, 1, "single re-request, accepted on first try");
-        assert.equal(assistantThinkingBlocks(captured[0].body).length, 0, "#7684: no unsigned thinking block is ever rendered (the Anthropic API rejects it); the block is degraded, not dropped");
-        assert.ok(JSON.stringify(captured[0].body).includes("I should compress first."), "the thinking content is carried back as visible text (never lost)");
+        assert.equal(assistantThinkingBlocks(captured[0].body).length, 1, "no signature seen this attempt = unsigned upstream: the block is legitimate and must be echoed back (#5495)");
         assert.ok(JSON.stringify(captured[0].body).includes('"acp_status"'), "acp_status continuation intact");
         assert.ok(out.includes("[ACP]"), "marker surfaced to client");
         assert.ok(out.includes("Continued after compression."), "round-2 text reaches the client");
