@@ -1767,6 +1767,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             }
             const ids = laneMsgIdsForWire(payload.messages, branch);
             if (ids !== undefined && body.messages.every((m) => lanePinnableContent(m.content))) {
+                // DO-NOT-RELAX (review #7738): laneMsgIdsForWire is core-aligned — a
+                // merged tool_result user message pushes N ids for ONE wire message —
+                // so this tail-slice is only correct because the lanePinnableContent
+                // guard above rejects any multi-core delta message. If that guard is
+                // ever relaxed (e.g. to allow image-array deltas), a merged-toolres
+                // delta would mis-stamp the group head with the last core's id.
                 const sliced = ids.slice(ids.length - body.messages.length);
                 if (sliced.length === body.messages.length && validateMsgIds(sliced, sliced.length).ok) body.msgIds = sliced;
             }
