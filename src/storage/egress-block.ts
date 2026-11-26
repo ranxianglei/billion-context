@@ -227,7 +227,14 @@ export function rebuildEgressKstateOverlay(
     const tsStamps: Record<string, number> = {};
     for (const row of view) {
         if (row.num <= 0 || row.msgid === undefined || row.msgid === "") continue;
-        const ref = typeof row.ref === "string" && row.ref.length > 0 ? row.ref : "m" + String(row.num).padStart(5, "0");
+        // #7758: only a REAL kernel ref (mNNNNN) is a citation. A placeholder
+        // row (num > 0, no ref — the dense fallback for a still-protected
+        // message) must NOT be written back to messageRefs: a fabricated ref
+        // would make the kernel treat the row as cited and never demote it
+        // back to BLOCKED (the number would stick forever). The next round's
+        // diff emits the demote U (num→0) as intended.
+        const ref = typeof row.ref === "string" ? row.ref : "";
+        if (ref.length === 0) continue;
         byRaw[row.msgid] = ref;
         byRef[ref] = row.msgid;
         if (row.ts !== undefined) tsStamps[row.msgid] = row.ts;

@@ -26,11 +26,12 @@ import {
     egressBlockCompact,
     egressPointFork,
     diffBlockSet,
+    rebuildEgressKstateOverlay,
     EgressBlockCorruptError,
     type EgressBlockOp,
     type EgressBlockSnapshot,
 } from "../src/storage/egress-block.ts";
-import { egressAppendTurn, egressStateView, egressStateAt } from "../src/storage/egress-state.ts";
+import { egressAppendTurn, egressStateView, egressStateAt, EGRESS_SYSTEM_MSGID, type EgressViewRow } from "../src/storage/egress-state.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-egress-block-hermetic-"));
@@ -363,4 +364,18 @@ test("corrupt: U on missing target throws", () => {
             ], null, 1_000);
         }, EgressBlockCorruptError);
     } finally { close(H); }
+});
+
+test("#7758: rebuildEgressKstateOverlay skips placeholder rows (num>0, no ref)", () => {
+    const view: EgressViewRow[] = [
+        { num: 0, msgid: EGRESS_SYSTEM_MSGID, ref: "", tokens: 0, type: "system", bytes: "sys" },
+        { num: 1, msgid: "u1", ref: "m00001", tokens: 10, type: "text", bytes: "u1" },
+        { num: 2, msgid: "u2", ref: "", tokens: 5, type: "text", bytes: "u2" },
+    ];
+    const out = rebuildEgressKstateOverlay({ blocks: new Map(), kstate: null }, view);
+    const messageRefs = out["messageRefs"] as { byRaw: Record<string, string>; byRef: Record<string, string> };
+    assert.equal(messageRefs.byRaw["u1"], "m00001", "the citation row is written back");
+    assert.equal(messageRefs.byRef["m00001"], "u1");
+    assert.equal(messageRefs.byRaw["u2"], undefined, "the placeholder row (num>0, no ref) is NOT written back");
+    assert.equal(Object.keys(messageRefs.byRef).length, 1, "only one ref in the map");
 });

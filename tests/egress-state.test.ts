@@ -589,3 +589,47 @@ test("U-with-num: full-chain roundtrip — state replay / compaction base / flow
         close(H);
     }
 });
+
+test("#7758: re-home U (0→N) ordered before demote U (N→0) in the same batch succeeds (two-pass)", () => {
+    const H = open();
+    try {
+        const S = "sess-7758-two-pass";
+        // Turn 1: system + a(1) cited; X(2, dense); C(3, dense).
+        egressStateAppend(H.db, S, [
+            { type: "I", msgid: EGRESS_SYSTEM_MSGID, after: null, ref: "", tokens: 0, typeTag: "system", bytes: "h_sys" },
+            { type: "I", msgid: "a", after: EGRESS_SYSTEM_MSGID, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a", num: 1 },
+            { type: "I", msgid: "X", after: "a", ref: "", tokens: 1, typeTag: "text", bytes: "h_X" },
+            { type: "I", msgid: "C", after: "X", ref: "", tokens: 1, typeTag: "text", bytes: "h_C" },
+        ], 1_000);
+        // Turn 2: X demotes to 0 (still protected).
+        egressStateAppend(H.db, S, [{ type: "U", msgid: "X", bytes: "h_X", num: 0 }], 2_000);
+        const view = egressStateView(H.db, S);
+        assert.deepEqual(view.map((r) => r.num), [0, 1, 0, 3]);
+
+        // Turn 3: X re-homes to 3 (kernel cites it), C demotes to 0 (still
+        // protected). The U ops in view order are [U(X, 3), U(C, 0)] — the
+        // re-home BEFORE the demote. The old single-pass replay threw
+        // "cited number 3 is already live" at the re-home step; the two-pass
+        // replay retires C's 3 first, then assigns X's 3.
+        const ops = diffEgressView(
+            view,
+            [
+                { ...view[0] },
+                { ...view[1] },
+                { ...view[2], num: 3, ref: "m00003" },
+                { ...view[3], num: 0 },
+            ],
+            { reconcileNum: true },
+        );
+        // The append SUCCEEDS (no throw) — the two-pass replay retires C's 3
+        // before assigning X's 3.
+        egressStateAppend(H.db, S, ops, 3_000);
+        const after = egressStateView(H.db, S);
+        assert.deepEqual(after.map((r) => r.msgid), [EGRESS_SYSTEM_MSGID, "a", "X", "C"]);
+        assert.deepEqual(after.map((r) => r.num), [0, 1, 3, 0]);
+        assert.equal(after.find((r) => r.msgid === "X")!.num, 3, "X re-homed to 3");
+        assert.equal(after.find((r) => r.msgid === "C")!.num, 0, "C demoted to 0");
+    } finally {
+        close(H);
+    }
+});

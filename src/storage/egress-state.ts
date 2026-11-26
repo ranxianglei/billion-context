@@ -318,8 +318,26 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
         // I or U, regardless of op order).
         if ((op.type === "I" || op.type === "U") && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
     }
+    // #7758: two-pass U processing. A re-home U (0→N) may be ordered before
+    // the demote U (N→0) that frees N in the same batch (the diff emits U ops
+    // in view order), so the retire must happen before any assign. Pass 1
+    // processes D (retire+splice), I (insert), and U (retire old number) in
+    // array order; pass 2 assigns the U new numbers + updates bytes. The D
+    // and I ops stay in array order (a D may delete a row an earlier I
+    // inserted); only the U ops split across the two passes.
     for (const op of ops) {
-        if (op.type === "I") {
+        if (op.type === "D") {
+            const s = idxOf(op.start);
+            const e = idxOf(op.end);
+            if (s < 0) throw new EgressStateCorruptError(sessionId, `delete start ${op.start} missing`);
+            if (e < 0) throw new EgressStateCorruptError(sessionId, `delete end ${op.end} missing`);
+            if (s > e) throw new EgressStateCorruptError(sessionId, "delete range inverted");
+            for (let i = s; i <= e; i++) {
+                const r = view[i];
+                if (r !== undefined && r.num > 0) liveNums.delete(r.num);
+            }
+            view.splice(s, e - s + 1);
+        } else if (op.type === "I") {
             if (idxOf(op.msgid) >= 0) throw new EgressStateCorruptError(sessionId, `duplicate msgid ${op.msgid}`);
             // `after: null` = the first row of the new view → the front.
             // #7574: idxOf answers -1 for a missing anchor, so the old
@@ -349,39 +367,32 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
             if (op.role !== undefined) entry.role = op.role;
             if (op.ts !== undefined) entry.ts = op.ts;
             view.splice(at + 1, 0, entry);
-        } else if (op.type === "D") {
-            const s = idxOf(op.start);
-            const e = idxOf(op.end);
-            if (s < 0) throw new EgressStateCorruptError(sessionId, `delete start ${op.start} missing`);
-            if (e < 0) throw new EgressStateCorruptError(sessionId, `delete end ${op.end} missing`);
-            if (s > e) throw new EgressStateCorruptError(sessionId, "delete range inverted");
-            for (let i = s; i <= e; i++) {
-                const r = view[i];
-                if (r !== undefined && r.num > 0) liveNums.delete(r.num);
-            }
-            view.splice(s, e - s + 1);
         } else {
             const i = idxOf(op.msgid);
             if (i < 0) throw new EgressStateCorruptError(sessionId, `update target ${op.msgid} missing`);
             const target = view[i];
             if (typeof op.num === "number") {
-                // #7758: re-pin the row's number. The old number retires
-                // (leaving the live set); the new one is validated like a
-                // citation — a collision with a row still LIVE is corrupt.
                 const isSystem = op.msgid === EGRESS_SYSTEM_MSGID;
                 if (op.num < 0 || (isSystem && op.num !== 0)) {
                     throw new EgressStateCorruptError(sessionId, `update ${op.msgid} carries an invalid number ${op.num}`);
                 }
                 if (target.num > 0) liveNums.delete(target.num);
-                if (op.num > 0) {
-                    if (liveNums.has(op.num)) throw new EgressStateCorruptError(sessionId, `cited number ${op.num} is already live (msgid ${op.msgid})`);
-                    liveNums.add(op.num);
-                    num = Math.max(num, op.num);
-                }
-                target.num = op.num;
             }
-            view[i] = { ...target, bytes: op.bytes, ...(op.role !== undefined ? { role: op.role } : {}) };
         }
+    }
+    for (const op of ops) {
+        if (op.type !== "U") continue;
+        const i = idxOf(op.msgid);
+        const target = view[i];
+        if (typeof op.num === "number") {
+            if (op.num > 0) {
+                if (liveNums.has(op.num)) throw new EgressStateCorruptError(sessionId, `cited number ${op.num} is already live (msgid ${op.msgid})`);
+                liveNums.add(op.num);
+                num = Math.max(num, op.num);
+            }
+            target.num = op.num;
+        }
+        view[i] = { ...target, bytes: op.bytes, ...(op.role !== undefined ? { role: op.role } : {}) };
     }
     return view;
 }
