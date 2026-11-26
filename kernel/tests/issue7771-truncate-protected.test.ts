@@ -81,3 +81,30 @@ test("#7771 emergency-truncate node honors protectedTools end to end", () => {
   assert.ok(plainText.includes("[truncated for context space]"), "plain result clipped");
   assert.ok(protectedText.length > plainText.length);
 });
+
+test("#7771 a protected result lacking toolName is still paired via toolCallId", () => {
+  const cfg = config(["read_file"]);
+  const core = createCore();
+  const messages: CoreMessage[] = [
+    // Protected call (has toolName) + its result projected WITHOUT a toolName
+    // (host keeps only the toolCallId). The fold gate pairs these; the
+    // emergency node must too, or the plain predicate misses the result.
+    { id: "p-call", role: "assistant", contentType: "tool-call", toolName: "read_file", toolCallId: "cp", text: '{"path":"/durable"}' },
+    { id: "p", role: "tool", contentType: "tool-result", toolCallId: "cp", text: BIG("DURABLE-STATE") },
+    ...toolPair("u", "search", BIG("plain-output")),
+    { id: "t1", role: "user", contentType: "text", text: "a" },
+    { id: "t2", role: "assistant", contentType: "text", text: "b" },
+    { id: "t3", role: "user", contentType: "text", text: "c" },
+  ];
+  const result = core.processTurn({
+    messages,
+    state: createInitialState(),
+    config: cfg,
+    tokenCount: 900,
+    renderTags: "none",
+  });
+  const protectedText = result.messages.find((m) => m.id === "p")!.text ?? "";
+  const plainText = result.messages.find((m) => m.id === "u")!.text ?? "";
+  assert.ok(!protectedText.includes("[truncated for context space]"), "paired protected result untouched");
+  assert.ok(plainText.includes("[truncated for context space]"), "plain result clipped");
+});
