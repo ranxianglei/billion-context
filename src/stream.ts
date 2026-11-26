@@ -18,6 +18,7 @@ import { maxShrinkPerCompress } from "./fetch-util.js";
 import { compressResult, toolFail, type ProxyToolResult } from "./proxy-tool-result.js";
 import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSubagentSessions } from "./subagent-sessions.js";
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
+import { clearFoldTaint, recordFoldTaintRefusal } from "./fold-taint.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
 import { NUDGE_CREDIT_ROUNDS, unpromptedGateOf } from "./unprompted-gate.js";
@@ -1531,7 +1532,8 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 const specKey = normalizedSpecKey(ranges);
                 const repeatGuard = recordCompressFailure(ctx.session, specKey);
                 ctx.log(`[acp-proxy: compress REFUSED ${detail} — coverage regression: ${lostCoverage.size} previously-folded message(s) would lose ALL covering block(s) (${sample}); committing it grows the live view and can push the local estimate past the model window (#3322). State left uncommitted, prefix cache untouched.]`);
-                const receipt = `[Compression refused: coverage regression — folding these ranges would leave ${lostCoverage.size} already-folded message(s) without any covering block, so the live context view would GROW instead of shrink (and the size estimate can blow past the model window, bricking the session behind permanent preflight rejections). Nothing was folded: no block was created and the context prefix/cache were left untouched. Retry with ranges aligned to whole turns (do not cut through a reasoning/tool-call/result group), target fewer blocks, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}]`;
+                const taintNote = recordFoldTaintRefusal(ctx.session, specKey); // #7049: stop advertising this span
+                const receipt = `[Compression refused: coverage regression — folding these ranges would leave ${lostCoverage.size} already-folded message(s) without any covering block, so the live context view would GROW instead of shrink (and the size estimate can blow past the model window, bricking the session behind permanent preflight rejections). Nothing was folded: no block was created and the context prefix/cache were left untouched. Retry with ranges aligned to whole turns (do not cut through a reasoning/tool-call/result group), target fewer blocks, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}${taintNote !== "" ? " " + taintNote : ""}]`;
                 return compressResult(receipt, "refused", 0, "gate:coverage-regression");
             }
         }
@@ -1598,8 +1600,9 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // "stop calling compress entirely" would wrongly kill legit folds.
             const specKey = normalizedSpecKey(ranges);
             const repeatGuard = recordCompressFailure(ctx.session, specKey);
+            const taintNote = recordFoldTaintRefusal(ctx.session, specKey); // #7049: stop advertising this span
             ctx.log(`[acp-proxy: compress REFUSED ${detail} — no net shrink (net delta=${netDelta} tok across ${touchedBlocks} touched block(s)); state left uncommitted, prefix cache untouched]`);
-            const receipt = `[Compression refused: no net shrink — the summary you supplied is not smaller than the range it replaces (${netDesc}). Nothing was folded: no block was created and the context prefix/cache were left untouched.${revNote} Do not re-issue this same range and summary; supply a much shorter summary for the range, target a larger span so the summary shrinks it, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}]`;
+            const receipt = `[Compression refused: no net shrink — the summary you supplied is not smaller than the range it replaces (${netDesc}). Nothing was folded: no block was created and the context prefix/cache were left untouched.${revNote} Do not re-issue this same range and summary; supply a much shorter summary for the range, target a larger span so the summary shrinks it, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}${taintNote !== "" ? " " + taintNote : ""}]`;
             return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
         }
         ctx.session.state = res.state;
@@ -1775,6 +1778,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             .filter((b) => !beforeIds.has(b.blockId) || beforeSummaries.get(b.blockId) !== b.summary)
             .reduce((n, b) => n + defaultCountTokens(b.summary), 0);
         const netSaved = Math.max(0, r.tokensCompressed - newSummaryTokens);
+        clearFoldTaint(ctx.session); // #7049: a proven fold clears the refusal taint
         clearCompressLoopStreak(ctx.session, netSaved);
 
         // #189 observability: record the rewrite magnitude + fold point so a

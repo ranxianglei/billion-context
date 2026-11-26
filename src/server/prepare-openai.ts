@@ -17,6 +17,7 @@ import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { emitNudgeInjected, nudgeDebugMeta } from "../nudge-debug.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
+import { applyFoldTaintToTurn } from "../fold-taint.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
@@ -522,6 +523,8 @@ export async function prepareOpenai(
         nudgeStampsBefore = nudgeStampsOf(session);
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
+        // #7049: drop taint-covered ranges from the menu BEFORE any gate/render reads it.
+        applyFoldTaintToTurn(turn, session, log, sessionId);
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
         adoptContentStore(session, turn.contentStore);

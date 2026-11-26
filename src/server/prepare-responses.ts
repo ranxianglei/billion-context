@@ -14,6 +14,7 @@ import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
+import { applyFoldTaintToTurn } from "../fold-taint.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
@@ -456,6 +457,8 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         nudgeStampsBefore = nudgeStampsOf(session);
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
+        // #7049: drop taint-covered ranges from the menu BEFORE any gate/render reads it.
+        applyFoldTaintToTurn(turn, session, log, sessionId);
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
         adoptContentStore(session, turn.contentStore);
