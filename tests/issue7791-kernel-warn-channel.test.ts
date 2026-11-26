@@ -1,4 +1,4 @@
-// #7729: the kernel's mid-turn diagnostics must never reach a terminal through
+// #7791: the kernel's mid-turn diagnostics must never reach a terminal through
 // a raw console call. In the inline lanes the kernel runs INSIDE the host agent
 // process, where stderr IS the interactive TUI — a `console.warn` from a
 // bundled module appends to whatever line holds the cursor (the input-box
@@ -16,12 +16,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { kernelWarnSink } from "../src/kernel-warn-channel.js";
 import { defaultLogFile } from "../src/paths.js";
 import { rmrf } from "./tmp-rm.js";
-import { execSync } from "node:child_process";
 
-test("#7729: inline lane routes kernel diagnostics to bili.log with zero terminal traffic", async () => {
+test("#7791: inline lane routes kernel diagnostics to bili.log with zero terminal traffic", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kernel-warn-"));
     const previous = process.env.XDG_STATE_HOME;
     process.env.XDG_STATE_HOME = dir;
@@ -43,7 +43,7 @@ test("#7729: inline lane routes kernel diagnostics to bili.log with zero termina
     }
 });
 
-test("#7729: server lane hands kernel diagnostics to the tee logger, not the console", () => {
+test("#7791: server lane hands kernel diagnostics to the tee logger, not the console", () => {
     const realWarn = console.warn;
     const consoleCalls: string[] = [];
     console.warn = (...args: unknown[]) => { consoleCalls.push(args.map(String).join(" ")); };
@@ -57,18 +57,25 @@ test("#7729: server lane hands kernel diagnostics to the tee logger, not the con
     }
 });
 
-test("#7729: every kernel core bili builds is constructed WITH a lane sink", () => {
+test("#7791: every kernel core bili builds is constructed WITH a lane sink", () => {
     // Static wiring pin: the sink is baked into the pipeline nodes at
     // construction, so a `createCore` call that forgets it silently reverts to
     // console.warn — and the terminal pollution comes back with no test
     // failing. Every construction site in src/ must pass kernelWarnSink.
-    const files = execSync("rg -l 'createCore\\(\\.*\\{' src/", { encoding: "utf8", cwd: new URL("..", import.meta.url).pathname })
-        .split("\n")
-        .filter(Boolean);
-    assert.ok(files.length > 0, "expected at least one createCore construction site");
-    for (const file of files) {
-        const text = fs.readFileSync(new URL(`../${file.replace(/^src\//, "src/")}`, import.meta.url), "utf8");
-        assert.match(text, /kernelWarnSink\(/, `${file}: builds a kernel core without a warn sink (#7729)`);
+    // A Node fs walk, not a shell-out: CI runners carry no ripgrep, and a
+    // spawning test would need a LIVE_FILES registration for no reason.
+    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const srcDir = path.join(root, "src");
+    const sites: string[] = [];
+    for (const entry of fs.readdirSync(srcDir, { recursive: true, withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".ts")) continue;
+        const rel = path.relative(root, path.join(entry.parentPath, entry.name));
+        if (/createCore\(.*\{/.test(fs.readFileSync(path.join(root, rel), "utf8"))) sites.push(rel);
+    }
+    assert.ok(sites.length > 0, "expected at least one createCore construction site");
+    for (const file of sites) {
+        const text = fs.readFileSync(path.join(root, file), "utf8");
+        assert.match(text, /kernelWarnSink\(/, `${file}: builds a kernel core without a warn sink (#7791)`);
         assert.match(text, /kernelWarnSink\(opts\.inlineLane === true \? "inline" : "server"\)/, `${file}: the sink must pick the lane at construction`);
     }
 });

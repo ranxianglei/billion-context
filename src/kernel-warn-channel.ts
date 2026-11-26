@@ -1,4 +1,4 @@
-// #7729: where the kernel's own mid-turn diagnostics go.
+// #7791: where the kernel's own mid-turn diagnostics go.
 //
 // The kernel is I/O-free by contract, so its diagnostics reached the outside
 // world through `console.warn` (kernel/src/recommend.ts, kernel/src/compress.ts).
@@ -18,7 +18,7 @@
 //     tee logger, which already knows whether stderr is a log stream or a
 //     terminal (logger's stderr leg + mute rules);
 //   - anything unrecognized: the historical console.warn (byte-identical to
-//     pre-#7729 behavior), so a new lane can never lose the diagnostic.
+//     pre-#7791 behavior), so a new lane can never lose the diagnostic.
 import type { Ports } from "acp-kernel";
 import { logHostEvent } from "./agent/host-log.js";
 import { log as loggerLog } from "./logger.js";
