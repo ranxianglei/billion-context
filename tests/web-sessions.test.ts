@@ -20,6 +20,8 @@ import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, 
 import { SUBAGENT_PROMPT_PREFIX } from "../src/session-title.ts";
 import vm from "node:vm";
 import { rmrf } from "./tmp-rm.ts";
+import { setBillingOverrides } from "../src/billing.ts";
+import { openSqliteDatabase } from "../src/storage/driver.ts";
 
 // Plain JSON session files so seeds and round-trips stay deterministic (#1080)
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -1463,6 +1465,136 @@ withSessionsDir("R2.2 parity: full-mode list from the unified index matches the 
         assert.equal(row.lastSeen, legacyRow.lastSeen, "lastSeen = updated_at vs savedAt parity");
     } finally {
         process.env.BILI_STORAGE_UNIFIED = "legacy";
+    }
+});
+
+withFullMode("bounded unified summaries preserve billing, badges, context and hint boundaries", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    let storeClosed = false;
+    const topics = [" \t\n".repeat(4096) + " lead   with\u00a0spaces ", "x".repeat(48) + " next", "x".repeat(47) + "😀tail", "x".repeat(48) + " \t\n", "", "abc\0def", " ".repeat(4095) + "😀tail"];
+    try {
+        for (let i = 0; i < topics.length; i++) {
+            const s = makeSession(`projection-${i}`, { protocol: "openai", title: "derived title", hostTitle: `Host ${i}`, label: `Label ${i}`, upstreamOrigin: "https://projection.test" }, { requests: 4, contextTokens: 600, inputTokens: 1000, outputTokens: 80 });
+            Object.assign(s.stats, { contextTokensSource: "estimate", lastInputTokensSource: "estimate", contextEstimateTokens: 550, contextEstimateCalibrated: true, ...(i === 0 ? { costUsd: { input: 1, cacheRead: 2, cacheWrite: 3, output: 4 } } : {}) });
+            if (i === 1) Object.assign(s.stats, { contextTokensSource: "usage", lastInputTokensSource: "usage" });
+            s.metadata = {
+                lastModel: i === 0 || i === 2 ? "projection-priced" : "projection-unpriced",
+                cachePriceProfile: { w: 3, r: 0.3, q: 15, unused: "ignore" },
+                cachePriceProfileAbs: i % 2 === 0,
+                billingPrice: { input: 2 }, effectiveContextLimit: i === 3 ? true : i === 4 ? false : 100000,
+                contextTokensAt: 1795650000000,
+                cacheLedger: {
+                    agg: { requests: 6, input: 2000, cached: 1500, output: 100, nc: 100, cr: 200, tr: 300, switches: 2, switchMissed: 90, keySwitches: 3, keySwitchMissed: 80 },
+                    folds: i === 2 ? null : [{ bid: "b1", S: 50000, sigma: 5000, T: 3000, requestsAfter: 10 }, { bid: "b2", S: 10000, sigma: 1000, T: 2000, requestsAfter: 4 }],
+                    samples: [{ unused: "ignore" }],
+                },
+                foldCoverageByBlock: { b1: { e: 1, p: 0, r: 0, t: 12 }, b2: { e: 1, p: 1, r: 0 } },
+                snapshotShadow: { turns: 4, errors: 1, lastClass: "degraded", lastReason: "fixture" },
+                selfHeal: { detected: "fixture", action: "nudge", since: 12 },
+                autoModeForge: { count: 3, lastAt: 45, lastVariant: "fixture" },
+                pluginAgent: "codex", clientHint: "fallback", engineLane: "server",
+                ...(i === 0 ? { derivedFromSessionId: "parent-current" } : { derivedFrom: "parent-legacy" }),
+            };
+            s.state.blocks.push(mkBlock("b1", 1000, true, topics[i]), mkBlock("b2", 500, true), mkBlock("b3", 9999, false));
+            if (i === 6) s.stats.requests = 10000;
+            await store.writeNow(s);
+        }
+        store.closeQuietly();
+        storeClosed = true;
+        _resetSessionsForTest();
+        const snapshot = async (mode: string) => {
+            process.env.BILI_STORAGE_UNIFIED = mode;
+            _resetDiskCacheForTest();
+            return { list: await buildSessionList(), overview: await buildOverview(), filtered: await buildSessionPage({ pageSize: 2, page: 2, q: "HOST", protocol: "OPENAI", client: "CODEX", state: "history" }) };
+        };
+        setBillingOverrides({ "projection-priced": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } });
+        const legacy = await snapshot("legacy");
+        const full = await snapshot("full");
+        assert.deepEqual(full, legacy);
+        assert.equal(full.filtered.total, topics.length);
+        const row = full.list.find((r) => r.id === "projection-0")!;
+        assert.equal(row.firstBlockHint, "lead with spaces");
+        assert.equal(row.coverageLostFolds, 1);
+        assert.equal(row.parentSessionId, "parent-current");
+        assert.equal(full.list.find((r) => r.id === "projection-1")!.parentSessionId, "parent-legacy");
+        assert.equal(full.list.find((r) => r.id === "projection-6")!.slowSession?.requests, 10000);
+        assert.ok(row.savedUsd !== undefined);
+        assert.ok(row.contextBest);
+        assert.deepEqual(row.rates, { w: 3.75, r: 0.3, q: 15 });
+        assert.equal(full.list.find((r) => r.id === "projection-1")!.firstBlockHint, "x".repeat(48) + "…");
+        assert.equal(full.list.find((r) => r.id === "projection-1")!.contextBest?.at, 1795650000000);
+        const noFolds = full.list.find((r) => r.id === "projection-2")!;
+        assert.equal(noFolds.foldCount, undefined);
+        assert.ok(noFolds.savedUsd! > 0, "no-fold sessions retain the savings estimate");
+        assert.equal(full.list.find((r) => r.id === "projection-3")!.contextWindow, undefined);
+        assert.equal(full.list.find((r) => r.id === "projection-4")!.contextWindow, undefined);
+        assert.equal(full.list.find((r) => r.id === "projection-3")!.firstBlockHint, "x".repeat(48));
+        assert.equal(full.list.find((r) => r.id === "projection-5")!.firstBlockHint, "abc\0def");
+        assert.equal(full.list.find((r) => r.id === "projection-6")!.firstBlockHint, "😀tail");
+        setBillingOverrides({ "projection-priced": { input: 6, output: 30, cacheRead: 0.6, cacheWrite: 7.5 } });
+        const repriced = await snapshot("full");
+        assert.deepEqual(repriced, await snapshot("legacy"));
+        assert.notEqual(repriced.list.find((r) => r.id === "projection-0")!.savedUsd, row.savedUsd);
+    } finally {
+        if (!storeClosed) store.closeQuietly();
+        setBillingOverrides(undefined);
+        process.env.BILI_STORAGE_UNIFIED = "full";
+    }
+});
+
+withFullMode("bounded unified summaries treat malformed stats and metadata as absent", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    await store.writeNow(makeSession("invalid-json", { protocol: "openai" }, { requests: 9, contextTokens: 100 }));
+    store.closeQuietly();
+    const { db } = openSqliteDatabase(path.join(dir, "index.db"));
+    try {
+        db.prepare("UPDATE sessions SET metadata_json = ? WHERE session_id = ?").run("{invalid", "invalid-json");
+        _resetDiskCacheForTest();
+        const page = await buildSessionPage({ pageSize: 10 });
+        assert.equal(page.total, 1);
+        assert.equal(page.sessions[0].requests, 9);
+        assert.equal(_diskScanStatsForTest().decodedTotal, 0);
+        db.prepare("UPDATE sessions SET stats_json = ? WHERE session_id = ?").run("{invalid", "invalid-json");
+        const empty = await buildSessionPage({ pageSize: 10 });
+        assert.equal(empty.total, 0, "invalid JSON defaults to an empty stub, without decoding stale files");
+        assert.equal(hiddenEmptyCount(), 1);
+    } finally {
+        db.close();
+    }
+});
+
+withFullMode("bounded unified previews preserve subagent display titles and summary fallback", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const topic = " \t\n".repeat(4096) + "x".repeat(47) + "😀 long task";
+    for (const [id, hostTitle] of [["subagent-topic", undefined], ["subagent-host", "Host title"], ["subagent-summary", undefined]] as const) {
+        const s = makeSession(id, { title: SUBAGENT_PROMPT_PREFIX, hostTitle }, { requests: 2 });
+        const empty = mkBlock("empty", 0, false);
+        delete empty.topic;
+        const sparse: Partial<CompressionBlock> = empty;
+        delete sparse.summary;
+        // A leading block without either field must not shadow the actual lead.
+        s.state.blocks.push(empty, mkBlock("lead", 10, true, topic));
+        if (id === "subagent-summary") {
+            s.state.blocks[1].topic = "";
+            s.state.blocks[1].summary = " ".repeat(4095) + "😀" + "y".repeat(60);
+        }
+        await store.writeNow(s);
+    }
+    store.closeQuietly();
+    const snapshot = async (mode: string) => {
+        process.env.BILI_STORAGE_UNIFIED = mode;
+        _resetDiskCacheForTest();
+        return buildSessionList();
+    };
+    try {
+        const legacy = await snapshot("legacy");
+        const full = await snapshot("full");
+        assert.deepEqual(full, legacy);
+        assert.equal(full.find((s) => s.id === "subagent-topic")!.title, "x".repeat(47) + "\ud83d…");
+        assert.equal(full.find((s) => s.id === "subagent-host")!.title, "Host title");
+        assert.equal(full.find((s) => s.id === "subagent-summary")!.title, "😀" + "y".repeat(46) + "…");
+    } finally {
+        process.env.BILI_STORAGE_UNIFIED = "full";
     }
 });
 

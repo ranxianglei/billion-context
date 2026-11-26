@@ -43,7 +43,7 @@ import { featureEnabled } from "./rollout.js";
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
-import { sha256Hex, type CheckpointRow, type MessageRefContentRow, type MessageIdContentRow } from "./storage/store.js";
+import { sha256Hex, type CheckpointRow, type MessageRefContentRow, type MessageIdContentRow, type WebSummaryRow } from "./storage/store.js";
 import { contentStoreOf } from "./store.js";
 import { CALIBRATION_PROVENANCE_TEXT_ONLY, type WireProtocol } from "./util.js";
 import { currentContextObservation, canonicalJson, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
@@ -2690,18 +2690,15 @@ export class SessionStore {
         return this.shadow.mode === "full" ? "authoritative" : "reconcile";
     }
 
-    /** #2960 R2.2 / #3199: web list rows — stats/metadata JSON + block
-     *  aggregates from one SQL. Full mode serves them as the authoritative
-     *  answer; shadow mode (#3199) serves them as a BASELINE the caller must
-     *  reconcile against the JSON tree (see webSummaryBaseline) — shadow rows
-     *  may lag files never yet recorded, and ghost rows must be dropped there.
-     *  Null → the web falls back to the bounded disk index walk. */
-    unifiedWebSummaries(): import("./storage/store.js").WebSummaryRow[] | null {
+    /** Project each SQLite row before retaining it. Full mode is authoritative;
+     * shadow callers reconcile with files. Network/legacy stores keep the
+     * bounded disk walk (null), including when the sidecar read fails. */
+    unifiedWebSummaries<T>(map: (row: WebSummaryRow) => T): T[] | null {
         if (this.webSummaryBaseline() === null) return null;
         const shadow = this.shadow;
         if (!shadow) return null;
         try {
-            return shadow.webSummaryRows();
+            return shadow.webSummaryRows(map);
         } catch (e) {
             // #7156: this catch used to swallow the error silently — a corrupt
             // payload_json made the panel show "0 historical sessions" with NO

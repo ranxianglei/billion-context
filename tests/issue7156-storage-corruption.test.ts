@@ -135,8 +135,8 @@ test("#7156 FIX 1 control: a VALID payload_json still yields its aggregates", { 
         try {
             const rows = s.webSummaryRows();
             assert.equal(rows.length, 1);
-            assert.equal(rows[0].firstTopic, "t", "a valid payload's topic is surfaced");
-            assert.equal(rows[0].firstSummary, "s");
+            assert.equal(rows[0].firstTopic, null);
+            assert.equal(rows[0].firstSummary, "t", "the bounded preview prefers the valid payload's topic");
             assert.equal(rows[0].activeCompressedTokens, 100, "a valid payload's tokens are summed");
         } finally {
             s.close();
@@ -162,7 +162,7 @@ test("#7156 FIX 2: unifiedWebSummaries logs a warn when webSummaryRows throws (f
         const warns: string[] = [];
         setLogCapture((level, msg) => { if (level === "warn") warns.push(String(msg)); });
         try {
-            const rows = store.unifiedWebSummaries();
+            const rows = store.unifiedWebSummaries((row) => row.sessionId);
             assert.equal(rows, null, "a throwing webSummaryRows falls back to null (the disk walk)");
             assert.ok(
                 warns.some((m) => m.includes("unifiedWebSummaries")),

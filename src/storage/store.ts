@@ -320,11 +320,10 @@ export interface CheckpointRow {
      firstSummary?: string | null;
  }
 
-/** #2960 R2.2: row backing the WEB session list in full mode. Carries the
- *  JSON columns the web summaryOf needs (stats/metadata) plus block
- *  aggregates extracted from payloads (topic/summary lead of the first
- *  block, gross compressed tokens over ACTIVE blocks) — everything the
- *  bounded disk index used to decode whole envelope files for. */
+/** Row backing the web list: only summary-consumed stats/metadata and block
+ * aggregates. SQLite returns a normalized preview in firstSummary (at most
+ * 51 UTF-16 units, enough for topicLeadFrom's 48-unit hint/title + ellipsis)
+ * and null firstTopic; these fields are not full block text. */
  export interface WebSummaryRow {
      sessionId: string;
      title: string | undefined;
@@ -342,6 +341,46 @@ export interface CheckpointRow {
     firstSummary: string | null;
     activeCompressedTokens: number;
 }
+
+/** Only fields consumed by the web summary view cross the SQLite/V8 boundary.
+ * Preserve JSON booleans (json_extract alone returns SQLite integers). Missing
+ * fields become null and use the same defaults as missing persisted fields. */
+function webJsonValue(column: string, path: string): string {
+    return `CASE json_type(${column}, '${path}')
+        WHEN 'true' THEN json('true') WHEN 'false' THEN json('false')
+        ELSE json_extract(${column}, '${path}') END`;
+}
+
+function webJsonFields(column: string, fields: readonly string[], prefix = "$"): string {
+    return `json_object(${fields.map((field) => `'${field}', ${webJsonValue(column, `${prefix}.${field}`)}`).join(", ")})`;
+}
+
+const WEB_STATS_JSON = webJsonFields("s.stats_json", [
+    "requests", "tokensSaved", "inputTokens", "cachedTokens", "outputTokens", "contextTokens",
+    "contextTokensSource", "lastUsageGradeTokens", "lastInputTokensSource", "contextEstimateTokens", "contextEstimateCalibrated",
+]);
+const WEB_METADATA_JSON = `json_object(
+    'lastModel', json_extract(s.metadata_json, '$.lastModel'),
+    'effectiveContextLimit', ${webJsonValue("s.metadata_json", "$.effectiveContextLimit")},
+    'contextTokensAt', ${webJsonValue("s.metadata_json", "$.contextTokensAt")},
+    'pluginAgent', json_extract(s.metadata_json, '$.pluginAgent'),
+    'clientHint', json_extract(s.metadata_json, '$.clientHint'),
+    'engineLane', json_extract(s.metadata_json, '$.engineLane'),
+    'derivedFromSessionId', json_extract(s.metadata_json, '$.derivedFromSessionId'),
+    'derivedFrom', json_extract(s.metadata_json, '$.derivedFrom'),
+    'cachePriceProfileAbs', CASE WHEN json_type(s.metadata_json, '$.cachePriceProfileAbs') = 'true' THEN json('true') ELSE json('false') END,
+    'cachePriceProfile', ${webJsonFields("s.metadata_json", ["w", "r", "q"], "$.cachePriceProfile")},
+    'billingPrice', ${webJsonFields("s.metadata_json", ["input"], "$.billingPrice")},
+    'snapshotShadow', ${webJsonFields("s.metadata_json", ["turns", "errors", "lastClass", "lastReason"], "$.snapshotShadow")},
+    'selfHeal', ${webJsonFields("s.metadata_json", ["detected", "action", "since"], "$.selfHeal")},
+    'autoModeForge', ${webJsonFields("s.metadata_json", ["count", "lastAt", "lastVariant"], "$.autoModeForge")},
+    'cacheLedger', json_object(
+        'agg', ${webJsonFields("s.metadata_json", ["requests", "input", "cached", "output", "nc", "cr", "tr", "switches", "switchMissed", "keySwitches", "keySwitchMissed"], "$.cacheLedger.agg")},
+        'folds', (SELECT json_group_array(${webJsonFields("CASE WHEN f.type = 'object' THEN f.value ELSE '{}' END", ["S", "sigma", "T", "requestsAfter", "bid"])})
+                  FROM json_each(CASE WHEN json_type(s.metadata_json, '$.cacheLedger.folds') = 'array'
+                      THEN json_extract(s.metadata_json, '$.cacheLedger.folds') ELSE '[]' END) f)),
+    'foldCoverageByBlock', (SELECT json_group_object(c.key, ${webJsonFields("CASE WHEN c.type = 'object' THEN c.value ELSE '{}' END", ["e", "p", "r"])})
+                           FROM json_each(s.metadata_json, '$.foldCoverageByBlock') c))`;
 
 /** #3928: per-session footprint inside index.db, backing `bili sessions ls`.
  *  CAS ownership follows the references deleteSession releases: several
@@ -4116,73 +4155,84 @@ export class UnifiedStore {
         });
     }
 
-    /** #2960 R2.2: web list rows — sessions table + block aggregates in one
-     *  SQL (payload json_extract for the first-block lead and active-block
-     *  compressed-token sum). Replaces the bounded envelope-file decode the
-     *  disk index performs per refresh. */
-    webSummaryRows(): WebSummaryRow[] {
-        // #7156: a corrupt/empty payload_json (e.g. left by an interrupted
-        // .recover) made json_extract throw "malformed JSON" and fail the WHOLE
-        // .all() — the panel then silently fell back to 0 historical sessions.
-        // Guard each extract with json_valid so a bad row degrades to NULL
-        // (skipped by the filters, ignored by SUM) instead of killing the list.
-        const rows = this.db
-            .prepare(
-                `WITH bl AS (
-                     SELECT b.session_id, b.ord, b.active,
-                            CASE WHEN json_valid(b.payload_json) THEN b.payload_json END AS payload
-                     FROM blocks b
-                 )
-                 SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
-                        s.protocol AS protocol, s.origin AS origin, s.status AS status, s.updated_at AS updatedAt,
-                        s.stats_json AS statsJson, s.metadata_json AS metadataJson,
-                        (SELECT COUNT(*) FROM bl WHERE bl.session_id = s.session_id) AS blocks,
-                        (SELECT json_extract(bl.payload, '$.topic') FROM bl
-                          WHERE bl.session_id = s.session_id
-                            AND (json_extract(bl.payload, '$.topic') IS NOT NULL
-                                 OR json_extract(bl.payload, '$.summary') IS NOT NULL)
-                          ORDER BY bl.ord LIMIT 1) AS firstTopic,
-                        (SELECT json_extract(bl.payload, '$.summary') FROM bl
-                          WHERE bl.session_id = s.session_id
-                            AND (json_extract(bl.payload, '$.topic') IS NOT NULL
-                                 OR json_extract(bl.payload, '$.summary') IS NOT NULL)
-                          ORDER BY bl.ord LIMIT 1) AS firstSummary,
-                        (SELECT COALESCE(SUM(json_extract(bl.payload, '$.compressedTokens')), 0)
-                          FROM bl WHERE bl.session_id = s.session_id AND bl.active = 1) AS activeCompressed
-                  FROM sessions s`,
-            )
-            .all() as Array<{
-                sessionId: string;
-                title: string | null;
-                hostTitle: string | null;
-                label: string | null;
-                protocol: string | null;
-                origin: string | null;
-                status: string;
-                updatedAt: number;
-                statsJson: string;
-                metadataJson: string;
-                blocks: number;
-                firstTopic: string | null;
-                firstSummary: string | null;
-                activeCompressed: number | null;
-            }>;
-        return rows.map((r) => ({
-            sessionId: r.sessionId,
-            title: r.title ?? undefined,
-            hostTitle: r.hostTitle ?? undefined,
-            label: r.label ?? undefined,
-            protocol: r.protocol ?? undefined,
-            origin: r.origin ?? undefined,
-            status: r.status,
-            updatedAt: r.updatedAt,
-            statsJson: r.statsJson,
-            metadataJson: r.metadataJson,
-            blocks: r.blocks,
-            firstTopic: r.firstTopic,
-            firstSummary: r.firstSummary,
-            activeCompressedTokens: r.activeCompressed ?? 0,
-        }));
+    /** Map one projected session at a time, retaining only the caller's compact
+     * result. Never .all() stats/metadata or block payloads: their corpus can
+     * exceed the JS heap even for a ten-row page. The read snapshot keeps the
+     * scalar id scan and point reads consistent across concurrent writers.
+     * The no-mapper backend API still returns projected rows for compatibility. */
+    webSummaryRows(): WebSummaryRow[];
+    webSummaryRows<T>(map: (row: WebSummaryRow) => T): T[];
+    webSummaryRows(map: (row: WebSummaryRow) => unknown = (row) => row): unknown[] {
+        return this.db.readTransaction(() => {
+            const ids = this.db.prepare("SELECT rowid AS rowId FROM sessions ORDER BY rowid").all() as Array<{ rowId: number }>;
+            const stmt = this.db.prepare(`SELECT s.session_id AS sessionId, s.title, s.host_title AS hostTitle, s.label,
+                s.protocol, s.origin, s.status, s.updated_at AS updatedAt,
+                CASE WHEN json_valid(s.stats_json) THEN json_set(${WEB_STATS_JSON}, '$.costUsd',
+                    ${webJsonFields("s.stats_json", ["input", "cacheRead", "cacheWrite", "output"], "$.costUsd")}) ELSE '{}' END AS statsJson,
+                CASE WHEN json_valid(s.metadata_json) THEN ${WEB_METADATA_JSON} ELSE '{}' END AS metadataJson,
+                (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
+                (SELECT COALESCE(SUM(json_extract(CASE WHEN json_valid(b.payload_json) THEN b.payload_json END, '$.compressedTokens')), 0)
+                  FROM blocks b WHERE b.session_id = s.session_id AND b.active = 1) AS activeCompressedTokens
+                FROM sessions s WHERE s.rowid = ?`);
+            // #7156: corrupt block payloads must neither hide historical sessions
+            // nor poison their compressed-token aggregate. Guard both SQL paths.
+            const hint = this.db.prepare(`WITH bl AS (
+                    SELECT b.session_id, b.ord,
+                        CASE WHEN json_valid(b.payload_json) THEN b.payload_json END AS payload
+                    FROM blocks b
+                )
+                SELECT substr(CAST(COALESCE(NULLIF(json_extract(payload, '$.topic'), ''),
+                        json_extract(payload, '$.summary')) AS BLOB), ?, 4096) AS chunk
+                FROM bl WHERE session_id = ?
+                    AND (json_extract(payload, '$.topic') IS NOT NULL OR json_extract(payload, '$.summary') IS NOT NULL)
+                ORDER BY ord LIMIT 1`);
+            const out: unknown[] = [];
+            for (const { rowId } of ids) {
+                const r = stmt.get(rowId) as Omit<WebSummaryRow, "firstTopic" | "firstSummary">;
+                out.push(map({
+                    ...r,
+                    title: r.title ?? undefined,
+                    hostTitle: r.hostTitle ?? undefined,
+                    label: r.label ?? undefined,
+                    protocol: r.protocol ?? undefined,
+                    origin: r.origin ?? undefined,
+                    // Both list hints and subagent display titles use the same
+                    // 48-unit topicLeadFrom cap; retain enough for its ellipsis.
+                    // never export a full topic or summary.
+                    firstTopic: null,
+                    firstSummary: r.blocks > 0 ? this.webFirstBlockLead((offset) => {
+                        const row = hint.get(offset, r.sessionId) as { chunk: Uint8Array | null } | undefined;
+                        return row?.chunk ?? null;
+                    }) : null,
+                }));
+            }
+            return out;
+        });
+    }
+
+    private webFirstBlockLead(readChunk: (offset: number) => Uint8Array | null): string | null {
+        let lead = "", space = false;
+        // Byte chunks retain embedded NUL (SQLite text substr stops at NUL);
+        // streaming UTF-8 decoding keeps code points split across chunks whole.
+        const decoder = new TextDecoder();
+        for (let offset = 1; ; offset += 4096) {
+            const chunk = readChunk(offset);
+            const done = !chunk?.byteLength;
+            const text = done ? decoder.decode() : decoder.decode(chunk, { stream: true });
+            // Normalize incrementally so arbitrarily long leading/inter-word
+            // whitespace cannot hide the real hint or force a full text read.
+            for (const char of text) {
+                if (/\s/u.test(char)) {
+                    if (lead) space = true;
+                } else {
+                    if (space) lead += " ";
+                    lead += char;
+                    space = false;
+                    if (lead.length > 48) return lead;
+                }
+            }
+            if (done) return lead || null;
+        }
     }
 
     private getContent(hash: string): string | null {
