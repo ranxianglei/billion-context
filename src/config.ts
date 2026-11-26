@@ -3370,18 +3370,35 @@ export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxy
     return value === "manual" || value === "auto" ? value : "direct";
 }
 
+// #7100: the pending compress-config rejection. parseCompressSettings runs in
+// loadOptions → loadConfigFile, which is BEFORE configureLogger — a log here
+// never reaches the file (logPath is still undefined). Record the error and
+// let the server log it once after the logger is live; /__bili/status and
+// /__bili/config surface it so the dropped block is observable on demand.
+let compressValidationError: string | undefined;
+
+export function pendingCompressValidationError(): string | undefined {
+    return compressValidationError;
+}
+
 export function parseCompressSettings(v: unknown): (CompressSettings & { injectTool?: boolean; injectNudge?: boolean }) | undefined {
+    // #7100: reset on every parse — a reload that removes the externalSummary
+    // block (or the whole compress section) must not leave a stale rejection
+    // visible in /__bili/status. Only a freshly-seen invalid block re-arms it.
+    compressValidationError = undefined;
     if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
     const obj = v as Record<string, unknown>;
     const out: CompressSettings = {};
     if (obj.externalSummary !== undefined) {
-        try { out.externalSummary = parseExternalSummaryChain(obj.externalSummary); }
+        try {
+            out.externalSummary = parseExternalSummaryChain(obj.externalSummary);
+        }
         catch (error) {
             // Keep the "unparseable values reject the whole compress block"
             // contract, but make the rejection VISIBLE with the specific
             // reason — silently dropping the block also reverts custom
             // prompts/knobs to defaults, which must never pass unnoticed.
-            loggerLog("warn", `[config] compress.externalSummary is invalid (${error instanceof Error ? error.message : String(error)}); ignoring the whole compress section`);
+            compressValidationError = `[config] compress.externalSummary is invalid (${error instanceof Error ? error.message : String(error)}); ignoring the whole compress section`;
             return undefined;
         }
     }

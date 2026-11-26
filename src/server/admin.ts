@@ -5,7 +5,7 @@ import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
-import { loadConfigFile, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { loadConfigFile, loadNamedProviders, loadOptions, loadRoutes, pendingCompressValidationError, resolveResignSettings } from "../config.js";
 import { resetEgressModuleCache } from "../egress-transforms.js";
 import { applyCompressSettings, listResolvedPacks, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
@@ -1464,7 +1464,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions, laneHost
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, origin: laneHost ?? null, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), resolverWedge: getResolverWedgeState(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), attribution: attributionStatusWire() }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, origin: laneHost ?? null, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), resolverWedge: getResolverWedgeState(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), attribution: attributionStatusWire(), compressConfigError: pendingCompressValidationError() ?? null }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:

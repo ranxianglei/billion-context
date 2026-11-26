@@ -13,7 +13,7 @@ export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { withExitDeadline } from "./exit-deadline.js";
-import { effectivePromptCacheRouting, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
+import { effectivePromptCacheRouting, findRoute, findRouteKey, lookupContextLimit, pendingCompressValidationError, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
@@ -522,6 +522,12 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
     const filePath = configureLogger(opts.logFile ?? defaultLogFile());
+    // #7100: the compress-config rejection was recorded in loadOptions (before
+    // configureLogger, so its own warn never reached the file) — log it now
+    // that the logger is live so a dropped compress block is observable in
+    // bili.log; the API surfaces carry the reason on demand.
+    const compressError = pendingCompressValidationError();
+    if (compressError) loggerLog("warn", compressError);
     // #2864: launcher-spawned children have stderr redirected to
     // %TEMP%/bili-proxy-<port>.log (raw append fd, no rotation) — with the
     // file leg live that pipe is a pure unbounded duplicate of bili.log
