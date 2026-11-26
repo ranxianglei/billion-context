@@ -869,9 +869,25 @@ export function createCore(ports: Ports = {}): CompressionCore {
       warnings.push(...resolution.resolved.snappedBoundaries);
       const note = resolution.resolved.reversedNote;
       if (note) notes.push(note);
+      // A clamped endpoint landed on a real message but the REQUESTED ref was
+      // never allocated in this session — it will be minted for an unrelated
+      // later message, so persisting it as the block's recorded span aliases
+      // that future message. Record the effective (anchored) ref instead;
+      // error attribution below keeps the original spec so the model sees its
+      // own range in any failure text.
+      const resolved = resolution.resolved;
+      const effectiveSpec =
+        resolved.effectiveStartRef !== undefined ||
+        resolved.effectiveEndRef !== undefined
+          ? {
+              ...spec,
+              startRef: resolved.effectiveStartRef ?? spec.startRef,
+              endRef: resolved.effectiveEndRef ?? spec.endRef,
+            }
+          : spec;
       try {
         const outcome = applySingleRange({
-          spec,
+          spec: effectiveSpec,
           messages: input.messages,
           state,
           runId: runIdOf(),
