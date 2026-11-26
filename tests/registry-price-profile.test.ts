@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { peekRegistryPriceProfile, providerFromHost, _resetForTest, _setForTest } from "../src/registry.ts";
+import { peekRegistryPriceProfile, scanRegistryCostRow, providerFromHost, _resetForTest, _setForTest } from "../src/registry.ts";
 import bundledSnapshot from "../src/registry-snapshot.json" with { type: "json" };
 
 // #1279 follow-up: registry-derived default price profiles. The lookup is
@@ -121,4 +121,31 @@ test("bundled snapshot ships cost rows so the offline floor exercises pricing", 
     }
     assert.equal(typeof snap.count, "number");
     assert.equal(Object.keys(snap.models ?? {}).length, snap.count);
+});
+
+
+test("relay cost suffix lookup retains first usable row and full model-id precedence", () => {
+    _resetForTest();
+    const costs = {
+        "aaa/Family/Model": { input: 0, output: 0 },
+        "bbb/Other/Model": { input: 9, output: 90 },
+        "ccc/FAMILY/MODEL": { input: 2, output: 4, cache_read: 0 },
+        "ddd/family/model": { input: 3, output: 6 },
+        "EEE/FAMILY/MODEL": { input: 4, output: 8 },
+        "eee/family/model": { input: 5, output: 10 },
+        "fff/family/OtherModel": { input: 6, output: 12 },
+    };
+    for (let repeat = 0; repeat < 2; repeat++) {
+        const nested = scanRegistryCostRow(costs, "Family/Model", "relay.example");
+        assert.equal(nested?.key, "ccc/FAMILY/MODEL");
+        assert.deepEqual(nested?.profile, { w: 2, r: 0, q: 4 });
+        assert.equal(scanRegistryCostRow(costs, "family/model-thinking", "relay.example")?.key, "ccc/FAMILY/MODEL");
+        assert.equal(scanRegistryCostRow(costs, "MODEL", "relay.example")?.key, "bbb/Other/Model");
+        assert.equal(scanRegistryCostRow(costs, "odel", "relay.example"), undefined);
+        assert.equal(scanRegistryCostRow(costs, "model", "api.openai.com"), undefined);
+        assert.equal(scanRegistryCostRow(costs, "eee/family/model", "relay.example")?.row.input, 5);
+    }
+    const replacement = { "new/family/model": { input: 7, output: 14 } };
+    assert.equal(scanRegistryCostRow(replacement, "Family/Model", "relay.example")?.row.input, 7);
+    assert.equal(scanRegistryCostRow(costs, "Family/Model", "relay.example")?.row.input, 2);
 });

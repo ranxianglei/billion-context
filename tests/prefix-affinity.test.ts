@@ -343,3 +343,30 @@ test("prefix-affinity: anonymous resolution never adopts an identified chain (#1
     assert.equal(a.via, "new");
     assert.equal(a.matchedDepth, 0);
 });
+
+test("prefix-affinity: machinery-only anonymous request keeps its deterministic mint (#7149 batch1)", () => {
+    // User content the neutral projection drops entirely (client markers,
+    // image placeholders, empty content arrays) leaves the incoming depth
+    // at 0 while the raw wire clears the 24B floor. The #2791 v1 skip must
+    // not flip those from their deterministic mint to the #286 400 — the
+    // degenerate-request guard and the mint tailHash are anchored on the
+    // raw domain (review of the batch-1 v1 skip).
+    const r = new PrefixAffinityResolver();
+    const marker = r.resolve([user("[model changed: gpt-4]")]);
+    assert.ok(marker, "marker-only user message must still mint a session, not 400");
+    assert.match(marker!.sessionId, /^pfa-[0-9a-f]{16}$/);
+    assert.equal(marker!.via, "new");
+    assert.equal(marker!.incomingDepth, 0);
+
+    const placeholder = r.resolve([{ role: "user", content: [{ type: "text", text: "(image omitted: model does not support images)" }] }]);
+    assert.ok(placeholder, "image-placeholder-only user message must still mint a session, not 400");
+    assert.equal(placeholder!.incomingDepth, 0);
+
+    const empty = r.resolve([{ role: "user", content: [] }]);
+    assert.ok(empty, "empty-array user content must still mint a session, not 400");
+    assert.equal(empty!.incomingDepth, 0);
+
+    // Deterministic across fresh resolvers, as before the v1 skip.
+    const r2 = new PrefixAffinityResolver();
+    assert.equal(r2.resolve([user("[model changed: gpt-4]")])!.sessionId, marker!.sessionId);
+});

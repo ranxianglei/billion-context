@@ -147,6 +147,17 @@ entries:
     desc_ja: "範囲外のモデル主導圧縮の禁止 (#5683)：提出されたすべての範囲は、bili が現在折りたたみを推奨している範囲内に留まらなければならない — ナッジテキストと acp_status が示すのと同じライブ折りたたみ可能セット（存在する場合、このリクエストの準備時オファー、それ以外の場合はライブ再計算）。判定はカバレッジによる：推奨スパンの細分化は合格し、アクティブなブロックにすでに折りたたまれたメッセージ（既存のサマリーを更新する再折りたたみ）は免除される。他のライブメッセージを含む範囲は、問題のあるスパンを特定するエラーレシートとともに全体として拒否される。明示的に有効化されない限りオフ。"
     site_en: "Forbid out-of-bounds compression (off by default): only ranges bili currently recommends may be folded; subdividing a listed span or refolding an existing block stays legal."
     site_zh: "禁止越界压缩（默认关闭）：只允许折叠 bili 当前推荐的范围；拆分推荐跨度、重折已有块更新摘要仍合法。"
+  - key: compress.postComPressTail
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    id: cw.ptail
+    render: compress-row
+    desc_en: "Recommend 'fold more' inside the SUCCESS compress receipt (#7318): the remaining-offer range list and the 'Uncovered history remains' audit note are printed only when enabled; off by default the receipt carries neither (the context-minimum stop signal is unaffected). When enabled, the uncovered-history note fires at most once per nudge-injection cycle and a fresh injection re-opens it (#6522/#6526). Off because per-receipt re-recommendation drove models into endless fold loops against explicit stop requests."
+    desc_zh: "在压缩成功回执里推荐「继续压缩」（#7318）：剩余可折叠范围列表与「Uncovered history remains」审计提示仅在开启时打印；默认关闭时两者都不出现（上下文已到底的停止信号不受影响）。开启后，未覆盖历史提示每个 nudge 注入周期最多发一次，新注入会重新打开（#6522/#6526）。之所以默认关闭：回执里反复推荐曾驱使模型无视用户停止指令无限折叠。"
+    desc_ja: "圧縮成功レシート内での「続けて折りたたむ」推奨 (#7318)：残り折りたたみ可能範囲リストと『Uncovered history remains』監査ノートを印刷するのは有効化時のみ；デフォルト OFF では両方とも出ない（コンテキスト最小停止シグナルには影響なし）。有効化時は、未カバー履歴ノットはナッジ注入サイクルごとに最大 1 回のみ発火し、新しい注入が再オープンする (#6522/#6526)。レシート毎の再推奨が明示的な停止要求を無視した無限折りたたみループを誘発したためデフォルト OFF。"
+    site_en: "Off by default: the success receipt stops re-advising remaining foldable ranges and the uncovered-history note. Enable compress.postComPressTail to restore the recommendation (then at most once per nudge cycle)."
+    site_zh: "默认关闭：成功回执不再推荐剩余可折叠范围、不再发未覆盖历史提示。开启 compress.postComPressTail 可恢复推荐（开启后每个 nudge 周期最多一次）。"
   - key: compress.streamSummary
     type: boolean
     default: "false (unset)"
@@ -247,6 +258,17 @@ entries:
     desc_ja: "T1→T3 の階層型蒸留により、フォールドコストを世代間で分散する。"
     site_en: "On by default: tiered T1→T3 distillation spreads folding cost across generations."
     site_zh: "默认开：T1→T3 分级蒸馏，把折叠成本摊到多代。"
+  - key: compress.protectedUserPatterns
+    type: "string[]"
+    default: "none"
+    group: compress
+    id: ct.pup
+    render: compress-row
+    desc_en: "Literal substrings on user text messages: matching prompts never fold, even when they are not the latest user message. For host-marked current-task prompts in long-lived sessions."
+    desc_zh: "用户文本消息的字面子串：命中即永不折叠，即使它不是最后一条 user 消息。用于长会话里 host 标记的当前任务 prompt。"
+    desc_ja: "ユーザー本文のリテラル部分文字列：一致したプロンプトは最新のユーザーメッセージでなくてもフォールドされない。長寿命セッションでホストが現在のタスクを示す用途。"
+    site_en: "Protect host-marked current-task prompts from folding (literal substrings)."
+    site_zh: "保护 host 标记的当前任务 prompt 不被折叠（字面子串）。"
   - key: compress.protectedTools
     type: "string[]"
     default: "none"
@@ -350,16 +372,16 @@ entries:
     site_en: "Send growth nudges as the window fills (on by default; global level only)."
     site_zh: "窗口填满过程中发送增长提醒（默认开；仅全局层级生效）。"
   - key: compress.reasoning
-    type: "{ drop?, threshold? }"
-    default: "drop true · threshold 2048"
+    type: "{ drop?, threshold?, tail? }"
+    default: "drop true · threshold 2048 · tail false"
     group: compress
     id: ct.rz
     render: compress-row
     desc_en: "Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
     desc_zh: "丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
     desc_ja: "2048文字を超える完了ラウンドの推論実行を破棄する（デフォルトで drop: true）；厳格な推論を要求するアップストリームでは drop: false が必要。"
-    site_en: "{ drop?, threshold? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
-    site_zh: "{ drop?, threshold? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
+    site_en: "{ drop?, threshold?, tail? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default; tail: false keeps it scoped to compress turns only); strict-reasoning upstreams need drop:false."
+    site_zh: "{ drop?, threshold?, tail? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true；tail 默认 false，只限 compress 轮次）；严格推理上游需设 drop:false。"
   - key: compress.absorb
     type: object
     default: "opt-in (disabled)"
@@ -371,6 +393,17 @@ entries:
     desc_ja: "ツール結果を短い要約に即時蒸留するオプトイン機能；元データはコンテンツストアに保存される。デフォルトでは画像を含む結果のみが対象となる。"
     site_en: "<code>absorb</code> — opt-in instant distillation of tool results into short abstracts; originals go to the content store; by default only image-bearing results qualify (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, mediaOnly (default true), toolName \"absorb\"</span>)."
     site_zh: "<code>absorb</code> —— 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库；默认仅图片类结果参与（<span class='mech'>enabled, minToolTokens(默认 1000), contextThresholdPct, excludeTools, mediaOnly(默认 true), toolName \"absorb\"</span>）。"
+  - key: compress.degenerateRetry
+    type: object
+    default: "1 attempt (built-in nudge)"
+    group: compress
+    id: co.degenerateRetry
+    render: obj-item
+    desc_en: "Retry budget and nudge sentences for turns that end with zero client-visible output (degenerate terminal turns). The continuation nudge rides the retry body only — it is never persisted into session state and never replayed on the client's next request."
+    desc_zh: "零可见输出回合（退化终端回合）的重试预算与 nudge 句配置。续接 nudge 只附在重试请求体上——不写入会话状态，客户端下一轮不重放。"
+    desc_ja: "クライアントに見える出力がゼロで終わるターンのリトライ予算と nudge 文の設定。継続 nudge はリトライ本文にのみ付加され、永続化も次のリクエストでの再生もされない。"
+    site_en: "<code>degenerateRetry</code> — retry budget for zero-visible-output turns; the continuation nudge rides the retry body only, never persisted (<span class='mech'>maxAttempts (default 1, 0 = off, max 5), nudges (1–8 custom sentences)</span>)."
+    site_zh: "<code>degenerateRetry</code> —— 零可见输出回合的重试预算；续接 nudge 只附在重试请求体上、不持久化（<span class='mech'>maxAttempts(默认 1，0=关，上限 5)、nudges(1–8 句自定义)</span>）。"
   - key: compress.blockOps
     type: object
     default: "off"
@@ -523,6 +556,20 @@ entries:
     desc_en: "Restrict absorption to tool results that carry media (images). Image bytes are exempt from minToolTokens since they are not counted in text. Set false to restore legacy full-text absorption of any large result."
     desc_zh: "仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。"
     desc_ja: "メディア（画像）を伴うツール結果に吸収を制限する。画像バイトはテキストにカウントされないため、minToolTokens の対象外となる。false に設定すると、従来の大規模結果の全文吸収が有効になる。"
+  - key: compress.degenerateRetry.maxAttempts
+    type: integer
+    default: "1"
+    group: compress
+    desc_en: "Degenerate-terminal retry budget (#7666): when a turn ends with nothing client-visible, the agent's own request is re-issued with a trailing user nudge. 0 = off (the turn passes through bare), 1 = once (pre-#7666 behavior), max 5; attempt i sends nudges[i] (cycling). Independent of the zero-byte-cut re-issue (#2171) — a turn may spend one of each."
+    desc_zh: "空回合重试预算（#7666）：回合以客户端零可见输出收尾时，把 agent 自己的原请求追加一条尾部 user nudge 后重发。0=关（空回合直接放行），1=一次（#7666 前的默认行为），上限 5；第 i 次发 nudges[i]（短了循环）。与断流重发（#2171）预算独立——同一回合各可花一次。"
+    desc_ja: "退化ターンのリトライ予算（#7666）：クライアントに見える出力が何もないターン終了時に、agent の元のリクエストに末尾ユーザー nudge を追加して再発行する。0 = 無効（そのターンは素通し）、1 = 1 回（#7666 以前の動作）、最大 5；i 回目の試行で nudges[i] を送信（リストが短ければ循環）。ゼロバイト切断の再発行（#2171）とは予算が独立——1 ターンでそれぞれ 1 回まで。"
+  - key: compress.degenerateRetry.nudges
+    type: "string[]"
+    default: "3 built-in"
+    group: compress
+    desc_en: "Custom nudge sentences for degenerate-terminal retries (#7666); retry i sends sentence i (cycling when shorter). Unset = the built-in rotation, whose first entry is the default continuation nudge."
+    desc_zh: "自定义空回合重试 nudge 句（#7666）；第 i 次重试发第 i 句（短了循环）。不填 = 内置轮换，首句即默认续接 nudge。"
+    desc_ja: "退化ターンリトライ用のカスタム nudge 文（#7666）；i 回目のリトライで i 番目の文を送信（短ければ循環）。未設定 = 組み込みローテーション（先頭はデフォルトの継続 nudge）。"
   - key: compress.blockOps.enabled
     type: boolean
     default: "false"
@@ -698,6 +745,13 @@ entries:
     desc_en: "Character threshold above which finished reasoning runs are dropped."
     desc_zh: "已结束推理块被丢弃的字符阈值。"
     desc_ja: "完了推論実行を破棄する文字数閾値。"
+  - key: compress.reasoning.tail
+    type: boolean
+    default: "false"
+    group: compress
+    desc_en: "(#7144 follow-up) Also drop reasoning from any CLOSED round in the protected tail, not only compress turns — a tool call whose result arrived with at least one message after it, or an assistant text turn that is no longer the last message. Those rounds leave the protected window at the next fold anyway, so dropping early reclaims the tokens now; the in-flight round is never touched. Strict-echo upstreams are unaffected: #762/#2169 blank-echo normalization runs after the drop."
+    desc_zh: "（#7144 后续）保护尾内不止 compress 轮次、任意已关闭轮次的推理块也丢弃——工具调用结果已到且其后还有消息，或助手文本不再是最后一条。这些轮次下次折叠时反正会连推理一起离开窗口，提前丢即回收 token；进行中的轮次绝不触碰。严格推理上游不受影响：#762/#2169 空回显归一化跑在丢弃之后。"
+    desc_ja: "(#7144 フォローアップ) 保護テール内では compress ラウンド以外に、任意のクローズ済みのラウンド（結果到着後メッセージがあるツール呼び出し、または最後のメッセージでなくなったアシスタントテキスト）の推論実行も破棄する。進行中のラウンドには一切触れない。厳格な推論アップストリームには影響なし：#762/#2169 の空白エコー正規化は破棄後に実行される。"
   - key: compress.minCompressRange
     type: number
     default: "same as minCompressRangeChars"

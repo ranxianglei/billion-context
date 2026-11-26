@@ -90,6 +90,7 @@ pi install npm:billion-context-pi-subagents
     "asyncTimeoutMinutes": 30,
     "thinkingLevel": "medium",
     "notifyIfRead": "skip",
+    "notifyStructured": false,
     "displayUsage": "separate",
     "forceEnable": false,
     "fleetShortcut": "ctrl+alt+d",
@@ -115,6 +116,7 @@ pi install npm:billion-context-pi-subagents
 | `delegate.thinkingLevel` | string | unset | 全局默认思考级别（off\|minimal\|low\|medium\|high\|xhigh\|max）。优先级：单次调用 > 角色 > 全局 > Pi 默认值。 |
 | `delegate.agents` | object | unset | 按角色设置默认值：`{ "<role>": { "model": "provider/id", "thinkingLevel": "…" } }`。无效模型回退到父模型并给出警告（不会导致失败）。 |
 | `delegate.notifyIfRead` | `"skip" \| "always"` | `"skip"` | 若模型在运行结束后已读取结果文件，则跳过完成通知。 |
+| `delegate.notifyStructured` | boolean | `false` | 将通知投递为带版本化 `details` 信封（runId/状态/agent + 发起溯源：originToolCallId/sourceSessionId）的类型化自定义消息，供第三方 UI 无需解析措辞即可把每条通知归属到发起轮次（#5750）。模型可见文本与 steer 投递不变；宿主无 `sendMessage` 时自动回退纯文本。 |
 | `delegate.fleetShortcut` | string | `"ctrl+alt+d"` | fleet 检查器的 TUI 快捷键。`""` 禁用键盘注册（`/acp-fleet` 仍然可用）。已从 `ctrl+alt+f` 移开，因为 pi-subagents 也占用了该组合键（#412）。 |
 | `delegatePrompt` | string \| null | built-in | 替换（字符串）或移除（`null`）系统提示词附录中的 `ACP_DELEGATE NOTIFICATIONS` 部分。 |
 | `debug` | boolean | `false` | 在 `~/.pi/acp.log` 中记录调试级别事件（与 billion-context-pi 共享）。也可通过环境变量 `ACP_DEBUG=1` 开启。 |

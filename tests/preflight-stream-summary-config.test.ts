@@ -306,6 +306,13 @@ test("e2e #2155/#2133 (stale learned flag): explicit OFF ignores a flag learned 
         assert.ok(sess, "session recorded by the warmup");
         assert.equal(sess?.metadata?.preflightStreamSummary, undefined, "no flag before seeding");
         sess!.metadata.preflightStreamSummary = true;
+        // Identity-fast-path guard: the warmup settles a genuine same-origin
+        // usage baseline, which alone would open the trusted fast path and
+        // forward the over-window payload. This pin targets the explicit-OFF
+        // fail-fast contract, so declare the overflow wall — statedWall > 0
+        // demotes the fast path; the wall equals the configured window, so the
+        // judge's limit is unchanged.
+        sess!.stats.overflowArmTokens = 10_000;
 
         const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s2155-stale-flag");
         assert.equal(r.status, 502, `explicit OFF must ignore the stale flag and fail fast, got ${r.status}; calls=${JSON.stringify(calls)}`);

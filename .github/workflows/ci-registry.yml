@@ -28,6 +28,7 @@ jobs:
   # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
   # or on the 30-min cron when master moved since the last green scheduled run.
   gate:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -57,7 +58,7 @@ jobs:
           echo "run=$run" >> "$GITHUB_OUTPUT"
   e2e-registry:
     needs: [gate]
-    if: needs.gate.outputs.run == 'true'
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (needs.gate.outputs.run == 'true') }}
     name: hermetic registry e2e (local verdaccio; loopback only, zero secrets)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25

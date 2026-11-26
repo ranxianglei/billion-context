@@ -7,8 +7,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
+import { rebuildCoreFromLog } from "./storage/egress-serve.js";
 import { cloneStoreForRefs } from "./store.js";
-import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, blockOpsTools, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
@@ -24,6 +25,7 @@ import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, co
 import { log as loggerLog } from "./logger.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
+import { formatProtectedMass, uncoveredAudit, type ProtectedMassLedger } from "./uncovered.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
 import { recordAttributionReport } from "./server/attribution-status.js";
@@ -72,7 +74,7 @@ import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
 import { billOutputUsage } from "./billing.js";
-import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
+import { promptInputTotal, declaredInclusiveFromUsage, lastIterationContext, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 import { lookupToolUseIdSession, lookupToolWitness, recordToolUseId, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
@@ -144,6 +146,27 @@ const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
  *  agents route by intent (side-request.ts SIDE_REQUEST_AGENTS); explicit "main"
  *  vetoes side heuristics, while other persona ids remain inert telemetry. */
 const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
+/** #6880: the host's declared PURPOSE for the dispatch (dsh stamps
+ *  GenerateOptions.purpose verbatim — "session-title", "compaction",
+ *  "auto-review", "timeline-report", ...; its contract: ordinary
+ *  conversation requests leave it unset). Carries the side/main intent
+ *  that content-guessing used to approximate: a PLUGIN-ANNOUNCED request
+ *  with a non-empty purpose is a side request by declaration, no per-feature
+ *  template matching needed (the content recognizers stay as the fallback
+ *  for pre-#6880 plugin installs). Honored only behind the x-bili-plugin
+ *  marker, same trust discipline as the conversation header: an unannounced
+ *  client's purpose header is inert telemetry. */
+const PLUGIN_PURPOSE_HEADER = "x-bili-plugin-purpose";
+/** #6880 v2 wire: the post-#6883 dsh plugin stamps this sentinel for MAIN
+ *  turns (dsh leaves GenerateOptions.purpose unset for ordinary conversation,
+ *  so no real dsh purpose can collide with it). PRESENCE of the header in any
+ *  value is the declaration that this conversation's plugin announces every
+ *  dispatch's purpose — main traffic then keys the raw session id directly
+ *  (dsh mints one UUID per session, ids never recycle) instead of routing
+ *  through the persona-order ladder, and its auxiliary traffic is a declared
+ *  side request by the header alone. The sentinel itself is NOT a side:
+ *  handle.ts normalizes it back to "absent" before the side classification. */
+export const PLUGIN_PURPOSE_CONVERSATION = "conversation";
 
 const PLUGIN_PROTOCOL_VERSION = 1;
 
@@ -210,6 +233,14 @@ function headerValue(headers: Record<string, string | string[] | undefined>, nam
     const s = typeof v === "string" ? v : Array.isArray(v) ? v[0] : undefined;
     const t = s?.trim();
     return t && t.length > 0 ? t : undefined;
+}
+
+export function pluginPurposeHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+    // #6880: purpose is a protocol-internal steering signal — honoring it
+    // without the plugin announcement would let any client that can reach
+    // the endpoint opt its traffic out of the session pipeline. A real
+    // plugin sends the marker and the purpose together.
+    return pluginAgentHeader(headers) !== undefined ? headerValue(headers, PLUGIN_PURPOSE_HEADER) : undefined;
 }
 
 export function pluginAgentHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
@@ -1245,6 +1276,15 @@ type ForkRequest = {
     branchPoint: { messageCount: number; orderHash: string };
     orderedMessages: ForkIdentity[];
     idempotencyKey: string;
+    // #6262 principle 1 (msgid identity track, discussion #6262): the child's
+    // host-stable ids for the claimed prefix. A host-pinned parent exposes the
+    // host ids AS its snapshot rawIds, so the gate in handlePluginFork is rawId
+    // equality — no new validation copy (identifier() below is the SAME check
+    // every rawId already passes).
+    prefixMsgIds?: string[];
+    // Where the byte-verified prefix stopped and the identity track extended it.
+    // Only rides WITH prefixMsgIds; >= messageCount normalizes to "no drift".
+    driftFrom?: number;
 };
 
 function stableJson(value: unknown): string {
@@ -1477,8 +1517,45 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     return out;
 }
 
+/** #7658 wiring 2: the egress op-log snapshot source. An egress-on
+ *  session's unified leg is frozen, so once the in-memory raw snapshot is
+ *  gone (dropOverCap under BILI_PUBLIC_SNAPSHOT_CAP_BYTES, or a cold
+ *  process whose reconstruction only sees the frozen-at-arm-point rows)
+ *  the flow is the ONLY place that still holds the full history — and it
+ *  is the content authority by ruling 7439-5, same source the lane serves
+ *  from. Last resort after the raw snapshot and the raw-tail
+ *  reconstruction, so sessions where those still work keep today's
+ *  behavior. */
+function egressOpLogSource(session: Session): CoreMessage[] | null {
+    if (session.metadata.egressAuthority !== true) return null;
+    const st = getStore().egressOpLogStore();
+    if (!st) return null;
+    // The view read is a FLOW REPLAY — it throws EgressStateCorruptError on a
+    // damaged log (the same hard-fail the lanes hit every request). This
+    // helper runs in the fork route OUTSIDE its structured-error try, so a
+    // damaged parent must degrade to "no source" (a clean 409
+    // SNAPSHOT_UNAVAILABLE from forkSnapshot) rather than an unhandled 500.
+    // The child's own recovery walk decides the copied log's health.
+    let view;
+    try {
+        view = st.egressStateView(session.id);
+    } catch (err) {
+        loggerLog("warn", `[plugin] egress op-log fork source unreadable for ${session.id} — fork falls through to the next source: ${String(err)}`);
+        return null;
+    }
+    return view.length > 0 ? rebuildCoreFromLog(view) : null;
+}
+
+/** #7658 wiring 2: ONE source chain for the snapshot identity AND the
+ *  child's inherited pluginSnapshot — the two must agree, so both ride
+ *  this helper (the fork route used to compute the first two links on its
+ *  own and null-slice when only the op-log fallback had a source). */
+function forkSourceOf(session: Session, source?: CoreMessage[] | null): CoreMessage[] | null {
+    return source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session) ?? egressOpLogSource(session);
+}
+
 function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
-    const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
+    const messages = forkSourceOf(session, source);
     if (!messages) {
         const capped = session.metadata.publicSnapshotCapped === true;
         const base = capped ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
@@ -1579,9 +1656,9 @@ function holdsRefs(s: Session): boolean {
     return Object.keys(s.state.messageRefs?.byRef ?? {}).length > 0;
 }
 
-/** #2601: persona-fork descendants of a raw host id — sessions minted by the
- *  persona-anchor fork branch (`${rawId}|sub:${fp}`, persona-anchor.ts) that
- *  actually carried traffic, are fresh, AND hold refs (#2948: freshness alone
+/** #2601: persona-fork descendants of a raw host id — sessions on a
+ *  `${rawId}|sub:` persona lane (the #5095 lane-token fork or the #970 split)
+ *  that actually carried traffic, are fresh, AND hold refs (#2948: freshness alone
  *  selected ref-less aux lanes — see holdsRefs). Grouping by
  *  `id.split("|sub:")[0]` is the house idiom (splitSessionWarnings, #2170
  *  canary). Sorted by lastSeen descending (listSessions order). */
@@ -1720,7 +1797,19 @@ function parseForkRequest(payload: string): ForkRequest {
         if (!identifier(item.rawId) || !(item.ref === null || (typeof item.ref === "string" && /^m\d{5,}$/.test(item.ref))) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
         return { rawId: item.rawId, ref: item.ref, identityHash: item.identityHash };
     });
-    return { protocolVersion: b.protocolVersion, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
+    // #6262 principle 1: optional msgid track. identifier() is REUSED, not copied —
+    // the same shape check every claimed rawId already passes above.
+    let prefixMsgIds: string[] | undefined;
+    if (b.prefixMsgIds !== undefined) {
+        if (!Array.isArray(b.prefixMsgIds) || b.prefixMsgIds.length !== (point.messageCount as number) || b.prefixMsgIds.some((v: unknown) => !identifier(v))) throw new Error("invalid prefixMsgIds");
+        prefixMsgIds = b.prefixMsgIds as string[];
+    }
+    let driftFrom: number | undefined;
+    if (b.driftFrom !== undefined) {
+        if (prefixMsgIds === undefined || !Number.isSafeInteger(b.driftFrom) || (b.driftFrom as number) < 0 || (b.driftFrom as number) > (point.messageCount as number)) throw new Error("invalid driftFrom");
+        driftFrom = (b.driftFrom as number) < (point.messageCount as number) ? (b.driftFrom as number) : undefined;
+    }
+    return { protocolVersion: b.protocolVersion, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey, ...(prefixMsgIds !== undefined ? { prefixMsgIds } : {}), ...(driftFrom !== undefined ? { driftFrom } : {}) };
 }
 
 /** [#2399 stage 2] omp/pi identity-register their session ids at session_start
@@ -1766,7 +1855,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
             // #5140 item 4: a cold non-retained parent has no resident snapshot;
             // stand in with the verified unified raw tail (no fresh model call).
-            const source = parent.pluginSnapshot ?? reconstructRawTailForFork(parent);
+            const source = forkSourceOf(parent);
             let snapshot: ReturnType<typeof forkSnapshot>;
             try { snapshot = forkSnapshot(parent, source); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
@@ -1780,6 +1869,23 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             }
             const prefix = snapshot.orderedMessages.slice(0, request.branchPoint.messageCount);
             if (prefix.length !== request.branchPoint.messageCount || forkOrderHash(request.orderedMessages) !== request.branchPoint.orderHash || stableJson(prefix) !== stableJson(request.orderedMessages)) return forkReply(res, 409, { ok: false, code: "BRANCH_POINT_CONFLICT", error: "ordered prefix/hash does not match parent" });
+            // #6262 principle 1 (msgid identity track): the byte check above is
+            // final for the prefix AS CLAIMED (the client copies the parent's
+            // identities verbatim, including the drift region). When the client
+            // additionally claims host-stable ids for the prefix and every one
+            // equals the parent's rawId at its slot (host-pinned parents: the
+            // rawId IS the host id), the region [driftFrom, messageCount) is
+            // identity-stable byte drift — the host re-rendered those messages
+            // after the parent saw them but kept their ids. Blocks and refs are
+            // keyed by rawId, and the child's pinned ids match the parent's, so
+            // everything copied below stays valid in the child: accept and mark
+            // the receipt. Gate failure (parent not host-pinned — its rawIds are
+            // content digests, never host ids — or any id/length mismatch) → the
+            // byte-verified fork proceeds EXACTLY as before: strict, no 409.
+            let forkDriftFrom: number | undefined;
+            if (request.prefixMsgIds !== undefined && request.prefixMsgIds.length === prefix.length && request.prefixMsgIds.every((id, k) => id === prefix[k]!.rawId)) {
+                forkDriftFrom = request.driftFrom;
+            }
             const rawIds = new Set(prefix.map((m) => m.rawId));
             const child = createSession(request.childConversationId, { ...parent.meta, label: request.childConversationId });
             const crossing = parent.state.blocks.filter((b) => b.effectiveMessageIds.some((id) => rawIds.has(id)) && !b.effectiveMessageIds.every((id) => rawIds.has(id)));
@@ -1870,7 +1976,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
             child.metadata.publicSnapshotTextComparable = true;
             child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
-            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
+            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens", "egressAuthority"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
             child.metadata.parentConversationId = request.parentConversationId;
             child.metadata.parentRevision = request.parentRevision;
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
@@ -1901,7 +2007,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
                 (child.transient ??= {}).latestKnownMsgId = parent.transient.latestKnownMsgId;
                 child.transient.needlePayloadUpper = parent.transient.needlePayloadUpper;
             }
-            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
+            const response = { ok: true, status: forkDriftFrom !== undefined ? (crossing.length > 0 ? "expanded+drifted" : "drifted") : crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, ...(forkDriftFrom !== undefined ? { driftFrom: forkDriftFrom } : {}), expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             await publishForkSession(child, parent.id);
             recordPluginSession(request.childConversationId, child.id);
@@ -2063,7 +2169,12 @@ export async function handlePluginStatus(conversationId: string, res: import("no
             res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null, sessionId: null, sessionRevision: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
-        res.writeHead(404, { "content-type": "application/json" });
+        // #6642: the 404 fallthrough must carry the SAME cors-mode headers the
+        // 2xx branches above do — the dsh Context tab reads this route
+        // cross-origin, and a bare 404 without access-control-allow-origin is
+        // rejected by the browser as "Failed to fetch", masking the real
+        // "unknown plugin conversation" error the panel is trying to surface.
+        res.writeHead(404, jsonHeaders());
         res.end(JSON.stringify({ ok: false, error: fallbackLatest ? "no session with activity since boot — issue a model request or pass the conversation id" : "unknown plugin conversation" }));
         return;
     }
@@ -2084,13 +2195,16 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     // as acp_status; on failure omit the nudge/ranges sections instead of
     // serving the stale snapshot.
     let nudge: NudgeDecision | undefined;
-    try {
-        const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
-        if (messages.length > 0) {
-            // #833: base kernelConfig carries no file/provider/model compress
-            // settings — render from the session's last resolved Config so the
-            // panel matches actual injection behavior.
-            const pluginCfg = effectiveConfig(session, deps.config);
+    // Hoisted out of the nudge try so the #7463 protected-mass audit below
+    // sees the same message view and resolved config (advisory surfaces must
+    // never classify against a different input than the panel did).
+    const messages: CoreMessage[] = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+    // #833: base kernelConfig carries no file/provider/model compress
+    // settings — render from the session's last resolved Config so the
+    // panel matches actual injection behavior.
+    const pluginCfg = effectiveConfig(session, deps.config);
+    if (messages.length > 0) {
+        try {
             nudge = deps.core.processTurn({
                 messages,
                 state: session.state,
@@ -2102,9 +2216,9 @@ export async function handlePluginStatus(conversationId: string, res: import("no
                 // history, not this panel's processed view (#2627 split).
                 applyView: mem && mem.original.length > 0 ? mem.original : undefined,
             }).nudge;
+        } catch {
+            nudge = undefined;
         }
-    } catch {
-        nudge = undefined;
     }
     // #3204: the submit gate rejects any span that brackets a ref recorded DEAD
     // (the client rewrote/dropped those messages) — the same self-contradiction
@@ -2113,12 +2227,38 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     if (nudge) {
         nudge = { ...nudge, compressibleRanges: excludeDeadRefRanges(nudge.compressibleRanges ?? [], session.state.deadRefs) };
     }
+    // #7463: protected-mass attribution on the HUMAN-only /acp panel + the
+    // structured context view (dsh Context tab). acp_status keeps the same
+    // ledger opt-in (protectedMass param); this panel is on-demand, so the
+    // one extra relaxed offer pass is paid only when a human asks for /acp.
+    // Advisory: any failure just omits the line.
+    let protectedMass: ProtectedMassLedger | undefined;
+    let protectedMassLine: string | undefined;
+    if (messages.length > 0) {
+        try {
+            const audit = uncoveredAudit({
+                core: deps.core,
+                messages,
+                state: session.state,
+                config: ccrLoopConfig(session, pluginCfg),
+                tokenCount: statusInputBaseline(session),
+                contentStore: contentStoreOf(session),
+                applyView: mem && mem.original.length > 0 ? mem.original : undefined,
+                normalRanges: nudge?.compressibleRanges,
+            });
+            const pmLine = formatProtectedMass(audit.mass);
+            if (pmLine !== null) {
+                protectedMass = audit.mass;
+                protectedMassLine = pmLine;
+            }
+        } catch {}
+    }
     // #532/#3862: host-measured system+tools overhead (prepare-time, same
     // source as estimateInputTokens) — shared by the panel text below AND the
     // structured context view, so both surfaces classify identically.
     const sysTokRaw = session.metadata.systemPromptTokens;
     const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
-    const contextView = buildContextView({ nudge, systemPromptTokens, limit: modelContextLimit, session });
+    const contextView = buildContextView({ nudge, systemPromptTokens, limit: modelContextLimit, session, protectedMass });
     let panel: string | undefined;
     try {
         // #532: the kernel breakdown classifies messages only; feeding in the
@@ -2158,6 +2298,9 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     // users actually see — the /acp panel — via the same before-footer slot the
     // Web UI link uses (the footer anchors the LLM-context stripper).
     const preFooter: string[] = [];
+    if (protectedMassLine !== undefined) {
+        preFooter.push(protectedMassLine);
+    }
     const adv = getAdvisoryState();
     if (adv.active) {
         preFooter.push(`⚠️ CRITICAL ADVISORY: ${describeAdvisory(adv.active, adv.lastError)}`);
@@ -2567,7 +2710,9 @@ export async function handlePluginTool(
 // part of the context size, but NOT a cache hit (#790).
 // declaredInclusive = #4128 upstream self-declaration (billing_usage.semantic)
 // that input_tokens already INCLUDES cache_read — set only on the anthropic lane.
-export type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number; declaredInclusive?: boolean };
+// contextTokens = the context an advisor reply's last executor call read (its
+// top-level usage sums several calls; see lastIterationContext).
+export type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number; declaredInclusive?: boolean; contextTokens?: number };
 
 function num(v: unknown): number | undefined {
     return typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -2630,6 +2775,8 @@ export function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | u
         if (creation !== undefined && creation > 0) sample.creationTokens = creation;
         const output = num(usage["output_tokens"]);
         if (output !== undefined) sample.outputTokens = output;
+        const context = lastIterationContext(usage);
+        if (context !== undefined) sample.contextTokens = context;
         // #4128: honour a billing_usage stamp carried on the delta frame too.
         const declared = declaredInclusiveFromUsage(usage);
         if (declared !== undefined) sample.declaredInclusive = declared;
@@ -2687,8 +2834,8 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const hit = reportedCached === null ? undefined : Math.round((100 * reportedCached) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
-        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
-        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, creation: typeof sample.creationTokens === "number" ? sample.creationTokens : undefined });
+        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${sample.contextTokens !== undefined ? ` context=${sample.contextTokens}` : ""}${foldNew ? " fold=new" : ""}`);
+        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, creation: typeof sample.creationTokens === "number" ? sample.creationTokens : undefined, context: sample.contextTokens });
     }
     if (sample.outputTokens !== undefined) {
         session.stats.outputTokens += sample.outputTokens;
@@ -2719,6 +2866,7 @@ export function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.creationTokens !== undefined) acc.creationTokens = sample.creationTokens;
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
     if (sample.declaredInclusive !== undefined) acc.declaredInclusive = sample.declaredInclusive;
+    if (sample.contextTokens !== undefined) acc.contextTokens = sample.contextTokens;
 }
 
 /** Terminal reasons after which the model genuinely finished its turn. A
@@ -2797,6 +2945,18 @@ export async function pipePluginChatWithStrip(
     // #5951: the requesting host already classifies this cut and retries on its
     // own budget — the proxy must not spend a second one.
     hostOwnsTruncationRecovery = false,
+    // #7666: degenerate-terminal retry budget (compress.degenerateRetry.
+    // maxAttempts, three-level resolved by the caller). Absent/undefined = 1
+    // (pre-#7666 behavior); 0 = off; the zero-byte-cut budget (#2171) stays
+    // independent of this one.
+    degenerateRetryMaxAttempts?: number,
+    // #4913: how an EXHAUSTED degenerate-turn retry (the budget spent with no
+    // usable output) is terminated — "passthrough" passes the empty turn
+    // through as a normal completion (pre-#870, the shape the proxy lane and
+    // the responses wire already take); "error" (default, = omitted) emits the
+    // #870 in-band stream error. Threaded from ProxyOptions.degenerateTurn
+    // (compat.degenerateTurn / BILI_DEGENERATE_TURN).
+    degenerateTurn?: "error" | "passthrough",
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -2822,10 +2982,23 @@ export async function pipePluginChatWithStrip(
     // write through the request logger landed in the SAME tee file, doubling
     // every count taken from bili.log.
     const who = session ? `[${session.id}] ` : "";
-    const onTagDrop = (snippet: string) => {
-        droppedTagInFrame = true;
+    const onTagDrop = (snippet: string, duringDrain?: boolean) => {
         sawStrippedEcho = true;
-        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
+        loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
+    // #6034 (option E): the answer ledger's markup flag is VERDICT-driven,
+    // not "any drop arms it". A complete refs-only echo unit dies whole — it
+    // leaves no interior behind, so the answer text around it must count as
+    // the answer; arming on every drop miscounted a 108-char real answer as
+    // markup after such an echo and killed a healthy turn twice (the sample
+    // in #6034). Only a session-start open (verdict pending until the span
+    // resolves) and a close that releases its prose body leave interior.
+    // Last-write-wins is safe: the filter delivers verdicts in release order
+    // within a frame (a unit's drop precedes its interior's resolution), and
+    // the frame's released text is counted only after push() returns.
+    const onTagDropVerdict = (leavesInterior: boolean) => {
+        droppedTagInFrame = leavesInterior;
     };
     // #2190: the filter released bytes that still carry echo-residue shape —
     // the leak is now observable instead of silent. Log-only; the bytes were
@@ -2862,7 +3035,7 @@ export async function pipePluginChatWithStrip(
             // openai reasoning fields — the thinking channel is NEVER
             // rewritten, only the visible text channel is.
             const signedThinking = field === "thinking" || (protocol === "openai" && (field === "reasoning_content" || field === "reasoning"));
-            s = { filter: signedThinking ? createIdentityStreamFilter() : composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
+            s = { filter: signedThinking ? createIdentityStreamFilter() : composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText, onTagDropVerdict), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
             streams.set(key, s);
         }
         return s;
@@ -2910,8 +3083,12 @@ export async function pipePluginChatWithStrip(
      *  unclosed-tag case): markup the filter declined to swallow. A turn whose
      *  only visible output is this is as dead to the host as an empty one. */
     let releasedMarkupChars = 0;
-    /** Set while a frame is being rewritten because a render tag was dropped:
-     *  the text that survives such a frame is the tag's own interior. */
+    /** VERDICT-driven (onTagDropVerdict, #6034 option E): true while the
+     *  filter has just dropped an artifact whose interior the stream still
+     *  releases — the text surviving such a frame is the tag's own interior
+     *  (markup), so the answer ledger must not count it as the answer. A
+     *  whole-dead unit (complete refs-only echo) or a content release keeps
+     *  it false and the released text stays answer. */
     let droppedTagInFrame = false;
     let finalFinishReason: string | undefined;
     // #2328 Q2/Q4: termination diagnostics — every truncation emit below
@@ -2956,7 +3133,12 @@ export async function pipePluginChatWithStrip(
     // terminal event is dropped when the retry takes over, so the client sees
     // one turn: its framing stays open, and the retry's content blocks are
     // shifted past the ones already streamed.
-    let degenerateRetried = false;
+    // #7666: the budget is a COUNT, not a flag — up to maxDegenerateRetries
+    // nudge re-issues per turn (default 1 = old one-shot; 0 = off), each with
+    // its own nudge sentence (the refetch closure rotates them). The
+    // zero-byte-cut re-issue (#2171) keeps its own independent one-shot.
+    const maxDegenerateRetries = Math.max(0, Math.min(5, Math.floor(degenerateRetryMaxAttempts ?? 1)));
+    let degenerateRetries = 0;
     let truncationRetried = false;
     let forwardedAny = false;
     let inRetry = false;
@@ -2970,11 +3152,12 @@ export async function pipePluginChatWithStrip(
      *  the tag-echo case, where the filter empties the only text block and the
      *  host aborts an empty completed turn. Returns true when the retry stream
      *  took over, in which case the caller drops the terminal event of the
-     *  attempt it came from. Consults truncationRetried: a request whose stream
-     *  already spent its one re-issue on a zero-visible cut (#2171) cannot also
-     *  re-send on a degenerate completion — one re-issue per request, total. */
+     *  attempt it came from. #7666: up to maxDegenerateRetries re-issues per
+     *  turn (each with a fresh nudge sentence); the zero-byte-cut re-issue
+     *  (#2171) no longer shares this budget — each retry kind keeps its own
+     *  one-shot, so a turn may spend one of each. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
-        if (refetch === undefined || truncationRetried) return false;
+        if (refetch === undefined || maxDegenerateRetries === 0) return false;
         // #2303: a terminal turn whose visible prose ends with a compression-draft
         // closing tag and no tool call is non-converged even though it has visible
         // text — the model wrote a handoff/compression draft in prose instead of
@@ -3009,11 +3192,46 @@ export async function pipePluginChatWithStrip(
             return false;
         }
         if (res.destroyed || res.writableEnded) return false;
-        if (degenerateRetried) {
-            // The retry degenerated too. An empty turn is indistinguishable from a
-            // model that produced nothing and the session reads as idle while it is
-            // dead, so the client gets an error the host would never surface (#870).
-            log?.("[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870)");
+        // A turn the model left genuinely bare — no thought, no stripped echo,
+        // no released markup — is the upstream's own empty answer, not a stall:
+        // re-issuing it double-bills an empty completion (#732/#821 keep the
+        // same boundary in the compress loop). A draft-tail turn is NOT bare:
+        // it delivered a full handoff draft, which is precisely the stall signal.
+        // #4913: this gate must run BEFORE the exhausted-retry branch below —
+        // it was written under it, where a spent retry budget made it
+        // unreachable, so a retry attempt the model left genuinely bare died
+        // as a fatal in-band error instead of taking the pass-through #2756
+        // documents for the same shape on the first pass. On the retry pass
+        // the per-attempt accumulators were reset when the retry took over
+        // (below), so this measures THIS attempt, not signals inherited from
+        // the first.
+        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !stalledTail) {
+            log?.(degenerateRetries > 0
+                ? `[plugin] degenerate terminal turn not retried (bare on the retry pass: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756/#4913) — passing the empty turn through`
+                : `[plugin] degenerate terminal turn not retried (bare: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
+            return false;
+        }
+        if (degenerateRetries >= maxDegenerateRetries) {
+            // The retry budget is spent and the last attempt was NOT bare (the
+            // gate above): it really did produce thinking or stripped output
+            // and still ended with nothing the host can act on. Default
+            // terminal: an in-band error the host would never surface on its
+            // own — an empty turn is indistinguishable from a model that
+            // produced nothing and the session reads as idle while it is dead
+            // (#870).
+            // #4913: compat.degenerateTurn="passthrough" (env BILI_DEGENERATE_TURN
+            // wins) opts a host back into the pre-#870 shape — the empty turn
+            // passes through as a normal completion, the same terminal the
+            // proxy lane and the responses wire already take for this
+            // condition (they never had this fatal branch).
+            if (degenerateTurn === "passthrough") {
+                log?.(`[plugin] degenerate terminal turn again after ${degenerateRetries} continuation nudge(s): passing the empty turn through (compat.degenerateTurn="passthrough", #4913): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, stalledTail=${stalledTail}, visibleTextChars=${visibleTextChars}, answerChars=${answerChars}, finishReason=${reason}`);
+                return false;
+            }
+            // #4913: name the signal that qualified the attempt. The
+            // accumulators now measure this attempt only (reset below when the
+            // retry takes over), so "again" is measured, not inherited.
+            log?.(`[plugin] degenerate terminal turn again after ${degenerateRetries} continuation nudge(s); emitting an in-band error (#870): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, stalledTail=${stalledTail}, visibleTextChars=${visibleTextChars}, answerChars=${answerChars}, finishReason=${reason}`);
             // #5958: the terminal shape follows the configured streamErrorShape
             // (default protocol → a native error frame the host records as a
             // failure) instead of the old hard-wired completed-turn shape, which
@@ -3023,24 +3241,19 @@ export async function pipePluginChatWithStrip(
             // #2689: hand the emitter the client-known stream state — the error
             // block opens at the next free index (blocksForwarded), and no
             // message_start is synthesized when the first attempt already sent one.
-            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge", undefined, streamErrorShape, { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
+            emitStreamError(res, protocol, degenerateRetries === 1
+                ? "the turn degenerated again after the continuation nudge"
+                : `the turn degenerated again after ${degenerateRetries} continuation nudges`,
+                undefined, streamErrorShape, { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
             return true;
         }
-        // A turn the model left genuinely bare — no thought, no stripped echo,
-        // no released markup — is the upstream's own empty answer, not a stall:
-        // re-issuing it double-bills an empty completion (#732/#821 keep the
-        // same boundary in the compress loop). A draft-tail turn is NOT bare:
-        // it delivered a full handoff draft, which is precisely the stall signal.
-        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !stalledTail) {
-            log?.(`[plugin] degenerate terminal turn not retried (bare: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
-            return false;
-        }
-        degenerateRetried = true;
+        degenerateRetries += 1;
+        const attemptNote = maxDegenerateRetries > 1 ? ` (attempt ${degenerateRetries}/${maxDegenerateRetries})` : " once";
         log?.(announceTail
-            ? "[plugin] terminal turn is a bare announcement (ends mid-promise, no tool call); retrying once with a continuation nudge (#3905)"
+            ? `[plugin] terminal turn is a bare announcement (ends mid-promise, no tool call); retrying${attemptNote} with a continuation nudge (#3905)`
             : draftTail
-              ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
-              : "[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
+              ? `[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying${attemptNote} with a continuation nudge (#2303)`
+              : `[plugin] degenerate terminal turn (no usable output); retrying${attemptNote} with a continuation nudge (#732/#821)`);
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -3058,6 +3271,21 @@ export async function pipePluginChatWithStrip(
         // lastChunkMeta.finishReason by design, so a mid-retry flush would
         // otherwise hand the client a chunk carrying the stale reason.
         delete lastChunkMeta["finishReason"];
+        // #4913: per-attempt observability accumulators belong to the attempt
+        // they were set on. Without this reset the retry pass inherits the
+        // first attempt's signals (its thinking, its stripped echo, its
+        // released markup), so "degenerated again" reports the FIRST
+        // attempt's activity and the bare gate above false-qualifies a retry
+        // the model left bare. proseAcc deliberately keeps all attempts: the
+        // #361 tool-call-XML warn and the #3456 phantom-attachment scan are
+        // per-request by design; diag*/blocksForwarded/seenToolCalls are
+        // stream-level and stay untouched.
+        sawThinking = false;
+        sawStrippedEcho = false;
+        sawToolUse = false;
+        visibleTextChars = 0;
+        answerProse = "";
+        releasedMarkupChars = 0;
         retryIndexOffset = blocksForwarded;
         inRetry = true;
         // The first attempt's held filter state belongs to text the client never
@@ -3085,12 +3313,13 @@ export async function pipePluginChatWithStrip(
      *  hung attempt never produced a usage frame, so the retry is
      *  unambiguously safe: no duplication risk (nothing was delivered), no
      *  side effects (stateless completion), zero billing for the dead attempt.
-     *  Shares the single stream-level re-issue budget with retryEmptyTurn so a
-     *  request re-sends at most once; anything parsed, held, or written keeps
-     *  the #721 in-band error (partial content must not be regenerated). */
+     *  #7666: keeps its OWN one-shot re-issue budget (truncationRetried),
+     *  independent of the degenerate-terminal retry budget — a turn may spend
+     *  one of each. Anything parsed, held, or written keeps the #721 in-band
+     *  error (partial content must not be regenerated). */
     const retryZeroByteCut = async (): Promise<boolean> => {
         if (refetch === undefined) return false;
-        if (degenerateRetried || truncationRetried) return false;
+        if (truncationRetried) return false;
         // Zero-visible predicate: no framing opened, no content block started,
         // no prose accumulated or held by the tag filter, no unparseable frame
         // forwarded verbatim, no partial SSE event left in the buffer.
@@ -3127,9 +3356,10 @@ export async function pipePluginChatWithStrip(
      *  transcript, which is the cheaper failure. An answer, a tool call, a partial
      *  argument stream, released markup or a stripped echo still keep the #721
      *  in-band error: regenerating real output would corrupt the turn.
-     *  Shares the single stream-level re-issue budget with retryEmptyTurn and
-     *  retryZeroByteCut, and reuses the mid-turn framing so the retry's blocks
-     *  land after the ones the client already saw. A dangling partial SSE event
+     *  #7666: own one-shot budget (truncationRetried), independent of the
+     *  degenerate-terminal retry budget, like retryZeroByteCut. Reuses the
+     *  mid-turn framing so the retry's blocks land after the ones the client
+     *  already saw. A dangling partial SSE event
      *  left in `buf` is dropped rather than refusing the replay: those bytes were
      *  never written to the client, and the abandoned attempt's filter state goes
      *  with them. `blocksForwarded` keeps the anthropic wire out of this path -
@@ -3137,7 +3367,7 @@ export async function pipePluginChatWithStrip(
      *  accounting belong to the client. */
     const retryReasoningOnlyCut = async (cause?: unknown): Promise<boolean> => {
         if (refetch === undefined) return false;
-        if (degenerateRetried || truncationRetried) return false;
+        if (truncationRetried) return false;
         // Nothing at all reached the client: retryZeroByteCut owns that shape.
         if (!sawThinking) return false;
         // `proseAcc` is not consulted here: the fast path folds reasoning text into
@@ -3199,7 +3429,7 @@ export async function pipePluginChatWithStrip(
         ...(cause === "read-error" && readError !== undefined ? { readError: describeReadError(readError) } : {}),
         ...(cause === "read-error" && readError !== undefined ? { readErrorCause: describeReadErrorCause(readError) } : {}),
         retryZeroByteCutSpent: truncationRetried,
-        retryDegenerateSpent: degenerateRetried,
+        retryDegenerateSpent: degenerateRetries > 0,
         // #5951: the replay predicate's inputs, so a refused cut names the clause
         // that refused it instead of only the read error.
         replay: {
@@ -3300,7 +3530,10 @@ export async function pipePluginChatWithStrip(
         // #1595: clean completion but no input usage sample — name it (the
         // cut-stream paths below have sawTerminal=false, so they stay
         // distinguishable from transport failures).
-        if (sawTerminal && acc.inputTokens === undefined) diagnoseSuccessWithoutUsage(session, `plugin-passthrough-${protocol}`);
+        if (sawTerminal && acc.inputTokens === undefined) {
+            diagnoseSuccessWithoutUsage(session, `plugin-passthrough-${protocol}`);
+            releaseNudgeHold(session);
+        }
     };
     // #498: whether a terminal event ([DONE] / message_stop) was seen. A
     // stream that ends without one was cut mid-flight.
@@ -3745,10 +3978,11 @@ export async function pipePluginChatWithStrip(
                 // field, so an interleaved thought/text pair in one frame never
                 // shares held-back state.
                 const field = p["thought"] === true ? "thinking" : "text";
+                const signed = typeof p["thoughtSignature"] === "string" && p["thoughtSignature"].length > 0;
                 // Whole-field tool-call emission on an absorb-instructed
                 // request (m00885) — see processOpenai. Degenerate-close
                 // residue (#2190) rides the same routing.
-                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending()) {
+                if (signed || (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending())) {
                     if (raw.length > 0) {
                         keptText = true;
                         appendReply(field, index, raw);
@@ -3844,7 +4078,10 @@ export async function pipePluginChatWithStrip(
         // structured or user data (#1039) and are excluded from the audit.
         if (!googleFrameHasNonText(ev)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
-        if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
+        // #5848 twin on the google lane: a frame carrying only empty parts has
+        // nothing a held tail must precede, and draining on it split a render tag
+        // so the remainder reached the host as prose (the #5192 shape).
+        if (!hadText && anyPending() && googleFrameHasNonText(ev)) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
     };
     try {
@@ -4078,9 +4315,11 @@ export async function pipePluginJsonlWithStrip(
     // delta as a whole line, so the filters' held tails are only resolved at
     // the terminal frame / EOF / read failure — never per line (a per-line
     // flush destroys the cross-delta tag/marker state this filter exists for).
-    const onStrip = (snippet: string) => {
-        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (commandcode plugin mode): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    const onStrip = (snippet: string, duringDrain?: boolean) => {
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (commandcode plugin mode)";
+        const head = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag";
+        loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] ${head}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     const textFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
     const reasonFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
@@ -4362,6 +4601,9 @@ export async function pipePluginResponsesWithStrip(
     upstreamMeta?: UpstreamMeta,
     reply?: HandoffReply,
     hostOwnsTruncationRecovery = false,
+    // #7666: degenerate-terminal retry budget (compress.degenerateRetry.
+    // maxAttempts, three-level resolved by the caller). See the chat-pipe twin.
+    degenerateRetryMaxAttempts?: number,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -4398,8 +4640,9 @@ export async function pipePluginResponsesWithStrip(
         if (diagLastTypes.length > 5) diagLastTypes.shift();
     };
     const who = session ? `[${session.id}] ` : "";
-    const onTagDrop = (snippet: string) => {
-        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    const onTagDrop = (snippet: string, duringDrain?: boolean) => {
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
+        loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // #2190: log-only residue audit — see the twin above.
     const onResidueWarn = (snippet: string) => {
@@ -4447,7 +4690,11 @@ export async function pipePluginResponsesWithStrip(
     // output_item.added releases them early instead — clients require
     // done(itemN) before added(itemN+1) (#1061) — so by the terminal only the
     // last item's family can still be held.
-    let degenerateRetried = false;
+    // #7666: up to maxDegenerateRetries nudge re-issues per turn (see the
+    // chat-pipe twin); this lane has no #870 in-band error — an exhausted
+    // budget passes the empty turn through instead.
+    const maxDegenerateRetries = Math.max(0, Math.min(5, Math.floor(degenerateRetryMaxAttempts ?? 1)));
+    let degenerateRetries = 0;
     let truncationRetried = false;
     let forwardedAny = false;
     let inRetry = false;
@@ -4483,12 +4730,13 @@ export async function pipePluginResponsesWithStrip(
      *  observed relay failure returns 200 + event-stream headers, never emits
      *  a single data frame, and is cut ~180s later; a manual re-send always
      *  heals with a warm prefix cache and the dead attempt bills nothing, so
-     *  the retry is unambiguously safe. Shares the single stream-level
-     *  re-issue budget with retryEmptyTurn; anything parsed, held, or written
-     *  keeps the #721 in-band error. */
+     *  the retry is unambiguously safe. #7666: own one-shot budget
+     *  (truncationRetried), independent of the degenerate-terminal retry
+     *  budget; anything parsed, held, or written keeps the #721 in-band error.
+     *  */
     const retryZeroByteCut = async (): Promise<boolean> => {
         if (refetch === undefined) return false;
-        if (degenerateRetried || truncationRetried) return false;
+        if (truncationRetried) return false;
         // Zero-visible predicate: no item framing held, no status observed, no
         // prose accumulated or held by the filters, no verbatim frame
         // forwarded, no partial SSE event left in the buffer.
@@ -4540,7 +4788,10 @@ export async function pipePluginResponsesWithStrip(
             markDirty(session);
         }
         // #1595: same as the chat-pipe twin — sawTerminal gates out cuts.
-        if (sawTerminal && acc.inputTokens === undefined) diagnoseSuccessWithoutUsage(session, "plugin-passthrough-responses");
+        if (sawTerminal && acc.inputTokens === undefined) {
+            diagnoseSuccessWithoutUsage(session, "plugin-passthrough-responses");
+            releaseNudgeHold(session);
+        }
     };
     // #498: whether a terminal event (done-family / [DONE]) was seen. A
     // stream that ends without one was cut mid-flight.
@@ -4581,13 +4832,13 @@ export async function pipePluginResponsesWithStrip(
         if (proseAcc.length === 0 || !session) return;
         scanModelOutputForPhantomAttachments(session.id, proseAcc);
     };
-    let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
+    let lastDeltaMeta: { item_id?: unknown; output_index?: unknown; content_index?: unknown } | null = null;
     const flushTail = (after: string) => {
         const tail = tagFilter.flush();
         if (tail.length > 0) {
             visibleTextChars += tail.length;
             answerProse += tail;
-            const meta = inRetry && heldItemId !== undefined ? { item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
+            const meta = inRetry && heldItemId !== undefined ? { ...lastDeltaMeta, item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
             appendReplyDelta(meta, tail);
             return `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n` + after;
         }
@@ -4671,7 +4922,7 @@ export async function pipePluginResponsesWithStrip(
         ...(cause === "read-error" && readError !== undefined ? { readError: describeReadError(readError) } : {}),
         ...(cause === "read-error" && readError !== undefined ? { readErrorCause: describeReadErrorCause(readError) } : {}),
         retryZeroByteCutSpent: truncationRetried,
-        retryDegenerateSpent: degenerateRetried,
+        retryDegenerateSpent: degenerateRetries > 0,
         // #5951: see the chat-pipe twin — the responses lane has no reasoning-only
         // replay, so `replayAvailable` is the field that says so on a cut.
         replay: {
@@ -4721,8 +4972,11 @@ export async function pipePluginResponsesWithStrip(
      *  Returns true when the retry stream took over, in which case the caller
      *  drops the held done-family events AND the completion it came from. */
     const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
-        // truncationRetried: one re-issue per request, total — see the chat-pipe twin.
-        if (degenerateRetried || truncationRetried || refetch === undefined) return false;
+        // #7666: budget is the configured degenerate count, NOT a shared
+        // stream-level one-shot — the truncation re-issues keep their own
+        // budget (see the chat-pipe twin).
+        if (refetch === undefined || maxDegenerateRetries === 0) return false;
+        if (degenerateRetries >= maxDegenerateRetries) return false;
         // #2303: same shape as the chat-pipe twin — visible prose ending in a
         // compression-draft closing tag with no function call is non-converged.
         // #2612: except when the request itself demands that shape (client
@@ -4754,12 +5008,13 @@ export async function pipePluginResponsesWithStrip(
             log?.(`[plugin] degenerate terminal turn not retried (bare: no reasoning, no stripped echo): visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars} (#2756)`);
             return false;
         }
-        degenerateRetried = true;
+        degenerateRetries += 1;
+        const attemptNote = maxDegenerateRetries > 1 ? ` (attempt ${degenerateRetries}/${maxDegenerateRetries})` : " once";
         log?.(announceTail
-            ? "[plugin] terminal turn is a bare announcement (ends mid-promise, no function call); retrying once with a continuation nudge (#3905)"
+            ? `[plugin] terminal turn is a bare announcement (ends mid-promise, no function call); retrying${attemptNote} with a continuation nudge (#3905)`
             : draftTail
-              ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
-              : "[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+              ? `[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying${attemptNote} with a continuation nudge (#2303)`
+              : `[plugin] degenerate terminal turn (no visible output); retrying${attemptNote} with a continuation nudge (#732/#821)`);
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -5039,7 +5294,7 @@ export async function pipePluginResponsesWithStrip(
                             continue;
                         }
                         const clean = tagFilter.push(delta);
-                        lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"] };
+                        lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"], content_index: ev["content_index"] };
                         if (!inRetry && heldItemId === undefined && ev["item_id"] !== undefined) {
                             heldItemId = ev["item_id"];
                             heldOutputIndex = ev["output_index"];
@@ -5177,12 +5432,16 @@ function stripGoogleChunk<T>(obj: T, drop: boolean = false, requestText?: string
             ...cand,
             content: {
                 ...cont,
-                parts: (cont["parts"] as unknown[]).map((p) =>
-                    // #1960/KDD#10: thought parts carry a thoughtSignature — leave them byte-for-byte.
-                    p && typeof p === "object" && (p as Record<string, unknown>)["thought"] !== true && typeof (p as Record<string, unknown>)["text"] === "string"
-                        ? { ...(p as Record<string, unknown>), text: stripAcpTags((p as Record<string, unknown>)["text"] as string, drop, requestText) }
-                        : p,
-                ),
+                parts: (cont["parts"] as unknown[]).map((p) => {
+                    if (!p || typeof p !== "object") return p;
+                    const part = p as Record<string, unknown>;
+                    // #1960/KDD#10: ordinary text can carry a signature too.
+                    return part["thought"] !== true
+                        && !(typeof part["thoughtSignature"] === "string" && part["thoughtSignature"].length > 0)
+                        && typeof part["text"] === "string"
+                        ? { ...part, text: stripAcpTags(part["text"], drop, requestText) }
+                        : p;
+                }),
             },
         };
     });
@@ -5275,7 +5534,10 @@ export async function pipePluginJson(
             }
         }
         // #1595: parsed success body carrying no input usage report — name it.
-        if (session && !sawInputSample) diagnoseSuccessWithoutUsage(session, "plugin-json");
+        if (session && !sawInputSample) {
+            diagnoseSuccessWithoutUsage(session, "plugin-json");
+            releaseNudgeHold(session);
+        }
         // #1685: a non-streaming plugin response still carries the model's
         // complete tool calls — same witness feed as the SSE pipes, from the
         // one full-body parse this path already does. Observe-only (#1039).

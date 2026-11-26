@@ -1,5 +1,13 @@
 # Identity-channel wiring (#5825)
 
+> **⚠️ SUPERSEDED — per-client *session-id* conclusions (2026-11-22).** The §2 rows for
+> **crush / gemini-cli / hermes / aider / jcode / kimi** ("closed", "content-hash fallback IS the
+> optimum") and **qoder / copilot** ("needs one measurement run") were re-verified against current
+> source and are now outdated — see **`docs/client-session-ids.md`** for the current 18-client
+> session-identity map (what carries a session id, how subagents behave, what to stamp). This page's
+> **message-id HARVEST** machinery (§1 seam, §3 trust boundaries, §4 change checklist) is *not*
+> superseded and remains operative.
+
 One page for the cross-client "stable conversation + message id" wiring: who
 carries identity into bili, where it is consumed, and what every new lane must
 do. The design law (owner ruling 2026-11-07): **every client lane wires INTO
@@ -52,7 +60,7 @@ a hit view is a shorter window and would mismatch by construction).
 | Client | Session key | Message ids | Adapter | Status |
 |---|---|---|---|---|
 | claude-code | `x-claude-code-session-id` (+transcript filename) | transcript `.jsonl` rows `uuid`; sidechain + summary rows excluded | `src/identity-claude.ts` | WIRED (anthropic wire: full path incl row pinning) |
-| codebuddy | `x-conversation-id` (= transcript filename, restart-stable, measured 2.181.0) | JSONL rows `id`+`parentId`; system/draft rows excluded | `src/identity-codebuddy.ts` | WIRED (openai wire: attribution rung); recognition merged into `conversationHeaderSource` low-trust tier |
+| codebuddy / workbuddy | `x-conversation-id` (= transcript filename, restart-stable, measured 2.181.0; WorkBuddy Desktop stamps the same header on the same fork — #7456, config roots `$CODEBUDDY_CONFIG_DIR`/`~/.codebuddy` **and** `$WORKBUDDY_CONFIG_DIR`/`~/.workbuddy`) | JSONL rows `id`+`parentId`; system/draft rows excluded | `src/identity-codebuddy.ts` | WIRED (openai wire: attribution rung); recognition merged into `conversationHeaderSource` low-trust tier |
 | mcode / mavis | `x-mavis-session-id` (`mvs_…`, already recognized #1050) | runtime-state.sqlite `local_runtime_message_rows.msg_id` | `src/identity-mcode.ts` | WIRED (sqlite exemplar; per-turn read probe, open→query→close) |
 | goose | `agent-session-id` (= sqlite sessions.id, restart-stable; BYOK/custom-provider paths included; user-overridden name degrades this lane only) | sessions.db `messages.message_id` (`msg_<uuidv4>`, never reused); ORDER BY created_timestamp,id; compaction re-parents ⇒ post-compaction turn degrades whole-turn, self-heals next turn | `src/identity-goose.ts` | WIRED |
 | qwen-code | `x-opencode-session` via user customHeaders `${session_id}` (official BYOK doc example name = one bili already recognizes; other chosen names degrade until recognized) | `<QWEN_HOME>\|~/.qwen/projects/<cwd>/chats/<sid>.jsonl` git-log rows `uuid`; sidechain files + compaction checkpoints + rewind records degrade whole-turn safely | `src/identity-qwen.ts` | WIRED (join is USER opt-in — see status caveat) |

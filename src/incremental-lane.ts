@@ -77,7 +77,10 @@ export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
  * conversations, side lanes) — the shape is the final word, so a marker'd
  * ordinary body replays through the normal pipeline untouched. */
 export function incrementalTurnBodyShape(raw: Buffer): boolean {
-    if (raw.length < 2 || raw.length > 64 * 1024 * 1024) return false;
+    // readBody already enforces the receive-size budget before this check.
+    // A large lane-only envelope must not fall through to ordinary upstream
+    // relay merely because its seed crosses a second, unrelated size limit.
+    if (raw.length < 2) return false;
     let parsed: unknown;
     try {
         parsed = JSON.parse(raw.toString("utf8"));
@@ -457,10 +460,11 @@ export function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], 
                 // unparseable row -> skip; a miss keeps the previous pointers
             }
         }
+        for (const bucket of byStable.values()) bucket.reverse();
         for (let i = ptrs.length; i < msgs.length; i++) {
             const m = msgs[i]!;
             const bucket = byStable.get(stableMessageKey(m as unknown as Record<string, unknown>).replace(CLUSTER_ID_SUFFIX_RE, "$1"));
-            const seq = bucket === undefined ? undefined : bucket.shift();
+            const seq = bucket?.pop();
             if (seq === undefined) {
                 // #5155: with the debounced save the unsettled tail is the
                 // common case right after a turn — record the settled prefix
@@ -526,6 +530,12 @@ function persistLaneState(sessionId: string, system: unknown, systemSet: boolean
 
 export function loadSystem(sessionId: string): unknown {
     try {
+        // Renumber (2026-11-25): egress-on sessions carry the client's raw
+        // system (A) in the op log's system row (sysIn) — the authoritative
+        // copy (survives kstate retirement, fork-verbatim). The inc:system
+        // ext row stays as the legacy read for everything else.
+        const viaOpLog = getStore().egressOpLogStore()?.egressSystemInput?.(sessionId);
+        if (viaOpLog !== null && viaOpLog !== undefined) return viaOpLog;
         return getStore().getSessionExt(sessionId, EXT_KEY_SYSTEM);
     } catch {
         return undefined;
@@ -935,7 +945,20 @@ export async function handleIncrementalTurn(
         // stamp the canonical ids so prepare pins exactly what the lane owns
         // (content-derived when the client sent none; client-pinned when it
         // did). The pipeline strips the field before forwarding upstream.
-        if (featureEnabled("pluginLaneServerHistory")) {
+        //
+        // #6680 (rolling cache marks): a body that carries client cache_control
+        // marks must re-enter EXACTLY as it does with the rollout off — no
+        // stamps. The id/seq stamps make the kernel's first-sight pass
+        // re-render the marked content into <acp>mNNNNN</acp> markers, which
+        // drops the wire-level cache_control breakpoints (and drifts the ACP
+        // refs) — tests/opencode-rolling-cache-marks.test.ts. coreToAnthropic
+        // splices entry.marks into the assembled items, so a non-empty marks
+        // map is the precise signal that this body carries marks. Skipping the
+        // stamps on mark turns is a safe degrade to the pre-GA behavior; the
+        // lane still owns the canonical ids (entry.msgs) and non-mark turns
+        // keep pinning.
+        const markChannelActive = entry.marks.size > 0;
+        if (featureEnabled("pluginLaneServerHistory") && !markChannelActive) {
             body[MSG_IDS_BODY_FIELD] = entry.msgs.map((m) => m.id);
             // #4316 PR2/3: seq stamps ride the same internal transport. The
             // canonical prefix carries its stamps from the unified rows
