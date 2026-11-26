@@ -41,6 +41,13 @@ async function harness(): Promise<{
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = "full";
+    // The egress plane, when armed, changes canonical-pointer recording
+    // (edited-tail resyncs settle fewer pointers in the legacy ext), which
+    // races the waitPtrs poll below. This test exercises the incremental
+    // lane's pointer chain, independent of the egress plane — pin it off so
+    // the poll targets the recording path it was written against regardless
+    // of the rollout default.
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     _resetSessionsForTest();
     _resetPluginStateForTest();
     resetToolRingForTest();

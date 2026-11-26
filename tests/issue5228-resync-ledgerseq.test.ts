@@ -47,6 +47,13 @@ async function harness(): Promise<Harness> {
     process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY = "1";
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = "full";
+    // This test asserts on the legacy `blocks` table (fold interval bounds).
+    // The egress plane, when armed, records folds in the egress_* op-log
+    // tables instead, leaving `blocks` empty — pin it off so the assertion
+    // targets the table this test was written against regardless of the
+    // rollout default (the #5228 fix is in the incremental lane, independent
+    // of the egress plane).
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     _resetSessionsForTest();
     _resetPluginStateForTest();
     resetToolRingForTest();
