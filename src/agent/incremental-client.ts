@@ -270,13 +270,21 @@ function claimableDeltaMsgIds(conversationId: string, ids: string[]): string[] |
 }
 
 const PROBE_TTL_MS = 30_000;
-const probeCache = new Map<string, { ok: boolean; cacheControlRetouch: boolean; at: number }>();
+const probeCache = new Map<string, { ok: boolean; cacheControlRetouch: boolean; compactRetouch: boolean; at: number }>();
 
 /** The optional envelope extension must be positively advertised by the server.
  * Older servers ignore unknown fields, so sending retouches to them is unsafe. */
 export function incrementalCacheRetouchEnabled(proxyBase: string): boolean {
     const cached = probeCache.get(proxyBase);
     return cached !== undefined && cached.ok && cached.cacheControlRetouch && Date.now() - cached.at < PROBE_TTL_MS;
+}
+
+/** #6776: the server advertised compact retouch ({index, hash, marks} instead
+ * of {index, message}). Older servers do not advertise it, so the client
+ * keeps the full-message retouch. */
+export function incrementalCompactRetouchEnabled(proxyBase: string): boolean {
+    const cached = probeCache.get(proxyBase);
+    return cached !== undefined && cached.ok && cached.compactRetouch && Date.now() - cached.at < PROBE_TTL_MS;
 }
 
 /** Probe the lane's incremental support. Cached per proxy base for 30s; any
@@ -287,17 +295,19 @@ export async function probeIncrementalTurns(proxyBase: string, fetchImpl: typeof
     if (cached && now - cached.at < PROBE_TTL_MS) return cached.ok;
     let ok = false;
     let cacheControlRetouch = false;
+    let compactRetouch = false;
     try {
         const res = await fetchImpl(`${proxyBase}/__bili/plugin/turn`, { method: "GET", signal: AbortSignal.timeout(3000) });
         if (res.ok) {
-            const body = await res.json() as { enabled?: unknown; cacheControlRetouch?: unknown };
+            const body = await res.json() as { enabled?: unknown; cacheControlRetouch?: unknown; compactRetouch?: unknown };
             ok = body.enabled === true;
             cacheControlRetouch = body.cacheControlRetouch === true;
+            compactRetouch = body.compactRetouch === true;
         }
     } catch {
         ok = false;
     }
-    probeCache.set(proxyBase, { ok, cacheControlRetouch, at: now });
+    probeCache.set(proxyBase, { ok, cacheControlRetouch, compactRetouch, at: now });
     return ok;
 }
 
@@ -352,6 +362,18 @@ function wireHashPair(m: IncrementalWireMessage): { raw: string; align: string }
     return { raw, align: createHash("sha256").update(`${m.role}\u0000${JSON.stringify(stripped)}`).digest("hex").slice(0, 16) };
 }
 
+/** #6776: per-block cache_control mark list for a wire message. String
+ *  content → [null] (one logical block, no mark). Block array → one entry
+ *  per block (the block's cache_control or null). The server maps the list
+ *  1:1 onto the wire span (core ids per block, in block order). */
+function marksForMessage(m: IncrementalWireMessage): unknown[] {
+    if (!Array.isArray(m.content)) return [null];
+    return m.content.map((b: unknown) => {
+        if (b === null || typeof b !== "object" || !("cache_control" in b)) return null;
+        return (b as Record<string, unknown>).cache_control;
+    });
+}
+
 /** Public twin of the internal wire hash for boundary comparisons. The
  *  server-side hashWireBoundary (src/incremental-lane.ts) must stay
  *  byte-identical to this formula. */
@@ -402,6 +424,9 @@ type IncrementalPlan =
 interface PlanArgs {
     /** Only true after the server's capability probe advertised support. */
     cacheControlRetouch?: boolean;
+    /** #6776: only true after the server's capability probe advertised
+     * compact retouch ({index, hash, marks} instead of {index, message}). */
+    compactRetouch?: boolean;
     conversationId: string;
     /** Forward path of the ORIGINAL request (the marker divert uses it);
      * optional — the lane defaults a bare `path` to /v1/messages. */
@@ -423,7 +448,7 @@ interface PlanArgs {
     msgIds?: string[];
 }
 
-function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMessage[], resync: boolean, includeSystem: boolean, msgIds?: string[], retouch?: { index: number; message: IncrementalWireMessage }[]): string {
+function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMessage[], resync: boolean, includeSystem: boolean, msgIds?: string[], retouch?: { index: number; message?: IncrementalWireMessage; hash?: string; marks?: unknown[] }[]): string {
     // `request` is optional at the call sites (a host may plan with only
     // messages+system); missing params simply ride their lane defaults.
     const src = args.request ?? {};
@@ -479,10 +504,16 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
         if (fullIds !== undefined) msgidClaims.set(args.conversationId, new Set(fullIds));
         return { mode: "resync", body: buildBody(args, 0, args.messages, true, systemJson !== state.systemJson, fullIds) };
     }
-    const retouch: { index: number; message: IncrementalWireMessage }[] = [];
+    const retouch: { index: number; message?: IncrementalWireMessage; hash?: string; marks?: unknown[] }[] = [];
     if (state.sentRaw !== undefined && state.sentRaw.length === state.sent.length) {
         for (let i = 0; i < state.sent.length; i++) {
-            if (state.sentRaw[i] !== pairs[i]!.raw) retouch.push({ index: i, message: args.messages[i] });
+            if (state.sentRaw[i] !== pairs[i]!.raw) {
+                if (args.compactRetouch === true) {
+                    retouch.push({ index: i, hash: pairs[i]!.align, marks: marksForMessage(args.messages[i]) });
+                } else {
+                    retouch.push({ index: i, message: args.messages[i] });
+                }
+            }
         }
     } else {
         for (let i = 0; i < state.sent.length; i++) retouch.push({ index: i, message: args.messages[i] });

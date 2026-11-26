@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import test from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -38,6 +39,37 @@ const SYSTEM = [{ type: "text", text: "you are a coding agent", cache_control: M
 // only that attribute before byte comparisons.
 function canonMessages(messages: unknown): string {
     return JSON.stringify(messages).replace(/\stime=\\?"[0-9T:.Z+\- ]+\\?"/g, ' time="X"');
+}
+
+// Local copies of the client's compact-retouch helpers (src/agent/incremental-client.ts)
+// so the fault-injection tests can forge server-side retouch entries without
+// re-implementing the client plan.
+function contentWithoutCacheControl(content: unknown): unknown {
+    if (!Array.isArray(content)) return content;
+    let changed = false;
+    const out = content.map((b: unknown) => {
+        if (b === null || typeof b !== "object" || !("cache_control" in b)) return b;
+        changed = true;
+        const { cache_control: _drop, ...rest } = b as Record<string, unknown>;
+        return rest;
+    });
+    return changed ? out : content;
+}
+
+function alignHash(m: { role: string; content: unknown }): string {
+    return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(contentWithoutCacheControl(m.content))}`).digest("hex").slice(0, 16);
+}
+
+function marksForMessage(m: { content: unknown }): unknown[] {
+    if (!Array.isArray(m.content)) return [null];
+    return m.content.map((b: unknown) => {
+        if (b === null || typeof b !== "object" || !("cache_control" in b)) return null;
+        return (b as Record<string, unknown>).cache_control;
+    });
+}
+
+function compactEntry(index: number, m: { role: string; content: unknown }): { index: number; hash: string; marks: unknown[] } {
+    return { index, hash: alignHash(m), marks: marksForMessage(m) };
 }
 
 interface H {
@@ -137,19 +169,19 @@ function messageBreakpoints(body: Record<string, unknown>): number {
 const CONV = "ses_rolling_marks";
 const laneHeaders = { "x-bili-plugin": "opencode", "x-bili-plugin-conversation": CONV, "x-acp-session": CONV };
 
-async function runIncremental(h: H, requests: Wire[][], opts: { restartBefore?: number } = {}) {
+async function runIncremental(h: H, requests: Wire[][], opts: { restartBefore?: number; compact?: boolean } = {}) {
     const modes: string[] = [];
     const sizes: { full: number; sent: number }[] = [];
     for (const [i, messages] of requests.entries()) {
         if (opts.restartBefore === i) h.resetLane();
         const full = JSON.stringify({ model: "claude-test", max_tokens: 1024, system: SYSTEM, messages });
-        let plan = planIncrementalTurn({ cacheControlRetouch: true, conversationId: CONV, path: "/v1/messages", messages: messages as IncrementalWireMessage[], system: SYSTEM, request: { model: "claude-test", max_tokens: 1024 } });
+        let plan = planIncrementalTurn({ cacheControlRetouch: true, compactRetouch: opts.compact, conversationId: CONV, path: "/v1/messages", messages: messages as IncrementalWireMessage[], system: SYSTEM, request: { model: "claude-test", max_tokens: 1024 } });
         assert.notEqual(plan.mode, "skip");
         let r = await h.post("/__bili/plugin/turn", (plan as { body: string }).body, laneHeaders);
         if (r.status === 409) {
             noteIncrementalRejection(CONV);
             modes.push(`${plan.mode}:409`);
-            plan = planIncrementalTurn({ cacheControlRetouch: true, conversationId: CONV, path: "/v1/messages", messages: messages as IncrementalWireMessage[], system: SYSTEM, request: { model: "claude-test", max_tokens: 1024 } });
+            plan = planIncrementalTurn({ cacheControlRetouch: true, compactRetouch: opts.compact, conversationId: CONV, path: "/v1/messages", messages: messages as IncrementalWireMessage[], system: SYSTEM, request: { model: "claude-test", max_tokens: 1024 } });
             r = await h.post("/__bili/plugin/turn", (plan as { body: string }).body, laneHeaders);
         }
         assert.equal(r.status, 200, `request ${i} accepted`);
@@ -167,6 +199,47 @@ async function runFullResend(h: H, requests: Wire[][]) {
         assert.equal(r.status, 200);
     }
 }
+
+test("compact cache retouch: malformed updates cannot mutate the acknowledged prefix", async () => {
+    const requests = conversation(2);
+    const h = await harness();
+    try {
+        await runIncremental(h, requests.slice(0, 1), { compact: true });
+        const plan = planIncrementalTurn({ cacheControlRetouch: true, compactRetouch: true, conversationId: CONV, path: "/v1/messages", messages: requests[1] as IncrementalWireMessage[], system: SYSTEM, request: { model: "claude-test", max_tokens: 1024 } });
+        assert.notEqual(plan.mode, "skip");
+        if (plan.mode === "skip") {
+            throw new Error("Expected an incremental plan");
+        }
+        const body = JSON.parse(plan.body);
+        assert.ok(body.retouch.length > 0);
+        assert.equal(Object.hasOwn(body.retouch[0], "message"), false);
+        const forged = structuredClone(body);
+        forged.retouch[0].hash = "0".repeat(16);
+        const before = h.forwarded.length;
+        assert.equal((await h.post("/__bili/plugin/turn", JSON.stringify(forged), laneHeaders)).status, 409);
+        forged.retouch[0].marks = ["invalid"];
+        assert.equal((await h.post("/__bili/plugin/turn", JSON.stringify(forged), laneHeaders)).status, 400);
+        assert.equal(h.forwarded.length, before);
+        assert.equal((await h.post("/__bili/plugin/turn", plan.body, laneHeaders)).status, 200);
+        assert.equal(h.forwarded.length, before + 1);
+    } finally { await h.close(); }
+});
+
+test("compact cache retouch: exact full-resend histories and cold recovery", async () => {
+    const requests = conversation(4);
+    const base = await harness();
+    try { await runFullResend(base, requests); } finally { await base.close(); }
+    const inc = await harness();
+    try {
+        const { modes } = await runIncremental(inc, requests, { compact: true, restartBefore: 3 });
+        assert.ok(modes.includes("delta:409"), "cold state must request a full reseed");
+        assert.equal(inc.forwarded.length, base.forwarded.length);
+        for (let i = 0; i < requests.length; i++) {
+            assert.equal(canonMessages(inc.forwarded[i].messages), canonMessages(base.forwarded[i].messages));
+            assert.equal(messageBreakpoints(inc.forwarded[i]), messageBreakpoints({ messages: requests[i] }));
+        }
+    } finally { await inc.close(); }
+});
 
 test("rolling cache_control: deltas after the seed, upstream bodies identical to full resend", async () => {
     const requests = conversation(6);
@@ -283,8 +356,8 @@ test("rolling marks follow client-pinned identities on seed and delta", async ()
     } finally { await inc.close(); }
 });
 
-for (const kind of ["document", "image", "tool-result", "signed-thinking"] as const) {
-    test(`rolling cache_control: ${kind} payloads stay exact when marks move`, async () => {
+for (const kind of ["document", "image", "tool-result", "signed-thinking"] as const) for (const compact of [false, true]) {
+    test(`rolling cache_control: ${kind} payloads stay exact when marks move (compact=${compact})`, async () => {
         const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "exact+opaque/bytes==" } };
         const prefix: Wire[] = kind === "tool-result" ? [
             { role: "user", content: [{ type: "text", text: "use the tool" }] },
@@ -304,11 +377,40 @@ for (const kind of ["document", "image", "tool-result", "signed-thinking"] as co
         try { await runFullResend(base, requests); } finally { await base.close(); }
         const inc = await harness();
         try {
-            const { modes } = await runIncremental(inc, requests);
+            const { modes } = await runIncremental(inc, requests, { compact });
             assert.deepEqual(modes, ["seed", "delta"]);
             for (let i = 0; i < requests.length; i++) {
                 assert.equal(canonMessages(inc.forwarded[i].messages), canonMessages(base.forwarded[i].messages));            }
         } finally { await inc.close(); }
+    });
+}
+
+for (const fault of ["duplicate-index", "later-hash", "claimed-id"] as const) {
+    test(`compact retouch refusal preserves prefix without corrective retouches: ${fault}`, async () => {
+        const h = await harness();
+        try {
+            const initial: Wire[] = [
+                { role: "user", content: [{ type: "text", text: "first", cache_control: MARK }] },
+                { role: "assistant", content: [{ type: "text", text: "second", cache_control: MARK }] },
+                { role: "user", content: [{ type: "text", text: "third" }] },
+            ];
+            const common = { conversationId: CONV, path: "/v1/messages", system: SYSTEM, request: { model: "claude-test", max_tokens: 1024 } };
+            const seed = await h.post("/__bili/plugin/turn", JSON.stringify({ ...common, sinceSeq: 0, resync: true, messages: initial, msgIds: ["pin-a", "pin-b", "pin-c"] }), laneHeaders);
+            assert.equal(seed.status, 200);
+            const first = compactEntry(0, { role: "user", content: [{ type: "text", text: "first" }] });
+            const second = compactEntry(1, { role: "assistant", content: [{ type: "text", text: "second" }] });
+            const delta = { ...common, sinceSeq: seed.appliedSeq, messages: [{ role: "assistant", content: [{ type: "text", text: "next" }] }], msgIds: ["pin-d"] };
+            const invalid = { ...delta, msgIds: fault === "claimed-id" ? ["pin-a"] : delta.msgIds,
+                retouch: fault === "duplicate-index" ? [first, first] : fault === "later-hash" ? [first, { ...second, hash: "0".repeat(16) }] : [first] };
+            const rejected = await h.post("/__bili/plugin/turn", JSON.stringify(invalid), laneHeaders);
+            assert.equal(rejected.status, fault === "later-hash" ? 409 : 400);
+            assert.equal(h.forwarded.length, 1);
+            const retry = await h.post("/__bili/plugin/turn", JSON.stringify(delta), laneHeaders);
+            assert.equal(retry.status, 200);
+            const oldMessages = h.forwarded[0].messages as unknown[];
+            const nextMessages = h.forwarded[1].messages as unknown[];
+            assert.equal(canonMessages(nextMessages.slice(0, oldMessages.length)), canonMessages(oldMessages), "rejection must leave both the payload and marks unchanged");
+        } finally { await h.close(); }
     });
 }
 

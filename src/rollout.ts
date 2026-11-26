@@ -54,6 +54,15 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `rollout.features.pluginIncrementalTurns: true` (or a percent), or
     // `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1`.
     pluginIncrementalTurns: { percent: 0 },
+    // #6776 incremental lane: compact cache-mark retouch. When enabled, the
+    // client sends {index, hash, marks} instead of {index, message} for
+    // cache-control-only retouches, shrinking the patch to O(marks) instead
+    // of O(message size). The server compares the align-hash (content without
+    // cache_control) against the stored per-wire-message hash and maps the
+    // mark list to core ids via the wire span. Warm-cache only: cold
+    // canonical → 409 → client resyncs once. Nested under pluginIncrementalTurns.
+    // Default 0% — force on with `rollout.features.pluginIncrementalCompactRetouch: true`.
+    pluginIncrementalCompactRetouch: { percent: 0, base: "pluginIncrementalTurns" },
     // #5403/#5418 full-resend watermark fastpath: plugin-lane turns re-send
     // the ENTIRE history each turn; on a verified hit (count watermark
     // stamped by the previous response) the server stops re-parsing and

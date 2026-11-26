@@ -197,7 +197,14 @@ export interface Canonical {
      *  exactly that message's core ids. Warm-cache only: null after a cold
      *  rebuild (the unified rows carry no wire boundaries), where a retouch
      *  answers 409 and the client resyncs once. */
-    wireSpans?: string[][] | null;
+     wireSpans?: string[][] | null;
+    /** #6776 compact retouch: align-hash (content without cache_control) of
+     *  each applied WIRE message, in wire order — parallel to wireSpans.
+     *  Lets a compact retouch verify content-unchanged by hash comparison
+     *  instead of re-parsing the whole message. Warm-cache only: null after
+     *  a cold rebuild, where a compact retouch answers 409 and the client
+     *  resyncs once (same discipline as wireSpans). */
+    wireAlignHashes?: string[] | null;
 }
 const canonicalCache = new Map<string, Canonical>();
 const inFlight = new Set<string>();
@@ -574,6 +581,28 @@ function hashWireBoundary(m: { role: string; content: unknown }): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
 }
 
+/** #6776: content with block-level cache_control removed. Byte-identical to
+ *  the client-side contentWithoutCacheControl (src/agent/incremental-client.ts)
+ *  — the two formulas must never diverge or the compact-retouch hash check
+ *  degrades into permanent false mismatches. */
+function contentWithoutCacheControl(content: unknown): unknown {
+    if (!Array.isArray(content)) return content;
+    let changed = false;
+    const out = content.map((b: unknown) => {
+        if (b === null || typeof b !== "object" || !("cache_control" in b)) return b;
+        changed = true;
+        const { cache_control: _drop, ...rest } = b as Record<string, unknown>;
+        return rest;
+    });
+    return changed ? out : content;
+}
+
+/** #6776: alignment hash — the wire hash with cache_control decorations
+ *  stripped. Byte-identical to the client-side alignHash formula. */
+function alignHashWireBoundary(m: { role: string; content: unknown }): string {
+    return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(contentWithoutCacheControl(m.content))}`).digest("hex").slice(0, 16);
+}
+
 const CONTENT_ID = /^(h_[0-9a-f]{16})(?:_([1-9]\d*))?$/;
 
 /** Continue separately converted content-ID clusters without rewriting any
@@ -606,6 +635,22 @@ export function continueContentClusters(
     return { msgs, cacheControls: new Map([...delta.cacheControls].map(([id, mark]) => [renamed.get(id) ?? id, mark])) };
 }
 
+/** #7321: which canonical rows the kernel records a cache_control mark for
+ *  (anthropicToCore's cacheControls map). Only these rows belong in
+ *  entry.marks — sidecar rows (image / redacted_thinking / unknown) and
+ *  thinking rows render their raw block verbatim and never read the marks
+ *  map, so a compact retouch must not write them there. The full path
+ *  derives marks from the kernel's map and already excludes them; the
+ *  compact path (which maps a per-block mark list) must apply the same
+ *  filter or it pollutes entry.marks with rows the full path would never
+ *  set. */
+function isKernelRecordedRow(m: BiliMessage): boolean {
+    return m.role === "system"
+        || m.contentType === "tool-call"
+        || m.contentType === "tool-result"
+        || (m.contentType === "text" && m.rawAnthropicBlock === undefined);
+}
+
 function applyTurn(
     entry: Canonical,
     sinceSeq: number,
@@ -618,8 +663,11 @@ function applyTurn(
      *  malformed or already-claimed id hard-fails the turn (400) — an id
      *  collision in the ledger would misattribute decompress lookups. */
     deltaIds?: string[],
-    /** Acked wire messages whose cache_control decoration changed (see Canonical.wireSpans). */
-    retouch: { index: number; message: { role: string; content: unknown } }[] = [],
+    /** Acked wire messages whose cache_control decoration changed (see Canonical.wireSpans).
+     *  Two wire shapes: full ({index, message} — legacy) and compact
+     *  ({index, hash, marks} — #6776: the client sends only the align-hash
+     *  and the per-block mark list instead of the whole message). */
+    retouch: { index: number; message?: { role: string; content: unknown }; hash?: string; marks?: unknown[] }[] = [],
 ): { ok: true; appliedSeq: number; marks: Map<string, unknown> } | { ok: false; status: 400 | 409; error: string; serverSeq: number; detail?: string } {
     const serverSeq = entry.msgs.length;
     if (resync) {
@@ -638,26 +686,67 @@ function applyTurn(
     // must map onto known wire spans with identical content (only the
     // cache_control decoration may differ); anything else is drift → 409 and
     // the client recovers with a full resync.
-    const retouchMarks: { ids: string[]; marks: Map<string, unknown>; rawBlocks: { message: BiliMessage; block: unknown }[] }[] = [];
+    // #7321: two mark channels per retouch. `marks` feeds entry.marks (render
+    // + persist) and holds ONLY kernel-recorded rows; `rawMarks` is the
+    // complete per-block mark list (incl. sidecar/thinking rows) that the
+    // compact apply phase uses to set/delete the raw block's cache_control.
+    // The full path replaces whole raw blocks, so its rawMarks stays empty.
+    const retouchMarks: { ids: string[]; marks: Map<string, unknown>; rawMarks: Map<string, unknown>; rawBlocks: { message: BiliMessage; block: unknown }[]; compact: boolean }[] = [];
     if (!resync && retouch.length > 0) {
         const spans = entry.wireSpans;
         if (spans === null || spans === undefined) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: "retouch without wire spans (cold canonical)" };
+        // Validate the complete index set before any per-entry work, so a
+        // small envelope cannot request repeated work on the same message.
+        const touched = new Set<number>();
+        for (const update of retouch) {
+            if (touched.has(update.index)) return { ok: false, status: 400, error: "duplicate retouch index", serverSeq };
+            touched.add(update.index);
+        }
         const byId = new Map(entry.msgs.map((m) => [m.id, m] as const));
         for (const r of retouch) {
             const ids = Number.isInteger(r.index) && r.index >= 0 && r.index < spans.length ? spans[r.index] : undefined;
             if (ids === undefined) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} outside ${String(spans.length)} wire spans` };
-            const conv = anthropicToCore({ messages: [r.message] } as never);
-            if (conv.msgs.length !== ids.length) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} span ${String(ids.length)} != ${String(conv.msgs.length)}` };
             const marks = new Map<string, unknown>();
             const rawBlocks: { message: BiliMessage; block: unknown }[] = [];
-            for (let k = 0; k < ids.length; k++) {
-                const have = byId.get(ids[k]);
-                if (have === undefined || !sameWireContent(have, conv.msgs[k])) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} content differs` };
-                const mark = conv.cacheControls.get(conv.msgs[k].id);
-                if (mark !== undefined) marks.set(ids[k], mark);
-                if (conv.msgs[k].rawAnthropicBlock !== undefined) rawBlocks.push({ message: have, block: conv.msgs[k].rawAnthropicBlock });
+            if (r.message !== undefined) {
+                // Legacy full-message retouch: re-parse and compare content.
+                const conv = anthropicToCore({ messages: [r.message] } as never);
+                if (conv.msgs.length !== ids.length) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} span ${String(ids.length)} != ${String(conv.msgs.length)}` };
+                for (let k = 0; k < ids.length; k++) {
+                    const have = byId.get(ids[k]);
+                    if (have === undefined || !sameWireContent(have, conv.msgs[k])) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} content differs` };
+                    const mark = conv.cacheControls.get(conv.msgs[k].id);
+                    if (mark !== undefined) marks.set(ids[k], mark);
+                    if (conv.msgs[k].rawAnthropicBlock !== undefined) rawBlocks.push({ message: have, block: conv.msgs[k].rawAnthropicBlock });
+                }
+                retouchMarks.push({ ids, marks, rawMarks: new Map(), rawBlocks, compact: false });
+            } else if (r.hash !== undefined && Array.isArray(r.marks)) {
+                // #6776 compact retouch: verify content-unchanged by hash, map
+                // the per-block mark list to core ids via the wire span.
+                const alignHashes = entry.wireAlignHashes;
+                if (alignHashes === null || alignHashes === undefined) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: "compact retouch without align hashes (cold canonical)" };
+                if (alignHashes[r.index] !== r.hash) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} hash mismatch (content changed)` };
+                if (r.marks.length !== ids.length) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} marks length ${String(r.marks.length)} != span ${String(ids.length)}` };
+                const rawMarks = new Map<string, unknown>();
+                for (let k = 0; k < ids.length; k++) {
+                    const have = byId.get(ids[k]);
+                    const mark = r.marks[k];
+                    if (mark !== null && mark !== undefined) {
+                        // Complete per-block list: the compact apply phase
+                        // reads this (not entry.marks) to set/delete the raw
+                        // block's cache_control, so sidecar/thinking rows keep
+                        // their mark even though it never reaches entry.marks
+                        // (#7321). entry.marks takes only kernel-recorded rows,
+                        // matching the full path's kernel-map derivation.
+                        rawMarks.set(ids[k], mark);
+                        if (have !== undefined && isKernelRecordedRow(have)) marks.set(ids[k], mark);
+                    }
+                    if (have !== undefined && have.rawAnthropicBlock !== undefined) rawBlocks.push({ message: have, block: have.rawAnthropicBlock });
+                }
+                retouchMarks.push({ ids, marks, rawMarks, rawBlocks, compact: true });
+            } else {
+                return { ok: false, status: 400, error: "retouch entry must carry either message or (hash+marks)", serverSeq };
             }
-            retouchMarks.push({ ids, marks, rawBlocks });
         }
     }
     const converted = deltaWire.length === 0 ? { msgs: [], cacheControls: new Map<string, unknown>() } : anthropicToCore({ messages: deltaWire as never } as never);
@@ -703,6 +792,9 @@ function applyTurn(
         if (typeof wi === "number" && wi >= 0 && wi < deltaSpans.length) deltaSpans[wi].push(m.id);
     }
     entry.wireSpans = resync ? deltaSpans : entry.wireSpans === null || entry.wireSpans === undefined ? null : [...entry.wireSpans, ...deltaSpans];
+    // #6776: align-hash per applied wire message (parallel to wireSpans).
+    const deltaAlignHashes = deltaWire.map((m) => alignHashWireBoundary(m));
+    entry.wireAlignHashes = resync ? deltaAlignHashes : entry.wireAlignHashes === null || entry.wireAlignHashes === undefined ? null : [...entry.wireAlignHashes, ...deltaAlignHashes];
     // Marks follow the CLIENT's current decoration: a resync re-derives the
     // marks of every message it carries, and a retouch replaces the marks of
     // exactly the retouched wire message — so a host's rolling breakpoints
@@ -712,9 +804,23 @@ function applyTurn(
         for (const m of deltaMsgs) if (entry.marks.delete(m.id)) marksTouched = true;
     }
     for (const r of retouchMarks) {
-        // Opaque blocks render verbatim, so their validated decoration must
-        // change along with the separate marks map, after all checks pass.
-        for (const { message, block } of r.rawBlocks) message.rawAnthropicBlock = block;
+        if (r.compact) {
+            // #6776 compact retouch: update the existing raw blocks'
+            // cache_control in place (the client did not send new blocks).
+            // #7321: read the COMPLETE per-block list (rawMarks), not
+            // entry.marks — sidecar/thinking rows carry their mark here even
+            // though it never reaches entry.marks.
+            for (const { message } of r.rawBlocks) {
+                const raw = message.rawAnthropicBlock as Record<string, unknown>;
+                const mark = r.rawMarks.get(message.id);
+                if (mark === undefined) delete raw.cache_control;
+                else raw.cache_control = mark;
+            }
+        } else {
+            // Opaque blocks render verbatim, so their validated decoration must
+            // change along with the separate marks map, after all checks pass.
+            for (const { message, block } of r.rawBlocks) message.rawAnthropicBlock = block;
+        }
         for (const id of r.ids) entry.marks.delete(id);
         for (const [id, mark] of r.marks) entry.marks.set(id, mark);
         marksTouched = true;
@@ -807,6 +913,9 @@ export function handleIncrementalProbe(res: http.ServerResponse, conversationId?
         // /__bili/plugin/render endpoint). Shims gate their splice on this.
         serverHistory: featureEnabled("pluginLaneServerHistory"),
         cacheControlRetouch: true,
+        // #6776 compact retouch: the client may send {index, hash, marks}
+        // instead of {index, message}. Gated by rollout + sidecar.
+        compactRetouch: featureEnabled("pluginIncrementalCompactRetouch") && sidecar,
         ...(conversation !== undefined ? { conversation } : {}),
     });
 }
@@ -872,13 +981,23 @@ export async function handleIncrementalTurn(
         }
     }
 
-    let retouch: { index: number; message: { role: string; content: unknown } }[] = [];
+    let retouch: { index: number; message?: { role: string; content: unknown }; hash?: string; marks?: unknown[] }[] = [];
     if (payload.retouch !== undefined) {
-        if (!Array.isArray(payload.retouch)) return jsonReply(res, 400, { error: "retouch must be an array of { index, message }" });
+        if (!Array.isArray(payload.retouch)) return jsonReply(res, 400, { error: "retouch must be an array of { index, message } or { index, hash, marks }" });
         for (const r of payload.retouch as unknown[]) {
-            const ok = r !== null && typeof r === "object" && Number.isInteger((r as { index?: unknown }).index)
-                && laneMessagesLookAnthropic([(r as { message?: unknown }).message]);
-            if (!ok) return jsonReply(res, 400, { error: "retouch entries must be { index: integer, message: anthropic wire message }", conversationId });
+            const obj = r as { index?: unknown; message?: unknown; hash?: unknown; marks?: unknown };
+            if (r === null || typeof r !== "object" || !Number.isInteger(obj.index)) return jsonReply(res, 400, { error: "retouch entries must be { index: integer, message } or { index: integer, hash: string, marks: array }", conversationId });
+            const hasMessage = obj.message !== undefined;
+            const hasCompact = obj.hash !== undefined && Array.isArray(obj.marks);
+            if (hasMessage) {
+                if (!laneMessagesLookAnthropic([obj.message])) return jsonReply(res, 400, { error: "retouch entries with message must carry an anthropic wire message", conversationId });
+            } else if (!hasCompact) {
+                return jsonReply(res, 400, { error: "retouch entries must carry either message or (hash + marks)", conversationId });
+            } else if (typeof obj.hash !== "string") {
+                return jsonReply(res, 400, { error: "retouch compact entries must carry hash: string", conversationId });
+            } else if (!(obj.marks as unknown[]).every((mark) => mark === null || (mark !== null && typeof mark === "object" && !Array.isArray(mark)))) {
+                return jsonReply(res, 400, { error: "retouch compact marks must be null or objects", conversationId });
+            }
         }
         retouch = payload.retouch as typeof retouch;
     }

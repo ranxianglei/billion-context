@@ -206,8 +206,15 @@ test("rolloutDecisions: sorted, one per registered feature, real install id", ()
         assert.equal(alpha.enabled, true);
         assert.equal(zeta.enabled, false);
         // percent-0 still flows through the bucketing tier (bucket < 0bp is
-        // never true) — "off" is reserved for features with no percent at all.
-        for (const d of ds) assert.equal(d.source, "bucket", d.feature);
+        // never true) — "off" is reserved for features with no percent at all,
+        // and for nested features whose base cohort is not enabled (#6776:
+        // pluginIncrementalCompactRetouch nests under pluginIncrementalTurns,
+        // which is percent-0 here → the nested feature reports "off").
+        const byFeature = new Map(ds.map((d) => [d.feature, d]));
+        for (const d of ds) {
+            const baseDisabled = d.base !== undefined && byFeature.get(d.base)?.enabled === false;
+            assert.equal(d.source, baseDisabled ? "off" : "bucket", d.feature);
+        }
     });
 });
 
