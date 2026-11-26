@@ -706,6 +706,7 @@ test("v6: ledger FIFO cap — the cumulative host-id table stays bounded while a
     assert.equal(lg.length, 2048, "cap must hold exactly (FIFO drop oldest)");
     assert.equal(lg[0], padIds[1], "exactly one oldest drops per single append");
     assert.deepEqual(lg.slice(-2), ["h-d", "h-e"], "newest appends survive at the tail");
+});
 
 // #7064 2×2 perf regression (2026-11-20, 100k-message sessions): in a
 // pinned session prepare-openai rebinds originalMessages to s0.pinned
