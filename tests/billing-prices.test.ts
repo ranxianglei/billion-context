@@ -80,6 +80,13 @@ test("#4899 parseBillingSettings: rejects every invalid shape loudly", () => {
     assert.equal(parseBillingSettings({ prices: { m: { input: "3" } } }), undefined, "string number");
 });
 
+test("#7263 parseBillingSettings: rejects unknown root fields regardless of prices", () => {
+    for (const prices of [undefined, {}, { "claude-bill": { input: 3, cacheRead: 0.3 } }]) {
+        assert.equal(parseBillingSettings({ prices, cacheRead: 0.3 }), undefined, "misplaced price field");
+        assert.equal(parseBillingSettings({ prices, price: {} }), undefined, "misspelled prices field");
+    }
+});
+
 // ---------------------------------------------------------------------------
 // resolveBillingPrice — overrides first (same name matching as the registry),
 // registry second, nothing third. Conservative fallbacks: a spend estimate

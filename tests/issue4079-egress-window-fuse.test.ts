@@ -10,11 +10,18 @@
 // excluded) vs max(2MB absolute, window×7.5 B/token from the densest observed
 // tokenizer, #2122) — and the window itself is floored at 1,000,000 tokens
 // (#4079: a declared window can be wrong SMALL; the catastrophic bar never
-// sizes below the largest common window). Only bodies NO 1M-token window can
-// fit are blocked, so this test pins BOTH directions (#3617): the doomed
-// giant answers a NON-retryable 413 and never reaches the upstream, while
-// bodies under the bars — including multi-MB ones an estimator (or a
-// mis-sized small window) would call over-window — still forward.
+// sizes below the largest common window).
+//
+// #7537 (owner ruling 2026-11-22): the size bars are ESTIMATES, and the whole
+// #7167/#7382/#2490/#2847 issue family is their false-refusal offshoot — so
+// the fuse no longer refuses locally. It now LOGS the measured evidence and
+// forwards; the upstream's own verdict is authoritative, and a size error
+// comes back annotated (x-bili-cause: upstream-size, x-bili-retryable: false,
+// error.bili_evidence) so the host doesn't retry the same doomed body. This
+// test pins the new both-ways semantics: an over-bar body is FORWARDED and the
+// upstream's 413 passes through annotated; under-bar bodies forward silently.
+// The count gate (BILI_MAX_MESSAGES) remains the only local 413 (exact wire
+// constraint, not an estimate).
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -59,6 +66,14 @@ function makeUpstream(): { server: http.Server; calls: Call[] } {
         req.on("end", () => {
             const bytes = Buffer.concat(chunks).length;
             calls.push({ bytes });
+            // #7537: the upstream is the size authority — bodies it cannot fit
+            // answer 413 with its own message; the proxy must pass it through
+            // annotated instead of judging locally.
+            if (bytes > 2_000_000) {
+                res.writeHead(413, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { message: "upstream says: request entity too large", type: "invalid_request_error", code: "entity_too_large" } }));
+                return;
+            }
             res.writeHead(200, { "content-type": "text/event-stream" });
             res.end(chatSse("forwarded answer"));
         });
@@ -142,49 +157,45 @@ const post = (ctx: Ctx, messages: Array<{ role: string; content: string }>, with
         body: JSON.stringify({ ...(withModel ? { model: "gpt-test" } : {}), stream: true, messages }),
     });
 
-test("e2e #4079: a body that provably cannot fit any window is stopped at the egress fuse, not forwarded", async () => {
+test("e2e #4079 (#7537): a body that no window can fit is FORWARDED — the fuse logs, the upstream's 413 passes through annotated", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-4079a-"));
     const { ctx, calls, close } = await setup();
     try {
         // No `model` in the body → preflight's `!model` early return skips its
         // doom math and folding entirely; forward() is the last line (#4079).
-        // The measured tier (the #554 meter on the ACTUAL body, #5000/#4543)
-        // fires first for this parseable body: ~2.17M measured tokens > the
-        // floored 1M bar. The byte floor below it stays as the fallback for
-        // unparseable bodies and is still covered by the both-ways test's
-        // 8.68MB-class arithmetic.
-        // 2000 msgs × 4.4K chars ≈ 8.68MB core text — past the floored ratio bar
-        // (max(20K declared, 1M assumed) × 7.5 B/token = 7.5MB; the 2MB absolute
-        // bar is dominated).
+        // The measured tier still measures and LOGS the evidence, but per
+        // #7537 it no longer refuses: the payload reaches the upstream, which
+        // answers its own 413 — passed through with the bili annotation so the
+        // host learns "don't retry this unchanged body" from ONE round trip.
+        // 2000 msgs × 4.4K chars ≈ 8.68MB core text — over every old bar; the
+        // fake upstream 413s above 2MB.
         const r = await post(ctx, bigMessages(2000, 4_400), false);
         const body = await r.text();
-        const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: boolean; message?: string } };
+        const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: unknown; message?: string } };
 
-        assert.equal(r.status, 413, `doomed egress must answer 413 (got ${r.status}) — the send must not reach an upstream that can only reject it (#4068)`);
-        assert.equal(parsed.error?.type, "request_too_large", "same structured too-large family as the byte budget");
-        assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself for log greppability");
-        assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound prompt measures ~[\d,]+ tokens/, "the measured prompt-mass math is in the operator-facing message (#7013)");
-        assert.match(parsed.error?.message ?? "", /bars never assume below 1000000 tokens/, "the assumed-window floor is stated for the operator (#4079)");
-        assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
-        // THE behavior under test: the doomed payload NEVER reaches the upstream.
-        assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);
+        assert.equal(r.status, 413, `the upstream's size verdict must pass through (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.match(parsed.error?.message ?? "", /upstream says: request entity too large/, "the 413 is the UPSTREAM's message, not a local refusal");
+        assert.equal(r.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
+        assert.equal(r.headers.get("x-bili-retryable"), "false", "non-retryable — retrying re-sends the same oversized history (#2847 semantics)");
+        assert.equal(parsed.error?.retryable, undefined, "the upstream body stays verbatim — no bili merge (header-only annotation)");
+        // THE behavior under test: the payload WAS forwarded — the fuse logs,
+        // it does not judge (#7537).
+        assert.equal(calls.length, 1, `upstream must see exactly one call (got ${JSON.stringify(calls)})`);
     } finally {
         await close();
         rmrf(root);
     }
 });
 
-test("e2e #5000: a body whose mass rides tools[] — core text clearing the byte floor — is still stopped by the measured tier, not forwarded", async () => {
+test("e2e #5000 (#7537): a body whose mass rides tools[] is FORWARDED — the measured tier logs evidence, the upstream decides", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-4079t-"));
     const { ctx, calls, close } = await setup();
     try {
-        // Incident #5000's shape: the wire body's mass sits in tool definitions,
-        // which the core-text byte floor never sees (it prices m.text only).
+        // Incident #5000's shape: the wire body's mass sits in tool definitions.
         // 120 tools × 40KB descriptions ≈ 4.8MB of tool text ≈ ~1.2M measured
-        // tokens — over the floored 1M bar — while the core text is ~1.5KB,
-        // ~5000× under the 7.5MB byte floor. With `model` present the preflight
-        // measured gate fires before the relay fuse; same verdict either way.
+        // tokens — over every old bar. Pre-#7537 the measured tier answered a
+        // local 413 first; now it measures, logs the breakdown (tools are the
+        // mass), forwards, and the upstream's 413 passes through annotated.
         const tools = Array.from({ length: 120 }, (_, i) => ({
             type: "function",
             function: { name: `tool_${i}`, description: "d".repeat(40_000) },
@@ -196,48 +207,51 @@ test("e2e #5000: a body whose mass rides tools[] — core text clearing the byte
             body: JSON.stringify({ model: "gpt-test", stream: true, tools, messages }),
         });
         const body = await r.text();
-        const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: boolean; message?: string } };
+        const parsed = JSON.parse(body) as { error?: { message?: string } };
 
-        assert.equal(r.status, 413, `tools-mass body must fail fast (got ${r.status}): ${body.slice(0, 300)}`);
-        assert.equal(parsed.error?.code, "preflight_compress_failed", "the preflight fail-fast house shape (the measured gate answers before the relay)");
-        assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound prompt measures ~[\d,]+ tokens/, "the measured tier names itself (prompt-mass; non-prompt fields excluded — #7013; image payloads are #496 arbitration, never doom)");
-        assert.match(parsed.error?.message ?? "", /NOT forwarded/, "the remedy wording is present");
-        // THE behavior under test: the doomed payload NEVER reaches the upstream
-        // (before the measured tier it cleared the byte floor and rode forward
-        // to a guaranteed 400 — incident #5000's 55.2 MiB send).
-        assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);
+        assert.equal(r.status, 413, `the upstream's size verdict must pass through (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.match(parsed.error?.message ?? "", /upstream says: request entity too large/, "the 413 is the UPSTREAM's message");
+        assert.equal(r.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
+        assert.equal(r.headers.get("x-bili-retryable"), "false", "non-retryable — the tools[] mass won't change on retry");
+        // THE behavior under test: the payload WAS forwarded — the measured
+        // tier is now an evidence logger, not a judge (#7537). With the #2383
+        // emergency digest default-OFF (#7549), a fresh-session first resend this
+        // size may spend a few small (sub-1MB) summarization calls on the core
+        // text during preflight before the forward — so pin the shape: exactly
+        // one call carries the full tools-mass body, and everything before it is
+        // small.
+        const forwardedFull = calls.filter((c) => c.bytes >= 1_000_000);
+        assert.equal(forwardedFull.length, 1, `upstream must see the full tools-mass body exactly once (got calls: ${JSON.stringify(calls.map((c) => c.bytes))})`);
+        assert.ok(calls.slice(0, calls.length - 1).every((c) => c.bytes < 1_000_000), `only small summarization calls may precede the forward (got calls: ${JSON.stringify(calls.map((c) => c.bytes))})`);
     } finally {
         await close();
         rmrf(root);
     }
 });
 
-test("e2e #4543: a CJK body whose CORE TEXT alone measures over the floored fuse bar — while its BYTES clear the byte floor — is stopped at the fuse (the incident's 4.1 MiB sailed to a guaranteed 400)", async () => {
+test("e2e #4543 (#7537): a dense CJK body over every old bar is FORWARDED — the fuse logs, the upstream decides", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-4079c-"));
     const { ctx, calls, close } = await setup();
     try {
         // Incident #4543's shape: dense CJK history. 1.12M CJK chars ≈ 3.36MB —
-        // ~55% under the 7.5MB floored byte floor (which the meter-based floor
-        // at ~7.5 B/token cannot see at CJK's 3.4 B/tok) — but CJK bills ~1
-        // token per character, so the #554 meter prices ~1.12M tokens: over the
-        // 1M floored bar. No `model` in the body → preflight skipped → the
-        // relay fuse is the last line. On master this body forwarded to a
-        // guaranteed upstream 400 (incident logs: 4.1 MiB, 1,121,674 tokens,
-        // grep "egress window fuse" = 0).
+        // ~1.1M measured tokens: over the 1M floored bar. No `model` in the
+        // body → preflight skipped → the relay fuse is the last line.
+        // Pre-#7537 this body answered a local 413; on master (pre-fuse) it
+        // sailed to a guaranteed upstream 400. Now: forwarded, and the
+        // upstream's own verdict passes through annotated (#7537).
         const cjk = "数".repeat(1_120_000);
         const messages = [{ role: "user", content: cjk + "\n" + "x".repeat(3_072) }] as Array<{ role: string; content: string }>;
         const r = await post(ctx, messages, false);
         const body = await r.text();
-        const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: boolean; message?: string } };
+        const parsed = JSON.parse(body) as { error?: { message?: string } };
 
-        assert.equal(r.status, 413, `the CJK-measured body must stop at the fuse (got ${r.status}): ${body.slice(0, 300)}`);
-        assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself");
-        assert.equal(parsed.error?.retryable, false, "non-retryable — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound prompt measures ~[\d,]+ tokens/, "the measured prompt-mass math is in the operator-facing message (#7013)");
-        assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
-        // THE behavior under test: the doomed payload NEVER reaches the upstream.
-        assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);
+        assert.equal(r.status, 413, `the upstream's size verdict must pass through (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.match(parsed.error?.message ?? "", /upstream says: request entity too large/, "the 413 is the UPSTREAM's message");
+        assert.equal(r.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
+        assert.equal(r.headers.get("x-bili-retryable"), "false", "non-retryable — the CJK mass won't change on retry");
+        // THE behavior under test: the payload WAS forwarded — the fuse logs,
+        // it does not judge (#7537).
+        assert.equal(calls.length, 1, `upstream must see exactly one call (got ${JSON.stringify(calls)})`);
     } finally {
         await close();
         rmrf(root);
@@ -272,9 +286,13 @@ test("e2e #4079 both-ways: bodies under the doom bars still forward — includin
 
 // #7013: the fuse prices the wire-format's PROMPT mass, not the whole body.
 // A non-prompt upload field (DSH's dsh_session_log — telemetry that rides the
-// wire but consumes no window) must NOT 413 a fitting prompt. This reproduces
+// wire but consumes no window) must NOT doom a fitting prompt. This reproduces
 // the issue's exact repro: ~100K-token prompt + an 8 MiB dsh_session_log that
 // used to measure ~2M tokens and doom the send.
+// #7537 (owner ruling 2026-11-22): the fuse no longer refuses on estimate — it
+// logs the prompt-mass evidence and forwards. The dsh_* strip (passDshExtensions
+// default OFF, #7168/#7439) removes the upload before the wire, so the forwarded
+// body is just the small prompt and the upstream answers 200.
 test("e2e #7013: a giant non-prompt upload field does not doom a fitting prompt at the egress fuse", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-7013-"));
     const { ctx, calls, close } = await setup();
@@ -282,9 +300,8 @@ test("e2e #7013: a giant non-prompt upload field does not doom a fitting prompt 
         // No `model` in the body → preflight's `!model` early return skips its
         // doom math; forward()'s egress fuse is the last line (#4079). The
         // prompt is small (~1K tokens); the dsh_session_log upload is 8 MiB of
-        // non-prompt telemetry (~2M tokens if it were priced). Before #7013 the
-        // fuse's meter counted the upload and answered 413; now it prices only
-        // the prompt mass and forwards.
+        // non-prompt telemetry. #7537: the fuse logs the prompt-mass evidence
+        // and forwards; the dsh_* strip removes the upload before the wire.
         const r = await fetch(ctx.url, {
             method: "POST",
             headers: { ...ctx.headers },
@@ -297,23 +314,27 @@ test("e2e #7013: a giant non-prompt upload field does not doom a fitting prompt 
         const body = await r.text();
         assert.equal(r.status, 200, `the fitting prompt must forward despite the 8 MiB non-prompt upload (got ${r.status}): ${body.slice(0, 300)}`);
         assert.equal(calls.length, 1, `the request reached the upstream exactly once (got ${calls.length})`);
-        assert.ok(calls[0]!.bytes > 8_000_000, "the upload rode the wire (the upstream ignores it; bili only mis-priced it)");
+        assert.ok(calls[0]!.bytes < 2_000_000, "the non-prompt upload was stripped before the wire — the forwarded body is just the small prompt (#7168/#7439)");
     } finally {
         await close();
         rmrf(root);
     }
 });
 
-// #7013 both-ways: a prompt that GENUINELY exceeds the window still dooms, even
-// with a large non-prompt upload field present — the fix must not over-suppress
-// the fuse (#3617). The prompt mass alone clears the floored 1M bar.
-test("e2e #7013 both-ways: a genuinely over-window prompt still dooms at the egress fuse", async () => {
+// #7013 both-ways: a prompt that GENUINELY exceeds the window is still the
+// upstream's problem, not a local estimate refusal — even with a large
+// non-prompt upload field present. #7537: the fuse logs the prompt-mass
+// evidence and forwards; the upstream's own 413 (the CJK prompt body exceeds
+// its limit) passes through annotated. The 2 MiB upload is stripped before the
+// wire (#7168/#7439), so it does not change the verdict.
+test("e2e #7013 both-ways: a genuinely over-window prompt is forwarded; the upstream's 413 passes through annotated (#7537)", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-7013b-"));
     const { ctx, calls, close } = await setup();
     try {
         // ~1.2M CJK chars ≈ ~1.2M tokens of PROMPT mass — over the floored 1M
-        // bar on its own. Plus a 2 MiB non-prompt upload (which the fix ignores
-        // for the window budget). The prompt mass alone dooms the send.
+        // bar on its own. Plus a 2 MiB non-prompt upload (stripped before the
+        // wire). The 3.6MB CJK prompt body exceeds the fake upstream's 2MB
+        // limit, so its own 413 is the verdict.
         const r = await fetch(ctx.url, {
             method: "POST",
             headers: { ...ctx.headers },
@@ -325,10 +346,13 @@ test("e2e #7013 both-ways: a genuinely over-window prompt still dooms at the egr
         });
         const body = await r.text();
         const parsed = JSON.parse(body) as { error?: { code?: string; message?: string } };
-        assert.equal(r.status, 413, `the over-window prompt must still doom (got ${r.status}): ${body.slice(0, 300)}`);
-        assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself");
-        assert.match(parsed.error?.message ?? "", /outbound prompt measures ~[\d,]+ tokens/, "the prompt-mass math is in the message");
-        assert.equal(calls.length, 0, "the doomed payload never reached the upstream");
+        assert.equal(r.status, 413, `the upstream's size verdict must pass through (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.match(parsed.error?.message ?? "", /upstream says: request entity too large/, "the 413 is the UPSTREAM's message, not a local refusal");
+        assert.equal(r.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
+        assert.equal(r.headers.get("x-bili-retryable"), "false", "non-retryable — the CJK mass won't change on retry");
+        // THE behavior under test: the payload WAS forwarded — the fuse logs,
+        // it does not judge (#7537).
+        assert.equal(calls.length, 1, `upstream must see exactly one call (got ${JSON.stringify(calls)})`);
     } finally {
         await close();
         rmrf(root);

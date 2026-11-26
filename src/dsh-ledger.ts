@@ -383,7 +383,7 @@ export function patchPnpmLock(text: string, spec: string, version: string): Pnpm
             const sub = patchNestedEntries(lines.slice(range[0], range[1]), 0, range[1] - range[0], spec, version);
             if (sub.kind === "fail") {
                 // an entry-less section is fine when another section holds the entry
-                if (patched === 0 && !sub.reason.startsWith("no billion-context entry")) return sub;
+                if (!sub.reason.startsWith("no billion-context entry")) return sub;
                 continue;
             }
             lines.splice(range[0], range[1] - range[0], ...sub.next.split("\n"));

@@ -744,7 +744,7 @@ function biliToolNamesIn(parsed: Record<string, unknown>): string[] | null {
  *  restoreOutputBudget must run so the model regains the output room to emit
  *  compress — so such requests stay main turns even when every tool is bili's. */
 /** #2156: READ-ONLY structural twin of stripLeakedBiliTools — same verdict,
- *  no mutation. Lets callers (the persona-anchor bypass in server.ts) ask
+ *  no mutation. Lets callers (the persona-lane bypass in server.ts) ask
  *  "would this request be demoted via #1897?" before any decision point that
  *  must not pay the mutation or re-run the check. */
 export function hasLeakedBiliToolsOnly(parsed: unknown): boolean {

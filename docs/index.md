@@ -7,7 +7,7 @@
 
 | Doc | What it is |
 |---|---|
-| [README](../README.md) / [中文](../README.zh-CN.md) / [日本語](../README.ja.md) | Project entry: what it is, quickstart, architecture overview |
+| [README](../README.md) / [中文](../README.zh-CN.md) / [日本語](../README.ja.md) / [한국어](../README.ko.md) | Project entry: what it is, quickstart, architecture overview |
 | [architecture](architecture.md) / [中文](architecture.zh-CN.md) / [日本語](architecture.ja.md) | **System architecture hub** (LIVE doc, owner ruling 2026-11-08): overall diagram + per-module pages, each with its own diagram — see `docs/architecture/` |
 | [configuration](configuration.md) / [中文](configuration.zh-CN.md) / [日本語](configuration.ja.md) | Full configuration reference (generated from `website/config-reference/*.yaml` by `tools/gen-config-docs.mjs`; hand-written sections are drift-guarded) |
 | [clients](clients.md) / [中文](clients.zh-CN.md) / [日本語](clients.ja.md) | Per-client integration deep dives: how each mode (launcher / `/bili/` / native plugin) wires traffic in |
@@ -35,3 +35,7 @@
 | [lifecycle](lifecycle.md) | Transition-switch ledger / retirement inventory / hygiene record (CI-enforced `BILI_*` coverage) |
 | [auto-merge-guardrails](auto-merge-guardrails.md) | Evidence appendix behind §7 of `AGENTS.md` (AI auto-dev review history) |
 | [unified-loop-spec](unified-loop-spec.md) | Historical design: unified compress-loop spec (implemented; code is the source of truth) |
+| [PR #6785 in depth](pr-6785-unified-storage-and-flows.md) / [中文](pr-6785-unified-storage-and-flows.zh-CN.md) | Review-grade walkthrough of PR #6785: unified-storage tables (schema v12) / implementation logic / per-turn data flow / full switch ledger + measured validation (#5874/#7064/#7398/#4491) + round 2: op-log canonical numbering, lazy projection, window re-anchor, resident perf gate (KDD #23) |
+| [egress block flow](egress-block-flow.md) / [中文](egress-block-flow.zh-CN.md) | Block canonical history + checkpoint retirement (#7577): `egress_block_flow`/`egress_block_state` tables, kstate sidecar, point-fork, kstate trim |
+| [egress plane](egress-plane.md) / [中文](egress-plane.zh-CN.md) | The egress plane one-stop: design lineage (#7439→#7581→#7617), dual clocks, identity consolidation, switch dependency + on/off resolution order, operator runbook |
+| [deprecations](deprecations.md) / [中文](deprecations.zh-CN.md) | Retirement register: l1 placeholder, conversations, D-lane trigger conditions, msgid switch removals, physical DROP batch |
