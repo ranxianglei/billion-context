@@ -794,12 +794,9 @@ test("T10 kstate retirement: the cold egress-on load rebuilds blocks/refs/tsStam
     // shape) — a cold fork of it inherits nothing. PR-B makes the load the
     // rebuild point: blocks from the block ledger (PR-A writes it),
     // messageRefs/tsStamps from the message flow, residual from the sidecar.
-    const REBUILD_ENV = "BILI_ROLLOUT_EGRESS_KSTATE_REBUILD";
-    const RETIRE_ENV = "BILI_ROLLOUT_EGRESS_KSTATE_RETIRE_WRITES";
-    const savedRebuild = process.env[REBUILD_ENV];
-    const savedRetire = process.env[RETIRE_ENV];
-    process.env[REBUILD_ENV] = "1";
-    process.env[RETIRE_ENV] = "1";
+    // KDD #25 (owner ruling 2026-11-26): the former egressKstateRetireWrites / egressKstateRebuild
+    // gates were removed — the kstate retirement+rebuild is part of egressPlane itself
+    // (ONE switch), so no env pin is needed here.
     const logs: string[] = [];
     const h = await harness(logs);
     try {
@@ -852,21 +849,10 @@ test("T10 kstate retirement: the cold egress-on load rebuilds blocks/refs/tsStam
         } finally {
             store2.cancelAll();
         }
-        // PHASE 2 (PR-B OFF = legacy): the same cold load comes back with an
-        // EMPTY block set — the pinned gap PR-B closes (the column never
-        // carried the live state of an armed session).
-        process.env[REBUILD_ENV] = "0";
-        const store3 = new SessionStore({ dir: h.dir + "/sessions", enabled: true, debounceMs: 15 });
-        try {
-            const legacy = await store3.loadAsync("p10");
-            assert(legacy !== null, "legacy cold load finds the session");
-            assert.equal(legacy!.state.blocks.length, 0, "legacy: the folded block is LOST on cold load (the gap)");
-        } finally {
-            store3.cancelAll();
-        }
+        // PHASE 2 (the pre-PR-B off-arm) is gone with the separate gate:
+        // KDD #25 folded retirement+rebuild into egressPlane (ONE switch),
+        // so the cold load above is the only behavior to pin.
     } finally {
-        if (savedRebuild === undefined) delete process.env[REBUILD_ENV]; else process.env[REBUILD_ENV] = savedRebuild;
-        if (savedRetire === undefined) delete process.env[RETIRE_ENV]; else process.env[RETIRE_ENV] = savedRetire;
         await h.close(h.store);
     }
 });

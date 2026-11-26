@@ -963,16 +963,16 @@ export class UnifiedShadow {
                     // stored state verbatim (no fuzzy guessing — same
                     // discipline as the message-log degrade ladder); lastPassIds
                     // self-heals on the first pass (deliberately not rebuilt).
-                    if (featureEnabled("egressKstateRebuild")) {
-                        try {
-                            const max = store.egressBlockMaxSeq(id);
-                            const replay = max > 0
-                                ? store.egressBlockReplay(id, max)
-                                : { blocks: new Map<string, EgressBlockSnapshot>(), kstate: null };
-                            Object.assign(view.state, rebuildEgressKstateOverlay(replay, store.egressStateView(id)));
-                        } catch (err) {
-                            loggerLog("warn", `[storage] egress kstate rebuild failed for ${id} (${String(err)}) — stored kstate kept`);
-                        }
+                    // KDD #25 (owner ruling 2026-11-26): folded into egressPlane —
+                    // ONE switch; the former egressKstateRebuild gate was removed.
+                    try {
+                        const max = store.egressBlockMaxSeq(id);
+                        const replay = max > 0
+                            ? store.egressBlockReplay(id, max)
+                            : { blocks: new Map<string, EgressBlockSnapshot>(), kstate: null };
+                        Object.assign(view.state, rebuildEgressKstateOverlay(replay, store.egressStateView(id)));
+                    } catch (err) {
+                        loggerLog("warn", `[storage] egress kstate rebuild failed for ${id} (${String(err)}) — stored kstate kept`);
                     }
                     if (view.state.tsStamps === undefined) {
                         const derived = store.egressTsStamps(id);
