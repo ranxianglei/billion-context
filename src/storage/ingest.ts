@@ -721,14 +721,29 @@ interface LegacyView {
 
 type BlockContents = LegacyView["blockContents"];
 
-/** Shared by full-view and resident-field reads; each page is released after parsing. */
-export function appendBlockContents(contents: BlockContents, rows: Pick<LegacyViewRows["blocks"][number], "blockId" | "summary" | "one">[]): void {
+/** Shared by full-view and resident-field reads; each page is released after
+ *  parsing. #7337: a corrupt block summary/one CAS row is skipped and returned
+ *  (not thrown) so one bad row cannot abort the whole load — before this it
+ *  threw out of finish()/readResidentFieldsFor and the session fell back to the
+ *  legacy file (or was discarded when none exists). */
+export function appendBlockContents(
+    contents: BlockContents,
+    rows: Pick<LegacyViewRows["blocks"][number], "blockId" | "summary" | "one">[],
+): { blockId: string; error: string }[] {
+    const skipped: { blockId: string; error: string }[] = [];
     for (const b of rows) {
-        contents.set(b.blockId, {
-            one: b.one === null ? null : (JSON.parse(b.one) as BlockView),
-            full: JSON.parse(b.summary) as BlockView,
-        });
+        let one: BlockView | null;
+        let full: BlockView;
+        try {
+            one = b.one === null ? null : (JSON.parse(b.one) as BlockView);
+            full = JSON.parse(b.summary) as BlockView;
+        } catch (err) {
+            skipped.push({ blockId: b.blockId, error: String(err) });
+            continue;
+        }
+        contents.set(b.blockId, { one, full });
     }
+    return skipped;
 }
 
 export function mergeOrphanBlockContents(contents: BlockContents, orphansJson: string | null | undefined): void {
@@ -757,6 +772,11 @@ export class LegacyViewBuilder {
     private readonly blocks: unknown[] = [];
     private readonly blockContents: BlockContents = new Map();
     private readonly messagesBySeq = new Map<number, CoreMessage>();
+    /** #7335 poison-row isolation: rows whose stored bytes no longer parse as
+     *  JSON are skipped and recorded here instead of aborting the whole load —
+     *  before this, one bad row threw out of finish() and the session was
+     *  rebuilt from scratch (all blocks and refs discarded). */
+    readonly skippedCorruptRows: { table: "messages" | "blocks"; key: string; error: string }[] = [];
     private ccrRows: readonly CcrLedgerRow[] = [];
     private orphanViews?: Record<string, { one: unknown; full: unknown }>;
     private stateFieldsRows: Record<string, string> | null = null;
@@ -851,12 +871,26 @@ export class LegacyViewBuilder {
     }
 
     addBlocks(rows: LegacyViewRows["blocks"]): void {
-        for (const b of rows) this.blocks.push(JSON.parse(b.payloadJson));
-        appendBlockContents(this.blockContents, rows);
+        for (const b of rows) {
+            try {
+                this.blocks.push(JSON.parse(b.payloadJson));
+            } catch (err) {
+                this.skippedCorruptRows.push({ table: "blocks", key: String(b.blockId), error: String(err) });
+            }
+        }
+        for (const s of appendBlockContents(this.blockContents, rows)) {
+            this.skippedCorruptRows.push({ table: "blocks", key: String(s.blockId), error: s.error });
+        }
     }
 
     addMessages(rows: LegacyViewRows["messages"]): void {
-        for (const m of rows) this.messagesBySeq.set(m.seq, JSON.parse(m.content) as CoreMessage);
+        for (const m of rows) {
+            try {
+                this.messagesBySeq.set(m.seq, JSON.parse(m.content) as CoreMessage);
+            } catch (err) {
+                this.skippedCorruptRows.push({ table: "messages", key: `seq=${m.seq}`, error: String(err) });
+            }
+        }
     }
 
     /** #6785 step 6: the ccr_entries ledger (CAS content) that backs a slim
