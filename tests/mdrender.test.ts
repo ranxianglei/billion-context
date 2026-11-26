@@ -6,6 +6,7 @@
 // closures (exactly what the minified IIFE gives it).
 import test from "node:test";
 import assert from "node:assert/strict";
+import { runInNewContext } from "node:vm";
 import { build } from "esbuild";
 import { makeMdRender } from "../src/web/mdrender.ts";
 import { markdownToHtml } from "../src/web/markdown.ts";
@@ -240,4 +241,67 @@ test("markdownToHtml delegates to makeMdRender", () => {
     const src = "# T\n\n**b** and `c`\n\n```json\n{\"k\": 1}\n```\n\n- [x] done";
     assert.equal(markdownToHtml(src), md.render(src));
     assert.match(markdownToHtml(src), /<span class="hl-key">/);
+});
+
+// --- #7358: malformed link/image delimiters must not rescan (quadratic) ---
+//
+// The old per-rule regexes backtracked one char at a time from every opening
+// bracket, so a document full of unclosed "[" / "![ cant" / "[x](" rescanned
+// the same suffix for each marker — O(n^2), stalling the server and panel
+// event loop. These tests pin the linear behavior AND the exact match
+// semantics the scanner must keep (label ends at the first ']', url at the
+// first ')', structurally-complete [label](url) always consumed, bad scheme
+// degrades to label text / drop).
+
+const malformedShapes = [
+    // [input, expectedHtml]
+    ["[a](https://x.test/y)", '<p><a href="https://x.test/y" target="_blank" rel="noopener noreferrer">a</a></p>'],
+    ["[a](javascript:x)", "<p>a</p>"],
+    ["[](https://x.test/y)", "<p>[](https://x.test/y)</p>"],
+    ["[a] (https://x.test/y)", "<p>[a] (https://x.test/y)</p>"],
+    ["[a](https://x.test/ y)", "<p>[a](https://x.test/ y)</p>"],
+    ["[a](https://x.test/y", "<p>[a](https://x.test/y</p>"],
+    ["[a[b](https://x.test/y)", '<p><a href="https://x.test/y" target="_blank" rel="noopener noreferrer">a[b</a></p>'],
+    ["[a](https://x.test/y) [b](javascript:x)", '<p><a href="https://x.test/y" target="_blank" rel="noopener noreferrer">a</a> b</p>'],
+    ["[a](https://x.test/y)[b](https://z.test/w)", '<p><a href="https://x.test/y" target="_blank" rel="noopener noreferrer">a</a><a href="https://z.test/w" target="_blank" rel="noopener noreferrer">b</a></p>'],
+    ["[[a](https://x.test/y)](https://z.test/w)", '<p><a href="https://x.test/y" target="_blank" rel="noopener noreferrer">[a</a>](https://z.test/w)</p>'],
+    ["![a](https://x.test/i.png)", '<p><img class="md-img" src="https://x.test/i.png" alt="a" /></p>'],
+    ["![](https://x.test/i.png)", '<p><img class="md-img" src="https://x.test/i.png" alt="" /></p>'],
+    ["![a](javascript:x)", "<p></p>"],
+    ["![a](https://x.test/ i.png)", "<p>![a](https://x.test/ i.png)</p>"],
+    ["![a](https://x.test/i.png", "<p>![a](https://x.test/i.png</p>"],
+    ["![a](https://x.test/i.png)![b](https://y.test/j.png)", '<p><img class="md-img" src="https://x.test/i.png" alt="a" /><img class="md-img" src="https://y.test/j.png" alt="b" /></p>'],
+] as const;
+
+for (const [input, expected] of malformedShapes) {
+    test(`link/image scanner keeps exact semantics: ${JSON.stringify(input)}`, () => {
+        assert.equal(md.render(input), expected);
+    });
+}
+
+// The regression itself: a 200,000-character run of unclosed labels must
+// finish in bounded time (the old renderer needed ~23 s; the linear scanner
+// finishes in ~2 ms). The 2 s bound is the issue's acceptance threshold and
+// is ~1000x the new code's cost. Run under runInNewContext so a regression
+// to quadratic behavior interrupts the test instead of hanging CI.
+const unclosedFixtures = [
+    ["[".repeat(200_000), "<p>" + "[".repeat(200_000) + "</p>"],
+    ["![ cant".repeat(20_000), "<p>" + "![ cant".repeat(20_000) + "</p>"],
+    ["[x](".repeat(20_000), "<p>" + "[x](".repeat(20_000) + "</p>"],
+] as const;
+
+function assertBounded(render: (source: string) => string): void {
+    for (const [source, expected] of unclosedFixtures) {
+        const actual = runInNewContext("render(source)", { render, source }, { timeout: 2_000 });
+        assert.equal(actual, expected, source.slice(0, 16));
+    }
+}
+
+test("server Markdown renders 200k unclosed labels in bounded time", () => {
+    assertBounded(markdownToHtml);
+});
+
+test("minified detached browser Markdown renders 200k unclosed labels in bounded time", async () => {
+    const detached = await makeDetached();
+    assertBounded(detached.render);
 });
