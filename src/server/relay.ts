@@ -1022,8 +1022,12 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // #4079: the declared window can be wrong SMALL (stale config, registry
         // miss, #3993-style catalog fallback) — never size the catastrophic bar
         // below the largest common window, or the fuse false-blocks bodies the
-        // real upstream accepts.
-        const fuseWindow = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
+        // real upstream accepts. #5937: an explicit compress.modelContextLimit
+        // is NOT a guess — it is the operator's deliberate wall, the same value
+        // the judging chain already runs on — so it sizes the bar directly and
+        // the anti-guess floor does not apply to it.
+        const operatorDeclared = prepared.session.metadata.operatorWindowTuned === true;
+        const fuseWindow = operatorDeclared ? declaredWindow : Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (declaredWindow > 0) {
             const fuseMsgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
             // #5000/#4543: the byte floor below prices only m.text — a body whose
@@ -1065,14 +1069,21 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // small. Log the measurement as evidence and forward; the
                 // upstream answers with its own real numbers (annotated in
                 // the upstream size-error branch below, same issue).
-                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; the #554 meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
+                const fuseWallClause = operatorDeclared
+                    ? `vs the operator-declared model window ${declaredWindow.toLocaleString("en-US")} (compress.modelContextLimit, #5937)`
+                    : `vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079)`;
+                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; the #554 meter) ${fuseWallClause} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
                 log("info", `[${prepared.session.id}] egress window fuse profile (duplication): ${describeCoreTextDuplication(fuseMsgs)}`);
             }
             const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
             if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
                 // #7537: byte-math profile over the local window bar — log and
                 // forward, same ruling as above.
-                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound core text alone is ~${fuseBytes} bytes (≥ ~${Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN)} tok at the densest observed density, #2122) vs the effective model window ${declaredWindow} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
+                const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+                const wallClause = operatorDeclared
+                    ? `vs the operator-declared model window ${declaredWindow} (compress.modelContextLimit, #5937)`
+                    : `vs the effective model window ${declaredWindow} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079)`;
+                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound core text alone is ~${fuseBytes} bytes (≥ ~${fuseFloorTokens} tok at the densest observed density, #2122) ${wallClause} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
             }
         }
     }

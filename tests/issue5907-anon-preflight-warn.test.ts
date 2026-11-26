@@ -118,7 +118,7 @@ function rebuild(f: Fixture): Prepared {
 
 function gate(f: Fixture, anonymous: boolean) {
     return preflightCompressIfNeeded(f.prepared, async () => rebuild(f), f.req, Buffer.from(f.prepared.body), f.res,
-        f.opts, f.core, f.config, f.config.modelContextLimit, "test-model", undefined, undefined, undefined, undefined, anonymous, f.log, "anon-warn-test");
+        f.opts, f.core, f.config, f.config.modelContextLimit, "test-model", undefined, undefined, undefined, undefined, undefined, anonymous, f.log, "anon-warn-test");
 }
 
 test("identified session: zero-progress fits-forward keeps the original warn wording", async () => {
