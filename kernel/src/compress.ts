@@ -71,6 +71,7 @@ import type {
   ProcessTurnResult,
   Recommendation,
   StatusReport,
+  ViewLatchEntry,
 } from "./types.js";
 
 export interface Ports {
@@ -2695,6 +2696,21 @@ function computeContextBreakdown(
   return { system, tool, summaries, code, text, total, growth };
 }
 
+// Deep-copies the view-latch map (same copy contract as the sync clone in
+// kernel/src/sync.ts). A for-of over Object.entries instead of
+// Object.fromEntries: compress.ts is in the verif guarded set
+// (verif/guarded-files.ts) and fromEntries is outside the verifiable subset.
+function cloneViewLatches(
+  viewLatches: Record<string, ViewLatchEntry> | undefined,
+): Record<string, ViewLatchEntry> | undefined {
+  if (viewLatches === undefined) return undefined;
+  const out: Record<string, ViewLatchEntry> = {};
+  for (const [ref, entry] of Object.entries(viewLatches)) {
+    out[ref] = { ...entry };
+  }
+  return out;
+}
+
 export function cloneState(state: CompressionState): CompressionState {
   return {
     blocks: state.blocks.map((block) => ({
@@ -2748,11 +2764,7 @@ export function cloneState(state: CompressionState): CompressionState {
     renderDeferredRefs: state.renderDeferredRefs
       ? [...state.renderDeferredRefs]
       : undefined,
-    viewLatches: state.viewLatches
-      ? Object.fromEntries(
-          Object.entries(state.viewLatches).map(([k, v]) => [k, { ...v }]),
-        )
-      : undefined,
+    viewLatches: cloneViewLatches(state.viewLatches),
     viewLatchConfigDigest: state.viewLatchConfigDigest,
     // #5608-C/#5608-B: the visibility mark and the honest-NULL arm ride the
     // fold clone with the same contract — losing either re-opens its window.
