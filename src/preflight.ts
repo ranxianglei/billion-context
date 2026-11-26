@@ -220,6 +220,30 @@ export type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
 // of index-0-only survives a host relocating the block.
 export const BILLING_ATTRIBUTION_PREFIX = "x-anthropic-billing-header:";
 
+export function isBillingAttributionText(text: string): boolean {
+    return text.trimStart().startsWith(BILLING_ATTRIBUTION_PREFIX);
+}
+
+export function stripBillingAttributionBlocks(system: unknown): unknown {
+    if (!Array.isArray(system)) {
+        return typeof system === "string" && isBillingAttributionText(system) ? "" : system;
+    }
+    let filtered: unknown[] | undefined;
+    for (let i = 0; i < system.length; i++) {
+        const block = system[i];
+        const isBilling = block !== null && typeof block === "object"
+            && (block as { type?: unknown }).type === "text"
+            && typeof (block as { text?: unknown }).text === "string"
+            && isBillingAttributionText((block as { text: string }).text);
+        if (isBilling) {
+            if (filtered === undefined) filtered = system.slice(0, i);
+        } else if (filtered !== undefined) {
+            filtered.push(block);
+        }
+    }
+    return filtered ?? system;
+}
+
 export function extractBillingAttributionBlock(
     system: string | Array<Record<string, unknown>> | undefined,
 ): { type: "text"; text: string } | undefined {
@@ -227,7 +251,7 @@ export function extractBillingAttributionBlock(
     for (const block of system) {
         if (!block || typeof block !== "object" || block.type !== "text") continue;
         const text = block.text;
-        if (typeof text === "string" && text.trimStart().startsWith(BILLING_ATTRIBUTION_PREFIX)) {
+        if (typeof text === "string" && isBillingAttributionText(text)) {
             return { type: "text", text };
         }
     }

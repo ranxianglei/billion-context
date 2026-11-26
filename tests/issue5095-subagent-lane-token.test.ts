@@ -30,6 +30,7 @@ const MAIN_SYSTEM = ["You are Claude Code, Anthropic's official CLI for Claude. 
 const SUB_AGENT_SYSTEM = ["x-anthropic-billing-header: cc_version=...", "You are a Claude agent, built on Anthropic's...", "You are a file search specialist for..."];
 
 const tag = (blocks: string[]): string => blocks.join("\n\n");
+const personaTag = (blocks: string[]): string => blocks.filter((b) => !b.trimStart().startsWith("x-anthropic-billing-header:")).join("\n\n");
 const fp16 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex").slice(0, 16);
 const forkKey = (conv: string, systemText: string): string => `${conv}|sub:${fp16(systemText)}`;
 const tokenLaneKey = (conv: string, systemText: string, token: string): string => `${forkKey(conv, systemText)}:t:${token}`;
@@ -293,8 +294,8 @@ test("#5095 end to end: parallel same-type dispatches ride distinct lanes; paren
         assert.ok(parent, "parent session exists");
         assert.equal(parent.stats.requests, 3);
 
-        const laneA = tokenLaneKey(SESSION, tag(SUB_AGENT_SYSTEM), tokA);
-        const laneB = tokenLaneKey(SESSION, tag(SUB_AGENT_SYSTEM), tokB);
+        const laneA = tokenLaneKey(SESSION, personaTag(SUB_AGENT_SYSTEM), tokA);
+        const laneB = tokenLaneKey(SESSION, personaTag(SUB_AGENT_SYSTEM), tokB);
 
         const a1 = await post(ccHeaders, mainBody(tokenedHistory("subA", 2, tokA), SUB_AGENT_SYSTEM));
         assert.equal(a1.status, 200, `dispatch A pass 1: ${a1.text}`);
@@ -309,7 +310,7 @@ test("#5095 end to end: parallel same-type dispatches ride distinct lanes; paren
         assert.ok(peekSession(laneB), "dispatch B rides its OWN token lane");
         assert.notEqual(laneA, laneB, "same system text, different tokens — the #5095 D1 merge is gone");
         assert.notEqual(peekSession(laneA), peekSession(laneB), "distinct session objects (own compression state)");
-        assert.equal(peekSession(forkKey(SESSION, tag(SUB_AGENT_SYSTEM))), undefined, "no shared fingerprint lane was minted");
+        assert.equal(peekSession(forkKey(SESSION, personaTag(SUB_AGENT_SYSTEM))), undefined, "no shared fingerprint lane was minted");
         assert.equal(peekSession(SESSION), parent, "parent session object unchanged");
         assert.equal(parent.stats.requests, 3, "parent untouched by both dispatches");
 
@@ -340,7 +341,7 @@ test("#5095 end to end fallback: un-upgraded clients (no token) ride the stamped
         // the token-less dispatch rides it verbatim (no fragment lane is
         // minted — the #5095 D1-B fallback was retired with the GA).
         assert.equal(peekSession(SESSION)!.stats.requests, 4, "token-less dispatch rides the stamped id verbatim");
-        assert.equal(peekSession(forkKey(SESSION, tag(SUB_AGENT_SYSTEM))), undefined, "no fingerprint lane was minted");
+        assert.equal(peekSession(forkKey(SESSION, personaTag(SUB_AGENT_SYSTEM))), undefined, "no fingerprint lane was minted");
         const sub2 = await post(ccHeaders, mainBody(history("sub", 3), SUB_AGENT_SYSTEM));
         assert.equal(sub2.status, 200, `token-less pass 2: ${sub2.text}`);
         assert.equal(peekSession(SESSION)!.stats.requests, 5, "successive turns of the SAME id stay verbatim");
