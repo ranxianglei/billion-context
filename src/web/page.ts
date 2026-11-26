@@ -160,6 +160,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div class="k" data-i18n="up.latest_known">${zh("up.latest_known")}</div><div class="v mono" id="up-latest">—</div>
 <div class="k" data-i18n="up.last_check">${zh("up.last_check")}</div><div class="v mono" id="up-last-check">—</div>
 </dl>
+<div id="up-dev-install" class="small" style="margin-top:10px" hidden><span class="badge" style="background:var(--blue,#1d76db);color:#fff" data-i18n="up.dev_install_badge">${zh("up.dev_install_badge")}</span> <span id="up-dev-install-label" class="mono"></span> <span id="up-dev-install-state" class="dim"></span></div>
 <p id="up-pending-hint" class="small" style="margin-top:10px;color:var(--amber)" hidden data-i18n="up.pending_hint">${zh("up.pending_hint")}</p>
 </div></div>
 <div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.notices">${zh("up.notices")}</span></div><div class="card-b"><div id="up-notices" class="dim small">—</div></div></div>

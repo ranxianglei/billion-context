@@ -39,6 +39,7 @@ import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
 import { updateRegistryBase as knobUpdateRegistryBase, updateCheckIntervalMs as knobUpdateCheckIntervalMs, updatePolicyUrl as knobUpdatePolicyUrl, updateStaggerMinDelayMs as knobUpdateStaggerMinDelayMs, updateStaggerMaxDelayMs as knobUpdateStaggerMaxDelayMs } from "./knobs.js";
 import { POLICY_URL_DEFAULT, ensureStaggerDraw, loadUpdatePolicy, resolveStaggerWindow, resolveUpgradeCandidate, setPlannedUpgrade, staggerKey } from "./update-policy.js";
+import { clearPin, formatPinUntil, resolvePinState } from "./update-pin.js";
 
 // BILI_UPDATE_REGISTRY overrides the registry base URL (full URL, e.g. a
 // loopback verdaccio in the hermetic e2e suite, #1153). Unset = production
@@ -115,9 +116,13 @@ let inFlight = false;
 let firstCheckDone = false;
 // #806: dedupe key for the stale-install reminder (version pair).
 let staleWarnKey: string | undefined;
+// #7806: the pin hold log line is per-key-once (the check runs every few
+// minutes; the hold message is only news once per transition).
+let pinHoldWarnKey: string | undefined;
 
 export function _resetStaleWarnForTest(): void {
     staleWarnKey = undefined;
+    pinHoldWarnKey = undefined;
 }
 
 // #1481: per-process dedupe for advisory force-install refusals/failures. The
@@ -1696,6 +1701,34 @@ export async function checkForUpdate(opts: UpdateOptions, force = false, checkOn
             return;
         }
 
+        // #7806 (reusing the #6804 pin state machine): a local pin is
+        // CHECK-ONLY — keep discovering and reporting newer versions, never
+        // auto-install them. This is what keeps a `bili install <ref>` dev
+        // build in place: PR-head builds often carry the SAME version as a
+        // release (no -pr suffix), so the tag channel alone can't recognize
+        // them as "not a release" — only the pin holds them. An explicit
+        // `bili update` (force) breaks through below and clears the pin on
+        // success. resolvePinState self-sweeps expired/stale records (deleting
+        // the file) so the next cycle starts clean.
+        if (!force) {
+            const pinState = await resolvePinState(currentVersion);
+            if (pinState.kind !== "none") {
+                if (pinState.kind === "active") {
+                    if (checkOnly) {
+                        loggerLog("info", `[update] manual web check: holding ${currentVersion} (pinned ${formatPinUntil(pinState.pin)}) — new version ${latest} reported, NOT installing`);
+                    } else {
+                        const key = `pin ${currentVersion}->${latest}`;
+                        if (pinHoldWarnKey !== key) {
+                            pinHoldWarnKey = key;
+                            loggerLog("info", `[update] holding ${currentVersion} (pinned ${formatPinUntil(pinState.pin)}) — new version ${latest} available, auto-upgrade paused until the pin lifts; \`bili unpin\` or an explicit \`bili update\` breaks through`);
+                        }
+                    }
+                    return { status: "update-available", latest, note: `holding ${currentVersion} — pinned ${formatPinUntil(pinState.pin)}; \`bili unpin\` or an explicit \`bili update\` to move` };
+                }
+                loggerLog("info", `[update] pin on ${pinState.pin.version} ${pinState.kind} — released; auto-upgrade resumes`);
+            }
+        }
+
         // #3619: remote update policy + staggered rollout. The gate resolves
         // the final install candidate (pin ceiling / blocked stepping) and the
         // per-version upgrade moment; any gate failure degrades to the legacy
@@ -1764,6 +1797,12 @@ export async function checkForUpdate(opts: UpdateOptions, force = false, checkOn
             if (result.ok) {
                 await clearInstallBackoff(bkey);
                 await persistLastInstall(currentVersion, target, force ? "manual" : "auto-update");
+                // #7806: a successful install moves the version, so a local pin
+                // on the old one is stale by definition — release it here (it
+                // would just be re-swept on the next resolve).
+                if (await clearPin()) {
+                    loggerLog("info", `[update] cleared local pin on ${currentVersion} (version changed to ${target})`);
+                }
                 loggerLog("info", `[update] installed ${currentVersion} \u2192 ${target}. Restart to finish.`);
                 // #966: dsh profile copies load their own plugin+proxy from the
                 // profile's node_modules — without this they would keep running
@@ -2316,6 +2355,13 @@ export async function forceInstallVersion(
         if (result.ok) {
             const channel = installSource ?? `advisory:${advisoryId}`;
             await persistLastInstall(diskUnderLock ?? opts.currentVersion, targetVersion, channel);
+            // #7806: an explicit install (owner-directed repair / advisory /
+            // web panel) beats a local pin — the version changed, the pin is
+            // stale by definition. Release it instead of leaving a record that
+            // would be swept on the next resolve.
+            if (await clearPin()) {
+                loggerLog("info", `[update] cleared local pin on ${diskUnderLock ?? opts.currentVersion} (version changed to ${targetVersion} via ${channel})`);
+            }
             // Advisory callers keep their pre-existing log wording exactly (#4791 review); only explicit sources get the channel label.
             const logLabel = installSource ? channel : `advisory ${advisoryId}`;
             loggerLog("info", `[update] ${logLabel}: installed ${diskUnderLock ?? opts.currentVersion} → ${targetVersion}. Restart to finish.`);

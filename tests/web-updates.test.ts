@@ -47,6 +47,7 @@ const { VERSION } = await import("../src/version.ts");
 const { _setReleaseNotesStateForTest, _resetReleaseNotesWatcherForTest } = await import("../src/update-notes.ts");
 const ua = await import("../src/server/update-actions.ts");
 const { forceInstallVersion, getLastInstall, readDiskVersion, lastUpdateCheckTime, _resetLastInstallForTest } = await import("../src/update.ts");
+const { writePin, clearPin } = await import("../src/update-pin.ts");
 const { rmrf } = await import("./tmp-rm.ts");
 
 /** Fresh fixture "install" — a plain dir whose package.json pins a version
@@ -70,6 +71,34 @@ test("unwired process: every action degrades to a plain error string, never thro
     assert.equal(s.running, VERSION);
     assert.equal(s.checking, false);
     assert.equal(s.installing, false);
+});
+
+test("updateStateSnapshot: a git-source dev-install pin earns a badge field (#7806)", async () => {
+    ua._resetUpdateActionsForTest();
+    const fixture = makeFixture("0.1.216");
+    try {
+        ua.registerUpdateActions({ packageName: "billion-context", currentVersion: VERSION, autoUpdate: false, installDir: fixture });
+        // No pin → no badge field.
+        assert.equal((await ua.updateStateSnapshot(VERSION)).pin, undefined, "no pin on disk → no badge");
+        // A git-source pin (version matches the disk) → active badge.
+        await writePin({ v: 1, version: "0.1.216", setAt: Date.now(), until: Date.now() + 86400000, source: { kind: "git", ref: "pull/7738/head", sha: "deadbeefdeadbeef" } });
+        let st = await ua.updateStateSnapshot(VERSION);
+        assert.equal(st.pin?.ref, "pull/7738/head");
+        assert.equal(st.pin?.sha, "deadbeefdeadbeef");
+        assert.equal(st.pin?.active, true, "not time-expired AND matches disk → active");
+        // A source-less pin (plain `bili pin`) is NOT a dev install → no badge.
+        await clearPin();
+        await writePin({ v: 1, version: "0.1.216", setAt: Date.now() });
+        assert.equal((await ua.updateStateSnapshot(VERSION)).pin, undefined, "source-less pin → no dev-install badge");
+        // A time-expired git pin → badge present but inactive.
+        await clearPin();
+        await writePin({ v: 1, version: "0.1.216", setAt: Date.now() - 40 * 86400000, until: Date.now() - 10 * 86400000, source: { kind: "git", ref: "master", sha: "cafebabe" } });
+        st = await ua.updateStateSnapshot(VERSION);
+        assert.equal(st.pin?.active, false, "time-expired → inactive");
+    } finally {
+        await clearPin();
+        ua._resetUpdateActionsForTest();
+    }
 });
 
 test("installVersionAction rejects non-semver shapes before touching the updater (#3719)", async () => {
