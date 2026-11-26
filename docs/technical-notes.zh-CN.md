@@ -99,6 +99,16 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 
 由于 `/bili/{绝对上游URL}` 只是一个 URL 前缀,任何你能控制 baseURL 的客户端都可以直连使用,不依赖钩子。把 provider 的 `baseURL` 指向 `http://<代理主机>:<端口>/bili/<上游基址>` 是远程 agent 的受支持形态(configuration.md 的 `host` 节),也是某条车道的钩子确实漏轮时的推荐兜底:压缩、计费、门禁拒绝与日志全部照常生效,因为它就是钩子改写到的同一条通道。注意:直连客户端不带插件归因头,其会话落入匿名(`pfa-*`)链,按窗口解析阶梯定窗 —— 与其它无归因流量一致(#5907)。
 
+## GPT-6.2 前缀编辑后丢推理 —— bili 折叠接受该代价(#7144)
+
+从 GPT-6.2 起,OpenAI 的 Responses API 在**对话前部轮次被修改后会作废(删除)推理项**——模型从剩余可见文本重新推导思考。只有 OpenAI 官方服务端压缩(`/responses/compact`、`context_management`)能保住推理,因为它在推理所在地运行。bili 的折叠正是这种客户端前缀编辑:被折轮次由折叠锚点处的原位块摘要(kernel `acp_summary`,见 tests/responses-fold-cache-seam.test.ts、#1548)替换,新锻造的摘要又注入 developer 消息(src/server/prepare-responses.ts 的 `devParts = [...systemParts, ...forgedSummaries, prompt]`)——按 OpenAI 自己的文档措辞就是前缀改写。#651 的推理裁剪(src/reasoning-drop.ts,默认开,阈值 2048 字符)是同类编辑:gpt-6.2 会话上第一次关闭轮裁剪就会作废其后的活推理,即使一次折叠都没发生。
+
+后果的精确范围:responses 线路 + GPT-6.2 及以上,每次 bili 折叠(和每次 #651 裁剪)会使编辑点之后的*活*推理项失效;模型从摘要 + 尾部可见消息继续,可能重推早先思考(OpenAI 文档载明的失效形态:回答质量可能下降,且模型花重复劳动的 token)。已关闭/较早轮次的推理在 bili 现有设计下对**所有**模型本来就有同样损失——这不是新的伤害维度。尾部保护是**可调权衡**而非契约:`compress.preserveRecentMessages: 0`(初始版本姿态)会把全部历史折掉、让模型只靠摘要干活,所以 GPT-6.2 的最坏情况落在工具本来就合法支持的配置之内,只是服务端替你把“推理部分”的保护调小了。
+
+**裁定(owner, 2026-11-19, #7144):维持现状 —— 只文档化,不加 gate。** 影响有界,对强模型丢一段思考代价低:下一个工具结果就会重新锚定推导。若出现可测症状(长链推理任务在两次折叠之间重推深度思考、token 明显翻倍),按序有现成轻杆:(1) 安静时刻折叠 gate —— 尾部为连续纯思考段时延后折叠,emergency 兑底不动;(2) gpt-6.2+ 会话设 `compress.reasoning.drop: false`,停掉 #651 这类编辑;(3) 委托官方 `/responses/compact` —— 唯一无损路径,但依赖服务端持有状态(`previous_response_id`),与无状态重放设计(#1954)矛盾,属另立的更大特性。(注意:src/codex-compact.ts 现有的 `/responses/compact` 处理是给 codex *伪造*压缩响应,从不调 OpenAI 端点。)
+
+官方文档:https://developers.openai.com/api/docs/guides/keep-prefix-unchanged.md 与 https://developers.openai.com/api/docs/guides/latest-model#gpt-6.2-astra-whats-new
+
 ## 单写者:哪份拷贝归谁管(#991)
 
 一台机器上每一份 bili 存在物恰好有**一个写者** —— 装它的那个东西负责更新它,其他任何东西都不就地覆盖那份拷贝:
