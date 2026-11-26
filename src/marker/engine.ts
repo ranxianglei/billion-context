@@ -109,6 +109,10 @@ function stripMessagesArray(messages: unknown, counts: RawStripCounts): void {
         const r = messages[i];
         if (isPlainRecord(r) && r.role === "user") lastUserIdx = i;
     }
+    // #7320: assistant slots the strip degraded to whitespace must not mint
+    // occurrence-numbered ids — a resumed history can shift them and move
+    // existing summary anchors (same mechanism as the responses fix, #7306).
+    const statusOnly = new Set<Record<string, unknown>>();
     // reverse index: nudge splices remove the current element, and a forward
     // for..of would silently skip the next message after each splice
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -118,8 +122,19 @@ function stripMessagesArray(messages: unknown, counts: RawStripCounts): void {
         if (role !== "user" && role !== "assistant") continue;
         const latestUserTurn = i === lastUserIdx;
         if (typeof rec.content === "string") {
-            rec.content = stripTextSlot(rec.content, counts, { latestUserTurn });
+            const stripped = stripTextSlot(rec.content, counts, { latestUserTurn });
+            // #7320: a string-content assistant message that the strip blanked
+            // and carries no tool_calls is a status echo — drop the whole
+            // message so it never mints an occurrence-numbered id.
+            if (role === "assistant" && rec.content !== stripped && stripped.trim() === ""
+                && !(Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0)) {
+                statusOnly.add(rec);
+            }
+            rec.content = stripped;
         } else if (Array.isArray(rec.content)) {
+            // #7320: track which text parts the strip degraded, so the
+            // whitespace marker echoes can be dropped before projection.
+            const changedParts = new Set<Record<string, unknown>>();
             for (const part of rec.content) {
                 if (!isPlainRecord(part)) continue;
                 // KDD #10 / #1882: signed thinking blocks ride byte-for-byte —
@@ -127,7 +142,22 @@ function stripMessagesArray(messages: unknown, counts: RawStripCounts): void {
                 // explicit gate keeps a future shape change from silently
                 // wiring them into the strip walk.
                 if (part.type === "thinking" || part.type === "redacted_thinking") continue;
-                if (typeof part.text === "string") part.text = stripTextSlot(part.text, counts, { latestUserTurn });
+                if (typeof part.text === "string") {
+                    const stripped = stripTextSlot(part.text, counts, { latestUserTurn });
+                    if (part.text !== stripped) changedParts.add(part);
+                    part.text = stripped;
+                }
+            }
+            if (role === "assistant" && changedParts.size > 0) {
+                for (let j = rec.content.length - 1; j >= 0; j--) {
+                    const part = rec.content[j];
+                    if (changedParts.has(part) && typeof part.text === "string" && part.text.trim() === "") {
+                        rec.content.splice(j, 1);
+                    }
+                }
+                // The message is left with no blocks at all only when every
+                // block was a stripped marker echo — then drop the message.
+                if (rec.content.length === 0) statusOnly.add(rec);
             }
         }
         // nudge echoes: whole user message (exact tail match); an assistant
@@ -141,6 +171,14 @@ function stripMessagesArray(messages: unknown, counts: RawStripCounts): void {
             }
         }
     }
+    if (statusOnly.size > 0) {
+        // Compact once, preserving order and the array identity.
+        let write = 0;
+        for (const item of messages) {
+            if (!statusOnly.has(item)) messages[write++] = item;
+        }
+        messages.length = write;
+    }
 }
 
 // google `contents` walk (#2798 fix): text parts live at content.parts[].text.
@@ -153,6 +191,10 @@ function stripGoogleContents(parsed: unknown, counts: RawStripCounts): void {
         const c = contents[i];
         if (isPlainRecord(c) && c.role === "user") lastUserIdx = i;
     }
+    // #7320: model parts the strip degraded to whitespace must not mint
+    // occurrence-numbered ids — a resumed history can shift them and move
+    // existing summary anchors (same mechanism as the responses fix, #7306).
+    const statusOnly = new Set<Record<string, unknown>>();
     for (let i = contents.length - 1; i >= 0; i--) {
         const c = contents[i];
         if (!isPlainRecord(c)) continue;
@@ -161,6 +203,9 @@ function stripGoogleContents(parsed: unknown, counts: RawStripCounts): void {
         const parts = c.parts;
         if (!Array.isArray(parts)) continue;
         const latestUserTurn = i === lastUserIdx;
+        // #7320: track which text parts the strip degraded, so the whitespace
+        // marker echoes can be dropped before projection.
+        const changedParts = new Set<Record<string, unknown>>();
         for (const p of parts) {
             if (!isPlainRecord(p)) continue;
             // KDD #10 / #1960: thought text is signed (thoughtSignature is
@@ -169,7 +214,22 @@ function stripGoogleContents(parsed: unknown, counts: RawStripCounts): void {
             // verbatim; cosmetic marker echoes inside a thought pane are
             // accepted, same verdict as the outbound walk (adapter-google).
             if (p.thought === true || p.thoughtSignature !== undefined) continue;
-            if (typeof p.text === "string") p.text = stripTextSlot(p.text, counts, { latestUserTurn });
+            if (typeof p.text === "string") {
+                const stripped = stripTextSlot(p.text, counts, { latestUserTurn });
+                if (p.text !== stripped) changedParts.add(p);
+                p.text = stripped;
+            }
+        }
+        if (role === "model" && changedParts.size > 0) {
+            for (let j = parts.length - 1; j >= 0; j--) {
+                const p = parts[j];
+                if (changedParts.has(p) && typeof p.text === "string" && p.text.trim() === "") {
+                    parts.splice(j, 1);
+                }
+            }
+            // The content is left with no parts at all only when every part
+            // was a stripped marker echo — then drop the whole content.
+            if (parts.length === 0) statusOnly.add(c);
         }
         // whole-content removal only under carrier strictness: every part is
         // a single-key {text} and the joined text matches a panel / nudge.
@@ -184,6 +244,14 @@ function stripGoogleContents(parsed: unknown, counts: RawStripCounts): void {
                 counts.nudges += isNudgeEchoText(joined) && !isAcpPanelText(joined) ? 1 : 0;
             }
         }
+    }
+    if (statusOnly.size > 0) {
+        // Compact once, preserving order and the array identity.
+        let write = 0;
+        for (const item of contents) {
+            if (!statusOnly.has(item)) contents[write++] = item;
+        }
+        contents.length = write;
     }
 }
 
