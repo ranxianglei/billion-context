@@ -105,6 +105,12 @@ export interface BiliMessage extends CoreMessage {
   /** The base64 data of an image (without the data: prefix). Lets the
    *  reverse conversion rebuild the full image payload. */
   imageBase64?: string;
+  /** Responses wire: the exact source input_image part of this image core
+   *  message, bound at parse. Renderers re-emit it verbatim instead of
+   *  consuming a shared cursor across one raw message's parts — cursor
+   *  drift (multi-item user runs, marker-text collision) silently DROPPED
+   *  images (#7824). */
+  rawResponseImagePart?: { type: "input_image"; image_url: string; [key: string]: unknown };
   /** OpenAI chat: ALL original image_url content parts (data: or remote
    *  URL) for a user message carrying more than one image, in wire order.
    *  coreToOpenai re-emits these verbatim (after the text part). The
