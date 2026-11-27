@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { coreToOpenai, openaiToCore } from "../src/wire/openai.js";
 import { coreToGoogle, googleToCore } from "../src/wire/google.js";
+import { anthropicToCore, coreToAnthropic } from "../src/wire/anthropic.js";
+import { coreToResponses, responsesToCore } from "../src/wire/responses.js";
 
 // #3938 / #3939⑥ — wire byte fidelity. The upstream prefix cache only holds
 // when the SAME logical shape serializes to IDENTICAL bytes on every
@@ -211,4 +213,205 @@ test("google: repeated parses of one body mint identical ids", () => {
   const a = googleToCore(body as never).msgs.map((m) => m.id);
   const b = googleToCore(body as never).msgs.map((m) => m.id);
   assert.deepEqual(b, a);
+});
+
+// #7825 — extend the #3939⑥ byte-stability pin to the two lanes PR #7738
+// changed the most (anthropic + responses, via #7684's render-fidelity work).
+// Same contract as openai/google above: a fixed logical shape must serialize
+// to IDENTICAL bytes on every request, or the upstream prefix cache breaks.
+// Goldens characterized against the current emission (probe-verified
+// 2026-11-27), not invented.
+
+const A_IMG = {
+  type: "image",
+  source: { type: "base64", media_type: "image/png", data: "QQ==" },
+};
+const A_DOC = {
+  type: "document",
+  source: { type: "base64", media_type: "application/pdf", data: "PDF" },
+};
+const A_TOOL_USE = { type: "tool_use", id: "call_1", name: "f", input: { b: 1, a: 2 } };
+const A_TOOL_RESULT = { type: "tool_result", tool_use_id: "call_1", content: "ok" };
+
+function aRebuild(messages: object[]) {
+  const flat = anthropicToCore({ messages } as never);
+  return coreToAnthropic(flat.msgs, flat.cacheControls);
+}
+
+test("anthropic: text + tool_use + tool_result round-trips byte-exact (input object keeps insertion order)", () => {
+  const body = [
+    { role: "user", content: [{ type: "text", text: "T1" }] },
+    { role: "assistant", content: [{ type: "text", text: "A1" }, A_TOOL_USE] },
+    { role: "user", content: [A_TOOL_RESULT] },
+  ];
+  // The tool_use input object must keep the host's insertion order
+  // ({ b, a }, not { a, b }) — a reorder here desyncs the prefix cache.
+  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+});
+
+test("anthropic: image block rides the sidecar verbatim (never re-laid-out)", () => {
+  const body = [{ role: "user", content: [A_IMG, { type: "text", text: "look" }] }];
+  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+});
+
+test("anthropic: redacted_thinking rides the sidecar verbatim (signature-verified, never rewritten)", () => {
+  const body = [
+    {
+      role: "assistant",
+      content: [{ type: "redacted_thinking", data: "REDACTED" }, { type: "text", text: "A3" }],
+    },
+  ];
+  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+});
+
+test("anthropic: unknown top-level block (document) rides the sidecar verbatim", () => {
+  const body = [{ role: "user", content: [A_DOC, { type: "text", text: "read" }] }];
+  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+});
+
+test("anthropic: unsigned thinking round-trips as { type: thinking, thinking } (no signature key)", () => {
+  const body = [
+    { role: "assistant", content: [{ type: "thinking", thinking: "hmm" }, { type: "text", text: "A4" }] },
+  ];
+  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+});
+
+const A_SHAPES: [string, object[]][] = [
+  ["text", [{ role: "user", content: [{ type: "text", text: "T1" }] }]],
+  [
+    "tool-loop",
+    [
+      { role: "user", content: [{ type: "text", text: "T1" }] },
+      { role: "assistant", content: [{ type: "text", text: "A1" }, A_TOOL_USE] },
+      { role: "user", content: [A_TOOL_RESULT] },
+    ],
+  ],
+  ["image", [{ role: "user", content: [A_IMG, { type: "text", text: "look" }] }]],
+];
+for (const [name, first] of A_SHAPES) {
+  test(`anthropic: ${name} — appended turns leave the rebuilt prefix byte-identical`, () => {
+    const req1 = aRebuild(first);
+    const req2 = aRebuild([
+      ...first,
+      { role: "assistant", content: [{ type: "text", text: "A1" }] },
+      { role: "user", content: [{ type: "text", text: "next" }] },
+    ]);
+    assert.equal(req2.length, req1.length + 2);
+    assert.equal(JSON.stringify(req2.slice(0, req1.length)), JSON.stringify(req1));
+  });
+}
+
+test("anthropic: parse is a structural fixed point over rebuild", () => {
+  const pick = (m: { [k: string]: unknown }) => ({
+    id: m.id,
+    ct: m.contentType,
+    text: m.text,
+    toolCallId: m.toolCallId ?? null,
+    toolName: m.toolName ?? null,
+    raw: m.rawAnthropicBlock ?? null,
+  });
+  const body = { messages: [{ role: "user", content: [A_IMG, { type: "text", text: "T1" }] }] };
+  const once = anthropicToCore(body as never).msgs.map(pick);
+  const twice = anthropicToCore({
+    messages: coreToAnthropic(anthropicToCore(body as never).msgs),
+  } as never).msgs.map(pick);
+  assert.deepEqual(twice, once);
+});
+
+test("anthropic: repeated parses of one body mint identical ids", () => {
+  const body = { messages: [{ role: "user", content: [A_IMG, { type: "text", text: "T1" }] }] };
+  const a = anthropicToCore(body as never).msgs.map((m) => m.id);
+  const b = anthropicToCore(body as never).msgs.map((m) => m.id);
+  assert.deepEqual(b, a);
+});
+
+const R_IMG = { type: "input_image", image_url: "data:image/png;base64,QQ==" };
+const R_FUNC_CALL = { type: "function_call", call_id: "call_1", name: "f", arguments: '{"b":1,"a":2}' };
+const R_FUNC_OUT = { type: "function_call_output", call_id: "call_1", output: "ok" };
+
+function rRebuild(input: object[]) {
+  const proj = responsesToCore({ input } as never);
+  return coreToResponses(proj.msgs, proj.customToolCallIds);
+}
+
+test("responses: message + function_call + function_call_output round-trips byte-exact", () => {
+  const body = [
+    { type: "message", role: "user", content: "T1" },
+    R_FUNC_CALL,
+    R_FUNC_OUT,
+  ];
+  assert.equal(JSON.stringify(rRebuild(body)), JSON.stringify(body));
+});
+
+test("responses: reasoning item re-emits the raw item verbatim (never re-laid-out)", () => {
+  const body = [
+    { type: "reasoning", id: "rs_1", summary: [] },
+    { type: "message", role: "assistant", content: "A2" },
+  ];
+  assert.equal(JSON.stringify(rRebuild(body)), JSON.stringify(body));
+});
+
+test("responses: image-only user item is preserved (tracked via [image] placeholder, never vanishes)", () => {
+  const body = [{ type: "message", role: "user", content: [R_IMG] }];
+  assert.equal(JSON.stringify(rRebuild(body)), JSON.stringify(body));
+});
+
+test("responses: text+image user message preserves both parts (split cores rebuild verbatim)", () => {
+  const body = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "look at" }, R_IMG] },
+  ];
+  assert.equal(JSON.stringify(rRebuild(body)), JSON.stringify(body));
+});
+
+const R_SHAPES: [string, object[], object][] = [
+  ["text", [{ type: "message", role: "user", content: "T1" }], { type: "message", role: "assistant", content: "A1" }],
+  ["tool-loop", [{ type: "message", role: "user", content: "T1" }, R_FUNC_CALL, R_FUNC_OUT], { type: "message", role: "user", content: "next" }],
+  ["image", [{ type: "message", role: "user", content: [R_IMG] }], { type: "message", role: "assistant", content: "A1" }],
+];
+for (const [name, first, append] of R_SHAPES) {
+  test(`responses: ${name} — appended turns leave the rebuilt prefix byte-identical`, () => {
+    const req1 = rRebuild(first);
+    const req2 = rRebuild([...first, append]);
+    assert.equal(req2.length, req1.length + 1);
+    assert.equal(JSON.stringify(req2.slice(0, req1.length)), JSON.stringify(req1));
+  });
+}
+
+test("responses: parse is a structural fixed point over rebuild", () => {
+  const pick = (m: { [k: string]: unknown }) => ({
+    id: m.id,
+    ct: m.contentType,
+    text: m.text,
+    toolCallId: m.toolCallId ?? null,
+    toolName: m.toolName ?? null,
+    raw: m.rawResponsesItem ?? null,
+  });
+  const body = {
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "look at" }, R_IMG] }],
+  };
+  const once = responsesToCore(body as never).msgs.map(pick);
+  const proj = responsesToCore(body as never);
+  const twice = responsesToCore({
+    input: coreToResponses(proj.msgs, proj.customToolCallIds),
+  } as never).msgs.map(pick);
+  assert.deepEqual(twice, once);
+});
+
+test("responses: repeated parses of one body mint identical ids", () => {
+  const body = {
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "look at" }, R_IMG] }],
+  };
+  const a = responsesToCore(body as never).msgs.map((m) => m.id);
+  const b = responsesToCore(body as never).msgs.map((m) => m.id);
+  assert.deepEqual(b, a);
+});
+
+test("cross-lane: the same image payload mints the same core id on anthropic and responses", () => {
+  const aId = anthropicToCore({
+    messages: [{ role: "user", content: [A_IMG] }],
+  } as never).msgs[0]!.id;
+  const rId = responsesToCore({
+    input: [{ type: "message", role: "user", content: [R_IMG] }],
+  } as never).msgs[0]!.id;
+  assert.equal(rId, aId);
 });
