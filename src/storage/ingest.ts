@@ -40,7 +40,6 @@ import { splitMediaContent, identityOfStoredContent } from "./identity.js";
  */
 import { COMPRESSION_STATE_FIELDS as MERGE_STATE_FIELDS } from "../state-hydration.js";
 import { KSTATE_RESIDUAL_FIELDS } from "./egress-block.js";
-import { featureEnabled } from "../rollout.js";
 
 /** Fields owned by dedicated tables/columns — never inside kstate_json. */
 const TABLE_OWNED_FIELDS = new Set(["blocks", "messageRefs", "deadRefs", "nextBlockId", "nextRunId"]);
@@ -517,11 +516,22 @@ function finishPlan(
             if (startSeq === -1 || s < startSeq) startSeq = s;
             if (s > endSeq) endSeq = s;
         }
+        // #7439 follow-up (C6): the kernel's OWN attested coverage bounds,
+        // carried on their native 1-based display space (CoreMessage.ledgerSeq
+        // / refs #4316 L3). The transcript resolution above lives in 0-based
+        // table space and is what eg-off keeps; egress-on sessions bind from
+        // these (see the per-block rule in ingestSession) — without it the
+        // flow-folded ids are already D'd from the view at save time and the
+        // bound would resolve to the honest no-claim sentinel.
+        const proven = typeof b.startSeq === "number" && typeof b.endSeq === "number" && b.startSeq >= 1 && b.endSeq >= b.startSeq
+            ? { provenStartSeq: b.startSeq, provenEndSeq: b.endSeq }
+            : {};
         return {
             blockId: b.blockId,
             ord,
             startSeq,
             endSeq,
+            ...proven,
             startRef: b.startRef !== undefined ? refToIndex(b.startRef) : null,
             endRef: b.endRef !== undefined ? refToIndex(b.endRef) : null,
             tier: b.tier,
@@ -602,11 +612,13 @@ function finishPlan(
     // block-ledger sidecar carries. Everything else (blocks, messageRefs,
     // tsStamps, tokenSnapshot, lastPassIds) is rebuildable from the op log at
     // load (rebuildEgressKstateOverlay); storing it would only grow the
-    // column and create a second, stale authority. 0 = legacy double-write.
+    // column and create a second, stale authority.
     // NOTE: an armed egress-on session's unified legs are frozen anyway
     // (egressProjectionFrozen) — this gate covers the arm-point and
     // rollback-window writes.
-    const retireWrites = egressOn && featureEnabled("egressKstateRetireWrites");
+    // KDD #25 (owner ruling 2026-11-26): folded into egressPlane — ONE
+    // switch; the former egressKstateRetireWrites gate was removed.
+    const retireWrites = egressOn;
     const KSTATE_RESIDUAL_SET = new Set<string>(KSTATE_RESIDUAL_FIELDS);
     const kstateRaw: Record<string, unknown> = {};
     for (const field of MERGE_STATE_FIELDS) {

@@ -117,7 +117,7 @@ PRIMARY KEY (session_id, log_seq)
 ```
 
 - `egress_state` = serving reads + compaction physically trims below the watermark;
-- `egress_flow` = append-only, **never deleted** (any historical log_seq can be rebuilt; rollback is based on this table, not on client resends). Changed in #7574 (§7.3): a compaction now trims this table too — it keeps the newest base row plus everything after it.
+- `egress_flow` = append-only, **never deleted** (any historical log_seq can be rebuilt; rollback is based on this table, not on client resends). A 2026-11-23 build (df7ac0929) made compaction trim this table too ("keeps the newest base row plus everything after it"); the #7439 ruling restored on 2026-11-26 — compaction prunes `egress_state` only, the flow stays append-only.
 
 Row payload contracts (egress-state.ts):
 - `I`: `{"after": msgid|null, "ref", "tokens", "type", "content_hash", "role"?, "cas_ref"?}`
@@ -164,7 +164,7 @@ Ported: `orphan_blocks`, `state_fields`, `ccr_entries.orig_hash` (+ index, probe
 
 - `diffEgressView` (153-204): the spine = the longest subsequence of `next`'s msgids that appears **in ascending order** in `prev` (two-pointer scan); a spine row whose contentHash changed ⇒ `U`; a prev row off the spine ⇒ emit the maximal contiguous `D` span in prev order; a next row off the spine ⇒ emit `I`s in next order (anchor = previous row); **a move = D+I, there is no M op**; op order D→U→I; invariant `replay(prev, diff(prev,next)) === next`.
 - `nextLogSeq` is taken from **flow** (state is physically trimmed by compaction; flow is the superset).
-- `egressStateAt(db, sid, x)` (264-274): replay flow up to `log_seq <= x` = rebuild at any historical point (rollback). Since #7574 (§7.3): any point from the newest base row on.
+- `egressStateAt(db, sid, x)` (264-274): replay flow up to `log_seq <= x` = rebuild at any historical point (rollback). Every point — including points below the newest base row (the flow is append-only; see the deviation note above).
 - `egressStateCompact` (278-292): the replay result is written as one `B` row (both tables) + physical delete of state rows below the watermark (flow untouched).
 - Any anchor/endpoint/duplicate/malformed violation ⇒ throws `EgressStateCorruptError` (36-42) ⇒ the caller **degrades the whole session to legacy**, never a fuzzy fallback.
 
@@ -412,7 +412,7 @@ A request of 1 MiB or more that carries an `x-bili-pf-*` header has its JSON dec
 - **A damaged log.** It costs a turn only for those authority sessions (same 500 as before). A session that is only mirrored keeps answering; the damage is logged once per turn. `GET /__bili/egress/latches` lists the sessions that failed. `POST /__bili/egress/reset { sessionId }` drops the damaged log; the next turn rebuilds it from the client's conversation. A latched session no longer re-scans its log on every request.
 - **Walking back** (and truncating after the last healthy point) happens only when the log really does not replay, and only for authority sessions. A busy/locked/I/O error is passed on and deletes nothing.
 - **Two requests on one session.** The writer whose turn started on an older log is refused (`EgressConcurrentWriteError`) and its turn is served unrecorded. A batch that would break the log is refused before anything is written.
-- **Compaction.** A turn that deletes compacts in the same write, and the compaction trims **both** tables. `egress_flow` is no longer "append-only, never deleted": it keeps the newest base row plus everything after it, and `egressStateAt` rebuilds any point from the newest base on. (Before: the flow kept every row and grew by one full snapshot per fold.)
+- **Compaction.** A turn that deletes compacts in the same write. The compaction trims the **state** table below the new base row; the **flow** table keeps every row it ever wrote (append-only, #7439 ruling — restored 2026-11-26 after a 2026-11-23 build pruned it below the newest base), so `egressStateAt` rebuilds any historical point. Growth is a deferred optimization (#7475), addressed elsewhere, never by retention.
 - **The serving copy** (`egress_state`) is compared with the log on every read; a damaged copy is copied again from the log, a hole in the log is reported.
 - **`after: null` on a non-empty view means "the new first row"**, in both replays. (Before: validation put it first, storage put it last, and the next turn paid a delete-and-insert rewrite.)
 - **Plane off** = nothing reads the op log, even for sessions that have one: the pin ledger reads `messages`, the drift checks are off.

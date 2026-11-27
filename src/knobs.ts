@@ -975,6 +975,31 @@ export function fileStorageUnified(): string | undefined {
     return typeof v === "string" ? v : undefined;
 }
 
+/** KDD #25 (discussions/7735) + the single-gate unification (discussions/7773
+ *  follow-up, PR #7738): THE one "egressPlane on?" read for the whole plane —
+ *  store creation (which tables a fresh DB gets), kv256, affinity retirement
+ *  AND every runtime behavior (arming, frozen ingest, serving-from-log, route
+ *  table persistence). featureEnabled() is NOT usable in any of them:
+ *  it resolves against the install id (rolloutInstallId), whose first-call
+ *  bootstrap performs the wx file race — a side effect that must not fire
+ *  from inside UnifiedStore.open — and two predicates that can disagree
+ *  (percent bucketing vs boolean) manufacture mixed states: a
+ *  `{ percent: 100 }` config armed routing while the DDL/kv/affinity side
+ *  stayed legacy. Mirrors rollout.resolveInternal's tiers minus install-id
+ *  bucketing: env force ("0"/"false" = off, anything else set = on), then
+ *  the explicit config boolean; percent-only configs fall closed because
+ *  the built-in plan's egressPlane percent is 0 (opt-in feature). The
+ *  rollout percent field for egressPlane is therefore intentionally inert —
+ *  staged GA goes through `enabled: true` / the env var, not bucketing. */
+export function egressPlaneGateOn(): boolean {
+    const envRaw = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    if (envRaw !== undefined) return envRaw !== "0" && envRaw !== "false";
+    const raw = loadConfigFile().rollout?.features?.egressPlane;
+    if (raw === true) return true;
+    if (typeof raw === "object" && raw !== null) return raw.enabled === true;
+    return false;
+}
+
 export function fileStorageJsonWriter(): string | undefined {
     const v = loadConfigFile().storage?.jsonWriter;
     return typeof v === "string" ? v : undefined;
