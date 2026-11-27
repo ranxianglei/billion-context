@@ -2,15 +2,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { coreToOpenai, openaiToCore } from "../src/wire/openai.js";
 import { coreToGoogle, googleToCore } from "../src/wire/google.js";
+import { coreToAnthropic, anthropicToCore } from "../src/wire/anthropic.js";
+import { coreToResponses, responsesToCore } from "../src/wire/responses.js";
 
 // #3938 / #3939⑥ — wire byte fidelity. The upstream prefix cache only holds
 // when the SAME logical shape serializes to IDENTICAL bytes on every
-// request. openaiToCore/coreToOpenai and googleToCore/coreToGoogle are pure
-// functions of the request body; these pins make that stability explicit
-// (the "explicit canonical" half of the #3939⑥ contract) so any future
-// reorder — however well-intentioned — fails here before it breaks a live
-// session's cache. Goldens below were characterized against the current
-// emission (probe-verified 2026-10-20), not invented.
+// request. The four codec pairs below pin that stability explicitly (the
+// "explicit canonical" half of the #3939⑥ contract) so any future reorder —
+// however well-intentioned — fails here before it breaks a live session's
+// cache. Goldens below were characterized against the current emission
+// (probe-verified 2026-10-20; anthropic/responses sections added 2026-11-27,
+// #7825 — the two lanes this PR changed most had no byte-level pin at all).
 
 const FILE = {
   type: "file",
@@ -210,5 +212,121 @@ test("google: repeated parses of one body mint identical ids", () => {
   const body = { contents: [{ role: "user", parts: [{ text: "after fd" }, FD] }] };
   const a = googleToCore(body as never).msgs.map((m) => m.id);
   const b = googleToCore(body as never).msgs.map((m) => m.id);
+  assert.deepEqual(b, a);
+});
+
+// ── anthropic ──────────────────────────────────────────────────────────
+
+const A_IMG = {
+  type: "image",
+  source: { type: "base64", media_type: "image/png", data: "QQ==" },
+};
+
+function aRebuild(messages: object[]) {
+  return coreToAnthropic(
+    anthropicToCore({ messages } as never).msgs as never,
+  );
+}
+
+test("anthropic: user [text, image] + unsigned thinking/text rebuild verbatim", () => {
+  assert.deepEqual(
+    aRebuild([
+      { role: "user", content: [{ type: "text", text: "hi" }, A_IMG] },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "T-THINK" }, { type: "text", text: "hello" }],
+      },
+    ]),
+    [
+      { role: "user", content: [{ type: "text", text: "hi" }, A_IMG] },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "T-THINK" }, { type: "text", text: "hello" }],
+      },
+    ],
+  );
+});
+
+test("anthropic: plain string content normalizes to the text-parts array shape", () => {
+  assert.deepEqual(aRebuild([{ role: "user", content: "next" }]), [
+    { role: "user", content: [{ type: "text", text: "next" }] },
+  ]);
+});
+
+test("anthropic: parse is a structural fixed point over rebuild", () => {
+  const msgs = anthropicToCore({
+    messages: [
+      { role: "user", content: [{ type: "text", text: "hi" }, A_IMG] },
+      { role: "assistant", content: [{ type: "text", text: "hello" }] },
+    ],
+  } as never).msgs;
+  const once = anthropicToCore({
+    messages: coreToAnthropic(msgs as never),
+  } as never).msgs;
+  assert.deepEqual(once.map((m) => m.id), msgs.map((m) => m.id));
+  assert.deepEqual(once.map((m) => m.text), msgs.map((m) => m.text));
+});
+
+test("anthropic: repeated parses of one body mint identical ids", () => {
+  const body = { messages: [{ role: "user", content: [{ type: "text", text: "hi" }, A_IMG] }] };
+  const a = anthropicToCore(body as never).msgs.map((m) => m.id);
+  const b = anthropicToCore(body as never).msgs.map((m) => m.id);
+  assert.deepEqual(b, a);
+});
+
+// ── responses ──────────────────────────────────────────────────────────
+
+function rRebuild(input: object[]) {
+  return coreToResponses(responsesToCore({ input } as never).msgs);
+}
+
+test("responses: two single-image user items stay distinct verbatim items (#7824)", () => {
+  const itemA = {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_image", image_url: "data:image/png;base64,QUJD" }],
+  };
+  const itemB = {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_image", image_url: "data:image/png;base64,RURG" }],
+  };
+  assert.deepEqual(rRebuild([itemA, itemB]), [itemA, itemB]);
+});
+
+test("responses: single [text, image] item rebuilds byte-stable (fullCover path)", () => {
+  const item = {
+    type: "message",
+    role: "user",
+    content: [
+      { type: "input_text", text: "T" },
+      { type: "input_image", image_url: "data:image/png;base64,QUJD" },
+    ],
+  };
+  assert.deepEqual(rRebuild([item]), [item]);
+});
+
+test("responses: parse is a structural fixed point over rebuild", () => {
+  const msgs = responsesToCore({
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "T" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "A" }] },
+    ],
+  } as never).msgs;
+  const once = responsesToCore({
+    input: coreToResponses(msgs),
+  } as never).msgs;
+  assert.deepEqual(once.map((m) => m.id), msgs.map((m) => m.id));
+  assert.deepEqual(once.map((m) => m.text), msgs.map((m) => m.text));
+});
+
+test("responses: repeated parses of one body mint identical ids", () => {
+  const body = {
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "T" }] },
+    ],
+  };
+  const a = responsesToCore(body as never).msgs.map((m) => m.id);
+  const b = responsesToCore(body as never).msgs.map((m) => m.id);
   assert.deepEqual(b, a);
 });

@@ -9,6 +9,8 @@ import { MysqlBackend, type Mysql2Module } from "../src/storage/mysql.ts";
 const LIMIT = 4 * 1024 * 1024;
 
 test("SQLite extension limits measure UTF-8 bytes before changing the existing value", () => {
+    const savedPlane = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     const dir = mkdtempSync(join(tmpdir(), "extension-bytes-"));
     const store = UnifiedStore.open(join(dir, "index.db"));
     try {
@@ -22,6 +24,7 @@ test("SQLite extension limits measure UTF-8 bytes before changing the existing v
     } finally {
         store.close();
         rmSync(dir, { recursive: true, force: true });
+        if (savedPlane === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE; else process.env.BILI_ROLLOUT_EGRESS_PLANE = savedPlane;
     }
 });
 
@@ -55,17 +58,26 @@ for (const invalid of ["", "x".repeat(257), "bad\u0000key", "bad\u007fkey"]) {
 }
 
 test("MySQL extension writes reject undefined and over-budget values consistently", async () => {
-    const { backend, queries } = mysqlFixture();
-    for (const value of [undefined, () => 1, "界".repeat(Math.ceil(LIMIT / 3))]) {
-        await assert.rejects(() => backend.setKv("ns", "key", value), /JSON-serializable|exceeds.*bytes/);
-        await assert.rejects(() => backend.setSessionExt("session", "key", value), /JSON-serializable|exceeds.*bytes/);
+    // KDD #25: legacy-mode contract — pin the eg flag OFF for the duration
+    // (the 256-char cap only applies with the flag on, covered by
+    // tests/eg-sweep-egress-identity.test.ts A4).
+    const savedPlane = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
+    try {
+        const { backend, queries } = mysqlFixture();
+        for (const value of [undefined, () => 1, "界".repeat(Math.ceil(LIMIT / 3))]) {
+            await assert.rejects(() => backend.setKv("ns", "key", value), /JSON-serializable|exceeds.*bytes/);
+            await assert.rejects(() => backend.setSessionExt("session", "key", value), /JSON-serializable|exceeds.*bytes/);
+        }
+        assert.equal(queries.length, 0);
+        await backend.setKv("ns", "key", { valid: "界" });
+        await backend.setSessionExt("session", "key", null);
+        assert.equal(queries[0][3], '{"valid":"界"}');
+        assert.equal(queries[1][3], "null");
+        await backend.listKv("ns", "");
+        await backend.deleteKv("ns");
+        await backend.deleteSessionExt("session");
+    } finally {
+        if (savedPlane === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE; else process.env.BILI_ROLLOUT_EGRESS_PLANE = savedPlane;
     }
-    assert.equal(queries.length, 0);
-    await backend.setKv("ns", "key", { valid: "界" });
-    await backend.setSessionExt("session", "key", null);
-    assert.equal(queries[0][3], '{"valid":"界"}');
-    assert.equal(queries[1][3], "null");
-    await backend.listKv("ns", "");
-    await backend.deleteKv("ns");
-    await backend.deleteSessionExt("session");
 });

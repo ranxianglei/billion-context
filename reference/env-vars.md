@@ -84,6 +84,7 @@ holds without polluting the product config surface.
 | Var | Read by | Effect | Default |
 |-----|---------|--------|---------|
 | `BILI_TEST_FORCE` | `scripts/test-suite-lock.mjs` only | Set to `1`/`true`/`yes` to deliberately bypass the per-machine test-suite mutex (#3103) and let a second full `npm test` run share the machine with a live one. Untyped escape hatch for the known limitation the lock cannot cover (orphan daemons from a SIGKILLed suite, cross-clone contention); a normal single run never sets it. | unset = lock enforced |
+| `BILI_TEST_FORCE_FULL_DDL` | `src/storage/shadow.ts` (`UnifiedShadow.maybeOpen`) only | Test-only escape hatch (KDD #25): with `egressPlane` on, a **fresh** DB normally gets only the core trio + the four egress tables (7-table shape). Suites that assert pre-gate legacy table shapes (l1_world/conversations/messages rows) set this to `1` to simulate a pre-gate DB. Production never sets it. | unset = egress-plane creation gate applies |
 | `BILI_TEST_LEAK_GUARD` | `scripts/test-suite-lock.mjs` only | Set to `0`/`false`/`no`/`off` to disable the #5107 leak guard (the post-run diff of the PRODUCTION sessions dir that fails `npm test` when NEW files appeared). The guard is ON by default; this is its false-positive door — a live bili instance starting a brand-new session during a long local run looks like a leak. A normal single run never sets it. | unset = guard enforced |
 
 `BILI_TEST_FORCE` is the escape door the suite lock points at when a sibling
