@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
-import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
+import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, responsesToCore, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type CompressSettings } from "../compress-settings.js";
 import { storeUnpromptedGate } from "../unprompted-gate.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveModelEntry, type ProxyOptions } from "../config.js";
@@ -75,7 +75,11 @@ import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
-import { MSG_IDS_BODY_FIELD, MSGID_MODE_HEADER, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSGID_MODE_HEADER, elementOfCore, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { recordAuthorityTurn, resolveEgressAuthority, egressBlockLedgerFor, egressTinyBudget } from "./egress-lane-io.js";
+import { recoverEgressBase } from "../storage/egress-record.js";
+import { rebuildCoreFromLog } from "../storage/egress-serve.js";
+import { EGRESS_SYSTEM_MSGID } from "../storage/egress-state.js";
 import { DeltaReanchorError } from "./fastpath.js";
 import { synthesizeTopLevel } from "./fastpath-scan.js";
 import { harvestIdentity } from "../identity-harvest.js";
@@ -3441,6 +3445,60 @@ async function handleRequest(
                         typeof (work as ResponsesRequestBody).previous_response_id === "string" &&
                         (work as ResponsesRequestBody).previous_response_id!.length > 0 &&
                         (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0);
+                    // #6181 B3 + egress plane (PR #7857 review F2 → fix): the
+                    // fast path skips prepareResponses — and with it the egress
+                    // record/authority seam (ruling 7439-4's single shared
+                    // implementation). B3 rounds never carry wire msgids, so
+                    // they are never ARMED (no pin) — but a RECORD-ONLY turn
+                    // must still land: a bare-string input is NEW user content
+                    // the provider keeps in its retained chain and the client
+                    // may never resend — without this it is missing from the
+                    // op log (the egress transcript, ruling 7439-5) forever.
+                    // The seam's core must be the lane's FULL view (the diff
+                    // truncates anything it loses), so compose it append-only:
+                    // the flow view + this turn's fresh cores. The kernel id
+                    // is deterministic (content-derived), so the preflight
+                    // re-prepare — and any identical resend — finds the row in
+                    // the flow and records nothing new. Empty-continuation
+                    // turns carry no new content → skipped (a zero-op record
+                    // would only burn a flow read). The fast path itself is
+                    // untouched: no probe, no swap, no hard-fail — the
+                    // client's continuation bytes still go out verbatim
+                    // (#6181's whole point).
+                    // Only a NON-EMPTY string input carries new content: a
+                    // missing/empty input is a pure continuation (the
+                    // provider's chain already holds everything) and the
+                    // kernel's responsesToCore does not parse absent input
+                    // at all — nothing to record, skip the flow read.
+                    const b3Input = (work as ResponsesRequestBody).input;
+                    if (
+                        pureChainContinuation
+                        && typeof b3Input === "string" && b3Input.length > 0
+                        && !egressTinyBudget(work)
+                        && egressPlaneGateOn()
+                    ) {
+                        const b3Fresh = responsesToCore(work as ResponsesRequestBody);
+                        if (b3Fresh.msgs.length > 0) {
+                            const st = getStore().egressOpLogStore();
+                            if (st) {
+                                const base0 = recoverEgressBase(st, session.id, { walk: false });
+                                if (base0 !== null) {
+                                    const flowCore = rebuildCoreFromLog(base0.view);
+                                    if (flowCore !== null) {
+                                        const seen = new Set(base0.view.map((r) => r.msgid));
+                                        const core = [
+                                            ...flowCore,
+                                            ...b3Fresh.msgs.filter((m) => !seen.has(m.id) && !seen.has(elementOfCore(m.id).element)),
+                                        ];
+                                        const auth = resolveEgressAuthority({ session, st, sessionId: session.id, core, log, armed: false });
+                                        const sysFromFlow = base0.view.find((r) => r.msgid === EGRESS_SYSTEM_MSGID)?.bytes ?? "";
+                                        const systemText = b3Fresh.systemParts.length > 0 ? b3Fresh.systemParts.join("\n\n") : sysFromFlow;
+                                        recordAuthorityTurn(st, session.id, auth, systemText, log, egressBlockLedgerFor(session), session.state.messageRefs);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     const preparedOut = protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
