@@ -286,8 +286,13 @@ function substrateDestructionPauseParagraph(n: number): string {
 // parse are never refused here (see applyRanges), so the #2432 substrate
 // recovery step — acp_status once, then ONE live range — still goes through
 // and can clear the breaker.
-function armedRefusalReceipt(n: number, decayMinutes: number): string {
-    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' is ONE string holding every range — each block starts with its 'mNNNNN–mNNNNN optional topic' header line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects as that string also works), using refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
+function armedRefusalReceipt(n: number, decayMinutes: number, cause?: string): string {
+    // #7821: the specific cause (invalidReasons[0]) was withheld while armed, so
+    // the model never saw WHY the call failed and kept retrying the same shape.
+    // Include the first reason (already truncated to 160 chars by the caller) so
+    // the model can self-correct even while the breaker is armed.
+    const causeNote = cause ? ` Last failure: ${cause}.` : "";
+    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures)${causeNote} — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' is ONE string holding every range — each block starts with its 'mNNNNN–mNNNNN optional topic' header line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects as that string also works), using refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
 }
 
 // #5986 review fix: the observed failure mode after a compress rejection is the
@@ -1230,6 +1235,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                     ? "Do not retry the same corrupt byte string — re-issue the call as one well-formed JSON object."
                     : "Fix the argument shape against the format below instead of re-issuing the same malformed call.",
         );
+        // #7821: if the breaker is already armed, this is a refusal, not a new
+        // failure — don't count it toward the streak (it would re-arm the decay
+        // timer and hide the cause). Return the armed refusal with the specific
+        // cause instead.
+        if (trackLoop && compressBreakerArmed(ctx.session)) {
+            const armedDetail = compressBreakerDetail(ctx.session)!;
+            ctx.log(`[acp-proxy: parse-failure receipt collapsed to short refusal (breaker already armed, n=${armedDetail.n}, kind=${diagnostics.kind})`);
+            return compressResult(armedRefusalReceipt(armedDetail.n, armedDetail.decayMinutes, reasons[0]), "refused", 0, `parse:${diagnostics.kind}`);
+        }
         const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, parseKey) : "";
         // #4812: enforce the armed breaker on parse-failure receipts — see
         // armedRefusalReceipt for the invariants (arm-moment receipt unchanged;
@@ -1238,7 +1252,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const armedDetail = trackLoop ? compressBreakerDetail(ctx.session) : undefined;
         if (armedDetail !== undefined && armedDetail.n > COMPRESS_LOOP_THRESHOLD) {
             ctx.log(`[acp-proxy: parse-failure receipt collapsed to short refusal (breaker armed, n=${armedDetail.n}, kind=${diagnostics.kind})`);
-            return compressResult(armedRefusalReceipt(armedDetail.n, armedDetail.decayMinutes), "refused", 0, `parse:${diagnostics.kind}`);
+            return compressResult(armedRefusalReceipt(armedDetail.n, armedDetail.decayMinutes, reasons[0]), "refused", 0, `parse:${diagnostics.kind}`);
         }
         // Repeat-parse-failure collapse: from the 2nd identical parse failure
         // on, the full format lecture + eligibility list re-appends ~200 words
@@ -1586,7 +1600,21 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const dropped = droppedEntriesNote(diagnostics);
             const specKey = normalizedSpecKey(ranges);
             const repeatGuard = recordCompressFailure(ctx.session, specKey);
-            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey, errs) : "";
+            // #7821: if the breaker is already armed, this is a refusal, not a
+            // new failure — don't count it toward the streak (it would re-arm the
+            // decay timer). Return the full receipt with the pause paragraph
+            // (same as before) but don't increment n or refresh lastAt, so the
+            // decay can actually elapse.
+            let loopGuard: string;
+            if (trackLoop && compressBreakerArmed(ctx.session)) {
+                const armedDetail = compressBreakerDetail(ctx.session)!;
+                const cause = compressFailureCause(errs, ctx.session);
+                loopGuard = cause.startsWith("substrate-destruction")
+                    ? substrateDestructionPauseParagraph(armedDetail.n)
+                    : loopNoisePauseParagraph(armedDetail.n);
+            } else {
+                loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey, errs) : "";
+            }
             const beyond = beyondFrontierNote(ctx.session.state, ranges);
             const clamp = frontierClampNote(ctx.session.state, ranges, beyond);
             // #2146: once the breaker arms, the diagnostic hint cluster it used
