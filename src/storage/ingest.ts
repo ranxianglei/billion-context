@@ -665,7 +665,7 @@ function finishPlan(
  *  resetSessionCompression when a rebase empties blockContents for good. The
  *  store compares it with the persisted row and drops the orphan journal on
  *  an increase; an ordinary save (no bump) merges as before. */
-export function orphanJournalGenerationOf(session: { metadata?: Record<string, unknown> }): number {
+function orphanJournalGenerationOf(session: { metadata?: Record<string, unknown> }): number {
     const value = session.metadata?.orphanJournalGeneration;
     return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
