@@ -30,6 +30,7 @@ import {
     egressFlowWalkBack,
     egressStateRead,
     egressStateView,
+    egressRowHighWater,
     egressFork,
     egressMaterializeState,
     egressMessageHighWater,
@@ -2646,6 +2647,12 @@ export class UnifiedStore {
         // number and only I rows carry it — it is not the row cursor).
         const row = this.db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
         return Number(row.mx) || 0;
+    }
+
+    /** 2026-11-27 (row ids): highest rid issued in the flow (0 = none) —
+     *  the allocator for a session's next row ids. */
+    egressStateMaxRid(sessionId: string): number {
+        return egressRowHighWater(this.db, sessionId);
     }
 
     /** 7773: truncate the flow past op_seq — and REBUILD the materialized

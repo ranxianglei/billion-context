@@ -62,7 +62,7 @@ test("recoverEgressBase: an unreplayable tail walks back to the newest healthy p
         // dense row order) gets a payload that does not parse, and a stray
         // state row without an I twin forces the read onto the rebuild path
         H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND op_seq = 3`).run('{"x":1}', S);
-        H.db.prepare(`INSERT INTO egress_state (session_id, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 'ghost', 99, 7, 7, '', 0, 'text', 'user', 0, 0, 'x', 9)`).run(S);
+        H.db.prepare(`INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 7, 7, '', 0, 'text', 'user', 0, 0, 'x', 9)`).run(S);
         const got = recoverEgressBase(H.store, S);
         assert.ok(got !== null);
         assert.equal(got.degraded, true);
