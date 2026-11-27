@@ -3737,6 +3737,58 @@ test("ensureProxyRunning: #3521 inherited launcher channels never reach the spaw
     }
 });
 
+test("ensureProxyRunning: a peer serving a DIFFERENT sessions dir is not rideable (#7861)", async () => {
+    const savedDir = process.env.BILI_SESSIONS_DIR;
+    const OURS = path.join(os.tmpdir(), `bili-7861-ours-${process.pid}`);
+    const THEIRS = path.join(os.tmpdir(), `bili-7861-theirs-${process.pid}`);
+    let liveInst: InstanceFile | undefined;
+    let spawns = 0;
+    const spawnImpl: SpawnFn = (_cmd, _args) => {
+        spawns++;
+        // pid: process.pid — probeLiveInstances drops candidates whose pid is
+        // not kill(0)-alive, so the fake peer must claim a LIVE pid.
+        liveInst = recordedInstance({ sessionsDir: THEIRS });
+        return makeFakeChild(process.pid + 1);
+    };
+    const deps = {
+        spawnImpl,
+        fetchImpl: async () => ({ ok: true }),
+        fetchHealthInfo: async () => ({ ok: true, instanceId: liveInst?.instanceId ?? "inst-1", pid: liveInst?.pid, watchdog: { armed: true } }),
+        readInstanceFile: () => liveInst,
+        sleep: () => Promise.resolve(),
+        scriptPath: FP_SCRIPT,
+    };
+    try {
+        process.env.BILI_SESSIONS_DIR = OURS;
+        await ensureProxyRunning({ host: "127.0.0.1", port: 8787, passthrough: false, debug: false }, deps);
+        assert.equal(spawns, 1, "first launch spawns");
+
+        // The repro: a same-build peer whose store is a DIFFERENT directory
+        // (plain `bili pi` default store vs a `-c eg` proxy) must not be
+        // ridden — riding would write this client's sessions into the other
+        // store.
+        const h2 = await ensureProxyRunning({ host: "127.0.0.1", port: 8787, passthrough: false, debug: false }, deps);
+        assert.equal(spawns, 2, "sessions-dir-mismatch forces a fresh spawn");
+        assert.notEqual(h2.attached, true, "the foreign-store peer is not attached");
+
+        // ...a peer serving the SAME store still attaches...
+        liveInst = recordedInstance({ sessionsDir: OURS });
+        const h3 = await ensureProxyRunning({ host: "127.0.0.1", port: 8787, passthrough: false, debug: false }, deps);
+        assert.equal(spawns, 2, "same sessions dir still attaches");
+        assert.equal(h3.attached, true);
+
+        // ...and a pre-#5046 peer that recorded no dir stays attachable
+        // (conservative: isolation cannot be claimed for old markers).
+        liveInst = recordedInstance();
+        const h4 = await ensureProxyRunning({ host: "127.0.0.1", port: 8787, passthrough: false, debug: false }, deps);
+        assert.equal(spawns, 2, "peer without a recorded dir still attaches");
+        assert.equal(h4.attached, true);
+    } finally {
+        if (savedDir === undefined) delete process.env.BILI_SESSIONS_DIR;
+        else process.env.BILI_SESSIONS_DIR = savedDir;
+    }
+});
+
 test("parseOmpYaml: reads providers.<name>.baseUrl (skips non-matching)", () => {
     const yml = [
         "providers:",
