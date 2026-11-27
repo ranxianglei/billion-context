@@ -69,7 +69,7 @@ export const windowSourceLogged = new Set<string>();
 // `${sessionId}@${model}@${window}` keys — unbounded across a long-lived
 // process, so cap the set: a re-logged line after the cap resets is a
 // duplicate info line, never a behavior change.
-export const WINDOW_SOURCE_LOGGED_CAP = 10_000;
+const WINDOW_SOURCE_LOGGED_CAP = 10_000;
 export function noteWindowSource(key: string): boolean {
     if (windowSourceLogged.has(key)) return false;
     if (windowSourceLogged.size >= WINDOW_SOURCE_LOGGED_CAP) windowSourceLogged.clear();
