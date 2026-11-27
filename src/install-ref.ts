@@ -316,19 +316,26 @@ async function installFromRefLocked(input: string, spec: InstallRefSpec, opts: I
     }
     // Auto-restore: put the backup back so the machine is exactly as it was
     // before this install started.
+    let restored = false;
     if (backupPath) {
         try {
             await rm(cur, { recursive: true, force: true }); // partial install, if any
             await rename(backupPath, cur);
+            restored = true;
             loggerLog("warn", `[install] swap failed — restored previous install from ${backupPath}`);
             log?.(`restored previous install from ${path.basename(backupPath)}`);
         } catch (restoreErr) {
             loggerLog("error", `[install] swap failed AND auto-restore failed: ${String(restoreErr)}`);
         }
     }
-    const restoreHint = backupPath
-        ? ` — previous install kept at ${backupPath}${swapFailed.includes("restored previous install") ? " (auto-restored)" : ` (restore manually: mv ${backupPath} ${cur})`}`
-        : "";
+    // The hint must match what is actually on disk: after a successful
+    // auto-restore the backup path is GONE (renamed back), so pointing the
+    // user at it for a manual `mv` would be a dead path (#6805 review).
+    const restoreHint = !backupPath
+        ? ""
+        : restored
+            ? " — previous install auto-restored"
+            : ` — previous install kept at ${backupPath} (restore manually: mv ${backupPath} ${cur})`;
     throw new Error(`${input} @ ${sha.slice(0, 8)}: install step failed: ${swapFailed}${restoreHint}`);
 }
 
