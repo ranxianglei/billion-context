@@ -86,3 +86,24 @@ test("marker stripping requires the canonical prompt shape at the tail", () => {
   const trailingJunk = "body\n\n[ACP absorb] This tool result (~9K tokens) will be REMOVED from context. but not the real prompt";
   assert.equal(stripTrailingAbsorbPrompt(trailingJunk), trailingJunk);
 });
+
+test("the truncation is no longer stable: a mid-marker tail survives turn after turn", () => {
+  // The bug's defining feature: once the payload was sliced at the first
+  // marker, the host re-sent the already-sliced text and the tail never came
+  // back. Pin the other direction — the tail survives turn 1 AND turn 2. The
+  // payload must be an absorb candidate (≥ minToolTokens) AND crushable
+  // (log-shaped): below the threshold or uncrushable, the original text is
+  // kept regardless of the strip, so the bug would not surface.
+  const src =
+    logText("before") +
+    "\n[ACP absorb] This tool result will be REMOVED from context.\n" +
+    logText("after");
+  const config = defaultConfig(100000, switches);
+  const t1 = applyCrushToMessages(messagesWith(src), config, 30000, countTokens);
+  const res1 = t1.messages[2]!.text!;
+  assert.ok(res1.includes("ERROR after failed step 0"), "turn 1: tail after the mid marker survives");
+  // The host re-sends turn 1's output; the tail must STILL survive.
+  const t2 = applyCrushToMessages(messagesWith(res1), config, 30000, countTokens);
+  const res2 = t2.messages[2]!.text!;
+  assert.ok(res2.includes("ERROR after failed step 0"), "turn 2: tail after the mid marker still survives (loss is not stable)");
+});
