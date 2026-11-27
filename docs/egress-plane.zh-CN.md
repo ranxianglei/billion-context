@@ -46,6 +46,22 @@
 
 **结构不变量（7773 §6，每次写入后断言，两平面）。** ① flow 总行数只增（append-only）；② state 行数 == live 视图行数（物化，不是聚合、不是 op 镜像）；③ flow/state 里最大 value 大小 == 历史最大**单行**大小——针对退役 `B` 行全视图聚合 payload 的回归防线；④ 行字母表恰为 I/D/U（消息平面）与 I/U/D（块平面）——`B` 永不出现；⑤ **日志寻址一律用 `rid`**——稠密、永不重发的每会话行 id：`egress_flow` payload 里的 D 端点、U 目标、I 锚点都是 rid，永不 msgid（msgid 是内核身份，proxy 可能从内容 hash 映射而来、还可能合法重现；rid 是我们自己派的，不可能——owner 裁定 2026-11-27，#7773 后续）。套件：`tests/egress-invariants-7773.test.ts`。
 
+### id 总表——每个数字回答哪个问题
+
+五张表里出现五个数字，它们回答**五个不同的问题**，没有一个是冗余的：
+
+| id | 在哪 | 它回答的问题 | 可否复用 |
+|---|---|---|---|
+| `op_seq` | flow / block_flow / usage 主键 | 「**这张表的第 N 次写盘**」——物理日志游标；fork 与 point 水位骑在它上（或块平面用 `flow_op_seq` 指针挂到它上） | 单调，但指**事件**不指行：一行的生命（I→U→U→D）要占好几个 op_seq——行用它的 I 行 `rid` 寻址，不指望写在哪 |
+| `log_seq` | flow I 行 / state | 「**kernel 引用**这行用几号」——`mNNNNN` = m + log_seq，一个号不是两个（§10） | 可被重引：fold summary 合法接手退役槽位（demote → re-home，§10 规则 7）——正因如此它**不能**当行身份 |
+| `num` | state 行 + U payload | 该行**当前**的 kernel 引用号；`0` = 未被引用/已 demote | 跟着 kernel 事实走，+U num |
+| `pos` | state 表 | 「它在**当前 live 视图**里排第几」 | 瞬态，每次插入/删除都变 |
+| `rid` | flow I/U 行 + state 主键 | 「**哪一行**」——每个 op payload 的指针目标（D 端点、U 目标、I 锚点） | 会话内稠密（`MAX(rid)+1`），永不重发（flow 永不裁剪） |
+
+一句话：**log_seq/num 是引用号（允许重发），rid 是行身份（禁止复用），op_seq 是写盘计数，pos 是视图偏移。** #7849 之前的形状让 msgid 一个人同时扛引用身份和行身份两件事——内容 hash 派生的 msgid 可能合法重现，D 行寻址就是这么坏的（owner 裁定 2026-11-27）。
+
+fork **不需要任何 id 转换**：所有主键都是 `(session_id, rid)`，子会话的拷贝行由会话 id 隔离命名空间，op 永不跨会话——子的 rid 原样保留（血缘身份），从自己的 `MAX(rid)+1` 续编。**usage** 流（§12）根本不携带 rid（事件只引用 kernel 块 id 和时间戳），所以 fork 拷贝——整拷（to-now）或 `at <= W` 前缀（point）——就是纯行拷贝，重放重建 ledger，没有任何重映射。
+
 ## 4. 一轮的生命周期
 
 1. **准备**——插件轮到达，车道仲裁选中 egress 路径；**`recordEgressTurn`** 把本轮出站视图与上一轮 diff，**立即（准备阶段，不是保存）追加 I/D/U 行到 flow**——单事务：事务内 `nextSeqs`（密度安全，#7574）、并发写守卫、然后把同一批 op 应用到**物化 state 行**（I 插入 + `pos` 后移、U 就地改、D 物理删 + 前移），最后跑不变量检查（state 行数 == live 视图长度，7773 §6）。

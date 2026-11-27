@@ -46,6 +46,22 @@ Retention rules: **flow is append-only and never pruned** (#7439 — its growth 
 
 **Structural invariants (7773 §6, asserted after EVERY write, both planes).** ① the flow's row count never shrinks (append-only); ② the state row count == the live view's row count (a materialization, never an aggregate and never an op mirror); ③ the largest value in flow/state equals the historical maximum SINGLE-row size — the regression defense against the retired `B` row's whole-view aggregate payload; ④ the row alphabet is exactly I/D/U (message plane) and I/U/D (block plane) — `B` never appears; ⑤ **log addressing is by `rid`** — the dense, never-reissued per-session row id: D endpoints, U targets and I anchors in `egress_flow` payloads are rids, never msgids (a msgid is a kernel identity that the proxy may map from a content hash and that can legitimately recur; a rid is ours and cannot — owner ruling 2026-11-27, the follow-up to #7773). Suite: `tests/egress-invariants-7773.test.ts`.
 
+### The id map — which question each number answers
+
+Five numbers appear across the five tables. They answer FIVE DIFFERENT questions; none of them is redundant:
+
+| id | lives on | the question it answers | re-use |
+|---|---|---|---|
+| `op_seq` | flow / block_flow / usage PK | "the Nth **write to this table**" — the physical journal cursor; fork and point-in-time watermarks ride it (or the block plane's `flow_op_seq` pointer onto it) | monotonic, but names **events**, not rows: one row's life (I→U→U→D) consumes several op_seqs — the row is addressed by its I row's `rid`, not by where its writes happened |
+| `log_seq` | flow I rows / state | "the number the **kernel cites** for this row" — `mNNNNN` = m + log_seq, one number not two (§10) | re-citable: a fold summary may legitimately take over a retired slot (demote → re-home, §10 rule 7) — this is exactly why it CANNOT be a row identity |
+| `num` | state row + U payload | the row's **current** kernel citation; `0` = not cited / demoted | follows the kernel's fact, +U num |
+| `pos` | state table | "where does it sit in the **current live view**" | transient; shifts on every insert/delete |
+| `rid` | flow I/U rows + state PK | "**which row**" — the target of every op payload (D endpoints, U target, I anchor) | dense per session (`MAX(rid)+1`), never re-issued (the flow is never pruned) |
+
+One-liner: **log_seq/num are citation numbers (re-issue allowed), rid is row identity (reuse forbidden), op_seq is a write counter, pos is a view offset.** The pre-#7849 shape had msgid carrying both citation-identity and row-identity duties at once; a content-hash-derived msgid can legitimately recur, which is what broke the D-row addressing (owner ruling 2026-11-27).
+
+Fork needs NO id conversion: every key is `(session_id, rid)`, so a child's copied rows are namespaced by the session id and no op can ever reach across sessions — the child keeps its forked rids as lineage identity and continues numbering from its own `MAX(rid)+1`. The **usage** stream (§12) carries no rids at all (its events reference kernel block ids and timestamps), so its fork copy — whole (to-now) or `at <= W` prefix (point) — is a plain row copy with replay reconstructing the ledger; nothing is remapped.
+
 ## 4. One turn, step by step
 
 1. **Prepare** — the plugin turn arrives; lane arbitration picks the egress path; **`recordEgressTurn`** diffs the turn's outbound view against the previous one and **appends I/D/U rows to the flow immediately (at prepare, not save)** — in one transaction: in-transaction `nextSeqs` (density-safe, #7574), a concurrent-writer guard, then the same ops applied to the **materialized state rows** (I inserts with `pos` shift, U in-place, D physically deletes + shifts), and finally the invariant checks (state row count == live view length, 7773 §6).
