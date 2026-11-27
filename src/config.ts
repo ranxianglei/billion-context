@@ -1080,6 +1080,15 @@ export type ProxyOptions = {
      *  whose SDK cannot surface in-band errors. Env BILI_STREAM_ERROR_SHAPE
      *  wins over the file's compat.streamErrorShape. */
     streamErrorShape?: "protocol" | "completion";
+    /** #4913: how the plugin chat pipe terminates an EXHAUSTED degenerate-turn
+     *  retry — the second attempt after the continuation nudge (#732/#821)
+     *  also ended with no usable output (thinking/echo only, clean stop). "error"
+     *  (default) emits the #870 in-band stream error; "passthrough" passes the
+     *  empty turn through as a normal completion (pre-#870). Only the chat
+     *  pipe has this fatal branch — the proxy lane and the responses wire
+     *  already pass this condition through, so the knob is a no-op for them.
+     *  Env BILI_DEGENERATE_TURN wins over the file's compat.degenerateTurn. */
+    degenerateTurn?: "error" | "passthrough";
     /** Global-level image billing mode (#767); per-provider route entries
      *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto
      *  (= pixels for every host since #1843). */
@@ -1861,6 +1870,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         },
         compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {}, dropFields: parseCompatDropFields(fileConfig.compat?.dropFields) ?? [] },
         streamErrorShape: parseStreamErrorShape(env.BILI_STREAM_ERROR_SHAPE ?? fileConfig.compat?.streamErrorShape),
+        degenerateTurn: parseDegenerateTurn(env.BILI_DEGENERATE_TURN ?? fileConfig.compat?.degenerateTurn),
         imageBilling: parseImageBilling(fileConfig.imageBilling),
         imageTokenCap: parseImageTokenCap(fileConfig.imageTokenCap),
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
@@ -2196,7 +2206,7 @@ type FileConfig = {
      *  cache_control marks entirely (env BILI_NO_CACHE_CONTROL wins).
      *  `keepResponseId` (#2030): set `true` to preserve previous_response_id
      *  on rebuilt Responses requests (env ACP_KEEP_RESPONSE_ID=1 wins). */
-    compat?: { roles?: Record<string, string>; streamErrorShape?: string; dropFields?: string[]; noCacheControl?: boolean; keepResponseId?: boolean };
+    compat?: { roles?: Record<string, string>; streamErrorShape?: string; degenerateTurn?: string; dropFields?: string[]; noCacheControl?: boolean; keepResponseId?: boolean };
     /** Global image billing mode (#767): "auto" | "pixels" | "bytes".
      *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
      *  over both. See ProviderRoute.imageBilling. */
@@ -2348,16 +2358,20 @@ type FileConfig = {
          *  unset (JSON writing resumes; index-only sessions keep loading via
          *  the boot union, and replicas/restore re-materialize envelopes). */
         jsonWriter?: string;
-        /** WAL reclamation cap for index.db-wal (#3250), in bytes: every
-         *  completed checkpoint truncates the WAL file back to this size.
-         *  NOT a per-session data quota — data lands in index.db as it is
-         *  written and the WAL only stages frames between checkpoints, so
-         *  session count/size does not scale this. Higher = rarer truncate
-         *  IO but more steady disk use and a longer crash-replay tail.
-         *  Env BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES wins; default
-         *  8388608 (8 MiB); a non-positive/non-integer value falls back to
-         *  the file/default tier. Applied when the store opens (lane boot) —
-         *  hot edits apply on the next restart. */
+        /** WAL reclamation cap for index.db-wal (#3250), in bytes. 0 (default,
+         *  #7674) = unlimited: the engine does NOT truncate the WAL file after
+         *  a checkpoint (it sits at its historical high-water mark; frames
+         *  still converge via the periodic/flush PASSIVE checkpoints) — the
+         *  pre-#7674 8 MiB default made the engine truncate the WAL internally
+         *  after every completed checkpoint, an implicit floor-reclaim that no
+         *  JS-side guard covers and that pulls the WAL out from under live peer
+         *  connections sharing the sessions dir (#2671) — the #7156 damage
+         *  shape. A POSITIVE value N: every completed checkpoint truncates the
+         *  WAL back to N. NOT a per-session data quota — data lands in index.db
+         *  as it is written. Env BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES wins;
+         *  a non-positive/non-integer value falls back to the file/default tier.
+         *  Applied when the store opens (lane boot) — hot edits apply on the
+         *  next restart. */
         walJournalSizeLimitBytes?: number;
         /** #3901/#3463: session retention window in days for the GC age
          *  sweep (archive + tombstone + CAS release). 0 disables; env
@@ -2493,6 +2507,17 @@ type FileConfig = {
      *  from pool eviction. Surviving bytes re-materialize via narrow disk reads.
      *  Default: same value as `residentMaxBytes` above. */
     sessions?: {
+        /** Relocate the sessions directory (where index.db, session JSON and
+         *  the CCR content stores live) off a capacity-constrained drive —
+         *  e.g. a Windows C: that cannot hold a growing index.db — without
+         *  touching the shell environment. env BILI_SESSIONS_DIR wins (the
+         *  #2030 override tier); absent/invalid falls back to the XDG data
+         *  dir. Resolved in paths.sessionsDir() (the leaf every consumer
+         *  imports); a value pointing at an existing FILE refuses to start
+         *  loudly instead of silently falling back (that fallback would
+         *  recreate the disk-capacity failure). Hot edits apply on the next
+         *  restart, like every other path. */
+        dir?: string;
         max?: number;
         warmMax?: number;
         warmMaxBytes?: number;
@@ -3322,6 +3347,10 @@ export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings 
 
 function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
     return value === "completion" ? "completion" : "protocol";
+}
+
+function parseDegenerateTurn(value: unknown): "error" | "passthrough" {
+    return value === "passthrough" ? "passthrough" : "error";
 }
 
 export function parsePromptCacheRouting(value: string | undefined): PromptCacheRouting {

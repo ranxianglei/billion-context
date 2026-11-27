@@ -176,9 +176,20 @@ test("#3544 equal-version resident is never rotated (no churn on equal builds)",
 });
 
 test("#3544 user-zone daemons are never touched by rotation", async () => {
-    const r = await runBringUp({ healthVersion: "0.0.1", userZone: true });
-    assert.equal(r.shutdownCalls.length, 0);
-    assert.equal(r.spawnCalls, 1);
+    // #7675 behavior change: a live lane-less (user-zone) daemon on the
+    // target port is still NEVER rotated or killed — but it is now counted
+    // by the second-writer gate, so the launch refuses instead of spawning
+    // a silent second writer behind it (spawnCalls 1 -> 0).
+    let err: unknown;
+    let r: Awaited<ReturnType<typeof runBringUp>> | undefined;
+    try {
+        r = await runBringUp({ healthVersion: "0.0.1", userZone: true });
+    } catch (e) {
+        err = e;
+    }
+    assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second writer"), `refusal: ${err instanceof Error ? err.message : String(err)}`);
+    assert.ok(err instanceof Error && err.message.includes("no lane declared"), "the refusal says what the holder is");
+    assert.equal(r, undefined, "no handle — the user's daemon is untouched and no second writer spawned");
 });
 
 test("#3544 unarmed-watchdog residents are never rotated", async () => {

@@ -394,6 +394,11 @@ export function responsesToCore(
                   text: CANONICAL_IMAGE_TEXT,
                   imagePart: true,
                   rawResponsesItem: item,
+                  rawResponseImagePart: {
+                    ...(part as object),
+                    type: "input_image",
+                    image_url: part.image_url,
+                  } as { type: "input_image"; image_url: string; [key: string]: unknown },
                   ...(image
                     ? {
                         imageMediaType: image.mediaType,
@@ -801,8 +806,16 @@ export function patchResponsesInput(
         // The SOURCE core decides image-ness: render/ref-tag injection may
         // rewrite the marker text, and a wire image part has no text slot.
         if (entry.core?.imagePart || bili.text === CANONICAL_IMAGE_TEXT) {
-          const part = imageParts[img++];
-          if (part) parts.push(part);
+          // #7824: the parse-time binding wins — a shared cursor across one
+          // raw message's parts drifts (marker-text collision) and the old
+          // `if (part)` then SILENTLY DROPPED the image. Legacy cores (no
+          // binding) keep the cursor; nothing may vanish without a throw.
+          const part = entry.core?.rawResponseImagePart ?? imageParts[img++];
+          if (!part)
+            throw new Error(
+              "coreToResponses: image core without a source part — refusing to drop content (#7824)",
+            );
+          parts.push(part);
         } else if (bili.text) {
           parts.push({ type: "input_text", text: bili.text });
         }
@@ -865,6 +878,24 @@ export function coreToResponses(
             (part) => part.type === "input_image",
           ),
         });
+      else if (
+        ((message as BiliMessage).imagePart ||
+          (message as BiliMessage).text === CANONICAL_IMAGE_TEXT) &&
+        (message as BiliMessage).imageBase64 &&
+        (message as BiliMessage).imageMediaType
+      )
+        // Cross-lane image: no foreign raw item — rebuild the input_image
+        // part from the media sidecars (never the "[image]" text).
+        out.push({
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_image",
+              image_url: `data:${(message as BiliMessage).imageMediaType};base64,${(message as BiliMessage).imageBase64}`,
+            },
+          ],
+        });
       else
         out.push({
           type: "message",
@@ -883,6 +914,26 @@ export function coreToResponses(
       rawItem?.type === "message"
         ? (rawItem as ResponseInputMessage)
         : undefined;
+    // #7824: a run spanning MULTIPLE distinct raw items cannot be merged into
+    // one message losslessly — the old merge read image parts only from the
+    // FIRST carrier and silently dropped every image (or whole item) from
+    // later items. Emit each distinct raw item verbatim in run order: the
+    // Responses wire is a list, so nothing is lost and nothing is invented.
+    if (run.every((m) => (m as BiliMessage).rawResponsesItem !== undefined)) {
+      const seen = new Set<object>();
+      const distinctItems: ResponseInputMessage[] = [];
+      for (const m of run) {
+        const it = (m as BiliMessage).rawResponsesItem as ResponseInputItem;
+        if (it.type === "message" && !seen.has(it)) {
+          seen.add(it);
+          distinctItems.push(it as ResponseInputMessage);
+        }
+      }
+      if (distinctItems.length > 1) {
+        out.push(...distinctItems);
+        return;
+      }
+    }
     const fullCover =
       rawMessage &&
       Array.isArray(rawMessage.content) &&
@@ -903,8 +954,28 @@ export function coreToResponses(
       // render/ref-tag injection rewrites the marker, and image parts have
       // no text slot to carry a tag.
       if (bili.imagePart && bili.rawResponsesItem) {
-        const part = imageParts[img++];
-        if (part) parts.push(part);
+        // #7824: per-message binding (exact source part) instead of a shared
+        // cursor across the FIRST carrier's parts — images from a later
+        // raw item in the run were unreachable and SILENTLY DROPPED.
+        // Legacy cores keep the cursor; a missing source is a throw, never
+        // a silent drop.
+        const part = bili.rawResponseImagePart ?? imageParts[img++];
+        if (!part)
+          throw new Error(
+            "coreToResponses: image core without a source part — refusing to drop content (#7824)",
+          );
+        parts.push(part);
+      } else if (
+        bili.imagePart &&
+        bili.imageBase64 &&
+        bili.imageMediaType
+      ) {
+        // Cross-lane image: no foreign raw item — rebuild the input_image
+        // part from the media sidecars (never the "[image]" text).
+        parts.push({
+          type: "input_image",
+          image_url: `data:${bili.imageMediaType};base64,${bili.imageBase64}`,
+        });
       } else if (bili.text) {
         parts.push({ type: "input_text", text: bili.text });
       }
@@ -990,6 +1061,16 @@ export function coreToResponses(
         }
       } else if (message.contentType === "reasoning") {
         if (raw) out.push(raw);
+        else if ((message.text ?? "").trim().length > 0) {
+          // Cross-lane reasoning: no raw item to reuse and no signature the
+          // Responses API would accept — degrade to a visible assistant text
+          // message instead of dropping the content silently.
+          out.push({
+            type: "message",
+            role: "assistant",
+            content: message.text ?? "",
+          });
+        }
       }
     } else if (message.role === "tool") {
       const callId = message.toolCallId ?? "";

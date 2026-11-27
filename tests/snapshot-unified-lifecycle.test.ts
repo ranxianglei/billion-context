@@ -6,6 +6,8 @@ import { after, test } from "node:test";
 
 const root = mkdtempSync(path.join(tmpdir(), "bili-snapshot-lifecycle-"));
 process.env.XDG_STATE_HOME = root;
+// KDD #25 hermeticity: legacy writer lifecycle assertions — pin the plane OFF.
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 
 const { _setStoreForTest, _resetStoreForTest } = await import("../src/persist.js");
 const affinity = await import("../src/affinity-persist.js");
