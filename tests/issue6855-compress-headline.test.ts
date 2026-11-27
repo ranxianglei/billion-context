@@ -74,7 +74,7 @@ test("#6855: in-bounds call → headline unchanged (no over-clamping)", () => {
 });
 
 test("#6855: pure function — only kernel-confirmed clamps are re-stated", () => {
-    const clampNote = 'endId="m00007" is above this session\'s highest allocated ref (m00003) — clamped to it (refs are minted in order and never pre-allocated, so higher numbers do not exist yet). The range folds up to the last visible message.';
+    const clampNote = 'endId="m00007" is above this session\'s highest allocated ref (m00003) — clamped to it (refs are minted in order and never pre-allocated, so higher numbers do not exist yet); the fold lands at m00003, the last visible message at or below the frontier.';
     // clamped by the kernel (note present) → effective end shown
     assert.equal(
         effectiveCompressedDetail([{ startRef: "m00001", endRef: "m00007" }], 3, [clampNote]),
