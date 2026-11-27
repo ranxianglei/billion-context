@@ -37,7 +37,7 @@
 import type { BiliMessage } from "acp-kernel/wire";
 import { getStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
-import { applyMsgIdPin, applyWireMsgIdPin, validateMsgIds, validateWireMsgIds, wireElementIds, wirePinGroups } from "../msgid-pin.js";
+import { applyMsgIdPin, applyWireMsgIdPin, SIBMARK, renderCoreId, validateMsgIds, validateWireMsgIds, wireElementIds, wirePinGroups } from "../msgid-pin.js";
 import { checkR3Identity, FoundationRejectError, r3FaultTracker } from "./plane.js";
 
 export interface Stage0Input {
@@ -444,7 +444,7 @@ export function tryIncrementalPin(
     for (let j = overlapEnd; j < L; j++) {
         const id = tailIds[j];
         if (id === "?") continue;
-        if (typeof id !== "string" || id.length === 0 || id.length > 512 || id.startsWith("acp_summary_") || /[\s\p{C}]/u.test(id) || seen.has(id)) {
+        if (typeof id !== "string" || id.length === 0 || id.length > 512 || id.startsWith("acp_summary_") || id.startsWith(SIBMARK) || /[\s\p{C}]/u.test(id) || seen.has(id)) {
             log("info", `[${sessionId}] [2x2:${lane}] incremental tail carried an invalid id at slot ${j} — full signal (reanchor next turn)`);
             return null;
         }
@@ -487,7 +487,7 @@ export function tryIncrementalPin(
         const w = m.wireIndex;
         if (havePrev && w !== undefined && w === prevWire) {
             sibling += 1;
-            out[i]! = { ...m, id: `${leaderId}#p${sibling}` };
+            out[i]! = { ...m, id: renderCoreId(leaderId, sibling) };
         } else {
             havePrev = true;
             prevWire = w;
@@ -498,7 +498,7 @@ export function tryIncrementalPin(
             }
             const t = tailIds[overlapEnd + slot]!;
             slot += 1;
-            leaderId = t === "?" ? m.id : t;
+            leaderId = t === "?" ? m.id : renderCoreId(t, 0);
             out[i]! = t === "?" ? { ...m } : { ...m, id: leaderId };
         }
     }

@@ -23,6 +23,55 @@ export const MSG_SEQS_BODY_FIELD = "biliLedgerSeqs";
 const MAX_ID_LEN = 512;
 const RESERVED_PREFIX = "acp_summary_";
 
+// STRUCTURAL wire-id identity. The real identity of a pinned core is the
+// (wire-element, ordinal) pair; the on-wire/ledger id string is an INJECTIVE
+// rendering of it. Legacy rendered the k-th sibling as `<base>#p<k>`, which is
+// lossy: (elem X, ord 1) and (elem X#p1, ord 0) BOTH rendered to "X#p1". That
+// only bites a host that mints an id CONTAINING '#' (pi/dsh/opencode mint
+// hex/uuid ids, so it never fired in the field) — but it made the id space
+// depend on a host promise instead of holding on its own.
+//
+// Now: a '#' -free element id renders VERBATIM (byte-identical to legacy for
+// every real host); a '#' -containing one is injected into the reserved SIBMARK
+// namespace (SIBMARK + base64url, '#' -free + injective), so its cores can never
+// equal a derived `#p<k>` sibling of another element. SIBMARK is reserved:
+// host ids in it are rejected, keeping the two namespaces disjoint.
+export const SIBMARK = "x";
+
+function b64u(s: string): string {
+    return Buffer.from(s, "utf8").toString("base64url");
+}
+function b64uDecode(s: string): string {
+    try {
+        return Buffer.from(s, "base64url").toString("utf8");
+    } catch {
+        return s; // malformed — keep opaque (well-formed ledger ids never hit this)
+    }
+}
+/** The '#' -free base a wire element's cores render under. */
+function elementBase(id: string): string {
+    return id.includes("#") ? SIBMARK + b64u(id) : id;
+}
+/** Render the on-wire/ledger id for (element, ordinal). ordinal 0 = head core
+ *  (no suffix); ordinal k>0 = k-th sibling (`#p` + k). Injective over the pair:
+ *  distinct (element, ordinal) always yield distinct ids. */
+export function renderCoreId(id: string, ordinal: number): string {
+    const base = elementBase(id);
+    return ordinal === 0 ? base : `${base}#p${ordinal}`;
+}
+/** Invert renderCoreId → (element, ordinal). A '#' -free head is ordinal 0 with
+ *  element === id; a `#p<k>` suffix is ordinal k; a SIBMARK-prefixed base decodes
+ *  back to the original '#' -containing element id (so wire-element consumers —
+ *  element lists, the incremental tail pin — compare '#' -host elements against
+ *  exactly what the host resends). */
+export function elementOfCore(id: string): { element: string; ordinal: number } {
+    const m = /^(.*)#p(\d+)$/.exec(id);
+    const base = m !== null ? m[1]! : id;
+    const ordinal = m !== null ? parseInt(m[2]!, 10) : 0;
+    const element = base.startsWith(SIBMARK) ? b64uDecode(base.slice(SIBMARK.length)) : base;
+    return { element, ordinal };
+}
+
 type MsgIdValidation = { ok: true; ids: string[] } | { ok: false; reason: string };
 
 function validateIdEntries(raw: unknown[], expectedLen: number): MsgIdValidation {
@@ -31,6 +80,9 @@ function validateIdEntries(raw: unknown[], expectedLen: number): MsgIdValidation
     for (const v of raw) {
         if (typeof v !== "string" || v.length === 0 || v.length > MAX_ID_LEN) return { ok: false, reason: "bad-entry" };
         if (v.startsWith(RESERVED_PREFIX)) return { ok: false, reason: "reserved-prefix" };
+        // SIBMARK is the server-side encoded-element namespace — a host id in it
+        // would collide with a derived core id (see renderCoreId).
+        if (v.startsWith(SIBMARK)) return { ok: false, reason: "reserved-prefix" };
         // whitespace/control chars make ids un-greppable and ambiguous in logs
         if (/[\s\p{C}]/u.test(v)) return { ok: false, reason: "control-or-space" };
         if (seen.has(v)) return { ok: false, reason: "duplicate" };
@@ -45,7 +97,7 @@ export function validateMsgIds(raw: unknown, expectedLen: number): MsgIdValidati
 }
 
 export function applyMsgIdPin(msgs: BiliMessage[], ids: string[]): BiliMessage[] {
-    return msgs.map((m, i) => ({ ...m, id: ids[i] }));
+    return msgs.map((m, i) => ({ ...m, id: renderCoreId(ids[i]!, 0) }));
 }
 
 // #7439 follow-up (cross-lane model/protocol switching): WIRE-granularity
@@ -105,26 +157,19 @@ export function wirePinGroups(msgs: BiliMessage[]): WirePinGroups | null {
     return { min, size: groups.size, split, groups };
 }
 
-const WIRE_SIBLING_RE = /^(\S+)#p\d+$/;
-
 /**
  * #7439 follow-up (Part 2): the ledger view is CORE-granular — a multi-core
  * wire element carries its host id on its FIRST core and derived `#pN` ids
  * on its siblings. Wire-element-granular consumers (the incremental tail pin
- * compares against the host's element list) need the ELEMENT list: drop
- * every derived sibling, keep every leader.
- *
- * Documented limit: a host-minted id that genuinely ends in `#pN` while its
- * base is ALSO in the ledger is indistinguishable from a derived sibling and
- * is treated as one (host ids are a host-owned namespace; the collision
- * would have to match both the exact suffix and a co-resident base id).
+ * compares against the host's element list) need the ELEMENT list: keep every
+ * head (ordinal 0), drop every sibling. Each head is returned DECODED to its
+ * element id (elementOfCore), so a '#' -host element compares equal to what
+ * the host resends; a '#' -free head decodes to itself — the legacy behavior.
  */
 export function wireElementIds(ledgerIds: readonly string[]): string[] {
-    const set = new Set(ledgerIds);
-    return ledgerIds.filter((id) => {
-        const m = WIRE_SIBLING_RE.exec(id);
-        return !(m !== null && set.has(m[1]));
-    });
+    return ledgerIds
+        .filter((id) => elementOfCore(id).ordinal === 0)
+        .map((id) => elementOfCore(id).element);
 }
 
 /** Wire-form validation: same entry rules as the per-core path, length
@@ -144,7 +189,7 @@ export function applyWireMsgIdPin(msgs: BiliMessage[], groups: WirePinGroups, id
         const w = m.wireIndex as number;
         const g = groups.groups.get(w)!;
         const pos = g.indexOf(i);
-        return { ...m, id: pos === 0 ? ids[w - groups.min] : `${ids[w - groups.min]}#p${pos}` };
+        return { ...m, id: renderCoreId(ids[w - groups.min]!, pos) };
     });
 }
 
