@@ -276,8 +276,19 @@ test("anthropic: unsigned thinking round-trips as { type: thinking, thinking } (
   assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
 });
 
+test("anthropic: cache_control rides the id-keyed map and is re-attached on rebuild (byte-exact)", () => {
+  const body = [
+    { role: "user", content: [{ type: "text", text: "T1", cache_control: { type: "ephemeral" } }] },
+  ];
+  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+});
+
 const A_SHAPES: [string, object[]][] = [
   ["text", [{ role: "user", content: [{ type: "text", text: "T1" }] }]],
+  [
+    "cache-control",
+    [{ role: "user", content: [{ type: "text", text: "T1", cache_control: { type: "ephemeral" } }] }],
+  ],
   [
     "tool-loop",
     [
@@ -328,6 +339,8 @@ test("anthropic: repeated parses of one body mint identical ids", () => {
 const R_IMG = { type: "input_image", image_url: "data:image/png;base64,QQ==" };
 const R_FUNC_CALL = { type: "function_call", call_id: "call_1", name: "f", arguments: '{"b":1,"a":2}' };
 const R_FUNC_OUT = { type: "function_call_output", call_id: "call_1", output: "ok" };
+const R_CT_CALL = { type: "custom_tool_call", call_id: "ct_1", name: "", input: "do it", status: "completed" };
+const R_CT_OUT = { type: "custom_tool_call_output", call_id: "ct_1", output: "done" };
 
 function rRebuild(input: object[]) {
   const proj = responsesToCore({ input } as never);
@@ -363,10 +376,16 @@ test("responses: text+image user message preserves both parts (split cores rebui
   assert.equal(JSON.stringify(rRebuild(body)), JSON.stringify(body));
 });
 
+test("responses: custom_tool_call canonical form (status present) round-trips byte-exact", () => {
+  const body = [R_CT_CALL, R_CT_OUT];
+  assert.equal(JSON.stringify(rRebuild(body)), JSON.stringify(body));
+});
+
 const R_SHAPES: [string, object[], object][] = [
   ["text", [{ type: "message", role: "user", content: "T1" }], { type: "message", role: "assistant", content: "A1" }],
   ["tool-loop", [{ type: "message", role: "user", content: "T1" }, R_FUNC_CALL, R_FUNC_OUT], { type: "message", role: "user", content: "next" }],
   ["image", [{ type: "message", role: "user", content: [R_IMG] }], { type: "message", role: "assistant", content: "A1" }],
+  ["custom-tool", [R_CT_CALL, R_CT_OUT], { type: "message", role: "user", content: "next" }],
 ];
 for (const [name, first, append] of R_SHAPES) {
   test(`responses: ${name} — appended turns leave the rebuilt prefix byte-identical`, () => {
