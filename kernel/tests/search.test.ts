@@ -777,10 +777,25 @@ test("tokenize: empty / punctuation / pure digits (edge)", async () => {
   assert.deepEqual(tokenize("!! ... "), []);
   assert.deepEqual(
     tokenize("4096"),
-    [],
-    "leading-digit run fails LATIN_WORD first alt, single digits filtered",
+    ["4096"],
+    "digit runs of length >= 2 are tokens (#7829)",
   );
-  assert.deepEqual(tokenize("value=4096"), ["value"]);
+  assert.deepEqual(tokenize("value=4096"), ["value", "4096"]);
+});
+
+test("tokenize: digit runs, decimals, single digits (#7829)", async () => {
+  const { tokenize } = await import("../src/search/tokenizer.js");
+  assert.deepEqual(tokenize("8080"), ["8080"]);
+  assert.deepEqual(tokenize("500"), ["500"]);
+  assert.deepEqual(tokenize("0.5"), ["0.5"], "decimal is ONE token");
+  assert.deepEqual(tokenize("7"), [], "single digit stays dropped (noise)");
+  assert.deepEqual(
+    tokenize("port 8080 and 443"),
+    ["port", "8080", "and", "443"],
+  );
+  assert.deepEqual(tokenize("v2"), ["v2"], "letter-starting word absorbs digits");
+  assert.deepEqual(tokenize("3.14.15"), ["3.14", "15"]);
+  assert.deepEqual(tokenize("4096", { stem: true }), ["4096"], "stem is a no-op on digits");
 });
 
 test("tokenize: digits inside CJK run dropped (edge)", async () => {
@@ -824,4 +839,28 @@ test("tfMap: counts per token, stems by flag", async () => {
   const m = tfMap("token token 身份", true);
   assert.equal(m.get("token"), 2);
   assert.equal(m.get("身份"), 1);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// #7829: default (hybrid) must find literal numeric queries
+// ─────────────────────────────────────────────────────────────────────────
+
+test("searchBlocks: default hybrid hits every literal numeric query (regression #7829)", () => {
+  const summary =
+    "Service notes: HTTP status 200 means ok, 404 not found, 500 server error, 403 forbidden, 301 moved. " +
+    "Port 8080 and 443 and 3000. Limit 42 and 7 and 100. Version v2 encoding utf8 latency p95. " +
+    "Issue 7765 build 1234 zip 90210 day 21 ratio 0.5";
+  const docs = blockDocs(stateWithBlocks(makeBlock({ summary })));
+  for (const q of [
+    "200", "404", "500", "403", "301", "42", "443", "21", "100", "0.5",
+    "1234", "90210", "8080", "3000", "7765",
+  ]) {
+    assert.ok(
+      searchBlocks(docs, q, {}).length > 0,
+      `default hybrid must hit literal numeric query "${q}"`,
+    );
+  }
+  // Single digit stays a miss: a 1-char token would match every doc that
+  // contains that digit — noise by construction.
+  assert.equal(searchBlocks(docs, "7", {}).length, 0);
 });

@@ -3,6 +3,7 @@
  *
  * Handles mixed Latin + CJK content — the single biggest quality lever
  * over plain substring search. Latin is split on non-word boundaries;
+ * digit runs (≥ 2 digits, one optional decimal part) are standalone tokens;
  * CJK (no spaces) is word-segmented via Intl.Segmenter (CLDR dictionary),
  * falling back to overlapping bigrams on out-of-vocabulary text so a query
  * like "身份验证" still scores against doc text "身份验证流程".
@@ -28,7 +29,13 @@
 import { stem } from "./stemmer.js";
 
 export const CJK = /[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/;
-const LATIN_WORD = /[a-z][a-z0-9_]*[a-z0-9]|[a-z0-9]/g;
+// Digit runs (optionally with ONE decimal part, "0.5"-shaped) are tokens of
+// their own: identifiers (ports, status codes, issue numbers, ratios) are a
+// primary search target, and letter-starting words already absorb their
+// trailing digits ("v2", "p95"). Single digits stay dropped by the length
+// filter below — a 1-char token would match every doc containing that digit
+// (#7829).
+const LATIN_WORD = /[a-z][a-z0-9_]*[a-z0-9]|[0-9]+(?:\.[0-9]+)?|[a-z0-9]/g;
 
 const cjkSegmenter = new Intl.Segmenter("zh", { granularity: "word" });
 

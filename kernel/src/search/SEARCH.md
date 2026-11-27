@@ -165,7 +165,7 @@ single batch keeps it to one round-trip per search.
 ```
 src/search/
 ├── types.ts              SearchAlgorithm, AsyncSearchAlgorithm, SearchOptions, SearchResult
-├── tokenizer.ts          Latin words + CJK word segmentation w/ bigram fallback
+├── tokenizer.ts          Latin words + digit runs + CJK word segmentation w/ bigram fallback
 ├── stemmer.ts            lightweight English stemmer
 ├── registry.ts           register / get / list algorithms
 ├── algorithms/
