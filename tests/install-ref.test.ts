@@ -140,7 +140,10 @@ function backupNames(globalRoot: string): string[] {
     return readdirSync(globalRoot).filter((e) => e.startsWith("billion-context.bak-")).sort();
 }
 
-test("#7806 resolveInstallRef: PR number, PR URL, branch, master, tag", () => {
+ // Pure mapping — no bash shim, so it runs on win32 too (the file-level
+ // `test` alias skips the shim-based suite there; #6805 review: the header
+ // comment promised this one still runs everywhere).
+ nodeTest("#7806 resolveInstallRef: PR number, PR URL, branch, master, tag", () => {
     assert.deepEqual(resolveInstallRef("7738"), { ref: "pull/7738/head", kind: "pr" });
     assert.deepEqual(resolveInstallRef("https://github.com/ranxianglei/billion-context/pull/7738"), { ref: "pull/7738/head", kind: "pr" });
     assert.deepEqual(resolveInstallRef("https://github.com/ranxianglei/billion-context/pull/7738/files#diff-x"), { ref: "pull/7738/head", kind: "pr" });
@@ -283,9 +286,14 @@ test("#7806 swap failure AFTER the backup auto-restores the previous install (no
         // after the backup rename, i.e. in the window where the global root
         // has no working install.
         writeFileSync(path.join(H.stateDir, "brick"), "1");
+        // The auto-restore succeeds here, so the error must say
+        // "auto-restored" — NOT "kept at <path> (restore manually: mv …)",
+        // which would point at a backup path that no longer exists (#6805
+        // review: the hint branch was keyed off the original error text and
+        // could never see the restore outcome).
         await assert.rejects(
             () => installFromRef("7738", { env: H.env, force: true }),
-            /install step failed: npm install .* — previous install kept at .*/,
+            /install step failed: npm install .* — previous install auto-restored/,
         );
         const cur = path.join(H.globalRoot, "billion-context");
         assert.ok(existsSync(cur), "the previous install must be BACK (auto-restore)");

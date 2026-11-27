@@ -183,11 +183,21 @@ test("parseArgs: --force attaches to update and install (#7806)", () => {
     assert.equal(i2.installRef, "master");
     assert.equal(i2.installDuration, "7d");
     assert.equal(i2.installForce, true);
+    // pack install: --force must reach packForce — a duplicate
+    // `case "--force"` made this dead code (first match wins) and silently
+    // disabled the flag (#6805 review).
+    const pk1 = parseArgs(["pack", "install", "spec", "--force"]);
+    assert.equal(pk1.packAction, "install");
+    assert.equal(pk1.packSpec, "spec");
+    assert.equal(pk1.packForce, true);
+    const pk2 = parseArgs(["--force", "pack", "install", "spec"]);
+    assert.equal(pk2.packForce, true);
     // --force does not leak across commands.
     const p = parseArgs(["pin", "1d"]);
     assert.equal(p.pinDuration, "1d");
     assert.equal(p.updateForce, false);
     assert.equal(p.installForce, false);
+    assert.equal(p.packForce, false);
 });
 
 test("parseArgs: --clear outside pin/unpin exits 2 (#6804)", () => {
