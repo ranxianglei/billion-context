@@ -146,6 +146,9 @@ export const LIVE_FILES = [
     // script with env fixtures; results land in mkdtemp dirs — no ports, no
     // credentials, no long-lived listeners, safe under --test-concurrency.
     "tests/ci-stale-pr-gate.test.ts",
+    // #7858: spawns `node --import tsx src/index.ts -c <name> sessions ls`
+    // in an mkdtemp XDG sandbox (hermetic dirs, no network/ports/creds).
+    "tests/cli-config-flag-store.test.ts",
     // Heap-bounded log readers in isolated children; private files, no sockets.
     "tests/web-logs-query.test.ts",
     // Native-zstd absence is simulated in an isolated Node child; it binds

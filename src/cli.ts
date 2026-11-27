@@ -807,6 +807,13 @@ export async function main(): Promise<void> {
         return;
     }
     if (command === "export") {
+        // The store lives where `sessionsDir()` points — which reads the config
+        // file via BILI_CONFIG_FILE. Apply the -c/--config override BEFORE the
+        // command (same as doctor/update below); without it `-c <name> export`
+        // silently exports from the default store.
+        for (const [k, v] of Object.entries(overrides)) {
+            if (v !== undefined) process.env[k] = v;
+        }
         try {
             const text = await exportSession(exportSelector, { output: exportOutput, full: exportFull, jsonl: exportJsonl });
             process.stdout.write(text + "\n");
@@ -820,6 +827,14 @@ export async function main(): Promise<void> {
         // Storage maintenance (#3928): standalone, no proxy needed — same
         // shape as export/doctor. The module owns all store access; failures
         // carry their own exit codes (1 = operation failed, 2 = usage).
+        // Apply -c/--config (and friends) BEFORE the command: runSessionsCommand
+        // opens the store at sessionsDir(), which resolves sessions.dir from the
+        // config file named by BILI_CONFIG_FILE — this branch used to return
+        // before the generic override loop below, so `-c <name> sessions ls`
+        // silently listed the DEFAULT store (#7858).
+        for (const [k, v] of Object.entries(overrides)) {
+            if (v !== undefined) process.env[k] = v;
+        }
         try {
             const r = command === "sessions"
                 ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum, apply: sessionsApply, restoreTarget: sessionsRestoreTarget })
