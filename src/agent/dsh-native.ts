@@ -1356,17 +1356,16 @@ function dshFpContent(content: unknown): unknown {
 }
 
 /** #6525: resolve the envelope (carrier ①) id array for a full-resend model
- *  body — CORE-aligned (== the post-hoist core count the server validates
- *  against, prepare-openai/anthropic) or undefined (degrade to
+ *  body — PER-WIRE-ELEMENT aligned (post-lead) or undefined (degrade to
  *  content-derived ids, never guess). Pure — unit-testable without a plugin
  *  ctx. Never re-implements the host's wire transforms: the pi-ai lockstep
  *  walkers (the SAME functions the pi/omp lanes pin with) prove
  *  wire-element ⇔ host-message pairing by order-preserving fingerprints and
- *  bail all-or-nothing; the kernel's own converters then prove the pin is
- *  core-alignable via the #3642 wireIndex back-pointer — every non-leading
- *  wire element must own exactly ONE core (parallel tool calls /
- *  reasoning+text / text+image parts split one host message into N cores,
- *  and N cores cannot share one host id: validateMsgIds rejects duplicates).
+ *  bail all-or-nothing. Element-granular, NOT core-granular (#7439
+ *  follow-up): the kernel splits one wire element into N cores (parallel
+ *  tool calls / reasoning+text / text+image parts), and the server dual-modes
+ *  the pin — per-core when every element is 1:1, wire-groups with derived
+ *  sibling ids when split.
  */
 function resolveEnvelopeMsgIds(parsed: Record<string, unknown>, hostMessages: unknown): string[] | undefined {
     const fmt = detectWireFormat(parsed);
@@ -1394,10 +1393,10 @@ function resolveEnvelopeMsgIds(parsed: Record<string, unknown>, hostMessages: un
         ? laneMsgIdsForResponsesWire(wire, entries)
         : laneMsgIdsForOpenAiWire(wire, entries);
     if (wireAligned === undefined) return undefined; // pairing not provable — degrade
-    // Shared core-alignment proof (pi-msgids.ts) — the SAME function the pi/omp
+    // Shared element-alignment (pi-msgids.ts) — the SAME function the pi/omp
     // lanes stamp with (review M1: the inline copy was a cherry-pick artifact;
     // any future fix to the proof must land once, not per-host).
-    return coreAlignEnvelopeIds(fmt, wireAligned, wire, parsed);
+    return coreAlignEnvelopeIds(wireAligned, wire);
 }
 
 /** #6525: the full-resend envelope's body field name, DUPLICATED from

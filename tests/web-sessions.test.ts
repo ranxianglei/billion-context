@@ -388,6 +388,20 @@ withSessionsDir("#3093: live (never-persisted) sessions carry the provenance sta
     assert.equal(d.biliVersion, VERSION);
 });
 
+withSessionsDir("egress-on sessions report the op-log carrier, not the legacy fallback", async (_dir) => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    // An egress-on session skips the per-turn unified ingest (KDD #23) and its
+    // identity-row metadata whitelist (KDD #25) carries no storageMode stamp,
+    // so the stamp is structurally absent — the detail must surface the real
+    // carrier (op log) instead of the frontend "legacy (json only)" fallback.
+    const s = getSession("eg-stamp", { protocol: "openai" });
+    s.metadata["egressAuthority"] = true;
+    const d = await buildSessionDetail("eg-stamp");
+    assert.ok(d && d.live, "detail resolves the resident session without touching disk");
+    assert.equal(d.storageMode, "egress");
+});
+
 withSessionsDir("buildSessionDetail flags externally-summarized blocks", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     const s = makeSession("det-ext", { protocol: "anthropic", title: "Ext" });
