@@ -66,7 +66,8 @@ test("(c) forkEgressSnapshot: egress-on parent forks to now — loadable, conten
             egressStateView: (s) => ustore!.egressStateView(s),
             egressStateViewAt: (s, x) => ustore!.egressStateViewAt(s, x),
             egressStateMaxSeq: (s) => ustore!.egressStateMaxSeq(s),
-            egressStateBaseSeq: (s) => ustore!.egressStateBaseSeq?.(s),
+            egressFlowWalkBack: (s) => ustore!.egressFlowWalkBack(s),
+
             egressStateTruncateAfter: (s, x) => ustore!.egressStateTruncateAfter(s, x),
         };
         const msgs: CoreMessage[] = [M("m1", "hello world"), M("m2", "hi there", "assistant")];

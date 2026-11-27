@@ -46,6 +46,7 @@ test("recording is content-table-free: rows carry bytes, content stays empty, re
             egressStateViewAt: (s, x) => store.egressStateViewAt(s, x),
             egressStateMaxSeq: (s) => store.egressStateMaxSeq(s),
             egressStateTruncateAfter: (s, x) => store.egressStateTruncateAfter(s, x),
+            egressFlowWalkBack: (s) => store.egressFlowWalkBack(s),
         };
         // turn 1: two messages; turn 2: tail append + fold shape; turn 3: an edit
         let view = recordEgressTurn({ store: ops, sessionId: sid, prev: undefined, conversation: [M("m1", "alpha"), M("m2", "beta")], systemText: "sys", nowMs: 1000 });
@@ -89,8 +90,8 @@ test("deleteSession cascades egress_state/egress_flow (plain rows, no CAS to rel
             { type: "U", msgid: "m2", bytes: '{"id":"m2","role":"user","text":"beta!"}', role: "user" },
         ], Date.now());
         const count = (t: string) => (db.prepare(`SELECT count(*) AS n FROM ${t}`).get() as { n: number }).n;
-        assert.equal(count("egress_state"), 4);
-        assert.equal(count("egress_flow"), 4);
+        assert.equal(count("egress_flow"), 4, "the flow keeps every op (append-only)");
+        assert.equal(count("egress_state"), 1, "the state plane is materialized — the live rows only (7773)");
         const v = egressStateView(db, sid);
         assert.deepEqual(v.map((r) => r.msgid), ["m2"]);
         assert.equal(v[0].bytes, '{"id":"m2","role":"user","text":"beta!"}', "the +U replaced the bytes in place");
