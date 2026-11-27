@@ -155,8 +155,33 @@ export async function searchBlocksAsync(
 }
 
 /**
+ * Map a UTF-16 offset in text.toLowerCase() back to text. Per-character
+ * accumulation is exact because the only length-changing lowercase mapping
+ * is U+0130 (İ, one to two UTF-16 units) and it is context-free; the
+ * contextual rules (Greek sigma) are length-preserving.
+ * (billion-context#6493)
+ */
+function originalOffsetOf(text: string, lowerOffset: number): number {
+  let lower = 0;
+  let orig = 0;
+  for (const char of text) {
+    const next = lower + char.toLowerCase().length;
+    if (next <= lowerOffset) {
+      orig += char.length;
+      lower = next;
+    } else {
+      break;
+    }
+  }
+  return orig;
+}
+
+/**
  * Preview centered on the first query-term hit (case-insensitive).
- * Falls back to the head when no term hits.
+ * Falls back to the head when no term hits. The hit offset is found in the
+ * lowercased text and mapped back to the original before windowing, so
+ * length-expanding lowercasing (İ) cannot shift the window past the hit
+ * (billion-context#6493).
  */
 function makePreview(text: string, query: string, len: number): string {
   if (!text) return "";
@@ -180,7 +205,8 @@ function makePreview(text: string, query: string, len: number): string {
   if (hitIdx < 0) return clampPrefix(text, len);
 
   const half = Math.max(0, Math.floor(len / 2) - 10);
-  const start = Math.max(0, hitIdx - half);
+  const hitOrig = originalOffsetOf(text, hitIdx);
+  const start = Math.max(0, hitOrig - half);
   const end = Math.min(text.length, start + len);
   const prefix = start > 0 ? "…" : "";
   const suffix = end < text.length ? "…" : "";
