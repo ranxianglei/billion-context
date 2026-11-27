@@ -48,14 +48,15 @@ import type { ConversationIdentity } from "../session-id.js";
 import { pckKeyAbated } from "../pck-probe.js";
 import { reconcilePluginFoldCallIds } from "../plugin.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
-import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
+import { egressPlaneGateOn, imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
 import { SessionStore, getStore } from "../persist.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudgeArmed, emergencyNudgeForConfig, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { egressAuthorityArmed, egressTinyBudget, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, egressBlockLedgerFor, egressTinyBudget, recordAuthorityTurn, resolveEgressAuthority, stampEgressSeqs } from "./egress-lane-io.js";
+import { EgressAuthorityRejectError } from "../storage/egress-record.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -347,6 +348,8 @@ export async function prepareResponses(
         } else {
             renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
         }
+        // #7439 follow-up (C6): egress-on sequence authority (see egress-lane-io).
+        renderMsgs = stampEgressSeqs(getStore()?.egressOpLogStore(), sessionId, renderMsgs);
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.
@@ -556,7 +559,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // (egressAuthorityArmed — same as the OpenAI lane). Every other main
         // turn is only recorded.
         const egressSide = isCompactionTrigger || egressTinyBudget(parsed);
-        if (!egressSide && featureEnabled("egressPlane")) {
+        if (!egressSide && egressPlaneGateOn()) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 // The single shared authority seam (egress-lane-io),
@@ -566,8 +569,14 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 // live every turn — recording it would churn the system
                 // row). Unreadable flow → hard fail.
                 const armed = egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: egressSide });
+                // The reject check sits AFTER processTurn here (the openai
+                // lane has it pre-kernel, prepare-openai.ts:384): the decision
+                // does not depend on the turn content, but the record needs
+                // the transformed lane shape. A rejected turn leaves only
+                // in-memory kernel state — nothing is recorded and the retry
+                // self-heals (single-txn, idempotent).
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCore, log, armed });
-                const served = recordAuthorityTurn(st, sessionId, auth, projection.systemParts.join("\n\n"), log);
+                const served = recordAuthorityTurn(st, sessionId, auth, projection.systemParts.join("\n\n"), log, egressBlockLedgerFor(session), session.state.messageRefs);
                 if (served !== null) laneCore = served;
             }
         }
@@ -717,6 +726,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // BEFORE the generic 503; zero kernel side effects by construction
         // (it throws before processTurn).
         if (err instanceof FoundationRejectError) throw err;
+        // Ruling 7439-5 (C3, PR #7684): an unreadable op-log on an armed turn
+        // is a HARD fail (500 + x-bili-egress: unreadable) — the generic
+        // forward below would send the CLIENT'S bytes, which the ruling
+        // forbids (the openai lane already rethrows this exact error).
+        if (err instanceof EgressAuthorityRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
     }

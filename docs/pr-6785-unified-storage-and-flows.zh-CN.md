@@ -2,7 +2,8 @@
 
 > 范围:`2026-11-15_msgid-snapshot-unified` @ `39941c816`(base `origin/master` `b10c1a0d4`)。
 > 134 文件 +13740/−367。本文是本 PR 的**审查级**完整梳理:四部分(表结构 / 实现逻辑 / 数据流转 / 开关)+ 实测验证 + 本轮发现与修复。行号均指 head 处源码。
-> **第 2 轮(owner 裁定 7439-2,KDD #23,2026-11-22)已落在同一分支、晚于本快照**——op log 正史编号、窗口 re-anchor delta、messages 惰性投影与常驻性能门。见 **§6**(与本文件 §1.2 egress DDL 草图、§5.4 遗留项冲突处以 §6 为准)。
+> **第 2 轮（owner 裁定 7439-2，KDD #23，2026-11-22）已落在同一分支、晚于本快照**——op log 正史编号、窗口 re-anchor delta、messages 惰性投影与常驻性能门。见 **§6**（与本文件 §1.2 egress DDL 草图、§5.4 遗留项冲突处以 §6 为准）。
+> **退役注（合入后，引用本文表清单前先读）：**截至 #7439 系列终态，`l1_world` 已降级为**占位行**（R3 latch 载体迁至 `sessions.r3_latched_at`；egress-on 的 stage-0 无状态——#7617），`conversations` 对 egress-on 退役，`fold_journal`/`egress_snapshot` 合入前已删。当前表清单——含 `egress_flow`/`egress_state` op log 与双时钟的 `egress_block_flow`/`egress_block_state`——见 [architecture/storage.md](./architecture/storage.zh-CN.md) 与一站式 [egress-plane.md](./egress-plane.zh-CN.md)；退役登记见 [deprecations.md](./deprecations.zh-CN.md)。
 
 
 ---
@@ -117,7 +118,7 @@ PRIMARY KEY (session_id, log_seq)
 ```
 
 - `egress_state` = serve 读 + 压实物理裁剪(水位以下删);
-- `egress_flow` = append-only **永不删**(任意 log_seq 可重建,回滚以此表为据,不靠客户端重发)。#7574 起有变化(§7.3):压缩时这张表也一起裁——只留最新一条基线行及其之后的行。
+- `egress_flow` = append-only **永不删**(任意 log_seq 可重建,回滚以此表为据,不靠客户端重发)。2026-11-23 的一个构建(df7ac0929)曾让压缩也裁这张表(「只留最新一条基线行及其之后的行」);2026-11-26 按 #7439 裁定恢复——压实只裁 `egress_state`,flow 保持 append-only。
 
 行 payload 契约(egress-state.ts):
 - `I`: `{"after": msgid|null, "ref", "tokens", "type", "content_hash", "role"?, "cas_ref"?}`
@@ -164,7 +165,7 @@ PRIMARY KEY (session_id, log_seq)
 
 - `diffEgressView`(153-204):骨架 = `next` 中 msgid 在 `prev` 里**升序出现**的最长子序列(双指针扫描);骨架行 contentHash 变 ⇒ `U`;prev 非骨架 ⇒ 按 prev 顺序发最大连续 `D` 段;next 非骨架 ⇒ 按 next 顺序发 `I`(锚 = 前行);**移动 = D+I,无 M op**;op 顺序 D→U→I;不变式 `replay(prev, diff(prev,next)) === next`。
 - `nextLogSeq` 从 **flow** 取 MAX(state 被压实裁剪过,flow 是超集)。
-- `egressStateAt(db, sid, x)`(264-274):flow 重放到 `log_seq <= x` = 任意历史点重建(回滚)。#7574 起(§7.3):只能重建最新基线行之后的点。
+- `egressStateAt(db, sid, x)`(264-274):flow 重放到 `log_seq <= x` = 任意历史点重建(回滚)。任意点位——包括最新基线行之下的点(flow append-only,见上方偏离注记)。
 - `egressStateCompact`(278-292):重放结果写成一条 `B` 行(两表)+ 物理删 state 水位以下(flow 不动)。
 - 任何锚点/端点/重复/畸形违例 ⇒ 抛 `EgressStateCorruptError`(36-42)⇒ 调用方**整会话降级 legacy**,永不模糊兜底。
 
@@ -412,7 +413,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 - **日志坏了。** 只有上面那些「以服务端为准」的会话才失败一轮(和以前一样是 500)。只做镜像的会话照常应答,每轮记一条日志。`GET /__bili/egress/latches` 列出失败的会话;`POST /__bili/egress/reset { sessionId }` 丢掉坏掉的日志,下一轮从客户端的对话重建。已经标记的会话不再每个请求都重扫一遍日志。
 - **回退到最后一个健康点**(并删掉之后的行)只在日志确实无法重放时发生,而且只针对「以服务端为准」的会话。数据库忙/锁住/IO 错误原样抛出,不删任何东西。
 - **同一会话两个请求。** 开始时基于旧日志的那个写入会被拒绝(`EgressConcurrentWriteError`),它的轮次照常下发、只是不记录。会把日志写坏的批次在写入之前就被拒绝。
-- **压缩。** 带删除的轮次在同一次写入里完成压缩,而且两张表**一起**裁。`egress_flow` 不再是「只追加、永不删」:它保留最新一条基线行及其之后的行,`egressStateAt` 能重建最新基线之后的任意点。(之前:flow 保留所有行,每次折叠多存一份完整快照。)
+- **压缩。** 带删除的轮次在同一次写入里完成压缩。压实裁**state**表新基线行以下的行;**flow**表保留它写过的每一行(append-only,#7439 裁定——2026-11-26 在 2026-11-23 的构建把 flow 裁到最新基线以下之后恢复),所以 `egressStateAt` 能重建任意历史点。增长是推迟的优化项(#7475),另行解决,绝不靠保留策略。
 - **服务副本**(`egress_state`)每次读取都和日志比对;副本坏了就从日志重新拷贝,日志有洞会被报出来。
 - **非空视图上的 `after: null` 表示「新的第一行」**,两个重放一致。(之前:校验放第一、存储放最后,下一轮要付出一次删除+插入的重写。)
 - **开关关闭** = 什么都不读操作日志,哪怕会话已经有日志:钉住的 id 从 `messages` 读,漂移检查关闭。

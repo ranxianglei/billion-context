@@ -26,6 +26,7 @@ process.env.BILI_PERSIST_ZSTD = "0";
 const hermetic = mkdtempSync(join(tmpdir(), "bili-egress-fork-hermetic-"));
 process.env.BILI_CONFIG_FILE = join(hermetic, "no-config.json");
 process.env.BILI_STORAGE_UNIFIED = "full";
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 
 // import AFTER the env is set (persist.js reads the storage mode at import
 // for some lazy paths; the constructor re-resolves, but keep it tidy).
@@ -65,7 +66,8 @@ test("(c) forkEgressSnapshot: egress-on parent forks to now — loadable, conten
             egressStateView: (s) => ustore!.egressStateView(s),
             egressStateViewAt: (s, x) => ustore!.egressStateViewAt(s, x),
             egressStateMaxSeq: (s) => ustore!.egressStateMaxSeq(s),
-            egressStateBaseSeq: (s) => ustore!.egressStateBaseSeq?.(s),
+            egressFlowWalkBack: (s) => ustore!.egressFlowWalkBack(s),
+
             egressStateTruncateAfter: (s, x) => ustore!.egressStateTruncateAfter(s, x),
         };
         const msgs: CoreMessage[] = [M("m1", "hello world"), M("m2", "hi there", "assistant")];

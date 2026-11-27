@@ -33,6 +33,7 @@ billion-context/
 │   │   ├── request-cost.ts       #   Per-request local-cost line (outbound measured at the real wire body) + #5408 heartbeat + wall-clock slow-session advisory, facts only (#903/#4528/#5744)
 │   │   ├── responses-ordering.ts #   #564 Responses assistant-run ordering repair + producer-owned turn-separator provenance (#2627)
 │   │   ├── responses-separator.ts #   Canonical Responses turn-separator literal and carrier predicates (#2627)
+│   │   ├── session-lane.ts       #   Wire-lane switch recorder: one loud line per session wire-lane switch (bounded cross-wire loss list), previous lane persisted in session metadata (#7439 C5 / #7684)
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests
 │   │   ├── attribution-status.ts #   Takeover-failure visibility from host attribution reports (#3581)
 │   │   ├── dsh-authored-compaction.ts #   Bili-authored dsh compaction: answers the summarize call locally (#3733)
@@ -162,6 +163,7 @@ billion-context/
 │   │   ├── egress-state.ts         #   Egress op-log outbound view: dual-table state+flow, replay, compaction, any-seq rollback (#7398)
 │   │   ├── egress-block.ts         #   Egress block op-log: dual-table block state+flow, replay, compaction, point-fork, kstate sidecar (#7577, rollout egressPlane)
 │   │   ├── egress-record.ts        #   Egress op-log RECORDING: build the outbound view rows, diff vs prev, append sparse ops, fold-triggered compaction (#7398, rollout egressPlane)
+│   │   ├── egress-usage.ts         #   Egress usage event stream: the cache-ledger mutations as an append-only M/S/F op log (append/fork/delete, restart replay rows, usage:stats materialization) (owner ruling 2026-11-27, rollout egressPlane)
 │   │   ├── egress-serve.ts         #   Egress op-log SERVE: rebuild the outbound elements from the self-contained op-log rows (byte-identity chain, ladder recovery, whole-turn degrade) + shadow byte comparison (#7398, rollout egressPlane)
 │   │   ├── ingest.ts             #   Legacy → unified row mapping + legacy view rebuild (#2671)
 │   │   ├── integrity-check.ts    #   Cached + background quick_check off the boot critical path (#4609)
@@ -222,6 +224,7 @@ billion-context/
 │   │   ├── media-bytes.ts        #   Shared inline-media byte accounting for native direct-send refusal gates
 │   │   ├── native-bootstrap.ts   #   dist/agent/<entry>.js → dist/index.js resolution
 │   │   ├── native-intercept.ts   #   Model-API fetch routing, attribution and proxy recovery
+│   │   ├── prompt-mass.ts   #   Protocol-shaped prompt-mass pricing for the client-local doom gate (#7106)
 │   │   ├── fetch-chain/
 │   │   │   └── index.ts          #   Fetch guard, re-entry cutoff and pi-web-access coexistence
 │   │   ├── native-ws-intercept.ts #  WebSocket-companion intercept: Codex Responses upgrades → /bili/ lane (#2111)

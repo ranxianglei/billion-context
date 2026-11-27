@@ -2323,6 +2323,10 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     let targetOrigin: string | undefined;
     try { targetOrigin = new URL(upstreamUrl).origin; } catch { targetOrigin = undefined; }
     let dumpRaw: Promise<void> | undefined;
+    // #7666: three-level resolved degenerate-retry budget (global → provider →
+    // model), shared by every plugin strip pipe below (plugin-mode streamed,
+    // reset-after-success, title-gen).
+    const degenerateRetryCfg = resolveCompress(opts.routes, upstreamUrl, throttleModel, opts.compress).degenerateRetry;
     // Plugin mode: the agent's native loop owns the tool surface — pass the
     // response through VERBATIM (a model-emitted compress call must reach the
     // plugin untouched) while sniffing usage so lastInputTokens (the input to
@@ -2434,6 +2438,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                             signal: clientAbort.signal,
                             log,
                             label: prepared.session.id,
+                            nudges: degenerateRetryCfg?.nudges,
                         }),
                         targetOrigin,
                         absorbInstructed,
@@ -2441,6 +2446,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         upstreamMeta,
                         reply,
                         hostOwnsTruncationRecovery,
+                        degenerateRetryCfg?.maxAttempts,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -2464,6 +2470,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                             signal: clientAbort.signal,
                             log,
                             label: prepared.session.id,
+                            nudges: degenerateRetryCfg?.nudges,
                         }),
                         targetOrigin,
                         absorbInstructed,
@@ -2472,6 +2479,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         reply,
                         opts.streamErrorShape,
                         hostOwnsTruncationRecovery,
+                        degenerateRetryCfg?.maxAttempts,
+                        opts.degenerateTurn,
                     );
                 }
             } else {
@@ -2618,6 +2627,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: prepared.session.id,
+                        nudges: degenerateRetryCfg?.nudges,
                     }),
                     undefined,
                     undefined,
@@ -2625,6 +2635,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     upstreamMeta,
                     reply,
                     hostOwnsTruncationRecovery,
+                    degenerateRetryCfg?.maxAttempts,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -2671,6 +2682,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: p.session.id,
+                        nudges: degenerateRetryCfg?.nudges,
                     }),
                     undefined,
                     undefined,
@@ -2678,6 +2690,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     upstreamMeta,
                     reply,
                     hostOwnsTruncationRecovery,
+                    degenerateRetryCfg?.maxAttempts,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -2698,6 +2711,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: p.session.id,
+                        nudges: degenerateRetryCfg?.nudges,
                     }),
                     undefined,
                     undefined,
@@ -2706,6 +2720,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     reply,
                     opts.streamErrorShape,
                     hostOwnsTruncationRecovery,
+                    degenerateRetryCfg?.maxAttempts,
+                    opts.degenerateTurn,
                 );
             }
         } else if (

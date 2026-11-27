@@ -41,12 +41,13 @@
 // the lane's OUTBOUND system text (post-injection), so system drift is
 // visible as a +U op on that row.
 //
-// Rollout gate (egressPlane, default 0) and each lane's arming condition
+// Rollout gate (egressPlane, default 0 — opt-in per owner ruling 2026-11-24) and each lane's arming condition
 // are owned by the caller.
 
-import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, type EgressOpLogStore } from "../storage/egress-record.js";
+import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, EGRESS_SYSTEM_MSGID, sanitizeEgressIdentityMetadata, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
+import type { EgressBlockLedgerInput } from "../storage/egress-block.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
-import { featureEnabled } from "../rollout.js";
+import { egressPlaneGateOn } from "../knobs.js";
 import { outputBudgetField, readOutputBudget } from "./budget.js";
 import { rebuildCoreFromLog } from "../storage/egress-serve.js";
 import type { EgressViewRow } from "../storage/egress-state.js";
@@ -130,7 +131,7 @@ interface EgressAuthorityOutcome {
  * session could have its conversation replaced by the log. A turn that is
  * not armed is still recorded (the log doubles as the pin ledger). */
 export function egressAuthorityArmed(input: { pluginMode: boolean; pinned: boolean; sideRequest: boolean }): boolean {
-    return featureEnabled("egressPlane") && input.pluginMode && input.pinned && !input.sideRequest;
+    return egressPlaneGateOn() && input.pluginMode && input.pinned && !input.sideRequest;
 }
 
 /** The side-request signal the seam understands on every wire: an output
@@ -142,6 +143,17 @@ export function egressTinyBudget(parsed: unknown): boolean {
     if (field === null) return false;
     const value = readOutputBudget(parsed as Record<string, unknown>, field);
     return typeof value === "number" && value > 0 && value <= 200;
+}
+
+/** #7664 (PR-A): the in-memory kernel block set for the egress block ledger —
+ *  present only for egress-on sessions (the latch set by
+ *  resolveEgressAuthority). The lane passes it to recordAuthorityTurn / the
+ *  inline recordEgressTurn call so the block tables get their per-turn diff
+ *  (the unified-leg recorder never runs for these sessions). */
+export function egressBlockLedgerFor(session: Session): EgressBlockLedgerInput | undefined {
+    return session.metadata?.["egressAuthority"] === true
+        ? { state: session.state, blockContents: session.blockContents }
+        : undefined;
 }
 
 /** The single authority decision (ruling 7439-5): latch, recover,
@@ -181,7 +193,7 @@ export function resolveEgressAuthority(args: {
             log("info", `[${sessionId}] egress: the op log was reset — latch cleared, the log is rebuilt from this turn`);
         } else if (armed) {
             log("error", `[${sessionId}] egress-authority: session is latched egressFlowUnreadable — refusing to run on client bytes (ruling 7439-5); reset the log to recover`);
-            throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (ruling 7439-5) — failing the turn instead of trusting client bytes`);
+            throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (details in the server log)`);
         } else {
             log("warn", `[${sessionId}] egress: session is latched egressFlowUnreadable — turn not recorded (the log is not this session's authority); reset the log to record again`);
         }
@@ -198,12 +210,7 @@ export function resolveEgressAuthority(args: {
         }
         log("error", `[${sessionId}] egress-authority: no healthy flow point — refusing to run on client bytes (ruling 7439-5); latching egressFlowUnreadable, session-level recovery required`);
         session.metadata["egressFlowUnreadable"] = true;
-        throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (ruling 7439-5) — failing the turn instead of trusting client bytes`);
-    }
-    if (!armed) {
-        // Record-only turn: the lane's own core is written as-is and served
-        // as-is.
-        return { base: base0.view, baseSeq: base0.seq, bootstrapping: false, swappedCore: null, recordCore: core };
+        throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (details in the server log)`);
     }
     // Ruling 7439: from this turn the op log is the content source of
     // truth for the session, so the unified-storage verifier must not
@@ -212,7 +219,68 @@ export function resolveEgressAuthority(args: {
     // bytes the client never saw verbatim). The marker persists in
     // session metadata (meta_json) so it survives restarts and covers
     // every later turn, not just this one.
-    session.metadata["egressAuthority"] = true;
+    //
+    // The latch is claimed BEFORE the identity upsert (the upsert's
+    // metadata_json is what makes the latch survive a restart — load
+    // restores session.metadata from the sessions row's metadata_json).
+    if (armed) session.metadata["egressAuthority"] = true;
+    // KDD #25 (discussions/7735): persist the MINIMAL identity row on EVERY
+    // egress-on turn — ARMED or LATCHED-RECORD-ONLY — never rely on the first
+    // ingest (egressProjection Frozen freezes it for armed sessions, so the
+    // row would never land and the session was invisible to list/GC/load
+    // after a restart). The latch is what makes a session egress-on, not the
+    // arm verdict of the current turn: a latched session whose pin FAILED
+    // this turn (host did not declare ids — e.g. the pi+reasoning wire made
+    // the full-resend resolver bail, every later turn record-only) degrades
+    // to record-only turns, and an armed-only upsert would then stop
+    // refreshing the row forever: title/origin/label never land or go stale
+    // (the field report: a pi thinking session whose title stayed NULL while
+    // its flow rows accumulated). Idempotent upsert = self-healing +
+    // updated_at keeps the sessions row fresh. Best-effort: a failure
+    // degrades to the existing fallback (isEgressOnSession probes
+    // egress_flow directly) — it never fails the request.
+    if (armed || session.metadata["egressAuthority"] === true) {
+        try {
+        st.ensureEgressIdentity?.({
+            sessionId: session.id,
+            parentSessionId:
+                typeof session.metadata["derivedFromSessionId"] === "string" && session.metadata["derivedFromSessionId"] !== ""
+                    ? session.metadata["derivedFromSessionId"] as string : null,
+            protocol: session.meta?.protocol ?? null,
+            label: session.meta?.label ?? null,
+            title: session.meta?.title ?? null,
+            hostTitle: session.meta?.hostTitle ?? null,
+            namespace:
+                typeof session.metadata["pluginAgent"] === "string" && session.metadata["pluginAgent"] !== ""
+                    ? session.metadata["pluginAgent"] as string : "proxy",
+            origin: session.meta?.upstreamOrigin ?? null,
+            createdAt: session.createdAt,
+            updatedAt: session.lastSeen,
+            // KDD #25: identity keys only — NEVER the raw session.meta bag
+            // (it carries handle.ts's runtime keys: summaryInstructions = the
+            // full multi-KB compress prompt, activePack, …). The typed fields
+            // ride their own columns; verifyProjections cross-checks exactly
+            // these four against meta_json.
+            metaJson: JSON.stringify({
+                protocol: session.meta?.protocol ?? null,
+                label: session.meta?.label ?? null,
+                title: session.meta?.title ?? null,
+                hostTitle: session.meta?.hostTitle ?? null,
+            }),
+            // KDD #25: NEVER the full runtime bag — it can carry the #6947
+            // turn-final reply stashes (handoffReply/handoffResponse, up to
+            // 1.5 MB each of chat content). Identity keys only.
+            metadataJson: JSON.stringify(sanitizeEgressIdentityMetadata(session.metadata)),
+        });
+        } catch (err) {
+            log("warn", `[${sessionId}] egress: identity row upsert failed (best-effort; the egress_flow probe still covers identity): ${String((err as { message?: unknown })?.message ?? err).slice(0, 200)}`);
+        }
+    }
+    if (!armed) {
+        // Record-only turn: the lane's own core is written as-is and served
+        // as-is.
+        return { base: base0.view, baseSeq: base0.seq, bootstrapping: false, swappedCore: null, recordCore: core };
+    }
     if (base0.view.length === 0) {
         // Turn-1 cold start (ruling 7439-5): the client bytes are the
         // content source EXACTLY ONCE — recordAuthorityTurn puts them in
@@ -248,6 +316,8 @@ export function recordAuthorityTurn(
     outcome: EgressAuthorityOutcome,
     systemText: string,
     log: LaneLog,
+    blockLedger?: EgressBlockLedgerInput,
+    refMap?: EgressRefMap,
 ): BiliMessage[] | null {
     if (outcome.recordCore === null) return null;
     try {
@@ -259,14 +329,63 @@ export function recordAuthorityTurn(
             conversation: outcome.recordCore,
             systemText,
             nowMs: Date.now(),
+            blockLedger,
+            refMap,
         });
     } catch (err) {
         if (err instanceof EgressConcurrentWriteError) {
             log("warn", `[${sessionId}] egress op-log recording skipped this turn (another request on this session recorded first): ${String(err)}`);
         } else {
-            log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
+            log("warn", `[${sessionId}] egress op-log recording skipped this turn (record failed — the log will not advance until the corruption is resolved; this turn serves the memory-swapped core from the last healthy base, NOT the raw client resend): ${String(err)}`);
         }
     }
     if (outcome.bootstrapping) return outcome.recordCore;
     return outcome.swappedCore;
+}
+
+/**
+ * #7439 follow-up (C6): egress-on sequence authority. For a session the
+ * op log records, the FLOW is the transcript: each core carries its
+ * canonical message number (egress_flow.log_seq — the renumbered citation
+ * space: the system row is 0, the first real message 1) as `ledgerSeq`, the
+ * same display space the kernel's refs/prune/sync/compress consume (CoreMessage
+ * .ledgerSeq, refs #4316 L3). Block coordinates resolved from the same flow
+ * (ingestSession) live in the identical space, so seq coverage, block
+ * pruning and the ref ledger all line up without any conversion.
+ *
+ * A core not yet in the flow (fresh this turn) is left un-stamped — its
+ * number exists only after recordEgressTurn assigns it, and the id path
+ * stays authoritative for it until then. Never fails: an absent store, the
+ * flag off, an empty/corrupt view returns the input untouched (the id path
+ * keeps working — a sequence stamp is an optimization, not an authority).
+ */
+export function stampEgressSeqs(
+    st: EgressOpLogStore | null | undefined,
+    sessionId: string,
+    msgs: readonly BiliMessage[],
+): BiliMessage[] {
+    if (st === null || st === undefined || !egressPlaneGateOn()) return msgs as BiliMessage[];
+    let view: EgressViewRow[];
+    try {
+        view = st.egressStateView(sessionId);
+    } catch {
+        return msgs as BiliMessage[];
+    }
+    if (view.length === 0) return msgs as BiliMessage[];
+    const byId = new Map<string, number>();
+    for (const row of view) {
+        if (row.msgid !== EGRESS_SYSTEM_MSGID && row.num > 0) byId.set(row.msgid, row.num);
+    }
+    if (byId.size === 0) return msgs as BiliMessage[];
+    let touched = false;
+    const out = msgs.map((m) => {
+        const n = byId.get(m.id);
+        if (n === undefined || m.ledgerSeq === n) return m;
+        touched = true;
+        return { ...m, ledgerSeq: n };
+    });
+    // The SAME reference is returned whenever nothing was stamped, so the
+    // lanes' reference-inequality discriminators (snapshot-view replacement)
+    // keep their exact meaning; a stamped view is a genuine replacement.
+    return touched ? out : (msgs as BiliMessage[]);
 }

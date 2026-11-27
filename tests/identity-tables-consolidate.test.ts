@@ -35,6 +35,11 @@ process.env.BILI_PERSIST_ZSTD = "0";
 // only reads the egress view when the egressPlane rollout is on (master's #7583
 // gate); force it on so the stateless stage-0 branch is exercised.
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+// KDD #25: these suites assert the LEGACY table shape (l1 rows, R3
+// carriers, GC) while egressPlane=1 — they simulate a pre-gate DB, so
+// force the full table set (the production gate would skip the 12 legacy
+// tables on this fresh test database).
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-identity-consolidate-hermetic-"));
 process.env.BILI_CONFIG_FILE = path.join(hermetic, "no-config.json");
 process.env.BILI_STORAGE_UNIFIED = "legacy";
@@ -205,9 +210,9 @@ test("S2 (owner ruling 2026-11-24): egressPlane OFF → latch writes the legacy 
     const h = openStore();
     const sid = "sess-r3-flag-off-l1";
     try {
-        // the file forces egressPlane ON at module load; flip it off here
-        // (featureEnabled re-reads the env on every call).
-        delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+        // this branch defaults the plane to 100 — "unset" no longer means
+        // off; force "0" (the env always wins over the baked-in percent).
+        process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
         try {
             h.store.snapR3Latch(sid);
             // legacy l1 carrier: the placeholder row, byte-identical to pre-migration
@@ -233,7 +238,10 @@ test("S2 (owner ruling 2026-11-24): egressPlane OFF → latch writes the legacy 
             assert.equal(h.db.prepare("SELECT sess_raw FROM l1_world WHERE sess_raw = ?").get("sid-ro"), undefined, "NOT keyed by the ledger sid");
             assert.equal(h.store.snapR3Latched("sid-ro"), true, "readable via the l1 fallback (keyed by sessRaw)");
         } finally {
-            process.env.BILI_ROLLOUT_EGRESS_PLANE = "1"; // restore for the rest of the file
+            // restore the module-level plane for the rest of the file (the
+            // branch default is 0 since KDD #25 — "unset" means OFF, so an
+            // explicit restore is what keeps the egress-branch tests armed).
+            process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
         }
     } finally {
         closeStore(h);

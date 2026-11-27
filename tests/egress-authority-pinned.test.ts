@@ -32,6 +32,10 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { setLogCapture } from "../src/logger.ts";
 
 const MODEL = "gpt-test";
+// KDD #25: this suite mixes an egress-on session and a LEGACY control session
+// in one database (unpinned control leg) — it simulates a pre-gate DB, so
+// force the full table set even where egressPlane=1 is set below.
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 
 function listen(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();
@@ -204,7 +208,10 @@ test("pinned lane: bootstrap, steady serve, unpinned control, hard-fail (#7439-5
                 const db = new DatabaseSync(dbPath);
                 try {
                     db.exec("PRAGMA busy_timeout = 15000");
-                    const st = db.prepare("UPDATE egress_state SET payload = ? WHERE session_id = ?").run('{"x":1}', sid);
+                    // 7773: the state plane carries no payload — damage it
+                    // structurally (the serving read notices) and make the
+                    // flow unreplayable (the rebuild and the walk-back hit it)
+                    const st = db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sid);
                     const fl = db.prepare("UPDATE egress_flow SET payload = ? WHERE session_id = ?").run('{"x":1}', sid);
                     if (st.changes > 0 && fl.changes > 0) {
                         assert.ok(fl.changes >= flowAfterBootstrap, `corruption covered the flow rows (changed ${fl.changes}, expected >= ${flowAfterBootstrap})`);
