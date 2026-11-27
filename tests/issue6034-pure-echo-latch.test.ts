@@ -78,7 +78,7 @@ function chatFinish(reason = "stop"): string {
 
 const DONE = "data: [DONE]\n\n";
 
-test("filter: a cross-chunk refs-only echo arms on session start, then disarms on its whole-dead close (#6034)", () => {
+test("filter: a cross-chunk refs-only echo never arms the frame — the whole-dead close leaves nothing either (#6034)", () => {
     const verdicts: boolean[] = [];
     const f = createTagEchoFilter(undefined, undefined, false, undefined, (v) => verdicts.push(v));
     const a = f.push(ECHO_OPEN);
@@ -87,7 +87,7 @@ test("filter: a cross-chunk refs-only echo arms on session start, then disarms o
     assert.equal(a, "", "the open holds");
     assert.equal(b, "", "the refs-only unit dies whole — nothing released");
     assert.equal(c, PROSE, "the prose after the echo flows to the client");
-    assert.deepEqual(verdicts, [true, false], "session start leaves a pending interior; the refs-only close leaves none");
+    assert.deepEqual(verdicts, [false, false], "an attrs-bearing opening is a complete tag quote — it arms nothing; the refs-only close leaves nothing either");
 });
 
 test("filter: a mangled close after a ref (unclosed echo) keeps the frame armed — the span died uncleanly (#6034 vs the unclosed-echo retry tests)", () => {
@@ -100,7 +100,7 @@ test("filter: a mangled close after a ref (unclosed echo) keeps the frame armed 
     f.push("\x3cacp tokens=\"247\" type=\"text\"\x3e");
     const released = f.push(` m00693</cp>${" ".repeat(80)}`);
     assert.ok(released.length > 0, "the residue after the mangled close flows to the client");
-    assert.deepEqual(verdicts, [true, true], "session start AND the mangled-close resolution both leave the frame armed");
+    assert.deepEqual(verdicts, [false, true], "the mangled-close resolution arms the frame; the opening itself does not");
 });
 
 test("filter: a closed span with a prose body leaves interior (markup), both in-frame and across chunks (#6034 control)", () => {
@@ -109,7 +109,7 @@ test("filter: a closed span with a prose body leaves interior (markup), both in-
     f.push(`<acp tokens="5" type="text">`.replace(/</g, "\x3c").replace(/>/g, "\x3e"));
     const released = f.push(`wrapped body\x3c/acp\x3e`);
     assert.equal(released, "wrapped body", "the body is released (only the close goes)");
-    assert.deepEqual(verdicts, [true, true], "session start AND the body-releasing close both leave interior");
+    assert.deepEqual(verdicts, [false, true], "the body-releasing close leaves interior; the opening itself does not");
 });
 
 test("filter: a complete refs-only echo in one buffer is a whole-dead unit — no interior verdict (#6034)", () => {
