@@ -736,6 +736,17 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     // would double-finish the client's stream, so it is left out.
                     // No firstRoundOnly: like text/reasoning frames it is
                     // content, forwarded on every round.
+                    //
+                    // #7694 follow-up: OpenRouter's `reasoning_details` is the
+                    // structured thinking channel, not an opaque extra. A turn
+                    // whose ONLY thinking arrives this way is the #732 "silent
+                    // thought" shape — it must reach `done.thinking` so the
+                    // degenerate-turn recovery fires, exactly as a
+                    // reasoning_content turn does. Pure unknown fields stay out
+                    // of that count: they are not evidence of thinking.
+                    if (Array.isArray(delta.reasoning_details) && delta.reasoning_details.length > 0) {
+                        sawReasoning = true;
+                    }
                     yield { kind: "meta", chunk: fin(rawBuf) } as ParsedStreamEvent;
                 }
             }

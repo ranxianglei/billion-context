@@ -64,6 +64,50 @@ test("#7694: reasoning_details-only delta is forwarded, not dropped", async () =
     assert.ok(bytes.includes('"content":"x"'), "content frame still reaches the client");
 });
 
+// #7694 follow-up: reasoning_details IS the structured thinking channel
+// (OpenRouter shape), so a turn whose only thinking arrives this way must
+// report `done.thinking` — that flag is what arms the #732 silent-thought
+// recovery. Forwarding the bytes alone leaves the turn looking empty.
+test("#7694: reasoning_details-only thinking arms done.thinking", async () => {
+    const events = await parse(mockStream(
+        sseChunk({ role: "assistant" }),
+        sseChunk({ reasoning_details: [{ type: "reasoning.text", text: "RD" }] }),
+        sseChunk({}, "stop"),
+        `data: [DONE]\n\n`,
+    ));
+    const done = events.find((e) => e.kind === "done");
+    assert.ok(done && done.kind === "done", "the turn terminates with a done event");
+    assert.equal(done!.kind === "done" ? done!.thinking : undefined, true, "reasoning_details counts as thinking");
+});
+
+// Negative: a genuinely unknown field is NOT thinking. It must still be
+// forwarded (previous test) but must never arm the silent-thought recovery —
+// otherwise a custom-field-only turn gets a spurious degenerate retry.
+test("#7694: an unknown field does NOT arm done.thinking", async () => {
+    const events = await parse(mockStream(
+        sseChunk({ role: "assistant" }),
+        sseChunk({ some_custom_field: "v" }),
+        sseChunk({}, "stop"),
+        `data: [DONE]\n\n`,
+    ));
+    const done = events.find((e) => e.kind === "done");
+    assert.ok(done && done.kind === "done", "the turn terminates with a done event");
+    assert.equal(done!.kind === "done" ? done!.thinking : undefined, false, "an unknown field is not thinking");
+});
+
+// Negative: an empty reasoning_details array carries no thinking either.
+test("#7694: an empty reasoning_details array does NOT arm done.thinking", async () => {
+    const events = await parse(mockStream(
+        sseChunk({ role: "assistant" }),
+        sseChunk({ reasoning_details: [] }),
+        sseChunk({ content: "x" }),
+        sseChunk({}, "stop"),
+        `data: [DONE]\n\n`,
+    ));
+    const done = events.find((e) => e.kind === "done");
+    assert.equal(done!.kind === "done" ? done!.thinking : undefined, false, "an empty array is not thinking");
+});
+
 // An unknown-field-only delta (a field bili has no notion of) is likewise
 // forwarded verbatim — the conservative "any non-empty field" expectation.
 test("#7694: unknown-field-only delta is forwarded verbatim", async () => {
