@@ -581,9 +581,12 @@ function bodyProxyVisible(ctx: Ctx, agent: string): boolean {
 // LANE-INDEPENDENT send path. The incremental lane stamps its own msgIds on
 // the delta it diverts (and early-returns before this line); this covers the
 // turns the lane shape-gates away (#3433: OpenAI-family full resends) plus
-// every other full-resend for both pi and omp. Core-aligned via the kernel
-// wireIndex proof (coreAlignEnvelopeIds); ANY mismatch bails to no field —
-// byte-identical to today, never a misaligned array. The pairing source is
+// every other full-resend for both pi and omp. Element-aligned via
+// coreAlignEnvelopeIds (the kernel splits one wire element into N cores on
+// agentic turns; the server dual-modes the pin — per-core when 1:1, wire-
+// groups with derived sibling ids when split, #7439 follow-up); ANY pairing
+// mismatch bails to no field — byte-identical to before, never a misaligned
+// array. The pairing source is
 // the live branch (ctx.sessionManager.getBranch) — the same source the
 // incremental lane and the watermark channel use, so no new collector.
 function resolveEnvelopeIdsForFullResend(parsed: Record<string, unknown>, ctx: Ctx): string[] | undefined {
@@ -605,9 +608,9 @@ function resolveEnvelopeIdsForFullResend(parsed: Record<string, unknown>, ctx: C
             ? laneMsgIdsForResponsesWire(wire, branch)
             : laneMsgIdsForOpenAiWire(wire, branch);
         if (wireAligned === undefined) return undefined; // pairing not provable — degrade
-        return coreAlignEnvelopeIds(fmt, wireAligned, wire, parsed);
+        return coreAlignEnvelopeIds(wireAligned, wire);
     } catch {
-        return undefined; // kernel converter threw on a malformed payload — never stamp
+        return undefined; // never stamp on an unexpected throw
     }
 }
 
@@ -1764,6 +1767,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             }
             const ids = laneMsgIdsForWire(payload.messages, branch);
             if (ids !== undefined && body.messages.every((m) => lanePinnableContent(m.content))) {
+                // DO-NOT-RELAX (review #7738): laneMsgIdsForWire is core-aligned — a
+                // merged tool_result user message pushes N ids for ONE wire message —
+                // so this tail-slice is only correct because the lanePinnableContent
+                // guard above rejects any multi-core delta message. If that guard is
+                // ever relaxed (e.g. to allow image-array deltas), a merged-toolres
+                // delta would mis-stamp the group head with the last core's id.
                 const sliced = ids.slice(ids.length - body.messages.length);
                 if (sliced.length === body.messages.length && validateMsgIds(sliced, sliced.length).ok) body.msgIds = sliced;
             }
