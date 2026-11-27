@@ -627,16 +627,27 @@ test("#5955 negative: SAME-build BUSY holder is attached and NEVER killed (#4811
     assert.equal(watchingLines(w).length, 0);
 });
 
-test("#5955 negative: user-zone BUSY holder untouched", async () => {
+test("#5955 negative: user-zone BUSY holder untouched (but #7675 refuses the second writer)", async () => {
+    // Pre-#7675 this row allowed the spawn to proceed behind the live
+    // user-zone holder (the child ladders to +1 in the field — the silent
+    // second-writer drift #7675 closes). The holder itself is STILL
+    // untouched: no shutdown, no signals, no wedge ledger. What changed is
+    // the launch outcome: an actionable refusal instead of a drifted child.
     const w = makeWorld({ gracefulShutdown: true, killReleases: false });
     const holder = { ...wedgedHolder(), lane: undefined, launchToken: undefined };
-    const handle = await runCycle(w, holder);
+    let err: unknown;
+    try {
+        await runCycle(w, holder);
+    } catch (e) {
+        err = e;
+    }
 
-    assert.equal(w.spawnCalls, 1);
+    assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second writer"),
+        `#7675: the live no-lane holder must be refused, not spawned behind: ${err instanceof Error ? err.message : "handle"}`);
+    assert.equal(w.spawnCalls, 0);
     assert.equal(w.shutdownCalls.length, 0);
     assert.equal(w.signalCalls.length, 0);
     assert.equal(w.killCalls.length, 0);
-    assert.equal(handle.port, PORT);
     assert.equal(watchingLines(w).length, 0);
 });
 

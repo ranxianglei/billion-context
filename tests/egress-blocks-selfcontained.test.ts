@@ -108,6 +108,7 @@ function opsFor(store: UnifiedStore): EgressOpLogStore {
         egressStateViewAt: (s, x) => store.egressStateViewAt(s, x),
         egressStateMaxSeq: (s) => store.egressStateMaxSeq(s),
         egressStateTruncateAfter: (s, x) => store.egressStateTruncateAfter(s, x),
+        egressFlowWalkBack: (s) => store.egressFlowWalkBack(s),
     };
 }
 

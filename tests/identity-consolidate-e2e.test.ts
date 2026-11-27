@@ -19,11 +19,11 @@
  *      why the lane passes the in-memory value);
  *   C. the position frontier is the message frontier, NOT the live-view
  *      length — after a REAL kernel fold the live view is 50 rows while
- *      the frontier is 82. The fold's compaction physically removed the I
- *      rows its base subsumed (#7574), so raw MAX(log_seq) is 0 right
- *      after a fold: the frontier lives in the base payload's highWater,
- *      and the stateless branch must read it through egressMessageHighWater
- *      (the review-critical fix this test pins);
+ *      the frontier is 82. The fold's D ops shrink the STATE view (7773),
+ *      but the flow is append-only and keeps every row it ever wrote, so
+ *      raw MAX(log_seq) IS the frontier: the stateless branch must read it
+ *      through egressMessageHighWater (the review-critical fix this test
+ *      pins);
  *   D. the R3 latch lands on the SESSIONS row (no l1 row for the sid),
  *      survives a restart, and the operator clear releases it;
  *   F. double-latched migration state (pre-migration l1 latch +
@@ -37,6 +37,12 @@
 
 process.env.BILI_PERSIST_ZSTD = "0";
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+// KDD #25: these suites assert the LEGACY table shape (l1 rows, GC, fork
+// reads) while egressPlane=1 — they simulate a pre-gate DB, so force the
+// full table set (the production gate would skip the 12 legacy tables on
+// this fresh test database; the 7-table invariant is covered by
+// tests/eg-sweep-egress-identity.test.ts).
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY = "1";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -204,7 +210,7 @@ test("B: an egress-on session runs a STATELESS stage-0 — no l1 row ever, acros
         const r2 = runStage0({ sessionId: sid, msgs, incomingMsgIds: [...ids], pluginMode: true, convBound: true, ...STAGE0_BASE });
         assert.equal(d2.decision.mode, "echo", "the egress verdict is replay math, not ledger math");
         assert.equal(d2.decision.replay, true);
-        assert.equal(d2.decision.window.maxPos, 6, "frontier = MAX(log_seq): system takes 1, the 5 messages 2..6");
+        assert.equal(d2.decision.window.maxPos, 5, "frontier = MAX(log_seq): the system row is 0 (outside the citation space), the 5 messages 1..5");
         assert.ok(r2.pinned !== null && r2.pinned.length === 5, "the full-form pin re-stamps every turn (#6785) — the ECHO is the decision, not the pin");
 
         // turn 3: grown array — the new id lands AT the frontier, past it
@@ -212,8 +218,8 @@ test("B: an egress-on session runs a STATELESS stage-0 — no l1 row ever, acros
         const d3 = ustore()!.snapStage0(sid, [...ids, "m6"]);
         const r3 = runStage0({ sessionId: sid, msgs: msgs3, incomingMsgIds: [...ids, "m6"], pluginMode: true, convBound: true, ...STAGE0_BASE });
         assert.equal(d3.decision.mode, "anchor");
-        assert.deepEqual(d3.decision.newIdPos, [{ id: "m6", pos: 7 }], "the new id's position comes from MAX(log_seq)");
-        assert.equal(d3.decision.window.maxPos, 7);
+        assert.deepEqual(d3.decision.newIdPos, [{ id: "m6", pos: 6 }], "the new id's position comes from MAX(log_seq)");
+        assert.equal(d3.decision.window.maxPos, 6);
         assert.ok(r3.cohortRan && r3.pinned !== null);
         const row3 = recordEgressTurn({ store: ustore()!, sessionId: sid, prev: row1, conversation: msgs3 as unknown as CoreMessage[], systemText: "sys", nowMs: 1_005_000 });
         assert.equal(row3.length, 7);
@@ -234,7 +240,7 @@ test("B: an egress-on session runs a STATELESS stage-0 — no l1 row ever, acros
         const d4 = store.egressOpLogStore()!.snapStage0(sid, [...ids, "m6"]);
         const r4 = runStage0({ sessionId: sid, msgs: msgs3, incomingMsgIds: [...ids, "m6"], pluginMode: true, convBound: true, ...STAGE0_BASE });
         assert.equal(d4.decision.mode, "echo", "echo after restart — the op log is the authority");
-        assert.equal(d4.decision.window.maxPos, 7);
+        assert.equal(d4.decision.window.maxPos, 6);
         assert.equal(L1_COUNT(vd(), sid), 1, "still just the dormant turn-1 row");
         assert.equal(store.egressOpLogStore()!.snapR3Latched(sid), false, "not latched");
     } finally {
@@ -275,28 +281,33 @@ test("C: after a REAL kernel fold the position frontier is MAX(log_seq), not the
         assert.equal(row2.length, 51, "system + 50 folded");
         await store.writeNow(persistable(ctx, folded));
 
-        // the split this test pins: the live view SHRANK, the frontier did not —
-        // and the #7574 compaction detail that makes it subtle: the fold's own
-        // writeBase PHYSICALLY removed the I rows it subsumed, so right after a
-        // fold the flow holds the B base row ONLY and raw MAX(log_seq) is 0.
-        // The frontier survives exclusively in the base payload's highWater —
-        // egressMessageHighWater is the rule (same as nextSeqs) that reads it.
+        // the split this test pins: the live view SHRANK, the frontier did not.
+        // The flow is append-only (#7439/7773): the fold's D ops trim the
+        // STATE rows of the covered messages, but the flow keeps every row it
+        // ever wrote, so raw MAX(log_seq) IS the frontier.
         const view = egressStateView(vd(), sid);
         assert.equal(view.length, 51, "system row + the folded 50 — the live view SHRANK");
         const flowTypes = (vd().prepare("SELECT row_type FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(sid) as { row_type: string }[]).map((r) => r.row_type);
-        assert.deepEqual(flowTypes, ["B"], "the compaction left only the base row in the flow — everything it subsumed is physically gone");
-        const basePayload = JSON.parse((vd().prepare("SELECT payload FROM egress_flow WHERE session_id = ? AND row_type = 'B' ORDER BY op_seq DESC LIMIT 1").get(sid) as { payload: string }).payload) as { highWater: number };
-        assert.equal(basePayload.highWater, 82, "system 1, the 80 originals 2..81, the fold's summary I-row 82 — the base carries the frontier");
+        // the flow keeps everything (append-only, #7439): turn 1's 81 I rows
+        // intact, then the fold's ops (the -D range for the covered originals,
+        // the -U re-renders of the 49 survivors, the -I summary). The STATE
+        // table in contrast holds the materialized live view (7773).
+        const expectedFlowTypes = [...Array(81).fill("I"), "D", ...Array(49).fill("U"), "I"] as string[];
+        assert.deepEqual(flowTypes, expectedFlowTypes, "the flow keeps everything (append-only, #7439): turn 1's 81 I rows, then the fold's ops (1 D for the covered range, 49 U re-renders of the survivors, 1 I summary) — the state plane is materialized, no base row");
+        const stateRows = (vd().prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = ?").get(sid) as { n: number }).n;
+        assert.equal(stateRows, 51, "the state table is the materialized live view (7773) — 51 live rows, no op copies, no base row");
+        const highWater = (vd().prepare("SELECT COALESCE(MAX(log_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(sid) as { m: number }).m;
+        assert.equal(highWater, 81, "the system row is 0, the 80 originals 1..80, the fold's summary I-row 81 — the flow's MAX(log_seq) IS the frontier");
 
         // a steady-state turn echoing three LIVE ids: the verdict carries the
-        // FRONTIER as maxPos. Pre-fix (raw MAX(log_seq), no base fallback) this
-        // computed 0 the turn right after every fold — and every persisted
-        // witness from this session on would have lied about where the world's
-        // positions live; under the live-length math it would say 50.
+        // FRONTIER as maxPos. This computed 0 the turn right after every fold
+        // under the pruned-flow build (raw MAX(log_seq) with nothing left
+        // above the floor) — under the append-only flow it is the max log_seq
+        // of the retained rows, and under the live-length math it would say 50.
         const tail = view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).slice(-3).map((r) => r.msgid);
         const d = store.egressOpLogStore()!.snapStage0(sid, tail);
         assert.equal(d.decision.mode, "echo", "the live tail is all in the flow — echo");
-        assert.equal(d.decision.window.maxPos, 82, "maxPos = 82 (the base highWater) — NOT 0 (raw MAX(log_seq) post-compaction) and NOT 50 (the live count)");
+        assert.equal(d.decision.window.maxPos, 81, "maxPos = 81 (the base highWater) — NOT 0 (raw MAX(log_seq) post-compaction) and NOT 50 (the live count)");
         runStage0({ sessionId: sid, msgs: tail.map(bm), incomingMsgIds: tail, pluginMode: true, convBound: true, ...STAGE0_BASE });
     } finally {
         closeStore(store, dir, db);

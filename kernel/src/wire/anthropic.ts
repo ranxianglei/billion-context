@@ -208,6 +208,7 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
             role: "assistant",
             contentType: "reasoning",
             text: b.thinking,
+            anthropicThinking: true,
             ...(b.signature ? { thinkingSignature: b.signature } : {}),
           });
           break;
@@ -641,6 +642,20 @@ export function coreToAnthropic(
           current.blocks.push(m.rawAnthropicBlock as AnthropicBlock);
           break;
         }
+        // Cross-lane image: no foreign raw block to reuse — rebuild the
+        // native block from the media sidecars (never the "[image]" text).
+        if (m.imageBase64 && m.imageMediaType) {
+          current.blocks.push({
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: m.imageMediaType,
+              data: m.imageBase64,
+            },
+            ...cc(m.id),
+          });
+          break;
+        }
         current.blocks.push({ type: "text", text: m.text ?? "", ...cc(m.id) });
         break;
       }
@@ -667,11 +682,27 @@ export function coreToAnthropic(
         });
         break;
       case "reasoning":
-        current.blocks.push({
-          type: "thinking",
-          thinking: m.text ?? "",
-          ...(m.thinkingSignature ? { signature: m.thinkingSignature } : {}),
-        });
+        if (m.thinkingSignature) {
+          current.blocks.push({
+            type: "thinking",
+            thinking: m.text ?? "",
+            signature: m.thinkingSignature,
+          });
+        } else if (m.anthropicThinking && (m.text ?? "").length > 0) {
+          // Same-lane round-trip (#5495): this core came from an Anthropic
+          // wire thinking block — an unsigned upstream (DeepSeek /anthropic)
+          // accepted it without a signature and REQUIRES it passed back
+          // verbatim ("content[].thinking ... must be passed back"). Re-emit
+          // as a thinking block, never as text.
+          current.blocks.push({ type: "thinking", thinking: m.text ?? "" });
+        } else if ((m.text ?? "").length > 0) {
+          // Unsigned reasoning of FOREIGN origin (cross-lane re-render,
+          // e.g. openai reasoning_content after a model switch): the
+          // Anthropic API rejects unsigned thinking blocks it did not issue,
+          // so degrade to a visible text block — pi's requiresThinkingAsText
+          // parity. Same-lane signed behavior is unchanged.
+          current.blocks.push({ type: "text", text: m.text ?? "" });
+        }
         break;
     }
   }
