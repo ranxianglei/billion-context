@@ -161,6 +161,35 @@ test("parseArgs: install takes <ref> [duration]; install status = show state (#7
     assert.equal(st.installRef, undefined);
 });
 
+test("parseArgs: --force attaches to update and install (#7806)", () => {
+    // Leading flag position.
+    const u1 = parseArgs(["--force", "update", "0.1.216"]);
+    assert.equal(u1.command, "update");
+    assert.equal(u1.updateVersion, "0.1.216");
+    assert.equal(u1.updateForce, true);
+    // Trailing flag position.
+    const u2 = parseArgs(["update", "0.1.216", "--force"]);
+    assert.equal(u2.updateVersion, "0.1.216");
+    assert.equal(u2.updateForce, true);
+    // update --force without a version = bare forced update.
+    const u3 = parseArgs(["update", "--force"]);
+    assert.equal(u3.updateVersion, undefined);
+    assert.equal(u3.updateForce, true);
+    // install: both positions.
+    const i1 = parseArgs(["install", "--force", "7738"]);
+    assert.equal(i1.installRef, "7738");
+    assert.equal(i1.installForce, true);
+    const i2 = parseArgs(["install", "master", "7d", "--force"]);
+    assert.equal(i2.installRef, "master");
+    assert.equal(i2.installDuration, "7d");
+    assert.equal(i2.installForce, true);
+    // --force does not leak across commands.
+    const p = parseArgs(["pin", "1d"]);
+    assert.equal(p.pinDuration, "1d");
+    assert.equal(p.updateForce, false);
+    assert.equal(p.installForce, false);
+});
+
 test("parseArgs: --clear outside pin/unpin exits 2 (#6804)", () => {
     const origExit = process.exit;
     const origError = console.error;

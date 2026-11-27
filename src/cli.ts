@@ -135,9 +135,11 @@ Usage:
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
                                    --json machine output, --log FILE correlates [acp-usage]
                                    lines (default <dir>/bili.log), --no-log skips, --session SID filters
-  bili update [version]            check for & install a newer version now — or
+  bili update [version] [--force]  check for & install a newer version now — or
                                    install an EXACT published version (master temp
-                                   builds included); an explicit install clears a pin
+                                   builds included); an explicit install clears a
+                                   pin; --force reinstalls even the exact version
+                                   you are already on (repair a broken install)
   bili pin [duration]              hold the installed version: auto-upgrade keeps
                                    checking & reporting but never installs; duration
                                    1h/12h/1d/7d/forever (default forever); no arg =
@@ -146,7 +148,8 @@ Usage:
   bili install [ref] [duration]    install from a git ref (branch/tag/PR number/PR
                                    URL, e.g. bili install 7738), built from source;
                                    auto-pins the result (default ${DEFAULT_INSTALL_PIN_DURATION}) so
-                                   auto-upgrade stays check-only — bili install
+                                   auto-upgrade stays check-only; --force rebuilds even
+                                   when that ref is already installed — bili install
                                    status shows what is installed from where
   bili doctor                      audit every install lane: versions, owners,
                                     freshness vs registry, running proxy processes
@@ -245,11 +248,15 @@ type Parsed = {
     mitmDomains: string[];
     overrides: Record<string, string | undefined>;
     updateVersion?: string;
+    /** --force on `update`: reinstall even when the exact version is already on disk. */
+    updateForce?: boolean;
     pinDuration?: string;
     pinClear?: boolean;
     installRef?: string;
     installDuration?: string;
     installStatusCmd?: boolean;
+    /** --force on `install`: rebuild even when ref@sha is already installed. */
+    installForce?: boolean;
     exportSelector?: string;
     exportOutput?: string;
     exportFull?: boolean;
@@ -320,6 +327,9 @@ export function parseArgs(argv: string[]): Parsed {
     let jsonOutput = false;
     let doctorJson = false;
     let updateVersion: string | undefined;
+    let updateForce = false;
+    let installForce = false;
+    let commandForce = false;
     let pinDuration: string | undefined;
     let pinClear = false;
     let installRef: string | undefined;
@@ -371,6 +381,9 @@ export function parseArgs(argv: string[]): Parsed {
                 break;
             case "--clear":
                 pinClear = true;
+                break;
+            case "--force":
+                commandForce = true;
                 break;
             case "--auto-restart-on-update":
                 overrides.ACP_AUTO_RESTART_ON_UPDATE = "1";
@@ -559,18 +572,26 @@ export function parseArgs(argv: string[]): Parsed {
             command = "start";
         } else if (cmd === "update") {
             command = "update";
-            updateVersion = positional[1];
+            if (commandForce) updateForce = true;
+            for (const p of positional.slice(1)) {
+                if (p === "--force") { updateForce = true; continue; }
+                if (p.startsWith("-")) { console.error(`bili: unknown option ${p} (update takes [version] [--force])`); process.exit(2); }
+                if (updateVersion !== undefined) { console.error("bili: update takes at most one version"); process.exit(2); }
+                updateVersion = p;
+            }
         } else if (cmd === "pin" || cmd === "unpin") {
             command = cmd;
             if (cmd === "pin") pinDuration = positional[1];
         } else if (cmd === "install") {
             command = "install";
-            const first = positional[1]?.trim();
-            if (first === "status") {
-                installStatusCmd = true;
-            } else if (first !== undefined) {
-                installRef = first;
-                installDuration = positional[2];
+            if (commandForce) installForce = true;
+            for (const p of positional.slice(1)) {
+                if (p === "--force") { installForce = true; continue; }
+                if (p.startsWith("-")) { console.error(`bili: unknown option ${p} (install takes [ref] [duration] [--force] | status)`); process.exit(2); }
+                if (p === "status") { installStatusCmd = true; continue; }
+                if (installRef === undefined) { installRef = p; continue; }
+                if (installDuration === undefined) { installDuration = p; continue; }
+                console.error("bili: install takes at most a ref and a duration"); process.exit(2);
             }
         } else if (cmd === "doctor") {
             command = "doctor";
@@ -701,11 +722,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, updateVersion, pinDuration, pinClear, installRef, installDuration, installStatusCmd, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
+    return { command, client, clientArgs, mitmDomains, overrides, updateVersion, updateForce, pinDuration, pinClear, installRef, installDuration, installStatusCmd, installForce, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, updateVersion, pinDuration, pinClear, installRef, installDuration, installStatusCmd, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, updateVersion, updateForce, pinDuration, pinClear, installRef, installDuration, installStatusCmd, installForce, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
     // -c/--config fail-fast: a bare NAME that resolves to a missing
     // <configDir>/NAME.json names the typo + the available siblings instead of
     // silently starting on an empty config (see paths.ts for path behavior).
@@ -945,9 +966,12 @@ export async function main(): Promise<void> {
             const v = updateVersion.replace(/^v/, "");
             const installDir = await findInstallDir(PACKAGE_NAME);
             const disk = installDir ? await readDiskVersion(installDir) : undefined;
-            if ((disk ?? VERSION) === v) {
-                console.log(`Already on ${v} — nothing to do.`);
+            if ((disk ?? VERSION) === v && !updateForce) {
+                console.log(`Already on ${v} — nothing to do. (--force reinstalls anyway.)`);
                 return;
+            }
+            if ((disk ?? VERSION) === v) {
+                console.log(`Already on ${v} — --force: reinstalling anyway.`);
             }
             const result = await forceInstallVersion(v, installDir, { packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, "manual", "manual-cli");
             if (!result.ok) {
@@ -1019,8 +1043,13 @@ export async function main(): Promise<void> {
         try {
             const r = await installFromRef(installRef, {
                 pinDurationText: installDuration,
+                force: installForce,
                 log: (line) => console.error(`  ${line}`),
             });
+            if (r.skipped) {
+                console.log(`already installed: ${r.version} from ${r.spec.kind === "pr" ? `PR ${r.spec.ref.split("/")[1]}` : r.spec.ref} (${r.sha.slice(0, 8)}) — nothing rebuilt. (--force rebuilds.)`);
+                return;
+            }
             const what = r.spec.kind === "pr" ? `PR ${r.spec.ref.split("/")[1]}` : r.spec.ref;
             console.log(`installed ${r.version} from ${what} (${r.sha.slice(0, 8)}) → ${r.installDir}`);
             console.log(`pinned ${r.pinDescription} — auto-upgrade keeps checking but will not install; \`bili unpin\` (or an explicit \`bili update\`) resumes moving.`);

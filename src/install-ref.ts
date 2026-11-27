@@ -101,15 +101,18 @@ export function childEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessE
 
 interface InstallResult {
     ok: true;
-    /** Version reported by the NEW install's package.json. */
+    /** True when the ref was already installed (same source + sha) and the
+     *  rebuild was skipped — pass `force` to rebuild anyway. */
+    skipped?: boolean;
+    /** Version reported by the NEW install's package.json (skipped: the current one). */
     version: string;
     /** Exact commit installed (FETCH_HEAD at install time). */
     sha: string;
     spec: InstallRefSpec;
     /** Epoch ms the auto-pin expires; absent = indefinite ("forever"). */
     pinUntil?: number;
-    /** One-line pin expiry for display (reuses the #6804 formatter). */
-    pinDescription: string;
+    /** One-line pin expiry for display (reuses the #6804 formatter); absent on skip. */
+    pinDescription?: string;
     /** The global package dir the new build landed in. */
     installDir: string;
 }
@@ -117,6 +120,8 @@ interface InstallResult {
 interface InstallOptions {
     /** #6804 duration vocabulary ("7d", "30d", "forever"); default 30d. */
     pinDurationText?: string;
+    /** Rebuild even when this ref@sha is already the installed, pinned build. */
+    force?: boolean;
     /** Child-process env (tests inject PATH shims). Default: childEnv(). */
     env?: NodeJS.ProcessEnv;
     log?: (line: string) => void;
@@ -199,6 +204,19 @@ export async function installFromRef(input: string, opts: InstallOptions = {}): 
     await run("git", ["fetch", "-q", "--depth", "1", "origin", spec.ref], gitOpts);
     const sha = (await run("git", ["rev-parse", "FETCH_HEAD"], gitOpts)).trim();
     if (!/^[0-9a-f]{7,40}$/i.test(sha)) throw new Error(`unexpected FETCH_HEAD: ${sha}`);
+    // Already on this exact build? The pin's git provenance (source.ref +
+    // source.sha) records what the on-disk install was built from — if it
+    // matches, the rebuild + backup + pin churn is pointless. `--force`
+    // overrides (repairing a half-broken install is the point of that).
+    if (!opts.force) {
+        const globalRootNow = await npmGlobalRoot(env);
+        const diskVersion = await readDirVersion(path.join(globalRootNow, PKG_DIR_NAME));
+        const pin = (await readPin()) ?? undefined;
+        if (diskVersion && pin?.version === diskVersion && pin.source?.kind === "git" && pin.source.ref === spec.ref && pin.source.sha === sha) {
+            log?.(`${spec.ref} @ ${sha.slice(0, 8)} is already installed (${diskVersion}) — skipping; use --force to rebuild`);
+            return { ok: true, skipped: true, version: diskVersion, sha, spec, installDir: path.join(globalRootNow, PKG_DIR_NAME) };
+        }
+    }
     await run("git", ["checkout", "-q", "--detach", sha], gitOpts);
 
     // 2) Build in the working tree (root npm install covers workspaces; the

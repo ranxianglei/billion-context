@@ -341,10 +341,10 @@ bili --debug                 # 详细日志(也可在配置里设 "debug": true)
 bili --passthrough           # 不压缩直接转发(冒烟测试模式)
 bili --config ~/my-bili.json # 用别的配置文件
 bili -c dsh-test             # 命名配置 → ~/.config/billion-context/dsh-test.json（按模型各放一份）
-bili update [version]        # 立即检查并安装新版本(跳过节流);带版本号则精确安装该已发布版本
+bili update [version] [--force]  # 立即检查并安装新版本(跳过节流);带版本号则精确安装该已发布版本;--force 已装时也重装
 bili pin [duration]          # 固定当前版本(1h/12h/1d/7d/30d/forever):只报告新版本、不自动安装(#6804)
 bili unpin                   # 解除固定(等价于: bili pin --clear)
-bili install <ref> [duration]  # 从任意 git ref(分支 / tag / PR 号 / PR 链接)源码构建并安装;自动 pin(默认 30 天,#7806)
+bili install <ref> [duration] [--force]  # 从任意 git ref(分支 / tag / PR 号 / PR 链接)源码构建并安装;自动 pin(默认 30 天,#7806);--force 已装时也重新构建
 bili install status          # 查看已装版本及其 git 来源
 bili doctor --fix            # 把漂移的 dsh profile 三本账(manifest 声明 / lockfile 记录 / 盘上副本)收敛到盘上版本(#3496)
 bili --no-auto-update        # 本次启动禁用自动更新

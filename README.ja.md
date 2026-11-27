@@ -483,10 +483,10 @@ bili --host 0.0.0.0           # listen on all interfaces (see host note below)
 bili --debug                 # verbose logging (also: set "debug": true in config)
 bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file
-bili update [version]        # check & install a newer version now (bypasses throttle); with a version, installs exactly that published version
+bili update [version] [--force]  # check & install a newer version now (bypasses throttle); with a version, installs exactly that published version; --force reinstalls even when already on it
 bili pin [duration]          # pin the current version (1h/12h/1d/7d/30d/forever): new versions are reported but not auto-installed (#6804)
 bili unpin                   # release the pin (same as: bili pin --clear)
-bili install <ref> [duration]  # git ref (ブランチ / タグ / PR 番号 / PR URL) からソースビルドしてインストール;自動ピン(既定 30d、#7806)
+bili install <ref> [duration] [--force]  # git ref (ブランチ / タグ / PR 番号 / PR URL) からソースビルドしてインストール;自動ピン(既定 30d、#7806);--force で同一 ref の再ビルド
 bili install status          # インストール済みバージョンとその git ソースを表示
 bili doctor --fix            # converge drifted dsh profile ledgers (manifest spec / lockfile record / bundle copy) to the on-disk version (#3496)
 bili --no-auto-update        # disable self-update for this run

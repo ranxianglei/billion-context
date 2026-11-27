@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { beforeEach } from "node:test";
 import { childEnv, DEFAULT_INSTALL_PIN_DAYS, installFromRef, installStatus, installSrcDir, resolveInstallRef } from "../src/install-ref.js";
 import { pinFilePath, readPin } from "../src/update-pin.js";
 
@@ -95,7 +96,6 @@ function makeHarness(): Harness {
     writeFileSync(path.join(fixture, "package.json"), JSON.stringify({ name: "billion-context", version: "9.9.9" }));
     writeFileSync(path.join(fixture, "src-index.ts"), "// fixture source\n");
     const logFile = path.join(root, "npm.log");
-    rmSync(pinFilePath(), { force: true }); // machine-level pin file: isolate per test
     const env: NodeJS.ProcessEnv = {
         ...childEnv(),
         PATH: binDir + path.delimiter + childEnv().PATH,
@@ -113,6 +113,11 @@ function makeHarness(): Harness {
 function mkdtemp(): string {
     return mkdtempSync(path.join(os.tmpdir(), "bili-install-ref-"));
 }
+
+// The pin file is machine-level (XDG cache dir shared by all tests in this
+// process under CI's hermetic preload): clear it between tests so one
+// install's auto-pin cannot short-circuit the next test's install.
+beforeEach(() => rmSync(pinFilePath(), { force: true }));
 
 function seedCurrentInstall(globalRoot: string, version: string): void {
     const dir = path.join(globalRoot, "billion-context");
@@ -176,6 +181,33 @@ test("#7806 install from a PR number: fetch → build → backup → install -g 
     }
 });
 
+test("#7806 re-install the same ref: skipped (pin provenance matches); --force rebuilds", async () => {
+    const H = makeHarness();
+    seedCurrentInstall(H.globalRoot, "0.1.216");
+    try {
+        const r1 = await installFromRef("7738", { env: H.env });
+        assert.equal(r1.skipped, undefined);
+        const installsAfterFirst = H.npmLog().filter((l) => l.startsWith("npm install")).length;
+
+        // Same ref resolves to the same sha (shim is deterministic) and the
+        // pin records that provenance → no rebuild, no backup, pin intact.
+        const r2 = await installFromRef("7738", { env: H.env });
+        assert.equal(r2.ok, true);
+        assert.equal(r2.skipped, true);
+        assert.equal(r2.version, "9.9.9");
+        assert.equal(H.npmLog().filter((l) => l.startsWith("npm install")).length, installsAfterFirst, "skip must not run npm install");
+        assert.equal(backupNames(H.globalRoot).length, 1, "skip must not create a backup");
+
+        // --force rebuilds anyway.
+        const r3 = await installFromRef("7738", { env: H.env, force: true });
+        assert.equal(r3.ok, true);
+        assert.equal(r3.skipped, undefined);
+        assert.equal(backupNames(H.globalRoot).length, 2, "the forced rebuild backs up again");
+    } finally {
+        rmSync(path.dirname(H.binDir), { recursive: true, force: true });
+    }
+});
+
 test("#7806 backup retention: after install exactly the 2 newest backups survive", async () => {
     const H = makeHarness();
     seedCurrentInstall(H.globalRoot, "1.0.4");
@@ -201,11 +233,12 @@ test("#7806 duration override: 7d bounds the pin; forever leaves it unbounded", 
         const day = 24 * 3600 * 1000;
         assert.ok(Math.abs((r7.pinUntil as number) - (Date.now() + 7 * day)) < 60_000, "7d pin ≈ now + 7d");
 
-        const rF = await installFromRef("master", { env: H.env, pinDurationText: "forever" });
+        // Different ref → different provenance → full install again.
+        const rF = await installFromRef("v9.9.9", { env: H.env, pinDurationText: "forever" });
         assert.equal(rF.pinUntil, undefined, "forever = no expiry");
         const pin = await readPin();
         assert.equal(pin?.until, undefined);
-        assert.deepEqual(pin?.source, { kind: "git", ref: "master", sha: FAKE_SHA });
+        assert.deepEqual(pin?.source, { kind: "git", ref: "v9.9.9", sha: FAKE_SHA });
     } finally {
         rmSync(path.dirname(H.binDir), { recursive: true, force: true });
     }

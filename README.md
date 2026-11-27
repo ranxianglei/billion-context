@@ -502,10 +502,10 @@ bili --debug                 # verbose logging (also: set "debug": true in confi
 bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file
 bili -c dsh-test             # named config → ~/.config/billion-context/dsh-test.json (per-model files)
-bili update [version]        # check & install a newer version now (bypasses throttle); with a version, installs exactly that published version
+bili update [version] [--force]  # check & install a newer version now (bypasses throttle); with a version, installs exactly that published version; --force reinstalls even when already on it
 bili pin [duration]          # pin the current version (1h/12h/1d/7d/30d/forever): new versions are reported but not auto-installed (#6804)
 bili unpin                   # release the pin (same as: bili pin --clear)
-bili install <ref> [duration]  # build + install from a git ref (branch / tag / PR number / PR URL); auto-pinned (default 30d, #7806)
+bili install <ref> [duration] [--force]  # build + install from a git ref (branch / tag / PR number / PR URL); auto-pinned (default 30d, #7806); --force rebuilds even when that ref is already installed
 bili install status          # show the installed version and its git source
 bili doctor --fix            # converge drifted dsh profile ledgers (manifest spec / lockfile record / bundle copy) to the on-disk version (#3496)
 bili --no-auto-update        # disable self-update for this run
