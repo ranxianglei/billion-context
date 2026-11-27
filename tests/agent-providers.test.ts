@@ -68,7 +68,7 @@ test("#2336 parseAgentProviderReport rejects malformed payloads", () => {
         ["missing agent", { providers: { a: VALID_REPORT.providers.zhipu } }],
         ["bad agent name", { agent: "-leading-dash", providers: { a: VALID_REPORT.providers.zhipu } }],
         ["missing providers", { agent: "pi" }],
-        ["empty providers", { agent: "pi", providers: {} }],
+        ["unmarked empty providers", { agent: "pi", providers: {} }],
     ];
     for (const [label, payload] of topLevel) {
         assert.throws(() => parseAgentProviderReport(payload), /.*/, label);

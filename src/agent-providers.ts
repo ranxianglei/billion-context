@@ -96,19 +96,25 @@ function parseAgentProviderEntry(name: string, value: unknown): AgentProviderRec
     return { baseUrl: recipe.baseUrl.replace(/\/+$/, ""), api: recipe.api as NamedProviderRecipe["api"], apiKey: recipe.apiKey, models: outModels };
 }
 
-/** Structural intake validation for a registry POST body: `{ agent, providers }`.
+/** Structural intake validation for a registry POST body: `{ agent, providers, clear? }`.
+ *  An empty providers object is accepted only with `clear: true`, an explicit
+ *  request to remove this agent's layer. An empty/failed host collection is
+ *  not evidence of that intent; clear must not accompany a nonempty report.
  *  Top-level violations (no usable agent/providers envelope) still throw —
  *  nothing could be attributed without them. Entry-level violations are
  *  collected instead (#2585): one refused entry costs only itself, so the
  *  route answers 200 with `registered` + `skipped:[{name, reason}]` and the
  *  client can say which provider stays unresolved. */
-export function parseAgentProviderReport(payload: unknown): { agent: string; registered: Record<string, AgentProviderRecipe>; skipped: Array<{ name: string; reason: string }> } {
+export function parseAgentProviderReport(payload: unknown): { agent: string; registered: Record<string, AgentProviderRecipe>; skipped: Array<{ name: string; reason: string }>; clear?: true } {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("Expected a JSON object");
-    const report = payload as { agent?: unknown; providers?: unknown };
+    const report = payload as { agent?: unknown; providers?: unknown; clear?: unknown };
     if (typeof report.agent !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(report.agent)) throw new Error("Invalid agent name");
     if (!report.providers || typeof report.providers !== "object" || Array.isArray(report.providers)) throw new Error("Expected a providers object");
     const entries = Object.entries(report.providers as Record<string, unknown>);
-    if (entries.length === 0 || entries.length > 64) throw new Error("Expected 1 to 64 providers");
+    if (report.clear !== undefined && typeof report.clear !== "boolean") throw new Error("Expected a boolean clear flag");
+    if (report.clear === true && entries.length !== 0) throw new Error("clear: true requires an empty providers object");
+    if (entries.length === 0 && report.clear !== true) throw new Error("An empty providers object requires clear: true");
+    if (entries.length > 64) throw new Error("Expected at most 64 providers");
     const registered: Record<string, AgentProviderRecipe> = {};
     const skipped: Array<{ name: string; reason: string }> = [];
     for (const [name, value] of entries) {
@@ -118,5 +124,5 @@ export function parseAgentProviderReport(payload: unknown): { agent: string; reg
             skipped.push({ name: sanitizeAgentProviderField(name, 64) || "<unnamed>", reason: sanitizeAgentProviderField(err instanceof Error ? err.message : String(err), 200) });
         }
     }
-    return { agent: report.agent, registered, skipped };
+    return { agent: report.agent, registered, skipped, ...(report.clear === true ? { clear: true as const } : {}) };
 }

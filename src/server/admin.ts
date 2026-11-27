@@ -979,7 +979,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             const report = parseAgentProviderReport(JSON.parse(body.toString("utf8")));
             recordAgentProviders(report.agent, report.registered);
             const names = Object.keys(report.registered).sort();
-            log("info", `[agent-providers] ${report.agent} registered: ${names.join(", ") || "(none)"} (#2336)`);
+            if (report.clear) log("info", `[agent-providers] ${report.agent} explicitly cleared its provider layer (clear: true) (#7037)`);
+            else log("info", `[agent-providers] ${report.agent} registered: ${names.join(", ") || "(none)"} (#2336)`);
             for (const s of report.skipped) log("warn", `[agent-providers] ${report.agent} skipped ${s.name}: ${s.reason} (this provider stays unresolved) (#2585)`);
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: true, agent: report.agent, registered: names, skipped: report.skipped }));

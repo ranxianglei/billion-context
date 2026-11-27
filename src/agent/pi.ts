@@ -44,6 +44,7 @@ export type Ctx = {
         find?: (provider: string, modelId: string) => { baseUrl?: unknown } | undefined;
         // #2336 agent-registry fallback: the fuller surface (verified against
         // pi v0.99.1 model-registry.d.ts) — all optional, older hosts lack them.
+        getError?: () => string | undefined;
         getAll?: () => Array<{ id: string; provider: string; api?: unknown; contextWindow?: unknown; maxTokens?: unknown }>;
         getProvider?: (provider: string) => { baseUrl?: unknown; auth?: { oauth?: unknown; apiKey?: unknown } | undefined } | undefined;
         getProviderAuthStatus?: (provider: string) => { configured?: unknown; source?: unknown } | undefined;
@@ -170,12 +171,15 @@ const AGENT_PROVIDER_API: Record<string, "anthropic" | "openai" | "responses" | 
  *  collected by design), unmappable apis, baseUrls that point back at this
  *  proxy, and plain-HTTP non-loopback baseUrls (#2585 — the server would
  *  refuse them). Returns true when done (or permanently unavailable) so the
- *  caller can stop retrying; throws on transient failures. */
+ *  caller can stop retrying; returns false for incomplete collections and
+ *  throws on transport failures. The model catalogue does not enumerate
+ *  configured providers, so an empty result never authorizes `clear: true`. */
 export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boolean> {
     const proxyBase = proxyBaseForCtx(ctx);
     if (proxyBase === undefined) return false;
     const registry = ctx.modelRegistry;
     if (registry?.getAll === undefined || registry.getProvider === undefined || registry.getProviderAuthStatus === undefined || registry.getApiKeyForProvider === undefined) return true;
+    if (registry.getError?.()) return false;
     type ProviderAcc = { api: "anthropic" | "openai" | "responses" | "google"; models: Array<{ id: string; contextWindow?: number; outputTokens?: number }> };
     const byProvider = new Map<string, ProviderAcc>();
     for (const model of registry.getAll()) {
@@ -199,6 +203,7 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
     for (const [id, entry] of byProvider) {
         if (entry.models.length === 0) continue;
         const provider = registry.getProvider(id);
+        if (provider === undefined) return false;
         const baseUrl = provider?.baseUrl;
         if (typeof baseUrl !== "string" || !(baseUrl.startsWith("https://") || baseUrl.startsWith("http://"))) continue;
         // Self-loop guard: skip providers whose endpoint IS this proxy — in
@@ -223,15 +228,16 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         } catch { selfLoop = true; }
         if (selfLoop) continue;
         const status = registry.getProviderAuthStatus(id);
-        if (status?.configured !== true || status.source === "stored") continue;
+        if (status === undefined) return false;
+        if (status.configured !== true || status.source === "stored") continue;
         if (provider?.auth?.oauth !== undefined) continue;
         let apiKey: string | undefined;
         try {
             apiKey = await registry.getApiKeyForProvider(id);
         } catch {
-            continue;
+            return false;
         }
-        if (typeof apiKey !== "string" || apiKey.length === 0) continue;
+        if (typeof apiKey !== "string" || apiKey.length === 0) return false;
         const models: Record<string, { contextWindow?: number; outputTokens?: number }> = {};
         for (const model of entry.models) {
             models[model.id] = {
@@ -241,7 +247,7 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         }
         providers[id] = { baseUrl, api: entry.api, apiKey, models };
     }
-    if (Object.keys(providers).length === 0) return true;
+    if (Object.keys(providers).length === 0) return false;
     const res = await fetch(`${proxyBase}/__bili/agent-providers`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1112,7 +1118,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         });
         // #2336: one successful agent-providers report per plugin instance;
         // retried on later session_starts while the proxy base is unknown
-        // (native mode resolves it asynchronously).
+        // or provider collection is incomplete.
         let agentProvidersDone = false;
         // #2185 方案 A: this bundle's own file path, registered per session so
         // pi-subagents children load it deterministically (see module header).
@@ -1971,7 +1977,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 agentProvidersDone = true;
                 reportAgentProviders(ctx, agent).then((done) => {
                     if (done) return;
-                    // Proxy base not resolvable yet — retry on the next session.
+                    // Proxy or provider collection not ready — retry next session.
                     agentProvidersDone = false;
                 }).catch((err: unknown) => {
                     agentProvidersDone = false;
