@@ -271,7 +271,11 @@ test("D: the incremental tail pin maps at wire-element granularity (split cores 
         ];
         recordEgressTurn({ store: store.egressOpLogStore()!, sessionId: sid, prev: undefined, conversation: prefix, systemText: "sys", nowMs: 1_000_000 });
         const liveIds = store.snapPinLiveIds(sid);
-        assert.deepEqual(liveIds, ["u0", "a1", "a1#p1"], "flow msgids in order (system row filtered)");
+        // #7836 Path A: the op-log stores a message's parts under ONE element
+        // msgid (both parts of a1 are "a1" — no #pN in the log). Pin consumers
+        // fold the run to elements (wireElementIds) and re-derive #pN
+        // (tryIncrementalPin); the kernel keeps per-core uniqueness.
+        assert.deepEqual(liveIds, ["u0", "a1", "a1"], "flow msgids in order, split parts sharing the element msgid (Path A; system row filtered)");
 
         const nextTurn = (): BiliMessage[] => [
             bm("u0", { wireIndex: 0 }),

@@ -131,9 +131,13 @@ test("wire-granularity pin: agentic split + lane switch keeps ids and placement 
         assert.equal(r1.status, 200, `bootstrap turn must succeed (got ${r1.status}: ${r1.body.slice(0, 200)})`);
         await settle("conv-split");
         const pinIds = store!.snapPinLiveIds("conv-split");
-        for (const id of ["host-0", "host-1", "host-1#p1", "host-2"]) {
+        // #7836 Path A: the op-log ledger stores a message's parts under ONE
+        // element msgid (no #pN in the log — the kernel keeps #pN, the
+        // pin re-derives it). Assert the element shape.
+        for (const id of ["host-0", "host-1", "host-2"]) {
             assert.ok(pinIds.includes(id), `flow ledger must carry ${id} (got: ${JSON.stringify(pinIds)})`);
         }
+        assert.ok(!pinIds.includes("host-1#p1"), `the op-log ledger carries element ids only (Path A) (got: ${JSON.stringify(pinIds)})`);
         assert.ok(!logs.some((l) => l.includes("conv-split") && l.includes("pin rejected")), "the wire-form pin must not hit the reject path");
 
         // B. LANE SWITCH: the next turn rides the Anthropic wire with the
@@ -157,7 +161,7 @@ test("wire-granularity pin: agentic split + lane switch keeps ids and placement 
         );
         await settle("conv-split");
         const pinIds2 = store!.snapPinLiveIds("conv-split");
-        for (const id of ["host-0", "host-1", "host-1#p1", "host-2", "host-3"]) {
+        for (const id of ["host-0", "host-1", "host-2", "host-3"]) {
             assert.ok(pinIds2.includes(id), `post-switch ledger must carry ${id} (got: ${JSON.stringify(pinIds2)})`);
         }
         // Upstream placement: assistant [text, tool_use] ONE message, then a
@@ -209,7 +213,11 @@ test("wire-granularity pin: agentic split + lane switch keeps ids and placement 
             const rows = db.prepare("SELECT pos, msgid FROM egress_state WHERE session_id = ? ORDER BY pos").all("conv-reason") as Array<{ pos: number; msgid: string }>;
             const ids = rows.map((r) => r.msgid);
             for (const want of ["pi-u1", "pi-a1", "pi-u2"]) {
-                assert.equal(ids.filter((x) => x === want).length, 1, `egress_state must carry the declared host id ${want} exactly once (rows: ${JSON.stringify(rows)})`);
+                // #7836 Path A: a split element's parts (text + reasoning) share
+                // the element msgid, so a declared id may occupy several rows —
+                // the guarded regression is a content-hash MINT standing in for
+                // the host's own id, not row multiplicity.
+                assert.ok(ids.filter((x) => x === want).length >= 1, `egress_state must carry the declared host id ${want} (rows: ${JSON.stringify(rows)})`);
             }
             // The turn-1 response was minted by the server; turn 2's pin
             // re-homes it onto the host's own id for that message — no

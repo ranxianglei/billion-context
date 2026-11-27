@@ -179,6 +179,7 @@ test("family gate: no raw negative string slices outside the allowlist", () => {
         ["src/web/client.ts", [/conflicts\.slice\(-10\)/]], // array receiver (#2102 session-detail card)
         ["src/web/report.ts", [/lines\.slice\(-12\)/, /folds\.slice\(-15\)/, /evs\.slice\(-30\)/, /rec\.events \|\| \[\]\)\.slice\(-10\)/]], // array receiver (#3099 session-report tables; #6729 recovery tables)
         ["src/storage/store.ts", [/incoming\.slice\(-64\)/]], // array receiver (#7591 egress-on stateless stage-0 window: last 64 msgids)
+        ["src/install-ref.ts", [/split\("\\n"\)\.slice\(-3\)/]], // array receiver (git stderr tail: last 3 lines)
         ["src/text-safe.ts", [/\.slice\(/]], // the clamped implementation itself
     ]);
     const srcDir = path.join(import.meta.dirname, "..", "src");

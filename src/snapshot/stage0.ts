@@ -476,7 +476,19 @@ export function tryIncrementalPin(
         }
     }
     const out: BiliMessage[] = new Array(msgs.length);
-    for (let i = 0; i < C0; i++) out[i]! = { ...msgs[i]!, id: liveIds[i]! };
+    // #7836 Path A: the egress ledger stores a message's parts under ONE
+    // element msgid ("no #pN in the log") while the kernel keeps per-core
+    // uniqueness (compression/CCR need per-core ids). A run of consecutive
+    // identical ledger rows is one split element — re-derive the parts' ids
+    // with the SAME renderCoreId scheme as applyWireMsgIdPin and the
+    // new-core loop below. Legacy ledgers never repeat an id → the restamp
+    // is byte-identical to the old positional copy.
+    let partRun = 0;
+    for (let i = 0; i < C0; i++) {
+        const id = liveIds[i]!;
+        partRun = i > 0 && liveIds[i - 1] === id ? partRun + 1 : 0;
+        out[i]! = { ...msgs[i]!, id: partRun === 0 ? id : renderCoreId(id, partRun) };
+    }
     let slot = 0;
     let sibling = 0;
     let leaderId = "";
