@@ -6,7 +6,7 @@
 
 | 表 | 角色 | 主键 |
 |---|---|---|
-| `egress_block_flow` | 追加式块正史（I/U/B 行） | `(session_id, op_seq)` |
+| `egress_block_flow` | 追加式块正史（I/U/D 行） | `(session_id, op_seq)` |
 | `egress_block_state` | 读副本：每块最新快照 | `(session_id, block_id)` |
 
 **双时钟**（owner 裁定 2026-11-24——原“共享时钟”设计被否：折叠轮的块行在 SAVE 时落盘，晚于同轮的消息行，下一条消息会从“最后一条 flow 行 +2”处开始，导致每次 egress 读的 `op_seq === prevSeq + 1` 稠密校验全部报错）：
@@ -20,8 +20,8 @@
 | row_type | 含义 |
 |---|---|
 | `I` | 块诞生（一次折叠）。payload = 完整快照。 |
-| `U` | 状态变更（被取代 / 收割 / 内容修订）。payload = 完整快照（无 diff）。 |
-| `B` | 压缩基线。payload = `{entries: [{blockId, snapshot}], watermark}`。 |
+| `U` | 状态变更（被取代 / 内容修订）。payload = 完整快照（无 diff）。 |
+| `D` | 块被收割——该行携带块的**终态全量快照**（`reaped: true`），同一事务内物理删除 `egress_block_state` 行（#7773）。退役的 `B` 压实基线行不再存在。 |
 
 ### 快照形状
 
@@ -44,7 +44,7 @@
 
 ## kstate 边车
 
-每个 I/U/B 行携带 `kstate_json` 列：写入时刻的有界残差快照（<2KB）。13 个残差字段：`viewLatches`、`emergencyTruncateLatch`、`absorbed`、`rules`、`nudge`、`stats`、`terminalStreak`、`nextRuleId`、`deadRefs`、`sweptOrphanCallIds`、`renderDeferredRefs`、`refLedgerAligned`、`timestampsHighWaterRefSeq`。`lastPassIds` 被排除（自愈字段）。
+每个 I/U/D 行携带 `kstate_json` 列：写入时刻的有界残差快照（<2KB）。13 个残差字段：`viewLatches`、`emergencyTruncateLatch`、`absorbed`、`rules`、`nudge`、`stats`、`terminalStreak`、`nextRuleId`、`deadRefs`、`sweptOrphanCallIds`、`renderDeferredRefs`、`refLedgerAligned`、`timestampsHighWaterRefSeq`。`lastPassIds` 被排除（自愈字段）。
 
 回放取水线之前（含）最后一个边车（否则用全新默认值）。
 

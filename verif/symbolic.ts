@@ -1710,9 +1710,23 @@ const mergeBranch = (
         if (ts.isSpreadAssignment(prop)) {
           const v = evalExpr(prop.expression, frame, st, depth);
           if (isObj(v)) {
-            for (const [k2, v2] of v.fields) fields.set(k2, v2);
+            // #7823: a later spread may LACK a key the earlier one may have.
+            // Value = ite(thisSourceHasKey, later, earlier) — the old blind
+            // overwrite forced the later value even on paths where the later
+            // source lacks the key (under-approximation ⇒ false-UNSAT
+            // "proofs"). Presence is OR'd: the key exists if EITHER source
+            // may carry it; a missing earlier guard means "always present".
+            for (const [k2, v2] of v.fields) {
+              const g2 = v.presence?.get(k2);
+              const prev = fields.get(k2);
+              fields.set(k2, prev !== undefined && g2 ? mergeVal(g2, v2, prev) : v2);
+            }
             if (v.symFields) symFields = new Map(v.symFields);
-            if (v.presence) for (const [k2, g2] of v.presence) presence.set(k2, g2);
+            if (v.presence)
+              for (const [k2, g2] of v.presence) {
+                const pg = presence.get(k2);
+                presence.set(k2, (pg ? orFold(pg, g2) : g2)!);
+              }
           }
         } else if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name)) {
           const pv = evalExpr(prop.initializer, frame, st, depth);
@@ -1720,7 +1734,10 @@ const mergeBranch = (
           presence.delete(prop.name.text);
         } else if (ts.isShorthandPropertyAssignment(prop)) {
           const sv0 = evalExpr(prop.name, frame, st, depth);
-          const sv = sv0 === undefined || sv0.kind === undefined ? (() => { console.log(`[AT-UNDEF] shorthand ${prop.name.text}:`, JSON.stringify(frame.vars.get(prop.name.text), (k, v) => (k === "kids" ? "…" : v))?.slice(0, 220)); return { kind: "any" as const }; })() : sv0;
+          const sv =
+            sv0 === undefined || sv0.kind === undefined
+              ? ({ kind: "any" } as const)
+              : sv0;
           fields.set(prop.name.text, sv);
           presence.delete(prop.name.text);
         } else {
