@@ -611,18 +611,29 @@ export function parseCompressInput(input: unknown, callId?: string, options: { q
     const normalized = normalizeCompressInput(input);
     let parsed = parseCompressArgs(normalized, { callId });
     const note = (message: string): void => { if (!options.quiet) loggerLog("warn", message); };
-    // #3780: retry the double-escaped line form once. Adopt the result only if
-    // it parses strictly MORE ranges than the undecoded attempt — a no-real-
-    // newline string always yields zero ranges undecoded, so this can never
-    // degrade a working parse. #1494 precedent: host-side pre-normalization of
-    // compress-arg drift before the kernel. The ultimate shared home for this
-    // decode is the kernel's parseLineEntry (kernel/src/parse-compress-input.ts);
-    // it stays there pending a kernel change — this salvage covers every lane now.
-    if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") {
+    // #3780: retry the double-escaped line form once. The decode applies to a
+    // no-real-newline string carrying a literal backslash-n. Pre-#7821 such a
+    // string ALWAYS yielded zero ranges undecoded (missing summary), so the
+    // salvage gated on a failed parse and adopted on strictly MORE ranges.
+    // #7821's one-line acceptance (text after the refs IS the summary) broke
+    // that invariant: the undecoded double-escaped string now "parses" with
+    // the literal backslash-n glued into the summary, so the gate must also
+    // fire on a SUCCESSFUL parse of that shape, and adoption must accept the
+    // same range count — the decoded parse carries the real header/summary
+    // split, the undecoded one cannot. #1494 precedent: host-side
+    // pre-normalization of compress-arg drift before the kernel. The ultimate
+    // shared home for this decode is the kernel's parseLineEntry
+    // (kernel/src/parse-compress-input.ts); it stays there pending a kernel
+    // change — this salvage covers every lane now.
+    const content0 = isPlainObject(normalized) ? normalized["content"] : undefined;
+    const doubleEscapedShape = typeof content0 === "string" && !content0.includes("\n") && content0.includes("\\n");
+    if ((!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") || (doubleEscapedShape && parsed.diagnostics.kind === "ok")) {
         const decoded = decodeDoubleEscapedContent(normalized);
         if (decoded !== undefined) {
             const retry = parseCompressArgs(decoded, { callId });
-            if (retry.ranges.length > parsed.ranges.length) {
+            const adopt = retry.ranges.length > parsed.ranges.length
+                || (doubleEscapedShape && retry.ranges.length === parsed.ranges.length && retry.ranges.length > 0);
+            if (adopt) {
                 note(`[acp-compress-input] double-escape salvage: recovered ${retry.ranges.length} range(s) after decoding literal backslash-n separators once (kind was ${parsed.diagnostics.kind}) (#3780)`);
                 parsed = retry;
             }
