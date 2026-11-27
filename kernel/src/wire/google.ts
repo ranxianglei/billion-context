@@ -404,7 +404,10 @@ export function coreToGoogle(messages: BiliMessage[], opts?: { model?: string })
     if (m.role === "assistant") {
       flushUser();
       if (!model) model = { reasoning: [], text: [], calls: [] };
-      if (m.contentType === "reasoning") model.reasoning.push(reasoningPart(m));
+      if (m.contentType === "reasoning") {
+        const rp = reasoningPart(m);
+        if (rp) model.reasoning.push(rp);
+      }
       else if (m.contentType === "tool-call") model.calls.push(toolCallPart(m));
       else model.text.push(...contentParts(m));
     } else {
@@ -462,16 +465,25 @@ export function conversationSignalGoogle(
 
 /** A reasoning core: its raw thought part verbatim (text refreshed — the
  *  kernel re-renders core text with ref tags/truncation), else a
- *  reconstructed `{thought:true}` part carrying the sidecar signature. */
-function reasoningPart(m: BiliMessage): GooglePart {
+ *  reconstructed `{thought:true}` part carrying the sidecar signature.
+ *  Unsigned + no raw (cross-lane, or a lane whose model emits no thought
+ *  signatures) degrades to a PLAIN text part: Gemini 3 validates thought
+ *  signatures, so an unsigned thought part rejects the whole request —
+ *  pi's parity is to ship the text without the thought flag. */
+function reasoningPart(m: BiliMessage): GooglePart | undefined {
   const text = m.text ?? "";
   const head = rawParts(m)[0];
   if (head) return { ...head, text, thought: true };
-  return {
-    text,
-    thought: true,
-    ...signatureField("thoughtSignature", m.googleThoughtSignature),
-  };
+  if (m.googleThoughtSignature)
+    return {
+      text,
+      thought: true,
+      ...signatureField("thoughtSignature", m.googleThoughtSignature),
+    };
+  // Unsigned + no raw part: a plain text part — but only when there is
+  // actually text (an empty part is a no-op the request would carry for
+  // nothing; the anthropic/responses wires guard the same way).
+  return text ? { text } : undefined;
 }
 
 function toolCallPart(m: BiliMessage): GooglePart {

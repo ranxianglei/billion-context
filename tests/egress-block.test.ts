@@ -1,15 +1,17 @@
 /**
- * #7577: egress block flow/state — the block canonical history + read replica.
+ * #7577: egress block flow/state — the block canonical history + materialized
+ * live view (7773: the B base row is retired; reap = a D row carrying the
+ * terminal snapshot; the state row is physically deleted).
  * Tests pin the CONTRACT:
  *   - replay determinism: same op sequence → same block set, always;
- *   - the three row types (I born, U state-change, B compaction base) and
- *     their payload shapes;
+ *   - the three row types (I born, U state-change, D terminal with a full
+ *     final snapshot) and their payload shapes;
  *   - point fork: 4-table copy preserves op_seq/log_seq, child inherits
  *     parent number space;
  *   - kstate sidecar: bounded residual snapshot at row-write time;
- *   - B-row compaction: flow-only, state untouched, replay equivalence;
- *   - reap semantics: terminal U row (reaped=1) instead of DELETE;
- *   - diffBlockSet: I for new, U for changed, U reaped=true for live→gone.
+ *   - reap semantics: terminal D row (snapshot reaped=true) + physical state
+ *     delete, instead of an UPDATE or an UPDATE-with-reaped-flag;
+ *   - diffBlockSet: I for new, U for changed, D for live→gone.
  */
 
 import { test } from "node:test";
@@ -23,7 +25,6 @@ import {
     egressBlockAppend,
     egressBlockView,
     egressBlockReplay,
-    egressBlockCompact,
     egressPointFork,
     diffBlockSet,
     EgressBlockCorruptError,
@@ -70,7 +71,7 @@ const snap = (over: Partial<EgressBlockSnapshot> = {}): EgressBlockSnapshot => (
     ...over,
 });
 
-test("replay determinism: I/U/B op sequence → same block set", () => {
+test("replay determinism: I/U op sequence → same block set", () => {
     const H = open();
     try {
         const S = "sess-1";
@@ -97,7 +98,7 @@ test("replay determinism: I/U/B op sequence → same block set", () => {
     } finally { close(H); }
 });
 
-test("B-row compaction: flow-only, state untouched, replay equivalence", () => {
+test("reap = terminal D row with the full final snapshot; the state row is physically deleted (7773)", () => {
     const H = open();
     try {
         const S = "sess-1";
@@ -105,39 +106,30 @@ test("B-row compaction: flow-only, state untouched, replay equivalence", () => {
             { type: "I", blockId: "b1", snapshot: snap() },
             { type: "I", blockId: "b2", snapshot: snap({ tier: 2 }) },
         ], null, 1_000);
+        // reap b1: the D row carries the terminal snapshot (reaped=true)
         egressBlockAppend(H.db, S, [
-            { type: "U", blockId: "b1", snapshot: snap({ active: false }) },
+            { type: "D", blockId: "b1", snapshot: snap({ reaped: true, active: false }) },
         ], null, 2_000);
-        const before = egressBlockView(H.db, S);
-        // compact: B row at op_seq 4 (after I@1, I@2, U@3)
-        const compactSeq = egressBlockCompact(H.db, S, before, null, 3_000);
-        assert.equal(compactSeq, 4);
+        // the live view loses the block — it is deleted, not flagged
         const after = egressBlockView(H.db, S);
-        assert.equal(after.size, before.size);
-        assert.equal(after.get("b1")!.active, false);
+        assert.equal(after.size, 1);
+        assert.equal(after.has("b1"), false);
         assert.equal(after.get("b2")!.active, true);
-        // replay from compacted flow (B row at op_seq 4)
-        const r = egressBlockReplay(H.db, S, 4);
-        assert.equal(r.blocks.size, 2);
-        assert.equal(r.blocks.get("b1")!.active, false);
-    } finally { close(H); }
-});
-
-test("reap semantics: terminal U row (reaped=1) instead of DELETE", () => {
-    const H = open();
-    try {
-        const S = "sess-1";
-        egressBlockAppend(H.db, S, [
-            { type: "I", blockId: "b1", snapshot: snap() },
-        ], null, 1_000);
-        // reap: terminal U with reaped=true
-        egressBlockAppend(H.db, S, [
-            { type: "U", blockId: "b1", snapshot: snap({ reaped: true, active: false }) },
-        ], null, 2_000);
-        const view = egressBlockView(H.db, S);
-        assert.equal(view.size, 1);
-        assert.equal(view.get("b1")!.reaped, true);
-        assert.equal(view.get("b1")!.active, false);
+        // the flow keeps both rows (append-only): I@1, I@2, D@3
+        const rows = H.db.prepare("SELECT row_type FROM egress_block_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
+        assert.deepEqual(rows.map((r) => r.row_type), ["I", "I", "D"]);
+        // replay sees the block only before the D
+        const before = egressBlockReplay(H.db, S, 2);
+        assert.equal(before.blocks.has("b1"), true);
+        const atD = egressBlockReplay(H.db, S, 3);
+        assert.equal(atD.blocks.has("b1"), false);
+        assert.equal(atD.blocks.get("b2")!.active, true);
+        // the D row's payload carries the terminal snapshot
+        const dRow = H.db.prepare("SELECT block_id, payload FROM egress_block_flow WHERE session_id = ? AND row_type = 'D'").get(S) as { block_id: string; payload: string };
+        const parsed = JSON.parse(dRow.payload);
+        assert.equal(dRow.block_id, "b1");
+        assert.equal(parsed.reaped, true);
+        assert.equal(parsed.tier, 1, "the D row's payload carries the full final snapshot, not a marker");
     } finally { close(H); }
 });
 
@@ -210,8 +202,8 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
         for (const [table, cols] of [
             ["egress_flow", "op_seq, log_seq, row_type, msgid, payload, bytes, created_at"],
             ["egress_block_flow", "op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at"],
-            ["egress_state", "op_seq, log_seq, row_type, msgid, payload, bytes, created_at"],
-            ["egress_block_state", "block_id, op_seq, flow_op_seq, payload, created_at"],
+            ["egress_state", "msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at"],
+            ["egress_block_state", "block_id, pos, op_seq, flow_op_seq, payload, created_at"],
         ] as const) {
             const q = (id: string) => H.db.prepare(`SELECT ${cols} FROM ${table} WHERE session_id = ? ORDER BY 1, 2`).all(id);
             assert.deepEqual(q(C), q(P));
@@ -225,10 +217,9 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
         assert.equal(egressBlockView(H.db, C).get("blk_1")!.active, true);
 
         // a TRUE point fork (wm < flow high water) replays: tables truncated
-        // at the FLOW watermark; block rows align via flow_op_seq.
-        // A separate NON-compacted parent, so rows 1,2 still exist to
-        // truncate at (the fold above already truncated P's flow to its B
-        // base row).
+        // at the FLOW watermark; block rows align via flow_op_seq. Use a
+        // separate non-folded parent so the watermark lands before the fold
+        // and the flow rows 1,2 are still the fork's source.
         const P2 = "parent-a2";
         egressAppendTurn(H.db, P2, [
             { type: "I", msgid: "m00001", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "hello" },
@@ -321,7 +312,7 @@ test("kstate sidecar: bounded residual snapshot at row-write time", () => {
     } finally { close(H); }
 });
 
-test("diffBlockSet: I for new, U for changed, U reaped=true for live→gone", () => {
+test("diffBlockSet: I for new, U for changed, D for live→gone (snapshot reaped=true)", () => {
     const prev = new Map<string, EgressBlockSnapshot>();
     const next = new Map<string, EgressBlockSnapshot>();
     prev.set("b1", snap());
@@ -334,8 +325,9 @@ test("diffBlockSet: I for new, U for changed, U reaped=true for live→gone", ()
     assert.equal(byBlock.get("b1")!.type, "U");
     assert.equal(byBlock.get("b1")!.snapshot.active, false);
     assert.equal(byBlock.get("b3")!.type, "I");
-    assert.equal(byBlock.get("b2")!.type, "U");
+    assert.equal(byBlock.get("b2")!.type, "D");
     assert.equal(byBlock.get("b2")!.snapshot.reaped, true);
+    assert.equal(byBlock.get("b2")!.snapshot.tier, 2, "the D snapshot is the full final state of the block");
 });
 
 test("corrupt: duplicate I throws", () => {
@@ -360,6 +352,18 @@ test("corrupt: U on missing target throws", () => {
         assert.throws(() => {
             egressBlockAppend(H.db, S, [
                 { type: "U", blockId: "b1", snapshot: snap() },
+            ], null, 1_000);
+        }, EgressBlockCorruptError);
+    } finally { close(H); }
+});
+
+test("corrupt: D on missing target throws", () => {
+    const H = open();
+    try {
+        const S = "sess-1";
+        assert.throws(() => {
+            egressBlockAppend(H.db, S, [
+                { type: "D", blockId: "b1", snapshot: snap({ reaped: true }) },
             ], null, 1_000);
         }, EgressBlockCorruptError);
     } finally { close(H); }
