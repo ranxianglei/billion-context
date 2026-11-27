@@ -230,6 +230,19 @@ function resolveAnchorIndex(
       // hole (pruned or skipped) and must not be read as cross-session.
       const highest = highestUsedIndex(state.messageRefs);
       if (boundary.numericId > highest) {
+        // #7821: a START endpoint at exactly highest+1 is the assistant message
+        // the model is currently writing — it has no ref yet (refs are minted
+        // on the next request). The generic "stale artifact or typo" message
+        // sent the model probing for a valid number instead of continuing the
+        // turn, and each probe re-armed the breaker. A dedicated message tells
+        // it to continue the turn; the message becomes compressible next call.
+        if (endpoint === "start" && boundary.numericId === highest + 1) {
+          throw new BoundaryNotFoundError(
+            "unknown",
+            endpoint,
+            `${label}="${boundary.raw}" is the assistant message you are currently writing — it has no ref yet (refs are minted on the next request). Do not compress it now; continue the turn and it will be compressible on a later call.`,
+          );
+        }
         // #4521: an endId above the highest allocated ref is the model aiming
         // at "the newest tail" without knowing where it ends — the single most
         // common compress failure on long sessions (it cannot see refs minted

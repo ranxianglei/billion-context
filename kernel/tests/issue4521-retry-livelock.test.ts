@@ -166,6 +166,53 @@ test("#4521: a range of pure protected tool pairs is the same no-op class", () =
   );
 });
 
+test("#7821: startId at exactly highest+1 (the in-flight message) gets a dedicated message", () => {
+  const core = createCore();
+  const messages = [text("u0", "user"), text("a1", "assistant"), text("a2", "assistant")];
+  const state = seed(messages);
+  // highest = m00003 (the last message). highest+1 = m00004 (the in-flight message).
+  const r = core.applyCompression({
+    ranges: [{ startRef: "m00004", endRef: "m00004", summary: "in-flight" }],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(r.result.blocksCreated, 0);
+  assert.ok(r.result.errors.length > 0, "the in-flight message cannot be compressed");
+  // The per-range error (from boundaries.ts) carries the dedicated in-flight
+  // message. The aggregated error (from compress.ts) is a generic
+  // "unknown to this session" message that may mention "stale artifact" as
+  // one possible cause, so we check the per-range portion specifically.
+  const perRange = r.result.errors.find((e) => e.startsWith("range m00004"));
+  assert.ok(perRange, `per-range error present (errors: ${JSON.stringify(r.result.errors)})`);
+  assert.match(perRange!, /assistant message you are currently writing/);
+  assert.match(perRange!, /no ref yet/);
+  assert.match(perRange!, /continue the turn/);
+  // The in-flight message is NOT described as a "stale artifact" in the
+  // per-range error (it is the current turn's message, not a stale one).
+  assert.doesNotMatch(perRange!, /stale artifact from an earlier generation/);
+});
+
+test("#7821: startId above highest+1 (not the in-flight message) keeps the stale-ref message", () => {
+  const core = createCore();
+  const messages = [text("u0", "user"), text("a1", "assistant"), text("a2", "assistant")];
+  const state = seed(messages);
+  // highest = m00003. highest+1 = m00004. m00005 is above highest+1.
+  const r = core.applyCompression({
+    ranges: [{ startRef: "m00005", endRef: "m00005", summary: "phantom" }],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(r.result.blocksCreated, 0);
+  assert.ok(r.result.errors.length > 0);
+  assert.match(r.result.errors.join("; "), /stale artifact from an earlier generation/);
+  // The in-flight message is NOT the cause (m00005 is not highest+1).
+  assert.doesNotMatch(r.result.errors.join("; "), /assistant message you are currently writing/);
+});
+
 test("#4521/#6928: armed-but-silent nudge window no longer emits a status line", () => {
   const core = createCore();
   const cfg = config();

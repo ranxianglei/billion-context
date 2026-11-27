@@ -974,7 +974,10 @@ test("parseCompressArgs keeps a stray refless string invalid after a complete li
 });
 
 test("parseCompressArgs still rejects a header-only entry with nothing to adopt (#1001)", () => {
-  const input = { content: ["m00001\u2013m00002 topic"] };
+  // #7821: a header-only entry is one with NO text after the refs (a bare
+  // refs line). A one-line entry with text after the refs is now accepted
+  // (the text is the summary), so the header-only case is a bare refs line.
+  const input = { content: ["m00001\u2013m00002"] };
   const { ranges, diagnostics } = parseCompressArgs(input);
   assert.equal(ranges.length, 0);
   assert.equal(diagnostics.kind, "no-valid-ranges");
@@ -1304,9 +1307,12 @@ test("parseCompressArgs does NOT apply flat single-range when content carries re
   assert.equal(ok.ranges.length, 1);
   assert.equal(ok.ranges[0]?.startRef, "m00010");
   assert.equal(ok.diagnostics.flatSummarySalvage, undefined);
-  // ...and header-only entries report the missing summary, not a salvage.
+  // ...and header-only entries (no text after the refs) report the missing
+  // summary, not a salvage. #7821: a one-line entry WITH text after the refs
+  // is now accepted (the text is the summary), so the header-only case is a
+  // bare refs line.
   const bad = parseCompressArgs({
-    content: "m00010–m00020 topic only",
+    content: "m00010–m00020",
     startId: "m00001",
     endId: "m00099",
   });
@@ -1323,15 +1329,44 @@ test("parseCompressArgs keeps headerless prose without top-level refs as content
 });
 
 test("parseCompressArgs reports header-only line entries as no-valid-ranges with reasons", () => {
+  // #7821: the second range is a bare refs line (no text after the refs), so
+  // it is still header-only. A one-line entry WITH text after the refs is now
+  // accepted (the text is the summary), so the header-only case is a bare
+  // refs line.
   const { diagnostics } = parseCompressArgs({
-    content: "m00010–m00020 topic one\nsummary ok.\nm00030–m00040 topic two",
+    content: "m00010–m00020 topic one\nsummary ok.\nm00030–m00040",
   });
   assert.equal(diagnostics.kind, "ok"); // 1 valid + 1 invalid
   assert.equal(diagnostics.invalidItems, 1);
   assert.match(diagnostics.invalidReasons?.[0] ?? "", /missing summary/);
-  const none = parseCompressArgs({ content: "m00010–m00020 topic only" });
+  // A bare refs line (no text after the refs) is still header-only.
+  const none = parseCompressArgs({ content: "m00010–m00020" });
   assert.equal(none.diagnostics.kind, "no-valid-ranges");
   assert.match(none.diagnostics.invalidReasons?.[0] ?? "", /missing summary/);
+});
+
+test("line form: one-line entry with text after refs is accepted as summary (#7821)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: ["m09309–m09309 Final."],
+  });
+  assert.equal(diagnostics.kind, "ok");
+  assert.equal(diagnostics.invalidItems, 0);
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0]!.startRef, "m09309");
+  assert.equal(ranges[0]!.endRef, "m09309");
+  assert.equal(ranges[0]!.summary, "Final.");
+});
+
+test("line form: one-line single-ref entry with text after refs is accepted (#7821)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: ["m09309 Final."],
+  });
+  assert.equal(diagnostics.kind, "ok");
+  assert.equal(diagnostics.invalidItems, 0);
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0]!.startRef, "m09309");
+  assert.equal(ranges[0]!.endRef, "m09309");
+  assert.equal(ranges[0]!.summary, "Final.");
 });
 
 // ---------------------------------------------------------------------------
