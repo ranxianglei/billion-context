@@ -157,6 +157,10 @@ export interface EgressOpLogStore {
     egressStateViewAt(sessionId: string, opSeq: number): EgressViewRow[];
     /** Highest op_seq in the flow (0 = no rows). */
     egressStateMaxSeq(sessionId: string): number;
+    /** 2026-11-27 (row ids): highest rid issued in the flow (0 = none) —
+     *  the allocator a turn's diff continues from. Optional: a shim without
+     *  rid support diffs from 0 (a single-writer test store). */
+    egressStateMaxRid?(sessionId: string): number;
     /** 7773 walk-back: one O(n) pass over the flow's FULL history returning
      *  the newest healthy NON-EMPTY prefix (seq + view), or null when no
      *  non-empty healthy prefix exists (corruption reaching the floor).
@@ -287,7 +291,9 @@ export function recordEgressTurn(args: {
     // trackNums: the next rows were stamped against the live refs ledger —
     // a spine row's num change is a kernel citation-fact change (demote /
     // re-cite / re-homing) and must reach the log as a +U carrying num.
-    const ops = diffEgressView(prev, next, refMap !== undefined);
+    // ridHighWater: row ids continue from the flow's MAX(rid) — ids never
+    // reuse (2026-11-27), a retired row's rid stays spent forever.
+    const ops = diffEgressView(prev, next, refMap !== undefined, store.egressStateMaxRid?.(sessionId) ?? 0);
     let stamped: EgressViewRow[];
     if (ops.length === 0) {
         stamped = prev;

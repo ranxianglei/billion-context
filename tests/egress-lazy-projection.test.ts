@@ -122,7 +122,7 @@ test("snapPinLiveIds: a damaged serving copy is copied again from the log; a cor
         // A ghost state row: pos density breaks, the serving read notices.
         const plantStateGhost = () =>
             H.db
-                .prepare(`INSERT INTO egress_state (session_id, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 3)`)
+                .prepare(`INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 3)`)
                 .run("s3");
         // 1. only the SERVING COPY is damaged, the log itself is intact: the
         //    copy is rebuilt from the log and the session keeps its ids

@@ -8,7 +8,9 @@
  *     never existed in this form: not written, not read) and their payload
  *     shapes;
  *   - the hard-error paths (missing anchor / missing or inverted delete
- *     endpoints / update target missing) throw, never degrade fuzzy;
+ *     endpoints / update target missing / duplicate row id) throw, never
+ *     degrade fuzzy — and addressing is by row id (2026-11-27): a msgid may
+ *     collide or churn, the log's anchors never do;
  *   - egress_state is the MATERIALIZED live view: its row count == the
  *     live row count (ORDER BY pos serving read, no replay); egress_flow
  *     keeps every row forever (append-only, physically never deleted —
@@ -72,7 +74,14 @@ const h = (m: string) => `h_${m}`;
 // The canonical `num` is assigned at append/replay time from the stored
 // high-water, so pure diff/replay fixtures carry num: 0 — comparisons ignore
 // it (norm); the db-backed tests assert the stamped numbers explicitly.
-const norm = (rows: EgressViewRow[]) => rows.map(({ num, ...rest }) => rest);
+const norm = (rows: EgressViewRow[]) => rows.map(({ num, rid, ...rest }) => rest);
+
+// Pure diff/replay fixtures build views without rids — diff assigns them
+// defensively from its counter, but a REPLAY resolves rid anchors against
+// the prev view, so tests stamp rids 1..n in view order (the same shape a
+// DB-backed log holds). `next` views need none: diff reads only their
+// content, and fresh rows get their rids from the diff's counter.
+const stamped = (rows: EgressViewRow[]): EgressViewRow[] => rows.map((r, i) => (typeof r.rid === "number" ? r : { ...r, rid: i + 1 }));
 
 
 /** Total rows of a session in BOTH tables. */
@@ -98,12 +107,12 @@ function flowRows(h: Harness, S: string): number {
 function plant(h: Harness, S: string, op: EgressOp, opSeq: number, nowMs: number): void {
     const written =
         op.type === "I"
-            ? ["I", op.msgid, JSON.stringify({ after: op.after, ref: op.ref, tokens: op.tokens, type: op.typeTag, role: op.role }), 9, op.bytes]
+            ? ["I", op.rid, op.msgid, JSON.stringify({ after: op.after, ref: op.ref, tokens: op.tokens, type: op.typeTag, role: op.role }), 9, op.bytes]
             : op.type === "D"
-                ? ["D", null, JSON.stringify({ start: op.start, end: op.end }), null, null]
-                : ["U", op.msgid, JSON.stringify({ role: op.role }), null, op.bytes];
-    const [rowType, msgid, payload, logSeq, bytes] = written;
-    h.db.prepare(`INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(S, opSeq, logSeq, rowType, msgid, payload, bytes, nowMs);
+                ? ["D", null, null, JSON.stringify({ start: op.start, end: op.end }), null, null]
+                : ["U", op.rid, op.msgid, JSON.stringify({ role: op.role }), null, op.bytes];
+    const [rowType, rid, msgid, payload, logSeq, bytes] = written as [string, number | null, string | null, string, number | null, string | null];
+    h.db.prepare(`INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(S, opSeq, logSeq, rowType, rid, msgid, payload, bytes, nowMs);
 }
 
 test("replay determinism: the five-op example from the proposal", () => {
@@ -114,11 +123,11 @@ test("replay determinism: the five-op example from the proposal", () => {
         // names the row it follows (#7574: the stored replay now agrees with
         // the diff on this — it used to put an unanchored row at the end)
         egressStateAppend(H.db, S, [
-            { type: "I", msgid: "a", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "h_a1" },
-            { type: "I", msgid: "b", after: "a", ref: "m00002", tokens: 4, typeTag: "text", bytes: "h_b1" },
-            { type: "I", msgid: "c", after: "b", ref: "m00003", tokens: 9, typeTag: "summary", bytes: "h_c1" },
-            { type: "D", start: "a", end: "b" },
-            { type: "U", msgid: "c", bytes: "h_c2" },
+            { type: "I", rid: 1, msgid: "a", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "h_a1" },
+            { type: "I", rid: 2, msgid: "b", after: 1, ref: "m00002", tokens: 4, typeTag: "text", bytes: "h_b1" },
+            { type: "I", rid: 3, msgid: "c", after: 2, ref: "m00003", tokens: 9, typeTag: "summary", bytes: "h_c1" },
+            { type: "D", start: 1, end: 2 },
+            { type: "U", rid: 3, msgid: "c", bytes: "h_c2" },
         ], 1_000);
         const view = egressStateView(H.db, S);
         assert.deepEqual(view.map((r) => r.msgid), ["c"]);
@@ -142,25 +151,27 @@ test("+I anchored insert lands mid-history; an unanchored +I is the new first ro
     try {
         const S = "sess-2";
         egressStateAppend(H.db, S, [
-            { type: "I", msgid: "a", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a" },
-            { type: "I", msgid: "d", after: "a", ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_d" },
-            { type: "I", msgid: "e", after: "d", ref: "m00003", tokens: 1, typeTag: "text", bytes: "h_e" },
+            { type: "I", rid: 1, msgid: "a", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a" },
+            { type: "I", rid: 2, msgid: "d", after: 1, ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_d" },
+            { type: "I", rid: 3, msgid: "e", after: 2, ref: "m00003", tokens: 1, typeTag: "text", bytes: "h_e" },
             // mid-history insert anchored at a (positions of d/e shift)
-            { type: "I", msgid: "b", after: "a", ref: "m00004", tokens: 1, typeTag: "text", bytes: "h_b" },
-            { type: "I", msgid: "c", after: "b", ref: "m00005", tokens: 1, typeTag: "text", bytes: "h_c" },
+            { type: "I", rid: 4, msgid: "b", after: 1, ref: "m00004", tokens: 1, typeTag: "text", bytes: "h_b" },
+            { type: "I", rid: 5, msgid: "c", after: 4, ref: "m00005", tokens: 1, typeTag: "text", bytes: "h_c" },
         ], 1_000);
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), ["a", "b", "c", "d", "e"]);
+        assert.deepEqual(egressStateView(H.db, S).map((r) => r.rid), [1, 4, 5, 2, 3], "the live view's rids follow the flow history, not the positions");
         // a system prompt that shows up in a later turn becomes the FIRST row
         // (what the diff asks for; what the lane then serves)
         egressStateAppend(H.db, S, [
-            { type: "I", msgid: "sys", after: null, ref: "m00006", tokens: 0, typeTag: "system", bytes: "h_sys" },
+            { type: "I", rid: 6, msgid: "sys", after: null, ref: "m00006", tokens: 0, typeTag: "system", bytes: "h_sys" },
         ], 1_500);
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), ["sys", "a", "b", "c", "d", "e"]);
-        // a fold deletes b..d — sys, a and e survive in place
-        egressStateAppend(H.db, S, [{ type: "D", start: "b", end: "d" }], 2_000);
+        // a fold deletes b..d (rids 4,5,2 by position — b=4, c=5, d=2) —
+        // sys, a and e survive in place
+        egressStateAppend(H.db, S, [{ type: "D", start: 4, end: 2 }], 2_000);
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), ["sys", "a", "e"]);
         // single-row delete (start == end)
-        egressStateAppend(H.db, S, [{ type: "D", start: "a", end: "a" }], 3_000);
+        egressStateAppend(H.db, S, [{ type: "D", start: 1, end: 1 }], 3_000);
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), ["sys", "e"]);
     } finally {
         close(H);
@@ -175,8 +186,8 @@ test("hard errors: missing anchor / missing or inverted endpoints / update targe
         // only ever surface the earliest one.
         const seed = (S: string) => {
             egressStateAppend(H.db, S, [
-                { type: "I", msgid: "a", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a" },
-                { type: "I", msgid: "b", after: "a", ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_b" },
+                { type: "I", rid: 1, msgid: "a", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a" },
+                { type: "I", rid: 2, msgid: "b", after: 1, ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_b" },
             ], 1_000);
         };
         const corrupt = (e: unknown, re: RegExp) => e instanceof EgressStateCorruptError && re.test(e.message);
@@ -190,15 +201,24 @@ test("hard errors: missing anchor / missing or inverted endpoints / update targe
             assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), ["a", "b"], `${S}: still on the healthy point`);
         };
         refused("anchor-missing", [
-            { type: "I", msgid: "x", after: "zz", ref: "m00003", tokens: 1, typeTag: "text", bytes: "h_x" },
-        ], /anchor zz missing/);
-        refused("endpoint-missing", [{ type: "D", start: "a", end: "nope" }], /delete end nope missing/);
-        refused("start-missing", [{ type: "D", start: "nope", end: "b" }], /delete start nope missing/);
-        refused("inverted", [{ type: "D", start: "b", end: "a" }], /inverted/);
-        refused("update-missing", [{ type: "U", msgid: "ghost", bytes: "h_g" }], /update target ghost missing/);
-        refused("dup", [
-            { type: "I", msgid: "a", after: null, ref: "m00009", tokens: 1, typeTag: "text", bytes: "h_a2" },
-        ], /duplicate msgid a/);
+            { type: "I", rid: 3, msgid: "x", after: 99, ref: "m00003", tokens: 1, typeTag: "text", bytes: "h_x" },
+        ], /anchor rid 99 missing/);
+        refused("endpoint-missing", [{ type: "D", start: 1, end: 99 }], /delete end rid 99 missing/);
+        refused("start-missing", [{ type: "D", start: 99, end: 2 }], /delete start rid 99 missing/);
+        refused("inverted", [{ type: "D", start: 2, end: 1 }], /inverted/);
+        refused("update-missing", [{ type: "U", rid: 99, msgid: "ghost", bytes: "h_g" }], /update target rid 99 missing/);
+        refused("dup-rid", [
+            { type: "I", rid: 1, msgid: "x", after: null, ref: "m00009", tokens: 1, typeTag: "text", bytes: "h_x" },
+        ], /duplicate row id 1/);
+        // 2026-11-27 (row ids): a COLLIDING msgid on a fresh row is legal at
+        // the log layer — addressing is by rid, so the two rows stay
+        // distinguishable (before/after an edit or a re-homing) where msgids
+        // cannot be.
+        seed("collide");
+        egressStateAppend(H.db, "collide", [
+            { type: "I", rid: 3, msgid: "a", after: 1, ref: "m00009", tokens: 1, typeTag: "text", bytes: "h_x" },
+        ], 3_000);
+        assert.deepEqual(egressStateView(H.db, "collide").map((r) => r.rid), [1, 3, 2], "same msgid, fresh rid: both rows live and distinct");
         // 7773: a bad row that got into the FLOW some other way (a library
         // edited by hand, a half-copied backup) must NOT break serving while
         // the materialized view is intact — the read is a consistent
@@ -210,9 +230,9 @@ test("hard errors: missing anchor / missing or inverted endpoints / update targe
             assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), ["a", "b"], `${S}: the intact view still serves`);
             assert.throws(() => egressStateAt(H.db, S, Number.MAX_SAFE_INTEGER), (e: unknown) => corrupt(e, re), `${S}: the full replay reports the planted bad row`);
         };
-        planted("planted-anchor", { type: "I", msgid: "x", after: "zz", ref: "m00003", tokens: 1, typeTag: "text", bytes: "h_x" }, /anchor zz missing/);
-        planted("planted-end", { type: "D", start: "a", end: "nope" }, /delete end nope missing/);
-        planted("planted-dup", { type: "I", msgid: "a", after: "b", ref: "m00009", tokens: 1, typeTag: "text", bytes: "h_a2" }, /duplicate msgid a/);
+        planted("planted-anchor", { type: "I", rid: 3, msgid: "x", after: 99, ref: "m00003", tokens: 1, typeTag: "text", bytes: "h_x" }, /anchor rid 99 missing/);
+        planted("planted-end", { type: "D", start: 1, end: 99 }, /delete end rid 99 missing/);
+        planted("planted-dup", { type: "I", rid: 1, msgid: "a", after: 2, ref: "m00009", tokens: 1, typeTag: "text", bytes: "h_a2" }, /duplicate row id 1/);
         // and the healthy sessions in the same db still replay cleanly (no
         // cross-session leakage from the corrupt rows)
         seed("healthy");
@@ -232,12 +252,12 @@ test("materialized view: state row count == live row count, flow keeps its full 
         const S = "sess-4";
         // 10 tail appends, then a fold collapses 1..6 into one summary
         const ops: EgressOp[] = [];
-        ops.push({ type: "I", msgid: "m1", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_m1" });
+        ops.push({ type: "I", rid: 1, msgid: "m1", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_m1" });
         for (let i = 2; i <= 10; i++) {
-            ops.push({ type: "I", msgid: `m${i}`, after: `m${i - 1}`, ref: `m0000${i}`, tokens: i, typeTag: "text", bytes: `h_m${i}` });
+            ops.push({ type: "I", rid: i, msgid: `m${i}`, after: i - 1, ref: `m0000${i}`, tokens: i, typeTag: "text", bytes: `h_m${i}` });
         }
-        ops.push({ type: "I", msgid: "fold", after: "m6", ref: "m00011", tokens: 77, typeTag: "summary", bytes: "h_fold" });
-        ops.push({ type: "D", start: "m1", end: "m6" });
+        ops.push({ type: "I", rid: 11, msgid: "fold", after: 6, ref: "m00011", tokens: 77, typeTag: "summary", bytes: "h_fold" });
+        ops.push({ type: "D", start: 1, end: 6 });
         egressStateAppend(H.db, S, ops, 1_000);
         const before = egressStateView(H.db, S);
         assert.deepEqual(before.map((r) => r.msgid), ["fold", "m7", "m8", "m9", "m10"]);
@@ -261,7 +281,7 @@ test("materialized view: state row count == live row count, flow keeps its full 
         // ops after the fold still apply on the live view, numbers continue
         // from the flow high-water (11)
         egressStateAppend(H.db, S, [
-            { type: "I", msgid: "m11", after: "m10", ref: "m00012", tokens: 11, typeTag: "text", bytes: "h_m11" },
+            { type: "I", rid: 12, msgid: "m11", after: 10, ref: "m00012", tokens: 11, typeTag: "text", bytes: "h_m11" },
         ], 3_000);
         const grown = egressStateView(H.db, S);
         assert.deepEqual(grown.map((r) => r.msgid), ["fold", "m7", "m8", "m9", "m10", "m11"]);
@@ -283,18 +303,18 @@ test("rollback: every point — from 0 up — stays reconstructible from egress_
         const snapshots = new Map<number, EgressViewRow[]>();
         for (let i = 1; i <= 5; i++) {
             egressStateAppend(H.db, S, [
-                { type: "I", msgid: `m${i}`, after: i === 1 ? null : `m${i - 1}`, ref: `m0000${i}`, tokens: i, typeTag: "text", bytes: `h_m${i}` },
+                { type: "I", rid: i, msgid: `m${i}`, after: i === 1 ? null : i - 1, ref: `m0000${i}`, tokens: i, typeTag: "text", bytes: `h_m${i}` },
             ], 1_000 + i);
             snapshots.set(i, egressStateView(H.db, S));
         }
-        egressStateAppend(H.db, S, [{ type: "U", msgid: "m2", bytes: "h_m2-edit" }], 6_000);
+        egressStateAppend(H.db, S, [{ type: "U", rid: 2, msgid: "m2", bytes: "h_m2-edit" }], 6_000);
         snapshots.set(6, egressStateView(H.db, S));
         assert.equal(snapshots.get(6)![1].num, 2, "the +U did not change m2's canonical number");
         // the materialized view serves the current point byte-identically to
         // the full replay (state == replay(flow) after every write)
         assert.deepEqual(egressStateView(H.db, S), egressStateAt(H.db, S, 6));
         egressStateAppend(H.db, S, [
-            { type: "I", msgid: "m6", after: "m5", ref: "m00006", tokens: 6, typeTag: "text", bytes: "h_m6" },
+            { type: "I", rid: 6, msgid: "m6", after: 5, ref: "m00006", tokens: 6, typeTag: "text", bytes: "h_m6" },
         ], 11_000);
         const later = egressStateView(H.db, S);
         assert.deepEqual(egressStateAt(H.db, S, 7), later, "a point after the last write");
@@ -317,38 +337,38 @@ const V = (msgid: string, bytes = "h_" + msgid, ref = "m" + msgid, tokens = 3, t
 
 
 test("diff: case 1 — tail append emits exactly one +I anchored to the last row", () => {
-    const prev = [V("a"), V("b")];
-    const next = [V("a"), V("b"), V("c")];
+    const prev = stamped([V("a"), V("b")]);
+    const next = [...prev, V("c")];
     const ops = diffEgressView(prev, next);
-    assert.deepEqual(ops, [{ type: "I", msgid: "c", after: "b", ref: "mc", tokens: 3, typeTag: "text", bytes: "h_c" }]);
+    assert.deepEqual(ops, [{ type: "I", rid: 3, msgid: "c", after: 2, ref: "mc", tokens: 3, typeTag: "text", bytes: "h_c" }]);
     assert.deepEqual(norm(egressReplay(prev, ops)), norm(next));
 });
 
 test("diff: cases 2+3 — nudge appears (+I) and vanishes (-D) without touching the prefix", () => {
-    const base = [V("a"), V("b")];
-    const nudged = [V("a"), V("b"), V("nudge", "h_n", "mn", 1, "nudge")];
+    const base = stamped([V("a"), V("b")]);
+    const nudged = stamped([...base, V("nudge", "h_n", "mn", 1, "nudge")]);
     assert.deepEqual(diffEgressView(base, nudged), [
-        { type: "I", msgid: "nudge", after: "b", ref: "mn", tokens: 1, typeTag: "nudge", bytes: "h_n" },
+        { type: "I", rid: 3, msgid: "nudge", after: 2, ref: "mn", tokens: 1, typeTag: "nudge", bytes: "h_n" },
     ]);
     assert.deepEqual(norm(egressReplay(base, diffEgressView(base, nudged))), norm(nudged));
-    assert.deepEqual(diffEgressView(nudged, base), [{ type: "D", start: "nudge", end: "nudge" }]);
+    assert.deepEqual(diffEgressView(nudged, base), [{ type: "D", start: 3, end: 3 }]);
     assert.deepEqual(norm(egressReplay(nudged, diffEgressView(nudged, base))), norm(base));
 });
 
 test("diff: case 4 — fold replaces a range with one summary row after the surviving anchor", () => {
-    const prev = [V("a"), V("b"), V("c"), V("d"), V("e"), V("f")];
+    const prev = stamped([V("a"), V("b"), V("c"), V("d"), V("e"), V("f")]);
     const folded = [V("a"), V("sum", "h_sum", "ms", 42, "acp_summary"), V("f")];
     assert.deepEqual(diffEgressView(prev, folded), [
-        { type: "D", start: "b", end: "e" },
-        { type: "I", msgid: "sum", after: "a", ref: "ms", tokens: 42, typeTag: "acp_summary", bytes: "h_sum" },
+        { type: "D", start: 2, end: 5 },
+        { type: "I", rid: 7, msgid: "sum", after: 1, ref: "ms", tokens: 42, typeTag: "acp_summary", bytes: "h_sum" },
     ]);
     assert.deepEqual(norm(egressReplay(prev, diffEgressView(prev, folded))), norm(folded));
 });
 
 test("diff: case U — content edit of an existing row is a +U, position and triple untouched", () => {
-    const prev = [V("a", "h_a1"), V("b")];
-    const next = [V("a", "h_a2"), V("b")];
-    assert.deepEqual(diffEgressView(prev, next), [{ type: "U", msgid: "a", bytes: "h_a2" }]);
+    const prev = stamped([V("a", "h_a1"), V("b")]);
+    const next = [{ ...prev[0], bytes: "h_a2" }, prev[1]];
+    assert.deepEqual(diffEgressView(prev, next), [{ type: "U", rid: 1, msgid: "a", bytes: "h_a2" }]);
     const replayed = egressReplay(prev, diffEgressView(prev, next));
     assert.deepEqual(norm(replayed), norm(next));
     assert.equal(replayed[0].ref, "ma", "+U must not touch the ref");
@@ -366,13 +386,13 @@ test("diff: case U — content edit of an existing row is a +U, position and tri
 
 test("diff: a spine row that loses its citation emits a +U with num 0", () => {
     const R = (msgid: string, num: number): EgressViewRow => ({ num, msgid, ref: "m" + msgid, tokens: 3, type: "text", bytes: "h_" + msgid });
-    const prev = [R("a", 2), R("p1", 91), R("p2", 92)];
+    const prev = stamped([R("a", 2), R("p1", 91), R("p2", 92)]);
     const next = [{ ...R("p1", 0) }, { ...R("p2", 0) }, R("r", 91)];
     assert.deepEqual(diffEgressView(prev, next, true), [
-        { type: "D", start: "a", end: "a" },
-        { type: "U", msgid: "p1", bytes: "h_p1", num: 0 },
-        { type: "U", msgid: "p2", bytes: "h_p2", num: 0 },
-        { type: "I", msgid: "r", after: "p2", ref: "mr", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 },
+        { type: "D", start: 1, end: 1 },
+        { type: "U", rid: 2, msgid: "p1", bytes: "h_p1", num: 0 },
+        { type: "U", rid: 3, msgid: "p2", bytes: "h_p2", num: 0 },
+        { type: "I", rid: 4, msgid: "r", after: 3, ref: "mr", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 },
     ]);
     const replayed = egressReplay(prev, diffEgressView(prev, next, true), 92);
     assert.deepEqual(norm(replayed), norm(next));
@@ -381,18 +401,18 @@ test("diff: a spine row that loses its citation emits a +U with num 0", () => {
 
 test("diff+replay: re-citing a slot held by a STILL-cited live row still throws (true corruption)", () => {
     const R = (msgid: string, num: number): EgressViewRow => ({ num, msgid, ref: "m" + msgid, tokens: 3, type: "text", bytes: "h_" + msgid });
-    const prev = [R("a", 91)];
-    const next = [{ ...R("a", 91) }, R("r", 91)];
+    const prev = stamped([R("a", 91)]);
+    const next = [...prev, R("r", 91)];
     const ops = diffEgressView(prev, next, true);
-    assert.deepEqual(ops, [{ type: "I", msgid: "r", after: "a", ref: "mr", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 }]);
+    assert.deepEqual(ops, [{ type: "I", rid: 2, msgid: "r", after: 1, ref: "mr", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 }]);
     assert.throws(() => egressReplay(prev, ops, 91), (e: unknown) => e instanceof EgressStateCorruptError && /cited number 91 is already live/.test(e.message));
 });
 
 test("diff: a spine row that gains a citation below the high water emits a +U with it (retired slot re-homing)", () => {
     const R = (msgid: string, num: number): EgressViewRow => ({ num, msgid, ref: "m" + msgid, tokens: 3, type: "text", bytes: "h_" + msgid });
-    const prev = [R("a", 0), R("b", 92)];
+    const prev = stamped([R("a", 0), R("b", 92)]);
     const next = [{ ...R("a", 5) }, { ...R("b", 92) }];
-    assert.deepEqual(diffEgressView(prev, next, true), [{ type: "U", msgid: "a", bytes: "h_a", num: 5 }]);
+    assert.deepEqual(diffEgressView(prev, next, true), [{ type: "U", rid: 1, msgid: "a", bytes: "h_a", num: 5 }]);
     const replayed = egressReplay(prev, diffEgressView(prev, next, true), 92);
     assert.equal(replayed[0].num, 5, "a retired slot is legal to re-cite");
 });
@@ -404,25 +424,25 @@ test("append: a U with num persists through state replay, compaction, and the de
         // seed: system + a cited row at 2 and a dense pair at 91/92 (the
         // shape the live repro produced: protection rows dense-allocated)
         egressStateAppend(H.db, S, [
-            { type: "I", msgid: EGRESS_SYSTEM_MSGID, after: null, ref: "", tokens: 1, typeTag: "system", bytes: "h_sys" },
-            { type: "I", msgid: "a", after: EGRESS_SYSTEM_MSGID, ref: "m00002", tokens: 2, typeTag: "text", bytes: "h_a", num: 2 },
-            { type: "I", msgid: "p1", after: "a", ref: "", tokens: 3, typeTag: "text", bytes: "h_p1" },
-            { type: "I", msgid: "p2", after: "p1", ref: "", tokens: 3, typeTag: "text", bytes: "h_p2" },
+            { type: "I", rid: 1, msgid: EGRESS_SYSTEM_MSGID, after: null, ref: "", tokens: 1, typeTag: "system", bytes: "h_sys" },
+            { type: "I", rid: 2, msgid: "a", after: 1, ref: "m00002", tokens: 2, typeTag: "text", bytes: "h_a", num: 2 },
+            { type: "I", rid: 3, msgid: "p1", after: 2, ref: "", tokens: 3, typeTag: "text", bytes: "h_p1" },
+            { type: "I", rid: 4, msgid: "p2", after: 3, ref: "", tokens: 3, typeTag: "text", bytes: "h_p2" },
         ], 1_000);
         const seeded = egressStateView(H.db, S);
         assert.deepEqual(seeded.map((r) => r.num), [0, 2, 3, 4], "dense allocation, before the repro shape");
         // bring it into the repro shape with an explicit num on the cites
         egressStateAppend(H.db, S, [
-            { type: "U", msgid: "p1", bytes: "h_p1", num: 91 },
-            { type: "U", msgid: "p2", bytes: "h_p2", num: 92 },
+            { type: "U", rid: 3, msgid: "p1", bytes: "h_p1", num: 91 },
+            { type: "U", rid: 4, msgid: "p2", bytes: "h_p2", num: 92 },
         ], 2_000);
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.num), [0, 2, 91, 92], "the U-with-num lands in the stored view");
         // the fix turn: both protection rows lose their citation; the fresh
         // reply cites 91 (the kernel counter never saw 91/92)
         egressStateAppend(H.db, S, [
-            { type: "U", msgid: "p1", bytes: "h_p1", num: 0 },
-            { type: "U", msgid: "p2", bytes: "h_p2", num: 0 },
-            { type: "I", msgid: "r", after: "p2", ref: "m00091", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 },
+            { type: "U", rid: 3, msgid: "p1", bytes: "h_p1", num: 0 },
+            { type: "U", rid: 4, msgid: "p2", bytes: "h_p2", num: 0 },
+            { type: "I", rid: 5, msgid: "r", after: 4, ref: "m00091", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 },
         ], 3_000);
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.num), [0, 2, 0, 0, 91], "demote + re-cite lands");
         // the state rows carry the immutable I-twin anchors: the demoted rows
@@ -453,7 +473,7 @@ test("append: a U with num persists through state replay, compaction, and the de
         // +U demotion (its kernel citation fact is 0), which frees the slot
         // earlier in the same batch.
         egressStateAppend(H.db, S, [
-            { type: "I", msgid: "x", after: "r", ref: "", tokens: 1, typeTag: "text", bytes: "h_x" },
+            { type: "I", rid: 6, msgid: "x", after: 5, ref: "", tokens: 1, typeTag: "text", bytes: "h_x" },
         ], 5_000);
         const view = egressStateView(H.db, S);
         assert.equal(view[view.length - 1].num, 92, "dense continues above the flow high water");
@@ -464,28 +484,29 @@ test("append: a U with num persists through state replay, compaction, and the de
     }
 });
 
-test("diff: move = D+I (no M op), msgid survives both ops", () => {
-    const prev = [V("a"), V("b")];
-    const next = [V("b"), V("a")];
+test("diff: move = D+I (no M op), msgid survives both ops — and the move CONSUMES a rid", () => {
+    const prev = stamped([V("a"), V("b")]);
+    const next = [prev[1], prev[0]];
     assert.deepEqual(diffEgressView(prev, next), [
-        { type: "D", start: "a", end: "a" },
-        { type: "I", msgid: "a", after: "b", ref: "ma", tokens: 3, typeTag: "text", bytes: "h_a" },
+        { type: "D", start: 1, end: 1 },
+        { type: "I", rid: 3, msgid: "a", after: 2, ref: "ma", tokens: 3, typeTag: "text", bytes: "h_a" },
     ]);
     const moved = egressReplay(prev, diffEgressView(prev, next));
     assert.deepEqual(norm(moved), norm(next));
+    assert.equal(moved.find((r) => r.msgid === "a")!.rid, 3, "2026-11-27: the D+I move lands on a FRESH rid; the retired one (1) stays spent — before/after stays distinguishable");
     assert.equal(moved.find((r) => r.msgid === "a")!.num, 1, "the D+I move takes the next number; the old one stays retired");
 });
 
 test("diff: empty views and empty diff (both directions)", () => {
     assert.deepEqual(diffEgressView([], []), []);
-    assert.deepEqual(diffEgressView([V("a"), V("b")], [V("a"), V("b")]), []);
+    assert.deepEqual(diffEgressView(stamped([V("a"), V("b")]), [V("a"), V("b")]), []);
     const fromEmpty = diffEgressView([], [V("a"), V("b")]);
     assert.deepEqual(fromEmpty, [
-        { type: "I", msgid: "a", after: null, ref: "ma", tokens: 3, typeTag: "text", bytes: "h_a" },
-        { type: "I", msgid: "b", after: "a", ref: "mb", tokens: 3, typeTag: "text", bytes: "h_b" },
+        { type: "I", rid: 1, msgid: "a", after: null, ref: "ma", tokens: 3, typeTag: "text", bytes: "h_a" },
+        { type: "I", rid: 2, msgid: "b", after: 1, ref: "mb", tokens: 3, typeTag: "text", bytes: "h_b" },
     ]);
-    const toEmpty = diffEgressView([V("a"), V("b")], []);
-    assert.deepEqual(toEmpty, [{ type: "D", start: "a", end: "b" }]);
+    const toEmpty = diffEgressView(stamped([V("a"), V("b")]), []);
+    assert.deepEqual(toEmpty, [{ type: "D", start: 1, end: 2 }]);
 });
 
 test("diff property: 300 random sparse mutations — replay(prev, diff) ≡ next, ops apply to the DB state too", () => {
@@ -517,7 +538,10 @@ test("diff property: 300 random sparse mutations — replay(prev, diff) ≡ next
             }
             const ops = diffEgressView(prev, next);
             assert.deepEqual(norm(egressReplay(prev, ops)), norm(next), `replay identity at iter ${iter}`);
-            view = next;
+            // carry the REPLAYED view forward (it carries the rids the next
+            // iteration's diff/replay must resolve; norm-identity above
+            // already proved it equals `next`)
+            view = egressReplay(prev, ops);
         }
         // the final view also round-trips through the DB: rebuild from ops
         const S = "prop-db";
@@ -542,10 +566,10 @@ test("fork: whole-table copy — the child inherits the parent number space and 
         const P = "parent";
         const C = "child";
         egressStateAppend(H.db, P, [
-            { type: "I", msgid: "a", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a" },
-            { type: "I", msgid: "b", after: "a", ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_b" },
-            { type: "I", msgid: "sum", after: "b", ref: "m00003", tokens: 5, typeTag: "summary", bytes: "h_sum" },
-            { type: "D", start: "a", end: "b" },
+            { type: "I", rid: 1, msgid: "a", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a" },
+            { type: "I", rid: 2, msgid: "b", after: 1, ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_b" },
+            { type: "I", rid: 3, msgid: "sum", after: 2, ref: "m00003", tokens: 5, typeTag: "summary", bytes: "h_sum" },
+            { type: "D", start: 1, end: 2 },
         ], 1_000);
         // no compaction step exists (7773): the state IS the live view and
         // the flow keeps everything — the fork copies both tables as-is
@@ -556,15 +580,17 @@ test("fork: whole-table copy — the child inherits the parent number space and 
         assert.deepEqual(egressStateView(H.db, C), parentView, "child view == parent view (incl. numbers)");
 
         // the child's NEXT number continues where the parent stopped (a=1,
-        // b=2, sum=3 — b's deletion retired 2, it is never re-issued)
+        // b=2, sum=3 — b's deletion retired 2, it is never re-issued) AND
+        // its next rid continues where the parent's flow stopped (1..3
+        // spent, 2 twice-over by the D)
         egressStateAppend(H.db, C, [
-            { type: "I", msgid: "c2", after: "sum", ref: "m00004", tokens: 1, typeTag: "text", bytes: "h_c2" },
+            { type: "I", rid: 4, msgid: "c2", after: 3, ref: "m00004", tokens: 1, typeTag: "text", bytes: "h_c2" },
         ], 3_000);
         const childView = egressStateView(H.db, C);
         assert.equal(childView.find((r) => r.msgid === "c2")!.num, 4, "child continues the parent high-water");
         // and the parent's own next number is UNTOUCHED by the fork
         egressStateAppend(H.db, P, [
-            { type: "I", msgid: "p2", after: "sum", ref: "m00005", tokens: 1, typeTag: "text", bytes: "h_p2" },
+            { type: "I", rid: 4, msgid: "p2", after: 3, ref: "m00005", tokens: 1, typeTag: "text", bytes: "h_p2" },
         ], 4_000);
         assert.equal(egressStateView(H.db, P).find((r) => r.msgid === "p2")!.num, 4, "parent numbering independent of the fork");
 
