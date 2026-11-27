@@ -60,7 +60,12 @@ import {
   isAbsorbCandidate,
   resolveAbsorbConfig,
 } from "./absorb.js";
-import { collectProtectedToolCallIds, matchToolPattern } from "./protected.js";
+import {
+  collectFailedCompressCallIds,
+  collectLatestProtected,
+  collectProtectedToolCallIds,
+  matchToolPattern,
+} from "./protected.js";
 import { defaultCountTokens, type TokenCountFn } from "./tokenize.js";
 import type {
   AbsorbConfig,
@@ -1795,12 +1800,26 @@ export function applyCrushToMessages(
   const absorb = resolveAbsorbConfig(config);
   const crush = resolveCrushConfig(config);
   const protectedCallIds = collectProtectedToolCallIds(messages, config);
+  // #7827: the prompt side (appendAbsorbPrompts) passes `latest` and the
+  // failed-compress set into isAbsorbCandidate; this node used to pass neither,
+  // so protectedLatestTools results (the newest result per tool path — durable
+  // state, skill catalogs) were silently crushed on the view path.
+  const latest = collectLatestProtected(messages, config);
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
   let crushedCount = 0;
   let distilledCount = 0;
   let changed = false;
   const out: CoreMessage[] = [];
   for (const msg of messages) {
-    if (!isAbsorbCandidate(msg, config, undefined, protectedCallIds)) {
+    if (
+      !isAbsorbCandidate(
+        msg,
+        config,
+        latest,
+        protectedCallIds,
+        failedCompressCallIds,
+      )
+    ) {
       out.push(msg);
       continue;
     }
