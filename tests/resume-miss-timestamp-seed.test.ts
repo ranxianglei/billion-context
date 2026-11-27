@@ -18,6 +18,8 @@ import { flushPrefixAffinity } from "../src/affinity-persist.ts";
 import { closeServers } from "./server-close-guard.ts";
 
 process.env.NODE_ENV = "test";
+// KDD #25 hermeticity: legacy flush/hydrate assertions — pin the plane OFF.
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 
 // #5608 CI triage (windows-latest node-22 shard): both e2e subtests below depend
 // on the phase-1 affinity snapshot surviving into the phase-2 server start

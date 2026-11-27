@@ -51,6 +51,12 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { snapL1Lookup, snapL1WindowRead, snapL1Record, type DbLike } from "../src/storage/snap.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
+// KDD #25: this suite exercises the LEGACY stage-0 machinery (l1 world,
+// conversations bindings) end to end — force the full table set so a host
+// config with rollout.features.egressPlane forced on (which this file does
+// not otherwise isolate) cannot make UnifiedStore.open skip the legacy
+// group under the egress-mode creation gate.
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5874-p3-"));
 const configPath = path.join(hermetic, "config.json");
 fs.writeFileSync(configPath, "{}");

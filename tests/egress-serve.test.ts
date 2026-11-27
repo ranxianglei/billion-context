@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { isRenderedSummaryMessage } from "acp-kernel";
 import { coreToOpenai, type BiliMessage } from "acp-kernel/wire";
 import { hardenOpenaiAssistantContent, systemToUser } from "../src/util.ts";
-import { egressAppendTurn, egressStateAt, egressStateView } from "../src/storage/egress-state.ts";
+import { egressAppendTurn, egressFlowWalkBack, egressStateAt, egressStateRead, egressStateView } from "../src/storage/egress-state.ts";
 import { recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
 import { rebuildCoreFromLog, rebuildOutboundFromLog } from "../src/storage/egress-serve.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
@@ -39,15 +39,15 @@ function open(): Harness {
     migrateSchema(db);
     const store = {
         egressAppendTurn: (sid: string, ops: Parameters<typeof egressAppendTurn>[2], baseSeq: number, nowMs: number) => egressAppendTurn(db, sid, ops, nowMs, { baseSeq }),
-        egressStateView: (sid: string) => egressStateView(db, sid),
+        egressStateView: (sid: string) => egressStateRead(db, sid),
  
         egressStateViewAt: (sid: string, seq: number) => egressStateAt(db, sid, seq),
         egressStateMaxSeq: (sid: string) => (db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
         egressStateTruncateAfter: (sid: string, seq: number) => {
-            const a = db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
             const b = db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
-            return Number(a.changes) + Number(b.changes);
+            return Number(b.changes);
         },
+        egressFlowWalkBack: (sid: string) => egressFlowWalkBack(db, sid),
     };
     return { db, store, dir };
 }
