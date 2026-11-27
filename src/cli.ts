@@ -383,7 +383,11 @@ export function parseArgs(argv: string[]): Parsed {
                 pinClear = true;
                 break;
             case "--force":
+                // Sets BOTH consumers — a second `case "--force"` here would
+                // be dead code (first match wins) and silently break
+                // `bili pack install --force` (#6805 review).
                 commandForce = true;
+                packForce = true;
                 break;
             case "--auto-restart-on-update":
                 overrides.ACP_AUTO_RESTART_ON_UPDATE = "1";
@@ -423,9 +427,6 @@ export function parseArgs(argv: string[]): Parsed {
                 break;
             case "--project":
                 packProject = true;
-                break;
-            case "--force":
-                packForce = true;
                 break;
             case "--json":
                 jsonOutput = true;
