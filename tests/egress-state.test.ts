@@ -376,6 +376,65 @@ test("diff: case U — content edit of an existing row is a +U, position and tri
     assert.equal(replayed[0].num, 0, "+U must not touch the canonical number");
 });
 
+// ---- collision pairs (same msgid, distinct rids — #7851) -----------------
+// The host minted two rows with the SAME msgid (a collision). Addressing is
+// by rid, so both stay live and distinct — but the DIFF must also be
+// occurrence-aware: deleting one of the pair must D the right occurrence,
+// not leave a ghost or write one row's bytes onto the other's rid.
+
+test("diff: collision pair — deleting the second row is a pure -D, no ghost (issue repro case 1)", () => {
+    // prev = [A(x,bytesA,rid1), B(x,bytesB,rid2)]; next = [A(x,bytesA)]
+    const prev = stamped([V("x", "h_xA"), V("x", "h_xB")]);
+    const next = [V("x", "h_xA")];
+    const ops = diffEgressView(prev, next);
+    // The survivor keeps its OWN rid (bytes match the first occurrence) — a
+    // pure -D of the deleted occurrence. The old first-wins spine marked both
+    // rows "spine" (spine.has(msgid) was true for both), so it emitted NO D
+    // and B stayed live (ghost).
+    assert.deepEqual(ops, [{ type: "D", start: 2, end: 2 }]);
+    const replayed = egressReplay(prev, ops);
+    assert.deepEqual(norm(replayed), norm(next));
+    assert.equal(replayed.length, 1, "the deleted occurrence is gone — no ghost row");
+    assert.equal(replayed[0].rid, 1, "the survivor keeps its own rid");
+    assert.equal(replayed[0].bytes, "h_xA");
+});
+
+test("diff: collision pair — deleting the first row keeps the second's bytes on its own rid (issue repro case 2)", () => {
+    // prev = [A(x,bytesA,rid1), B(x,bytesB,rid2)]; next = [B(x,bytesB)]
+    const prev = stamped([V("x", "h_xA"), V("x", "h_xB")]);
+    const next = [V("x", "h_xB")];
+    const ops = diffEgressView(prev, next);
+    // The survivor (B) keeps its OWN rid (bytes match the second occurrence)
+    // — a pure -D of A. The old first-wins code matched next to A (rid1) and
+    // emitted U{rid1, bytesB}, leaving BOTH rows with B's bytes (mismatch)
+    // with A still live (ghost).
+    assert.deepEqual(ops, [{ type: "D", start: 1, end: 1 }]);
+    const replayed = egressReplay(prev, ops);
+    assert.deepEqual(norm(replayed), norm(next));
+    assert.equal(replayed.length, 1, "the deleted occurrence is gone — no ghost row");
+    assert.equal(replayed[0].rid, 2, "the survivor keeps its own rid");
+    assert.equal(replayed[0].bytes, "h_xB");
+});
+
+test("diff: collision pair — editing the surviving row is a +U on its own rid", () => {
+    // prev = [A(x,bytesA,rid1), B(x,bytesB,rid2)]; next = [A(x,bytesA2)]
+    // A survives with CHANGED bytes — the U must land on A's rid (1), not
+    // silently target the first-wins row's bytes.
+    const prev = stamped([V("x", "h_xA"), V("x", "h_xB")]);
+    const next = [V("x", "h_xA2")];
+    const ops = diffEgressView(prev, next);
+    // D ops are emitted before U ops (the diff's fixed op order).
+    assert.deepEqual(ops, [
+        { type: "D", start: 2, end: 2 },
+        { type: "U", rid: 1, msgid: "x", bytes: "h_xA2" },
+    ]);
+    const replayed = egressReplay(prev, ops);
+    assert.deepEqual(norm(replayed), norm(next));
+    assert.equal(replayed.length, 1);
+    assert.equal(replayed[0].rid, 1, "the edited row keeps its own rid");
+    assert.equal(replayed[0].bytes, "h_xA2");
+});
+
 // ---- num lifecycle (cited-vs-dense divergence, 2026-11-26) --------------
 // A protection (BLOCKED) row that never carried a kernel citation is dense-
 // allocated at insert time; when the protection clears (or the row loses its

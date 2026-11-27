@@ -418,12 +418,20 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
 
 /** Deterministic diff between two consecutive views (owner design, 4 upper
  * cases: tail append / nudge appear+vanish / fold replace / content edit).
- * The diff keys on msgid + bytes; a spine row's effective num (0 = uncited)
- * is a third input that can flip it to a +U carrying `num` (see below).
+ * The diff keys on msgid OCCURRENCE + bytes; a spine row's effective num
+ * (0 = uncited) is a third input that can flip it to a +U carrying `num`
+ * (see below).
  *
- * Spine = a monotonically increasing subsequence of `next` whose msgids
- * appear in `prev` (greedy pointer scan, O(n+m); any monotone sub-spine
- * replays equivalently, the greedy one is what this implementation picks).
+ * Spine = a monotonically increasing subsequence of `next` matched to
+ * SPECIFIC prev occurrences (greedy pointer scan, O(n+m); any monotone
+ * sub-spine replays equivalently, the greedy one is what this implementation
+ * picks). Matching is OCCURRENCE-AWARE, not first-wins on msgid (#7851): a
+ * collision pair (two prev rows, same msgid, distinct rids) is addressed per
+ * occurrence — a next row prefers the occurrence whose bytes agree (the
+ * survivor keeps its own rid, a pure -D), else the first occurrence after
+ * the pointer (msgid-only, so a content edit still emits a U). No-collision
+ * views have one occurrence per msgid, so the match is identical to the old
+ * first-wins key there.
  * Spine rows with CHANGED BYTES (direct inequality — no hash) OR a changed
  * effective num (0 = uncited — a kernel protection row that lost or gained
  * its citation) emit +U (with `num` set on a num change, so the log follows
@@ -461,24 +469,51 @@ export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[], tra
             rid = r.rid;
         }
     }
-    const prevIdx = new Map<string, number>();
-    prev.forEach((r, i) => { if (!prevIdx.has(r.msgid)) prevIdx.set(r.msgid, i); });
-    const prevByMsg = new Map<string, EgressViewRow>();
-    prev.forEach((r) => { if (!prevByMsg.has(r.msgid)) prevByMsg.set(r.msgid, r); });
-    const spine = new Set<string>();
+    // OCCURRENCE-AWARE SPINE (2026-11-27, #7851): a msgid can appear MORE
+    // THAN ONCE in prev when the host minted a collision pair (same msgid,
+    // distinct rids). Keying the spine on msgid (first-wins) made the two
+    // rows indistinguishable — deleting one of the pair left the survivor
+    // "spine" for BOTH, so the D-run never fired (ghost row) and the U wrote
+    // to the first row's rid with the second's bytes (content mismatch).
+    // Match each next row to a SPECIFIC prev occurrence instead: prefer the
+    // occurrence whose bytes agree (the survivor keeps its own rid — a pure
+    // -D, no spurious U), else the first occurrence after the pointer
+    // (msgid-only, so a content edit still emits a U). No-collision views
+    // have at most one occurrence per msgid, so this is a no-op there.
+    const prevOcc = new Map<string, number[]>();
+    prev.forEach((r, i) => {
+        const occs = prevOcc.get(r.msgid);
+        if (occs) occs.push(i);
+        else prevOcc.set(r.msgid, [i]);
+    });
+    const spinePrev = new Map<number, number>();
     let p = -1;
-    for (const r of next) {
-        const i = prevIdx.get(r.msgid);
-        if (i !== undefined && i > p) {
-            spine.add(r.msgid);
-            p = i;
+    for (let j = 0; j < next.length; j++) {
+        const r = next[j];
+        const occs = prevOcc.get(r.msgid);
+        if (!occs) continue;
+        let match = -1;
+        for (const i of occs) {
+            if (i > p && prev[i].bytes === r.bytes) { match = i; break; }
+        }
+        if (match === -1) {
+            for (const i of occs) {
+                if (i > p) { match = i; break; }
+            }
+        }
+        if (match !== -1) {
+            spinePrev.set(j, match);
+            p = match;
         }
     }
+    const matchedPrev = new Set<number>();
+    for (const i of spinePrev.values()) matchedPrev.add(i);
     const ops: EgressOp[] = [];
     let runStart: EgressViewRow | null = null;
     let runEnd: EgressViewRow | null = null;
-    for (const r of prev) {
-        if (!spine.has(r.msgid)) {
+    for (let i = 0; i < prev.length; i++) {
+        const r = prev[i];
+        if (!matchedPrev.has(i)) {
             if (runStart === null) runStart = r;
             runEnd = r;
         } else if (runStart !== null) {
@@ -487,9 +522,11 @@ export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[], tra
         }
     }
     if (runStart !== null) ops.push({ type: "D", start: runStart.rid!, end: runEnd!.rid! });
-    for (const r of next) {
-        if (spine.has(r.msgid)) {
-            const old = prevByMsg.get(r.msgid)!;
+    for (let j = 0; j < next.length; j++) {
+        const r = next[j];
+        const pi = spinePrev.get(j);
+        if (pi !== undefined) {
+            const old = prev[pi];
             const oldNum = trackNums && typeof old.num === "number" && old.num > 0 ? old.num : 0;
             const newNum = trackNums && typeof r.num === "number" && r.num > 0 ? r.num : 0;
             if (old.bytes !== r.bytes || oldNum !== newNum) {
@@ -501,9 +538,11 @@ export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[], tra
         }
     }
     let last: number | null = null;
-    for (const r of next) {
-        if (spine.has(r.msgid)) {
-            last = prevByMsg.get(r.msgid)!.rid!;
+    for (let j = 0; j < next.length; j++) {
+        const r = next[j];
+        const pi = spinePrev.get(j);
+        if (pi !== undefined) {
+            last = prev[pi].rid!;
         } else {
             rid += 1;
             const ins: InsertOp = { type: "I", rid, msgid: r.msgid, after: last, ref: r.ref, tokens: r.tokens, typeTag: r.type, bytes: r.bytes };
