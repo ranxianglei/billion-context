@@ -74,15 +74,16 @@ function seedSessionWithBlock(dir: string, payload: string): string {
     return p;
 }
 
-/** Zero one 4096-byte page. Page 2 (the schema-overflow page for the real 12-table
- *  DDL) is the deterministic recipe: open() survives (the pragmas + migration only
- *  touch the header + page 1) but the first write that resolves the schema throws
- *  "database disk image is malformed" — verified against the real store, stable
- *  across runs and row counts. */
+/** Zero one 4096-byte page (1-indexed SQLite page number). The deterministic recipe
+ *  is to zero the sessions table's ROOT page (looked up from sqlite_master, so it is
+ *  stable across schema sizes): open() survives (async mode — the sync quick_check
+ *  never runs, and the migrations only touch the schema on page 1) but the first
+ *  write that traverses the sessions b-tree (resetAllIngestWatermarks) throws
+ *  "database disk image is malformed". */
 function zeroPage(p: string, page: number): void {
     const fd = openSync(p, "r+");
     try {
-        writeSync(fd, Buffer.alloc(4096, 0), 0, 4096, page * 4096);
+        writeSync(fd, Buffer.alloc(4096, 0), 0, 4096, (page - 1) * 4096);
     } finally {
         closeSync(fd);
     }
@@ -179,7 +180,7 @@ test("#7156 FIX 2: unifiedWebSummaries logs a warn when webSummaryRows throws (f
     }
 });
 
-test("#7156 FIX 4: a first-post-open-write corruption starts WITHOUT the index (not REFUSING TO START)", { skip: SKIP }, () => {
+test("#7156 FIX 4 (2026-11-21 per-session rework): open no longer writes — a pre-verdict corruption boots, then surfaces loudly at the first ingest write", { skip: SKIP }, () => {
     const dir = tmpDir();
     const prevUnified = process.env.BILI_STORAGE_UNIFIED;
     process.env.BILI_STORAGE_UNIFIED = "full";
@@ -195,20 +196,34 @@ test("#7156 FIX 4: a first-post-open-write corruption starts WITHOUT the index (
             ro.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES (?, 1, 1)").run("s" + i + "-" + "x".repeat(300));
         }
         ro.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        const rootPage = (ro.prepare("SELECT rootpage FROM sqlite_master WHERE name = 'sessions'").get() as { rootpage: number }).rootpage;
         ro.close();
-        // Corrupt page 2: open() survives (async mode — the sync quick_check never
-        // runs), but the first write (resetAllIngestWatermarks) throws CORRUPT.
-        zeroPage(p, 2);
+        // Corrupt the sessions root page (found dynamically, not a hardcoded
+        // page). open() performs NO write (2026-11-21 per-session rework — the
+        // open-time global watermark reset is gone), so the store BOOTS even
+        // with the verdict not yet landed; the corruption surfaces — loudly —
+        // at the process's first ingest write (the per-session watermark
+        // prime), which traverses the sessions b-tree and throws CORRUPT.
+        zeroPage(p, rootPage);
         setIntegritySyncThresholdForTests(1); // force async mode for any size
         const errors: string[] = [];
         setLogCapture((level, msg) => { if (level === "error") errors.push(String(msg)); });
         try {
-            const sh = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
-            assert.equal(sh, null, "a first-write corruption yields 'no sidecar' (start without index) — never a REFUSING-TO-START throw");
-            assert.equal(hadIntegrityQuickCheckFailure(), true, "the integrity latch tripped");
+            const legacy = {
+                id: "s-corrupt-" + "x".repeat(10),
+                createdAt: 1, lastSeen: 2, meta: {}, stats: {}, metadata: {},
+                state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 1, nextRunId: 1 },
+                blockContents: new Map(),
+                lastMessages: [{ role: "user", content: "hello" }],
+            };
+            const sh = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => legacy as never);
+            assert.ok(sh, "open performs NO write anymore — a pre-verdict corrupt store BOOTS (2026-11-21 per-session watermark fix)");
+            assert.equal(hadIntegrityQuickCheckFailure(), false, "no integrity latch before the first write");
+            sh.record({});
+            assert.equal(hadIntegrityQuickCheckFailure(), true, "the integrity latch tripped at the first ingest write");
             assert.ok(
-                errors.some((m) => m.includes("first post-open write")),
-                `the error names the first-write corruption; got ${JSON.stringify(errors)}`,
+                errors.some((m) => m.includes("ingest write")),
+                `the error names the first-ingest-write corruption; got ${JSON.stringify(errors)}`,
             );
         } finally {
             setLogCapture(null);
