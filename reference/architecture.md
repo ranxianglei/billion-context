@@ -163,6 +163,7 @@ billion-context/
 │   │   ├── egress-state.ts         #   Egress op-log outbound view: dual-table state+flow, replay, compaction, any-seq rollback (#7398)
 │   │   ├── egress-block.ts         #   Egress block op-log: dual-table block state+flow, replay, compaction, point-fork, kstate sidecar (#7577, rollout egressPlane)
 │   │   ├── egress-record.ts        #   Egress op-log RECORDING: build the outbound view rows, diff vs prev, append sparse ops, fold-triggered compaction (#7398, rollout egressPlane)
+│   │   ├── egress-usage.ts         #   Egress usage event stream: the cache-ledger mutations as an append-only M/S/F op log (append/fork/delete, restart replay rows, usage:stats materialization) (owner ruling 2026-11-27, rollout egressPlane)
 │   │   ├── egress-serve.ts         #   Egress op-log SERVE: rebuild the outbound elements from the self-contained op-log rows (byte-identity chain, ladder recovery, whole-turn degrade) + shadow byte comparison (#7398, rollout egressPlane)
 │   │   ├── ingest.ts             #   Legacy → unified row mapping + legacy view rebuild (#2671)
 │   │   ├── integrity-check.ts    #   Cached + background quick_check off the boot critical path (#4609)

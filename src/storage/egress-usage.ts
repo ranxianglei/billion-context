@@ -32,7 +32,7 @@ import type { SqliteDatabase } from "./driver.js";
 // state (block rows are the same object graph the live ledger saw), so
 // no re-materialization is needed — the stream is pure.
 
-export type EgressUsageRowType = "M" | "S" | "F";
+type EgressUsageRowType = "M" | "S" | "F";
 
 export interface EgressUsageEvent {
   type: EgressUsageRowType;

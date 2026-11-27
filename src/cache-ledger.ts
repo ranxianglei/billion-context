@@ -1328,7 +1328,6 @@ export function cacheLedgerIsEmpty(session: Session): boolean {
 // adjustment need the raw per-request bodies / live context and are not
 // reconstructed — every other line/fold/agg field is byte-identical.
 type UsageSample = { at: number; input: number; cached: number | null; output?: number; protocol?: string; upstream?: string; keyFp?: string; sysFp?: string; canonFp?: string; mode?: "plugin" | "proxy"; effFp?: string };
-export type UsageSampleInput = UsageSample;
 type UsageForkRow = { at: number; S: number; sigma: number; X?: number; V?: number; Vp?: number; bid: string };
 export type EgressUsageEvent =
     | { type: "M"; at: number }
