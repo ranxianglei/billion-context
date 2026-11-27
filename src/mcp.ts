@@ -350,7 +350,7 @@ async function handleMessage(msg: {
     id?: JsonRpcId;
     method?: string;
     params?: {
-        _meta?: { ui?: { sessionId?: string }; threadId?: unknown; "claudecode/toolUseId"?: unknown };
+        _meta?: { ui?: { sessionId?: unknown }; threadId?: unknown; "claudecode/toolUseId"?: unknown };
         [k: string]: unknown;
     };
 }): Promise<void> {
@@ -365,7 +365,8 @@ async function handleMessage(msg: {
             // same time — registering here is still the earliest we can be.
             // Identity-mode registrations bind on any later request, so the
             // race only matters for headless mode.
-            const fromMeta = params._meta?.ui?.sessionId?.trim();
+            const metaSessionId = params._meta?.ui?.sessionId;
+            const fromMeta = typeof metaSessionId === "string" ? metaSessionId.trim() : undefined;
             if (fromMeta) conversationId ??= fromMeta;
             initialized = true;
             if (conversationId && !registeredConversations.has(conversationId)) {

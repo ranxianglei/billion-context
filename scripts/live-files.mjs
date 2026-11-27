@@ -172,6 +172,9 @@ export const LIVE_FILES = [
     // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
     // for the tripwire, like #5046/#4612.
     "tests/storage-backup-repair.test.ts",
+    // MCP stdio children talk only to each case's listen(0) HTTP fixture;
+    // teardown reaps each child and closes its listener. No shared port or state.
+    "tests/mcp-initialize-metadata.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
