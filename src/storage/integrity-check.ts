@@ -33,7 +33,10 @@
  *
  * BILI_STORAGE_QUICK_CHECK=0 keeps its meaning: no check, no cache IO.
  */
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { Socket } from "node:net";
+import type { Readable } from "node:stream";
 import { Worker } from "node:worker_threads";
 import { log as loggerLog } from "../logger.js";
 import { isBunRuntime } from "./driver.js";
@@ -156,8 +159,15 @@ export function integrityModeFor(dbPath: string, env: { BILI_STORAGE_QUICK_CHECK
 
 // --- background check ------------------------------------------------------
 
-const WORKER_SOURCE = `
-const { parentPort, workerData } = require("node:worker_threads");
+// The scan runs on a second read-only connection in a separate context. On
+// Node that context is a child process, not a worker thread (#6987): the scan
+// is one synchronous sqlite3_step that nothing can interrupt (node:sqlite
+// exposes no sqlite3_interrupt), and process.exit() joins every worker thread
+// first — so a SIGTERM during a ~45 min scan of a 10 GB store left the relay
+// blocked in exit until the supervisor's SIGKILL. A child process is killed on
+// exit instead. Bun keeps the worker thread: a compiled host's execPath is the
+// host binary, not a runtime that can run the scan source.
+const CHECK_CORE = `
 // Specifier through a constant: this string is bundled VERBATIM into dist,
 // where scripts/check-dist-external.mjs text-scans for quoted-require forms
 // (node:sqlite is NOT in module.builtinModules, so it is not skipped as a
@@ -175,13 +185,14 @@ const isBunRuntime = typeof process !== "undefined" && process.versions != null 
 const openReadOnly = isBunRuntime
     ? (p) => new (require(BUN_SQLITE_SPEC).Database)(p, { readonly: true })
     : (p) => new (require(SQLITE_SPEC).DatabaseSync)(p, { readOnly: true });
+function runCheck(path, sql) {
 let db;
 try {
-    db = openReadOnly(workerData.path);
-    const rows = db.prepare("PRAGMA quick_check").all();
+    db = openReadOnly(path);
+    const rows = db.prepare(sql).all();
     db.close();
     const verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
-    parentPort.postMessage({ ok: true, verdict });
+    return { ok: true, verdict };
 } catch (err) {
     // #5108/#4816: a corruption-shaped THROW out of quick_check (truncated file,
     // garbage header, broken overflow chain) is a FAIL VERDICT, not "could not
@@ -191,16 +202,35 @@ try {
     const m = String((err && err.message) || err);
     const c = String((err && err.code) || "").toUpperCase();
     const corrupt = c === "SQLITE_CORRUPT" || c === "SQLITE_NOTADB" || m.includes("database disk image is malformed") || m.includes("file is not a database");
-    parentPort.postMessage(corrupt ? { ok: false, corrupt: true, error: m } : { ok: false, error: m });
     // #6785 CI: the read-only handle must be released on the error path too —
     // a throwing quick_check left it open until the worker thread tore down, and
     // a concurrent rmSync of the test's temp dir raced that teardown (EPERM on
-    // windows-latest). The verdict is already posted above, so close is best-effort.
+    // windows-latest). The verdict is already determined above, so close is best-effort.
     if (db) {
-        try { db.close(); } catch { /* verdict already posted; close is best-effort */ }
+        try { db.close(); } catch { /* verdict already determined; close is best-effort */ }
     }
+    return corrupt ? { ok: false, corrupt: true, error: m } : { ok: false, error: m };
+}
 }
 `;
+
+const WORKER_SOURCE = `${CHECK_CORE}
+const { parentPort, workerData } = require("node:worker_threads");
+parentPort.postMessage(runCheck(workerData.path, workerData.sql));
+`;
+
+const CHILD_SOURCE = `${CHECK_CORE}
+process.stdout.write(JSON.stringify(runCheck(process.argv[1], process.argv[2])) + "\\n");
+`;
+
+const DEFAULT_CHECK_SQL = "PRAGMA quick_check";
+let checkSqlOverride: string | null = null;
+
+/** Test seam: replace the scan statement (rows must expose a quick_check
+ * column) — lets a test hold the scan inside one long sqlite3_step. */
+export function setIntegrityCheckSqlForTests(sql: string | null): void {
+    checkSqlOverride = sql;
+}
 
 // --- worker stderr hygiene (#5940) ------------------------------------------
 
@@ -241,8 +271,7 @@ export function createIntegrityWorkerStderrFilter(): (line: string) => boolean {
  * file; standalone bili keeps its usual file+stderr surface. Call right
  * after construction — the stream flows immediately and can deliver data
  * even after the verdict message arrives. */
-function attachWorkerStderr(worker: Worker, dbPath: string): void {
-    const stream = worker.stderr;
+function attachWorkerStderr(stream: Readable | null | undefined, dbPath: string): void {
     if (!stream) return; // runtime without a capturable worker stderr: nothing to route
     const keep = createIntegrityWorkerStderrFilter();
     let pending = "";
@@ -282,36 +311,20 @@ export function scheduleBackgroundIntegrityCheck(
     loggerLog("info", `[storage] background quick_check started for ${dbPath} (${(size / (1024 * 1024)).toFixed(1)} MiB over the ${Math.round(effectiveSyncThreshold() / (1024 * 1024))} MiB sync threshold) — serving continues; the verdict lands in /__bili/status (#4609)`);
     inflight.add(dbPath);
     noteCheckRun();
-    let worker: Worker;
-    try {
-        // stderr: true — capture the worker's own stderr instead of inheriting
-        // the host terminal (#5940): Node emits "ExperimentalWarning: SQLite is
-        // an experimental feature" once per thread on first node:sqlite use,
-        // and with default stdio that printed straight into the agent's TUI
-        // mid-session. attachWorkerStderr drops only that known notice block;
-        // every other line still reaches loggerLog diagnostics. Node-only:
-        // bun workers expose no capturable stderr (and bun:sqlite emits no
-        // such notice), so nothing is routed there.
-        worker = new Worker(WORKER_SOURCE, {
-            eval: true,
-            workerData: { path: dbPath },
-            ...(isBunRuntime() ? {} : { stderr: true }),
-        });
-        attachWorkerStderr(worker, dbPath);
-    } catch (err) {
-        inflight.delete(dbPath);
-        loggerLog("warn", `[storage] background quick_check could not start for ${dbPath}: ${String(err)} — the store serves unverified; the next boot rechecks`);
-        return;
-    }
+    const sql = checkSqlOverride ?? DEFAULT_CHECK_SQL;
+    let handle: CheckHandle | undefined;
+    let settled = false;
     const finish = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
         inflight.delete(dbPath);
         try {
             fn();
         } finally {
-            worker.unref();
+            handle?.unref();
         }
     };
-    worker.on("message", (msg: { ok?: boolean; corrupt?: boolean; verdict?: string; error?: string }) => {
+    const onMessage = (msg: CheckMessage): void => {
         finish(() => {
             if (msg.ok === true) {
                 const verdict = String(msg.verdict ?? "");
@@ -355,15 +368,99 @@ export function scheduleBackgroundIntegrityCheck(
                 loggerLog("warn", `[storage] background quick_check could not run for ${dbPath}: ${String(msg.error)} — the store serves unverified; the next boot rechecks`);
             }
         });
+    };
+    const onFailure = (what: string): void => {
+        finish(() => loggerLog("warn", `[storage] background quick_check ${what} for ${dbPath} — the store serves unverified; the next boot rechecks`));
+    };
+    try {
+        handle = isBunRuntime() ? startWorkerCheck(dbPath, sql, onMessage, onFailure) : startChildCheck(dbPath, sql, onMessage, onFailure);
+    } catch (err) {
+        settled = true;
+        inflight.delete(dbPath);
+        loggerLog("warn", `[storage] background quick_check could not start for ${dbPath}: ${String(err)} — the store serves unverified; the next boot rechecks`);
+    }
+}
+
+type CheckMessage = { ok?: boolean; corrupt?: boolean; verdict?: string; error?: string };
+
+interface CheckHandle {
+    unref(): void;
+}
+
+/** Bun: worker thread. Bun workers expose no capturable stderr (and
+ * bun:sqlite emits no experimental notice), so nothing is routed there. */
+function startWorkerCheck(dbPath: string, sql: string, onMessage: (msg: CheckMessage) => void, onFailure: (what: string) => void): CheckHandle {
+    const worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { path: dbPath, sql } });
+    worker.on("message", onMessage);
+    worker.on("error", (err) => onFailure(`worker error (${String(err)})`));
+    worker.on("exit", (code) => onFailure(`worker exited early (code ${code})`));
+    return worker;
+}
+
+/** Node: child process, killed when this process exits (#6987). Its stderr is
+ * captured instead of inheriting the host terminal (#5940): Node emits
+ * "ExperimentalWarning: SQLite is an experimental feature" on first
+ * node:sqlite use, and with inherited stdio that printed straight into the
+ * agent's TUI mid-session. attachWorkerStderr drops only that known notice
+ * block; every other line still reaches loggerLog diagnostics. */
+function startChildCheck(dbPath: string, sql: string, onMessage: (msg: CheckMessage) => void, onFailure: (what: string) => void): CheckHandle {
+    const sqliteFlags = process.execArgv.filter((arg) => arg.startsWith("--experimental-sqlite"));
+    const child = spawn(process.execPath, [...sqliteFlags, "-e", CHILD_SOURCE, dbPath, sql], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    checkProcesses.set(dbPath, child);
+    killCheckProcessesOnExit();
+    attachWorkerStderr(child.stderr, dbPath);
+    let out = "";
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+        out += chunk;
     });
-    worker.on("error", (err) => {
-        finish(() => loggerLog("warn", `[storage] background quick_check worker error for ${dbPath}: ${String(err)} — the store serves unverified; the next boot rechecks`));
-    });
-    worker.on("exit", (code) => {
-        if (inflight.has(dbPath)) {
-            finish(() => loggerLog("warn", `[storage] background quick_check worker exited early (code ${code}) for ${dbPath} — the store serves unverified; the next boot rechecks`));
+    child.on("error", (err) => onFailure(`process error (${String(err)})`));
+    child.on("close", (code, signal) => {
+        if (checkProcesses.get(dbPath) === child) checkProcesses.delete(dbPath);
+        const msg = parseCheckMessage(out);
+        if (msg) {
+            onMessage(msg);
+        } else {
+            onFailure(`process exited early (code ${code}, signal ${signal})`);
         }
     });
+    return {
+        unref: () => {
+            child.unref();
+            for (const stream of [child.stdout, child.stderr]) {
+                if (stream instanceof Socket) stream.unref();
+            }
+        },
+    };
+}
+
+function parseCheckMessage(out: string): CheckMessage | undefined {
+    const line = out.trim().split("\n").pop() ?? "";
+    if (line === "") return undefined;
+    try {
+        return JSON.parse(line) as CheckMessage;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Running check processes by store path. */
+const checkProcesses = new Map<string, ChildProcess>();
+let exitHookInstalled = false;
+
+function killCheckProcessesOnExit(): void {
+    if (exitHookInstalled) return;
+    exitHookInstalled = true;
+    process.on("exit", () => {
+        for (const child of checkProcesses.values()) {
+            child.kill("SIGKILL");
+        }
+    });
+}
+
+/** Test seam: pid of the running check process for dbPath (Node only). */
+export function integrityCheckPidForTests(dbPath: string): number | undefined {
+    return checkProcesses.get(dbPath)?.pid;
 }
 
 /** Test seam: true when a background check for dbPath is still running. */

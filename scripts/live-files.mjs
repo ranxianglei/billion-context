@@ -165,6 +165,13 @@ export const LIVE_FILES = [
     // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
     // for the tripwire, like #5046/#4612.
     "tests/storage-backup-repair.test.ts",
+    // #6987: spawnSyncs one bare node child (--import tsx) that arms the real
+    // background quick_check (child-process scan) on a per-run mkdtemp fixture
+    // DB and process.exit()s mid-scan; the spawn is synchronous (blocks the
+    // shard runner while it runs), the child binds no port and does no network
+    // I/O, so no zone band is needed — the entry is for the tripwire alone,
+    // like #3890/#5114/#5940
+    "tests/issue6987-quickcheck-shutdown.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
