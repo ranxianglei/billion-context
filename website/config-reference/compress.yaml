@@ -415,6 +415,17 @@ entries:
     desc_ja: "圧縮ブロック管理用のブロックライフサイクルツール（acp_retire / acp_restore / acp_rewrite）のオプトイン；デフォルト無効により、#5765 以前のワイヤーとバイト単位で同一を維持する。"
     site_en: "<code>blockOps</code> — opt-in compressed-block lifecycle tools (acp_retire / acp_restore / acp_rewrite); off by default so the wire surface stays byte-identical to pre-#5765 (<span class='mech'>enabled</span>)."
     site_zh: "<code>blockOps</code> —— 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，线上表面与 #5765 之前逐字节一致（<span class='mech'>enabled</span>）。"
+  - key: compress.anchorSidecar
+    type: object
+    default: "off"
+    group: compress
+    id: co.anchorSidecar
+    render: obj-item
+    desc_en: "Opt-in deterministic anchor sidecar: mechanically appends a bounded verbatim index of file paths, error signatures, and durable IDs to folded summaries and carries them forward across T2/T3 distillation."
+    desc_zh: "可选的确定性锚点 Sidecar：折叠时机械提取并附带受控字面索引（文件路径、错误签名、持久 ID），并在 T2/T3 蒸馏与重折时自动沿袭。"
+    desc_ja: "オプトインの決定論的アンカーサイドカー：折りたたみ要約にファイルパス・エラー署名・永続 ID の有界な字面インデックスを機械的に付加し、T2/T3 蒸留でも引き継ぐ。"
+    site_en: "<code>anchorSidecar</code> — opt-in deterministic anchor sidecar: mechanically appends bounded file paths, error signatures, and durable IDs to folded summaries and preserves them across T2/T3 distillation (<span class='mech'>enabled, maxAnchors (16), maxSectionChars (1200)</span>)."
+    site_zh: "<code>anchorSidecar</code> —— 可选的确定性锚点 Sidecar：机械附带受控的文件路径、错误签名与持久 ID 索引，并在 T2/T3 蒸馏时沿袭（<span class='mech'>enabled, maxAnchors(16), maxSectionChars(1200)</span>）。"
   - key: compress.ccr
     type: object
     default: "enabled in proxy mode since v2"
@@ -577,6 +588,27 @@ entries:
     desc_en: "Enable the three block-lifecycle tools (injection + prompt + manifest). Off = no tools, no prompt section, zero per-request cost."
     desc_zh: "启用三个压缩块生命周期工具（注入 + prompt + manifest）。关闭 = 无工具、无 prompt 段、零每请求开销。"
     desc_ja: "3 つのブロックライフサイクルツール（インジェクション + プロンプト + マニフェスト）を有効にする。Off = ツールなし、プロンプトセクションなし、リクエストごとのコストゼロ。"
+  - key: compress.anchorSidecar.enabled
+    type: boolean
+    default: "false"
+    group: compress
+    desc_en: "Enable deterministic anchor sidecar extraction on folded blocks. Off = byte-identical summaries."
+    desc_zh: "开启折叠块的确定性锚点 Sidecar 提取。关闭 = 摘要逐字节不变。"
+    desc_ja: "折りたたみブロックへの決定論的アンカーサイドカー抽出を有効にする。Off = バイト単位で同一の要約。"
+  - key: compress.anchorSidecar.maxAnchors
+    type: number
+    default: "16"
+    group: compress
+    desc_en: "Maximum number of deterministic anchors emitted per folded block (integer >= 1)."
+    desc_zh: "单个折叠块最多附带的确定性锚点数（>= 1 的整数）。"
+    desc_ja: "1 ブロックあたり出力する決定論的アンカーの最大数（1 以上の整数）。"
+  - key: compress.anchorSidecar.maxSectionChars
+    type: number
+    default: "1200"
+    group: compress
+    desc_en: "Hard character cap for the appended ANCHORS section per folded block (integer >= 120)."
+    desc_zh: "单个折叠块附带 ANCHORS 段的字符硬上限（>= 120 的整数）。"
+    desc_ja: "1 ブロックあたり付加する ANCHORS セクションの最大文字数（120 以上の整数）。"
   - key: compress.ccr.enabled
     type: boolean
     default: "true (proxy mode)"

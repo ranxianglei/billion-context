@@ -319,6 +319,7 @@
 | `compress.absorb` | object | opt-in (disabled) | — | ツール結果を短い要約に即時蒸留するオプトイン機能；元データはコンテンツストアに保存される。デフォルトでは画像を含む結果のみが対象となる。 |
 | `compress.degenerateRetry` | object | 1 attempt (built-in nudge) | — | クライアントに見える出力がゼロで終わるターンのリトライ予算と nudge 文の設定。継続 nudge はリトライ本文にのみ付加され、永続化も次のリクエストでの再生もされない。 |
 | `compress.blockOps` | object | off | — | 圧縮ブロック管理用のブロックライフサイクルツール（acp_retire / acp_restore / acp_rewrite）のオプトイン；デフォルト無効により、#5765 以前のワイヤーとバイト単位で同一を維持する。 |
+| `compress.anchorSidecar` | object | off | — | オプトインの決定論的アンカーサイドカー：折りたたみ要約にファイルパス・エラー署名・永続 ID の有界な字面インデックスを機械的に付加し、T2/T3 蒸留でも引き継ぐ。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | コンテンツキャッシュと取得：大きな出力はセッションの隣接にロスカレスで保存され、先頭抜粋とポインタに置き換えられ、acp_retrieve 経由で取得される；上限や退避は行われない。 |
 | `compress.search` | object | off | — | search_context の検索動作設定；現在、planAware リランキングを保持している。 |
 | `compress.search.planAware` | boolean | false | — | オンにすると、search_context の候補が現在のプラン状態に対してリランキングされる；オフにすると、バイト単位で同一の語彙結果が維持される。 |
@@ -337,6 +338,9 @@
 | `compress.degenerateRetry.maxAttempts` | integer | 1 | — | 退化ターンのリトライ予算（#7666）：クライアントに見える出力が何もないターン終了時に、agent の元のリクエストに末尾ユーザー nudge を追加して再発行する。0 = 無効（そのターンは素通し）、1 = 1 回（#7666 以前の動作）、最大 5；i 回目の試行で nudges[i] を送信（リストが短ければ循環）。ゼロバイト切断の再発行（#2171）とは予算が独立——1 ターンでそれぞれ 1 回まで。 |
 | `compress.degenerateRetry.nudges` | string[] | 3 built-in | — | 退化ターンリトライ用のカスタム nudge 文（#7666）；i 回目のリトライで i 番目の文を送信（短ければ循環）。未設定 = 組み込みローテーション（先頭はデフォルトの継続 nudge）。 |
 | `compress.blockOps.enabled` | boolean | false | — | 3 つのブロックライフサイクルツール（インジェクション + プロンプト + マニフェスト）を有効にする。Off = ツールなし、プロンプトセクションなし、リクエストごとのコストゼロ。 |
+| `compress.anchorSidecar.enabled` | boolean | false | — | 折りたたみブロックへの決定論的アンカーサイドカー抽出を有効にする。Off = バイト単位で同一の要約。 |
+| `compress.anchorSidecar.maxAnchors` | number | 16 | — | 1 ブロックあたり出力する決定論的アンカーの最大数（1 以上の整数）。 |
+| `compress.anchorSidecar.maxSectionChars` | number | 1200 | — | 1 ブロックあたり付加する ANCHORS セクションの最大文字数（120 以上の整数）。 |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | コンテンツキャッシュおよび取得ブロックを有効にする。 |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | CCR ストレージの対象となるツール結果の最小推定トークンサイズ。 |
 | `compress.ccr.excludeTools` | string[] | [] | — | CCR ストレージから除外されるツール名。 |

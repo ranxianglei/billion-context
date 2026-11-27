@@ -58,6 +58,7 @@ export function mergeCompress(
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
     const blockOpsLevels = [global?.blockOps, provider?.blockOps, model?.blockOps].filter(Boolean) as NonNullable<CompressSettings["blockOps"]>[];
+    const anchorSidecarLevels = [global?.anchorSidecar, provider?.anchorSidecar, model?.anchorSidecar].filter(Boolean) as NonNullable<CompressSettings["anchorSidecar"]>[];
     const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
     const searchLevels = [global?.search, provider?.search, model?.search].filter(Boolean) as NonNullable<CompressSettings["search"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
@@ -100,6 +101,7 @@ export function mergeCompress(
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
         blockOps: blockOpsLevels.length > 0 ? Object.assign({}, ...blockOpsLevels) : undefined,
+        anchorSidecar: anchorSidecarLevels.length > 0 ? Object.assign({}, ...anchorSidecarLevels) : undefined,
         ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
         search: searchLevels.length > 0 ? Object.assign({}, ...searchLevels) : undefined,
         rules: pick("rules"),
@@ -450,6 +452,15 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         // #5765: one-switch opt-in — absent `s.blockOps` leaves base untouched
         // (off); a present block normalizes enabled (absent/false = off).
         ...(s.blockOps !== undefined ? { blockOps: { enabled: s.blockOps.enabled === true } } : {}),
+        ...(s.anchorSidecar !== undefined
+            ? {
+                  anchorSidecar: {
+                      enabled: s.anchorSidecar.enabled === true,
+                      ...(s.anchorSidecar.maxAnchors !== undefined ? { maxAnchors: s.anchorSidecar.maxAnchors } : {}),
+                      ...(s.anchorSidecar.maxSectionChars !== undefined ? { maxSectionChars: s.anchorSidecar.maxSectionChars } : {}),
+                  },
+              }
+            : {}),
         ...(ccr !== undefined ? { ccr } : {}),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
