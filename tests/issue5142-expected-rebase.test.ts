@@ -469,7 +469,7 @@ describe("#5142 carrier classifier units", () => {
     test("dshCarrierRawMarkers stay in lockstep with the dsh lane classifiers", () => {
         const cls = oneShotCarrierPaths.dsh;
         assert.ok(cls !== undefined, "dsh lane must have a classifier registry entry");
-        assert.ok(dshCarrierRawMarkers.length >= 18, "eighteen raw markers for the twelve known dsh carrier families");
+        assert.ok(dshCarrierRawMarkers.length >= 19, "nineteen raw markers for the thirteen known dsh carrier families (workspace-instructions contributes four; runtime-context, mnemon, image-offload each contribute two; #7264 skill-load one)");
         // Markers that only occur mid-template need their fixed left context to
         // be a standalone classifiable shape (the relay wrapper's sender-id slot
         // varies, so the joint alone cannot classify).

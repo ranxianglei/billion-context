@@ -115,6 +115,32 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
+/** dsh skill-load identity (#7264): the skill BODY injected when the user
+ *  invokes a skill (e.g. /prompt-refiner) — a user-role text message carrying
+ *  the \x3cskill_content name="…"\x3e block with the skill's full programmatic
+ *  steps (source: dsh asar, dsh-tool-skill; reporter evidence 2026-11-19: 73
+ *  occurrences across 51 dumps, ALL in text blocks, 0 in tool_result). The
+ *  skill CATALOG (#2419, durable/skill-catalog) is protected, but the BODY was
+ *  not — one fold of a 7K-char skill body collapses it to a 1–1.3K summary,
+ *  dropping the programmatic input-classification rules and example strategies
+ *  the model needs to follow the skill. The host loads the body once per
+ *  invocation and does NOT resend it (unlike the catalog's fingerprint gate),
+ *  so one fold kills the skill's steps forever — the #2419 failure mode on the
+ *  body channel. Classified as durable/skill-load so the default
+ *  latest-per-identity policy pins the most recently loaded skill body while
+ *  superseded loads (previous invocations) fold normally — the model follows
+ *  the latest skill, and the always-pinned catalog still lists every skill for
+ *  re-invocation. The match is on the distinctive tag-prefix
+ *  \x3cskill_content name= (the name attribute value varies, so the full tag
+ *  cannot be a fixed string); a literal user echo is benign (a matching message
+ *  simply stays visible). #2766: assistant-role messages are never carriers
+ *  (see dshSkillCatalogPath). */
+export function dshSkillLoadPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cskill_content name=")
+        ? "durable/skill-load"
+        : undefined;
+}
+
 /** dsh workspace-instructions REVISION identity: the reconciliation shapes of
  *  the #2447 carrier — @deepseek-ai/dsh-agent-instructions' changedSectionText
  *  emits one message per changed file, framed by the same
@@ -253,7 +279,7 @@ const TIME_CONTEXT_MARKER = "Time sampled while preparing turn";
 
 /** dsh per-turn time-context carrier (#5142, superseding #5109's naming):
  *  the timestamp notice injected before each turn (marker above).
- *  Deliberately FOLDABLE by design — unlike the four durable carriers it
+ *  Deliberately FOLDABLE by design — unlike the five durable carriers it
  *  carries no state beyond its own turn and must NEVER be pinned, so its
  *  path lives in the oneshot/ namespace where no protection pattern matches
  *  it (kernel-foldable) while still riding dshDurableToolPath. Its problem is
@@ -452,8 +478,8 @@ function startsWithAsciiCI(hay: string, needle: string): boolean {
     return true;
 }
 
-/** dsh lane classifier: any of the twelve evidence-backed identities → its
- *  canonical path (four durable carriers + eight foldable one-shot injections).
+/** dsh lane classifier: any of the thirteen evidence-backed identities → its
+ *  canonical path (five durable carriers + eight foldable one-shot injections).
  *  Every classified message loses Rule-3 last-user anchor eligibility (#5109/
  *  #5173); only `durable/*` paths are actually pinned by the default policy —
  *  the oneshot/ families ride here purely so an injection can never displace
@@ -461,6 +487,7 @@ function startsWithAsciiCI(hay: string, needle: string): boolean {
 function dshDurableToolPath(msg: CoreMessage): string | undefined {
     return (
         dshSkillCatalogPath(msg) ??
+        dshSkillLoadPath(msg) ??
         dshWorkspaceInstructionsPath(msg) ??
         dshRuntimeContextPath(msg) ??
         dshMcpCatalogPath(msg) ??
@@ -520,6 +547,7 @@ export function withDurableProtection(config: Config, classifier: DurableMessage
 export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
     dsh: (msg) =>
         dshSkillCatalogPath(msg) ??
+        dshSkillLoadPath(msg) ??
         dshWorkspaceInstructionsPath(msg) ??
         dshRuntimeContextPath(msg) ??
         dshMcpCatalogPath(msg) ??
@@ -534,18 +562,19 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
- *  exact marker strings of the twelve dsh classifiers above (eighteen markers:
+ *  exact marker strings of the thirteen dsh classifiers above (nineteen markers:
  *  the workspace-instructions family contributes four, the runtime-context
  *  family two — the pre-0.2.2-rc.3 "Current runtime context" literal and the
  *  0.2.2-rc.3 lead-in without its trailing colon, which both the
  *  first-snapshot and re-send intros share, #7085 — the mnemon family
- *  contributes two, the agent-relay family two, the image-offload family
- *  two), so a unified-store row can be screened with cheap substring checks
- *  BEFORE JSON.parse (rows may carry megabytes of base64 media). Lockstep
- *  with the classifiers is enforced in
+ *  contributes two, the image-offload family two, #7264's skill-load
+ *  contributes one), so a unified-store row can be screened with cheap
+ *  substring checks BEFORE JSON.parse (rows may carry megabytes of base64
+ *  media). Lockstep with the classifiers is enforced in
  *  tests/issue5142-expected-rebase.test.ts. */
 export const dshCarrierRawMarkers: readonly string[] = [
     "\x3cavailable_skills\x3e",
+    "\x3cskill_content name=",
     "Instructions from:",
     "Updated instructions from:",
     "Additional instructions from:",
