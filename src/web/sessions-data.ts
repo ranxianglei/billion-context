@@ -1578,7 +1578,15 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         ...(clientHint ? { clientHint } : {}),
         ...(engineLane ? { engineLane } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
-        ...(typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {}),
+        // Egress-on sessions have no file/DB copy at all — the per-turn unified
+        // ingest is frozen (KDD #23) and the identity row's metadata whitelist
+        // (KDD #25) drops the storageMode stamp, so the stamp is structurally
+        // absent. Surface the REAL carrier instead of letting the client's
+        // "legacy" fallback lie (#155 honest-output class).
+        ...(() => {
+            if (session.metadata["egressAuthority"] === true) return { storageMode: "egress" as const };
+            return typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {};
+        })(),
         // #3756 follow-up: snapshot-render shadow observability (compute the
         // view, never emit it) — surfaced so the panel can prove the render
         // engine healthy across the fleet before the rollout flip.
