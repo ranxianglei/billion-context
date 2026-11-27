@@ -149,6 +149,10 @@ export const LIVE_FILES = [
     // #7858: spawns `node --import tsx src/index.ts -c <name> sessions ls`
     // in an mkdtemp XDG sandbox (hermetic dirs, no network/ports/creds).
     "tests/cli-config-flag-store.test.ts",
+    // #7806: spawns short-lived fake `git`/`npm` PATH-shim children against
+    // mkdtemp dirs (shimmed global root, fixture source tree); no network,
+    // no ports, no credentials, safe under --test-concurrency.
+    "tests/install-ref.test.ts",
     // Heap-bounded log readers in isolated children; private files, no sockets.
     "tests/web-logs-query.test.ts",
     // Native-zstd absence is simulated in an isolated Node child; it binds
