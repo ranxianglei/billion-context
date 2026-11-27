@@ -2741,8 +2741,8 @@ Do **not** "fix" this by relabeling the billion-context data dir Low — that di
 
 ### Windows: claude native hook exits 127 on old Node (#7835)
 
-On Windows with Node **< v24.20.0**, the claude native hook's finalizer hard-exits (`process.exit(0)`) right after ~9.5s of heavy allocation work (fetch / JSON / process-table walk). A V8 background worker thread may then call `uv_async_send` on the platform task runner's `flush_tasks_` handle exactly as teardown closes it → libuv `UV_HANDLE_CLOSING` assertion → abort (exit code **127**, reported as a hook failure on every claude start).
+On Windows with Node **< v24.20.0** and bili **≤ v0.1.216**, the claude native hook's finalizer hard-exits (`process.exit(0)`) right after ~9.5s of heavy allocation work (fetch / JSON / process-table walk). A V8 background worker thread may then call `uv_async_send` on the platform task runner's `flush_tasks_` handle exactly as teardown closes it → libuv `UV_HANDLE_CLOSING` assertion → abort (exit code **127**, reported as a hook failure on every claude start).
 
 This is a **Node.js runtime bug** (nodejs/node#56645 / #64322, fixed by nodejs/node#61999 in **v24.20.0** and **v26.7.0**; the same `flush_tasks_ == nullptr` guard is already in the v20.x / v22.x branches). The session itself is **not affected** — the proxy attach and the managed-settings pin complete before the abort, so compression works normally.
 
-**Fix: upgrade Node to ≥ v24.20.0.**
+**Fix: upgrade Node to ≥ v24.20.0** — definitive on any bili version. Since #7094 (master 2026-11-24; v0.1.216 predates it) the hook no longer force-exits on the normal path — it tears down stdin and drains to a natural exit (an unref'd 5 s backstop force-exits only if something unexpectedly keeps the loop alive) — so in the first release that includes it, the every-startup 127 goes away on old Node too; the Node upgrade above also eliminates the residual race in the natural-shutdown path.
