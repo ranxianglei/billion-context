@@ -341,6 +341,20 @@ export function applyAbsorb(input: AbsorbInput): AbsorbOutcome {
       resultText: `absorb failed: ${target.toolName} is an ACP-managed tool result — it is not absorbable.`,
     };
   }
+  // #7826: the contract says excludeTools patterns are NEVER absorbable
+  // (types.ts AbsorbConfig.excludeTools). The prompt side enforces it in
+  // isAbsorbCandidate; the execution side must share that judgment (#3371) —
+  // otherwise a model that calls absorb on an un-prompted, excluded result
+  // hides it anyway.
+  for (const pattern of cfg.excludeTools) {
+    if (target.toolName && matchToolPattern(target.toolName, pattern)) {
+      return {
+        state: input.state,
+        ok: false,
+        resultText: `absorb failed: ${target.toolName} is excluded by absorb.excludeTools — its results must stay visible.`,
+      };
+    }
+  }
   if (
     isMessageProtectedWithPairing(
       target,
