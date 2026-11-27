@@ -63,7 +63,7 @@ import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandc
 import { ZED_PROVIDER_PROTOCOL, ZED_PROVIDERS, unwrapZedEnvelope, type ZedEnvelopeMeta, type ZedProvider } from "../zed-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
-import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, egressPlaneGateOn, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
@@ -82,6 +82,7 @@ import { harvestIdentity } from "../identity-harvest.js";
 import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
+import { noteSessionLaneSwitch } from "./session-lane.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
@@ -1035,6 +1036,10 @@ async function handleRequest(
     // FALLBACK_EFFECTIVE_WINDOW_FLOOR). Cleared when an async registry hit
     // replaces the value.
     let nativeFromFallback = false;
+    // C4 (PR #7684): model judged on the anonymous default window THIS request
+    // (set inside the window block; read again where the session is bound, to
+    // apply / record the session-local ratchet).
+    let ratchetableWindowModel: string | undefined;
     // Effective compression prompts for this request: resolved from the same
     // three-level cascade (global → provider → model) as the limit above, then
     // threaded into every prepare* path so the system prompt, the nudge text,
@@ -1153,6 +1158,11 @@ async function handleRequest(
             // #2336: agent-registry recipes are the FALLBACK layer — bili's
             // own named providers (file) win per provider name.
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} });
+        // C4 (PR #7684): remember that THIS request judged the model on the
+        // anonymous default window (no declaration of any kind, and an
+        // operator-tuned window never counts as the default). The session-local
+        // ratchet is applied / recorded where the session is bound (below).
+        if (native === undefined && !operatorWindowTuned) ratchetableWindowModel = model;
             {
                 const wsSource = betaWindow ? "anthropic-beta" : suffixWindow ? "model-suffix" : pluginWindow ? "plugin" : runtimeWindow ? "runtime-info" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
                 wsSourceForLog = wsSource;
@@ -1203,6 +1213,7 @@ async function handleRequest(
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
+                ratchetableWindowModel = undefined; // the client's declared window now owns this model — the ratchet must never re-parse it back (see :3064)
                 windowShrinkReason = "codex";
                 codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
                 log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
@@ -1213,6 +1224,7 @@ async function handleRequest(
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
+                ratchetableWindowModel = undefined; // bili's own codex table sized this model — declared knowledge, not the anonymous fallback the ratchet may touch
                 codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
                 log("info", `[codex] effective window raised ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}; bili's anonymous fallback undersized the session — #7205) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
@@ -2077,7 +2089,14 @@ async function handleRequest(
                 ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
                 ...(existingProducer ? { producer: existingProducer } : anonProvenance ? { producer: anonProvenance } : {}),
             };
-        } else if (clientProvided && zcodeMemory === undefined) {
+        } else if (clientProvided && zcodeMemory === undefined &&
+            // KDD #25 (discussions/7735): an egress-on session resolves identity
+            // from the op log + its sessions identity row, not from the
+            // content-chain map — skip the #1486 identified-client tracking for
+            // it (the 1.8 MB prefix-affinity kv blob stays out of an eg
+            // database). Anonymous clients keep writing: they have no other
+            // identity source and availability outranks retirement.
+            !(session.metadata?.["egressAuthority"] === true && egressPlaneGateOn())) {
             // #1486: track identified clients' chains too, so a resume that
             // forks a NEW client id (cc --resume) can be matched back to its
             // parent across requests and proxy restarts (the #499 snapshot
@@ -3042,7 +3061,35 @@ async function handleRequest(
         // otherwise the request is degenerate (output >= whole window) and the
         // self-heal above handles the resulting overflow. Feeds reqConfig (→
         // processTurn `config`), so diagNudge shows the reserved window (no extra log).
-        const nativeWindow = reqConfig.modelContextLimit;
+        let nativeWindow = reqConfig.modelContextLimit;
+        // C4 (PR #7684): window ratchet — a model with no declared window rides
+        // the anonymous default until this session's own billing proves the
+        // upstream window bigger: settleUsageReport raises
+        // session.metadata.windowRatchet[model] to 2× the observation
+        // (monotonic) when a turn BILLS beyond the window the request was
+        // judged on. Re-resolve the request config with the raised number so
+        // preflight/nudge judge against it (declared windows are never in the
+        // ratchet map; an operator-tuned window outranks it by construction).
+        if (ratchetableWindowModel !== undefined) {
+            const ratchetedRaw = ((session.metadata.windowRatchet ?? {}) as Record<string, unknown>)[ratchetableWindowModel];
+            if (typeof ratchetedRaw === "number" && Number.isFinite(ratchetedRaw) && ratchetedRaw > nativeWindow) {
+                reqConfig = resolveRequestConfig(config, opts.routes, providerDestUrl, ratchetableWindowModel, ratchetedRaw, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} });
+                nativeWindow = reqConfig.modelContextLimit;
+                wsSourceForLog = "ratchet";
+                // Session-scoped key: windowSourceLogged is process-global, so without
+                // the session id the "applied" line would fire once for the first
+                // session and stay silent for every other session with the same
+                // model@window pair.
+                const ratchetLogKey = `${sessionId}@${ratchetableWindowModel}@${ratchetedRaw}`;
+                if (!windowSourceLogged.has(ratchetLogKey)) {
+                    windowSourceLogged.add(ratchetLogKey);
+                    log("info", `[window-ratchet-applied] model=${ratchetableWindowModel} session=${sessionId}: billing proved the anonymous default small — judging this request against the session-raised window ${nativeWindow} (source=ratchet; monotonic, session-local)`);
+                }
+            }
+            // Record what window THIS request judged the model on: the billing
+            // funnel compares the next successful report against this number.
+            session.metadata.windowFallbackModels = { ...((session.metadata.windowFallbackModels ?? {}) as Record<string, number>), [ratchetableWindowModel]: nativeWindow };
+        }
         const headroomOrigin = normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin);
         // #3450 follow-up (#3973): a 400 that stated a completion share disproves
         // any separate-wall evidence for this origin+model — judging input against
@@ -3429,6 +3476,11 @@ async function handleRequest(
                 // request (initial AND preflight re-prepares both flow through).
                 const runPrepare = async (): Promise<Prepared> => {
                     const p = await runPrepareInner();
+                    // C5 (PR #7684): a wire-lane change for this session is an
+                    // EVENT — one loud line with the explicit cross-wire loss
+                    // list (the stored history re-renders on the new lane from
+                    // here on). Same-lane re-prepares (preflight) re-log nothing.
+                    noteSessionLaneSwitch(session, p.protocol, p.originalMessages ?? p.processedMessages, log);
                     if (ccMeta !== undefined) p.commandcode = { meta: ccMeta };
                     if (wireFamily === "zed" && zedMeta !== undefined) p.zed = { meta: zedMeta };
                     return p;
