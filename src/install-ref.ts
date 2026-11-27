@@ -75,7 +75,8 @@ function run(cmd: string, args: string[], opts: RunOpts): Promise<string> {
     return new Promise((resolve, reject) => {
         execFile(cmd, args, { cwd: opts.cwd, env: opts.env, timeout: opts.timeoutMs, maxBuffer: 64 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
             if (err) {
-                const tail = String(stderr).trim().split("\n").slice(-3).join(" | ");
+                const tailLines = String(stderr).trim().split("\n");
+                const tail = tailLines.slice(Math.max(0, tailLines.length - 3)).join(" | ");
                 reject(new Error(`${cmd} ${args.join(" ")} failed${tail ? `: ${tail}` : ""}`));
                 return;
             }

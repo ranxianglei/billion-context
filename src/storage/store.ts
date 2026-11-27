@@ -591,6 +591,20 @@ function dbFileIsAlreadyWal(dbPath: string): boolean {
     }
 }
 
+/** #7864: the pin ledger view is CORE-granular (msgid-pin.ts) — a split
+ *  element's siblings keep their `#pN` core ids. Path A (#7836) coarsened
+ *  the op-log msgid column to the client element id, so the core id is
+ *  recovered from the row's recorded bytes (the canonical core JSON);
+ *  rows whose bytes do not parse fall back to the stored msgid. */
+function egressRowCoreId(row: EgressViewRow): string {
+    try {
+        const m = JSON.parse(row.bytes) as { id?: unknown };
+        return typeof m.id === "string" && m.id !== "" ? m.id : row.msgid;
+    } catch {
+        return row.msgid;
+    }
+}
+
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
@@ -2400,7 +2414,7 @@ export class UnifiedStore {
      *  system row is not part of the msgid ledger. */
     snapEgressPinLiveIds(sid: string): string[] {
         const view = egressStateRead(this.db, sid);
-        return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map((r) => r.msgid);
+        return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map(egressRowCoreId);
     }
 
     /** #7474 P2 (ruling 7439): ONE pin-ledger entry for both storage
@@ -2420,7 +2434,7 @@ export class UnifiedStore {
             try {
                 const view = egressStateRead(this.db, sid);
                 if (view.length > 0) {
-                    return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map((r) => r.msgid);
+                    return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map(egressRowCoreId);
                 }
             } catch {
                 // EgressStateCorruptError — degrade to the messages ledger below.
