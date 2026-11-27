@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { spawn } from "node:child_process";
 import { UnifiedStore, StorageIntegrityError } from "../src/storage/store.js";
 import { setLogCapture } from "../src/logger.ts";
@@ -29,6 +30,9 @@ import {
     integrityCheckRunsForTests,
     setIntegritySyncThresholdForTests,
     backgroundIntegrityInflightForTests,
+    scheduleBackgroundIntegrityCheck,
+    unrefIntegrityWorkers,
+    integrityWorkerForTests,
 } from "../src/storage/integrity-check.js";
 import { DatabaseSync } from "node:sqlite";
 
@@ -224,6 +228,41 @@ test("a damaged verdict cache cannot prevent a healthy store from reopening", ()
         }
         assert.equal(readIntegrityCache(dbPath)?.ok, true);
     } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("shutdown unrefs in-flight background quick_check workers so exit is not held hostage (#6987)", () => {
+    resetIntegrityCheckStateForTests();
+    const dir = tmpDir();
+    // Worker exposes no hasRef() in current Node, so observe the unref by
+    // recording which worker instances unrefIntegrityWorkers() flips.
+    const origUnref = Worker.prototype.unref;
+    const unrefed = new Set<Worker>();
+    Worker.prototype.unref = function (this: Worker) {
+        unrefed.add(this);
+        return origUnref.call(this);
+    };
+    try {
+        const dbPath = join(dir, "index.db");
+        // A valid SQLite DB (migrations) so the worker's quick_check has a real
+        // file to scan. The store's open() size-gates on the file at
+        // integrityModeFor time, so a brand-new store takes the SYNC path;
+        // schedule the background check directly — the same call open() makes
+        // for a large store.
+        const seed = UnifiedStore.open(dbPath);
+        seed.close();
+        scheduleBackgroundIntegrityCheck(dbPath); // worker created, ref'd
+        const worker = integrityWorkerForTests(dbPath);
+        assert.ok(worker, "a scheduled background check has an in-flight worker");
+        // Synchronous, same event-loop turn: the worker was just created and is
+        // ref'd; its completion (message -> finish -> unref) can only run in a
+        // LATER turn, so this reads the pre-shutdown state.
+        assert.ok(!unrefed.has(worker), "the freshly scheduled worker is still ref'd");
+        unrefIntegrityWorkers();
+        assert.ok(unrefed.has(worker), "shutdown unrefs the in-flight worker");
+    } finally {
+        Worker.prototype.unref = origUnref;
         rmSync(dir, { recursive: true, force: true });
     }
 });

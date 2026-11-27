@@ -267,6 +267,12 @@ function attachWorkerStderr(worker: Worker, dbPath: string): void {
  * defers to the worker's own completion write). */
 const inflight = new Set<string>();
 
+/** In-flight workers keyed by dbPath (#6987: shutdown must not wait for a
+ * worker stuck in a long synchronous PRAGMA quick_check — a 10 GB store's
+ * scan takes ~45 min and the main thread futex-waits on it). Unref'd on
+ * shutdown so the worker does not hold the event loop open. */
+const inflightWorkers = new Map<string, Worker>();
+
 /** Fire-and-forget background quick_check on a second read-only connection
  * (#4609). Records the outcome for the operator's alarms (ok or fail —
  * 2026-10-30 owner policy: background findings are ALARMS ONLY, never
@@ -297,6 +303,7 @@ export function scheduleBackgroundIntegrityCheck(
             workerData: { path: dbPath },
             ...(isBunRuntime() ? {} : { stderr: true }),
         });
+        inflightWorkers.set(dbPath, worker);
         attachWorkerStderr(worker, dbPath);
     } catch (err) {
         inflight.delete(dbPath);
@@ -305,6 +312,7 @@ export function scheduleBackgroundIntegrityCheck(
     }
     const finish = (fn: () => void): void => {
         inflight.delete(dbPath);
+        inflightWorkers.delete(dbPath);
         try {
             fn();
         } finally {
@@ -369,6 +377,25 @@ export function scheduleBackgroundIntegrityCheck(
 /** Test seam: true when a background check for dbPath is still running. */
 export function backgroundIntegrityInflightForTests(dbPath: string): boolean {
     return inflight.has(dbPath);
+}
+
+/** #6987: unref every in-flight background quick_check worker so a clean
+ * shutdown can exit without waiting for a worker stuck in a long synchronous
+ * PRAGMA quick_check (a 10 GB store's scan takes ~45 min; the main thread
+ * futex-waits on it and the process never exits until SIGKILL). The next boot
+ * re-scans anyway (no PASS is cached while the check is in flight), so
+ * abandoning the worker here loses nothing. */
+export function unrefIntegrityWorkers(): void {
+    for (const worker of inflightWorkers.values()) {
+        worker.unref();
+    }
+}
+
+/** Test seam (#6987): the in-flight worker for dbPath, or undefined when no
+ * background check is running. Lets a test pin the shutdown unref by observing
+ * the worker's ref state (Worker exposes no hasRef() in current Node). */
+export function integrityWorkerForTests(dbPath: string): Worker | undefined {
+    return inflightWorkers.get(dbPath);
 }
 
 // --- test seams ------------------------------------------------------------

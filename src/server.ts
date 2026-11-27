@@ -105,6 +105,7 @@ import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, peerStillContests, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
+import { unrefIntegrityWorkers } from "./storage/integrity-check.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
 import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
 import { tcpConnectable } from "./liveness.js";
@@ -1831,6 +1832,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const shutdown = (sig: string) => {
         if (shuttingDown) return;
         shuttingDown = true;
+        // #6987: unref in-flight background quick_check workers NOW so the
+        // drain/exit path is not held hostage by a worker stuck in a long
+        // synchronous PRAGMA quick_check (10 GB store ≈ 45 min scan; the main
+        // thread futex-waits on it and the process never exits until SIGKILL).
+        // The next boot re-scans anyway (no PASS is cached while in flight).
+        unrefIntegrityWorkers();
         log("info", `${sig} received — flushing sessions…`);
         // Stop accepting new requests BEFORE flushing, otherwise a late request
         // could mutate state after its snapshot is taken and be lost.
