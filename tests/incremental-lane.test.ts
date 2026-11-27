@@ -35,6 +35,7 @@ interface Harness {
     markerTurn: (reqPath: string, payload: { conversationId: string; sinceSeq: number; resync?: boolean; system?: unknown; request?: Record<string, unknown>; messages: unknown[] }) => Promise<{ status: number; body: unknown; appliedSeq?: number }>;
     markerRaw: (reqPath: string, anthropicBody: Record<string, unknown>) => Promise<{ status: number; body: unknown }>;
     forwarded: Record<string, unknown>[];
+    forwardedUrls: string[];
     dir: string;
     settle: () => Promise<void>;
     close: () => Promise<void>;
@@ -53,10 +54,12 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
     _setStoreForTest(store);
     _setForTest({});
     const forwarded: Record<string, unknown>[] = [];
+    const forwardedUrls: string[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (chunk: Buffer) => chunks.push(chunk));
         req.on("end", () => {
+            forwardedUrls.push(req.url ?? "");
             forwarded.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
             const reply = (): void => {
                 res.writeHead(opts.upstreamStatus ?? 200, { "content-type": "application/json" });
@@ -108,11 +111,46 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
         const body: unknown = await response.json().catch(() => null);
         return { status: response.status, body };
     };
-    return { proxyUrl, path, turn, probe, markerTurn, markerRaw, forwarded, dir, settle: async () => { await new Promise<void>((resolve) => setTimeout(resolve, (opts.debounceMs ?? 60000) + 40)); }, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    return { proxyUrl, path, turn, probe, markerTurn, markerRaw, forwarded, forwardedUrls, dir, settle: async () => { await new Promise<void>((resolve) => setTimeout(resolve, (opts.debounceMs ?? 60000) + 40)); }, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 const userTurn = (n: number, text = "hello") => ({ id: `u${n}`, role: "user", contentType: "text", content: text.repeat(400) });
 const assistantTurn = (n: number) => ({ id: `a${n}`, role: "assistant", contentType: "text", content: `model answer ${n}` });
+
+test("Responses marker entry preserves query bytes and isolates query-distinguished histories", async () => {
+    process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "1";
+    const h = await harness("full");
+    const a = { role: "user", content: "route A" };
+    const b = { role: "user", content: "route B" };
+    const c = { role: "user", content: "suffix C" };
+    const firstPath = "/v1/responses?api-version=fixture-a&opaque=a%2Fb%3Fc";
+    const secondPath = "/v1/responses?api-version=fixture-b&opaque=a%2Fb%3Fc";
+    const seed = { conversationId: "query-history", wireFormat: "responses", sinceSeq: 0, resync: true,
+        request: { model: "claude-test" }, messages: [a] };
+    try {
+        assert.equal((await h.markerRaw(firstPath, seed)).status, 200);
+        assert.equal((await h.markerRaw(secondPath, { ...seed, messages: [b] })).status, 200);
+        assert.equal((await h.markerRaw(firstPath, { ...seed, sinceSeq: 1, resync: false, messages: [c] })).status, 200);
+        assert.deepEqual(h.forwardedUrls, [firstPath, secondPath, firstPath], "retain the exact provider request target");
+        // The real ordinary pipeline adds its developer guide and addressed
+        // message prefix. Keep those additions explicit rather than comparing
+        // its output with raw pre-pipeline items.
+        const histories = h.forwarded.map(body => {
+            assert.ok(Array.isArray(body.input));
+            const items = body.input as Record<string, unknown>[];
+            assert.equal(items[0].role, "developer");
+            assert.deepEqual(items[0], (h.forwarded[0].input as unknown[])[0]);
+            return items.slice(1).map(item => {
+                assert.deepEqual(Object.keys(item).sort(), ["content", "role", "type"]);
+                assert.equal(item.type, "message");
+                assert.equal(item.role, "user");
+                assert.equal(typeof item.content, "string");
+                return { role: item.role, content: (item.content as string).replace(/^<acp\b[^>]*>m[0-9]+<\/acp>\n/, "") };
+            });
+        });
+        assert.deepEqual(histories, [[a], [b], [a, c]], "query-distinguished seeds cannot overwrite each other");
+    } finally { await h.close(); delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS; }
+});
 
 test("incremental lane: seed → delta → upstream receives the assembled full history; ack advances", async () => {
     const h = await harness("full");
