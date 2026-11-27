@@ -150,7 +150,11 @@ test("relative sessions.dir resolves against the process CWD", () => {
 
 test("JSONC tolerance: comments and trailing commas parse like parseBiliConfig", () => {
     const moved = path.join(ROOT, "jsonc-sessions");
-    writeConfig(`// relocate off the C: drive\n{\n  "sessions": {\n    "dir": "${moved}",\n  },\n}\n`);
+    // JSON.stringify the path: on Windows the raw backslashes (C:\\Users\\...)
+    // are INVALID JSON escapes and would make the whole config unparseable —
+    // the tolerance under test here is comments + trailing commas, not
+    // escape repair (real users write forward slashes or escaped backslashes).
+    writeConfig(`// relocate off the C: drive\n{\n  "sessions": {\n    "dir": ${JSON.stringify(moved)},\n  },\n}\n`);
     try {
         assert.equal(sessionsDir(), moved);
     } finally {

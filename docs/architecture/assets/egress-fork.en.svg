@@ -18,7 +18,7 @@
 <text x="352" y="285" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">whole point of dual clocks)</text>
 <text x="352" y="300" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">then rebuild both state replicas by replay</text>
 <text x="352" y="315" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Below the newest base ⇒ refused (400):</text>
-<text x="352" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">those rows were pruned by design</text>
+<text x="352" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">conservative gate, not a data constraint</text>
 <rect x="820" y="70" width="380" height="130" rx="8" fill="#f3e6f5" stroke="#3a5a8a" stroke-width="1.5"/>
 <text x="832" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">Rollback / downgrade (opt-out or old binary)</text>
 <text x="832" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">The lazy messages projection is rebuilt</text>
@@ -33,5 +33,5 @@
 <text x="832" y="325" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">No healthy point ⇒ loud hard fail (7439-5)</text>
 <line x1="260" y1="100" x2="336" y2="100" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/><line x1="260" y1="130" x2="336" y2="260" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/><text x="298" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#7a3b0f" text-anchor="middle" font-weight="bold">wm = a past point</text><line x1="740" y1="130" x2="816" y2="130" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/><text x="778" y="120" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#7a3b0f" text-anchor="middle" font-weight="bold">opt-out / old version</text><rect x="340" y="400" width="860" height="55" rx="8" fill="#fff6e6" stroke="#3a5a8a" stroke-width="1.5"/>
 <text x="352" y="420" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">Retention floor = the newest B base</text>
-<text x="352" y="440" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">History below it is physically deleted ⇒ forks below it are refused (never guessed); block rows always follow the flow pointer, so point slices never cross tables</text>
+<text x="352" y="440" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">The flow keeps that history (append-only, #7439) — below-base forks stay refused as a conservative gate (never guessed); block rows always follow the flow pointer, so point slices never cross tables</text>
 </svg>
