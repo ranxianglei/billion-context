@@ -2733,13 +2733,18 @@ async function handleRequest(
         // (title requests arrive FIRST, at session start). Starved all-bili requests
         // never reach here demoted: stripLeakedBiliTools vetoes them per #546.
         if (!demotedSide && !serverToolUtility && !structuredOutputUtility && !audioOutputUtility) {
-            // #3438: the dsh host contract (pi-ai buildBaseOptions) stamps the model-declared
-            // maxTokens on every main turn, so on this lane a below-ceiling tool-carrying
-            // budget is a raw-history collapse, not intent — arm the mid-band rescue.
-            // The plugin-stamped lane is the live path; the clientHint arm is defensive —
-            // it matches only if some dsh build's wire identity is literally "dsh".
-            const dshRestoreLane = pluginAgent === "dsh" || session.metadata.clientHint === "dsh";
-            restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, providerDestUrl, opts.sessionHeader, requestModel), dshRestoreLane);
+            // #3438/#6955: on collapse-rescue lanes the host derives the main-turn
+            // budget from the model declaration (pi-ai), so a below-ceiling
+            // tool-carrying budget is a raw-history collapse, not intent — arm the
+            // mid-band rescue. dsh: buildBaseOptions stamps the model-declared
+            // maxTokens on every main turn (the plugin-stamped lane is the live
+            // path; the clientHint arm is defensive — it matches only if some dsh
+            // build's wire identity is literally "dsh"). pi plugin: pi-ai's
+            // clampMaxTokensToContext stamps the model's maxTokens in the healthy
+            // state and only drops below it when the raw history nears the window
+            // (#6955: 271–441 vs ceiling 128000, above the <=200 starve gate).
+            const collapseRescueLane = pluginAgent === "dsh" || session.metadata.clientHint === "dsh" || pluginAgent === "pi";
+            restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, providerDestUrl, opts.sessionHeader, requestModel), collapseRescueLane);
         }
         // #896: the per-scope output-headroom cap (compress.outputHeadroomMaxPct,
         // three-level merge; default 0.25, aligned with billion-context-pi).
