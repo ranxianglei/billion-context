@@ -185,8 +185,10 @@ async function doRescale(mime: RescaledMime, b64: string, origBytes: number, max
             : await img.getBuffer(mime);
         const keepLimit = force ? origBytes : origBytes * KEEP_RATIO;
         if (!force && mime === "image/png" && out.length >= keepLimit && isOpaqueRgba(img.bitmap.data)) {
+            // Entry implies out.length >= keepLimit, so jpg.length < keepLimit
+            // alone decides adoption (it also implies jpg < out).
             const jpg = await img.getBuffer("image/jpeg", { quality: JPEG_QUALITY });
-            if (jpg.length < keepLimit && jpg.length < out.length) {
+            if (jpg.length < keepLimit) {
                 out = jpg;
                 outMime = "image/jpeg";
             }
