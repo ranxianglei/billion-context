@@ -32,6 +32,12 @@ interface WireRule {
 
 export const WIRE_RULES: readonly WireRule[] = [
     {
+        id: "WC-027",
+        wire: "google",
+        summary: "functionResponse.parts contains inlineData or fileData, never text; exact JSON $ref objects resolve to a unique displayName in the same response",
+        provenance: "Google FunctionResponsePart schema (https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/Shared.Types/Content#FunctionResponsePart) and multimodal function responses (https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/tools/function-calling): media lives inside the function response; its structured response can reference a unique named part. Image egress archiving must remove the media and replace its reference with the omission note, or place unreferenced notes outside FunctionResponsePart.",
+    },
+    {
         id: "WC-026",
         wire: "responses",
         lane: "responses-sse",
@@ -693,10 +699,42 @@ export function validateCodexResponsesWsCreate(body: unknown): string[] {
     return out;
 }
 
-/** WC-006, WC-018 on a Gemini generateContent/streamGenerateContent body. */
+/** WC-006, WC-018, WC-027 on a Gemini generateContent/streamGenerateContent body. */
 function validateGoogleBody(body: unknown, model?: string): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
+    if (Array.isArray(body.contents)) {
+        body.contents.forEach((content, i) => {
+            if (!isPlainObject(content) || !Array.isArray(content.parts)) return;
+            content.parts.forEach((part, j) => {
+                if (!isPlainObject(part) || !isPlainObject(part.functionResponse)) return;
+                const response = part.functionResponse;
+                const names = new Map<string, number>();
+                if (Array.isArray(response.parts)) {
+                    response.parts.forEach((media, k) => {
+                        const inline = isPlainObject(media) && isPlainObject(media.inlineData);
+                        const file = isPlainObject(media) && isPlainObject(media.fileData);
+                        if (!isPlainObject(media) || inline === file || "text" in media) {
+                            out.push(`WC-027 contents[${i}].parts[${j}].functionResponse.parts[${k}]: expected one inlineData or fileData media part, without text`);
+                            return;
+                        }
+                        const blob = (inline ? media.inlineData : media.fileData) as Record<string, unknown>;
+                        if (typeof blob.displayName === "string") names.set(blob.displayName, (names.get(blob.displayName) ?? 0) + 1);
+                    });
+                }
+                const pending = [response.response];
+                while (pending.length > 0) {
+                    const value = pending.pop();
+                    if (Array.isArray(value)) for (const item of value) pending.push(item);
+                    else if (isPlainObject(value)) {
+                        if (Object.keys(value).length === 1 && typeof value.$ref === "string") {
+                            if (names.get(value.$ref) !== 1) out.push(`WC-027 contents[${i}].parts[${j}]: image reference ${value.$ref} has no unique displayName in this function response`);
+                        } else for (const item of Object.values(value)) pending.push(item);
+                    }
+                }
+            });
+        });
+    }
     // WC-018: Vertex rejects a request whose user content carries plain
     // (unsigned, non-thought) text AFTER a functionResponse part — 400
     // "Requests ending with a model turn are not supported" (#3159). Runs
@@ -749,7 +787,7 @@ function validateGoogleBody(body: unknown, model?: string): string[] {
     return out;
 }
 
-export const VALIDATORS: Record<Wire, (body: unknown) => string[]> = {
+export const VALIDATORS: Record<Wire, (body: unknown, model?: string) => string[]> = {
     anthropic: validateAnthropicBody,
     "openai-chat": validateOpenAiChatBody,
     responses: validateResponsesBody,

@@ -909,7 +909,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // (#3701 Finding 1).
     let outboundCopyRewritten = false;
     if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
-        const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send" });
+        const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, model: prepared.model ?? prepared.google?.model, log, phase: "pre-send" });
         if (shed.body !== wireBody) {
             outboundCopyRewritten = true;
             // #564/#2627: an opaque egress shed can delete or synthesize items —
@@ -928,6 +928,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             const sess = prepared.session;
             const countShed = await shedWireImagesToCount(wireBody, prepared.protocol, imgCap - 1, {
                 resolveRef: (mt, b64) => refForItemBytes(sess, mt, b64),
+                model: prepared.model ?? prepared.google?.model,
             });
             if (countShed.stats.changed) {
                 outboundCopyRewritten = true;
@@ -1379,7 +1380,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         const shedSession = prepared.session;
         let shedResult: ShedWireImagesResult;
         try {
-            shedResult = await shedWireImages(wireBody, prepared.protocol, target, { resolveRef: (mt, b64) => refForItemBytes(shedSession, mt, b64) });
+            shedResult = await shedWireImages(wireBody, prepared.protocol, target, { resolveRef: (mt, b64) => refForItemBytes(shedSession, mt, b64), model: prepared.model ?? prepared.google?.model });
         } catch (error) {
             releaseUpstreamThrottleProbe(throttleProbeToken);
             throw error;
@@ -1923,6 +1924,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 const target = Math.max(0, overflowInfo.imageCountCap - 1);
                 const countShed = await shedWireImagesToCount(wireBody, prepared!.protocol, target, {
                     resolveRef: (mt, b64) => refForItemBytes(s, mt, b64),
+                    model: prepared!.model ?? prepared!.google?.model,
                 });
                 if (!countShed.stats.changed) {
                     log("warn", `[${s.id}] image-count overflow (upstream cap ${overflowInfo.imageCountCap}, request carried ${overflowInfo.imageCountSeen ?? "?"}) — nothing archivable in the outbound copy (images sit in exempt tool outputs?) — passing the rejection through (#4124)`);

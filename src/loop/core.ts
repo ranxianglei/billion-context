@@ -610,6 +610,7 @@ export async function* runCompressLoop(
             const shedBody = (await shedEgressIfOverBudget(wireBodyStr, ctx.protocol, {
                 sessionId: ctx.session.id,
                 session: ctx.session,
+                model: requestModel,
                 // Single sink: ctx.log routes into the same tee logger
                 // (server.ts logMsg → loggerLog), so calling both would
                 // write each line twice (#3701 review Finding 2).
