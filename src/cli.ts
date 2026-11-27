@@ -973,7 +973,7 @@ export async function main(): Promise<void> {
             if ((disk ?? VERSION) === v) {
                 console.log(`Already on ${v} — --force: reinstalling anyway.`);
             }
-            const result = await forceInstallVersion(v, installDir, { packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, "manual", "manual-cli");
+            const result = await forceInstallVersion(v, installDir, { packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, "manual", "manual-cli", { allowSameVersion: updateForce });
             if (!result.ok) {
                 console.error(`bili update: ${(result.error ?? "install failed").replace(/^advisory [^:]+: /, "")}`);
                 process.exit(1);
@@ -1032,6 +1032,12 @@ export async function main(): Promise<void> {
         // update` / `unpin` still break through. Never kills running
         // processes; the new build takes effect on restart.
         if (installStatusCmd) {
+            // `status` takes no other arguments — a stray ref would otherwise
+            // be silently ignored (R2 review, #7806).
+            if (installRef !== undefined || installDuration !== undefined) {
+                console.error("bili install: status takes no ref/duration arguments");
+                process.exit(2);
+            }
             const st = await installStatus();
             console.log(st.line);
             return;

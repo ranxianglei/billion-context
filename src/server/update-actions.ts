@@ -16,7 +16,7 @@
  * nothing here throws into the HTTP handlers.
  */
 import { checkForUpdate, findInstallDir, forceInstallVersion, isPrereleaseVersion, lastUpdateCheckTime, readDiskVersion, staleInstallStatus, type UpdateCheckOutcome, type UpdateOptions } from "../update.js";
-import { clearPin, formatPinUntil, parsePinDuration, resolvePinState, writePin } from "../update-pin.js";
+import { clearPin, formatPinUntil, parsePinDuration, readPin, resolvePinState, writePin } from "../update-pin.js";
 import { getUpdateVisibility } from "../update-notes.js";
 import { log as loggerLog } from "../logger.js";
 
@@ -200,7 +200,12 @@ export async function pinCurrentAction(runningVersion: string, durationText?: st
     const now = Date.now();
     const until = parsed.ms !== undefined ? now + parsed.ms : undefined;
     try {
-        await writePin({ v: 1, version, setAt: now, ...(until !== undefined ? { until } : {}) });
+        // Keep the `bili install` git provenance when re-pinning the SAME
+        // version — dropping it would make the next same-ref install do a
+        // pointless rebuild instead of skipping (#7806 review).
+        const existing = await readPin();
+        const source = existing && existing.version === version ? existing.source : undefined;
+        await writePin({ v: 1, version, setAt: now, ...(until !== undefined ? { until } : {}), ...(source ? { source } : {}) });
         loggerLog("info", `[update] web panel pinned ${version} ${formatPinUntil({ until })}`);
         return { ok: true, version, ...(until !== undefined ? { until } : {}) };
     } catch (e) {

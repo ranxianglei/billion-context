@@ -287,3 +287,21 @@ test("forceInstallVersion (advisory / panel lane) also clears a local pin (#6804
     assert.equal(await readDiskVersion(installDir), "3.0.0");
     assert.equal(await readPin(), undefined, "owner-directed repair beats a local pin and sweeps the record");
 });
+
+test("forceInstallVersion: allowSameVersion repairs a broken install AT the current version; advisory lane stays refused (#7806 review P1)", { timeout: 60_000 }, async () => {
+    await resetUpdaterState();
+    // The documented repair path: `bili update <v> --force` when the disk
+    // already reports v (partial install, missing dist/). The advisory-lane
+    // guard ("target == current ⇒ misconfigured advisory") must NOT apply to
+    // the human-directed manual lane.
+    const repairDir = seedPlainInstall("4.0.0", "force-repair");
+    await withRegistryFetch([makeRegistry("4.0.0", goodEntry("4.0.0"))], async () => {
+        const refused = await forceInstallVersion("4.0.0", repairDir, { packageName: "billion-context", currentVersion: "4.0.0", autoUpdate: true }, "adv-repair", "manual-cli");
+        assert.equal(refused.ok, false);
+        assert.match(refused.error ?? "", /misconfigured advisory/);
+
+        const repaired = await forceInstallVersion("4.0.0", repairDir, { packageName: "billion-context", currentVersion: "4.0.0", autoUpdate: true }, "manual", "manual-cli", { allowSameVersion: true });
+        assert.equal(repaired.ok, true, repaired.error);
+    });
+    assert.equal(await readDiskVersion(repairDir), "4.0.0");
+});

@@ -977,7 +977,7 @@ async function verifyEntries(dir: string, label: string): Promise<string | null>
  *
  * Returns a release function if the lock was acquired, or null otherwise.
  */
-async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null> {
+export async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null> {
     const pid = process.pid;
     const now = Date.now();
 
@@ -2335,6 +2335,11 @@ export async function forceInstallVersion(
     opts: UpdateOptions,
     advisoryId: string,
     installSource?: LastInstallRecord["source"],
+    flags?: { /** A human explicitly asked to (re)install the exact version they are on — a
+     *  repair path for a broken install at the current version (#7806 review). The
+     *  advisory lane must NOT pass this: there, target == current is a
+     *  misconfigured advisory and the no-op guard stands. */
+        allowSameVersion?: boolean },
 ): Promise<{ ok: boolean; error?: string }> {
     if (!installDir) {
         const error = "cannot locate the install directory";
@@ -2342,7 +2347,7 @@ export async function forceInstallVersion(
         return { ok: false, error };
     }
     const diskNow = await readDiskVersion(installDir);
-    if ((diskNow ?? opts.currentVersion) === targetVersion) {
+    if (!flags?.allowSameVersion && (diskNow ?? opts.currentVersion) === targetVersion) {
         // The advisory marks its own target as affected — a misconfiguration.
         // Fail loudly instead of spinning on a no-op install every cycle.
         const error = `advisory ${advisoryId} targets the current version ${targetVersion} (misconfigured advisory)`;

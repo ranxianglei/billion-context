@@ -5,9 +5,13 @@
 // exact command sequence --install-links included without touching the
 // network or the machine's real global install.
 
-import test from "node:test";
+// bash PATH shims cannot spawn on win32 (extensionless files, shebangs) —
+// and the install lane itself is win32-unexercised (childEnv history); the
+// pure ref-mapping test below still runs everywhere.
+const nodeTest = (await import("node:test")).default;
+const test = process.platform === "win32" ? nodeTest.skip.bind(nodeTest) : nodeTest;
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { beforeEach } from "node:test";
@@ -66,6 +70,12 @@ for a in "$@"; do
   esac
 done
 if [ -n "$dir" ]; then
+  n=0; [ -f "$GITSTATE/gi-count" ] && n=$(cat "$GITSTATE/gi-count")
+  n=$((n+1)); echo "$n" > "$GITSTATE/gi-count"
+  if [ "$n" -gt 1 ] && [ -f "$GITSTATE/brick" ]; then
+    echo "npm error ETIMEDOUT (injected) — registry fetch aborted mid-install" >&2
+    exit 1
+  fi
   rm -rf "$GLOBALROOT/billion-context"
   cp -r "$dir" "$GLOBALROOT/billion-context"
 fi
@@ -214,6 +224,10 @@ test("#7806 backup retention: after install exactly the 2 newest backups survive
     for (const v of ["1.0.1", "1.0.2", "1.0.3"]) {
         const dir = path.join(H.globalRoot, `billion-context.bak-${v}-2020-01-0${v.slice(-1)}T00-00-00-000Z`);
         mkdirSync(dir, { recursive: true });
+        // mtime retention: give the seeds distinct OLD mtimes so "newest" is
+        // unambiguous (the fresh backup is touched to now by the lane itself).
+        const t = new Date(Date.UTC(2020, 0, Number(v.slice(-1))));
+        utimesSync(dir, t, t);
     }
     try {
         await installFromRef("master", { env: H.env });
@@ -254,6 +268,33 @@ test("#7806 unknown ref: the fetch failure leaves the current install completely
         assert.match(readFileSync(path.join(cur, "package.json"), "utf-8"), /0\.1\.216/);
         assert.equal(backupNames(H.globalRoot).length, 0, "no backup is created before the build succeeds");
         assert.equal(await readPin(), undefined, "no pin is written on failure");
+    } finally {
+        rmSync(path.dirname(H.binDir), { recursive: true, force: true });
+    }
+});
+
+test("#7806 swap failure AFTER the backup auto-restores the previous install (no dangling bin)", async () => {
+    const H = makeHarness();
+    seedCurrentInstall(H.globalRoot, "0.1.216");
+    try {
+        // First install succeeds (gi-count → 1, no brick file yet).
+        await installFromRef("7738", { env: H.env });
+        // Arm the brick: the NEXT global install (npm i -g) fails mid-flight —
+        // after the backup rename, i.e. in the window where the global root
+        // has no working install.
+        writeFileSync(path.join(H.stateDir, "brick"), "1");
+        await assert.rejects(
+            () => installFromRef("7738", { env: H.env, force: true }),
+            /install step failed: npm install .* — previous install kept at .*/,
+        );
+        const cur = path.join(H.globalRoot, "billion-context");
+        assert.ok(existsSync(cur), "the previous install must be BACK (auto-restore)");
+        assert.match(readFileSync(path.join(cur, "package.json"), "utf-8"), /9\.9\.9/, "restored content = the install that was on disk before the failed swap");
+        // The FIRST install's pin survived (it describes exactly what is on
+        // disk again after the restore — auto-upgrade must stay check-only).
+        const pin = await readPin();
+        assert.equal(pin?.version, "9.9.9");
+        assert.deepEqual(pin?.source, { kind: "git", ref: "pull/7738/head", sha: FAKE_SHA });
     } finally {
         rmSync(path.dirname(H.binDir), { recursive: true, force: true });
     }
