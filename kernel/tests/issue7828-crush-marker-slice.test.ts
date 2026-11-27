@@ -10,10 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { applyCrushToMessages, stripTrailingAbsorbPrompt } from "../src/crush.js";
 import { ABSORB_PROMPT_MARKER, buildAbsorbPrompt } from "../src/absorb.js";
-import { createCore } from "../src/compress.js";
-import { createInitialState } from "../src/state.js";
 import { defaultConfig } from "../src/config.js";
-import { collectLatestProtected } from "../src/protected.js";
 import type { CoreMessage } from "../src/types.js";
 
 const countTokens = (text: string) => Math.ceil(text.length / 4);
