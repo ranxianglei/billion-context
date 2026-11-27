@@ -3741,21 +3741,25 @@ test("ensureProxyRunning: a peer serving a DIFFERENT sessions dir is not rideabl
     const savedDir = process.env.BILI_SESSIONS_DIR;
     const OURS = path.join(os.tmpdir(), `bili-7861-ours-${process.pid}`);
     const THEIRS = path.join(os.tmpdir(), `bili-7861-theirs-${process.pid}`);
+    // Fixture pid for the fake spawned child — the post-spawn wait loop
+    // settles when the (injected) health report's pid equals the child pid;
+    // the spawned child's own record carries that same pid, exactly as a
+    // real child's handshake record would (a dead pid is fine here: the
+    // wait loop's stale check deliberately tolerates it).
+    const FAKE_CHILD_PID = 42781;
     let liveInst: InstanceFile | undefined;
     let spawns = 0;
     const spawnImpl: SpawnFn = (_cmd, _args) => {
         spawns++;
-        // pid: process.pid — probeLiveInstances drops candidates whose pid is
-        // not kill(0)-alive, so the fake peer must claim a LIVE pid.
-        liveInst = recordedInstance({ sessionsDir: THEIRS });
-        return makeFakeChild(process.pid + 1);
+        liveInst = recordedInstance({ pid: FAKE_CHILD_PID, sessionsDir: OURS });
+        return makeFakeChild(FAKE_CHILD_PID);
     };
     const deps = {
         spawnImpl,
         fetchImpl: async () => ({ ok: true }),
         fetchHealthInfo: async () => ({ ok: true, instanceId: liveInst?.instanceId ?? "inst-1", pid: liveInst?.pid, watchdog: { armed: true } }),
         readInstanceFile: () => liveInst,
-        sleep: () => Promise.resolve(),
+        sleep: () => new Promise<void>((r) => setTimeout(r, 0)),
         scriptPath: FP_SCRIPT,
     };
     try {
@@ -3763,12 +3767,12 @@ test("ensureProxyRunning: a peer serving a DIFFERENT sessions dir is not rideabl
         await ensureProxyRunning({ host: "127.0.0.1", port: 8787, passthrough: false, debug: false }, deps);
         assert.equal(spawns, 1, "first launch spawns");
 
-        // The repro: a same-build peer whose store is a DIFFERENT directory
-        // (plain `bili pi` default store vs a `-c eg` proxy) must not be
-        // ridden — riding would write this client's sessions into the other
-        // store.
+        // The repro: a same-build peer serving a DIFFERENT store (plain
+        // `bili pi` default dir vs a `-c eg` proxy) must not be ridden —
+        // riding would write this client's sessions into the other store.
+        liveInst = recordedInstance({ sessionsDir: THEIRS });
         const h2 = await ensureProxyRunning({ host: "127.0.0.1", port: 8787, passthrough: false, debug: false }, deps);
-        assert.equal(spawns, 2, "sessions-dir-mismatch forces a fresh spawn");
+        assert.equal(spawns, 2, "sessions-dir-mismatch forces a fresh spawn (spawns=1)");
         assert.notEqual(h2.attached, true, "the foreign-store peer is not attached");
 
         // ...a peer serving the SAME store still attaches...
