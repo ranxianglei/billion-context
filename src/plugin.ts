@@ -66,6 +66,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
         /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
 }
 import { degenerateTurnWarning, endsWithAnnouncement, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
+import type { ContinuationRetryHint } from "./degenerate-retry.js";
 import { getChangelog, latestChangelog, warmChangelogOnce } from "./web/changelog.js";
 import { warmBlogRefreshOnce } from "./web/blog-refresh.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
@@ -2931,7 +2932,7 @@ export async function pipePluginChatWithStrip(
     protocol: WireProtocol,
     session?: Session,
     log?: (msg: string) => void,
-    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
+    refetch?: (hint?: ContinuationRetryHint) => Promise<ReadableStream<Uint8Array> | null>,
     upstreamOrigin?: string,
     // True when the outbound request carried the [ACP absorb] instruction:
     // the model may then answer with a tool call written as prose, and the
@@ -3265,9 +3266,15 @@ export async function pipePluginChatWithStrip(
             : draftTail
               ? `[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying${attemptNote} with a continuation nudge (#2303)`
               : `[plugin] degenerate terminal turn (no usable output); retrying${attemptNote} with a continuation nudge (#732/#821)`);
+        // #7440: an empty turn whose only output was a stripped render-tag echo
+        // gets the tag-forbidding nudge — the generic continuation push never
+        // mentions the tags, so the model repeats the echo and the retry dies
+        // too (the #870 loop). A stalled-tail turn delivered visible prose, so
+        // it keeps the generic push.
+        const hint: ContinuationRetryHint | undefined = !stalledTail && sawStrippedEcho ? { sawStrippedEcho: true } : undefined;
         let next: ReadableStream<Uint8Array> | null = null;
         try {
-            next = await refetch();
+            next = await refetch(hint);
         } catch (e) {
             log?.(`[plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
             return false;
@@ -4601,7 +4608,7 @@ export async function pipePluginResponsesWithStrip(
     res: ServerResponse,
     session?: Session,
     log?: (msg: string) => void,
-    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
+    refetch?: (hint?: ContinuationRetryHint) => Promise<ReadableStream<Uint8Array> | null>,
     upstreamOrigin?: string,
     // See pipePluginChatWithStrip: whole-field tool-call emission drop,
     // gated on the request carrying the [ACP absorb] instruction (m00885).
@@ -5026,9 +5033,13 @@ export async function pipePluginResponsesWithStrip(
             : draftTail
               ? `[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying${attemptNote} with a continuation nudge (#2303)`
               : `[plugin] degenerate terminal turn (no visible output); retrying${attemptNote} with a continuation nudge (#732/#821)`);
+        // #7440: same as the chat-pipe twin — an empty turn whose only output
+        // was a stripped render-tag echo gets the tag-forbidding nudge; a
+        // stalled-tail turn delivered visible prose and keeps the generic push.
+        const hint: ContinuationRetryHint | undefined = !stalledTail && sawStrippedEcho ? { sawStrippedEcho: true } : undefined;
         let next: ReadableStream<Uint8Array> | null = null;
         try {
-            next = await refetch();
+            next = await refetch(hint);
         } catch (e) {
             log?.(`[plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
             return false;

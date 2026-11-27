@@ -43,6 +43,24 @@ function releaseThrottleErrorReader(reader: ReadableStreamDefaultReader<Uint8Arr
 // issue the pending action or state the final answer explicitly.
 export const DEGENERATE_RETRY_NUDGE =
     "[billion-context] Your previous response ended without a tool call. Continue now: take your next concrete action — issue the tool call you were about to make, or state your final answer explicitly.";
+// #7440: the tag-echo shape of the degenerate turn — the model emitted ONLY
+// internal render tags (conditioned on the tagged history) and the tag-echo
+// filter discarded them, so the turn reached the host empty. The generic nudge
+// above never mentions the tags, so the model has no signal to stop echoing
+// them and the retry reproduces the same tag-only output → the #870 fatal
+// error → the host re-requests the same prompt into a loop. This variant names
+// the discarded tags and forbids them, which is the one signal the model needs
+// to break the echo. Angles are hex-escaped per KDD #2.
+export const DEGENERATE_RETRY_NUDGE_TAG_ECHO =
+    "[billion-context] Your previous response contained only internal \x3cacp\x3e metadata tags and was discarded. Do not output \x3cacp\x3e metadata tags. Continue now: take your next concrete action — issue the tool call you were about to make, or state your final answer explicitly in plain text.";
+
+/** The pipe's one-shot degenerate retry can tell the refetch WHY the turn was
+ *  empty; the refetch picks the matching nudge (the tag-echo shape needs the
+ *  tag-forbidding variant, everything else the generic continuation push). */
+export interface ContinuationRetryHint {
+    /** The attempt's only output was a render tag the filter stripped. */
+    sawStrippedEcho?: boolean;
+}
 
 /** #7666: built-in nudge rotation when the user configured no `nudges` list.
  *  Attempt i sends the i-th sentence (cycling), so repeated attempts do not
@@ -126,14 +144,14 @@ async function readSmallThrottleErrorBody(response: Response): Promise<Uint8Arra
  *  when the retry cannot be issued (unbuildable body, upstream error, client
  *  already gone) — the caller then passes the original empty turn through
  *  unchanged. */
-export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Promise<ReadableStream<Uint8Array> | null> {
+export function makeContinuationRefetch(opts: ContinuationRetryOpts): (hint?: ContinuationRetryHint) => Promise<ReadableStream<Uint8Array> | null> {
     const nudges = opts.nudges && opts.nudges.length > 0 ? opts.nudges : DEFAULT_DEGENERATE_RETRY_NUDGES;
     // #7666: self-counted attempt index for nudge rotation. The pipe only ever
     // calls this within its configured budget, so the index can never run past
     // what the user allowed; the modulo keeps a short list cycling instead of
     // stalling on a missing sentence.
     let attempt = 0;
-    return async () => {
+    return async (hint) => {
         if (opts.signal.aborted) return null;
         // A body whose final input item is a compaction trigger must never be
         // re-issued: appending the nudge after it breaks the wire shape (#283:
@@ -151,7 +169,11 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
                 /* unparseable body: injectContinuationNudge below reports and skips */
             }
         }
-        const attemptNudge = nudges[attempt % nudges.length];
+        // #7440: the tag-echo shape gets the tag-forbidding nudge; every other
+        // degenerate shape rotates the configured/generic continuation nudges (#7666).
+        const attemptNudge = hint?.sawStrippedEcho
+            ? DEGENERATE_RETRY_NUDGE_TAG_ECHO
+            : nudges[attempt % nudges.length];
         attempt += 1;
         const retryBody = injectContinuationNudge(opts.protocol, opts.body, opts.model, attemptNudge);
         if (retryBody === null) {

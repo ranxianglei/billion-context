@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import { pipePluginChatWithStrip, pipePluginResponsesWithStrip } from "../src/plugin.ts";
 import { loadOptions } from "../src/config.ts";
 import { setLogCapture } from "../src/logger.ts";
-import { DEGENERATE_RETRY_NUDGE, injectContinuationNudge } from "../src/degenerate-retry.ts";
+import { DEGENERATE_RETRY_NUDGE, DEGENERATE_RETRY_NUDGE_TAG_ECHO, injectContinuationNudge, makeContinuationRefetch, type ContinuationRetryHint } from "../src/degenerate-retry.ts";
 import type { Session } from "../src/session.ts";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -775,5 +776,141 @@ test("config: compat.degenerateTurn resolves env > file > default (#4913)", () =
         }
     } finally {
         rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// #7440: the tag-echo shape of the degenerate turn — the model emitted ONLY a
+// render tag, the filter emptied it, and the retry must carry the tag-forbidding
+// nudge (not the generic continuation push) or the model repeats the echo and
+// the retry dies too. The pipe tells the refetch WHY the turn was empty via a
+// hint; these tests pin both halves of that contract.
+
+test("plugin chat passes the tag-echo hint so the retry nudge forbids the tags (#7440)", async () => {
+    const out: string[] = [];
+    let hint: ContinuationRetryHint | undefined = {};
+    let calls = 0;
+    const refetch = (h?: ContinuationRetryHint) => {
+        calls += 1;
+        hint = h;
+        return Promise.resolve(streamOf(proseTurn("real answer after the nudge")));
+    };
+    await pipePluginChatWithStrip(streamOf(echoOnlyTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
+    assert.equal(calls, 1, "the tag-echo turn is retried once");
+    assert.deepEqual(hint, { sawStrippedEcho: true }, "the tag-echo shape passes the hint to the refetch");
+    assert.ok(!out.join("").includes("m00155"), "the echoed tag never leaks");
+});
+
+test("plugin chat does not pass the tag-echo hint for a silent-thinking turn (#7440)", async () => {
+    const out: string[] = [];
+    let hint: ContinuationRetryHint | undefined = {};
+    let calls = 0;
+    const refetch = (h?: ContinuationRetryHint) => {
+        calls += 1;
+        hint = h;
+        return Promise.resolve(streamOf(proseTurn("the continuation")));
+    };
+    // A reasoning-only terminal (openai `reasoning_content`, zero visible text)
+    // is the silent-thought shape: retried, but with the GENERIC nudge — the
+    // model emitted no tag, so the tag-forbidding variant would be noise.
+    const events = [chatChunk({ role: "assistant" }), chatChunk({ reasoning_content: "a silent thought" }), chatStop(), DONE];
+    await pipePluginChatWithStrip(streamOf(events), makeRes(out), "openai", makeSession(), undefined, refetch);
+    assert.equal(calls, 1, "the silent-thinking turn is retried");
+    assert.equal(hint, undefined, "a thinking-only degenerate turn keeps the generic nudge (no hint)");
+});
+
+test("plugin responses passes the tag-echo hint so the retry nudge forbids the tags (#7440)", async () => {
+    const out: string[] = [];
+    let hint: ContinuationRetryHint | undefined = {};
+    let calls = 0;
+    const refetch = (h?: ContinuationRetryHint) => {
+        calls += 1;
+        hint = h;
+        return Promise.resolve(streamOf(responsesProseTurn("real answer after the nudge")));
+    };
+    await pipePluginResponsesWithStrip(streamOf(responsesEchoOnlyTurn()), makeRes(out), makeSession(), undefined, refetch);
+    assert.equal(calls, 1, "the tag-echo turn is retried once");
+    assert.deepEqual(hint, { sawStrippedEcho: true }, "the responses pipe passes the hint to the refetch");
+    assert.ok(!out.join("").includes("m00155"), "the echoed tag never leaks");
+});
+
+test("the tag-echo retry nudge forbids the render tags and is injected as a trailing user turn (#7440)", () => {
+    const openaiBody = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] });
+    const merged = JSON.parse(injectContinuationNudge("openai", openaiBody, undefined, DEGENERATE_RETRY_NUDGE_TAG_ECHO)!) as { messages: { role: string; content: string }[] };
+    assert.equal(merged.messages.length, 1, "merged into the existing user turn");
+    assert.ok(merged.messages[0]!.content.startsWith("hi"), "the original text is preserved");
+    assert.ok(merged.messages[0]!.content.includes("Do not output \x3cacp\x3e metadata tags"), `the tag-forbidding instruction is present, got: ${merged.messages[0]!.content}`);
+    assert.ok(merged.messages[0]!.content.includes("plain text"), "it tells the model to answer in plain text");
+    // The default (no hint) keeps the generic nudge, tag-free.
+    const generic = JSON.parse(injectContinuationNudge("openai", openaiBody)!) as { messages: { content: string }[] };
+    assert.ok(generic.messages[0]!.content.includes("ended without a tool call"), "the default nudge is unchanged");
+    assert.ok(!generic.messages[0]!.content.includes("Do not output \x3cacp\x3e"), "the default nudge does not mention the tags");
+});
+
+/** A server that records the request BODY of every hit, for the nudge-selection
+ *  pin: the refetch must ship the tag-forbidding nudge on the wire, not just in
+ *  the in-memory body. */
+async function bodyRecordingServer(): Promise<{ url: string; bodies: string[]; close: () => Promise<void> }> {
+    const bodies: string[] = [];
+    const server = http.createServer((req, res) => {
+        let raw = "";
+        req.on("data", (c) => { raw += c; });
+        req.on("end", () => {
+            bodies.push(raw);
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.end("data: [DONE]\n\n");
+        });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address();
+    if (typeof addr !== "object" || addr === null) throw new Error("no addr");
+    return {
+        url: `http://127.0.0.1:${addr.port}/v1/chat/completions`,
+        bodies,
+        close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+}
+
+test("makeContinuationRefetch ships the tag-forbidding nudge when the hint is set (#7440)", async () => {
+    const srv = await bodyRecordingServer();
+    try {
+        const refetch = makeContinuationRefetch({
+            protocol: "openai",
+            body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+            model: "m",
+            upstreamUrl: srv.url,
+            reqHeaders: {},
+            signal: new AbortController().signal,
+            log: () => {},
+            label: "test",
+        });
+        await refetch({ sawStrippedEcho: true });
+        assert.equal(srv.bodies.length, 1, "one upstream hit");
+        const sent = JSON.parse(srv.bodies[0]!) as { messages: { content: string }[] };
+        assert.ok(sent.messages[0]!.content.includes("Do not output \x3cacp\x3e metadata tags"), `the wire body carries the tag-forbidding nudge, got: ${sent.messages[0]!.content}`);
+    } finally {
+        await srv.close();
+    }
+});
+
+test("makeContinuationRefetch ships the generic nudge when the hint is absent (#7440)", async () => {
+    const srv = await bodyRecordingServer();
+    try {
+        const refetch = makeContinuationRefetch({
+            protocol: "openai",
+            body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+            model: "m",
+            upstreamUrl: srv.url,
+            reqHeaders: {},
+            signal: new AbortController().signal,
+            log: () => {},
+            label: "test",
+        });
+        await refetch();
+        assert.equal(srv.bodies.length, 1, "one upstream hit");
+        const sent = JSON.parse(srv.bodies[0]!) as { messages: { content: string }[] };
+        assert.ok(sent.messages[0]!.content.includes("ended without a tool call"), "the wire body carries the generic nudge");
+        assert.ok(!sent.messages[0]!.content.includes("Do not output \x3cacp\x3e"), "the wire body does not mention the tags");
+    } finally {
+        await srv.close();
     }
 });
