@@ -3448,6 +3448,17 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (typeof v !== "number" || !Number.isInteger(v) || v < 2) ok = false;
         else out[key] = v;
     }
+    // Kernel invariant (validateConfig): tier3Trigger must be greater than
+    // tier2Trigger. Enforce it against the EFFECTIVE values — unset fields fall
+    // back to the kernel defaults — so a combination that would only surface as
+    // a runtime kernel warning is rejected at parse time (fail-fast, matching
+    // the rest of this function).
+    {
+        const tierDefaults = defaultConfig(0).tiers;
+        const effT2 = out.tier2Trigger ?? tierDefaults.tier2Trigger;
+        const effT3 = out.tier3Trigger ?? tierDefaults.tier3Trigger;
+        if (effT3 <= effT2) ok = false;
+    }
     if ("tierNudgeTokens" in obj && obj.tierNudgeTokens !== undefined) {
         const v = obj.tierNudgeTokens;
         if (!v || typeof v !== "object" || Array.isArray(v)) {
