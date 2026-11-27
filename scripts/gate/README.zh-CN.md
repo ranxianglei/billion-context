@@ -14,6 +14,7 @@
 | I | 安装 | `npm i -g <tarball> --install-links` = **真拷贝**(无 symlink 泄漏,#1225),CLI 报告候选版本 | `docker-lanes.mjs` |
 | X | 自动更新 | 发一个假新版本的同 commit 构建 → `bili update` **装上了它**,CLI 落到新版本 | `docker-lanes.mjs` |
 | P | 宿主车道 | 真实宿主 CLI(dsh/dsh-google/pi/opencode/codex/claude——四种客户端 wire:openai-chat、google、responses、anthropic)走 bili **插件模式**:流量到上游、compress 工具在 wire 上活着、nudge 上 wire、fold 开火+暗号回忆(细节见下) | `plugin-lanes.mjs` |
+| W | wire 切换 | egress 平面建立在单模型单 wire 假设上,gate 此前对它零覆盖(#7439;症状 issue #6781/#7102/#6957/#4920 全是切换过的会话)。Lane W 以切换宿主的姿态(plugin 模式、wire 粒度 `biliMsgIds`、按请求窗口)打真模型,同一会话**中途换 wire**:t1 大窗 12 暗号语料(必须回声)→ t2 小窗折叠压力(无 500/422)→ t3 切到 `/v1/messages`——暗号必须**穿越切换**被召回(跨 lane 渲染+flow 重放,真实字节)→ t4 再切 `/v1/responses`(第 2 次切换,同契约)。硬断言:只准 200、recorder 见过目标 wire 的 POST(wire 事实,不认 bili 日志)、`[lane-switch]` 行 from→to 正确、无 pin 拒绝/unreadable。上游缺门时该次切换降级 env-blocked(同 dsh wire 变体规则) | `wire-lanes.mjs` |
 | R | 重启 | 长会话先被压过上下文墙(默认 16384 token 小窗 ⇒ 有余量的 fold;更小的墙结构上不可行——折后稳态 ~20k tok,preflight 拒绝压不下的回合),真模型持续应答;**claude**(经 `agentsR` 选入)把 anthropic wire 带进矩阵——prefix 拓扑,代理子进程由 harness 管理,被杀后在同一端口重建,会话必须续上;然后反复 kill 且必须继续干活:**dsh**——自起的代理子进程经 kill -15 / kill -9 / 干净退出被杀,每次重生从磁盘恢复同一会话,出站远低于裸历史大小**且**高于裸问候地板(既压缩又非空),恰好一个活代理持有会话(无脑裂);**pi**——引擎内联在 pi CLI 里,kill 矩阵直接打在 pi 宿主进程身上。每次 kill 后重问近区标记词(证据行——折后逐字质量是 Lane A 的断言),上报 `cached_tokens` 时须恢复到先前 prompt token 的 ≥50% | `restart-lanes.mjs` |
 
 ## 密钥/端点契约
@@ -36,7 +37,7 @@ cp config.example.json ~/system/bili-gate.json   # 位置随意
 scripts/gate/bili-gate.sh --config ~/system/bili-gate.json --rev <分支或 tag>
 
 # 常用参数
-scripts/gate/bili-gate.sh --config ... --skip u,i,x        # 只跑 A/B/P/R
+scripts/gate/bili-gate.sh --config ... --skip u,i,x        # 只跑 A/B/P/R/W
 scripts/gate/bili-gate.sh --config ... --keep              # 全绿也保留 scratch
 scripts/gate/bili-gate.sh --config ... --dry-run           # 只打印 docker 命令
 ```

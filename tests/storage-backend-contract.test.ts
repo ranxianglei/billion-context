@@ -10,6 +10,10 @@ import { planIngest, planIngestDelta, type LegacySessionLike } from "../src/stor
 import { openBackend, listBackendNames, type StorageBackend } from "../src/storage/backend.ts";
 
 const MYSQL_DSN = process.env.BILI_MYSQL_TEST_DSN ?? "";
+// KDD #25: the contract suite exercises the legacy ingest path on fresh
+// databases; force the full table set so a host config with egressPlane
+// forced on cannot make openBackend skip the legacy group.
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 
 /** The suite runs against every backend it can reach: sqlite always, mysql
  *  when BILI_MYSQL_TEST_DSN is exported (CI runs a mysql:8.0 service). The

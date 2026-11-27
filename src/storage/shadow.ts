@@ -31,13 +31,12 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { featureEnabled } from "../rollout.js";
 import { planIngest, planIngestDelta, planIngestReanchor, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { CcrLedgerRow } from "./slim.ts";
 import { splitMediaContent } from "./identity.js";
 import { rebuildEgressKstateOverlay, type EgressBlockSnapshot } from "./egress-block.ts";
 import type { BlockView } from "../session.js";
-import { effectiveJsonWriterOff, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.ts";
+import { effectiveJsonWriterOff, egressPlaneGateOn, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.js";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
@@ -420,6 +419,13 @@ export class UnifiedShadow {
             try {
                 store = UnifiedStore.open(`${dir}/index.db`, undefined, {
                     walJournalSizeLimitBytes: walLimit,
+                    // KDD #25 (discussions/7735): an eg-mode fresh database gets
+                    // only the core trio + egress groups; the 12 legacy tables
+                    // are probed back in on a later open once the flag is off.
+                    // BILI_TEST_FORCE_FULL_DDL (TEST-ONLY escape hatch): suites
+                    // asserting the LEGACY table shape while egressPlane=1
+                    // simulate a pre-gate DB and set it — production never does.
+                    legacyTables: !egressPlaneGateOn() || !!process.env.BILI_TEST_FORCE_FULL_DDL,
                 });
             } catch (err) {
                 // #4175: anything else throwing StorageIntegrityError means quick_check
@@ -727,7 +733,7 @@ export class UnifiedShadow {
             // with the session, so after an install turns the plane off it
             // would otherwise keep the sampled verification off and keep the
             // delta fast path latched forever for that session.
-            if (legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane") && this.driftedSessions.delete(legacy.id)) {
+            if (legacy.metadata?.egressAuthority === true && egressPlaneGateOn() && this.driftedSessions.delete(legacy.id)) {
                 this.driftStreaks.delete(legacy.id);
                 if (this.frozenEnvelopeIds.delete(legacy.id)) {
                     this.frozenEnvelopeSince.delete(legacy.id);
@@ -739,7 +745,7 @@ export class UnifiedShadow {
             // it re-latches the known canonical≠client divergence (the #5677
             // chronic loop source). The egress probe (client bytes vs flow
             // sampled rows) is the sole verification for egress-on sessions.
-            const egressOn = legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane");
+            const egressOn = legacy.metadata?.egressAuthority === true && egressPlaneGateOn();
             if (!egressOn && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
@@ -956,16 +962,16 @@ export class UnifiedShadow {
                     // stored state verbatim (no fuzzy guessing — same
                     // discipline as the message-log degrade ladder); lastPassIds
                     // self-heals on the first pass (deliberately not rebuilt).
-                    if (featureEnabled("egressKstateRebuild")) {
-                        try {
-                            const max = store.egressBlockMaxSeq(id);
-                            const replay = max > 0
-                                ? store.egressBlockReplay(id, max)
-                                : { blocks: new Map<string, EgressBlockSnapshot>(), kstate: null };
-                            Object.assign(view.state, rebuildEgressKstateOverlay(replay, store.egressStateView(id)));
-                        } catch (err) {
-                            loggerLog("warn", `[storage] egress kstate rebuild failed for ${id} (${String(err)}) — stored kstate kept`);
-                        }
+                    // KDD #25 (owner ruling 2026-11-26): folded into egressPlane —
+                    // ONE switch; the former egressKstateRebuild gate was removed.
+                    try {
+                        const max = store.egressBlockMaxSeq(id);
+                        const replay = max > 0
+                            ? store.egressBlockReplay(id, max)
+                            : { blocks: new Map<string, EgressBlockSnapshot>(), kstate: null };
+                        Object.assign(view.state, rebuildEgressKstateOverlay(replay, store.egressStateView(id)));
+                    } catch (err) {
+                        loggerLog("warn", `[storage] egress kstate rebuild failed for ${id} (${String(err)}) — stored kstate kept`);
                     }
                     if (view.state.tsStamps === undefined) {
                         const derived = store.egressTsStamps(id);
@@ -1571,7 +1577,7 @@ export class UnifiedShadow {
                 this.ingestCounts.set(legacy.id, count);
                 // #7439 item 1: BatchedViewVerification disabled for egress-on
                 // sessions (same rationale as the sync path above).
-                const egressOnAsync = legacy.metadata?.egressAuthority === true && featureEnabled("egressPlane");
+                const egressOnAsync = legacy.metadata?.egressAuthority === true && egressPlaneGateOn();
                 if (!egressOnAsync && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
                     this.stats.verifySamples++;
                     const sessionRow = await backend.getSessionRow(legacy.id);
