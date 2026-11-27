@@ -149,10 +149,22 @@ function loadJimp(): Promise<JimpModule | null> {
     return jimpLoad;
 }
 
-// force (#3701 byte-shed ladder): adopts ANY strict byte reduction (not just <80%).
-// The 100 KiB trigger gate applies equally to both; a within-maxDim image is
-// re-encoded only if it exceeds the trigger. The byte-shed caller pre-filters
-// maxDim-fitting images before calling (egress-shed rung B).
+/** True when every pixel in the decoded RGBA bitmap is fully opaque (alpha === 255).
+ *  Used to guard opaque-PNG → JPEG fallback so images with transparency never
+ *  lose their alpha channel. */
+function isOpaqueRgba(data: Uint8Array): boolean {
+    for (let i = 3; i < data.length; i += 4) {
+        if (data[i] !== 255) return false;
+    }
+    return true;
+}
+
+// force (#3701 byte-shed ladder): adopts ANY strict byte reduction (not just <80%)
+// and keeps the original MIME (shedDownscaleImage returns bare base64 without a
+// media-type channel). On the standard egress rescale pass (!force), when a
+// lossless PNG re-encode fails KEEP_RATIO (common for OS-compressed opaque UI
+// screenshots resized via Jimp's PNG encoder) and the image has no alpha
+// transparency, fall back to JPEG at JPEG_QUALITY and propagate the new mime.
 async function doRescale(mime: RescaledMime, b64: string, origBytes: number, maxDim: number, force = false): Promise<RescaledImage | null> {
     try {
         const mod = await loadJimp();
@@ -167,10 +179,19 @@ async function doRescale(mime: RescaledMime, b64: string, origBytes: number, max
         const tw = Math.max(1, Math.round(ow * scale));
         const th = Math.max(1, Math.round(oh * scale));
         if (tw !== ow || th !== oh) await img.resize({ w: tw, h: th });
-        const out = mime === "image/jpeg"
+        let outMime: RescaledMime = mime;
+        let out = mime === "image/jpeg"
             ? await img.getBuffer("image/jpeg", { quality: JPEG_QUALITY })
             : await img.getBuffer(mime);
-        if (force ? out.length >= origBytes : out.length >= origBytes * KEEP_RATIO) return null;
+        const keepLimit = force ? origBytes : origBytes * KEEP_RATIO;
+        if (!force && mime === "image/png" && out.length >= keepLimit && isOpaqueRgba(img.bitmap.data)) {
+            const jpg = await img.getBuffer("image/jpeg", { quality: JPEG_QUALITY });
+            if (jpg.length < keepLimit && jpg.length < out.length) {
+                out = jpg;
+                outMime = "image/jpeg";
+            }
+        }
+        if (out.length >= keepLimit) return null;
         return {
             base64: out.toString("base64"),
             width: tw,
@@ -179,7 +200,7 @@ async function doRescale(mime: RescaledMime, b64: string, origBytes: number, max
             origHeight: oh,
             origBytes,
             newBytes: out.length,
-            mime,
+            mime: outMime,
             fresh: true,
         };
     } catch {
@@ -343,7 +364,7 @@ async function rescaleAnthropic(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMe
         if (!r) return undefined;
         const ref = refFor(ctx.session, m.id);
         logCompression(ctx, ref, r);
-        const copy: BiliMessage = { ...m, rawAnthropicBlock: { ...block, source: { ...src, data: r.base64 } } };
+        const copy: BiliMessage = { ...m, rawAnthropicBlock: { ...block, source: { ...src, media_type: r.mime, data: r.base64 } } };
         // The codec drops m.text ("[image]") when rawAnthropicBlock is set, so
         // the annotation rides a SEPARATE adjacent core message: same role →
         // coreToAnthropic merges both into one wire message [image, text].
@@ -364,7 +385,7 @@ async function rescaleAnthropic(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMe
                     if (r) {
                         any = true;
                         logCompression(ctx, ref, r);
-                        changed.push({ ...p, source: { ...src, data: r.base64 } });
+                        changed.push({ ...p, source: { ...src, media_type: r.mime, data: r.base64 } });
                         changed.push({ type: "text", text: noteFor(ctx, ref, r) });
                         continue;
                     }
@@ -395,7 +416,7 @@ async function rescaleOpenaiParts(m: BiliMessage, ctx: RescaleCtx): Promise<Bili
                         if (r) {
                             any = true;
                             logCompression(ctx, ref, r);
-                            changed.push({ ...p, image_url: { ...(asPart(p.image_url) ?? {}), url: `data:${d.mediaType};base64,${r.base64}` } });
+                            changed.push({ ...p, image_url: { ...(asPart(p.image_url) ?? {}), url: `data:${r.mime};base64,${r.base64}` } });
                             changed.push({ type: "text", text: noteFor(ctx, ref, r) });
                             continue;
                         }
@@ -423,7 +444,7 @@ async function rescaleOpenaiParts(m: BiliMessage, ctx: RescaleCtx): Promise<Bili
         const copy: BiliMessage = {
             ...m,
             rawOpenaiContentParts: [
-                { ...p, image_url: { ...(asPart(p.image_url) ?? {}), url: `data:${d.mediaType};base64,${r.base64}` } },
+                { ...p, image_url: { ...(asPart(p.image_url) ?? {}), url: `data:${r.mime};base64,${r.base64}` } },
                 { type: "text", text: noteFor(ctx, ref, r) },
             ],
         };
@@ -450,7 +471,7 @@ async function rescaleGoogle(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessa
             if (r) {
                 any = true;
                 logCompression(ctx, ref, r);
-                changed.push({ ...p, inlineData: { ...inline, data: r.base64 } });
+                changed.push({ ...p, inlineData: { ...inline, mimeType: r.mime, data: r.base64 } });
                 notes.push(noteFor(ctx, ref, r));
                 continue;
             }
@@ -485,7 +506,7 @@ async function rescaleResponsesItem(m: BiliMessage, ctx: RescaleCtx): Promise<Bi
                 if (r) {
                     if (!first) first = r;
                     logCompression(ctx, ref, r);
-                    changed.push({ ...p, image_url: `data:${d.mediaType};base64,${r.base64}` });
+                    changed.push({ ...p, image_url: `data:${r.mime};base64,${r.base64}` });
                     // NO note part inside the item: coreToResponses' verbatim
                     // condition compares the item's display text against
                     // m.text — an inserted text part breaks the round-trip and
@@ -512,7 +533,7 @@ async function rescaleBareSidecar(m: BiliMessage, ctx: RescaleCtx): Promise<Bili
     logCompression(ctx, ref, r);
     const note = noteFor(ctx, ref, r);
     const text = (m.text ?? "") + ((m.text ?? "").length > 0 ? "\n\n" : "") + note;
-    return [{ ...m, imageBase64: r.base64, text }];
+    return [{ ...m, imageBase64: r.base64, imageMediaType: r.mime, text }];
 }
 
 /** The shared egress pass: walks the generic message structure once and
@@ -626,7 +647,7 @@ export async function applyImageRescaleItems(items: unknown[], ctx: RescaleCtx):
                             any = true;
                             const ref = await refForItemBytes(ctx.session, d.mediaType, d.base64);
                             logCompression(ctx, ref, r);
-                            changed.push({ ...p, image_url: `data:${d.mediaType};base64,${r.base64}` });
+                            changed.push({ ...p, image_url: `data:${r.mime};base64,${r.base64}` });
                             changed.push({ type: "input_text", text: noteFor(ctx, ref, r) });
                             continue;
                         }
