@@ -5,6 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import { PrefixAffinityResolver, prefixAffinity, MAX_TRACKED_SESSIONS } from "../src/prefix-affinity.ts";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "../src/affinity-persist.ts";
+// KDD #25 hermeticity: legacy file-persistence suite — pin the plane OFF so a host
+// config with rollout.features.egressPlane forced on cannot flip the eg-mode
+// memory-only gate mid-suite.
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 
 let tmp: string;
 

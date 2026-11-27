@@ -57,6 +57,10 @@ const SAVED_PLANE = process.env.BILI_ROLLOUT_EGRESS_PLANE;
 process.env.NODE_ENV = "test";
 process.env.BILI_STORAGE_UNIFIED = "full";
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+// KDD #25: the fork flows read the legacy view getters (viewFor) — these
+// suites simulate a pre-gate DB (full table set) while egressPlane=1;
+// the 7-table invariant lives in tests/eg-sweep-egress-identity.test.ts.
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 
 type Snap = { parentRevision: string; orderHash: string; orderedMessages: Array<{ rawId: string; ref: string | null; identityHash: string }> };
 
@@ -424,12 +428,15 @@ test("#7658 T5: fork-then-compress — the child's client-side fold books correc
         assert(summaryRow!.num > parentHighWater, `summary number ${summaryRow!.num} continues above the parent high water ${parentHighWater}`);
         for (const id of ["p5-id-1", "p5-id-2", "p5-id-3"]) assert(!liveIds.has(id), `covered cell ${id} must be retired from the child flow`);
 
-        // Compaction: a D-bearing batch wrote the B base row and physically
-        // pruned the log before it — the flow is not a raw append-only dump.
+        // 7773: the flow is a raw append-only dump — the fold's D ops stay in
+        // it, and it is the STATE plane that is materialized (covered rows
+        // physically deleted, no compaction base rows).
         const { DatabaseSync } = await import("node:sqlite");
         const raw = new DatabaseSync(`${h.dir}/sessions/index.db`, { readOnly: true });
-        const bCount = (raw.prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = 'c5' AND row_type = 'B'").get() as { n: number }).n;
-        assert.ok(bCount >= 1, `the D-run triggered compaction (B rows: ${bCount})`);
+        const dCount = (raw.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = 'c5' AND row_type = 'D'").get() as { n: number }).n;
+        assert.ok(dCount >= 1, `the fold's D ops are in the append-only flow (D rows: ${dCount})`);
+        const stateCount = (raw.prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = 'c5'").get() as { n: number }).n;
+        assert.ok(stateCount < childView.length + 1, `the state plane is materialized and shrank with the fold (state rows: ${stateCount}, live view: ${childView.length})`);
         raw.close();
 
         // The next turn still serves from the child's own flow (no legacy
@@ -790,12 +797,9 @@ test("T10 kstate retirement: the cold egress-on load rebuilds blocks/refs/tsStam
     // shape) — a cold fork of it inherits nothing. PR-B makes the load the
     // rebuild point: blocks from the block ledger (PR-A writes it),
     // messageRefs/tsStamps from the message flow, residual from the sidecar.
-    const REBUILD_ENV = "BILI_ROLLOUT_EGRESS_KSTATE_REBUILD";
-    const RETIRE_ENV = "BILI_ROLLOUT_EGRESS_KSTATE_RETIRE_WRITES";
-    const savedRebuild = process.env[REBUILD_ENV];
-    const savedRetire = process.env[RETIRE_ENV];
-    process.env[REBUILD_ENV] = "1";
-    process.env[RETIRE_ENV] = "1";
+    // KDD #25 (owner ruling 2026-11-26): the former egressKstateRetireWrites / egressKstateRebuild
+    // gates were removed — the kstate retirement+rebuild is part of egressPlane itself
+    // (ONE switch), so no env pin is needed here.
     const logs: string[] = [];
     const h = await harness(logs);
     try {
@@ -848,21 +852,10 @@ test("T10 kstate retirement: the cold egress-on load rebuilds blocks/refs/tsStam
         } finally {
             store2.cancelAll();
         }
-        // PHASE 2 (PR-B OFF = legacy): the same cold load comes back with an
-        // EMPTY block set — the pinned gap PR-B closes (the column never
-        // carried the live state of an armed session).
-        process.env[REBUILD_ENV] = "0";
-        const store3 = new SessionStore({ dir: h.dir + "/sessions", enabled: true, debounceMs: 15 });
-        try {
-            const legacy = await store3.loadAsync("p10");
-            assert(legacy !== null, "legacy cold load finds the session");
-            assert.equal(legacy!.state.blocks.length, 0, "legacy: the folded block is LOST on cold load (the gap)");
-        } finally {
-            store3.cancelAll();
-        }
+        // PHASE 2 (the pre-PR-B off-arm) is gone with the separate gate:
+        // KDD #25 folded retirement+rebuild into egressPlane (ONE switch),
+        // so the cold load above is the only behavior to pin.
     } finally {
-        if (savedRebuild === undefined) delete process.env[REBUILD_ENV]; else process.env[REBUILD_ENV] = savedRebuild;
-        if (savedRetire === undefined) delete process.env[RETIRE_ENV]; else process.env[RETIRE_ENV] = savedRetire;
         await h.close(h.store);
     }
 });
