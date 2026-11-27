@@ -796,6 +796,16 @@ export class MysqlBackend implements StorageBackend {
             // assignments left-to-right: inspect the OLD parent for the fork
             // point before assigning the parent, or first-time lineage loses
             // its fork point. Later metadata cannot reparent a cloned child.
+            // #5597-C: the orphan-journal generation must be read BEFORE the
+            // upsert overwrites metadata_json — after the write the surviving
+            // row already carries the incoming value and the clear never
+            // registers. Same transaction, same row, so this cannot race.
+            const [priorMetaRows] = (await c.query("SELECT metadata_json FROM sessions WHERE session_id = ?", [
+                s.sessionId,
+            ])) as unknown as Row[][];
+            const priorOrphanJournalGeneration = this.storedOrphanJournalGeneration(
+                priorMetaRows.length > 0 ? str(priorMetaRows[0].metadata_json) : null,
+            );
             await c.query(
                 `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
                    status, created_at, updated_at, next_block_id, next_run_id,
@@ -851,7 +861,15 @@ export class MysqlBackend implements StorageBackend {
             );
             // #6785 step 7: orphans ride the orphan_blocks table (the column
             // merges + migrates once, then retires) — same as the sqlite leg.
-            await this.applyOrphanBlocksOn(c, s.sessionId, s.orphansJson ?? null);
+            // #5597-C: an authoritative clear (generation bump) drops this
+            // session's journal rows before the merge.
+            await this.applyOrphanBlocksOn(
+                c,
+                s.sessionId,
+                s.orphansJson ?? null,
+                priorOrphanJournalGeneration,
+                input.orphanJournalGeneration ?? 0,
+            );
             // #6785 step 8: row-backed kstate fields (state_fields table).
             await this.applyStateFieldsOn(c, s.sessionId, input.stateFields ?? {});
             const batchTs = Date.now(); // #4313: one sample per save batch
@@ -1407,15 +1425,46 @@ export class MysqlBackend implements StorageBackend {
             }
             // #6785 step 7: the reaped-block journal lives in orphan_blocks
             // now (same merge semantics as the column did — incoming wins on
-            // key collision, trimmed entries survive).
-            await this.applyOrphanBlocksOn(c, sessionId, orphanContents.size > 0 ? JSON.stringify(Object.fromEntries(orphanContents)) : null);
+            // key collision, trimmed entries survive). #5597-C: a reap is not
+            // an authoritative clear, so both generations stay 0.
+            await this.applyOrphanBlocksOn(
+                c,
+                sessionId,
+                orphanContents.size > 0 ? JSON.stringify(Object.fromEntries(orphanContents)) : null,
+                0,
+                0,
+            );
         });
+    }
+
+    /** #5597-C: the persisted authoritative-clear generation (MySQL twin of
+     *  UnifiedStore.storedOrphanJournalGeneration) — absent/malformed reads 0. */
+    private storedOrphanJournalGeneration(metadataJson: string | null): number {
+        if (typeof metadataJson !== "string" || metadataJson.length === 0) return 0;
+        try {
+            const parsed = JSON.parse(metadataJson) as { orphanJournalGeneration?: unknown };
+            const value = parsed?.orphanJournalGeneration;
+            return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+        } catch {
+            return 0;
+        }
     }
 
     /** #6785 step 7 (MySQL twin of UnifiedStore.applyOrphanBlocks): merge
      *  legacy column ∪ incoming onto the orphan_blocks table, upsert each
-     *  entry, then retire the column. */
-    private async applyOrphanBlocksOn(c: PoolConnection | Pool, sessionId: string, incomingJson: string | null): Promise<void> {
+     *  entry, then retire the column. #5597-C: when `generation` exceeds
+     *  `priorGeneration` this is an authoritative clear — the session's
+     *  journal rows are dropped first so nothing survives the reset. */
+    private async applyOrphanBlocksOn(
+        c: PoolConnection | Pool,
+        sessionId: string,
+        incomingJson: string | null,
+        priorGeneration: number,
+        generation: number,
+    ): Promise<void> {
+        if (generation > priorGeneration) {
+            await c.query("DELETE FROM orphan_blocks WHERE session_id = ?", [sessionId]);
+        }
         const [col] = (await c.query("SELECT orphans_json FROM sessions WHERE session_id = ?", [sessionId])) as unknown as Row[][];
         const colRaw = col.length > 0 ? col[0].orphans_json : null;
         const hadColumn = colRaw !== null && colRaw !== undefined;

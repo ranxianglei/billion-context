@@ -658,7 +658,16 @@ function finishPlan(
         ccrJson: session.contentStore ? JSON.stringify(slimCcrEnvelope(session.contentStore)) : null,
     };
 
-    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, stateFields, pluginSnapshotSeqs, tailSeqs };
+    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, stateFields, pluginSnapshotSeqs, tailSeqs, orphanJournalGeneration: orphanJournalGenerationOf(session) };
+}
+
+/** #5597-C: the plan's authoritative-clear generation — bumped by
+ *  resetSessionCompression when a rebase empties blockContents for good. The
+ *  store compares it with the persisted row and drops the orphan journal on
+ *  an increase; an ordinary save (no bump) merges as before. */
+export function orphanJournalGenerationOf(session: { metadata?: Record<string, unknown> }): number {
+    const value = session.metadata?.orphanJournalGeneration;
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 /** Rebuilds the legacy load view from unified rows alone. */

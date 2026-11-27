@@ -50,14 +50,14 @@ const T_SEEN = 1_700_000_000_500;
 
 type OrphanMap = Map<string, { one: null; full: { text: string; count: number } }>;
 
-function mkLegacy(id: string, blockContents: OrphanMap): LegacySessionLike {
+function mkLegacy(id: string, blockContents: OrphanMap, orphanJournalGeneration = 0): LegacySessionLike {
     return {
         id,
         createdAt: T_CREATED,
         lastSeen: T_SEEN,
         meta: { protocol: "anthropic" },
         stats: { requests: 1 },
-        metadata: {},
+        metadata: orphanJournalGeneration > 0 ? { orphanJournalGeneration } : {},
         state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 1, nextRunId: 1 } as unknown as LegacySessionLike["state"],
         blockContents: blockContents as unknown as LegacySessionLike["blockContents"],
         lastMessages: [msg(0), msg(1)],
@@ -98,9 +98,11 @@ test("#5589-C: an authoritative clear must not latch a ghost-journal drift", () 
         let s = stats(shadow);
         assert.equal(s.verifySamples, 1, "first save must run the sampled verify");
         assert.equal(s.verifyDrift, 0, "reap shape with journal coverage must be clean (#4216/#4242)");
-        // Generation 2: a native-compaction rebase cleared blockContents. The
+        // Generation 2: a native-compaction rebase cleared blockContents and
+        // bumped the authoritative-clear generation (#5597-C) — the store must
+        // drop the journal rows on the first save carrying the new value. The
         // 21st save carries the second sampled verify.
-        for (let i = 0; i < 20; i++) shadow.record(mkLegacy("ghost", new Map()));
+        for (let i = 0; i < 20; i++) shadow.record(mkLegacy("ghost", new Map(), 2));
         s = stats(shadow);
         assert.equal(s.verifySamples, 2, "the 21st save must run the second sampled verify");
         assert.equal(s.verifyDrift, 0, "an authoritative clear must reset the journal, not leave ghosts behind (pre-fix: 1)");
