@@ -83,6 +83,15 @@ entries:
     desc_en: "Escape hatch for the pure-sqlite proven-corruption refusal (2026-11-21, #7156): 1/true/on restores the historical alarm-and-degrade contract (start WITHOUT the index, serve the JSON path) even though the corrupt index is the ONLY persistent copy — every turn served that way lands only in the non-durable view. Never the default, never implied by any config value."
     desc_zh: "纯 SQLite 姿态下“证实损坏拒启”的逃生阀（2026-11-21，#7156）：设 1/true/on 可恢复旧契约——响亮告警后照常不挂索引启动、以 JSON 路径服务，尽管此时损坏的索引是唯一持久副本，这样服务的每一轮都只落在非持久视图里。永不缺省、不被任何配置值隐含。"
     desc_ja: "ピュア SQLite 姿勢の本破損拒否の脱出ハッチ (2026-11-21, #7156): 1/true/on は、破損したインデックスが唯一の永続コピーであるにもかかわらず、従来のアラーム & デグレード契約 (インデックスなしで起動し、JSON パスでサーブ) を復元する — そのようにサーブされた各ターンは非永続ビューにのみ落ちる。決してデフォルトではなく、いかなる設定値からも暗黙にはされない。"
+  - key: BILI_TEST_FORCE_FULL_DDL
+    type: boolean-ish
+    default: "off"
+    kind: env-only
+    audience: test
+    group: envonly
+    desc_en: "TEST-ONLY escape hatch (KDD #25 / #7735): on an egressPlane-enabled instance, 1 forces the full 12-table legacy DDL instead of the 7-table egress gate, so the suites can exercise the legacy read paths on an eg instance. Never set in production; no config-file key by design (test surface only)."
+    desc_zh: "仅测试用的逃生口（KDD #25 / #7735）：egressPlane 开启的实例设 1 时强制创建全部 12 张 legacy 表（而不是 7 表 egress 门），让测试套件能在 eg 实例上走 legacy 读路径。生产永不设置；刻意无配置文件键（纯测试面）。"
+    desc_ja: "テスト専用エスケープハッチ (KDD #25 / #7735): egressPlane 有効インスタンスで 1 を設定すると 7 表 egress ゲートに代えて全 12 表 legacy DDL を強制作成し、テストスイートが eg インスタンス上で legacy 読み取りパスを実行できる。本番では決して設定しない; 設計上設定ファイルキーなし (純テスト面)。"
   - key: BILI_SNAPSHOT_SHADOW
     type: boolean
     default: "true (on)"
@@ -101,15 +110,7 @@ entries:
     desc_en: "Override the config file path (path relocation). A bare NAME (no `/`) selects the named config `<configDir>/NAME.json`; a missing NAME fails fast listing the available names, a missing explicit PATH keeps its historical empty-config behavior."
     desc_zh: "覆盖配置文件路径（路径重定位）。不带 `/` 的纯名字 NAME 选择命名配置 `<configDir>/NAME.json`；名字写错立即报错并列出可用名字，显式路径写错保持历史空配置行为。"
     desc_ja: "設定ファイルのパスを上書きする（パスの再配置）。スラッシュ `/` を含まない名前（NAME）のみは命名設定 `<configDir>/NAME.json` を選択します。名前が誤っている場合は利用可能な名前を列挙して即座にエラーとなり、明示的なパスが誤っている場合は従来の空設定の挙動を維持します。"
-  - key: BILI_SESSIONS_DIR
-    type: string
-    default: "unset (XDG state path)"
-    kind: env-only
-    audience: user
-    group: envonly
-    desc_en: "Where session records are stored (path relocation)."
-    desc_zh: "会话记录的存放目录（路径重定位）。"
-    desc_ja: "セッションレコードの保存先（パスの再配置）。"
+  # BILI_SESSIONS_DIR now has a file-key twin (sessions.dir, #7803) — it lives in process.yaml.
   - key: BILI_ENCRYPTION_KEY
     type: string
     default: "unset"
@@ -551,6 +552,15 @@ entries:
     desc_en: "Test hook: recovery sweep interval for the dsh lane."
     desc_zh: "测试钩子：dsh 车道恢复清扫间隔。"
     desc_ja: "テストフック: dsh レーンのリカバリスウィープ間隔。"
+  - key: BILI_TEST_FORCE_FULL_DDL
+    type: boolean-ish
+    default: "unset (egress-plane creation gate applies)"
+    kind: env-only
+    audience: test
+    group: envonly
+    desc_en: "TEST-ONLY escape hatch (KDD #25): with egressPlane on, a FRESH database normally gets only the core trio (sessions/session_ext/kv_store) + the four egress tables (7-table shape); the 12 legacy tables are not created. Test suites that assert the pre-gate legacy table shapes (l1_world/conversations/messages rows) set this to 1 to force the full DDL and simulate a pre-gate DB. Production never sets it; unset = the egress-plane creation gate applies (read point src/storage/shadow.ts UnifiedShadow.maybeOpen)."
+    desc_zh: "测试专用逃生口（KDD #25）：egressPlane 开启时**新建**库默认只建核心三件套（sessions/session_ext/kv_store）+ 四张 egress 表（7 表形态），12 张 legacy 表不创建。断言门禁前 legacy 表形状（l1_world/conversations/messages 行）的测试套件设 `=1` 强制建全表、模拟门禁前的库。生产永不设置；缺省 = egress-plane 创建门生效（读点 src/storage/shadow.ts 的 UnifiedShadow.maybeOpen）。"
+    desc_ja: "テスト専用エスケープハッチ (KDD #25): egressPlane がオンでは、新規データベースは通常コア3点セット (sessions/session_ext/kv_store) + 4 つの egress テーブル (7 テーブル形状) のみを作成し、12 個の legacy テーブルは作成されない。ゲート前の legacy テーブル形状 (l1_world/conversations/messages 行) をアサートするテストスイートは、これを 1 に設定して完全な DDL を強制し、ゲート前の DB をシミュレートする。本番では決して設定しない; 未設定 = egress-plane 作成ゲートが適用される (読み取り点 src/storage/shadow.ts の UnifiedShadow.maybeOpen)。"
   - key: ACP_DUMP_DIR
     type: string
     default: "unset"

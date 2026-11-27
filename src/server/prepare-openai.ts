@@ -42,7 +42,7 @@ import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
-import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { egressPlaneGateOn, imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { SessionStore } from "../persist.js";
 import { FoundationRejectError } from "../snapshot/plane.js";
 import { runStage0 } from "../snapshot/stage0.js";
@@ -63,7 +63,7 @@ interface EgressRecordSourceMsg {
     text?: unknown;
 }
 import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
-import { resolveEgressAuthority, egressAuthorityArmed } from "./egress-lane-io.js";
+import { resolveEgressAuthority, egressAuthorityArmed, egressBlockLedgerFor, stampEgressSeqs } from "./egress-lane-io.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
@@ -397,7 +397,11 @@ export async function prepareOpenai(
         // re-mints #3752); only the live tail keeps the client's bytes.
         // No-op returns `msgs` when the lane is inactive/degraded.
         // reconcileFoldCoverage below still observes the CLIENT view.
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        let renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #7439 follow-up (C6): egress-on sequence authority — canonical 1-based
+        // flow message numbers on the kernel-visible cores (same reference when
+        // the plane does not record this session; the id path stays authoritative).
+        renderMsgs = stampEgressSeqs(getStore()?.egressOpLogStore(), sessionId, renderMsgs);
 
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
@@ -702,7 +706,7 @@ export async function prepareOpenai(
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         if (blockOpsActive) sysParts.push(buildBlockOpsSystemPrompt("function"));
         openaiOutboundSystem = sysParts.join("\n\n");
-        if (!isTitleGen && featureEnabled("egressPlane") && !(egressArmed && !egressSwapApplied)) {
+        if (!isTitleGen && egressPlaneGateOn() && !(egressArmed && !egressSwapApplied)) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 try {
@@ -714,6 +718,8 @@ export async function prepareOpenai(
                         conversation: egressMessages,
                         systemText: openaiOutboundSystem,
                         nowMs: Date.now(),
+                        blockLedger: egressBlockLedgerFor(session),
+                        refMap: session.state.messageRefs,
                     });
                     const reb = rebuildOutboundFromLog(view);
                     if (reb !== null) {
@@ -960,7 +966,7 @@ export async function prepareOpenai(
     // empty flow records the client view ONCE — that is the cold start, not
     // "untrusted bytes advancing the flow" (there is no flow to advance
     // against; from turn 2 the armed gate is fully enforced again).
-    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog && !(egressArmed && !egressSwapApplied && !egressBootstrap)) {
+    if (!isTitleGen && egressPlaneGateOn() && !egressServedFromLog && !(egressArmed && !egressSwapApplied && !egressBootstrap)) {
         try {
             const st = getStore().egressOpLogStore();
             if (st) {
@@ -972,6 +978,8 @@ export async function prepareOpenai(
                     conversation: egressRecordSource ?? (processedMessages.length > 0 ? processedMessages : originalMessages),
                     systemText: openaiOutboundSystem ?? openaiSystemText,
                     nowMs: Date.now(),
+                    blockLedger: egressBlockLedgerFor(session),
+                    refMap: session.state.messageRefs,
                 });
             }
         } catch (err) {
@@ -988,7 +996,7 @@ export async function prepareOpenai(
     // identity rate the swap will rely on (rollout egressPlane, default 0;
     // reads the hydrated flow view — on a bootstrap turn that is the view
     // the record above just wrote, i.e. an exact self-compare).
-    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog) {
+    if (!isTitleGen && egressPlaneGateOn() && !egressServedFromLog) {
         try {
             const st = getStore().egressOpLogStore();
             const view = egressBaseRows ?? (st ? st.egressStateView(sessionId) : undefined);

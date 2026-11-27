@@ -141,7 +141,11 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // partial swap, never client-as-authority). OFF = legacy chain, zero
     // rows, byte-identical to pre-feature.
     // Force with `rollout.features.egressPlane: true` or
-    // `BILI_ROLLOUT_EGRESS_PLANE=1`.
+    // `BILI_ROLLOUT_EGRESS_PLANE=1`. NOTE: this entry's percent is
+    // structurally inert — the plane has ONE side-effect-free gate
+    // (egressPlaneGateOn in knobs.ts) that reads env > config boolean only;
+    // install-id bucketing is unusable on the store-open path (KDD #25 wx
+    // race), and two disagreeing gates manufacture mixed states.
     egressPlane: { percent: 0 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
@@ -483,6 +487,14 @@ export function warnRolloutConfigProblems(): void {
         }
         if (raw.percent !== undefined && percentBp(raw.percent) === undefined) {
             problems.push(`${name}.percent (ignored: must be a number 0–100, got ${JSON.stringify(raw.percent)})`);
+        }
+        // egressPlane has a single side-effect-free gate (egressPlaneGateOn)
+        // that ignores install-id bucketing (KDD #25: featureEnabled's
+        // bootstrap races inside UnifiedStore.open) — a percent-only
+        // override for it does nothing at all; name it like every other
+        // inert entry instead of letting it silently no-op.
+        if (name === "egressPlane" && raw.percent !== undefined && raw.enabled !== true) {
+            problems.push(`${name}.percent (no effect: the egress plane's single gate ignores bucketing — use enabled: true or BILI_ROLLOUT_EGRESS_PLANE=1)`);
         }
     }
     if (problems.length === 0) return;
