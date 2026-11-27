@@ -2482,6 +2482,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         opts.streamErrorShape,
                         hostOwnsTruncationRecovery,
                         degenerateRetryCfg?.maxAttempts,
+                        opts.degenerateTurn,
                     );
                 }
             } else {
@@ -2722,6 +2723,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     opts.streamErrorShape,
                     hostOwnsTruncationRecovery,
                     degenerateRetryCfg?.maxAttempts,
+                    opts.degenerateTurn,
                 );
             }
         } else if (

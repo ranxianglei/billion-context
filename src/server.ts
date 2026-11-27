@@ -86,7 +86,7 @@ import { AUTO_FOLD_TARGET_MIN, AUTO_FOLD_MIN_BENEFIT_TOKENS } from "./external-s
 import { auditStartupSummaryCredentials } from "./external-summary-credentials.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
-import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
+import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, setEgressUsageSink, setEgressUsageStatsSink, settleUsageReport } from "./cache-ledger.js";
 import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
 import { epochConfirmPending } from "./fold-reconcile.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
@@ -601,6 +601,18 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // any file-only routes one time (needs initSessions' store to be live).
     void hydratePluginConversationsUnified();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
+    // Egress usage plane (8th egress table): the cache ledger is in-memory;
+    // these sinks append its event stream to egress_usage (null store =
+    // legacy backend → the ledger simply never survives a restart, same as
+    // before this plane existed). Sink failures are swallowed inside the
+    // emitter (warn-once) — the stream degrades, the request never does.
+    setEgressUsageSink((sessionId, events) => {
+        getStore().egressOpLogStore()?.egressUsageAppend(sessionId, events);
+    });
+    setEgressUsageStatsSink((sessionId, json) => {
+        const st = getStore().egressOpLogStore();
+        st?.writeUsageStatsBestEffort(sessionId, json, (m) => log("warn", m));
+    });
     // #2807: restore fork lineage that a restart orphaned. Every fork writes
     // metadata.derivedFromSessionId, but both adoption paths read process-local
     // state (prefixAffinity.trackedChains for the byte-prefix path, the plugin

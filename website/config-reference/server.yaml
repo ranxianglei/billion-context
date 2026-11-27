@@ -407,6 +407,14 @@ entries:
     desc_en: "How upstream stream failures are presented after the 200 is committed: protocol-native error frames (default) or the legacy synthesized-completion shape."
     desc_zh: "200 已提交后上游流失败的呈现方式：协议原生错误帧（默认）或旧版合成完成形态。"
     desc_ja: "200 がコミットされた後、上流ストリーム失敗がどのように提示されるか：プロトコルネイティブのエラーフレーム（デフォルト）またはレガシーの合成完了形状。"
+  - key: compat.degenerateTurn
+    type: "\"error\" | \"passthrough\""
+    default: "error"
+    env: BILI_DEGENERATE_TURN
+    group: behavior
+    desc_en: "Terminal for the plugin chat pipe when the degenerate-turn retry ALSO ends with no usable output (#4913): in-band stream error (default, #870) or the empty turn passed through as a normal completion (pre-#870)."
+    desc_zh: "plugin chat 管道的退化回合重试后仍无可用输出时的终局（#4913）：带内流错误（默认，#870）或把空回合作为正常完成放行（pre-#870）。"
+    desc_ja: "プラグインチャットパイプで退化ターンのリトライ後も利用可能な出力がゼロだった場合の終了処理（#4913）：インバンドストリームエラー（デフォルト、#870）または空ターンを通常の完了として通過させる（#870 以前）。"
   - key: compat.noCacheControl
     type: boolean
     default: "false"
