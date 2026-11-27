@@ -140,7 +140,10 @@ function backupNames(globalRoot: string): string[] {
     return readdirSync(globalRoot).filter((e) => e.startsWith("billion-context.bak-")).sort();
 }
 
-test("#7806 resolveInstallRef: PR number, PR URL, branch, master, tag", () => {
+ // Pure mapping — no bash shim, so it runs on win32 too (the file-level
+ // `test` alias skips the shim-based suite there; #6805 review: the header
+ // comment promised this one still runs everywhere).
+ nodeTest("#7806 resolveInstallRef: PR number, PR URL, branch, master, tag", () => {
     assert.deepEqual(resolveInstallRef("7738"), { ref: "pull/7738/head", kind: "pr" });
     assert.deepEqual(resolveInstallRef("https://github.com/ranxianglei/billion-context/pull/7738"), { ref: "pull/7738/head", kind: "pr" });
     assert.deepEqual(resolveInstallRef("https://github.com/ranxianglei/billion-context/pull/7738/files#diff-x"), { ref: "pull/7738/head", kind: "pr" });
