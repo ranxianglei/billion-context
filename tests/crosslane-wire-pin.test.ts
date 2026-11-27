@@ -209,8 +209,12 @@ test("wire-granularity pin: agentic split + lane switch keeps ids and placement 
             const rows = db.prepare("SELECT pos, msgid FROM egress_state WHERE session_id = ? ORDER BY pos").all("conv-reason") as Array<{ pos: number; msgid: string }>;
             const ids = rows.map((r) => r.msgid);
             for (const want of ["pi-u1", "pi-a1", "pi-u2"]) {
-                assert.equal(ids.filter((x) => x === want).length, 1, `egress_state must carry the declared host id ${want} exactly once (rows: ${JSON.stringify(rows)})`);
+                // Path A (#7836): a split element's parts share the client
+                // element id in the log, so a declared id may appear once
+                // per part — present, never absent, and never as a #pN id.
+                assert.ok(ids.filter((x) => x === want).length >= 1, `egress_state must carry the declared host id ${want} (rows: ${JSON.stringify(rows)})`);
             }
+            assert.ok(!ids.some((x) => x.includes("#p")), `egress_state stores element ids only, no #pN core ids (rows: ${JSON.stringify(rows)})`);
             // The turn-1 response was minted by the server; turn 2's pin
             // re-homes it onto the host's own id for that message — no
             // orphaned mint may survive for a message the host declared.
