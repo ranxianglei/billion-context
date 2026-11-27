@@ -1541,6 +1541,11 @@ export async function* runCompressLoop(
                             contentType: "reasoning",
                             text: part.text,
                             reasoningContent: part.text,
+                            // #5495: an anthropic-lane reasoning part came from a
+                            // wire thinking block — mark it so coreToAnthropic
+                            // re-emits it as a thinking block even when the
+                            // upstream never signed (unsigned relay).
+                            ...(ctx.protocol === "anthropic" ? { anthropicThinking: true } : {}),
                             ...(part.signature.length > 0
                                 ? ctx.protocol === "google"
                                     ? { googleThoughtSignature: part.signature }

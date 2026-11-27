@@ -1,5 +1,5 @@
 import { ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME, BLOCKED_REF, BLOCK_OP_TOOL_NAMES, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
-import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
+import { egressPlaneGateOn, imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
@@ -8,6 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { rebuildCoreFromLog } from "./storage/egress-serve.js";
+import { stampEgressSeqs } from "./server/egress-lane-io.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -387,6 +388,13 @@ let conversationsDirty = false;
 
 function writeConversationsFile(): void {
     if (!conversationsDirty) return;
+    // KDD #25 (discussions/7735): an egress-on instance does NOT persist the
+    // conversationId→session route table (56 KB kv blob + legacy file) — the
+    // in-memory table keeps serving THIS process; after a restart,
+    // self-binding clients (cid == sid, e.g. pi) re-resolve via their native
+    // session id and the rest re-bind on their next model request
+    // ("有问题再说" — owner ruling 2026-11-25).
+    if (egressPlaneGateOn()) return;
     try {
         const obj: Record<string, ConversationEntry> = {};
         for (const [k, v] of conversations) obj[k] = v;
@@ -491,6 +499,12 @@ export function loadConversations(): void {
 export async function hydratePluginConversationsUnified(): Promise<void> {
     const store = kvStore();
     if (convKvReady || !store) return;
+    // KDD #25 (discussions/7735): in egress mode the routing table stays
+    // memory-only — the plugin lane is one-to-one and a restart simply waits
+    // for the next model request to repopulate (its existing miss behavior).
+    // Skipping the store entirely keeps the retired blob out of an eg
+    // database (writeConversationsFile is gated the same way).
+    if (egressPlaneGateOn()) return;
     try {
         let raw: unknown;
         try {
@@ -2617,7 +2631,16 @@ export async function handlePluginTool(
             // (rememberPluginMessages), so a racing tool call sees a consistent
             // state instead of a stale/empty window.
             const mem = session.transient?.pluginMessages;
-            const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+            const rawMessages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+            // #7439 follow-up (C6): egress-on sessions number their live
+            // messages in the op log (the renumbered citation space — the
+            // system row holds 0). Stamp
+            // that space onto the fold's cores BEFORE the kernel runs — the
+            // same way the four wire lanes stamp their processTurn input.
+            // The kernel attests a fold block's startSeq/endSeq only from
+            // cores that carry ledgerSeq; without this, a plugin-channel fold
+            // on an egress-on session lands an unattested block ([-1,-1]).
+            const messages = stampEgressSeqs(getStore()?.egressOpLogStore(), session.id, rawMessages);
             const before = currentContextObservation(session);
             const creditBefore = session.stats.compressCreditTokens ?? 0;
             const compressBefore = session.lastCompress;
@@ -2634,7 +2657,7 @@ export async function handlePluginTool(
                 // registered into new blocks' coverage and read back as
                 // permanent drift against the client's unchanged history
                 // (same split as the relay loop ctx).
-                compressMessages: mem && mem.original.length > 0 ? mem.original : undefined,
+                compressMessages: mem && mem.original.length > 0 ? stampEgressSeqs(getStore()?.egressOpLogStore(), session.id, mem.original) : undefined,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);

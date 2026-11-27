@@ -1,18 +1,24 @@
 /**
- * Egress state log (proposal discussions/7398, #6785 perf work): the op-log
- * outbound view. Tests pin the CONTRACT:
+ * Egress state log (proposal discussions/7398, #6785 perf work;
+ * MATERIALIZED form per discussions/7773 owner ruling 2026-11-26):
+ * the op-log outbound view. Tests pin the CONTRACT:
  *   - replay determinism: same op sequence → same view, always;
- *   - the four row types (+I tail/anchored, -D inclusive range, +U
- *     content-only, B base) and their payload shapes;
- *   - the three hard-error paths (missing anchor / missing or inverted
- *     delete endpoints / update target missing) throw, never degrade fuzzy;
- *   - compaction equivalence: view before == view after, row count bounded;
- *   - compaction: view before == view after; both tables shrink to the
- *     newest base row + the tail (#7574 — the flow used to keep every
- *     row forever, one more full snapshot per fold);
- *   - rollback: any point at or after the newest base stays
- *     reconstructible from egress_flow;
- *   - a batch that would not replay is refused at append time (#7574).
+ *   - the three row types (+I tail/anchored, -D inclusive range, +U
+ *     content/number — the 7773 letter alphabet is I/D/U; the B base row
+ *     never existed in this form: not written, not read) and their payload
+ *     shapes;
+ *   - the hard-error paths (missing anchor / missing or inverted delete
+ *     endpoints / update target missing) throw, never degrade fuzzy;
+ *   - egress_state is the MATERIALIZED live view: its row count == the
+ *     live row count (ORDER BY pos serving read, no replay); egress_flow
+ *     keeps every row forever (append-only, physically never deleted —
+ *     growth optimization is the separate #7475 family);
+ *   - rollback: ANY point (from 0) stays reconstructible from egress_flow;
+ *   - a batch that would not replay is refused at append time (#7574);
+ *   - a manually planted corrupt FLOW row does not break serving while the
+ *     state view is intact (the read is a consistent snapshot) — it is
+ *     surfaced by the full replay (egressStateAt) and blocks the walk-back,
+ *     which is the degrade path.
  */
 
 import { test } from "node:test";
@@ -24,11 +30,13 @@ import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
 import {
     egressStateAppend,
-    egressStateCompact,
     egressStateView,
     egressStateAt,
     egressFork,
+    egressFlowWalkBack,
+    egressStateRead,
     EgressStateCorruptError,
+    EGRESS_SYSTEM_MSGID,
     diffEgressView,
     egressReplay,
     type EgressOp,
@@ -73,7 +81,20 @@ function rows(h: Harness, S: string): number {
     return n("egress_state") + n("egress_flow");
 }
 
-/** Write one op row straight into BOTH tables, bypassing the append check. */
+/** Live rows (materialized view) of a session. */
+function stateRows(h: Harness, S: string): number {
+    return (h.db.prepare(`SELECT COUNT(*) AS n FROM egress_state WHERE session_id = ?`).get(S) as { n: number }).n;
+}
+
+/** Flow rows (append-only record) of a session. */
+function flowRows(h: Harness, S: string): number {
+    return (h.db.prepare(`SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?`).get(S) as { n: number }).n;
+}
+
+/** Write one op row straight into the FLOW only, bypassing the append
+ *  check (7773: egress_state is the materialized live view — a hand edit
+ *  targets the record, and the read path must survive it while the view is
+ *  intact). */
 function plant(h: Harness, S: string, op: EgressOp, opSeq: number, nowMs: number): void {
     const written =
         op.type === "I"
@@ -82,9 +103,7 @@ function plant(h: Harness, S: string, op: EgressOp, opSeq: number, nowMs: number
                 ? ["D", null, JSON.stringify({ start: op.start, end: op.end }), null, null]
                 : ["U", op.msgid, JSON.stringify({ role: op.role }), null, op.bytes];
     const [rowType, msgid, payload, logSeq, bytes] = written;
-    for (const table of ["egress_state", "egress_flow"]) {
-        h.db.prepare(`INSERT INTO ${table} (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(S, opSeq, logSeq, rowType, msgid, payload, bytes, nowMs);
-    }
+    h.db.prepare(`INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(S, opSeq, logSeq, rowType, msgid, payload, bytes, nowMs);
 }
 
 test("replay determinism: the five-op example from the proposal", () => {
@@ -180,12 +199,16 @@ test("hard errors: missing anchor / missing or inverted endpoints / update targe
         refused("dup", [
             { type: "I", msgid: "a", after: null, ref: "m00009", tokens: 1, typeTag: "text", bytes: "h_a2" },
         ], /duplicate msgid a/);
-        // a bad row that got into the tables some other way (a library edited
-        // by hand, a half-copied backup) is still reported by the replay
+        // 7773: a bad row that got into the FLOW some other way (a library
+        // edited by hand, a half-copied backup) must NOT break serving while
+        // the materialized view is intact — the read is a consistent
+        // snapshot — and the full replay (the rollback path) reports it, so
+        // the degrade ladder (walk-back / truncate) can reach the damage.
         const planted = (S: string, op: EgressOp, re: RegExp) => {
             seed(S);
             plant(H, S, op, 3, 2_000);
-            assert.throws(() => egressStateView(H.db, S), (e: unknown) => corrupt(e, re), `${S}: a planted bad row is reported`);
+            assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), ["a", "b"], `${S}: the intact view still serves`);
+            assert.throws(() => egressStateAt(H.db, S, Number.MAX_SAFE_INTEGER), (e: unknown) => corrupt(e, re), `${S}: the full replay reports the planted bad row`);
         };
         planted("planted-anchor", { type: "I", msgid: "x", after: "zz", ref: "m00003", tokens: 1, typeTag: "text", bytes: "h_x" }, /anchor zz missing/);
         planted("planted-end", { type: "D", start: "a", end: "nope" }, /delete end nope missing/);
@@ -195,15 +218,15 @@ test("hard errors: missing anchor / missing or inverted endpoints / update targe
         seed("healthy");
         assert.deepEqual(egressStateView(H.db, "healthy").map((r) => r.msgid), ["a", "b"]);
         // a GOOD op after a BAD op must not be masked: drop the bad row, replay OK
-        H.db.prepare("DELETE FROM egress_state WHERE session_id = 'planted-anchor' AND op_seq = 3").run();
         H.db.prepare("DELETE FROM egress_flow WHERE session_id = 'planted-anchor' AND op_seq = 3").run();
         assert.deepEqual(egressStateView(H.db, "planted-anchor").map((r) => r.msgid), ["a", "b"]);
+        assert.deepEqual(egressStateAt(H.db, "planted-anchor", Number.MAX_SAFE_INTEGER).map((r) => r.msgid), ["a", "b"], "the full replay is healthy again once the bad row is gone");
     } finally {
         close(H);
     }
 });
 
-test("compaction equivalence: view before == view after; both tables shrink to the base", () => {
+test("materialized view: state row count == live row count, flow keeps its full history, no B row (7773)", () => {
     const H = open();
     try {
         const S = "sess-4";
@@ -219,40 +242,44 @@ test("compaction equivalence: view before == view after; both tables shrink to t
         const before = egressStateView(H.db, S);
         assert.deepEqual(before.map((r) => r.msgid), ["fold", "m7", "m8", "m9", "m10"]);
 
-        const stateRowsBefore = (H.db.prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = ?").get(S) as { n: number }).n;
-        const flowRowsBefore = (H.db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(S) as { n: number }).n;
-        assert.equal(stateRowsBefore, 12);
-        assert.equal(flowRowsBefore, 12);
+        // state = the live view exactly: 5 rows for 5 live messages (the 6
+        // deleted ones are physically gone — 7773: D deletes the rows, no
+        // tombstones); flow = the full record: every one of the 12 ops.
+        assert.equal(stateRows(H, S), 5);
+        assert.equal(flowRows(H, S), 12);
+        // the row alphabet is I/D/U — the B base letter never exists in this
+        // form (not written, not read, not in the CHECK)
+        const types = (H.db.prepare("SELECT DISTINCT row_type AS t FROM egress_flow WHERE session_id = ? ORDER BY t").all(S) as { t: string }[]).map((r) => r.t);
+        assert.deepEqual(types, ["D", "I"]);
 
         assert.deepEqual(before.map((r) => r.num), [11, 7, 8, 9, 10], "I rows numbered in append order (fold=11)");
-        egressStateCompact(H.db, S, before, 2_000);
-        const after = egressStateView(H.db, S);
-        assert.deepEqual(after, before, "compact base carries the stamped numbers inline");
-        // state: base + nothing below (the 12 ops are physically gone)
-        const stateRows = (H.db.prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = ?").get(S) as { n: number }).n;
-        assert.equal(stateRows, 1);
-        // flow: the base row replaces everything below it too (#7574 — it
-        // used to keep the full history AND gain one snapshot per fold, so a
-        // long session grew without bound)
-        const flowRows = (H.db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(S) as { n: number }).n;
-        assert.equal(flowRows, 1);
-        // ops after compaction still replay on top of the base, numbers continue
+        // the state row's immutable I-twin anchor (log_seq) == the flow I row
+        const twin = H.db.prepare("SELECT log_seq, num FROM egress_state WHERE session_id = ? AND msgid = ?").get(S, "fold") as { log_seq: number; num: number };
+        assert.equal(twin.log_seq, 11);
+        assert.equal(twin.num, 11);
+
+        // ops after the fold still apply on the live view, numbers continue
+        // from the flow high-water (11)
         egressStateAppend(H.db, S, [
             { type: "I", msgid: "m11", after: "m10", ref: "m00012", tokens: 11, typeTag: "text", bytes: "h_m11" },
         ], 3_000);
         const grown = egressStateView(H.db, S);
         assert.deepEqual(grown.map((r) => r.msgid), ["fold", "m7", "m8", "m9", "m10", "m11"]);
-        assert.equal(grown.find((r) => r.msgid === "m11")!.num, 12, "the next number is still issued after the base");
+        assert.equal(grown.find((r) => r.msgid === "m11")!.num, 12, "the next number continues the flow high-water");
+        assert.equal(stateRows(H, S), 6, "state stays == the live count");
+        assert.equal(flowRows(H, S), 13, "flow keeps every row");
+        // the serving read is byte-stable across calls (no replay wobble)
+        assert.deepEqual(egressStateView(H.db, S), grown);
     } finally {
         close(H);
     }
 });
 
-test("rollback: every point from the newest base on stays reconstructible from egress_flow", () => {
+test("rollback: every point — from 0 up — stays reconstructible from egress_flow (no base concept, 7773)", () => {
     const H = open();
     try {
         const S = "sess-5";
-        // snapshot the view at every seq 1..5, then compact at 6
+        // snapshot the view at every seq 1..6
         const snapshots = new Map<number, EgressViewRow[]>();
         for (let i = 1; i <= 5; i++) {
             egressStateAppend(H.db, S, [
@@ -263,23 +290,20 @@ test("rollback: every point from the newest base on stays reconstructible from e
         egressStateAppend(H.db, S, [{ type: "U", msgid: "m2", bytes: "h_m2-edit" }], 6_000);
         snapshots.set(6, egressStateView(H.db, S));
         assert.equal(snapshots.get(6)![1].num, 2, "the +U did not change m2's canonical number");
-        egressStateCompact(H.db, S, egressStateView(H.db, S), 10_000);
-        // the flow now starts at the base row (op_seq 7): the view it carries
-        // comes back byte-identical …
-        assert.deepEqual(egressStateAt(H.db, S, 7), snapshots.get(6), "the base point");
+        // the materialized view serves the current point byte-identically to
+        // the full replay (state == replay(flow) after every write)
+        assert.deepEqual(egressStateView(H.db, S), egressStateAt(H.db, S, 6));
         egressStateAppend(H.db, S, [
             { type: "I", msgid: "m6", after: "m5", ref: "m00006", tokens: 6, typeTag: "text", bytes: "h_m6" },
         ], 11_000);
-        // … and so does every later point
         const later = egressStateView(H.db, S);
-        assert.deepEqual(egressStateAt(H.db, S, 8), later, "a point after the base");
+        assert.deepEqual(egressStateAt(H.db, S, 7), later, "a point after the last write");
         // seq 0 = empty view
         assert.deepEqual(egressStateAt(H.db, S, 0), []);
-        // history before the newest base is not kept any more (#7574: the
-        // operator asked for a bounded log, not a second full copy of the
-        // session); such a point answers "empty", it never answers a wrong view
-        for (const seq of [1, 2, 3, 4, 5, 6]) {
-            assert.deepEqual(egressStateAt(H.db, S, seq), [], `seq ${seq} is below the base`);
+        // the flow is append-only and holds the WHOLE history: every earlier
+        // point reconstructs byte-for-byte from it (no base floor to stop at)
+        for (const seq of [1, 2, 3, 4, 5, 6, 7]) {
+            assert.deepEqual(egressStateAt(H.db, S, seq), snapshots.has(seq) ? snapshots.get(seq) : later, `seq ${seq} reconstructs`);
         }
     } finally {
         close(H);
@@ -330,6 +354,114 @@ test("diff: case U — content edit of an existing row is a +U, position and tri
     assert.equal(replayed[0].ref, "ma", "+U must not touch the ref");
     assert.equal(replayed[0].tokens, 3, "+U must not touch tokens");
     assert.equal(replayed[0].num, 0, "+U must not touch the canonical number");
+});
+
+// ---- num lifecycle (cited-vs-dense divergence, 2026-11-26) --------------
+// A protection (BLOCKED) row that never carried a kernel citation is dense-
+// allocated at insert time; when the protection clears (or the row loses its
+// citation) the kernel counter — which never saw the dense number — may
+// cite that slot again. The log must follow the kernel citation facts:
+// the row demotes to 0 (its number RETIRED, never re-issued) via a +U that
+// carries the new number, and the new citation lands on the freed slot.
+
+test("diff: a spine row that loses its citation emits a +U with num 0", () => {
+    const R = (msgid: string, num: number): EgressViewRow => ({ num, msgid, ref: "m" + msgid, tokens: 3, type: "text", bytes: "h_" + msgid });
+    const prev = [R("a", 2), R("p1", 91), R("p2", 92)];
+    const next = [{ ...R("p1", 0) }, { ...R("p2", 0) }, R("r", 91)];
+    assert.deepEqual(diffEgressView(prev, next, true), [
+        { type: "D", start: "a", end: "a" },
+        { type: "U", msgid: "p1", bytes: "h_p1", num: 0 },
+        { type: "U", msgid: "p2", bytes: "h_p2", num: 0 },
+        { type: "I", msgid: "r", after: "p2", ref: "mr", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 },
+    ]);
+    const replayed = egressReplay(prev, diffEgressView(prev, next, true), 92);
+    assert.deepEqual(norm(replayed), norm(next));
+    assert.equal(replayed[2].num, 91, "the new citation takes the slot the demotion retired");
+});
+
+test("diff+replay: re-citing a slot held by a STILL-cited live row still throws (true corruption)", () => {
+    const R = (msgid: string, num: number): EgressViewRow => ({ num, msgid, ref: "m" + msgid, tokens: 3, type: "text", bytes: "h_" + msgid });
+    const prev = [R("a", 91)];
+    const next = [{ ...R("a", 91) }, R("r", 91)];
+    const ops = diffEgressView(prev, next, true);
+    assert.deepEqual(ops, [{ type: "I", msgid: "r", after: "a", ref: "mr", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 }]);
+    assert.throws(() => egressReplay(prev, ops, 91), (e: unknown) => e instanceof EgressStateCorruptError && /cited number 91 is already live/.test(e.message));
+});
+
+test("diff: a spine row that gains a citation below the high water emits a +U with it (retired slot re-homing)", () => {
+    const R = (msgid: string, num: number): EgressViewRow => ({ num, msgid, ref: "m" + msgid, tokens: 3, type: "text", bytes: "h_" + msgid });
+    const prev = [R("a", 0), R("b", 92)];
+    const next = [{ ...R("a", 5) }, { ...R("b", 92) }];
+    assert.deepEqual(diffEgressView(prev, next, true), [{ type: "U", msgid: "a", bytes: "h_a", num: 5 }]);
+    const replayed = egressReplay(prev, diffEgressView(prev, next, true), 92);
+    assert.equal(replayed[0].num, 5, "a retired slot is legal to re-cite");
+});
+
+test("append: a U with num persists through state replay, compaction, and the dense cursor never re-issues the retired slot", () => {
+    const H = open();
+    const S = "s-numlifecycle";
+    try {
+        // seed: system + a cited row at 2 and a dense pair at 91/92 (the
+        // shape the live repro produced: protection rows dense-allocated)
+        egressStateAppend(H.db, S, [
+            { type: "I", msgid: EGRESS_SYSTEM_MSGID, after: null, ref: "", tokens: 1, typeTag: "system", bytes: "h_sys" },
+            { type: "I", msgid: "a", after: EGRESS_SYSTEM_MSGID, ref: "m00002", tokens: 2, typeTag: "text", bytes: "h_a", num: 2 },
+            { type: "I", msgid: "p1", after: "a", ref: "", tokens: 3, typeTag: "text", bytes: "h_p1" },
+            { type: "I", msgid: "p2", after: "p1", ref: "", tokens: 3, typeTag: "text", bytes: "h_p2" },
+        ], 1_000);
+        const seeded = egressStateView(H.db, S);
+        assert.deepEqual(seeded.map((r) => r.num), [0, 2, 3, 4], "dense allocation, before the repro shape");
+        // bring it into the repro shape with an explicit num on the cites
+        egressStateAppend(H.db, S, [
+            { type: "U", msgid: "p1", bytes: "h_p1", num: 91 },
+            { type: "U", msgid: "p2", bytes: "h_p2", num: 92 },
+        ], 2_000);
+        assert.deepEqual(egressStateView(H.db, S).map((r) => r.num), [0, 2, 91, 92], "the U-with-num lands in the stored view");
+        // the fix turn: both protection rows lose their citation; the fresh
+        // reply cites 91 (the kernel counter never saw 91/92)
+        egressStateAppend(H.db, S, [
+            { type: "U", msgid: "p1", bytes: "h_p1", num: 0 },
+            { type: "U", msgid: "p2", bytes: "h_p2", num: 0 },
+            { type: "I", msgid: "r", after: "p2", ref: "m00091", tokens: 3, typeTag: "text", bytes: "h_r", num: 91 },
+        ], 3_000);
+        assert.deepEqual(egressStateView(H.db, S).map((r) => r.num), [0, 2, 0, 0, 91], "demote + re-cite lands");
+        // the state rows carry the immutable I-twin anchors: the demoted rows
+        // keep their ORIGINAL insertion numbers in log_seq while num is 0
+        // (7773: the (msgid, log_seq) twin check reads the I-time number)
+        const p1twin = H.db.prepare("SELECT log_seq, num FROM egress_state WHERE session_id = ? AND msgid = ?").get(S, "p1") as { log_seq: number; num: number };
+        assert.equal(p1twin.log_seq, 3, "p1's I-twin anchor is its insertion number");
+        assert.equal(p1twin.num, 0, "... while its current number is demoted");
+        // the REBUILD path must survive the demoted rows: a damaged state
+        // copy is repaired by replay + materialize, and materialize writes
+        // each row's I-time anchor into log_seq — a demoted row keeps its
+        // anchor with num 0 (the pre-fix materialize threw on it, bricking
+        // the session's recovery, 7773 review)
+        H.db.prepare("UPDATE egress_state SET pos = pos + 1 WHERE session_id = ? AND pos > 1").run(S);
+        const healed = egressStateRead(H.db, S);
+        assert.deepEqual(healed.map((r) => r.num), [0, 2, 0, 0, 91], "the rebuild serves the demoted view");
+        const p2twin = H.db.prepare("SELECT log_seq, num FROM egress_state WHERE session_id = ? AND msgid = ?").get(S, "p2") as { log_seq: number; num: number };
+        assert.equal(p2twin.log_seq, 4, "the rebuilt p2 keeps its I-twin anchor");
+        assert.equal(p2twin.num, 0, "... with its demoted number");
+        // full replay ends byte-identical to the materialized view (the
+        // invariant every write maintains)
+        const beforeAppend = egressStateView(H.db, S);
+        assert.deepEqual(egressStateAt(H.db, S, Number.MAX_SAFE_INTEGER), beforeAppend, "state == replay(flow) after the num churn");
+        // dense continues above the flow high-water (91). Whether an
+        // uncited row lands on a once-dense-allocated slot (92) is safe by
+        // construction: such a slot was never a kernel citation, and any
+        // later kernel citation of it arrives alongside the holder's own
+        // +U demotion (its kernel citation fact is 0), which frees the slot
+        // earlier in the same batch.
+        egressStateAppend(H.db, S, [
+            { type: "I", msgid: "x", after: "r", ref: "", tokens: 1, typeTag: "text", bytes: "h_x" },
+        ], 5_000);
+        const view = egressStateView(H.db, S);
+        assert.equal(view[view.length - 1].num, 92, "dense continues above the flow high water");
+        // flow rollback: the current point still reconstructs
+        assert.deepEqual(egressStateAt(H.db, S, Number.MAX_SAFE_INTEGER).map((r) => r.num), view.map((r) => r.num), "the flow point equals the live view");
+    } finally {
+        close(H);
+    }
 });
 
 test("diff: move = D+I (no M op), msgid survives both ops", () => {
@@ -415,9 +547,8 @@ test("fork: whole-table copy — the child inherits the parent number space and 
             { type: "I", msgid: "sum", after: "b", ref: "m00003", tokens: 5, typeTag: "summary", bytes: "h_sum" },
             { type: "D", start: "a", end: "b" },
         ], 1_000);
-        // a compaction so the state table carries a base row too — the fork
-        // must copy BOTH tables (base entries keep their numbers)
-        egressStateCompact(H.db, P, egressStateView(H.db, P), 2_000);
+        // no compaction step exists (7773): the state IS the live view and
+        // the flow keeps everything — the fork copies both tables as-is
         const parentView = egressStateView(H.db, P);
 
         const copied = egressFork(H.db, P, C);
