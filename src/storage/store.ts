@@ -409,6 +409,13 @@ export interface IngestSessionInput {
      *  absolute seqs before insert — see remapPlanSeqs. */
     pluginSnapshotSeqs?: number[] | null;
     tailSeqs?: number[] | null;
+    /** #5597-C: the session's authoritative-clear generation (a native-
+     *  compaction rebase bumps it via resetSessionCompression). A value above
+     *  the persisted row's generation means the journal was cleared
+     *  authoritatively: the store DROPs the session's orphan_blocks rows
+     *  before merging. Ordinary saves leave it unchanged and keep the
+     *  #6785/#4242 merge/survive semantics. */
+    orphanJournalGeneration?: number;
     /** Serialized orphan map (Record<blockId, {one, full}>) — blockContents
      *  entries whose block is absent from state.blocks (#4216/#4242: the reap
      *  shape is REPRESENTABLE; rides the same transaction so the session row,
@@ -1059,8 +1066,20 @@ export class UnifiedStore {
      *  only ever INSERT/UPDATE, never DELETE within a session. The legacy
      *  orphans_json column migrates onto the table on first ingest and is
      *  then cleared, so the column stops growing and stops being re-written
-     *  on every save. Returns null: the column is deprecated. */
-    private applyOrphanBlocks(sessionId: string, incomingJson: string | null): null {
+     *  on every save. Returns null: the column is deprecated.
+     *  #5597-C (owner ruling B): the ONE exception to "never DELETE" is an
+     *  authoritative clear — a native-compaction rebase bumps the session's
+     *  orphanJournalGeneration (resetSessionCompression), and a value above
+     *  the persisted row's generation drops this session's journal rows
+     *  before the merge. An ordinary save cannot express a clear (its plan
+     *  may simply omit trimmed entries), so a plain empty plan still merges. */
+    private applyOrphanBlocks(sessionId: string, incomingJson: string | null, generation: number): null {
+        const prior = this.db.prepare("SELECT metadata_json FROM sessions WHERE session_id = ?").get(sessionId) as
+            | { metadata_json: string | null }
+            | undefined;
+        if (generation > this.storedOrphanJournalGeneration(prior?.metadata_json ?? null)) {
+            this.db.prepare("DELETE FROM orphan_blocks WHERE session_id = ?").run(sessionId);
+        }
         const existing = this.db
             .prepare("SELECT block_id, one_json, full_json FROM orphan_blocks WHERE session_id = ?")
             .all(sessionId) as { block_id: string; one_json: string | null; full_json: string }[];
@@ -1100,6 +1119,20 @@ export class UnifiedStore {
             this.db.prepare("UPDATE sessions SET orphans_json = NULL WHERE session_id = ?").run(sessionId);
         }
         return null;
+    }
+
+    /** #5597-C: the persisted authoritative-clear generation. A missing or
+     *  malformed value reads as 0 — legacy rows pre-date the counter and the
+     *  first clear after upgrade simply wins (no migration needed). */
+    private storedOrphanJournalGeneration(metadataJson: string | null): number {
+        if (typeof metadataJson !== "string" || metadataJson.length === 0) return 0;
+        try {
+            const parsed = JSON.parse(metadataJson) as { orphanJournalGeneration?: unknown };
+            const value = parsed?.orphanJournalGeneration;
+            return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+        } catch {
+            return 0;
+        }
     }
 
     /** #6785 step 8: row-backed CompressionState fields — one row per field,
@@ -1521,7 +1554,9 @@ export class UnifiedStore {
                     // #4216/#4242: orphan journal rides the normal upsert with
                     // MERGE semantics (existing entries survive — LazyBlockContents
                     // means the live map may not carry trimmed entries).
-                    orphansJson: this.applyOrphanBlocks(s.sessionId, s.orphansJson ?? null),
+                    // #5597-C: except an authoritative clear (generation bump),
+                    // which drops this session's journal rows first.
+                    orphansJson: this.applyOrphanBlocks(s.sessionId, s.orphansJson ?? null, input.orphanJournalGeneration ?? 0),
                 });
 
             // #6785 step 8: row-backed kstate fields ride the same tx (the
@@ -2989,8 +3024,13 @@ export class UnifiedStore {
             }
             // #6785 step 7: the reaped-block journal lives in orphan_blocks
             // now (same merge semantics the column had — incoming entries win
-            // on key collision, trimmed entries survive).
-            this.applyOrphanBlocks(sessionId, orphanContents.size > 0 ? JSON.stringify(Object.fromEntries(orphanContents)) : null);
+            // on key collision, trimmed entries survive). #5597-C: a reap is
+            // not an authoritative clear, so the generation stays 0.
+            this.applyOrphanBlocks(
+                sessionId,
+                orphanContents.size > 0 ? JSON.stringify(Object.fromEntries(orphanContents)) : null,
+                0,
+            );
         });
     }
 

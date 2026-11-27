@@ -1853,6 +1853,16 @@ export function cacheBlockContent(session: Session, blockId: string, content: Bl
 export function resetSessionCompression(session: Session): void {
     session.state = createInitialState();
     session.blockContents.clear();
+    // #5597-C (owner ruling B): this clear is AUTHORITATIVE — the live map can
+    // never re-materialize the entries again, so the persisted orphan journal
+    // must be REPLACED, not merged. The store cannot infer that from an empty
+    // plan (an ordinary save also carries no orphan entries while the live map
+    // is merely trimmed); the monotonic generation bump below is the explicit
+    // signal: a higher value than the stored row's generation means "drop the
+    // journal rows for this session". Ordinary saves leave it unchanged and
+    // keep the #6785/#4242 merge/survive semantics.
+    session.metadata.orphanJournalGeneration =
+        (typeof session.metadata.orphanJournalGeneration === "number" ? session.metadata.orphanJournalGeneration : 0) + 1;
     // The kernel contract ties the store to the state ('host resets the store
     // with the state'): a full rebase restarts refs at m00001, so old entries
     // would misattribute under reused numbers. contentStoreDirty + markDirty
