@@ -99,7 +99,7 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp, setAbortOrigin, getAbortOrigin, abortMidStreamLine } from "./logger.js";
 import { configureLogRetention } from "./log-retention.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
@@ -390,6 +390,10 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
         if (res.writableEnded || res.destroyed || !res.socket || res.socket.destroyed) return;
         const secs = Math.round((Date.now() - startedAt) / 1000);
         log("error", `[watchdog] ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} produced no output for ${secs}s (idle budget ${Math.round(budgetMs / 1000)}s) — closing the request so the client can fail fast instead of hanging forever`);
+        // #7661: this aborts the CLIENT's controller (requestAborts), so the
+        // dispatch catch mislabels it "client aborted mid-stream" without the tag.
+        // Bili-initiated (idle watchdog), not a client hangup.
+        setAbortOrigin(res, "bili-internal");
         requestAborts.get(res)?.abort();
         try {
             if (!res.headersSent) {
@@ -843,7 +847,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // With the client already gone it is logged as info instead of
             // feeding the context-free [error] AbortError storm.
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
-            if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
+            if (clientAbort) log("info", abortMidStreamLine(msg, getAbortOrigin(res)));
             // #2465/#5663: classified transport deaths are already fully described on
             // one line (kind/code/errno/syscall/address/hint) — stack frames were pure
             // noise in field EHOSTUNREACH storms (305 failures × 7).
@@ -4519,6 +4523,7 @@ export async function preflightCompressIfNeeded(
     registerRequestAbort(res, clientAbort);
     res.on("close", () => {
         if (!res.writableEnded) {
+            setAbortOrigin(res, "client-disconnect");
             clientAbort.abort();
             noteClientAbort(session);
         }

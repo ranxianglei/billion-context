@@ -38,7 +38,7 @@ import { applyEgressTransforms, type EgressTransformBase } from "../egress-trans
 import { currentFetchTransport } from "../fetch-transport.js";
 import { refForItemBytes } from "../image-rescale.js";
 import { countImagesInParsedBody, countImagesInRawBody, upstreamHost } from "../image-tokens.js";
-import { log as loggerLog } from "../logger.js";
+import { log as loggerLog, setAbortOrigin } from "../logger.js";
 import { dumpReqAllowed as knobDumpReqAllowed, limitsMaxMessages, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
@@ -1153,6 +1153,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             const ageMs = Date.now() - forwardStartedAt;
             const clientBytes = res.socket?.bytesWritten ?? 0;
             log("info", `[${prepared?.session.id ?? "passthrough"}] client disconnected mid-stream after ${ageMs}ms (${clientBytes} bytes written to client)`);
+            setAbortOrigin(res, "client-disconnect");
             clientAbort.abort();
             if (prepared?.session) noteClientAbort(prepared.session);
         }
@@ -2407,6 +2408,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // observe the raw upstream bytes even when the guard aborts them.
                 pluginBody = wrapStreamWithRunawayGuard(pluginBody, (v) => {
                     log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
+                    setAbortOrigin(res, "runaway-guard");
                     clientAbort.abort();
                 });
                 if (prepared.commandcode) {
@@ -2759,6 +2761,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // observes raw upstream bytes even when the guard aborts them.
         responseBody = wrapStreamWithRunawayGuard(responseBody, (v) => {
             log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
+            setAbortOrigin(res, "runaway-guard");
             clientAbort.abort();
         });
         // P1.1: wrap the rewriter loops in try/catch. If a rewriter throws

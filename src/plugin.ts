@@ -23,7 +23,7 @@ import { executeProxyToolAsync } from "./loop/core.js";
 import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
-import { log as loggerLog } from "./logger.js";
+import { log as loggerLog, getAbortOrigin, abortMidStreamLine } from "./logger.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { formatProtectedMass, uncoveredAudit, type ProtectedMassLedger } from "./uncovered.js";
@@ -4277,7 +4277,7 @@ export async function pipePluginChatWithStrip(
         maybeSummarizeStrips();
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
-            log?.("client aborted mid-stream");
+            log?.(abortMidStreamLine(undefined, getAbortOrigin(res)));
             // #5293: the partial output of an aborted turn never reports usage — record the pre-abort anchor so the first nudge decision after resume can absorb that debt.
             if (session) noteAbortedTurn(session);
             // A terminal already arrived before the client left: the reply is
@@ -4447,7 +4447,7 @@ export async function pipePluginJsonlWithStrip(
     } catch (e) {
         settleUsage();
         if (res.destroyed || res.writableEnded) {
-            log?.("client aborted mid-stream");
+            log?.(abortMidStreamLine(undefined, getAbortOrigin(res)));
             return;
         }
         try { await flushFieldTails(); } catch { /* client half-gone; the signal below is best-effort too */ }
@@ -5376,7 +5376,7 @@ export async function pipePluginResponsesWithStrip(
         maybeSummarizeStrips();
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
-            log?.("client aborted mid-stream");
+            log?.(abortMidStreamLine(undefined, getAbortOrigin(res)));
             // #5293: same as the chat lane — record the pre-abort anchor for the post-resume re-anchor.
             if (session) noteAbortedTurn(session);
             // Completed turn, dead socket: keep the reply for the handoff render.

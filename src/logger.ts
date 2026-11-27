@@ -63,6 +63,37 @@ const MAX_BYTES = (): number => logRetention().segmentBytes;
 
 export type Logger = (level: string, msg: string) => void;
 
+// ── Mid-stream abort origin (#7661) ─────────────────────────────────────────
+// The "client aborted mid-stream" log line (server.ts dispatch catch,
+// inline-engine, plugin pipe) fires for BOTH a client that hung up AND a
+// bili-initiated abort (runaway guard, upstream watchdog), because both
+// surface as a generic AbortError on a destroyed/ended response. This
+// per-response tag lets the catch sites say WHO initiated the abort — the
+// observability gap #7661's 20% DSH mid-stream aborts were stuck on. The
+// symbol rides the global Symbol.for registry so the tag is readable across
+// module boundaries without an import cycle (logger is the one leaf every
+// abort site already imports).
+export const ABORT_ORIGIN = Symbol.for("bili.abortOrigin");
+type AbortOrigin = "client-disconnect" | "runaway-guard" | "upstream-watchdog" | "bili-internal";
+
+export function setAbortOrigin(res: object, origin: AbortOrigin): void {
+    Object.defineProperty(res, ABORT_ORIGIN, { value: origin, enumerable: false, writable: true });
+}
+
+export function getAbortOrigin(res: object): AbortOrigin | undefined {
+    return (res as unknown as Record<symbol, unknown>)[ABORT_ORIGIN] as AbortOrigin | undefined;
+}
+
+/** The mid-stream abort log line, attributed by origin. A bili-initiated abort
+ *  (runaway guard / watchdog) is no longer mislabeled "client"; the origin tag
+ *  rides the tail so the base phrase stays grep-stable. `msg` is optional — the
+ *  plugin pipe sites log the bare phrase, the dispatch catches append the error. */
+export function abortMidStreamLine(msg: string | undefined, origin: AbortOrigin | undefined): string {
+    const tail = msg !== undefined ? `: ${msg}` : "";
+    if (origin && origin !== "client-disconnect") return `bili-initiated abort mid-stream${tail} [origin: ${origin}]`;
+    return `client aborted mid-stream${tail}`;
+}
+
 // ── Request-scoped session attribution ─────────────────────────────────────
 // enterSessionContext() is called once per inbound model request, at the point
 // where identity resolves (server.ts main pipeline funnel). Because it rides
