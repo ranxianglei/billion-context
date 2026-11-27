@@ -193,7 +193,7 @@ export function resolveEgressAuthority(args: {
             log("info", `[${sessionId}] egress: the op log was reset — latch cleared, the log is rebuilt from this turn`);
         } else if (armed) {
             log("error", `[${sessionId}] egress-authority: session is latched egressFlowUnreadable — refusing to run on client bytes (ruling 7439-5); reset the log to recover`);
-            throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (ruling 7439-5) — failing the turn instead of trusting client bytes`);
+            throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (details in the server log)`);
         } else {
             log("warn", `[${sessionId}] egress: session is latched egressFlowUnreadable — turn not recorded (the log is not this session's authority); reset the log to record again`);
         }
@@ -210,7 +210,7 @@ export function resolveEgressAuthority(args: {
         }
         log("error", `[${sessionId}] egress-authority: no healthy flow point — refusing to run on client bytes (ruling 7439-5); latching egressFlowUnreadable, session-level recovery required`);
         session.metadata["egressFlowUnreadable"] = true;
-        throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (ruling 7439-5) — failing the turn instead of trusting client bytes`);
+        throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (details in the server log)`);
     }
     // Ruling 7439: from this turn the op log is the content source of
     // truth for the session, so the unified-storage verifier must not

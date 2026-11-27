@@ -569,6 +569,12 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 // live every turn — recording it would churn the system
                 // row). Unreadable flow → hard fail.
                 const armed = egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: egressSide });
+                // The reject check sits AFTER processTurn here (the openai
+                // lane has it pre-kernel, prepare-openai.ts:384): the decision
+                // does not depend on the turn content, but the record needs
+                // the transformed lane shape. A rejected turn leaves only
+                // in-memory kernel state — nothing is recorded and the retry
+                // self-heals (single-txn, idempotent).
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCore, log, armed });
                 const served = recordAuthorityTurn(st, sessionId, auth, projection.systemParts.join("\n\n"), log, egressBlockLedgerFor(session), session.state.messageRefs);
                 if (served !== null) laneCore = served;

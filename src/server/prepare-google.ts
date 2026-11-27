@@ -412,6 +412,12 @@ export async function prepareGoogle(
             const st = getStore().egressOpLogStore();
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinned, sideRequest: isTitleGen });
+                // The reject check sits AFTER processTurn here (the openai
+                // lane has it pre-kernel, prepare-openai.ts:384): the decision
+                // does not depend on the turn content, but the record needs
+                // the transformed lane shape. A rejected turn leaves only
+                // in-memory kernel state — nothing is recorded and the retry
+                // self-heals (single-txn, idempotent).
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
                 const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log, egressBlockLedgerFor(session), session.state.messageRefs);
                 if (served !== null) {
