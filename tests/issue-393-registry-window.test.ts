@@ -126,6 +126,7 @@ test("#393: modelVariants strips inference suffixes (original first)", () => {
     assert.deepEqual(modelVariants("claude-opus-5-thinking"), ["claude-opus-5-thinking", "claude-opus-5"]);
     assert.deepEqual(modelVariants("claude-opus-5"), ["claude-opus-5"]);
     assert.deepEqual(modelVariants("gpt-5-high"), ["gpt-5-high", "gpt-5"]);
+    assert.deepEqual(modelVariants("gemini-4-neon-xhigh"), ["gemini-4-neon-xhigh", "gemini-4-neon"]);
 });
 
 test("#393: bundledSnapshotLookup resolves the -thinking variant to the base model's window", () => {

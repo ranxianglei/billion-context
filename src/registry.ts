@@ -538,6 +538,7 @@ const VARIANT_SUFFIXES = [
     "-reasoning",
     "-extended",
     "-fast",
+    "-xhigh",
     "-high",
     "-medium",
     "-low",
