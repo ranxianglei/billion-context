@@ -409,11 +409,17 @@ export function isTransientShArgv(argv: string[]): boolean {
  *  host when the walk finds one. Otherwise: a SessionStart hook's direct
  *  parent is always the transient `sh -c` wrapper — watching it re-arms the
  *  2s self-kill — so fall back to ITS parent instead (in a real session that
- *  is claude itself, even when an exotic install form went unrecognized);
- *  when the direct parent is anything else (manual run under an interactive
- *  shell) or unreadable, keep the legacy direct parent. Exported for tests
- *  (inject `read` to stub the process table). */
-export function chooseWatchdogParentPid(opts: { read?: ProcReader; parentPid?: number } = {}): number {
+ *  is claude itself, even when an exotic install form went unrecognized).
+ *  #7482: when the walk misses AND the direct parent is not a transient
+ *  shell (interactive bash under a session-holder like tmux/herdr/screen,
+ *  or an orphaned tool shell with ppid=1), the direct parent outlives the
+ *  claude session — watching it pins the lane to a long-lived ancestor and
+ *  the anti-orphan never fires (observed: 21 h lane survival on Android
+ *  chroot under herdr-core). Return undefined instead: the lane arms the
+ *  watcher without a parent pid and relies on the MCP child (a child of the
+ *  claude host, registered via POST /__bili/watcher) to detect session end.
+ *  Exported for tests (inject `read` to stub the process table). */
+export function chooseWatchdogParentPid(opts: { read?: ProcReader; parentPid?: number } = {}): number | undefined {
     const read = opts.read ?? defaultProcReader();
     const host = resolveClaudeHostPid({ read });
     if (host !== undefined) return host;
@@ -423,7 +429,7 @@ export function chooseWatchdogParentPid(opts: { read?: ProcReader; parentPid?: n
         const grandPid = parentInfo.ppid;
         if (grandPid !== null && grandPid > 1) return grandPid;
     }
-    return parentPid;
+    return undefined;
 }
 
 /** #2408: declare fork lineage to the proxy. A `claude --resume <parent>
@@ -473,6 +479,12 @@ async function run(payloadJson: string): Promise<void> {
         // host itself; when the walk cannot find it, chooseWatchdogParentPid
         // degrades via the wrapper's parent instead of the wrapper.
         const watchPid = chooseWatchdogParentPid();
+        // #7482: field instrumentation — record which pid the parent watcher
+        // chose (and the direct parent for comparison). "none" means the walk
+        // missed and the direct parent is not a transient shell — the lane
+        // arms the watcher without a parent pid and relies on the MCP child
+        // to detect session end.
+        log(`watchdog parent pid=${watchPid ?? "none"} (direct parent=${process.ppid})`);
         // #1660: an EXPLICIT pin stays exact + strict; otherwise pass port 0
         // so the launcher resolves the zone preference and settles the
         // actually-bound port sticky (a pre-resolved port > 0 would skip the

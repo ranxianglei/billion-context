@@ -423,9 +423,9 @@ entries:
     kind: env-only
     audience: internal
     group: envonly
-    desc_en: "Host posture: marks a claude-native plugin process."
-    desc_zh: "宿主姿态：标记 claude 原生插件进程。"
-    desc_ja: "Host posture: claude ネイティブプラグインプロセスであることを示します。"
+    desc_en: "Host posture: marks a claude-native plugin process. `=0` opts the lane into **passthrough** mode (compression fully off) — the lane STILL starts and binds its port; it does NOT prevent the lane from starting (unlike the other `BILI_NATIVE_*` lanes, where `=0` turns the lane off entirely)."
+    desc_zh: "宿主姿态：标记 claude 原生插件进程。`=0` 让 lane 以**透传**模式运行（压缩完全关闭）——lane 仍会拉起并绑定端口，**不会**阻止 lane 拉起（与其他 `BILI_NATIVE_*` 车道不同，它们的 `=0` 是整体关闭车道）。"
+    desc_ja: "Host posture: claude ネイティブプラグインプロセスであることを示します。`=0` はレーンを**passthrough**モード（圧縮完全オフ）にします — レーンは依然として起動しポートをバインドします。レーンの起動を阻止しません（他の `BILI_NATIVE_*` レーンとは異なり、それらの `=0` はレーンを完全にオフにします）。"
   - key: BILI_NATIVE_DSH
     type: boolean-ish
     default: "off"

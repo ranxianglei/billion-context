@@ -1915,8 +1915,20 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // (observed live: spawner died 1s into the second session). A single-
     // owner proxy still reports the historical `parent-gone (pid N)` reason;
     // multi-owner deaths log `watchers-gone`.
-    if (initialWatcherPid !== null) {
+    // #7482: a lane proxy started without a parent pid (the /proc walk missed
+    // the claude host and the direct parent is a long-lived session-holder
+    // ancestor) still needs the watcher armed — it relies on the MCP child
+    // (registered via POST /__bili/watcher) to detect session end. Daemons
+    // (no BILI_LAUNCHER_LANE) keep the historical unarmed behavior.
+    const laneWatcherArmed = initialWatcherPid !== null || process.env.BILI_LAUNCHER_LANE !== undefined;
+    if (laneWatcherArmed) {
         let idleSince: number | null = null;
+        // #7482: when the watcher is armed without a parent pid, the set is
+        // empty until the first MCP child registers. Do not start the idle
+        // grace period until at least one watcher has been registered —
+        // otherwise the lane shuts down ~5s after spawn, before the MCP
+        // server starts.
+        let everHadWatcher = initialWatcherPid !== null;
         let lastDead: number[] = [];
         let lastStaleHb: number[] = [];
         // #3890: consecutive failed kill-0 probes per pid (see WATCHER_DEAD_CONFIRM_TICKS).
@@ -2012,8 +2024,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             if (staleByHeartbeat.length > 0) lastStaleHb = staleByHeartbeat; else lastStaleHb = [];
             if (proxyWatchers.size > 0) {
                 idleSince = null;
+                everHadWatcher = true;
                 return;
             }
+            // #7482: no watcher has ever registered — the MCP child hasn't
+            // started yet. Don't start the idle grace period; the lane is
+            // still waiting for its first owner.
+            if (!everHadWatcher) return;
             if (idleSince === null) {
                 idleSince = tickNow;
                 return;

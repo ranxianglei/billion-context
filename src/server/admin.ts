@@ -573,7 +573,10 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1 || pid === process.pid) {
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: "expected { pid: <integer>, hb?: true }" }));
-            } else if (initialWatcherPid === null) {
+            } else if (initialWatcherPid === null && process.env.BILI_LAUNCHER_LANE === undefined) {
+                // #7482: a lane proxy started without a parent pid (walk miss)
+                // still takes watchers — it relies on the MCP child to detect
+                // session end. Daemons (no BILI_LAUNCHER_LANE) stay daemons.
                 res.writeHead(409, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: "watchdog not armed (no parent pid) — this proxy does not take watchers" }));
             } else {

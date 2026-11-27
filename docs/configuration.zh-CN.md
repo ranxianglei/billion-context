@@ -442,7 +442,7 @@
 | `BILI_INHERITED_HTTPS_PROXY` | string | unset | — | 启动器通道：跨派生边界保留的 https_proxy 继承值。 |
 | `BILI_INHERITED_ALL_PROXY` | string | unset | — | 启动器通道：跨派生边界保留的 all_proxy 继承值。 |
 | `BILI_INHERITED_NO_PROXY` | string | unset | — | 启动器通道：跨派生边界保留的 no_proxy 继承值。 |
-| `BILI_NATIVE_CLAUDE` | boolean-ish | off | — | 宿主姿态：标记 claude 原生插件进程。 |
+| `BILI_NATIVE_CLAUDE` | boolean-ish | off | — | 宿主姿态：标记 claude 原生插件进程。`=0` 让 lane 以**透传**模式运行（压缩完全关闭）——lane 仍会拉起并绑定端口，**不会**阻止 lane 拉起（与其他 `BILI_NATIVE_*` 车道不同，它们的 `=0` 是整体关闭车道）。 |
 | `BILI_NATIVE_DSH` | boolean-ish | off | — | 宿主姿态：标记 dsh 原生插件进程。 |
 | `BILI_NATIVE_KIMI` | boolean-ish | off | — | 宿主姿态：标记 kimi 原生插件进程。 |
 | `BILI_NATIVE_OMP` | boolean-ish | off | — | 宿主姿态：标记 omp 原生插件进程。 |

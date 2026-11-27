@@ -5737,8 +5737,13 @@ export async function ensureProxyRunning(
     const refusedLog = new Set<string>();
     const attachDiag = deps.attachDiag ?? defaultAttachDiag(opts.debug);
     // Same expression as the spawn path's BILI_PARENT_PID: one owner-pid
-    // semantic for spawned AND attached proxies (#1190).
-    const watchPid = opts.parentPid ?? process.pid;
+    // semantic for spawned AND attached proxies (#1190). #7482: when the
+    // walk misses and the direct parent is not a transient shell,
+    // chooseWatchdogParentPid returns undefined — the lane arms the watcher
+    // without a parent pid and relies on the MCP child to detect session end.
+    // Do NOT fall back to process.pid (the hook process, which exits
+    // immediately) or the watcher would kill the lane ~2s into the session.
+    const watchPid = opts.parentPid;
     // #1190: every ATTACH registers our owner pid with the shared proxy's
     // watchdog so its exit cannot kill the sessions still riding on it
     // (#7/#1183). Awaited before returning: a spawner that dies right after a
@@ -5750,6 +5755,9 @@ export async function ensureProxyRunning(
     // for our own pid each retry shortens the unregistered window. "refused"
     // (409) is a policy answer and is never retried.
     const registerOwner = async (inst: ProxyInstanceFile): Promise<WatcherRegistration> => {
+        // #7482: no parent pid (walk miss) — the MCP child registers itself;
+        // the spawner has no owner pid to register.
+        if (watchPid === undefined) return "refused";
         let reg = await registerWatcher(inst.origin, watchPid);
         for (let attempt = 1; reg === "failed" && attempt < WATCHER_REG_ATTEMPTS; attempt++) {
             await sleepImpl(WATCHER_REG_RETRY_BACKOFF_MS);
@@ -5765,8 +5773,9 @@ export async function ensureProxyRunning(
         const reg = await registerOwner(inst);
         // #3544: keep re-asserting our liveness so the proxy's watchdog ages us
         // out by HEARTBEAT expiry, not just kill(pid,0) (identity-blind under
-        // Windows pid reuse). No-op unless we own the pid.
-        startOwnerHeartbeat(inst.origin, watchPid);
+        // Windows pid reuse). No-op unless we own the pid. #7482: no parent
+        // pid (walk miss) — no heartbeat to start.
+        if (watchPid !== undefined) startOwnerHeartbeat(inst.origin, watchPid);
         // #1322: a refusal means the shared proxy has NO session-lifecycle
         // watchdog (started without BILI_PARENT_PID, e.g. manually on a stable
         // port) — it will outlive every session; host-native bootstraps must
@@ -5779,8 +5788,9 @@ export async function ensureProxyRunning(
             // The shared proxy may be healthy again on the next beat: remember
             // the pending failure so the first ACKNOWLEDGED heartbeat flips it
             // to recovered with one host-visible notice (host-safe channel —
-            // never a raw console.* on the attach path).
-            markWatcherPendingRecovery(inst.origin, watchPid, attachDiag);
+            // never a raw console.* on the attach path). #7482: "failed" is
+            // only reachable when watchPid is defined (undefined → "refused").
+            markWatcherPendingRecovery(inst.origin, watchPid as number, attachDiag);
         } else {
             // A direct "ok" proves registration right now — drop any stale
             // pending entry for this origin (e.g. a sibling lane failed first).
@@ -6029,7 +6039,7 @@ export async function ensureProxyRunning(
                         // of relaunching the desktop app. Harmless to a real node (ignored).
                         ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
                         BILI_LAUNCH_TOKEN: launchToken,
-                        BILI_PARENT_PID: String(opts.parentPid ?? process.pid),
+                        BILI_PARENT_PID: String(opts.parentPid ?? ""),
                         ...(opts.lane ? { BILI_LAUNCHER_LANE: opts.lane } : {}),
                         ...(opts.mitmDomains && opts.mitmDomains.length
                             ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
@@ -6270,7 +6280,8 @@ export async function ensureProxyRunning(
                     // child actually bound (preferred or laddered) so every
                     // later launch of this lane tries it first.
                     settleZonePort(inst.port);
-                    startOwnerHeartbeat(inst.origin, watchPid);
+                    // #7482: no parent pid (walk miss) — no heartbeat to start.
+                    if (watchPid !== undefined) startOwnerHeartbeat(inst.origin, watchPid);
                     return { origin: inst.origin, port: inst.port, child, logPath };
                 }
                 continue;
@@ -6287,7 +6298,8 @@ export async function ensureProxyRunning(
                 const mine = listRegistry().find((e) => e.pid === child.pid);
                 if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl))) {
                     settleZonePort(mine.port);
-                    startOwnerHeartbeat(mine.origin, watchPid);
+                    // #7482: no parent pid (walk miss) — no heartbeat to start.
+                    if (watchPid !== undefined) startOwnerHeartbeat(mine.origin, watchPid);
                     return { origin: mine.origin, port: mine.port, child, logPath };
                 }
             }
@@ -6309,7 +6321,8 @@ export async function ensureProxyRunning(
                 const info = await fetchHealthInfo(preferredOrigin);
                 if (info?.ok && child.pid !== undefined && info.pid === child.pid) {
                     settleZonePort(port);
-                    startOwnerHeartbeat(preferredOrigin, watchPid);
+                    // #7482: no parent pid (walk miss) — no heartbeat to start.
+                    if (watchPid !== undefined) startOwnerHeartbeat(preferredOrigin, watchPid);
                     return { origin: preferredOrigin, port, child, logPath };
                 }
                 if (info?.ok && !squatterAnnounced) {
@@ -6464,7 +6477,8 @@ export async function ensureProxyRunning(
             // the same identity proof the stale-record fallback trusts per-poll,
             // reached here because clobbered records starved it for the budget.
             settleZonePort(port);
-            startOwnerHeartbeat(proxyOrigin(opts.host, port), watchPid);
+            // #7482: no parent pid (walk miss) — no heartbeat to start.
+            if (watchPid !== undefined) startOwnerHeartbeat(proxyOrigin(opts.host, port), watchPid);
             attachDiag(`bili: adopting our own healthy child (pid ${child.pid}) at ${proxyOrigin(opts.host, port)} after ${SPAWN_BUDGET_MS}ms — the instance handshake never matched but the health probe proves this child serves the port; keeping it instead of killing (#4994)`);
             return { origin: proxyOrigin(opts.host, port), port, child, logPath };
         }
@@ -6476,7 +6490,8 @@ export async function ensureProxyRunning(
             const info = await fetchHealthInfo(bound.origin);
             if (info?.ok && info.pid === child.pid) {
                 settleZonePort(bound.port);
-                startOwnerHeartbeat(bound.origin, watchPid);
+                // #7482: no parent pid (walk miss) — no heartbeat to start.
+                if (watchPid !== undefined) startOwnerHeartbeat(bound.origin, watchPid);
                 attachDiag(`bili: adopting our own healthy child (pid ${child.pid}) at ${bound.origin} after ${SPAWN_BUDGET_MS}ms — it bound ${bound.port} per its own listen line and answers health under our pid; keeping it instead of killing (#4994)`);
                 return { origin: bound.origin, port: bound.port, child, logPath };
             }
