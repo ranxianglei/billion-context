@@ -435,6 +435,29 @@ test("diff: collision pair — editing the surviving row is a +U on its own rid"
     assert.equal(replayed[0].bytes, "h_xA2");
 });
 
+// ---- Path A shape (discussions/7836): a message's parts are N rows sharing
+// the element msgid (distinct rids, distinct bytes). The occurrence-aware diff
+// must handle the general N case (not just #7851's 2-row adversarial pair).
+test("diff: 3-part message (one element, N occurrences) — editing part 3 is a +U on its own rid (Path A shape)", () => {
+    const prev = stamped([V("m1", "h_p0"), V("m1", "h_p1"), V("m1", "h_p2")]); // rids 1,2,3
+    const next = [V("m1", "h_p0"), V("m1", "h_p1"), V("m1", "h_p2x")]; // part 3 edited
+    const ops = diffEgressView(prev, next);
+    assert.deepEqual(ops, [{ type: "U", rid: 3, msgid: "m1", bytes: "h_p2x" }], "exactly one +U on the edited part's rid");
+    const replayed = egressReplay(prev, ops);
+    assert.deepEqual(norm(replayed), norm(next));
+    assert.equal(replayed.length, 3, "all three parts stay live");
+});
+
+test("diff: deleting the last part of a 3-part message is a clean -D of its rid (Path A shape)", () => {
+    const prev = stamped([V("m1", "h_p0"), V("m1", "h_p1"), V("m1", "h_p2")]); // rids 1,2,3
+    const next = [V("m1", "h_p0"), V("m1", "h_p1")]; // part 3 removed
+    const ops = diffEgressView(prev, next);
+    assert.deepEqual(ops, [{ type: "D", start: 3, end: 3 }], "a pure -D of the removed part, no ghost");
+    const replayed = egressReplay(prev, ops);
+    assert.deepEqual(norm(replayed), norm(next));
+    assert.equal(replayed.length, 2, "the removed part is gone");
+});
+
 // ---- num lifecycle (cited-vs-dense divergence, 2026-11-26) --------------
 // A protection (BLOCKED) row that never carried a kernel citation is dense-
 // allocated at insert time; when the protection clears (or the row loses its

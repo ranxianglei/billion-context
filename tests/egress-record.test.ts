@@ -32,6 +32,7 @@ import {
     type EgressOp,
 } from "../src/storage/egress-state.ts";
 import { EGRESS_SYSTEM_MSGID, buildEgressViewRows, recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
+import { rebuildCoreFromLog } from "../src/storage/egress-serve.ts";
 import { egressPlaneGateOn } from "../src/knobs.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -87,6 +88,39 @@ test("buildEgressViewRows: deterministic, system row first, content-edit visible
     // summary rows are typed acp_summary
     const s = buildEgressViewRows([M("acp_summary_1", "…", "assistant")], undefined);
     assert.equal(s[0].type, "acp_summary");
+});
+
+test("buildEgressViewRows: a #pN part-split coarsens to ONE shared element msgid (Path A, #7836)", () => {
+    // The kernel splits one message into part-cores m1 / m1#p1 / m1#p2
+    // (#pN). The op-log msgid must be the ELEMENT id (m1) for every part —
+    // storage aligns with the protocol (the client resends "m1"), no #pN in
+    // the stored msgid. Non-split ids pass through unchanged.
+    const rows = buildEgressViewRows([M("m1", "a"), M("m1#p1", "b"), M("m1#p2", "c")], undefined);
+    assert.equal(rows.length, 3);
+    assert.deepEqual(rows.map((r) => r.msgid), ["m1", "m1", "m1"], "all parts share the element msgid");
+    assert.equal(new Set(rows.map((r) => r.bytes)).size, 3, "each part keeps its own bytes (never merged)");
+    assert.equal(buildEgressViewRows([M("solo", "x")], undefined)[0].msgid, "solo", "non-split id unchanged");
+});
+
+test("round-trip: a multi-part turn stores N rows under one element msgid and rebuilds to the original cores (Path A hard gate)", () => {
+    const H = open();
+    try {
+        const S = "sess-rt";
+        const cores = [M("m1", "part-a"), M("m1#p1", "part-b"), M("m1#p2", "part-c")];
+        const view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: cores, systemText: undefined, nowMs: 1000 });
+        // The op-log column msgid is the ELEMENT id for all three parts
+        // (shared), while the RECORDED bytes keep each core's #pN id.
+        assert.deepEqual(view.map((r) => r.msgid), ["m1", "m1", "m1"], "stored msgid is the shared element id");
+        const rebuilt = rebuildCoreFromLog(view);
+        assert.ok(rebuilt, "rebuild succeeds (lossless)");
+        assert.deepEqual(
+            rebuilt!.map((m) => m.id),
+            ["m1", "m1#p1", "m1#p2"],
+            "the rebuild recovers each part's original #pN core id (from bytes) — kernel identity intact",
+        );
+    } finally {
+        close(H);
+    }
 });
 
 test("recording: turn1 = full +I batch; turn2 tail append = exactly one +I", () => {
