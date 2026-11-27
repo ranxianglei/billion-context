@@ -55,9 +55,20 @@ test("recoverEgressBase: corrupt tail walks back to the newest healthy point and
     try {
         let view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: [M("m1", "alpha")], systemText: "sys", nowMs: 1 });
         view = recordEgressTurn({ store: H.store, sessionId: S, prev: view, conversation: [M("m1", "alpha"), M("m2", "beta")], systemText: "sys", nowMs: 2 });
-        // structurally corrupt the newest row (log_seq 3 = m2's I op) in BOTH tables
-        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND log_seq = 3`).run('{"x":1}', S);
-        H.db.prepare(`UPDATE egress_state SET payload = ? WHERE session_id = ? AND log_seq = 3`).run('{"x":1}', S);
+        const tail = H.db.prepare(
+            `SELECT op_seq, log_seq FROM egress_flow WHERE session_id = ? AND msgid = ? AND row_type = 'I'`,
+        ).get(S, "m2") as { op_seq: number; log_seq: number } | undefined;
+        assert.ok(tail, "m2 has an insert record");
+        assert.equal(tail.op_seq, H.store.egressStateMaxSeq(S), "m2 is the newest operation");
+        assert.equal(tail.log_seq, 2, "the system row does not consume a message number");
+        const flowUpdate = H.db.prepare(
+            `UPDATE egress_flow SET payload = ? WHERE session_id = ? AND op_seq = ?`,
+        ).run('{"x":1}', S, tail.op_seq);
+        const stateUpdate = H.db.prepare(
+            `UPDATE egress_state SET payload = ? WHERE session_id = ? AND op_seq = ?`,
+        ).run('{"x":1}', S, tail.op_seq);
+        assert.equal(Number(flowUpdate.changes), 1, "corrupt exactly one flow row");
+        assert.equal(Number(stateUpdate.changes), 1, "corrupt exactly its state twin");
         const got = recoverEgressBase(H.store, S);
         assert.ok(got !== null);
         assert.equal(got.degraded, true);
