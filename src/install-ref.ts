@@ -62,6 +62,13 @@ export function resolveInstallRef(input: string): InstallRefSpec {
     const m = /github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)/.exec(t);
     if (m) return { ref: `pull/${m[1]}/head`, kind: "pr" };
     if (!t) throw new Error("empty ref");
+    // The ref reaches `git fetch origin <ref>` as a single argv slot: a
+    // refspec (`a:b`) would UPDATE a local ref, a leading dash would parse
+    // as an option, and anything beyond [\w./-] cannot be a branch/tag name.
+    // Plain names only — git still validates existence on the fetch.
+    if (!/^[\w./-]+$/.test(t) || t.startsWith("-")) {
+        throw new Error(`unsupported ref "${t}": expected a plain branch or tag name (bare PR numbers and PR URLs are mapped automatically)`);
+    }
     return { ref: t, kind: "ref" };
 }
 

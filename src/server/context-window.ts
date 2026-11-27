@@ -65,6 +65,18 @@ export function launcherContextWindow(model: string): number | undefined {
 
 export const windowSourceLogged = new Set<string>();
 
+// One-shot "source applied" log guard. The ratchet site stamps
+// `${sessionId}@${model}@${window}` keys — unbounded across a long-lived
+// process, so cap the set: a re-logged line after the cap resets is a
+// duplicate info line, never a behavior change.
+export const WINDOW_SOURCE_LOGGED_CAP = 10_000;
+export function noteWindowSource(key: string): boolean {
+    if (windowSourceLogged.has(key)) return false;
+    if (windowSourceLogged.size >= WINDOW_SOURCE_LOGGED_CAP) windowSourceLogged.clear();
+    windowSourceLogged.add(key);
+    return true;
+}
+
 // #5490: a model that resolves to NOTHING — no tier evidence, plugin/launcher
 // report, operator declaration, registry entry, or built-in-table match — rides
 // the anonymous default window (base.modelContextLimit) in every session until

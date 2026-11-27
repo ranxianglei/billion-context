@@ -66,7 +66,7 @@ import { matchModelEndpoint } from "../model-endpoints.js";
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, egressPlaneGateOn, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
-import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
+import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, noteWindowSource, UNRESOLVED_MODEL_SESSION_THRESHOLD } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
@@ -1166,8 +1166,7 @@ async function handleRequest(
             {
                 const wsSource = betaWindow ? "anthropic-beta" : suffixWindow ? "model-suffix" : pluginWindow ? "plugin" : runtimeWindow ? "runtime-info" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
                 wsSourceForLog = wsSource;
-                if (!windowSourceLogged.has(model)) {
-                    windowSourceLogged.add(model);
+                if (noteWindowSource(model)) {
                     // #2096: label what this value IS — the pre-reservation base.
                     // The output-headroom reservation below shrinks
                     // reqConfig.modelContextLimit per request; its result gets
@@ -3076,13 +3075,12 @@ async function handleRequest(
                 reqConfig = resolveRequestConfig(config, opts.routes, providerDestUrl, ratchetableWindowModel, ratchetedRaw, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} });
                 nativeWindow = reqConfig.modelContextLimit;
                 wsSourceForLog = "ratchet";
-                // Session-scoped key: windowSourceLogged is process-global, so without
-                // the session id the "applied" line would fire once for the first
-                // session and stay silent for every other session with the same
-                // model@window pair.
+                // Session-scoped key: noteWindowSource's set is process-global, so
+                // without the session id the "applied" line would fire once for
+                // the first session and stay silent for every other session
+                // with the same model@window pair.
                 const ratchetLogKey = `${sessionId}@${ratchetableWindowModel}@${ratchetedRaw}`;
-                if (!windowSourceLogged.has(ratchetLogKey)) {
-                    windowSourceLogged.add(ratchetLogKey);
+                if (noteWindowSource(ratchetLogKey)) {
                     log("info", `[window-ratchet-applied] model=${ratchetableWindowModel} session=${sessionId}: billing proved the anonymous default small — judging this request against the session-raised window ${nativeWindow} (source=ratchet; monotonic, session-local)`);
                 }
             }
