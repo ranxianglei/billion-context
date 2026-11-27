@@ -87,6 +87,49 @@ export function _resetBlindTunnelStatsForTest(): void {
     blindTunnelLive = 0;
 }
 
+// #7585: a client whose TLS stack does not trust bili's MITM root CA — or
+// ignores the ambient SSL_CERT_FILE bundle entirely (Hermes stable
+// 0.22.6-0.23.3, at least on macOS, fixed upstream in
+// NousResearch/hermes-agent#148241) — resets
+// the connection mid-handshake, usually WITHOUT a TLS alert. The alert-based
+// warning above never fires for that signature, so the failure was a wall of
+// info-level "TLS error: read ECONNRESET" lines with zero diagnosis. Count
+// every handshake that fails before completing (per host, instance-level) and
+// warn once per host when no alert explains the abort.
+const mitmHandshakeRejectCounts = new Map<string, number>();
+const warnedMitmHandshakeRejects = new Set<string>();
+
+interface MitmHandshakeRejectStats {
+    total: number;
+    hosts: Record<string, number>;
+}
+
+/** Record one MITM TLS handshake that failed before completing for `host`.
+ *  Always counts; warns once per host when the error carries no TLS alert
+ *  (the alert case already gets noteMitmTlsError's specific warning). */
+export function recordMitmHandshakeReject(host: string, message: string, log?: Logger): void {
+    mitmHandshakeRejectCounts.set(host, (mitmHandshakeRejectCounts.get(host) ?? 0) + 1);
+    if (!CERT_REJECT_RE.test(message) && !warnedMitmHandshakeRejects.has(host)) {
+        warnedMitmHandshakeRejects.add(host);
+        log?.(`mitm ${maskHostForLog(host)} HANDSHAKE REJECT: the client aborted the TLS handshake before it completed, without a TLS alert — this almost always means the client does not trust bili's MITM root CA, or its TLS stack ignores the ambient trust bundle (known case: Hermes stable 0.22.6-0.23.3, at least on macOS, ignores SSL_CERT_FILE; fixed upstream in NousResearch/hermes-agent#148241). Traffic to this host will keep failing until the client trusts the CA (${rootCaPath()}) or stops routing it through the lane (host NO_PROXY opt-out — see docs/clients.md).`);
+    }
+}
+
+export function getMitmHandshakeRejectStats(): MitmHandshakeRejectStats {
+    const hosts: Record<string, number> = {};
+    let total = 0;
+    for (const [h, n] of mitmHandshakeRejectCounts) {
+        hosts[h] = n;
+        total += n;
+    }
+    return { total, hosts };
+}
+
+export function _resetMitmHandshakeRejectStatsForTest(): void {
+    mitmHandshakeRejectCounts.clear();
+    warnedMitmHandshakeRejects.clear();
+}
+
 /** Max ms to wait for a MITM client to finish the TLS handshake after we
  *  return CONNECT 200. Bounds slowloris-style resource hold (a client that
  *  opens the tunnel but never sends/trickle-feeds its ClientHello).
@@ -134,6 +177,20 @@ export function setupMitm(
     allowRemoteClients = false,
 ): void {
     ensureRootCA();
+    // #7585: log the effective whitelist at lane start so an operator can see
+    // exactly which hosts will be MITM'd without digging through config.
+    // Discovery keeps growing after startup, so this is the whitelist AS OF
+    // STARTUP, not a promise about later.
+    const whitelistSeen = new Set<string>();
+    const whitelist: string[] = [];
+    for (const d of [...DEFAULT_MITM_DOMAINS, ...extraDomains, ...discoverMitmDomains()]) {
+        const k = d.toLowerCase();
+        if (!whitelistSeen.has(k)) {
+            whitelistSeen.add(k);
+            whitelist.push(d);
+        }
+    }
+    log(`mitm active: effective whitelist = ${whitelist.join(", ")} (built-in defaults + configured + discovered at startup; hosts outside this list blind-tunnel)`);
     server.on("connect", (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
         const remote = !isLoopbackAddress(clientSocket.remoteAddress);
         if (remote && !allowRemoteClients) {
@@ -278,8 +335,13 @@ function doMitm(
     // reset) emits "error" on the TLSSocket. Without a listener Node treats
     // it as an uncaught exception and crashes the whole proxy. Destroy the
     // underlying socket and log — mirrors tunnelThrough()'s error handling.
+    // #7585: `secured` distinguishes handshake-phase failures (the client
+    // never completed the handshake — counted + warned) from mid-stream
+    // resets after a completed handshake (plain info-level error line).
+    let secured = false;
     tlsSocket.on("error", (err: Error) => {
         noteMitmTlsError(host, port, err.message, log);
+        if (!secured) recordMitmHandshakeReject(host, err.message, log);
         tlsSocket.destroy();
         clientSocket.destroy();
     });
@@ -292,7 +354,7 @@ function doMitm(
         tlsSocket.destroy();
         clientSocket.destroy();
     }, mitmHandshakeTimeoutMs());
-    tlsSocket.once("secure", () => clearTimeout(handshakeTimer));
+    tlsSocket.once("secure", () => { secured = true; clearTimeout(handshakeTimer); });
     tlsSocket.once("close", () => clearTimeout(handshakeTimer));
     tlsSocket.once("error", () => clearTimeout(handshakeTimer));
     // Hand the decrypted TLS socket to the http server's connection listener.

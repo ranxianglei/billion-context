@@ -1304,10 +1304,15 @@ def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = 
             os.environ["HERMES_CA_BUNDLE"] = str(root)
         combined = ca_dir / "combined-ca.pem"
         if combined.is_file():
-            # Current hermes' main client ignores HERMES_CA_BUNDLE (agent/ssl_verify.py: platform
-            # store + per-provider ssl_ca_cert); ambient trust rides SSL_CERT_FILE — OpenSSL
-            # REPLACE semantics, so it must be the COMBINED bundle (MITM root + public roots) to
-            # keep blind-tunnelled hosts validating (#1375).
+            # Current hermes' main client ignores HERMES_CA_BUNDLE (agent/ssl_verify.py:
+            # platform store + per-provider ssl_ca_cert); ambient trust rides SSL_CERT_FILE —
+            # OpenSSL REPLACE semantics, so it must be the COMBINED bundle (MITM root + public
+            # roots) to keep blind-tunnelled hosts validating (#1375). That only holds for
+            # builds whose resolver unions SSL_CERT_FILE into the platform context: hermes
+            # <=0.22.5 and builds carrying NousResearch/hermes-agent#148241 (bb19d8f). Stable
+            # 0.22.6-0.23.3 (at least on macOS) drops the bundle, so MITM'd hosts hard-fail there
+            # — the lane surfaces it as a HANDSHAKE REJECT warning (mitmHandshakeRejects in
+            # GET /__bili/stats); the operator opt-out is a host NO_PROXY entry (docs/clients.md).
             os.environ["SSL_CERT_FILE"] = str(combined)
         _state["env_applied"] = True
     _ensure_watchdog(sidecar, ctx)

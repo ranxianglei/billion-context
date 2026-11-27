@@ -355,6 +355,19 @@ pure-stdlib Python module shipped inside the npm package:
   for MITM; everything else blind-tunnels exactly like launcher mode. If no
   proxy can be made healthy, the plugin stands down silently and traffic goes
   direct (no compression, no dead port).
+- **Hermes 0.22.6–0.23.3 trust regression (#7585):** these stable builds
+  (at least on macOS; Windows expected the same, Linux probably unaffected)
+  changed `agent/ssl_verify.py` to stop unioning `SSL_CERT_FILE` into the
+  platform trust context, so bili's combined CA bundle is never consulted and
+  every MITM'd host (e.g. `chatgpt.com` for openai-codex) hard-fails at the
+  TLS handshake. Fixed upstream in NousResearch/hermes-agent#148241 (bb19d8f —
+  canary builds; wait for the next stable). Until then the lane surfaces each
+  affected host as a `HANDSHAKE REJECT` warning in the bili log, counted under
+  `mitmHandshakeRejects` in `GET /__bili/stats`. Operator opt-out: add the
+  affected host to `NO_PROXY` in `~/.hermes/.env` (e.g.
+  `NO_PROXY=127.0.0.1,localhost,::1,chatgpt.com`) — hermes re-applies its
+  dotenv every turn, so no restart is needed; trade-off is that host's traffic
+  bypasses the lane and stays uncompressed.
 - **Plugin-mode stamping:** an `llm_request` middleware stamps
   `x-bili-plugin: hermes` + conversation id (= the hermes session id, so
   gateway multi-session stays safe) + model, and `x-bili-plugin-max-output`
