@@ -91,6 +91,8 @@ export function mergeCompress(
         maxSummaryLength: pick("maxSummaryLength"),
         minSummaryLength: pick("minSummaryLength"),
         tiers: pick("tiers"),
+        tier2Trigger: pick("tier2Trigger"),
+        tier3Trigger: pick("tier3Trigger"),
         protectedLatestTools: pick("protectedLatestTools"),
         protectedTools: pick("protectedTools"),
         protectedUserPatterns: pick("protectedUserPatterns"),
@@ -386,6 +388,8 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     }
     const tiers = { ...base.tiers };
     if (s.tiers !== undefined) tiers.enabled = s.tiers;
+    if (s.tier2Trigger !== undefined) tiers.tier2Trigger = s.tier2Trigger;
+    if (s.tier3Trigger !== undefined) tiers.tier3Trigger = s.tier3Trigger;
     const absorb = resolveAbsorbSettings(s.absorb);
     // #1207 owner decision: CCR is opt-in on every lane — no default-on
     // else-branch; an unset `s.ccr` leaves `base.ccr` untouched (off).

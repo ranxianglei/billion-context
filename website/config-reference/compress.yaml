@@ -258,6 +258,28 @@ entries:
     desc_ja: "T1→T3 の階層型蒸留により、フォールドコストを世代間で分散する。"
     site_en: "On by default: tiered T1→T3 distillation spreads folding cost across generations."
     site_zh: "默认开：T1→T3 分级蒸馏，把折叠成本摊到多代。"
+  - key: compress.tier2Trigger
+    type: number
+    default: "kernel 1000"
+    group: compress
+    id: cw.t2t
+    render: compress-row
+    desc_en: "Active tier-1 block count that triggers T2 distillation nudges (kernel tiers.tier2Trigger; integer >= 2). Default 1000 leaves T2 purely token-mass driven."
+    desc_zh: "触发 T2 蒸馏提醒的活跃 T1 块数量阈值（映射内核 tiers.tier2Trigger；>= 2 的整数）。默认 1000 表示仅按 token 体积触发。"
+    desc_ja: "T2 蒸留ナッジを発火させるアクティブ T1 ブロック数しきい値（カーネル tiers.tier2Trigger、2 以上の整数）。デフォルト 1000 はトークン量のみで発火。"
+    site_en: "Active T1 block count that triggers T2 distillation nudges (integer >= 2; kernel default 1000 keeps T2 token-mass driven)."
+    site_zh: "触发 T2 蒸馏提醒的活跃 T1 块数量阈值（>= 2 的整数；内核默认 1000 仅按 token 体积触发）。"
+  - key: compress.tier3Trigger
+    type: number
+    default: "kernel 2000"
+    group: compress
+    id: cw.t3t
+    render: compress-row
+    desc_en: "Active tier-2 block count that triggers T3 distillation nudges (kernel tiers.tier3Trigger; integer >= 2). Default 2000 leaves T3 purely token-mass driven."
+    desc_zh: "触发 T3 蒸馏提醒的活跃 T2 块数量阈值（映射内核 tiers.tier3Trigger；>= 2 的整数）。默认 2000 表示仅按 token 体积触发。"
+    desc_ja: "T3 蒸留ナッジを発火させるアクティブ T2 ブロック数しきい値（カーネル tiers.tier3Trigger、2 以上の整数）。デフォルト 2000 はトークン量のみで発火。"
+    site_en: "Active T2 block count that triggers T3 distillation nudges (integer >= 2; kernel default 2000 keeps T3 token-mass driven)."
+    site_zh: "触发 T3 蒸馏提醒的活跃 T2 块数量阈值（>= 2 的整数；内核默认 2000 仅按 token 体积触发）。"
   - key: compress.protectedUserPatterns
     type: "string[]"
     default: "none"

@@ -305,6 +305,8 @@
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | クライアントがターン間で履歴を巻き戻しまたは書き換えた場合、フォールド状態を調整する。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 圧縮プロンプトパック。解決順序はプロジェクトパック → ユーザーパック → ビルトイン。`acknowledgePromptsRisk` によるゲートはされない。 |
 | `compress.tiers` | boolean | true | — | T1→T3 の階層型蒸留により、フォールドコストを世代間で分散する。 |
+| `compress.tier2Trigger` | number | kernel 1000 | — | T2 蒸留ナッジを発火させるアクティブ T1 ブロック数しきい値（カーネル tiers.tier2Trigger、2 以上の整数）。デフォルト 1000 はトークン量のみで発火。 |
+| `compress.tier3Trigger` | number | kernel 2000 | — | T3 蒸留ナッジを発火させるアクティブ T2 ブロック数しきい値（カーネル tiers.tier3Trigger、2 以上の整数）。デフォルト 2000 はトークン量のみで発火。 |
 | `compress.protectedUserPatterns` | string[] | none | — | ユーザー本文のリテラル部分文字列：一致したプロンプトは最新のユーザーメッセージでなくてもフォールドされない。長寿命セッションでホストが現在のタスクを示す用途。 |
 | `compress.protectedTools` | string[] | none | — | 全履歴に対するハード除外：リストされたツールの結果は決してフォールドされない。パスパターン（`skill/<name>`）は名前でスキルを選択する（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 最新の結果が古いものを上書きする累積スナップショット型ツールの最新インスタンスのみを保護する（例：todo リスト）。パスパターンはスキルごとに最新インスタンスを保持する（`skill/*`, #1947）。 |
