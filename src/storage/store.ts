@@ -511,6 +511,28 @@ function effectiveIdsOfPayload(payload: string | null): string[] {
     }
 }
 
+/** #7836-PartA stores egress op-log rows keyed by the WIRE-ELEMENT msgid
+ *  (split cores share the element id), but the pin ledger is CORE-granular
+ *  (#7439-Part2: stage0 dedupes by wire element over per-core `#pN` ids).
+ *  A row is the FULL core message JSON (egress-serve rebuilds from it), so
+ *  the ledger reads the per-core id back out of `bytes`; a row whose
+ *  payload has no usable id falls back to the stored msgid — which for
+ *  pre-Path-A rows IS the per-core id, so old logs keep working unchanged.
+ *  Never throws: the pin degrades to a full signal on any mismatch, it must
+ *  not reject. */
+function egressRowPinId(row: EgressViewRow): string {
+    const bytes = row.bytes;
+    if (typeof bytes === "string" && bytes.length > 0) {
+        try {
+            const m = JSON.parse(bytes) as { id?: unknown };
+            if (typeof m.id === "string" && m.id.length > 0) return m.id;
+        } catch {
+            // Non-JSON payload (defensive; rows are core JSON) — fall back below.
+        }
+    }
+    return row.msgid;
+}
+
 /**
  * #4175: raised when PRAGMA quick_check fails at open. Migrations must never
  * run against a corrupt file, so this fires BEFORE migrateSchema (and from the
@@ -2397,10 +2419,18 @@ export class UnifiedStore {
      *  these sessions stop growing the messages projection entirely, so the
      *  messages-row read would freeze at the arm turn. Order = pos = view
      *  order (the pin's 0-based index ⇔ position contract); the constant
-     *  system row is not part of the msgid ledger. */
+     *  system row is not part of the msgid ledger.
+     *
+     *  #7836-PartA stores the msgid column at WIRE-ELEMENT granularity
+     *  (split cores share their element id), but the pin ledger is
+     *  CORE-granular (the #7439-Part2 contract: split cores keep their
+     *  `#pN` ids — stage0 dedupes by wire element over these). A row is the
+     *  FULL core message JSON (egress-serve rebuilds from it), so the
+     *  ledger reads the per-core id back out of `bytes` and falls back to
+     *  the stored msgid when the payload has no usable id. */
     snapEgressPinLiveIds(sid: string): string[] {
         const view = egressStateRead(this.db, sid);
-        return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map((r) => r.msgid);
+        return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map(egressRowPinId);
     }
 
     /** #7474 P2 (ruling 7439): ONE pin-ledger entry for both storage
@@ -2420,7 +2450,7 @@ export class UnifiedStore {
             try {
                 const view = egressStateRead(this.db, sid);
                 if (view.length > 0) {
-                    return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map((r) => r.msgid);
+                    return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map(egressRowPinId);
                 }
             } catch {
                 // EgressStateCorruptError — degrade to the messages ledger below.
