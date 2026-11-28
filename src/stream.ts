@@ -498,7 +498,7 @@ export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">,
     });
     if (!allAbove) return "";
     const hi = `m${String(highest).padStart(5, "0")}`;
-    return ` All requested refs are above this session's highest ref (${hi}) — they cannot exist here (this session allocates no future refs). They are stale artifacts from an earlier session generation left in your visible history; NO superset of them can ever compress. Request only refs ≤ ${hi}, or call acp_status for the live ranges.`;
+    return ` All requested refs are above this session's highest ref (${hi}) — they cannot exist here (this session allocates no future refs). They are stale artifacts from an earlier session generation left in your visible history; NO superset of them can ever compress. Request only refs ≤ ${hi}, or call acp_status for the live ranges. If the ranges your compression nudge offered sit far above this session's ref space, the nudge and this compress call resolved to DIFFERENT conversation views (a session-binding inconsistency): do NOT probe or guess other refs to force a fold — they may belong to another conversation, and folding them would corrupt it; the safe recovery is to start a fresh conversation.`;
 }
 
 /** #4252 follow-up: PARTIALLY past the frontier — some endpoint above the
