@@ -83,6 +83,7 @@ interface WebSessionSummary {
     /** true when the per-request cache ledger holds samples — the token
      *  fields above then include ledger-measured usage (max with stats). */
     hasLedger?: boolean;
+    hasEgress?: boolean; // #B4 (KDD#25): egress op-log records present — a single-turn egress session is not an empty stub
     /** Display-name fallback: collapsed lead of the first compression block's topic/summary. */
     firstBlockHint?: string;
     /** Parent session for a subagent/derived session, when the host stamped
@@ -812,7 +813,9 @@ function summaryFromRow(row: import("../storage/store.js").WebSummaryRow): WebSe
         lastSeen: row.updatedAt,
         restored: true,
     };
-    return summaryOf(source, false);
+    const s = summaryOf(source, false);
+    if ((row.egressRecords ?? 0) > 0) s.hasEgress = true;
+    return s;
 }
 
 function hitPct(input: number, cached: number): number | null {
@@ -1061,7 +1064,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
  *  compression blocks, no cache ledger (startup & test stubs). Hidden from every
  *  list (#1426 user ask); still reachable through a direct detail link. */
 function isEmptyStub(s: WebSessionSummary): boolean {
-    return (s.requests ?? 0) <= 1 && (s.contextTokens ?? 0) === 0 && (s.blocks ?? 0) === 0 && !s.hasLedger;
+    return (s.requests ?? 0) <= 1 && (s.contextTokens ?? 0) === 0 && (s.blocks ?? 0) === 0 && !s.hasLedger && !(s.hasEgress ?? false);
 }
 
 let lastHiddenEmpty = 0;

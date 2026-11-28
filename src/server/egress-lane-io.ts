@@ -44,7 +44,7 @@
 // Rollout gate (egressPlane, default 0 — opt-in per owner ruling 2026-11-24) and each lane's arming condition
 // are owned by the caller.
 
-import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, EGRESS_SYSTEM_MSGID, sanitizeEgressIdentityMetadata, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
+import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, EGRESS_SYSTEM_MSGID, sanitizeEgressIdentityMetadata, type EgressIdentityInput, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
 import type { EgressBlockLedgerInput } from "../storage/egress-block.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { egressPlaneGateOn } from "../knobs.js";
@@ -156,6 +156,46 @@ export function egressBlockLedgerFor(session: Session): EgressBlockLedgerInput |
         : undefined;
 }
 
+/** #B3: the EgressIdentityInput the lane seam derives from the live Session
+ *  (KDD #25). Extracted so the title-refresh re-upsert after deriveTitle
+ *  (prepare-openai.ts) rebuilds the row with the freshly derived title instead
+ *  of the pre-derive null that resolveEgressAuthority stored on a fresh
+ *  session. The mapping must not drift from the ingest session-row mapping
+ *  (src/storage/ingest.ts:627-655). */
+export function buildEgressIdentityInput(session: Session): EgressIdentityInput {
+    return {
+        sessionId: session.id,
+        parentSessionId:
+            typeof session.metadata["derivedFromSessionId"] === "string" && session.metadata["derivedFromSessionId"] !== ""
+                ? session.metadata["derivedFromSessionId"] as string : null,
+        protocol: session.meta?.protocol ?? null,
+        label: session.meta?.label ?? null,
+        title: session.meta?.title ?? null,
+        hostTitle: session.meta?.hostTitle ?? null,
+        namespace:
+            typeof session.metadata["pluginAgent"] === "string" && session.metadata["pluginAgent"] !== ""
+                ? session.metadata["pluginAgent"] as string : "proxy",
+        origin: session.meta?.upstreamOrigin ?? null,
+        createdAt: session.createdAt,
+        updatedAt: session.lastSeen,
+        // KDD #25: identity keys only — NEVER the raw session.meta bag
+        // (it carries handle.ts's runtime keys: summaryInstructions = the
+        // full multi-KB compress prompt, activePack, …). The typed fields
+        // ride their own columns; verifyProjections cross-checks exactly
+        // these four against meta_json.
+        metaJson: JSON.stringify({
+            protocol: session.meta?.protocol ?? null,
+            label: session.meta?.label ?? null,
+            title: session.meta?.title ?? null,
+            hostTitle: session.meta?.hostTitle ?? null,
+        }),
+        // KDD #25: NEVER the full runtime bag — it can carry the #6947
+        // turn-final reply stashes (handoffReply/handoffResponse, up to
+        // 1.5 MB each of chat content). Identity keys only.
+        metadataJson: JSON.stringify(sanitizeEgressIdentityMetadata(session.metadata)),
+    };
+}
+
 /** The single authority decision (ruling 7439-5): latch, recover,
  * hard-fail, classify (bootstrap / swapped / legacy). Lane-neutral —
  * OpenAI feeds the result as kernel input, the post-kernel lanes as the
@@ -241,37 +281,7 @@ export function resolveEgressAuthority(args: {
     // egress_flow directly) — it never fails the request.
     if (armed || session.metadata["egressAuthority"] === true) {
         try {
-        st.ensureEgressIdentity?.({
-            sessionId: session.id,
-            parentSessionId:
-                typeof session.metadata["derivedFromSessionId"] === "string" && session.metadata["derivedFromSessionId"] !== ""
-                    ? session.metadata["derivedFromSessionId"] as string : null,
-            protocol: session.meta?.protocol ?? null,
-            label: session.meta?.label ?? null,
-            title: session.meta?.title ?? null,
-            hostTitle: session.meta?.hostTitle ?? null,
-            namespace:
-                typeof session.metadata["pluginAgent"] === "string" && session.metadata["pluginAgent"] !== ""
-                    ? session.metadata["pluginAgent"] as string : "proxy",
-            origin: session.meta?.upstreamOrigin ?? null,
-            createdAt: session.createdAt,
-            updatedAt: session.lastSeen,
-            // KDD #25: identity keys only — NEVER the raw session.meta bag
-            // (it carries handle.ts's runtime keys: summaryInstructions = the
-            // full multi-KB compress prompt, activePack, …). The typed fields
-            // ride their own columns; verifyProjections cross-checks exactly
-            // these four against meta_json.
-            metaJson: JSON.stringify({
-                protocol: session.meta?.protocol ?? null,
-                label: session.meta?.label ?? null,
-                title: session.meta?.title ?? null,
-                hostTitle: session.meta?.hostTitle ?? null,
-            }),
-            // KDD #25: NEVER the full runtime bag — it can carry the #6947
-            // turn-final reply stashes (handoffReply/handoffResponse, up to
-            // 1.5 MB each of chat content). Identity keys only.
-            metadataJson: JSON.stringify(sanitizeEgressIdentityMetadata(session.metadata)),
-        });
+        st.ensureEgressIdentity?.(buildEgressIdentityInput(session));
         } catch (err) {
             log("warn", `[${sessionId}] egress: identity row upsert failed (best-effort; the egress_flow probe still covers identity): ${String((err as { message?: unknown })?.message ?? err).slice(0, 200)}`);
         }
