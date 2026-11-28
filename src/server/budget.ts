@@ -123,6 +123,20 @@ export function resolveEmergencyEscalationPct(maxContextLimitPct?: number): numb
     return EMERGENCY_NUDGE_ESCALATION_PCT;
 }
 
+// #5230: resolve the host-side escalation line off a resolved kernel config.
+// The value rides the ResolvedKernelConfig rail (host-only, never sent to the
+// kernel). An explicit positive compress.nudgeEscalationPct wins; an absent or
+// non-positive value falls back to the #7605 auto-track
+// (resolveEmergencyEscalationPct), which keeps the 0.70 default and tracks
+// maxContextLimitPct - 0.05 once an operator raises the over-limit line — so
+// behavior is byte-identical to pre-#5230 unless a level sets the field.
+export function resolveNudgeEscalationPct(config: unknown): number {
+    const c = config as { nudgeEscalationPct?: unknown; nudge?: { maxContextLimitPct?: number } } | null | undefined;
+    const v = c?.nudgeEscalationPct;
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
+    return resolveEmergencyEscalationPct(c?.nudge?.maxContextLimitPct);
+}
+
 /** #2391: a budget view only; never forward this projection. OpenAI tool search
  * defers individual function schemas, while namespace descriptions stay visible.
  * https://developers.openai.com/api/docs/guides/tools-tool-search */
@@ -478,11 +492,11 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
 
 export function emergencyNudgeForConfig(
     nudge: NudgeDecision | null | undefined,
-    loopConfig: { compress: { minCompressRange: number }; nudge: { maxContextLimitPct?: number } },
+    loopConfig: { compress: { minCompressRange: number }; nudge: { maxContextLimitPct?: number }; nudgeEscalationPct?: number },
 ): boolean {
     return emergencyNudge(
         nudge,
-        resolveEmergencyEscalationPct(loopConfig.nudge.maxContextLimitPct),
+        resolveNudgeEscalationPct(loopConfig),
         loopConfig.compress.minCompressRange,
     );
 }
@@ -509,18 +523,20 @@ export function emergencyNudgeForConfig(
  * call sites OR them in BEFORE the emergency arm, so normal cadence is
  * untouched. State lives in session.metadata.emergencyNudgeGate (survives
  * restarts with the snapshot, visible on /__bili/sessions like selfHeal).
- * The escalation line is config-aware (#7605): resolveEmergencyEscalationPct
- * keeps the default 0.70 and tracks maxContextLimitPct - 0.05 once an operator
- * raises the over-limit line above the 0.75 default. */
-export function emergencyNudgeArmed(
+  * The escalation line is config-aware: an explicit compress.nudgeEscalationPct
+  * (#5230) wins when set; otherwise resolveEmergencyEscalationPct (#7605) keeps
+  * the default 0.70 and tracks maxContextLimitPct - 0.05 once an operator raises
+  * the over-limit line above the 0.75 default. Call sites pass the resolved
+  * loop config; resolution goes through resolveNudgeEscalationPct. */
+ export function emergencyNudgeArmed(
     session: Session,
     nudge: NudgeDecision | null | undefined,
     minCompressRange: number,
     tokenCount: number,
     growthStep?: number,
-    maxContextLimitPct?: number,
+    loopConfig?: { nudge?: { maxContextLimitPct?: number }; nudgeEscalationPct?: number },
 ): boolean {
-    if (!emergencyNudge(nudge, resolveEmergencyEscalationPct(maxContextLimitPct), minCompressRange)) return false;
+    if (!emergencyNudge(nudge, resolveNudgeEscalationPct(loopConfig), minCompressRange)) return false;
     const now = Date.now();
     const key = reductionKeyOf(session);
     const raw = session.metadata["emergencyNudgeGate"];

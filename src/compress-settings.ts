@@ -74,6 +74,7 @@ export function mergeCompress(
         modelContextLimit: pick("modelContextLimit"),
         outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
         maxContextLimit: pick("maxContextLimit"),
+        nudgeEscalationPct: pick("nudgeEscalationPct"),
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
         minPressureBenefitTokens: pick("minPressureBenefitTokens"),
@@ -306,7 +307,7 @@ export function hasCompressSettings(s: CompressSettings): boolean {
 // clone-safe DATA half of the isMessageProtected predicate: the stamp
 // (storeEffectiveConfig) strips function fields, and effectiveConfig rebuilds
 // the predicate from this list on the session-stamp read path.
-export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings; protectedUserPatterns?: string[] };
+export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings; protectedUserPatterns?: string[]; nudgeEscalationPct?: number };
 
 /** User-text half of the host predicate: literal substring match on
  *  user-role text messages only. Both the resolve-time builder
@@ -446,6 +447,11 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         // HERE, at resolve time — the executor still receives a fully
         // expanded ExternalSummarySettings and never sees references.
         externalSummary: s.externalSummary !== undefined ? expandExternalSummaryChainTolerant(s.externalSummary, recipes) : (base as ResolvedKernelConfig).externalSummary,
+        // Host-only escalation-nudge line (#5230): never passed to the kernel.
+        // Deepest-wins via mergeCompress; unset inherits base unchanged so a
+        // re-resolve without the field keeps its prior value; unset everywhere
+        // leaves it absent → budget.ts falls back to the 0.7 default.
+        nudgeEscalationPct: s.nudgeEscalationPct !== undefined ? parsePercent(s.nudgeEscalationPct) : (base as ResolvedKernelConfig).nudgeEscalationPct,
         ...(absorb !== undefined ? { absorb } : {}),
         // #5765: one-switch opt-in — absent `s.blockOps` leaves base untouched
         // (off); a present block normalizes enabled (absent/false = off).

@@ -91,8 +91,8 @@ test("emergencyNudgeForConfig and emergencyNudgeArmed honor raised maxContextLim
     const at81 = makeNudge(0.81);
 
     assert.equal(emergencyNudgeForConfig(at74, cfg), false);
-    assert.equal(emergencyNudgeArmed(makeSession(), at74, 1000, 74_000, undefined, 0.85), false);
+    assert.equal(emergencyNudgeArmed(makeSession(), at74, 1000, 74_000, undefined, cfg), false);
 
     assert.equal(emergencyNudgeForConfig(at81, cfg), true);
-    assert.equal(emergencyNudgeArmed(makeSession(), at81, 1000, 81_000, undefined, 0.85), true);
+    assert.equal(emergencyNudgeArmed(makeSession(), at81, 1000, 81_000, undefined, cfg), true);
 });
