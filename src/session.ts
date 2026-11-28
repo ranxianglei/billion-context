@@ -1,7 +1,8 @@
-import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
+import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, type CompressionBlock, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
 import { createHash } from "node:crypto";
+import type { BiliMessage } from "acp-kernel/wire";
 import { log as loggerLog } from "./logger.js";
-import { getStore, effectiveFileStorageMode } from "./persist.js";
+import { getStore, effectiveFileStorageMode, type SessionStore } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
 import { configFileEpoch, loadConfigFile, loadNamedProviders } from "./config.js";
@@ -43,6 +44,159 @@ export function blockContentSnapshot(
     const content = contents.get(block.blockId);
     if (content !== undefined && content.one === null && content.full.count === 0 && content.full.text === block.summary) return undefined;
     return content;
+}
+
+type BlockCitation = { start: number; at: number; end: number; raw: string; ref: string };
+const blockRefTag = /^(\x3cacp tokens="[^"\n]+" type="[^"\n]+"(?: time="[^"\n]+")?\x3e)(m\d+)\x3c\/acp\x3e\n$/;
+const blockHasRef = /^\[(?:user|assistant|system|tool)(?: • [^\n]+)?\]\n\x3cacp tokens="/m;
+
+/** Match whole originals backwards from the end of the kernel view. A role
+ *  heading, ref tag or entire quoted transcript inside an original is consumed
+ *  as data. Nested summaries occupy the prefix of the one-tier view. */
+function locateBlockCitations(view: BlockView, messages: CoreMessage[], summaries: number): BlockCitation[] | null {
+    if (messages.length + summaries !== view.count) return null;
+    const found: BlockCitation[] = [];
+    const seen = new Set<string>();
+    let end = view.text.length;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i]!;
+        const body = m.text ?? "";
+        const header = m.toolName && m.contentType !== "text" ? "[" + m.role + " • " + m.toolName + "]\n" : "[" + m.role + "]\n";
+        const original = header + body;
+        // Equal messages with different identities cannot be distinguished by
+        // content alone in a pre-fix snapshot. Never guess from their position.
+        if (seen.has(original) || !view.text.endsWith(body, end)) return null;
+        seen.add(original);
+        let headerEnd = end - body.length;
+        if (!view.text.endsWith(header, headerEnd)) {
+            if (view.text[headerEnd - 1] !== "\n") return null;
+            const start = view.text.lastIndexOf("\n", headerEnd - 2) + 1;
+            const tag = blockRefTag.exec(view.text.slice(start, headerEnd));
+            if (!tag || !view.text.endsWith(header, start)) return null;
+            found.push({ start, at: start + tag[1]!.length, end: headerEnd, raw: m.id, ref: tag[2]! });
+            headerEnd = start;
+        }
+        end = headerEnd - header.length;
+        if (i > 0 || summaries) {
+            if (!view.text.endsWith("\n\n", end)) return null;
+            end -= 2;
+        }
+    }
+    return summaries > 0 || end === 0 ? found.reverse() : null;
+}
+
+export function mayHaveHistoricalCitations(session: Session): boolean {
+    return session.state.refLedgerAligned === true && session.metadata.foldedCitationsPreserved !== true;
+}
+
+/** Pre-fix, already-aligned sessions can have two owners for the same printed
+ *  number. Prove each archived binding by stable ID, role and exact original
+ *  bytes. null means insufficient evidence; [] means no translation needed. */
+export function historicalBlockCitations(session: Session, block: CompressionBlock, view: BlockView, full: boolean): BlockCitation[] | null {
+    return mayHaveHistoricalCitations(session) ? snapshotCitations(session, block, view, full) : [];
+}
+
+function snapshotCitations(session: Session, block: CompressionBlock, view: BlockView, full: boolean, store?: SessionStore): BlockCitation[] | null {
+    if (!blockHasRef.test(view.text)) return [];
+    const ids = new Set(block.effectiveMessageIds ?? []);
+    let summaries = 0;
+    if (!full) {
+        for (const id of block.directBlockIds ?? []) {
+            const child = session.state.blocks.find(b => b.blockId === id);
+            if (!child?.active) continue;
+            summaries++;
+            for (const raw of child.effectiveMessageIds) ids.delete(raw);
+        }
+    }
+    const byId = new Map<string, BiliMessage>();
+    for (const source of [session.lastMessages, session.pluginSnapshot]) {
+        if (!source?.length) continue;
+        const members = source.filter(m => ids.has(m.id));
+        for (const m of members) byId.set(m.id, m);
+        if (members.length === ids.size && new Set(members.map(m => m.id)).size === ids.size) {
+            const result = locateBlockCitations(view, members, summaries);
+            if (result) return result;
+        }
+    }
+    for (const row of (store ?? getStore()).unifiedMessageContentByIds(session.id, [...ids]) ?? []) {
+        try {
+            const m: BiliMessage = JSON.parse(row.content);
+            if (m?.id === row.msgId && m.role === row.role && (m.text === undefined || typeof m.text === "string")) byId.set(m.id, m);
+        } catch { /* A corrupt historical row cannot prove a citation. */ }
+    }
+    if (byId.size !== ids.size) return null;
+    const rows = [...ids].map(id => byId.get(id)!);
+    const matches = locateBlockCitations(view, rows, summaries);
+    if (matches || !rows.every(m => Number.isSafeInteger(m.wireIndex))) return matches;
+    return locateBlockCitations(view, rows.sort((a, b) => a.wireIndex! - b.wireIndex!), summaries);
+}
+
+/** Numbers can reach a caller in the frozen transcript or in the plugin
+ *  snapshot's ordered messages (including tool parts without inline tags).
+ *  Block coverage alone does not establish either kind of publication. */
+export function publishedBlockCitationOwners(session: Session, store: SessionStore): { owners: Set<string>; allVerified: boolean } {
+    const owners = new Set<string>();
+    let allVerified = true;
+    const { byRaw, byRef } = session.state.messageRefs;
+    const plugin = session.metadata.publicSnapshotTextComparable === false ? undefined : session.pluginSnapshot;
+    for (const block of session.state.blocks) {
+        const snapshot = blockContentSnapshot(session.blockContents, block);
+        if (!snapshot) continue;
+        let pluginCitations: BlockCitation[] | null = null;
+        if (plugin?.length) {
+            const ids = new Set(block.effectiveMessageIds);
+            const members = plugin.filter(m => ids.has(m.id));
+            if (members.length === ids.size && new Set(members.map(m => m.id)).size === ids.size) {
+                pluginCitations = locateBlockCitations(snapshot.full, members, 0);
+                if (pluginCitations) {
+                    for (const { id } of members) {
+                        const ref = byRaw[id];
+                        if (ref && byRef[ref] === id) owners.add(id);
+                    }
+                }
+            }
+        }
+        for (const view of [snapshot.full, snapshot.one]) {
+            if (!view) continue;
+            const full = view === snapshot.full;
+            const citations = full && pluginCitations !== null ? pluginCitations : snapshotCitations(session, block, view, full, store);
+            if (!citations) {
+                allVerified = false;
+                continue;
+            }
+            for (const { raw, ref } of citations) {
+                if (byRaw[raw] === ref && byRef[ref] === raw) owners.add(raw);
+                else allVerified = false;
+            }
+        }
+    }
+    return { owners, allVerified };
+}
+
+/** Keep the frozen snapshot available byte-for-byte to archival readers. Only
+ *  the actionable presentation gets today's verified message numbers. */
+export function currentBlockView(session: Session, block: CompressionBlock, view: BlockView, full: boolean): BlockView {
+    const citations = historicalBlockCitations(session, block, view, full);
+    if (!citations) return { count: view.count, text: "[Historical transcript: its message numbers could not be verified. Use the text here instead of copying its numbers for range restore.]\n" + view.text };
+    const { byRaw, byRef } = session.state.messageRefs;
+    const chunks: string[] = [];
+    let from = 0;
+    let example: string | undefined;
+    for (const { start, at, end, raw, ref } of citations) {
+        const live = byRaw[raw];
+        if (live === ref && byRef[live] === raw) continue;
+        if (!live || !/^m\d+$/.test(live) || byRef[live] !== raw) {
+            chunks.push(view.text.slice(from, start));
+            from = end;
+            continue;
+        }
+        example ??= live;
+        chunks.push(view.text.slice(from, at), live);
+        from = at + ref.length;
+    }
+    if (!chunks.length) return view;
+    const note = example ? "[Historical message numbers changed. In the owning session, prefix the displayed number with current: for retrieval (for example current:" + example + "). For a range, prefix both endpoints.]\n" : "";
+    return { text: note + chunks.join("") + view.text.slice(from), count: view.count };
 }
 
 /** #3050 R3 ②b: block-contents map that folds away to (almost) nothing once
@@ -1853,6 +2007,7 @@ export function cacheBlockContent(session: Session, blockId: string, content: Bl
 export function resetSessionCompression(session: Session): void {
     session.state = createInitialState();
     session.blockContents.clear();
+    delete session.metadata.foldedCitationsPreserved;
     // The kernel contract ties the store to the state ('host resets the store
     // with the state'): a full rebase restarts refs at m00001, so old entries
     // would misattribute under reused numbers. contentStoreDirty + markDirty

@@ -1,5 +1,5 @@
 import { collectBlockContent } from "acp-kernel";
-import { blockContentSnapshot } from "./session.js";
+import { blockContentSnapshot, currentBlockView } from "./session.js";
 import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from "./compress-tool.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
@@ -93,7 +93,7 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
             if (collected.trim()) return collected;
             // An inline-restored block may no longer have originals in the wire view.
             const cached = blockContentSnapshot(ctx.session.blockContents, block);
-            return cached?.one?.text ?? cached?.full?.text ?? "";
+            return cached ? currentBlockView(ctx.session, block, cached.one ?? cached.full, !cached.one).text : "";
         }).join("\n\n");
         if (!content.trim()) continue;
         const covered = new Set(blocks.flatMap((block) => block.effectiveMessageIds));

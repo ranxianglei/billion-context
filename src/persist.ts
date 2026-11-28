@@ -33,10 +33,10 @@ import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
-import { markDirty } from "./session.js";
+import { markDirty, publishedBlockCitationOwners } from "./session.js";
 import { validCostUsd } from "./billing.js";
 import { mergeState } from "./state-hydration.js";
-import { restampRefsToLedger, restampContentStore } from "acp-kernel";
+import { BLOCKED_REF, restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
@@ -2084,6 +2084,19 @@ export class SessionStore {
         try {
             const seqByRawId = this.unifiedSeqByRaw(session.id);
             if (seqByRawId === null || seqByRawId.size === 0) return;
+            // Check the frozen views only if a ledger row would actually move.
+            // Keep both the printed citation and its slot: another row could
+            // otherwise displace the owner even if its own move was omitted.
+            const ledgerRows = seqByRawId.size;
+            let published: ReturnType<typeof publishedBlockCitationOwners> | undefined;
+            for (const [raw, seq] of seqByRawId) {
+                const target = "m" + String(seq + 1).padStart(5, "0");
+                const current = state.messageRefs.byRaw[raw];
+                if (current === undefined || current === BLOCKED_REF || current === target) continue;
+                published ??= publishedBlockCitationOwners(session, this);
+                const occupant = state.messageRefs.byRef[target];
+                if (published.owners.has(raw) || (occupant !== undefined && published.owners.has(occupant))) seqByRawId.delete(raw);
+            }
             const outcome = restampRefsToLedger(state, seqByRawId);
             // #4733: the ref restamp alone leaves the CCR content store keyed by
             // store-time refs — a stored original would sit under a number the
@@ -2134,6 +2147,9 @@ export class SessionStore {
                 }
             }
             state.refLedgerAligned = true;
+            // Ordinary legacy alignment keeps its original persisted shape.
+            // Unverified archives still need the historical reader after reload.
+            if (seqByRawId.size < ledgerRows && published?.allVerified) session.metadata.foldedCitationsPreserved = true;
             this.log("info", `[persist] ledger-aligned refs for ${session.id}: kept=${outcome.kept} restamped=${outcome.restamped} rehomed=${outcome.rehomed} blocked=${outcome.blocked} superseded=${outcome.superseded.size} (#4316 PR3/3)`);
             this.scheduleSave(session);
         } catch (err) {

@@ -273,19 +273,23 @@ test("native retrieval exports preserve each session's original when refs collid
         const refs = rig.forwards.map(body => /\[acp-stored #(m\d+)/.exec(body)?.[1]);
         assert.ok(refs[0]);
         assert.equal(refs[0], refs[1], "independent sessions can reuse the same message ref");
-        const results = await Promise.all(identities.map(async (conversationId, i) => {
+        const retrieve = async (conversationId: string, ref: string) => {
             const response = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
                 method: "POST", headers: { "content-type": "application/json" },
-                body: JSON.stringify({ conversationId, nativeCaller: true, tool: "acp_retrieve", args: { ref: refs[i] } }),
+                body: JSON.stringify({ conversationId, nativeCaller: true, tool: "acp_retrieve", args: { ref } }),
             });
             assert.equal(response.status, 200);
             return await response.json() as { ok: boolean; retrievalExport?: { path: string; text: string }; result: string };
-        }));
+        };
+        const results = await Promise.all(identities.map((id, i) => retrieve(id, refs[i]!)));
         for (let i = 0; i < results.length; i++) {
             assert.equal(results[i].ok, true);
             assert.equal(results[i].retrievalExport?.text, originals[i], "export snapshot retains exact CRLF bytes from its own session");
             assert.ok(results[i].result.includes(results[i].retrievalExport?.path ?? "MISSING"));
         }
+        const qualified = await retrieve(identities[0]!, "current:" + refs[0]);
+        assert.equal(qualified.retrievalExport?.text, originals[0]);
+        assert.equal(qualified.retrievalExport?.path, results[0]!.retrievalExport?.path);
         assert.ok(listSessions().filter(ccrEnabled).every(session => session.metadata.pluginAgent === undefined));
     } finally {
         await closeRig(rig);

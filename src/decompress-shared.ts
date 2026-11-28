@@ -22,7 +22,7 @@ import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { blockContentSnapshot, markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
+import { blockContentSnapshot, currentBlockView, historicalBlockCitations, mayHaveHistoricalCitations, markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
 import { getStore } from "./persist.js";
 import { ccrEnabled, contentStoreOf } from "./store.js";
 import { safePrefix } from "./text-safe.js";
@@ -227,12 +227,12 @@ export function resolveDecompress(
         // unconditionally would break the default one-level semantics.
         // `one === null` means the two views were byte-identical at cache
         // time and deduped to one copy (#401).
-        const view = full ? cached.full : (cached.one ?? cached.full);
+        const view = currentBlockView(ctx.session, block, full ? cached.full : (cached.one ?? cached.full), full || !cached.one);
         body = view.text;
         count = view.count;
     } else {
         const collected = collectBlockContent(ctx.session.state, block, ctx.compressMessages ?? ctx.messages, { full });
-        body = collected.text || block.summary;
+        body = collected.text ? currentBlockView(ctx.session, block, collected, full).text : block.summary;
         count = collected.count;
     }
     // #1336: retrieve-quality proxy — a whole-block restore where a precise
@@ -378,8 +378,8 @@ export function coveredRefSpan(state: CompressionState, block: CompressionBlock)
 // shape as acp_retrieve injections, structurally excluded from fold space),
 // never cached in blockContents. Gated on CCR being armed for the session.
 function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx, block: CompressionBlock): ProxyToolResult {
-    const startRaw = typeof args.startId === "string" ? args.startId.trim() : "";
-    const endRaw = typeof args.endId === "string" ? args.endId.trim() : "";
+    let startRaw = typeof args.startId === "string" ? args.startId.trim() : "";
+    let endRaw = typeof args.endId === "string" ? args.endId.trim() : "";
     if (!startRaw || !endRaw) return toolFail("[decompress FAILED: startId and endId must be given together — pass both mNNNNN refs, or omit both to restore the whole block]");
     if (!ccrEnabled(ctx.session)) {
         // Range restore needs the CCR content store; a CCR-off session has none.
@@ -393,6 +393,12 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
         }
         return toolFail("[decompress FAILED: range restore (startId/endId) requires CCR — enable compress.ccr.enabled]");
     }
+    const current = startRaw.startsWith("current:");
+    if (current !== endRaw.startsWith("current:")) return toolFail("[decompress FAILED: use current: on both range endpoints, or on neither.]");
+    if (current) {
+        startRaw = startRaw.slice("current:".length).trim();
+        endRaw = endRaw.slice("current:".length).trim();
+    }
     const sb = parseBoundary(startRaw);
     const eb = parseBoundary(endRaw);
     if (!sb || sb.kind !== "message" || !eb || eb.kind !== "message") {
@@ -403,6 +409,33 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     const cov = coveredMessages(state, block);
     if (!cov) return toolFail(`[decompress FAILED: ${block.blockId} has no per-message coverage recorded (older block) — use plain decompress {blockId} for the whole block]`);
     const pickedSet = new Set(cov.raws.filter(({ num }) => num >= sb.numericId && num <= eb.numericId).map(({ raw }) => raw));
+    if (!current && mayHaveHistoricalCitations(ctx.session)) {
+        const frozen = blockContentSnapshot(ctx.session.blockContents, block);
+        const citations = frozen ? historicalBlockCitations(ctx.session, block, frozen.full, true) : [];
+        if (!citations) return toolFail("[decompress FAILED: this historical block's citation owners cannot be verified. Open the whole block for the frozen text, or use current: on both endpoints for a range read from the current ledger.]");
+        const moved = citations.filter(c => {
+            const n = refNum(c.ref);
+            if (n === null || state.messageRefs.byRaw[c.raw] === c.ref) return false;
+            // A span changes meaning if a covered message moved either into
+            // it or out of it. For a single ref only its old owner competes.
+            return (n >= sb.numericId && n <= eb.numericId) || (sb.numericId !== eb.numericId && pickedSet.has(c.raw));
+        });
+        if (moved.length) {
+            const first = moved[0]!;
+            const live = state.messageRefs.byRaw[first.raw];
+            const available = !!live && refNum(live) !== null && state.messageRefs.byRef[live] === first.raw;
+            if (sb.numericId !== eb.numericId || pickedSet.size || moved.length !== 1 || !available) {
+                const oldOwner = available ? "the archived message is now current:" + live : "the archived message has no current citation";
+                const owner = state.messageRefs.byRef[first.ref];
+                const other = owner !== undefined && owner !== first.raw ? "; current:" + first.ref + " belongs to another message" : "";
+                return toolFail("[decompress FAILED: historical ref " + first.ref + " changed; " + oldOwner + other + ". Open the full block or use current: on both endpoints to select the current numbering.]");
+            }
+            // This old single-message citation has exactly one covered owner.
+            // Use its current identity for the injected header and retry key.
+            startRaw = endRaw = live;
+            pickedSet.add(first.raw);
+        }
+    }
     if (pickedSet.size === 0) return toolFail(`[decompress FAILED: ${block.blockId} covers no messages in ${startRaw}–${endRaw} (its coverage is ${cov.text})]`);
     const parts: string[] = [];
     let restoredFromStore = 0;
@@ -592,7 +625,7 @@ function resolveDerivedDecompress(
         }
         const full = args.full === true || args.full === "true";
         const cached = blockContentSnapshot(anc.blockContents, block);
-        const view = cached ? (full ? cached.full : (cached.one ?? cached.full)) : undefined;
+        const view = cached ? currentBlockView(anc, block, full ? cached.full : (cached.one ?? cached.full), full || !cached.one) : undefined;
         const body = view?.text || block.summary;
         const count = view?.count ?? 0;
         const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""} · read-only from derived session ${anc.id} (#1333)]`;

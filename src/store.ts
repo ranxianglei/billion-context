@@ -19,7 +19,7 @@ import { stateDir } from "./paths.js";
 import { getStore } from "./persist.js";
 import type { CompressSettings } from "./config.js";
 import { ccrRetrievalTtlMs as knobCcrRetrievalTtlMs } from "./knobs.js";
-import type { PendingRetrieval, Session } from "./session.js";
+import { blockContentSnapshot, historicalBlockCitations, mayHaveHistoricalCitations, type PendingRetrieval, type Session } from "./session.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 export type CcrSettings = NonNullable<CompressSettings["ccr"]>;
@@ -189,6 +189,42 @@ export function cloneStoreForRefs(store: MessageContentStore, refs: Iterable<str
     return Object.keys(byRef).length > 0 ? { version: 1, byHash, byRef } : null;
 }
 
+/** A bare CCR ref has no block to narrow its meaning. Check every frozen
+ *  block that contains that label on pre-fix sessions, on explicit lookup
+ *  only. A vacant number can still have a unique archived owner. */
+function resolveStoredCitation(session: Session, requested: string): { ref: string; raw?: string } | { error: string } {
+    const { byRaw, byRef } = session.state.messageRefs;
+    if (requested.startsWith("current:")) {
+        const ref = requested.slice("current:".length).trim();
+        const raw = byRef[ref];
+        return /^m\d+$/.test(ref) && raw && byRaw[raw] === ref ? { ref, raw } : { error: "no current message owns " + requested };
+    }
+    const current = byRef[requested];
+    if (!mayHaveHistoricalCitations(session) || !/^m\d+$/.test(requested)) return { ref: requested, raw: current };
+
+    let owner = current;
+    const tagEnd = "\x3e" + requested + "\x3c/acp\x3e\n";
+    for (const block of session.state.blocks) {
+        const view = blockContentSnapshot(session.blockContents, block)?.full;
+        if (!view?.text.includes(tagEnd)) continue;
+        const citations = historicalBlockCitations(session, block, view, true);
+        if (!citations) return { error: "the original owner of " + requested + " in " + block.blockId + " cannot be verified. Open the full block or use current: with a verified current number." };
+        for (const c of citations) {
+            if (c.ref !== requested) continue;
+            if (owner !== undefined && owner !== c.raw) {
+                const choices = [owner, c.raw].flatMap(raw => {
+                    const ref = byRaw[raw];
+                    return ref && /^m\d+$/.test(ref) && byRef[ref] === raw ? ["current:" + ref] : [];
+                });
+                return { error: requested + " has different historical and current owners. Open " + block.blockId + " to identify the original, then choose a current number" + (choices.length ? " (" + choices.join(", ") + ")" : "") + "." };
+            }
+            owner = c.raw;
+        }
+    }
+    const live = owner !== undefined ? byRaw[owner] : undefined;
+    return { ref: live && byRef[live] === owner ? live : requested, raw: owner };
+}
+
 /** Execute a retrieve-tool call against the kernel store: resolve the ref,
  *  count hit/miss, and return the framed original IN THE TOOL RESULT ITSELF
  *  (GHSA jc6g v2: untrusted data rides back at the trust tier it came from,
@@ -199,12 +235,24 @@ export function cloneStoreForRefs(store: MessageContentStore, refs: Iterable<str
 export function executeRetrieve(args: Record<string, unknown>, session: Session): ProxyToolResult {
     session.stats.retrieveCalls = (session.stats.retrieveCalls ?? 0) + 1;
     const rawRef = args.ref;
-    const ref = typeof rawRef === "string" ? rawRef.trim() : "";
-    if (!ref) {
+    const requested = typeof rawRef === "string" ? rawRef.trim() : "";
+    if (!requested) {
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         return toolFail(`[${retrieveToolName(session)} FAILED: ref (an mNNNNN id) is required]`);
     }
-    const result = applyRetrieve({ store: contentStoreOf(session), ref, exportDir: retrievalExportDir() });
+    const citation = resolveStoredCitation(session, requested);
+    if ("error" in citation) {
+        session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
+        return toolFail("[" + retrieveToolName(session) + " FAILED: " + citation.error + "]");
+    }
+    const { ref, raw } = citation;
+    const store = contentStoreOf(session);
+    const entry = store.byRef[ref];
+    if (raw !== undefined && entry && entry.rawId !== raw) {
+        session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
+        return toolFail("[" + retrieveToolName(session) + " FAILED: stored content for " + ref + " belongs to a different message. Open the whole block for its original text.]");
+    }
+    const result = applyRetrieve({ store, ref, exportDir: retrievalExportDir() });
     if (!result.ok) {
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         loggerLog("info", `[ccr] retrieve ${ref}: miss (${result.reason})`);
@@ -223,7 +271,9 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
     // returns, so it counts as delivered now — nothing left to queue.
     session.stats.retrieveDelivered = (session.stats.retrieveDelivered ?? 0) + 1;
     loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars${result.export ? `, exported ${result.export.path}` : ""})`);
-    return toolOk(result.toolResultText);
+    const receipt = toolOk(result.toolResultText);
+    if (result.export && ref !== requested) receipt.retrievalRef = ref;
+    return receipt;
 }
 
 /** Host side of the kernel RetrievalExport effect: exports land under
