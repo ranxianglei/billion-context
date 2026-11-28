@@ -159,6 +159,20 @@ const CHAT_BODY = (maxTokens: number) => JSON.stringify({
     ],
 });
 
+// #7882: a title-gen request is a one-shot (NO model-round-trip history) with a
+// tiny budget. The #7882 replay veto promotes any body that resends assistant/
+// tool history to a MAIN turn regardless of budget, so a user-only body keeps
+// this test on the side lane — it keeps verifying the title-gen passthrough
+// (no compression prompt injected) after the replay veto landed.
+const TITLE_GEN_BODY = JSON.stringify({
+    model: "test",
+    max_tokens: 100,
+    messages: [
+        { role: "system", content: "You are helpful." },
+        { role: "user", content: "Generate a title for this conversation." },
+    ],
+});
+
 function systemText(fwd: Record<string, unknown>): string {
     const msgs = fwd.messages as Array<{ role?: string; content?: unknown }> | undefined;
     assert.ok(Array.isArray(msgs), "forwarded body carries messages");
@@ -228,7 +242,7 @@ test("e2e #1881 C: title-gen request gets neither full prompt nor tags-only sect
         const res = await fetch(`http://127.0.0.1:${harness.port}/v1/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-session-id": "issue1881-c" },
-            body: CHAT_BODY(100),
+            body: TITLE_GEN_BODY,
         });
         assert.equal(res.status, 200);
         assert.equal(seen.length, 1);
