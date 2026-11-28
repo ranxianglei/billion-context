@@ -22,7 +22,7 @@
 // (BILLION_CONTEXT_PLUGIN=0 / BILI_NATIVE_OMP=0).
 
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
-import { createBiliPlugin, createOmpDirectSendGuard } from "./pi.js";
+import { createBiliPlugin, createOmpDirectSendGuard, piDeclaredWindowForDirect } from "./pi.js";
 import { applyOmpFirstEventTimeout, applyOmpMessageThreadsOff, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
 import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
@@ -218,6 +218,10 @@ state.beforeSend = ompIncrementalBeforeSend;
 // direct send also drops the prompt_cache_key the plugin stamped (no proxy
 // strips it on that path).
 state.prepareDirectSend = createOmpDirectSendGuard();
+// #5032: arm the guard's second window source — omp never stamps a
+// context-window header (no before_provider_headers), so without this arm
+// the reader was always empty and oversized history egressed on outage.
+state.declaredWindowForDirect = piDeclaredWindowForDirect;
 
 export function ompIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
     const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
@@ -459,6 +463,11 @@ export function _setOmpOriginForTest(origin: string | undefined): void {
 /** Test hook: expose the armed runtime-recovery seam (mirrors pi/opencode/dsh). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook (#5032): expose the armed direct-send window reader. */
+export function _declaredWindowHookForTest(): (() => number | undefined) | undefined {
+    return state.declaredWindowForDirect;
 }
 
 /** Test hook: inspect the owner marker installed by the native OMP host. */

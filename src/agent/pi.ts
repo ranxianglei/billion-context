@@ -1818,6 +1818,17 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: payload, msgIds: forkMsgIds });
         }
         pi.on("before_provider_request", async (event, ctx) => {
+            // #5032 (the #5025 family): omp never fires before_provider_headers,
+            // so this is its ONLY per-request seam — record the window FIRST,
+            // before any await below, because the proxy-readiness returns deeper
+            // in the chain are precisely the degraded direct-send path the
+            // shared guard measures against (#4894). Same client-declared value
+            // reportOmpRuntimeInfo already ships server-side as "client-config"
+            // (#955/#1531), so the guard measures what the proxy enforces.
+            if (agent === "omp") {
+                const liveWindow = ctx.model?.contextWindow;
+                piDeclaredWindow = typeof liveWindow === "number" && Number.isFinite(liveWindow) && liveWindow > 0 ? Math.floor(liveWindow) : undefined;
+            }
             // #5403/#5418 unified watermark channel: capture THIS request's
             // host msgids per family for the ONE chokepoint emitter. Runs on
             // EVERY model request — including the OpenAI-family turns the
