@@ -162,6 +162,61 @@ test("diagnosis: the divergent slot's differing top-level fields are named, valu
     assert.equal(d5.tailSlot?.fields, undefined);
 });
 
+test("diagnosis: object-typed divergent fields drill one level into their inner keys (#5589)", () => {
+    // The v0.1.215 Codex CLI shape: same id/role/text on both legs, a fixed
+    // (+26 canonical bytes) difference INSIDE rawResponsesItem — the top-level
+    // diff names the sidecar but not which wire key moved.
+    const base = [msg(0), msg(1)];
+    const item = (extra: Record<string, unknown> = {}) => ({ type: "message", status: "completed", ...extra });
+    const expectView = { lastMessages: [{ ...base[0], rawResponsesItem: item() }, base[1]] };
+    const withItem = (extra: Record<string, unknown>) => ({ lastMessages: [{ ...base[0], rawResponsesItem: item(extra) }, base[1]] });
+
+    // One inner key added on the stored copy: named; values stay out.
+    const d = describeViewDivergence(expectView, withItem({ summary: "x".repeat(26) }));
+    assert.deepEqual(d.keys, ["lastMessages"]);
+    assert.equal(d.tailSlot?.index, 0);
+    assert.deepEqual(d.tailSlot?.fields, ["rawResponsesItem"]);
+    assert.deepEqual(d.tailSlot?.nestedFields, { rawResponsesItem: ["summary"] });
+    const line = formatDriftDiagnostics(d);
+    assert.ok(line.includes("fields: rawResponsesItem; rawResponsesItem: summary"), `nested segment present: ${line}`);
+    assert.ok(!line.includes("x".repeat(26)), "inner values never reach the line");
+
+    // A VALUE change on a shared inner key names that key.
+    const d2 = describeViewDivergence(expectView, withItem({ status: "incomplete" }));
+    assert.deepEqual(d2.tailSlot?.nestedFields, { rawResponsesItem: ["status"] });
+
+    // Multiple inner disagreements: all named, sorted.
+    const d3 = describeViewDivergence(expectView, withItem({ zeta: 1, alpha: 2 }));
+    assert.deepEqual(d3.tailSlot?.nestedFields, { rawResponsesItem: ["alpha", "zeta"] });
+
+    // The whole field present on one leg only: the top-level name IS the
+    // diagnosis — no drill.
+    const d4 = describeViewDivergence(
+        { lastMessages: [{ ...base[0] }, base[1]] },
+        { lastMessages: [{ ...base[0], rawResponsesItem: item() }, base[1]] },
+    );
+    assert.deepEqual(d4.tailSlot?.fields, ["rawResponsesItem"]);
+    assert.equal(d4.tailSlot?.nestedFields, undefined, "no drill when the field is absent on one leg");
+
+    // Bounded: >5 disagreeing inner keys report the first 5 (sorted).
+    const d5 = describeViewDivergence(expectView, withItem({ k1: 1, k2: 2, k3: 3, k4: 4, k5: 5, k6: 6, k7: 7 }));
+    assert.deepEqual(d5.tailSlot?.nestedFields, { rawResponsesItem: ["k1", "k2", "k3", "k4", "k5"] });
+
+    // Array-typed divergent fields are named but not drilled.
+    const d6 = describeViewDivergence(
+        { lastMessages: [{ ...base[0], rawOpenaiContentParts: [{ type: "output_text", text: "a" }] }, base[1]] },
+        { lastMessages: [{ ...base[0], rawOpenaiContentParts: [{ type: "output_text", text: "b" }] }, base[1]] },
+    );
+    assert.deepEqual(d6.tailSlot?.fields, ["rawOpenaiContentParts"]);
+    assert.equal(d6.tailSlot?.nestedFields, undefined, "arrays are not drilled");
+
+    // A non-object divergent field: named, no drill segment (no empty suffix).
+    const d7 = describeViewDivergence(expectView, { lastMessages: [{ ...base[0], rawResponsesItem: item(), ts: 123 }, base[1]] });
+    assert.deepEqual(d7.tailSlot?.fields, ["ts"]);
+    assert.equal(d7.tailSlot?.nestedFields, undefined, "non-object fields are not drilled");
+    assert.ok(!formatDriftDiagnostics(d7).includes("ts: "), `no empty drill segment: ${formatDriftDiagnostics(d7)}`);
+});
+
 test("latch gate: a drift-latched session rides the full path until a clean sample re-admits it", () => {
     const dir = tmpdir("bili-5677-latch-");
     try {
