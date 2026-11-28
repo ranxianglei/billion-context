@@ -485,6 +485,7 @@ CREATE TABLE IF NOT EXISTS state_fields (
 const EGRESS_STATE_DDL = `-- #6785 perf (proposals discussions/7398 + 7439, materialized at 7773): op-log outbound view (flow record + materialized live state), self-contained bytes, canonical per-message numbers.
 CREATE TABLE IF NOT EXISTS egress_state (
     session_id TEXT NOT NULL,
+    rid INTEGER NOT NULL,
     msgid TEXT NOT NULL,
     pos INTEGER NOT NULL,
     log_seq INTEGER NOT NULL,
@@ -497,19 +498,22 @@ CREATE TABLE IF NOT EXISTS egress_state (
     sys_in TEXT,
     bytes TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    PRIMARY KEY (session_id, msgid)
+    PRIMARY KEY (session_id, rid)
 );
 CREATE TABLE IF NOT EXISTS egress_flow (
     session_id TEXT NOT NULL,
     op_seq INTEGER NOT NULL,
     log_seq INTEGER,
     row_type TEXT NOT NULL CHECK (row_type IN ('I','D','U')),
+    rid INTEGER,
     msgid TEXT,
     payload TEXT NOT NULL,
     bytes TEXT,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (session_id, op_seq)
 );
+CREATE INDEX IF NOT EXISTS idx_egress_state_msgid ON egress_state (session_id, msgid);
+CREATE INDEX IF NOT EXISTS idx_egress_flow_rid ON egress_flow (session_id, rid);
 CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msgid);
 `;
 
@@ -702,7 +706,14 @@ export function migrateSchema(db: {
     // check stays for a DB where only the flow row survived). The NEW shape
     // is recognized by the ABSENCE of op_seq plus the presence of pos —
     // that is the exact opposite of the old op-copy shape, never "old".
-    const egressOldShape = (egressCols.length > 0 && (egressCols.includes("op_seq") || !egressCols.includes("pos")))
+    // 2026-11-27 (owner ruling, discussion follow-up to #7773): log
+    // addressing moved off msgid onto the self-issued row id `rid` (dense
+    // per-session, issued at I, NEVER re-issued — retired rows keep their
+    // rid forever; msgid stayed the CLIENT-facing identity but is no longer
+    // the state PK and no longer an op anchor). A state table without the
+    // rid column is an old-shape dev DB — same never-shipped rule, one-step
+    // drop + recreate (the owner's live DBs are rebuilt by the operator).
+    const egressOldShape = (egressCols.length > 0 && (egressCols.includes("op_seq") || !egressCols.includes("pos") || !egressCols.includes("rid")))
         || egressFlowSql.includes("('B','I','D','U')");
     if (egressOldShape) {
         // #7574 item 10: drop + recreate is one step (same transaction rule).

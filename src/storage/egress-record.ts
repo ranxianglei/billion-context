@@ -40,6 +40,7 @@
 import { diffEgressView, EgressStateCorruptError, EGRESS_SYSTEM_MSGID, type EgressOp, type EgressViewRow } from "./egress-state.js";
 import { buildEgressBlockSnapshots, diffBlockSet, serializeKstateResidual, type EgressBlockLedgerInput, type EgressBlockOp, type EgressBlockSnapshot } from "./egress-block.js";
 import { log as loggerLog } from "../logger.js";
+import { elementOfCore } from "../msgid-pin.js";
 
 /** #6785 ruling 7439-5: a pinned (server-authoritative) session whose op-log
  * has NO healthy point must FAIL the turn — never run on client bytes, never
@@ -130,9 +131,18 @@ export function buildEgressViewRows(
         // already ignores it (identity.ts strips ledgerSeq).
         const record = m.ledgerSeq === undefined ? m : Object.assign({}, m, { ledgerSeq: undefined });
         delete (record as { ledgerSeq?: number }).ledgerSeq;
+        // Path A (discussions/7836): the STORED msgid is the element id — the
+        // client-facing identity, one per message — not the per-core #pN id.
+        // The kernel core KEEPS its #pN id (compression/CCR need per-core
+        // uniqueness); this coarsens the op-log msgid so storage aligns with
+        // the protocol (the client resends element ids) and shares one msgid
+        // across a message's parts. The shared msgid is safe because
+        // addressing is by rid and the diff is occurrence-aware (#7849/#7851).
+        // num/ref stay keyed on the core id (m.id): only the head part carries
+        // the message's citation/block-ref, exactly as before.
         rows.push({
             num: citationNumber(m.id, refMap),
-            msgid: m.id,
+            msgid: elementOfCore(m.id).element,
             ref: /^m\d{4,}$/.test(m.id) ? m.id : "",
             tokens: Math.max(1, Math.ceil(text.length / 4)),
             type: m.id.startsWith("acp_summary") ? "acp_summary" : m.role === "tool" ? "tool" : "text",
@@ -157,6 +167,10 @@ export interface EgressOpLogStore {
     egressStateViewAt(sessionId: string, opSeq: number): EgressViewRow[];
     /** Highest op_seq in the flow (0 = no rows). */
     egressStateMaxSeq(sessionId: string): number;
+    /** 2026-11-27 (row ids): highest rid issued in the flow (0 = none) —
+     *  the allocator a turn's diff continues from. Optional: a shim without
+     *  rid support diffs from 0 (a single-writer test store). */
+    egressStateMaxRid?(sessionId: string): number;
     /** 7773 walk-back: one O(n) pass over the flow's FULL history returning
      *  the newest healthy NON-EMPTY prefix (seq + view), or null when no
      *  non-empty healthy prefix exists (corruption reaching the floor).
@@ -287,7 +301,9 @@ export function recordEgressTurn(args: {
     // trackNums: the next rows were stamped against the live refs ledger —
     // a spine row's num change is a kernel citation-fact change (demote /
     // re-cite / re-homing) and must reach the log as a +U carrying num.
-    const ops = diffEgressView(prev, next, refMap !== undefined);
+    // ridHighWater: row ids continue from the flow's MAX(rid) — ids never
+    // reuse (2026-11-27), a retired row's rid stays spent forever.
+    const ops = diffEgressView(prev, next, refMap !== undefined, store.egressStateMaxRid?.(sessionId) ?? 0);
     let stamped: EgressViewRow[];
     if (ops.length === 0) {
         stamped = prev;

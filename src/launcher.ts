@@ -52,12 +52,13 @@ import {
     readProxyInstanceFile,
     readStartingMarker,
     removeStartingMarker,
+    sessionsDirsDiffer,
     SPAWN_FINGERPRINT_ENV,
     writeZonePort,
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
-import { stateDir } from "./paths.js";
+import { sessionsDir, stateDir } from "./paths.js";
 import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
 import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
@@ -4206,6 +4207,12 @@ function instanceShapeMismatch(inst: ProxyInstanceFile, opts: LaunchOptions, for
     // #2905: a foreign DECLARED lane is attachable only when the operator
     // listed it in native.attachLanePriority — isolation by default (#1225/#1232).
     if (opts.lane !== undefined && inst.lane !== undefined && inst.lane !== opts.lane && !foreignLanes.includes(inst.lane)) return "lane-mismatch";
+    // #7861: store identity is shape. Per-config `sessions.dir` (#7804) lets
+    // two same-shape peers serve DIFFERENT stores — riding one would write
+    // this client's sessions (and its subagents') into the other's directory.
+    // Pre-#5046 markers record no dir → "not proven apart" → attach stays
+    // allowed (same conservative rule as the #394/#5046 warning in instance.ts).
+    if (inst.sessionsDir !== undefined && sessionsDirsDiffer(sessionsDir(), inst.sessionsDir)) return "sessions-dir-mismatch";
     if (inst.host !== opts.host || inst.passthrough !== resolveRecordedPassthrough(opts.passthrough)) return "host-or-passthrough-mismatch";
     // #3436: each cell wants what a spawned child will RECORD, not the raw
     // caller input — the child records loadOptions' gated mitm tier and the

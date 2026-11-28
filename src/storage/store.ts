@@ -30,6 +30,7 @@ import {
     egressFlowWalkBack,
     egressStateRead,
     egressStateView,
+    egressRowHighWater,
     egressFork,
     egressMaterializeState,
     egressMessageHighWater,
@@ -359,6 +360,13 @@ export interface CheckpointRow {
     firstTopic: string | null;
     firstSummary: string | null;
     activeCompressedTokens: number;
+    /** #B4 (KDD#25): non-system egress_state rows — set on a 7-table (egress)
+     *  instance (where the legacy `blocks` table is absent and the blocks
+     *  fields are zero); a >0 count marks a session that has egress records,
+     *  so isEmptyStub doesn't mistake a single-turn egress session for an
+     *  empty stub. Always 0 on legacy instances (their block/ledger signals
+     *  already cover it). */
+    egressRecords: number;
 }
 
 /** #3928: per-session footprint inside index.db, backing `bili sessions ls`.
@@ -508,6 +516,28 @@ function effectiveIdsOfPayload(payload: string | null): string[] {
     } catch {
         return [];
     }
+}
+
+/** #7836-PartA stores egress op-log rows keyed by the WIRE-ELEMENT msgid
+ *  (split cores share the element id), but the pin ledger is CORE-granular
+ *  (#7439-Part2: stage0 dedupes by wire element over per-core `#pN` ids).
+ *  A row is the FULL core message JSON (egress-serve rebuilds from it), so
+ *  the ledger reads the per-core id back out of `bytes`; a row whose
+ *  payload has no usable id falls back to the stored msgid — which for
+ *  pre-Path-A rows IS the per-core id, so old logs keep working unchanged.
+ *  Never throws: the pin degrades to a full signal on any mismatch, it must
+ *  not reject. */
+function egressRowPinId(row: EgressViewRow): string {
+    const bytes = row.bytes;
+    if (typeof bytes === "string" && bytes.length > 0) {
+        try {
+            const m = JSON.parse(bytes) as { id?: unknown };
+            if (typeof m.id === "string" && m.id.length > 0) return m.id;
+        } catch {
+            // Non-JSON payload (defensive; rows are core JSON) — fall back below.
+        }
+    }
+    return row.msgid;
 }
 
 /**
@@ -2396,10 +2426,18 @@ export class UnifiedStore {
      *  these sessions stop growing the messages projection entirely, so the
      *  messages-row read would freeze at the arm turn. Order = pos = view
      *  order (the pin's 0-based index ⇔ position contract); the constant
-     *  system row is not part of the msgid ledger. */
+     *  system row is not part of the msgid ledger.
+     *
+     *  #7836-PartA stores the msgid column at WIRE-ELEMENT granularity
+     *  (split cores share their element id), but the pin ledger is
+     *  CORE-granular (the #7439-Part2 contract: split cores keep their
+     *  `#pN` ids — stage0 dedupes by wire element over these). A row is the
+     *  FULL core message JSON (egress-serve rebuilds from it), so the
+     *  ledger reads the per-core id back out of `bytes` and falls back to
+     *  the stored msgid when the payload has no usable id. */
     snapEgressPinLiveIds(sid: string): string[] {
         const view = egressStateRead(this.db, sid);
-        return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map((r) => r.msgid);
+        return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map(egressRowPinId);
     }
 
     /** #7474 P2 (ruling 7439): ONE pin-ledger entry for both storage
@@ -2419,7 +2457,7 @@ export class UnifiedStore {
             try {
                 const view = egressStateRead(this.db, sid);
                 if (view.length > 0) {
-                    return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map((r) => r.msgid);
+                    return view.filter((r) => r.msgid !== EGRESS_SYSTEM_MSGID).map(egressRowPinId);
                 }
             } catch {
                 // EgressStateCorruptError — degrade to the messages ledger below.
@@ -2646,6 +2684,12 @@ export class UnifiedStore {
         // number and only I rows carry it — it is not the row cursor).
         const row = this.db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
         return Number(row.mx) || 0;
+    }
+
+    /** 2026-11-27 (row ids): highest rid issued in the flow (0 = none) —
+     *  the allocator for a session's next row ids. */
+    egressStateMaxRid(sessionId: string): number {
+        return egressRowHighWater(this.db, sessionId);
     }
 
     /** 7773: truncate the flow past op_seq — and REBUILD the materialized
@@ -4352,6 +4396,47 @@ export class UnifiedStore {
      *  compressed-token sum). Replaces the bounded envelope-file decode the
      *  disk index performs per refresh. */
     webSummaryRows(): WebSummaryRow[] {
+        // #B4 (KDD#25): a 7-table (egress) instance does NOT create the legacy
+        // CAS projection tables — the `blocks` CTE below would throw "no such
+        // table: blocks" and the whole list would crash to the disk walk, where
+        // egress sessions (no JSON files) are missing → the panel shows 0.
+        // When the legacy group is absent, query the sessions table alone
+        // (blocks-derived fields zero/NULL) and count the egress_state rows so
+        // a single-turn egress session isn't mistaken for an empty stub
+        // (isEmptyStub checks egressRecords).
+        if (!this.legacyTablesPresent) {
+            const rows = this.db
+                .prepare(
+                    `SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
+                            s.protocol AS protocol, s.origin AS origin, s.status AS status, s.updated_at AS updatedAt,
+                            s.stats_json AS statsJson, s.metadata_json AS metadataJson,
+                            (SELECT COUNT(*) FROM egress_state es
+                              WHERE es.session_id = s.session_id AND es.msgid <> 'egress-system') AS egressRecords
+                     FROM sessions s`,
+                )
+                .all() as Array<{
+                    sessionId: string; title: string | null; hostTitle: string | null; label: string | null;
+                    protocol: string | null; origin: string | null; status: string; updatedAt: number;
+                    statsJson: string; metadataJson: string; egressRecords: number;
+                }>;
+            return rows.map((r) => ({
+                sessionId: r.sessionId,
+                title: r.title ?? undefined,
+                hostTitle: r.hostTitle ?? undefined,
+                label: r.label ?? undefined,
+                protocol: r.protocol ?? undefined,
+                origin: r.origin ?? undefined,
+                status: r.status,
+                updatedAt: r.updatedAt,
+                statsJson: r.statsJson,
+                metadataJson: r.metadataJson,
+                blocks: 0,
+                firstTopic: null,
+                firstSummary: null,
+                activeCompressedTokens: 0,
+                egressRecords: r.egressRecords ?? 0,
+            }));
+        }
         // #7156: a corrupt/empty payload_json (e.g. left by an interrupted
         // .recover) made json_extract throw "malformed JSON" and fail the WHOLE
         // .all() — the panel then silently fell back to 0 historical sessions.
@@ -4413,6 +4498,7 @@ export class UnifiedStore {
             firstTopic: r.firstTopic,
             firstSummary: r.firstSummary,
             activeCompressedTokens: r.activeCompressed ?? 0,
+            egressRecords: 0,
         }));
     }
 

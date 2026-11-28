@@ -123,11 +123,15 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // re-anchor the client answers with a full-form resend (one-round
     // convergence); flipping the key back to 0 400s every delta turn, which
     // is the rollback path (clients converge to the full form within one
-    // turn). Default OFF until the shim send-sides ship — a delta body is
-    // unprocessable by older servers, so both ends must roll together.
-    // Force with `rollout.features.pluginDeltaResend: true` or
-    // `BILI_ROLLOUT_PLUGIN_DELTA_RESEND=1`.
-    pluginDeltaResend: { percent: 0 },
+    // turn). ON under eg-on (owner ruling 2026-11-28, regression-conservative): the
+    // delta arm is SCOPED to the egress plane - active only when the global
+    // egress gate is on; an eg-off instance 400-reanchors a delta claim so the
+    // client resends this turn in full form (no new code path touches a legacy
+    // deployment). The server handles the delta arm (direct-append) ALONGSIDE
+    // the full / incremental / tail / non-intersecting shapes; it is inert
+    // until a shim actually claims delta (x-bili-pf-delta: 1). Roll back with
+    // `BILI_ROLLOUT_PLUGIN_DELTA_RESEND=0`.
+    pluginDeltaResend: { percent: 100 },
     // #7398/#7439: the egress plane — ONE switch for the whole new path.
     // ON: every lane (OpenAI/Anthropic/Responses/Google) records its
     // outbound conversation view as sparse ops (I/D/U) into the

@@ -131,7 +131,10 @@ test("wire-granularity pin: agentic split + lane switch keeps ids and placement 
         assert.equal(r1.status, 200, `bootstrap turn must succeed (got ${r1.status}: ${r1.body.slice(0, 200)})`);
         await settle("conv-split");
         const pinIds = store!.snapPinLiveIds("conv-split");
-        for (const id of ["host-0", "host-1", "host-1#p1", "host-2"]) {
+        // Path A (coarsened op-log, #7855): a split element's part-rows share
+        // ONE element id in the ledger — the #pN sibling is a core-internal
+        // detail, not a ledger row. Assert the element ids.
+        for (const id of ["host-0", "host-1", "host-2"]) {
             assert.ok(pinIds.includes(id), `flow ledger must carry ${id} (got: ${JSON.stringify(pinIds)})`);
         }
         assert.ok(!logs.some((l) => l.includes("conv-split") && l.includes("pin rejected")), "the wire-form pin must not hit the reject path");
@@ -157,7 +160,7 @@ test("wire-granularity pin: agentic split + lane switch keeps ids and placement 
         );
         await settle("conv-split");
         const pinIds2 = store!.snapPinLiveIds("conv-split");
-        for (const id of ["host-0", "host-1", "host-1#p1", "host-2", "host-3"]) {
+        for (const id of ["host-0", "host-1", "host-2", "host-3"]) {
             assert.ok(pinIds2.includes(id), `post-switch ledger must carry ${id} (got: ${JSON.stringify(pinIds2)})`);
         }
         // Upstream placement: assistant [text, tool_use] ONE message, then a
@@ -206,11 +209,30 @@ test("wire-granularity pin: agentic split + lane switch keeps ids and placement 
         const { DatabaseSync } = await import("node:sqlite");
         const db = new DatabaseSync(join(dir, "sessions", "index.db"), { readOnly: true });
         try {
-            const rows = db.prepare("SELECT pos, msgid FROM egress_state WHERE session_id = ? ORDER BY pos").all("conv-reason") as Array<{ pos: number; msgid: string }>;
+            // #7855 (Path A, discussions/7836): the STORED msgid is the client's
+            // ELEMENT id — one response's parts (reasoning + content) share it
+            // across their rows — while each row keeps its distinct core id (the
+            // #pN-deriving ordinal) inside its bytes JSON. The re-home is
+            // asserted at both granularities: element ids present, per-core ids
+            // still unique (the split kept, not collapsed).
+            const rows = db.prepare("SELECT pos, msgid, bytes FROM egress_state WHERE session_id = ? ORDER BY pos").all("conv-reason") as Array<{ pos: number; msgid: string; bytes: string }>;
             const ids = rows.map((r) => r.msgid);
+            const coreIdOf = (r: { msgid: string; bytes: string }): string | undefined => {
+                if (r.msgid === "egress-system") return undefined;
+                try {
+                    const j = JSON.parse(r.bytes) as { id?: string };
+                    return typeof j.id === "string" && j.id !== "" ? j.id : r.msgid;
+                } catch {
+                    return r.msgid;
+                }
+            };
+            const coreIds = rows.map(coreIdOf).filter((x): x is string => x !== undefined);
+            console.error(`[crosslane] ROWDUMP ${JSON.stringify(rows.map((r) => ({ pos: r.pos, msgid: r.msgid })))} CORES ${JSON.stringify(coreIds)}`);
             for (const want of ["pi-u1", "pi-a1", "pi-u2"]) {
-                assert.equal(ids.filter((x) => x === want).length, 1, `egress_state must carry the declared host id ${want} exactly once (rows: ${JSON.stringify(rows)})`);
+                assert.ok(ids.includes(want), `egress_state must carry the declared host element id ${want} (ids: ${JSON.stringify(ids)})`);
             }
+            assert.equal(new Set(coreIds).size, coreIds.length, `per-core ids stay unique under Path A element storage (cores: ${JSON.stringify(coreIds)})`);
+            assert.ok(coreIds.includes("pi-a1#p1"), `the re-home keeps the split core's derived ordinal (cores: ${JSON.stringify(coreIds)})`);
             // The turn-1 response was minted by the server; turn 2's pin
             // re-homes it onto the host's own id for that message — no
             // orphaned mint may survive for a message the host declared.
