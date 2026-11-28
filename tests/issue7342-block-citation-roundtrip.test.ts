@@ -13,7 +13,7 @@ import { applyRanges } from "../src/stream.ts";
 
 const quotedTranscript = '\n\n[assistant]\n\x3cacp tokens="8" type="text"\x3em00002\x3c/acp\x3e\nLiteral m00002, copied from a transcript.';
 
-async function foldedSession(t: TestContext, backfilled: boolean, legacy = false) {
+async function foldedSession(t: TestContext, backfilled: boolean, options: { legacy?: boolean; firstTagOnly?: boolean; pluginSnapshot?: "current" | "stale" } = {}) {
     process.env.BILI_STORAGE_UNIFIED = "full";
     process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
     process.env.BILI_PERSIST = "1";
@@ -43,6 +43,9 @@ async function foldedSession(t: TestContext, backfilled: boolean, legacy = false
     const full = core.processTurn({ messages: raw, state: first.state, config, tokenCount: 200, renderTags: "text-only" });
     session.state = full.state;
     session.lastMessages = raw;
+    if (options.pluginSnapshot) {
+        session.pluginSnapshot = raw.map(m => m.id === "3" && options.pluginSnapshot === "stale" ? { ...m, text: "An earlier draft." } : m);
+    }
 
     // The first complete save orders the rows by transcript. When the quote
     // arrives late, the user's approval already holds the second citation.
@@ -52,13 +55,14 @@ async function foldedSession(t: TestContext, backfilled: boolean, legacy = false
     assert.equal(beforeFold[approval.id], backfilled ? "m00002" : "m00003");
     assert.equal(store.unifiedSeqByRaw(session.id)?.get(approval.id), 2);
 
-    const ctx = { core, config, session, messages: full.messages, log: () => {} };
+    const messages = options.firstTagOnly ? [full.messages[0]!, ...raw.slice(1)] : full.messages;
+    const ctx = { core, config, session, messages, log: () => {} };
     const fold = applyRanges(parseCompressInput({ content: [{
         startId: beforeFold[raw[0]!.id], endId: beforeFold[approval.id],
         summary: "The assistant proposed a budget and the user approved the final, lower amount.",
     }] }), ctx);
     assert.equal(fold.blocksCreated, 1, fold.text);
-    if (legacy) {
+    if (options.legacy) {
         // Write the pre-fix store using the exact old ledger/CCR restamp before
         // reopening with the new reader. No SQL rows or frozen text are edited.
         const seq = store.unifiedSeqByRaw(session.id);
@@ -74,7 +78,10 @@ async function foldedSession(t: TestContext, backfilled: boolean, legacy = false
 }
 
 async function checkRoundTrip(t: TestContext, backfilled: boolean): Promise<void> {
-    const { session, ctx, approval, texts, blockId, originalRef } = await foldedSession(t, backfilled);
+    const { store, session, ctx, approval, texts, blockId, originalRef } = await foldedSession(t, backfilled);
+    const cold = store.loadSync(session.id, session.meta);
+    assert.ok(cold);
+    assert.equal(cold.metadata.foldedCitationsPreserved, backfilled ? true : undefined);
     const opened = resolveDecompress({ blockId, full: true }, ctx).text;
     const citations = opened.matchAll(/^\[user\]\r?\n\x3cacp\b[^\x3e]*\x3e(m\d+)\x3c\/acp\x3e\r?\n([^\r\n]+)/gm);
     const printed = [...citations].find(match => match[2] === approval.text!.split("\n")[0]);
@@ -100,8 +107,41 @@ test("#7342: a citation copied from a block after ledger alignment restores its 
     await checkRoundTrip(t, true);
 });
 
+test("#7342: untagged messages without a public plugin snapshot follow legacy alignment", async (t) => {
+    const { store, session, blockId, approval, originalRef } = await foldedSession(t, true, { firstTagOnly: true });
+    const cold = store.loadSync(session.id, session.meta);
+    assert.ok(cold);
+    const frozen = cold.blockContents.get(blockId)!.full.text;
+    assert.ok(frozen.includes("m00001\x3c/acp\x3e\nPlease compare"));
+    assert.ok(frozen.includes(quotedTranscript));
+    assert.equal(cold.state.messageRefs.byRaw["1"], "m00001");
+    assert.equal(cold.state.messageRefs.byRef[originalRef], "2", "the other folded message never published this number");
+    assert.notEqual(cold.state.messageRefs.byRaw[approval.id], originalRef);
+    assert.equal(cold.metadata.foldedCitationsPreserved, undefined);
+});
+
+test("#7342: a public plugin snapshot exposes addressable messages even without inline tags", async (t) => {
+    const { store, session, blockId, approval, originalRef } = await foldedSession(t, true, { firstTagOnly: true, pluginSnapshot: "current" });
+    const cold = store.loadSync(session.id, session.meta);
+    assert.ok(cold);
+    assert.ok(cold.blockContents.get(blockId)!.full.text.includes("[user]\n" + approval.text));
+    assert.equal(cold.state.messageRefs.byRef[originalRef], approval.id);
+    assert.equal(cold.metadata.foldedCitationsPreserved, true);
+    const direct = executeRetrieve({ ref: originalRef }, cold);
+    assert.equal(direct.outcome, "success");
+    assert.ok(direct.text.includes(approval.text!));
+});
+
+test("#7342: a retained plugin snapshot with different original text cannot reserve unprinted numbers", async (t) => {
+    const { store, session, originalRef } = await foldedSession(t, true, { firstTagOnly: true, pluginSnapshot: "stale" });
+    const cold = store.loadSync(session.id, session.meta);
+    assert.ok(cold);
+    assert.equal(cold.state.messageRefs.byRef[originalRef], "2");
+    assert.equal(cold.metadata.foldedCitationsPreserved, undefined);
+});
+
 test("#7342: a pre-fix SQLite block survives restart and disambiguates reused numbers without queuing someone else's words", async (t) => {
-    const { session, ctx, approval, texts, blockId, originalRef } = await foldedSession(t, true, true);
+    const { session, ctx, approval, texts, blockId, originalRef } = await foldedSession(t, true, { legacy: true });
     _resetStoreForTest();
     const coldStore = getStore();
     await coldStore.ready();
@@ -144,7 +184,7 @@ test("#7342: a pre-fix SQLite block survives restart and disambiguates reused nu
 });
 
 test("#7342: an unverifiable archive can still be read without serving a guessed citation", async (t) => {
-    const { store, session, ctx, blockId, originalRef, texts } = await foldedSession(t, true, true);
+    const { store, session, ctx, blockId, originalRef, texts } = await foldedSession(t, true, { legacy: true });
     session.lastMessages = [];
     session.pluginSnapshot = undefined;
     t.mock.method(store, "unifiedMessageContentByIds", () => null);

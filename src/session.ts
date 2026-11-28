@@ -2,7 +2,7 @@ import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, type C
 import { createHash } from "node:crypto";
 import type { BiliMessage } from "acp-kernel/wire";
 import { log as loggerLog } from "./logger.js";
-import { getStore, effectiveFileStorageMode } from "./persist.js";
+import { getStore, effectiveFileStorageMode, type SessionStore } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
 import { configFileEpoch, loadConfigFile, loadNamedProviders } from "./config.js";
@@ -93,7 +93,11 @@ export function mayHaveHistoricalCitations(session: Session): boolean {
  *  number. Prove each archived binding by stable ID, role and exact original
  *  bytes. null means insufficient evidence; [] means no translation needed. */
 export function historicalBlockCitations(session: Session, block: CompressionBlock, view: BlockView, full: boolean): BlockCitation[] | null {
-    if (!mayHaveHistoricalCitations(session) || !blockHasRef.test(view.text)) return [];
+    return mayHaveHistoricalCitations(session) ? snapshotCitations(session, block, view, full) : [];
+}
+
+function snapshotCitations(session: Session, block: CompressionBlock, view: BlockView, full: boolean, store?: SessionStore): BlockCitation[] | null {
+    if (!blockHasRef.test(view.text)) return [];
     const ids = new Set(block.effectiveMessageIds ?? []);
     let summaries = 0;
     if (!full) {
@@ -114,7 +118,7 @@ export function historicalBlockCitations(session: Session, block: CompressionBlo
             if (result) return result;
         }
     }
-    for (const row of getStore().unifiedMessageContentByIds(session.id, [...ids]) ?? []) {
+    for (const row of (store ?? getStore()).unifiedMessageContentByIds(session.id, [...ids]) ?? []) {
         try {
             const m: BiliMessage = JSON.parse(row.content);
             if (m?.id === row.msgId && m.role === row.role && (m.text === undefined || typeof m.text === "string")) byId.set(m.id, m);
@@ -125,6 +129,48 @@ export function historicalBlockCitations(session: Session, block: CompressionBlo
     const matches = locateBlockCitations(view, rows, summaries);
     if (matches || !rows.every(m => Number.isSafeInteger(m.wireIndex))) return matches;
     return locateBlockCitations(view, rows.sort((a, b) => a.wireIndex! - b.wireIndex!), summaries);
+}
+
+/** Numbers can reach a caller in the frozen transcript or in the plugin
+ *  snapshot's ordered messages (including tool parts without inline tags).
+ *  Block coverage alone does not establish either kind of publication. */
+export function publishedBlockCitationOwners(session: Session, store: SessionStore): { owners: Set<string>; allVerified: boolean } {
+    const owners = new Set<string>();
+    let allVerified = true;
+    const { byRaw, byRef } = session.state.messageRefs;
+    const plugin = session.metadata.publicSnapshotTextComparable === false ? undefined : session.pluginSnapshot;
+    for (const block of session.state.blocks) {
+        const snapshot = blockContentSnapshot(session.blockContents, block);
+        if (!snapshot) continue;
+        let pluginCitations: BlockCitation[] | null = null;
+        if (plugin?.length) {
+            const ids = new Set(block.effectiveMessageIds);
+            const members = plugin.filter(m => ids.has(m.id));
+            if (members.length === ids.size && new Set(members.map(m => m.id)).size === ids.size) {
+                pluginCitations = locateBlockCitations(snapshot.full, members, 0);
+                if (pluginCitations) {
+                    for (const { id } of members) {
+                        const ref = byRaw[id];
+                        if (ref && byRef[ref] === id) owners.add(id);
+                    }
+                }
+            }
+        }
+        for (const view of [snapshot.full, snapshot.one]) {
+            if (!view) continue;
+            const full = view === snapshot.full;
+            const citations = full && pluginCitations !== null ? pluginCitations : snapshotCitations(session, block, view, full, store);
+            if (!citations) {
+                allVerified = false;
+                continue;
+            }
+            for (const { raw, ref } of citations) {
+                if (byRaw[raw] === ref && byRef[ref] === raw) owners.add(raw);
+                else allVerified = false;
+            }
+        }
+    }
+    return { owners, allVerified };
 }
 
 /** Keep the frozen snapshot available byte-for-byte to archival readers. Only
