@@ -62,6 +62,7 @@ import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { anthropicToCore, coreToAnthropic, type BiliMessage } from "acp-kernel/wire";
 import { getStore } from "./persist.js";
+import { markFirstSeenRequest, isFirstSeenCommitted, forgetSettledFirstSeen } from "./incremental-first-seen.js";
 import { peekSession } from "./session.js";
 import { pluginAgentHeader, pluginReportedModel } from "./plugin.js";
 import { headerValue, readBody } from "./server.js";
@@ -198,6 +199,7 @@ export interface Canonical {
      *  rebuild (the unified rows carry no wire boundaries), where a retouch
      *  answers 409 and the client resyncs once. */
     wireSpans?: string[][] | null;
+    receiptReady?: boolean;
 }
 const canonicalCache = new Map<string, Canonical>();
 const inFlight = new Set<string>();
@@ -449,10 +451,18 @@ export function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], 
         // key and hand out settled rows in seq order: same stripped key means
         // identical role/contentType/text/media, so any of the clustered rows
         // materializes that canonical message byte-identically.
+        const rowTimestamps = new Map(rows.map(row => [row.seq, row.ts]));
+        const confirmed: { id: string; ts: number }[] = [];
         const byStable = new Map<string, number[]>();
         for (const r of rows) {
             try {
-                const key = stableMessageKey(JSON.parse(r.content) as Record<string, unknown>).replace(CLUSTER_ID_SUFFIX_RE, "$1");
+                const raw = JSON.parse(r.content) as Record<string, unknown>;
+                // The journal uses kernel identities; lane IDs may instead
+                // be client pins when kernel pinning is disabled. Confirm
+                // against the actual committed raw row, independently of
+                // whether this row can serve as a lane pointer.
+                if (typeof raw.id === 'string' && typeof r.ts === 'number') confirmed.push({ id: raw.id, ts: r.ts });
+                const key = stableMessageKey(raw).replace(CLUSTER_ID_SUFFIX_RE, "$1");
                 const bucket = byStable.get(key);
                 if (bucket === undefined) byStable.set(key, [r.seq]);
                 else bucket.push(r.seq);
@@ -483,7 +493,12 @@ export function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], 
             // assembly (store seq is 0-based; the ledger display space is
             // 1-based, same convention as parseCanonicalRows).
             m.ledgerSeq = seq + 1;
+            const timestamp = rowTimestamps.get(seq);
+            if (typeof timestamp === "number") {
+                m.ts = timestamp;
+            }
         }
+        forgetSettledFirstSeen(store, sessionId, confirmed);
         if (ptrs.length === 0) {
             log("debug", `[incremental] canonical pointers not recorded for ${sessionId}: no message rows settled yet (debounced save) — retrying on the next flush`);
             return;
@@ -793,8 +808,8 @@ export function handleIncrementalProbe(res: http.ServerResponse, conversationId?
     if (conversationId !== undefined && conversationId.length > 0) {
         const entry = canonicalCache.get(conversationId);
         conversation = {
-            appliedSeq: entry !== undefined && entry.sessionId === laneSessionId(conversationId) ? entry.msgs.length : 0,
-            boundary: entry !== undefined && entry.sessionId === laneSessionId(conversationId) ? entry.boundary : null,
+            appliedSeq: entry !== undefined && entry.receiptReady !== false && entry.sessionId === laneSessionId(conversationId) ? entry.msgs.length : 0,
+            boundary: entry !== undefined && entry.receiptReady !== false && entry.sessionId === laneSessionId(conversationId) ? entry.boundary : null,
         };
     }
     jsonReply(res, 200, {
@@ -931,6 +946,7 @@ export async function handleIncrementalTurn(
             entry.system = system;
             entry.systemSet = true;
         }
+        entry.receiptReady = false;
         touchCache(conversationId, entry);
         // Record the epoch BEFORE the forward lands the new branch's rows.
         if (resync) await recordResyncBaseSeq(sessionId, log);
@@ -1032,6 +1048,7 @@ export async function handleIncrementalTurn(
             socket: req.socket,
         });
 
+        markFirstSeenRequest(synthetic);
         // Ack header: stamped ONLY on 2xx — a non-2xx response means the turn
         // did not land, and a host trusting the ack unconditionally would skip
         // its resend and lose the user's message (#3344). In-repo clients gate
@@ -1043,9 +1060,13 @@ export async function handleIncrementalTurn(
             const status = typeof args[0] === "number" ? args[0] : 200;
             if (status >= 200 && status < 300) {
                 try {
+                    if (!isFirstSeenCommitted(synthetic)) throw new Error("Incremental timestamp journal not committed");
+                    entry.receiptReady = true;
                     res.setHeader("x-bili-applied-seq", String(appliedSeq));
-                } catch {
-                    // header injection is best-effort; the seq is also in the log line
+                } catch (error) {
+                    // Withhold the acknowledgement when recovery metadata did
+                    // not commit. The client must reseed on its next request.
+                    log("warn", `[incremental] first-seen acknowledgement withheld for ${sessionId}: ${String(error)}`);
                 }
             }
             return (originalWriteHead as (...a: unknown[]) => ReturnType<typeof res.writeHead>)(...args);
@@ -1100,9 +1121,12 @@ export async function handleIncrementalTurn(
         // pointer freshness, and a crash in the window costs a 409 resync.
         void getStore()
             .afterNextFlush(sessionId)
-            .then(() => {
+            .then((landed) => {
+                if (!landed) return;
                 const live = canonicalCache.get(conversationId);
-                if (live && live.sessionId === sessionId) recordCanonicalPointers(sessionId, live.msgs, log);
+                // Settled SQL timestamps release the journal even after the
+                // warm canonical was evicted; pointer publication stays gated.
+                recordCanonicalPointers(sessionId, live?.sessionId === sessionId ? live.msgs : [], log);
             })
             .catch(() => undefined);
         releaseChain?.();
@@ -1110,6 +1134,19 @@ export async function handleIncrementalTurn(
     } finally {
         // Exception path (never entered the wrap-up): release everything.
         if (!settled) {
+            // Journal failure can happen after prepare has scheduled a SQL
+            // save. Its independently committed rows still settle retries,
+            // even when forward never completes and no next turn arrives.
+            try {
+                const failedSessionId = laneSessionId(conversationId);
+                const failedSession = peekSession(failedSessionId);
+                if (failedSession) getStore().scheduleSave(failedSession);
+                void getStore().afterNextFlush(failedSessionId).then(landed => {
+                    if (!landed) return;
+                    const live = canonicalCache.get(conversationId);
+                    recordCanonicalPointers(failedSessionId, live?.sessionId === failedSessionId ? live.msgs : [], log);
+                }).catch(() => undefined);
+            } catch { /* Unconfirmed retries remain protected. */ }
             releaseChain?.();
             inFlight.delete(conversationId);
             if (pendingPtrWork.get(conversationId) === chain) pendingPtrWork.delete(conversationId);

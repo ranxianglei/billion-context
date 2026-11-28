@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { FIRST_SEEN_KEY, recoveredFirstSeen, rememberFirstSeen } from '../src/incremental-first-seen.ts';
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
@@ -10,7 +11,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
-import { _resetSessionsForTest } from "../src/session.ts";
+import { _resetSessionsForTest, listSessions, getSession } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
 import { __resetIncrementalLaneForTests } from "../src/incremental-lane.ts";
@@ -46,6 +47,9 @@ interface H {
     forwardedHeaders: http.IncomingHttpHeaders[];
     resetLane: () => void;
     close: () => Promise<void>;
+    store: SessionStore;
+    failJournal: (fail: boolean) => void;
+    poll: () => Promise<{ appliedSeq: number; boundary: string | null }>;
 }
 
 async function harness(): Promise<H> {
@@ -58,6 +62,12 @@ async function harness(): Promise<H> {
     __resetIncrementalLaneForTests();
     __resetIncrementalClientForTests();
     const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60000 });
+    const setExt = store.setSessionExt.bind(store);
+    let failJournal = false;
+    store.setSessionExt = (id, key, value) => {
+        if (failJournal && key === FIRST_SEEN_KEY) throw new Error('injected timestamp manifest failure');
+        setExt(id, key, value);
+    };
     _setStoreForTest(store);
     _setForTest({});
     const forwarded: Record<string, unknown>[] = [];
@@ -87,6 +97,13 @@ async function harness(): Promise<H> {
         return { status: response.status, appliedSeq: applied !== null && /^\d+$/.test(applied) ? Number(applied) : undefined };
     };
     return {
+        store,
+        failJournal: fail => { failJournal = fail; },
+        poll: async () => {
+            const response = await fetch(`${proxyUrl}/__bili/plugin/turn?conversation=${CONV}`);
+            const body = await response.json() as { conversation: { appliedSeq: number; boundary: string | null } };
+            return body.conversation;
+        },
         post,
         forwarded,
         forwardedHeaders,
@@ -136,6 +153,266 @@ function messageBreakpoints(body: Record<string, unknown>): number {
 
 const CONV = "ses_rolling_marks";
 const laneHeaders = { "x-bili-plugin": "opencode", "x-bili-plugin-conversation": CONV, "x-acp-session": CONV };
+
+for (const landed of [true, false]) test(`successful Anthropic save settles journal after canonical cache eviction (flush=${landed})`, { timeout: 20000 }, async () => {
+    const before = process.env.BILI_MESSAGE_TIMESTAMPS;
+    process.env.BILI_MESSAGE_TIMESTAMPS = '1';
+    const h = await harness();
+    const originalAfterNextFlush = h.store.afterNextFlush.bind(h.store);
+    let release!: (landed: boolean) => void;
+    const held = new Promise<boolean>(resolve => { release = resolve; });
+    h.store.afterNextFlush = id => id === CONV ? held : originalAfterNextFlush(id);
+    const seed = (id: string) => ({ conversationId: id, path: '/v1/messages', sinceSeq: 0, resync: true,
+        request: { model: 'claude-test', max_tokens: 1024 },
+        messages: [{ role: 'user', content: 'Main turn for canonical eviction journal control. '.repeat(100) }] });
+    const post = (id: string) => h.post('/__bili/plugin/turn', JSON.stringify(seed(id)),
+        { ...laneHeaders, 'x-bili-plugin-conversation': id, 'x-acp-session': id });
+    try {
+        const response = await post(CONV);
+        assert.equal(response.status, 200);
+        assert.equal(response.appliedSeq, 1);
+        const session = listSessions().find(s => s.id === CONV);
+        assert.ok(session);
+        assert.ok(Object.keys(recoveredFirstSeen(h.store, CONV, undefined)).length > 0,
+            'the acknowledged main turn must have unsettled first-seen resources');
+        await h.store.writeNow(session);
+        assert.ok(h.store.unifiedRawMessages(CONV)?.some(row => typeof row.ts === 'number'),
+            'canonical timestamps must actually be committed before releasing completion');
+        // Actual lane requests fill the bounded 16-entry canonical cache. The
+        // original conversation receives no further request or cache touch.
+        for (let i = 0; i < 16; i++) assert.equal((await post(`ses_evict_other_${i}`)).status, 200);
+        assert.ok(Object.keys(recoveredFirstSeen(h.store, CONV, undefined)).length > 0);
+        const pending = recoveredFirstSeen(h.store, CONV, undefined);
+        release(landed);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.deepEqual(recoveredFirstSeen(h.store, CONV, undefined), landed ? {} : pending,
+            landed ? 'successful SQL save must settle journal even after canonical cache eviction'
+                : 'a negative flush verdict must retain the journal after eviction');
+        if (landed) assert.equal(h.store.listSessionExt(CONV).filter(row => row.key.startsWith('inc:first-seen:')).length, 0,
+            'settled timestamp chunk rows must be collected without another turn');
+    } finally {
+        release(false);
+        h.store.afterNextFlush = originalAfterNextFlush;
+        await h.close();
+        if (before === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS; else process.env.BILI_MESSAGE_TIMESTAMPS = before;
+    }
+});
+
+test('timestamp-free side requests may acknowledge without journal publication', async () => {
+    const before = process.env.BILI_MESSAGE_TIMESTAMPS;
+    process.env.BILI_MESSAGE_TIMESTAMPS = '1';
+    const h = await harness();
+    try {
+        h.failJournal(true);
+        const seed = { conversationId: CONV, path: '/v1/messages', sinceSeq: 0, resync: true,
+            request: { model: 'claude-test', max_tokens: 16 }, messages: [{ role: 'user', content: 'small side request' }] };
+        const response = await h.post('/__bili/plugin/turn', JSON.stringify(seed), laneHeaders);
+        assert.equal(response.status, 200);
+        assert.equal(response.appliedSeq, 1);
+        assert.equal(h.forwarded.length, 1);
+        for (const session of listSessions()) assert.deepEqual(session.state.tsStamps ?? {}, {}, 'the side lane must not add kernel timestamps');
+    } finally {
+        await h.close();
+        if (before === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS; else process.env.BILI_MESSAGE_TIMESTAMPS = before;
+    }
+});
+
+test('journal failure exposes neither a response ACK nor a polling receipt; retry may acknowledge', async () => {
+    const before = process.env.BILI_MESSAGE_TIMESTAMPS;
+    process.env.BILI_MESSAGE_TIMESTAMPS = '1';
+    const h = await harness();
+    try {
+        const plan = planIncrementalTurn({ conversationId: CONV, path: '/v1/messages', messages: conversation(1)[0]!, system: SYSTEM, request: { model: 'claude-test', max_tokens: 1024 } });
+        assert.notEqual(plan.mode, 'skip');
+        if (plan.mode === 'skip') throw new Error('Expected seed');
+        h.failJournal(true);
+        const rejected = await h.post('/__bili/plugin/turn', plan.body, laneHeaders);
+        assert.equal(rejected.appliedSeq, undefined);
+        assert.deepEqual(await h.poll(), { appliedSeq: 0, boundary: null });
+        h.failJournal(false);
+        const retry = await h.post('/__bili/plugin/turn', plan.body, laneHeaders);
+        assert.equal(retry.status, 200);
+        assert.equal(retry.appliedSeq, 1);
+        assert.equal((await h.poll()).appliedSeq, 1);
+    } finally {
+        await h.close();
+        if (before === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS; else process.env.BILI_MESSAGE_TIMESTAMPS = before;
+    }
+});
+
+test('failed HTTP publication settles retries after SQL save and eviction without another turn', async () => {
+    const before = process.env.BILI_MESSAGE_TIMESTAMPS;
+    process.env.BILI_MESSAGE_TIMESTAMPS = '1';
+    const h = await harness();
+    try {
+        const plan = planIncrementalTurn({ conversationId: CONV, path: '/v1/messages', messages: conversation(1)[0]!, system: SYSTEM, request: { model: 'claude-test', max_tokens: 1024 } });
+        if (plan.mode === 'skip') throw new Error('Expected seed');
+        h.failJournal(true);
+        const response = await h.post('/__bili/plugin/turn', plan.body, laneHeaders);
+        assert.equal(response.appliedSeq, undefined);
+        const sessions = listSessions();
+        assert.equal(sessions.length, 1);
+        const session = sessions[0]!;
+        assert.ok(session.lastMessages?.length);
+        // Leave manifest writes failing. Only the successful SQL flush is a
+        // valid confirmation; this test does not call the pruning helper.
+        await h.store.writeNow(session);
+        await Promise.resolve();
+        const rows = h.store.unifiedRawMessages(session.id);
+        assert.ok(rows?.length);
+        _resetSessionsForTest();
+        h.failJournal(false);
+        rememberFirstSeen(h.store, session.id, [], undefined);
+        assert.deepEqual(recoveredFirstSeen(h.store, session.id, undefined), {}, 'settled retry entries must not be republished after eviction');
+    } finally {
+        await h.close();
+        if (before === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS; else process.env.BILI_MESSAGE_TIMESTAMPS = before;
+    }
+});
+
+for (const completedWrite of [false, true]) for (const failedEviction of [false, true]) test(`failed HTTP journal cleanup follows actual LRU eviction (failed flush=${failedEviction}, completed write=${completedWrite})`, { timeout: 15000 }, async () => {
+    const before = process.env.BILI_MESSAGE_TIMESTAMPS;
+    process.env.BILI_MESSAGE_TIMESTAMPS = '1';
+    const h = await harness();
+    _resetSessionsForTest(1);
+    try {
+        let plan = planIncrementalTurn({ conversationId: CONV, path: '/v1/messages', messages: conversation(1)[0]!, system: SYSTEM, request: { model: 'claude-test', max_tokens: 1024 } });
+        if (plan.mode === 'skip') throw new Error('Expected seed');
+        if (completedWrite) {
+            await h.post('/__bili/plugin/turn', plan.body, laneHeaders);
+            const prior = listSessions()[0];
+            assert.ok(prior);
+            await h.store.writeNow(prior);
+            plan = planIncrementalTurn({ conversationId: CONV, path: '/v1/messages', messages: conversation(2)[1]!, system: SYSTEM, request: { model: 'claude-test', max_tokens: 1024 } });
+            if (plan.mode === 'skip') throw new Error('Expected second turn');
+        }
+        h.failJournal(true);
+        const response = await h.post('/__bili/plugin/turn', plan.body, laneHeaders);
+        assert.equal(response.appliedSeq, undefined);
+        const sessions = listSessions();
+        assert.equal(sessions.length, 1);
+        const session = sessions[0]!;
+        assert.ok(session.lastMessages?.length);
+        const verdict = h.store.afterNextFlush(session.id);
+        if (failedEviction) {
+            const kernelStore: unknown = Reflect.get(h.store, 'store');
+            assert.ok(kernelStore && typeof kernelStore === 'object');
+            const original: unknown = Reflect.get(kernelStore, 'flushSync');
+            assert.equal(typeof original, 'function');
+            Reflect.set(kernelStore, 'flushSync', () => false);
+            try { assert.throws(() => getSession('eviction-trigger'), /session pool exhausted/); }
+            finally { Reflect.set(kernelStore, 'flushSync', original); }
+            assert.equal(await verdict, false, 'failed synchronous flush must settle its waiters negatively');
+            assert.equal(listSessions()[0], session, 'failed flush must keep the unsaved resident');
+            h.failJournal(false);
+            rememberFirstSeen(h.store, session.id, [], undefined);
+            assert.ok(Object.keys(recoveredFirstSeen(h.store, session.id, undefined)).length > 0, 'unconfirmed retry must survive failed eviction');
+        } else {
+            // The HTTP failure is transient. Allow the confirmed-write cleanup
+            // to publish its manifest; a continuing manifest fault must retain
+            // the old durable journal and is covered by the journal unit tests.
+            h.failJournal(false);
+            getSession('eviction-trigger');
+            assert.equal(await verdict, true, 'successful synchronous eviction must settle its waiters');
+            await Promise.resolve();
+            assert.ok(!listSessions().some(value => value.id === session.id));
+            assert.ok(h.store.unifiedRawMessages(session.id)?.length);
+            h.failJournal(false);
+            rememberFirstSeen(h.store, session.id, [], undefined);
+            assert.deepEqual(recoveredFirstSeen(h.store, session.id, undefined), {}, 'actual eviction must release SQL-confirmed retries without another turn');
+        }
+    } finally {
+        await h.close();
+        _resetSessionsForTest(256);
+        if (before === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS; else process.env.BILI_MESSAGE_TIMESTAMPS = before;
+    }
+});
+
+test('overlapping immediate writers retain flush completion until the last writer settles', { timeout: 15000 }, async () => {
+    const h = await harness();
+    const session = getSession('overlapping-immediate-writes');
+    const kernelStore: unknown = Reflect.get(h.store, 'store');
+    assert.ok(kernelStore && typeof kernelStore === 'object');
+    const original: unknown = Reflect.get(kernelStore, 'writeNow');
+    assert.ok(typeof original === 'function');
+    const releases: Array<() => void> = [];
+    const gates = [0, 1].map(() => new Promise<void>(resolve => releases.push(resolve)));
+    let entered = 0;
+    let ready!: () => void;
+    const started = new Promise<void>(resolve => { ready = resolve; });
+    Reflect.set(kernelStore, 'writeNow', async (...args: unknown[]) => {
+        const index = entered++;
+        await Reflect.apply(original, kernelStore, args);
+        if (index === 1) ready();
+        await gates[index];
+    });
+    let first: Promise<void> | undefined;
+    let second: Promise<void> | undefined;
+    try {
+        first = h.store.writeNow(session);
+        second = h.store.writeNow(session);
+        await started;
+        let settled = false;
+        const verdict = h.store.afterNextFlush(session.id);
+        void verdict.then(() => { settled = true; });
+        releases[0]!();
+        await first;
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(settled, false, 'one completed writer cannot release another active writer');
+        const shadow: unknown = Reflect.get(h.store, 'shadow');
+        assert.ok(shadow && typeof shadow === 'object');
+        const frozen: unknown = Reflect.get(shadow, 'frozenEnvelopeIds');
+        assert.ok(frozen instanceof Set);
+        frozen.add(session.id);
+        h.store.scheduleSave(session);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(settled, false, 'a scheduled index-only commit cannot release an active envelope writer');
+        assert.equal(h.store.flushSync(session), true);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(settled, false, 'a synchronous flush cannot steal completion from an active writer');
+        releases[1]!();
+        await second;
+        assert.equal(await verdict, true);
+    } finally {
+        for (const release of releases) release();
+        await Promise.allSettled([first, second]);
+        Reflect.set(kernelStore, 'writeNow', original);
+        await h.close();
+    }
+});
+
+test('explicit client IDs with kernel pinning disabled still journal actual kernel timestamps', async () => {
+    const before = process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY;
+    const beforeTimestamps = process.env.BILI_MESSAGE_TIMESTAMPS;
+    process.env.BILI_MESSAGE_TIMESTAMPS = '1';
+    process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY = '0';
+    const h = await harness();
+    try {
+        const plan = planIncrementalTurn({ conversationId: CONV, path: '/v1/messages', messages: conversation(1)[0]!, system: SYSTEM, request: { model: 'claude-test', max_tokens: 1024 } });
+        assert.notEqual(plan.mode, 'skip');
+        if (plan.mode === 'skip') throw new Error('Expected seed');
+        const payload = JSON.parse(plan.body) as Record<string, unknown>;
+        payload.msgIds = ['client-pinned-explicit'];
+        const response = await h.post('/__bili/plugin/turn', JSON.stringify(payload), laneHeaders);
+        assert.equal(response.appliedSeq, 1);
+        const sessions = listSessions();
+        assert.equal(sessions.length, 1);
+        const session = sessions[0]!;
+        assert.ok(session.state.tsStamps);
+        assert.equal(Object.hasOwn(session.state.tsStamps, 'client-pinned-explicit'), false);
+        const pending = recoveredFirstSeen(h.store, session.id, undefined);
+        assert.ok(Object.keys(pending).length > 0, 'enabled timestamps must not produce an empty journal');
+        assert.equal(session.lastMessages?.length, 1);
+        for (const message of session.lastMessages ?? []) {
+            assert.equal(pending[message.id], session.state.tsStamps[message.id]);
+            assert.equal(message.ts, pending[message.id]);
+        }
+    } finally {
+        await h.close();
+        if (before === undefined) delete process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY; else process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY = before;
+        if (beforeTimestamps === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS; else process.env.BILI_MESSAGE_TIMESTAMPS = beforeTimestamps;
+    }
+});
 
 async function runIncremental(h: H, requests: Wire[][], opts: { restartBefore?: number } = {}) {
     const modes: string[] = [];

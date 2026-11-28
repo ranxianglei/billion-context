@@ -6,7 +6,7 @@ import * as path from "node:path";
 import type { CompressionBlock, CoreMessage } from "acp-kernel";
 import { SqliteBackend } from "../src/storage/backend.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
-import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { planIngest, loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 
@@ -83,6 +83,17 @@ function changeBeforeRead(t: TestContext, store: UnifiedStore, dbPath: string, m
 }
 
 for (const asyncLane of [false, true]) {
+    test(`timestamp column participates in sampled verification (${asyncLane ? "async" : "sync"})`, async (t) => {
+        const { shadow, view, close } = fixture(t, asyncLane);
+        const stamp = 1_700_000_000_123;
+        view.lastMessages![70] = { ...view.lastMessages![70], ts: stamp };
+        shadow.record(view);
+        if (asyncLane) await close();
+        assert.equal(shadow.stats.verifyDrift, 0, shadow.stats.lastError ?? "dedicated timestamp must not drift");
+        assert.equal(shadow.stats.verifyOk, 1);
+        assert.equal(view.lastMessages![70].ts, stamp);
+    });
+
     test(`sampled verification bounds reads and preserves live contents (${asyncLane ? "async" : "sync"})`, async (t) => {
         const { store, shadow, view, close } = fixture(t, asyncLane);
         store.ingestSession(planIngest({ ...view, pluginSnapshot: undefined, lastMessages: Array.from({ length: 200 }, (_, i) => message(i + 1000)) }));
@@ -112,6 +123,46 @@ for (const asyncLane of [false, true]) {
         assert.ok(blockReads.every((r) => r.limit === 32 && r.returned <= 32));
     });
 }
+
+test("a changed timestamp is detected exactly within the same canonical epoch", (t) => {
+    const { store, shadow, dbPath, view } = fixture(t);
+    const stamp = 1_700_000_000_123;
+    view.lastMessages![70] = { ...view.lastMessages![70], ts: stamp };
+    changeBeforeRead(t, store, dbPath, (db) => {
+        db.prepare("UPDATE messages SET ts = ? WHERE session_id = ? AND msg_id = ?").run(stamp + 1, view.id, "raw-70");
+    });
+    shadow.record(view);
+    assert.equal(shadow.stats.verifyDrift, 1, "a one-millisecond change must survive canonical timestamp masking");
+    assert.equal(store.ingestWatermark(view.id), null);
+});
+
+test("cold view restores proven kernel stamps without stamping legacy messages", (t) => {
+    const { shadow, view } = fixture(t);
+    const stamp = 1_700_000_000_123;
+    view.state.tsStamps = { "raw-70": stamp, "raw-71": 0 };
+    view.lastMessages![70] = { ...view.lastMessages![70], ts: stamp };
+    view.lastMessages![71] = { ...view.lastMessages![71], ts: 0 };
+    view.pluginSnapshot = [view.lastMessages![70], view.lastMessages![69], view.lastMessages![71]];
+    shadow.record(view);
+    const loaded = shadow.viewFor(view.id);
+    assert.ok(loaded);
+    assert.deepEqual(loaded.lastMessages, view.lastMessages, "cold tail must preserve exact timestamps and their absence");
+    assert.deepEqual(loaded.pluginSnapshot, view.pluginSnapshot, "snapshot timestamp/presence/order must survive");
+    assert.deepEqual(loaded.state.tsStamps, view.state.tsStamps);
+});
+
+test("cold view refuses a timestamp column that conflicts with durable kernel provenance", (t) => {
+    const { store, shadow, dbPath, view } = fixture(t);
+    const stamp = 1_700_000_000_123;
+    view.state.tsStamps = { "raw-70": stamp };
+    view.lastMessages![70] = { ...view.lastMessages![70], ts: stamp };
+    shadow.record(view);
+    const { db } = openSqliteDatabase(dbPath);
+    try { db.prepare("UPDATE messages SET ts=? WHERE session_id=? AND msg_id=?").run(stamp + 1, view.id, "raw-70"); } finally { db.close(); }
+    // Use the raw builder so the production facade's null-on-read-failure policy cannot mask the refusal.
+    // #6818: tsStamps is row-backed (#6785 step 8) — feed the state_fields row so the provenance check sees it.
+    assert.throws(() => loadLegacyView({ session: store.getSessionRow(view.id)!, refs: store.getRefs(view.id), deadRefs: store.getDeadRefs(view.id), blocks: store.getBlocks(view.id), messages: store.getMessages(view.id) }, undefined, store.getStateFields(view.id)), /timestamp.*provenance/i);
+});
 
 test("a changed message beyond the first batch trips drift and clears the watermark", (t) => {
     const { store, shadow, dbPath, view } = fixture(t);

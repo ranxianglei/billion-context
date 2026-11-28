@@ -708,7 +708,7 @@ interface LegacyViewRows {
         ccrJson: string | null;
         orphansJson?: string | null;
     };
-    messages: { seq: number; msgId: string; ref: string | null; content: string }[];
+    messages: { seq: number; msgId: string; ref: string | null; content: string; ts?: number | null }[];
     blocks: { blockId: string; summary: string; one: string | null; payloadJson: string }[];
     deadRefs: { ord: number; ref: string }[];
     refs: { ord: number; rawId: string; ref: string }[];
@@ -832,9 +832,13 @@ export class LegacyViewBuilder {
 
     /** #6785 step 8: the unbounded CompressionState field rows (state_fields
      *  table). Call AFTER constructing, BEFORE finish(); rows overlay the
-     *  column values (legacy sessions have no rows → column serves). */
+     *  column values (legacy sessions have no rows → column serves).
+     *  Applied immediately (idempotent — finish() re-applies): callers that
+     *  feed messages before the state fields (cold-view stamping, #6818)
+     *  must see the row-backed values at addMessages time. */
     addStateFields(fields: Record<string, string>): void {
         this.stateFieldsRows = fields;
+        this.applyStateFieldsRows();
     }
 
     /** #6785 step 8: apply the row-backed state fields OVER the column
@@ -868,7 +872,20 @@ export class LegacyViewBuilder {
     }
 
     addMessages(rows: LegacyViewRows["messages"]): void {
-        for (const m of rows) this.messagesBySeq.set(m.seq, JSON.parse(m.content) as CoreMessage);
+        const stamps = this.state.tsStamps;
+        for (const m of rows) {
+            const message = JSON.parse(m.content) as CoreMessage;
+            // The column also carries a batch-time fallback for pre-feature
+            // messages. Only the existing kernel ledger proves a real stamp.
+            if (stamps && typeof stamps === "object" && !Array.isArray(stamps) && Object.hasOwn(stamps, message.id)) {
+                const stamp: unknown = Reflect.get(stamps, message.id);
+                if (typeof stamp !== "number" || !Number.isSafeInteger(stamp) || stamp < 0 || m.ts !== stamp || (message.ts !== undefined && message.ts !== stamp)) {
+                    throw new Error("Stored message timestamp conflicts with durable kernel provenance");
+                }
+                message.ts = stamp;
+            }
+            this.messagesBySeq.set(m.seq, message);
+        }
     }
 
     /** #6785 step 6: the ccr_entries ledger (CAS content) that backs a slim
@@ -976,10 +993,12 @@ export function resolveCcrContentStore(
 /** Compatibility wrapper for callers that already hold all rows. */
 export function loadLegacyView(rows: LegacyViewRows, ccrRows?: readonly CcrLedgerRow[], stateFieldsRows?: Record<string, string> | null, orphanViews?: Record<string, { one: unknown; full: unknown }>): LegacyView {
     const builder = new LegacyViewBuilder(rows.session, rows.refs, rows.deadRefs);
+    // #6818: row-backed state fields (tsStamps) must be effective BEFORE
+    // addMessages — the per-message provenance check reads state.tsStamps.
+    if (stateFieldsRows) builder.addStateFields(stateFieldsRows);
     builder.addBlocks(rows.blocks);
     builder.addMessages(rows.messages);
     if (ccrRows) builder.addCcrEntries(ccrRows);
-    if (stateFieldsRows) builder.addStateFields(stateFieldsRows);
     if (orphanViews !== undefined) builder.addOrphanViews(orphanViews);
     return builder.finish();
 }
