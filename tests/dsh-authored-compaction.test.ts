@@ -216,7 +216,7 @@ function conversation(): { role: string; content: string }[] {
     return out;
 }
 
-type Harness = { proxy: http.Server; upstream: http.Server; bodies: string[]; url: string; sessionOf: (label: string) => { meta: { label: string }; state: { blocks: { id: string; active: boolean }[] }; metadata: Record<string, unknown> } | undefined };
+type Harness = { proxy: http.Server; upstream: http.Server; bodies: string[]; url: string; base: string; sessionOf: (label: string) => { id: string; meta: { label: string }; state: { blocks: { id: string; active: boolean }[] }; metadata: Record<string, unknown> } | undefined };
 
 async function withHarness(fn: (h: Harness) => Promise<void>, optsOverride: Partial<ProxyOptions> = {}): Promise<void> {
     const bodies: string[] = [];
@@ -275,6 +275,7 @@ async function withHarness(fn: (h: Harness) => Promise<void>, optsOverride: Part
         upstream,
         bodies,
         url: `http://127.0.0.1:${port}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+        base: `http://127.0.0.1:${port}`,
         sessionOf: (label) => listSessions().find((x) => x.meta.label === label) as never,
     };
     try {
@@ -579,4 +580,62 @@ test("e2e: responses wire — authored answer + landed checkpoint recognized on 
         delete process.env.BILI_DSH_AUTHORED_COMPACTION;
 
     }
+});
+
+test("e2e: compaction call counters track auto/manual distinction (#7744)", async () => {
+    await withHarness(async (h) => {
+        await armBlock(h, "s-counters");
+        process.env.BILI_DSH_AUTHORED_COMPACTION = "1";
+        // Manual compaction: text match (final user message is COMPACTION_INSTRUCTION).
+        const r1 = await turn(h, "s-counters", [
+            { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense.` },
+        ]);
+        assert.equal(r1.status, 200, r1.body);
+        let s = h.sessionOf("s-counters")!;
+        assert.equal(s.metadata["dshCompactionCallsManual"], 1, "manual counter after text-match call");
+        assert.equal(s.metadata["dshCompactionCallsAuto"] ?? 0, 0, "auto counter unchanged");
+        assert.ok(typeof s.metadata["dshMaxInboundMsgs"] === "number", "max inbound msgs tracked");
+        // Auto compaction: declaration-only (x-bili-plugin=dsh + purpose=compaction, no text match).
+        const r2 = await turn(h, "s-counters", [
+            { role: "user", content: "regular message, not a compaction instruction" },
+        ], { "x-bili-plugin": "dsh", "x-bili-plugin-purpose": "compaction" });
+        assert.equal(r2.status, 200, r2.body);
+        s = h.sessionOf("s-counters")!;
+        assert.equal(s.metadata["dshCompactionCallsManual"], 1, "manual counter unchanged");
+        assert.equal(s.metadata["dshCompactionCallsAuto"], 1, "auto counter after declaration-only call");
+    });
+});
+
+test("e2e: max-inbound high-water grows on ordinary turns with zero compaction calls (#7744)", async () => {
+    await withHarness(async (h) => {
+        await armBlock(h, "s-hwm");
+        // armBlock's turn is an ordinary request (no compaction call): the
+        // pre-fix sampler only ran inside the compaction branch, so a
+        // zero-call session (the stuck anthropic direct-lane case) stayed at
+        // 0/undefined forever — the 24 here is the regression pin for
+        // per-request sampling.
+        let s = h.sessionOf("s-hwm")!;
+        assert.equal(s.metadata["dshMaxInboundMsgs"], 24, "high-water sampled on an ordinary turn (no compaction call)");
+        assert.equal(s.metadata["dshCompactionCallsAuto"] ?? 0, 0, "no compaction call counted");
+        assert.equal(s.metadata["dshCompactionCallsManual"] ?? 0, 0, "no compaction call counted");
+        // A smaller ordinary envelope must NOT lower the high-water...
+        const r1 = await turn(h, "s-hwm", [
+            { role: "user", content: "first ordinary message" },
+        ], { "x-bili-plugin": "dsh" });
+        assert.equal(r1.status, 200, r1.body);
+        s = h.sessionOf("s-hwm")!;
+        assert.equal(s.metadata["dshMaxInboundMsgs"], 24, "high-water is a max, not a last value");
+        // ...and a larger one must raise it.
+        const r2 = await turn(h, "s-hwm", Array.from({ length: 25 }, (_, i) => ({ role: "user", content: `m${i}` })), { "x-bili-plugin": "dsh" });
+        assert.equal(r2.status, 200, r2.body);
+        s = h.sessionOf("s-hwm")!;
+        assert.equal(s.metadata["dshMaxInboundMsgs"], 25, "high-water tracks the largest envelope");
+        assert.equal(s.metadata["dshCompactionCallsAuto"] ?? 0, 0, "still no compaction call");
+        // The three signals are pollable on /__bili/sessions — a zero-call
+        // session is diagnosable without grepping the log.
+        const list = (await (await fetch(`${h.base}/__bili/sessions`)).json()) as { sessions?: { id: string; label?: string; dshMaxInboundMsgs?: number; dshCompactionCallsAuto?: number; dshCompactionCallsManual?: number }[] };
+        const entry = list.sessions?.find((x) => x.id === s.id || x.label === "s-hwm");
+        assert.ok(entry, "session listed on /__bili/sessions");
+        assert.equal(entry!.dshMaxInboundMsgs, 25, "high-water exposed on /__bili/sessions");
+    });
 });

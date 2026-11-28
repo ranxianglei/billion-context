@@ -95,6 +95,15 @@ interface WebSessionSummary {
     /** #4571: which engine served this session — "inline" (pi in-process) or
      *  "server" (standalone proxy process). Absent on pre-stamp sessions. */
     engineLane?: "inline" | "server";
+    /** #7744: dsh compaction call counters — how many compaction calls this
+     *  session has sent (auto = declaration-only, manual = text-match).
+     *  Absent when no compaction call has been observed. */
+    dshCompactionCallsAuto?: number;
+    dshCompactionCallsManual?: number;
+    /** #7744: high-water mark of inbound message count on this session —
+     *  tracks the host-side history growth even when no compaction call
+     *  arrives. Absent when no request has been observed. */
+    dshMaxInboundMsgs?: number;
     /** Number of compression events recorded in the per-request cache ledger (folds). */
     foldCount?: number;
     /** Non-cached token attribution from ledger samples (acp-kernel decomposeSample):
@@ -1055,6 +1064,11 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             : {}),
         ...(clientHint ? { clientHint } : {}),
         ...(engineLane ? { engineLane } : {}),
+        // #7744: dsh compaction observability — expose the three signals so
+        // the caller can poll /__bili/sessions without grepping logs.
+        ...(typeof metaRec["dshCompactionCallsAuto"] === "number" ? { dshCompactionCallsAuto: metaRec["dshCompactionCallsAuto"] as number } : {}),
+        ...(typeof metaRec["dshCompactionCallsManual"] === "number" ? { dshCompactionCallsManual: metaRec["dshCompactionCallsManual"] as number } : {}),
+        ...(typeof metaRec["dshMaxInboundMsgs"] === "number" ? { dshMaxInboundMsgs: metaRec["dshMaxInboundMsgs"] as number } : {}),
     };
 }
 

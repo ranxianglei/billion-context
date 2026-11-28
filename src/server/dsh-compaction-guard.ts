@@ -331,3 +331,11 @@ export function dshCompactionRefusal(protocol: string): Refusal {
  * passthrough lane's per-refusal warn so an agentless storm cannot spam the
  * log either. Constant, not config (#2155 precedent). */
 export const DSH_REFUSAL_STORM_LOG_EVERY = 100;
+
+/** #7744: cadence for the dsh compaction-observability line (auto/manual
+ * counters + max-inbound high-water + context-token state). Fires on the
+ * session's FIRST request (proves the sampler is live) and then every 50th
+ * main-lane request — a session that sends no compaction calls at all
+ * (the anthropic direct-lane case) still leaves a periodic log trail
+ * instead of a blank log. Constant, not config (#2155 precedent). */
+export const DSH_COMPACTION_OBS_LOG_EVERY = 50;
