@@ -31,6 +31,8 @@ hook 附着前先探测候选者的 `/__bili/health`:armed → 附着并注册 w
 
 附着发现在**所有**存活实例间是 lane 感知的(#1232):启动器探测实例注册表里的每一条存活记录,而不只是单个实例文件(last-writer-wins —— 并发多客户端下它可能指向别的客户端的代理),并对每个候选应用上面的门禁。兼容候选中,lane 与启动器自身声明一致的最新实例胜出;未声明 lane 的实例(用户主权区守护进程)在 lane 轴上通配,且门禁默认豁免(#1660)。`another bili instance is running` 告警(#394)也是 lane 感知的:同 lane 或无 lane 共存时触发,两个*不同声明* lane 之间保持沉默(它们的会话文件互不相交)。
 
+**复用的代理保留自己的进程内 resolver 状态(#5222)。** 附着/复用把会话交给一个*长命*进程;OS 级网络变化(WSL/VPN 切换、MagicDNS 接管)之后,该进程的 libuv 线程池 —— `dns.lookup` 与 undici 默认连接器在出站连接上共用的那个 —— 可能卡死(wedge),导致池内每次 lookup 都超时,而同机其他进程解析正常。重启*宿主*(如 DSH web)并不会刷新它:实例注册表会静默地重新收养同一个 pid。补救:重启 PROXY 进程(kill `~/.local/state/billion-context/instances/` 里记录的 pid),或让出站走上游代理(`-F` / `BILI_UPSTREAM_PROXY`,它完全跳过本地 DNS 准入)。自 #5222 起隧道准入也自我防御:当主池 lookup 耗尽重试时,在 `unresolvable` 判决前,会在一个全新的 worker 线程池上跑**一次**探测,于是卡死的代理不再误拒健康目的地(经 worker 结果放行,并打一条响亮的 warn 日志提示操作员重启代理以完全恢复 —— 在此之前出站连接仍共享卡死的池)。Phase 2(owner 决定 2026-10-31:只检测+表面化,绝不自我重启)增加一个由准入 MAIN 池结果喂给的持续卡死检测器(worker 探测缓解准入但不修复池):只有 THROW 的 lookup 才算失败(权威的空应答证明 resolver 可达),门禁 —— 至少两个不同 host 现在每次 lookup 都持续失败 ≥5 分钟(`src/resolver-wedge.ts` 的 `WEDGE_MIN_HOSTS` / `WEDGE_SUSTAIN_MS`;tracker 按 FIFO 上限 256 个用户给定 host)—— 无论本进程是否曾解析过它们:一个**天生卡死**的进程(首次启动前就被 DNS 接管,或直连出站在结构上不可能的主机)从不记录绿色,所以旧「必须先解析成功过」的门禁恰恰在它存在的场景里让告警保持沉默(#7747);从未解析过的 host 在 wire 上 + 告警/横幅/逐请求消息里被标记为 `coldStartHosts`,这样建议让出站走代理,而不是承诺一次无济于事的重启 —— 驱动 web 面板横幅、`/__bili/status` + `/__bili/overview` 上的附加 `resolverWedge` 字段(健康时为 null)、一条 `acp_status` 告警行,以及事件持续期间每 10 分钟重记一条 warn 日志;进程行为不变。
+
 ## 共享 state 目录与多实例安全边界(#394、#1724)
 
 同一台 host 上的每个 bili 实例读写的是**同一组** per-host 存储:XDG data 目录(`~/.local/share/billion-context/` —— 会话记录、CCR content-store、prefix-affinity)加 state 目录(`~/.local/state/billion-context/` —— 日志、实例注册表)。控制面是 lane 感知的(#1232:附着发现与 #394 共存告警都尊重已声明 lane),但**数据面没有分区** —— 既无按会话的属主,也无按 lane 的磁盘隔离。由此带来两个后果:
@@ -99,6 +101,18 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 
 由于 `/bili/{绝对上游URL}` 只是一个 URL 前缀,任何你能控制 baseURL 的客户端都可以直连使用,不依赖钩子。把 provider 的 `baseURL` 指向 `http://<代理主机>:<端口>/bili/<上游基址>` 是远程 agent 的受支持形态(configuration.md 的 `host` 节),也是某条车道的钩子确实漏轮时的推荐兜底:压缩、计费、门禁拒绝与日志全部照常生效,因为它就是钩子改写到的同一条通道。注意:直连客户端不带插件归因头,其会话落入匿名(`pfa-*`)链,按窗口解析阶梯定窗 —— 与其它无归因流量一致(#5907)。
 
+## Responses 原生链式不支持 —— 历史必须重放(#1954)
+
+Responses-wire 适配器(`src/server.ts` 的 `prepareResponses`、`src/loop/adapter-responses.ts` 的 `buildRequest`)是一个**无状态重放压缩器**:它把 `parsed.input` 当作*完整*对话,压缩它,然后在 `ACP_KEEP_RESPONSE_ID=1` 之外丢弃 `previous_response_id`。它不保存任何 response 谱系存储,因此**无法物化原生链式续传所引用的历史**。
+
+OpenAI 的原生链式(`store:true` + `previous_response_id`,服务端持有历史)与 bili 的客户端重放模型是互斥的范式。一个仅增量的续传(只有新轮次 + `previous_response_id`,无完整重放)因此到达上游时**既没有引用也没有被引用的轮次** —— 之前的上下文在上游被静默丢失,而请求仍返回 200。这就是 #1954 背后的机制。
+
+**本 PR 交付什么(方案 A —— 仅可见性)。** 当一个非空 `previous_response_id` 被剥离时,两条路径现在都会发一条 `warn`,点名该 id 并说明后果。触发条件只看 id **本身**,不看显式 `store:true`,因为 Responses 默认存储 response —— 省略 `store` 仍让被引用的 response 在上游可解析,所以按 `store` 判断会漏掉常见情形。方案 A 不改任何转发字节、也不关闭任何东西:增量请求仍丢失历史、仍返回 200。它只是让这种丢失不再静默。
+
+**是观察,不是证明。** 当前构建/测试显示 codex 发 `store:false` 且从不设置 `previous_response_id`,所以这对 codex *今天*是 no-op。这是来自既有 E2E + 流量的观察,不是「没有任何客户端会链式」的证明 —— E2E 不覆盖增量链式形态。codex 是 OpenAI 自家 CLI,对着一个原生支持链式的 Responses API,所以未来版本为省 token 切换到原生续传是合理演化;在那之前这仍是一个潜在高严重度缺口。
+
+**链式客户端今天的安全选项:** 重发完整输入/输出历史(bili 照常压缩/转发),或设 `ACP_KEEP_RESPONSE_ID=1` 保留该 id —— 但在 KEEP 下被引用的历史住在服务端,bili 的压缩/前缀缓存核算看不到它。真正的修复(压缩前物化谱系)作为 feature #1973 跟踪。官方迁移指南:https://developers.openai.com/api/docs/guides/migrate-to-responses
+
 ## 单写者:哪份拷贝归谁管(#991)
 
 一台机器上每一份 bili 存在物恰好有**一个写者** —— 装它的那个东西负责更新它,其他任何东西都不就地覆盖那份拷贝:
@@ -124,6 +138,16 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 
 可观测:`session.metadata.selfHeal = { detected, action, since }` 进 `/__bili/sessions`、web UI 挂"自愈"徽标、每次转换一行 `[self-heal]` 日志(检测+恢复)。`bili plugin remove <client>` 尽力查询活代理(instance 文件 → `GET /__bili/sessions`,2.5 秒超时,失败静默),该客户端近 **10 分钟**内有活跃会话时打印提示。
 
+## 降级直发兜底 —— 拒绝、自愈、通告(#4516、#3304、#2924、#4079)
+
+当某条原生车道的代理不可用时,模型流量回退到直发(`directSendOrRefuse`,`src/agent/native-intercept.ts`)。那条路径是一种降级模式,带三份契约,所有车道共享(#4516 之前无门禁车道 pi/omp/opencode-V1 一份都没有 —— 一份 106 万 token 的原始历史直接骑到了 provider 身上):
+
+- **尺寸臂** —— 任何降级发送之前,body 用与 dsh 门禁相同的 doom 数学计价(`bodyProvablyOverWindow`):stage 1 是原始字节下限对窗口,stage 2 剥掉结构性媒体字节(#4111 方向:核心 TEXT 放得下的媒体重 body **不**拒)。门槛从不假设窗口低于 `MIN_ASSUMED_WINDOW_TOKENS`(1M,#4079 —— 声明的窗口可能偏小错);那个区间的 body 交给 preflight。缺数据(无 `x-bili-plugin-context-window` 头、body 不可读)对直发 fail OPEN —— 本地守卫绝不能因自己的无知而误拦。判决:422 `x-bili-gate: oversize-refusal-fallback`,可重试,按上游方言 wire 成形,消息点名 floor/core/window 与不可用原因(`bootstrap-failed` vs `dead` —— 后者仅当车道曾持有 origin 又失去它)。
+- **自愈** —— bootstrap 失败不再意味着直发终身。每个发现无活 origin 的请求在 15 秒冷却下触发 owner 的 `respawn`(singleFlight —— 并发请求共享**一次**尝试),然后在 `state.spawnWaitMs ?? readyTimeoutMs ?? 15_000` 下等那个在途尝试:pi spawn 车道设 `SPAWN_BUDGET_MS + 10 s`,让慢冷启动(#4515)被等出来而不是在通用上限处被拒。恢复无需宿主重启。
+- **通告** —— 每次进出降级状态的 TRANSITION 向 bili.log 记一行(代理恢复 / 转直发 / 拒绝),不是每请求一行;`state.lastUnavailableReason` 把 WHY 带进拒绝措辞,让用户能分清「还在启动」和「死了」。
+
+opencode V2 resolver 车道(`createLiveOriginResolver`)保留自己的探测驱动重试;本契约覆盖它们不覆盖的纯拦截路径。面板归因上报仍是 dsh 专属(见 #4516)。
+
 ## ACP 标签回声统一整治 —— 四条不变量(#2023/#2066/#2190/#2248)
 
 一个 PR 把三条整治腿合并(refs-run 残留 #2023、退化闭名剥离+出口审计网 #2190、emission 整段丢弃+签名思考 verbatim #2066),并统一受四条硬规则约束 —— 覆盖**所有**文本改写面(loop 适配器、插件直通、JSON strip 函数、出口审计):
@@ -134,6 +158,22 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 4. **用户发送的消息永不被改写。** 用户自己片段的逐字回声在武装清洗下也保留(#463 豁免,按请求文本匹配,不按形状)。
 
 出口审计网(#2248)保持仅记日志:裸出口(未识别帧、解析失败)原样转发并打 `[tag-echo] raw exit` 日志,新泄漏形状可见而不改线上行为。由 `tests/unified-acp-invariants.test.ts` 钉住(8 个测试,两条 lane)。
+
+## 缓存台账累积以覆盖率为条件(#2202)
+
+台账对每个已发生的 fold 逐请求记账(每样本 `requestsAfter += 1`),面板把那个计数器变成 `netSaved = Σ (S − σ) × requestsAfter`。记账是一个*「本请求受益于该 fold」的主张* —— 只有当 fold 覆盖的字节真的搭在重发 wire 上时才成立。当宿主在 bili 不知情下移除它们(dsh 原生 compaction,#2193)时,旧计数器在一个被摧毁的基底上继续爬升:#2193 事件显示 netSaved 达 355M,而 1510 个被覆盖 id 已永久消失。
+
+修复在写侧、在主张点:`reconcileFoldCoverage` 本就在每个入站 pass 上检查这一证据,所以现在还按块把存在性记入 `session.metadata["foldCoverageByBlock"]` —— 每 blockId `{p, r, t, e}`(verbatim 在场 / 经 re-anchor 回收 / 覆盖总量 / 曾在场 latch)。台账用稀疏 `LedgerFold.bid` 把每个 fold 链到它的块(在 `recordCacheFoldsFromBlocks` 设置一次,那是 eager 代理路径与 lazy 插件模式路径的唯一咽喉点),并按实测比例 `(p + r) / t` 缩放增量:
+
+- **1** —— 全覆盖,或无可用记录 → 与 pre-#2202 计数器逐字节一致(健康会话与所有 legacy 条目);
+- **f** —— 部分覆盖 → 按比例累积;
+- **0** —— 证实覆盖丢失 → 累积冻结直到覆盖恢复。
+
+`e` latch 自校准两类:一个被覆盖 id *曾被*看见在场的 fold 可验证,所以全缺席即丢失;一个 id 创建后*从未*出现过的 fold 结构上不可验证(发折叠视图而非原始原文的 view-folding 宿主),保持现状记账而非被静默归零。覆盖丢失是活算的(`e === 1 && p + r === 0`),所以恢复时无粘滞状态即恢复累积;每次翻转发一条 warn/info 日志(`foldCoverageLostLogged` 去重键)。
+
+证据卫生镜像 #1195 守卫:侧请求形 pass(< 10 条入站消息 —— title-gen、WebSearch 细化)完全不取证据(无记录、无 backbone roll、无 drift-streak 移动、无重置),因为一个短 pass 会歪曲下一个 pass 的对齐并制造幻影全损。
+
+面板呈现把丢失的 fold 排除在头条数字之外:web 会话视图把它们显示为独立带标签的分段(行 tooltip、overview 副行、detail 统计)—— 丢失前冻结的节省仍可见,丢失后的增长停止。
 
 ## OpenAI 聊天线路的 `prompt_cache_key`:默认处处打戳,严格上游用受控 A/B 保护(#2218/#2645/#3556)
 
@@ -160,6 +200,45 @@ chat wire 上 bili 自己 vs 客户端自带:插件车道上,请求体里等于�
 升级提示(owner 要求):运行 `"disabled"` 的实例展示一次性提示 —— Web 面板横幅(可关闭,按实例持久化在 state 目录 `upgrade-notices.json`)、`acp_status` 一行、启动日志一行 —— 点名应切回 `"auto"`/`"enabled"` 的人群:workbuddy panel/hub 之类的中转站与号池,缺了这个 key 流量随机路由、前缀缓存亲和下降。直连官方 API 的用户忽略即可。关闭提示不会改动 routing 的值。
 
 测试:`tests/issue5079-pck-default-off.test.ts`(解析兜底、双 wire 矩阵含 bili 回显行、提示模块、默认关/auto 成对的活代理出口断言)+ `tests/issue2218-relay-affinity-signal.test.ts` 的更新矩阵。
+
+## 未覆盖历史审计 —— 诚实的最小判决(#4331)
+
+「无可压缩区间 —— 上下文已在最小」这个停止信号在结构上不可验证:它在 PRE-FOLD OFFER 耗尽时触发(`postCompressTail`,#2404 钉住),但从未有任何东西把活动块区间的并集与会话的 ref 集对比。一个活的 ZCode 会话展示了规模化失败 —— 138 个历史中部 ref(约 65K tok,约 16% 上下文)不在任何活动块里,最大连续段 `m00312`–`m00411`(100 条),而回执连声明三次全局最小。内核**确实**能在这些 span 被 offer 时找到它们(master 上已复现验证);缺的是一个全局覆盖审计,加上一个只在「最小」成立时才声称它的判决。
+
+设计(`src/uncovered.ts`,仅宿主侧,无 kernel 变更):
+
+- `uncoveredHistoryRuns()`:遍历消息数组找所有活动块覆盖之外的条目(`collectVisible` 谓词),分组连续段,然后逐段分类:若任一当前 offer 覆盖其一部分则跳过(模型现在就能对它行动);否则对 `structuredClone(state)` 跑**两遍** `core.processTurn` 求差 —— 正常配置 vs 放宽的 `{preserveRecentMessages: 0, preserveRecentTokens: 0}` —— 把只在放宽 pass 被 offer 的 ref 当作 zone-hidden(在受保护最近窗内)。经验 zone 差刻意复用内核自己的受保护 zone 规则而非复制它们,所以随那些规则演化自维护(过近似偏向少报)。低于 `VIABLE_RANGE_MIN_TOKENS`(200)的段保持沉默。已跑过正常 offer pass 的调用方可经 `normalRanges` 传入(数组 = 信任复用,即使为空;undefined = 无调用方数据,审计自跑一遍),于是 acp_status 只付**一次**额外 `processTurn` 而非两次。整个函数是建议性的:任何 throw 退化为「未找到段」,绝不破坏回执或 status。
+- **acp_status** 增加一个附加 `UNCOVERED HISTORY` 段(按 token 取 top-5 段,其余计数),列出既在所有活动块之外、又不在上方 live Compressible-ranges 列表里的质量 —— 包括被覆盖块之间、任何 merge 都永不折叠的孤立 sub-gate 段(#4331 / #847 的永久洞类)。命名只为可见性,明确不是折叠建议;行经 `scope:"uncompressed"` 下钻不变。
+- **Tier-2 覆盖不变量(已评审,P4 钉住)**:审计的覆盖集是 `coveredMessageIds` = 活动块 `effectiveMessageIds` 的并集,**无**子块递归(kernel/src/state.ts:57-64)。这是安全的,因为每条块创建路径都把被消费子块的 `effectiveMessageIds` 并入新父块(kernel/src/unit-projection.ts:178-183)并停用子块(kernel/src/compress.ts:1578-1581)—— T2/T3 父块因此在状态模型里携带其完整蒸馏 span,hydration 也保留它(整份状态 JSON)。DB 侧遍历 `blocks.payload_json` **不**有该性质,需要 `directBlockIds` 递归(早期一个独立尝试带它的原因);状态模型不需要。
+- **postCompressTail**:在干净的整 offer 耗尽且无 tier 蒸馏时,审计在判决前跑。找到段且总量 ≥ `UNCOVERED_RECEIPT_FLOOR_TOKENS`(10K,仅回执)→ 诚实文本点名它们(「未在最小」,指向 acp_status)。低于下限 —— 或无段 —— 逐字 #1387 契约串以字节稳定触发,与 master 完全一致:小的被拒残留不得每次折叠都重新唠叨(pi #521 规则),而实质性泄漏则覆盖它。下限刻意**不**应用于 acp_status 段:显式的检查面不是唠叨面,且 #4331 方案 1 在那里指定无尺寸门。10K 总量是待 owner 确认的产品值(与评审者独立选择一致)。
+
+行为变更(已披露):旧 = offer 耗尽时无条件「已在最小」;新 = 只有当全局审计验证它**且**未覆盖质量越过 10K 回执下限时才声称 —— 低于下限时回执与 master 逐字节一致(所以 `tests/compress-success-tail.test.ts` 保持 master 字节,零 diff),其 #2404/#1387 低于下限的残留 fixture 现在兼作下限的钉。Sub-gate 残留在 acp_status 可见(之前在所有面不可见)。未新增配置/env 面;nudge 提示文本不动(kernel 拥有)。已知限制另作观察:回执的剩余量计算在任一已提交 span 与之重叠时移除**整个** offer 批,所以部分折叠的合并批可能少报而非多报。
+
+测试:`tests/issue4331-uncovered-history.test.ts`(洞会话 → 诚实判决 + 点名 span;排空会话 → 逐字契约串;低于下限沉默;tier 优先级;**tier-2 蒸馏覆盖钉** —— 经真实宿主路径蒸馏进一个 T2 父块的三个 T1 不得把子 span 泄漏进审计;acp_status 双向;formatter 上限)+ `tests/compress-success-tail.test.ts` 与 master 不变(其 < 10K 残留 fixture 钉住下限)、`tests/issue2029-status-baseline-provenance.test.ts`(每个 status-reader kernel 调用喂给 provenance 基线)、`tests/issue847-compress-failure-guards.test.ts`(sub-gate 残留在诊断里可见,仍从不被 offer)。
+
+## 事件循环卡死自退与 EADDRINUSE 持有者诊断(#4762)
+
+一个长命的独立代理(v0.1.208 现场报告:dsh-harness 车道,最后一条日志是一份 48 MiB 会话的 fold-reconcile re-anchor)主事件循环阻塞了 15 分钟以上,同时**仍持有**监听 socket —— HTTP 死了,socket 还开着。外部 harness 子进程(无 `BILI_LAUNCH_TOKEN`)按设计对 EADDRINUSE fail fast(`src/listen-policy.ts`),所以每 ~70 秒的重生都死在 `listen failed: EADDRINUSE … exiting before persist`,直到有人手动杀掉僵尸。两个缺口:没有任何东西能让一个卡死的代理让出端口,而且死亡消息把锅甩给「另一个进程」却从不检查那个监听者是否真的在服务 —— 更糟的是,一个间歇性排空 accept 队列的卡死僵尸能过启动期的 twin 健康探测,于是子进程在「服务中的实例继续服务」的提示下退出,而那个实例什么都没服务。
+
+设计:
+
+- **看门狗**(`src/event-loop-watchdog.ts`):一个独立的 worker 线程**拥有**时钟 —— worker 自己的事件循环在主线程被永久阻塞时仍会走针,这正是重点所在。主线程每 `WATCHDOG_HEARTBEAT_MS`(5 s)发一次心跳;worker 每 5 s 检查一次:gap ≥ `WATCHDOG_SOFT_WARN_MS`(30 s)→ **一条**取证 warn 行(uptime/RSS);gap ≥ `WATCHDOG_HARD_TIMEOUT_MS`(300 s)→ 向 bili.log + stderr 记 FATAL 行,然后整进程 kill —— 由 worker 发出 `process.kill(process.pid, "SIGKILL")`(exit 模式)。不是 `process.exit()`:在 worker 线程里它只结束 worker,而这恰恰是卡死代理过去能活过自己的看门狗、继续无看门狗运行的方式(#6157);SIGKILL 不需要被阻塞主线程的任何东西(JS SIGTERM 监听器永远不会跑),在 Windows 上 `process.kill` 映射到 TerminateProcess。阈值按设计硬编码(配置面是 owner 门禁的):合法的大压缩在数秒到数分钟内完成且会在块间让出循环,所以**连续**五分钟沉默只可能是死锁。在 `startServer` 的**入口**武装(在 twin 探测之前,引擎/存储初始化与 hydrate 全在它之下跑 —— 卡死可能在启动期到来,而 #4762 自己的复现类就是同步 I/O 热点)—— 仅独立进程;插件注入模式永不武装(那会杀掉宿主进程)。取证行只要配置了文件腿就路由到 bili.log;worker 的 STDERR 腿仅在 stderr 是 TTY 或根本没有文件腿时才发 —— 向一个满的、未排空的管道做阻塞写永远不会触发 error 事件(#5012 类),所以 worker 把自己的 FATAL 行写进恰好那条死管道会卡死**它自己**而不是触发退出;这道门是结构性的,不是防御性的。worker 被 unref 掉,所以安全网永远不会把干净的自然进程退出扣为人质。worker 以 inline `eval` 代码运行,因为 `dist/index.js` 是单 bundle 没有可引用的兄弟文件;它唯一的 import 是带守卫的 `require("worker_threads")` —— `parentPort` 全局在 eval worker 里**不**存在(ReferenceError,Node 22 上已验证)。Worker 生成失败退化为无看门狗并打一条 warn,绝不破坏启动(可用性大于护栏)。
+- **持有者诊断**(`src/port-owner.ts` + `src/server.ts` 里两条 EADDRINUSE 死亡路径):在死亡时刻,对既有监听者的 `/__bili/health` **重新**探测一次(2 s 预算;通配符绑定经回环 origin 探测 —— `holderProbeOrigin`)。有应答 → 提示说明对端**在**服务,spawner 应附着到它;无应答 → 提示说明持有者看起来卡死或已死,并点名具体释放方式:pid 已知时(应答者 pid 优先于陈旧注册表条目;回退到同 lane 注册表 pid)用 `taskkill /PID N`(Windows)/ `kill N`(POSIX),否则 `netstat/lsof`。记为 `[eaddrinuse-diag]`,设了 `BILI_LAUNCH_TOKEN` 时写进 spawn 端口日志(本子进程的 stderr 被静音进 bili.log,#2864)。覆盖**两条**路径:引擎前的早期 twin 碰撞退出,与 post-bind `server.on("error")` 终态分支。
+- **为何重新探测而非信任启动期判决:** 早期 twin 检查(`findVerifiedSameLaneTwin`)在 bind 前数秒跑,而晚期路径的 `classifySameLanePeer` 仅查注册表(pid 活着,**无**健康检查)。中间发展出的卡死 —— 正是 #4762 的形态 —— 会翻转两者的真相。而且一次浅探测无法区分慢活与卡死但排空(僵尸应答了部分探测),所以措辞说「看起来卡死」,把 kill 决定留给操作员/spawner 而非自行执行。
+- **范围外(已记录):** 反复 EADDRINUSE 后的父侧强杀属于 SPAWNER(DeepSeek Harness),不属于本仓 —— 诊断行现在告诉它该做什么。
+
+行为变更(已披露):旧 = 卡死的独立代理永生持有其端口,每次重生都死在不透明的 EADDRINUSE;新 = 主循环连续沉默 ≥ 5 min ⇒ 30 s 一条 warn,一条 FATAL 日志行,然后由看门狗 worker 整进程 SIGKILL(#6157:worker 里 `process.exit(1)` 只结束 worker),于是 spawner 的正常重生成能夺回端口 —— POSIX 子进程以信号结束(`code: null`),Windows 经 TerminateProcess —— 外加每条终态 EADDRINUSE 消息都追加一段服务/卡死裁决 + kill 指引。无新配置/env/CLI 面 —— 阈值是模块常量。插件模式行为不变(那里看门狗不武装)。
+
+测试:`tests/event-loop-watchdog.test.ts`(判决边界表含 warn-once 语义;默认钉;真实 worker 卡死集成 —— 同步自旋把主循环阻塞过硬阈值,触发开火,两条取证行落在带 `[v=…]` 标签的日志文件里;健康流永不触发;生成失败缝干净退化;子进程里真实「exit」模式 —— 卡死的主线程随整进程死亡且 FATAL 行先落地,#6157)+ `tests/port-owner.test.ts` 增补(通配符 origin 重写;服务/卡死/匿名提示措辞;活应答者 pid 优先于陈旧注册表 pid;死持有者读作未服务;注册前「启动中」读作未服务)。
+
+## 依赖审计 —— zod advisory GHSA-mrhx-c7xc-m3w5 与 jimp 嵌套 zod 误报(#4820)
+
+全新安装的 `npm audit` 报出一条高危 advisory,GHSA-mrhx-c7xc-m3w5(CVE-2023-54404,CVSS 7.5 High,**仅可用性/DoS** —— 无保密性或完整性影响),针对两条必须区别处理的链:
+
+- **直接 `zod`**(`package.json` `dependencies.zod`,按 KDD #1 精确钉死)。确实受影响:漏洞代码是 `v4/core/schemas.js` 的 `$ZodArray.handleArrayResult`,当把超大数组对无约束的数组 schema 校验时,它累积每个元素的校验 issue,无上限也无提前终止。已 `4.1.8 → 4.6.7` 升级(修复行从 4.6.6 起,它加了 `abortEarly` 门控的提前 break 加一个 4.1.8 没有的 `capSize` 注册)。钉死保持**精确**(不是范围),让 npm 能与 opencode 宿主去重到一个共享实例 —— KDD #1 的互操作保证 —— 并由 `tests/opencode-native-v1.test.ts` 覆盖。在我们的树里这份拷贝只被 `src/agent/opencode-native.ts` 消费(OpenCode V1 插件工具,惰性不透明 import);Pi/proxy 车道不加载它。
+- **Jimp 的嵌套 `zod@3.x`**(`optionalDependencies.jimp`;每个 `@jimp/*` 声明 `zod ^3.23.8`,所以 npm 在每个 `node_modules/@jimp/*/node_modules/zod` 下嵌套一份 3.x 拷贝)。这是**对我们使用 jimp 方式的误报**,在源码层确立而非从 semver 范围假设:漏洞函数只存在于 zod 的 v4 实现(`v4/core/schemas.js`),v3 里从没有;3.25.x 安装里 `import "zod"` 解析到 v3 core;且 `@jimp/*` import 的是普通 `"zod"`(从不 `zod/v4`)。所以这个 bug 经 jimp 不可达。因此我们**不**强制覆盖 jimp 的 zod 3→4(一个没有可收敛的已修复 3.x 的跨主版本覆盖,冒着破坏 jimp 自己的校验语义的风险);我们改为跟踪上游。可达性限制保持显式:jimp 是可选且惰性加载的(`src/image-rescale.ts`),缺席时退化为直通,仅在图像处理期间可达。边界:3.25.x tarball **内部**捆绑的 v4 预览本身是修复前的 —— 若未来某个 `@jimp` import 了 `zod/v4`,重估此结论。
+
+硬 CI/运行时审计门刻意延后:除非加例外,否则它会因 jimp 链保持红,而任何例外都必须窄范围、有解释、可复查 —— 绝不是一刀切的抑制。待直接 zod 升级落地且上游 jimp 被跟踪后再重审。
 
 ## 全量重发水位快路径(#5403 / #5418)
 
