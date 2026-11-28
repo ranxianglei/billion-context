@@ -3866,6 +3866,9 @@ export class SessionStore {
                 // holds the same bytes on disk.
                 this.lastSaveLanded.set(session.id, true);
             }
+            // #5228: settle afterNextFlush waiters like every other landing path —
+            // this branch deleted the armed microtask whose finally would have drained them.
+            this.drainFlushWaiters(session.id, true);
             return;
         }
         // #6793-review: full-build path (store.writeNow) never consults the
@@ -3878,6 +3881,9 @@ export class SessionStore {
             await this.withPreoomSnapshot(session.id, session.meta, () => this.store.writeNow(session.id, () => { const r = this.guardedBuild(session)(); rec.v = r; return r; }));
         } catch (err) {
             this.saveWritesInFlight.delete(session.id);
+            // #5228: settle waiters even on failure — waiting on a flush must never
+            // wedge past a failed write (mirrors the debounce timer's .finally).
+            this.drainFlushWaiters(session.id, false);
             throw err;
         }
         this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
