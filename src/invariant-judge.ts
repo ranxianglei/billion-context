@@ -810,6 +810,19 @@ let armedOverride: boolean | null = null;
 let sink: Sink | null = null;
 let fault: Fault | null = null;
 
+const VIOLATION_DEDUPE_MAX = 2048;
+const violationSeen = new Map<string, number>();
+
+export function _resetViolationDedupeForTest(): void { violationSeen.clear(); }
+
+export function dedupeViolation(key: string): { log: boolean; count: number } {
+  const count = (violationSeen.get(key) ?? 0) + 1;
+  violationSeen.delete(key);
+  violationSeen.set(key, count);
+  if (violationSeen.size > VIOLATION_DEDUPE_MAX) violationSeen.delete(violationSeen.keys().next().value as string);
+  return { log: (count & (count - 1)) === 0, count };
+}
+
 function defaultSink(sessionId: string | undefined, lane: "main" | "loop"): Sink {
   return (v) => {
     const where = `[${sessionId ?? "unknown"}] [invariant-judge${v.lane ? `/${v.lane}` : ``}]`;
@@ -818,7 +831,9 @@ function defaultSink(sessionId: string | undefined, lane: "main" | "loop"): Sink
       // #4862: label by the invariant that actually fired — an I3 pairing
       // violation on a non-folded request must not read as "I1".
       const inv = head.kind === "unpaired-tool-call" || head.kind === "unpaired-tool-result" ? 3 : v.folded ? 2 : 1;
-      loggerLog("warn", `${where} I${inv} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.covered ? `, covered ${v.covered}` : ``}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``})`);
+      const seen = dedupeViolation(`${sessionId ?? "unknown"}|${inv}|${head.kind}|${head.index}|${head.detail}`);
+      if (!seen.log) return;
+      loggerLog("warn", `${where} I${inv} violation${seen.count > 1 ? ` (seen ${seen.count}x)` : ``}: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.covered ? `, covered ${v.covered}` : ``}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``})`);
     } else {
       loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.covered ? `, covered ${v.covered}` : ``}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``}`);
     }
