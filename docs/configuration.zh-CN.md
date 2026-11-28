@@ -2698,3 +2698,11 @@ C:\Windows\System32\icacls.exe "C:\Program Files\nodejs\node.exe" /setintegrityl
 若标签带 `(I)`(继承)标记,说明**父目录**才是源头:只修目录**根、不递归**——`icacls "<目录>" /setintegritylevel Medium`,**不加 `/T`**。新建/重建的子项会继承出「(no label)」并收敛;`/T` 只是白扫几千个文件。不确定时先用 `icacls "<目录>" /save acl.txt` 备份当前 ACL。
 
 **不要**用「把 billion-context 数据目录打成 Low」来修——方向反了,只会更糟(对比 #3823 与 #5154:文件变成只有 Low 进程可写,到处撞完整性天花板)。
+
+### Windows:claude native hook 在旧版 Node 上退出 127(#7835)
+
+在 Windows + Node **< v24.20.0** + bili **≤ v0.1.216** 上,claude native hook 的 finalizer 在约 9.5s 的重分配工作(fetch / JSON / 进程表遍历)完成后硬退出(`process.exit(0)`)。此时 V8 后台工作线程可能恰好在 teardown 关闭平台任务运行器的 `flush_tasks_` handle 时对其调用 `uv_async_send` → libuv `UV_HANDLE_CLOSING` 断言 → abort(退出码 **127**,每次 claude 启动都被报 hook 失败)。
+
+这是 **Node.js 运行时缺陷**(nodejs/node#56645 / #64322,由 nodejs/node#61999 修复,已进 **v24.20.0** 与 **v26.7.0**;v20.x / v22.x 分支已带同样的 `flush_tasks_ == nullptr` guard)。会话本身**不受影响**——proxy attach 与 managed-settings pin 在 abort 前已完成,压缩正常。
+
+**修复:升级 Node 到 ≥ v24.20.0**——任何 bili 版本上的确定性修复。自 #7094(2026-11-24 合入 master;v0.1.216 早于该修复)起,hook 在正常路径上不再硬退出——teardown stdin 后让事件循环自然 drain 到退出(unref 的 5s 安全定时器仅在意外残留时强制退出)——因此首个包含它的版本起,旧 Node 上「每次启动都 127」不再出现;上面的 Node 升级则连自然退出路径的残余竞态也一并消除。
