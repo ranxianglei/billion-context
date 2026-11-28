@@ -284,6 +284,7 @@ billion-context/
 │   ├── dump-banner.ts            # PLAINTEXT warning header for (and stripped from) body dumps (#4482)
 │   ├── durable-message-guards.ts # Projects host durable-state message carriers to virtual tool paths (#2446)
 │   ├── duration.ts               # Duration string parsing (1d12h) for update-policy keys (#3619)
+│   ├── egress-core-shed.ts       # Core-space image shed: archive over-budget image rows in the egress op log as U ops (#7693)
 │   ├── egress-shed.ts            # Byte-space egress shed: archive/downscale outbound images past lane budget (#3701)
 │   ├── fold-decomposition-lookup.ts # Stored message decompositions for fold-anchor backfill (#3301)
 │   ├── host-profiles.ts          # Per-agent declared-defaults registry, import-free leaf (#3417)

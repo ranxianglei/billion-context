@@ -575,7 +575,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 // the transformed lane shape. A rejected turn leaves only
                 // in-memory kernel state — nothing is recorded and the retry
                 // self-heals (single-txn, idempotent).
-                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCore, log, armed });
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCore, log, armed, origin: upstreamOrigin });
                 const served = recordAuthorityTurn(st, sessionId, auth, projection.systemParts.join("\n\n"), log, egressBlockLedgerFor(session), session.state.messageRefs);
                 if (served !== null) laneCore = served;
             }

@@ -89,7 +89,11 @@ test("an authority session with an unreadable log fails at once, is remembered, 
     // 3. the operator resets the log: the latch clears and the session bootstraps again
     st.unreadable = false;
     const out = resolveEgressAuthority({ session, st, sessionId: "s", core: CORE, log, armed: true });
-    assert.deepEqual(out, { base: [], baseSeq: 0, bootstrapping: true, swappedCore: null, recordCore: CORE });
+    assert.deepEqual(
+        { base: out.base, baseSeq: out.baseSeq, bootstrapping: out.bootstrapping, swappedCore: out.swappedCore, recordCore: out.recordCore },
+        { base: [], baseSeq: 0, bootstrapping: true, swappedCore: null, recordCore: CORE },
+    );
+    assert.deepEqual(out.imageShedTargets, { maxImages: undefined, maxBytes: 10 * 1024 * 1024 }, "armed bootstrap carries the default byte wall (no learned count cap)");
     assert.equal(session.metadata["egressFlowUnreadable"], undefined, "latch cleared");
     assert.ok(lines.some((l) => l.includes("op log was reset")), `the reset is logged (log: ${lines.slice(-3).join(" | ")})`);
     const served = recordAuthorityTurn(st, "s", out, "sys", log);
