@@ -2900,7 +2900,7 @@ export function diagTagSummary(messages: CoreMessage[], sessionId: string, strat
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
-export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean, decidePending = false, surfaceOff?: string): string {
+export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number>; compressibleRanges?: { startRef: string; endRef: string; tokens: number }[] } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean, decidePending = false, surfaceOff?: string): string {
     const n = turn.nudge;
     if (!n) return `[${sessionId}] nudge: unavailable`;
     const b = n.breakdown ?? {};
@@ -2910,6 +2910,14 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
     const interval = b["nudgeGrowthTokens"] ?? 0;
     const pendingT1 = b["pendingT1"] ?? 0;
     const ref = b["growthReference"] ?? 0;
+    // #6720: the offered range list itself — "the model saw this list and didn't
+    // fold it all" was previously unverifiable (only pendingT1 was logged). Cap
+    // at 4 ranges so a long list doesn't bloat the line; the full list is in the
+    // nudge text the model receives.
+    const ranges = n.compressibleRanges ?? [];
+    const rangesTag = ranges.length > 0
+        ? `, ranges=[${ranges.slice(0, 4).map((r) => `${r.startRef}–${r.endRef}(${r.tokens})`).join(", ")}${ranges.length > 4 ? `, +${ranges.length - 4} more` : ""}]`
+        : "";
     // "INJECT" only when the nudge actually reaches the upstream payload. When
     // armed but suppressed by config/mode, say so explicitly so the log never
     // lies about delivery (#451, same class as #413). #3004: when the
@@ -2924,7 +2932,7 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
     // the observed top-level tools so the next omnibus rename is greppable here
     // (`surface=off(top-level=[...])`) instead of arriving as a user incident.
     const offTag = surfaceOff ? `, ${surfaceOff}` : "";
-    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}${offTag}, reason="${n.reason.slice(0, 120)}"`;
+    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${rangesTag}${modelTag}${offTag}, reason="${n.reason.slice(0, 120)}"`;
 }
 
 // Zero-baseline sessions are judged conservatively ONLY when they arrived

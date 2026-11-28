@@ -172,6 +172,16 @@ export interface NudgeState {
    *  a mass-qualified T2/T3 fire ahead of T1 instead of starving forever.
    *  Cleared by a compliant harvest or any distillation. */
   t1HarvestStall?: boolean;
+  /** #6720: one-shot re-inject armed by a PARTIAL tier-1 fold (the fold
+   *  harvested < STALL_HARVEST_RATIO of the offered pending, leaving >= half
+   *  the threshold on the table). While armed, the NEXT processTurn re-offers
+   *  T1 without waiting for the full growth floor — this kills the ratchet
+   *  where each partial fold's remainder rides along and the post-fold floor
+   *  rises monotonically (#6720). Cleared when the re-injected T1 nudge is
+   *  displayed (the model gets its one re-offer) or by a compliant full fold;
+   *  an ignored re-offer keeps lastNudgeShownTokens set so the normal growth
+   *  gate re-asserts and this never loops on an unresponsive session. */
+  partialFoldReinjectArmed?: boolean;
   /** #5865 estimate-hold backstop: count of CONSECUTIVE processTurn events
    *  whose meter reading was estimate-grade. Reset to 0 by any usage-grade
    *  reading. Only consulted while nudge.requireUsageSampleForPressure is on:
@@ -843,6 +853,13 @@ export interface ApplyCompressionResult {
      *  source. Hosts render it with the "[Compression no-op:" prefix and fold
      *  the exchange away like other zero-applied compress results (#4289). */
     noop?: true;
+    /** #6720: tokens of the last tier-1 offer that this fold did NOT harvest
+     *  (offered pending minus what actually folded, floored at 0). Present
+     *  only on a PARTIAL tier-1 fold — the host renders it into the compress
+     *  receipt so the model sees the remainder instead of a "done" receipt,
+     *  which is what let weak models treat a partial fold as complete and let
+     *  the floor ratchet up. Omitted on full/compliant folds and no-ops. */
+    remainingPending?: number;
   };
 }
 

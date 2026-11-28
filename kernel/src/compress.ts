@@ -935,6 +935,10 @@ export function createCore(ports: Ports = {}): CompressionCore {
     state.stats.compressionCount += blocksCreated;
     state.stats.tokensCompressed += tokensCompressed;
 
+    // #6720: tokens of the last tier-1 offer this fold left unharvested — set
+    // only on a partial tier-1 fold, rendered into the receipt below.
+    let remainingPending: number | undefined;
+
     if (blocksCreated > 0) {
       // #3769: record where THIS fold starts so the next processTurn sweeps
       // orphan failures at/after it cache-neutrally, leaving orphans before it
@@ -988,10 +992,17 @@ export function createCore(ports: Ports = {}): CompressionCore {
       const firePending = state.nudge.lastT1FirePending;
       if (distilled) {
         state.nudge.t1HarvestStall = false;
+        state.nudge.partialFoldReinjectArmed = false;
         state.nudge.lastT1FirePending = undefined;
       } else if (firePending !== undefined && firePending > 0) {
-        state.nudge.t1HarvestStall =
-          tokensCompressed < STALL_HARVEST_RATIO * firePending;
+        const partial = tokensCompressed < STALL_HARVEST_RATIO * firePending;
+        state.nudge.t1HarvestStall = partial;
+        // #6720: arm the one-shot re-inject on a partial fold so the next
+        // processTurn re-offers T1 without waiting for the full growth floor.
+        state.nudge.partialFoldReinjectArmed = partial;
+        if (partial) {
+          remainingPending = Math.max(0, firePending - tokensCompressed);
+        }
         state.nudge.lastT1FirePending = undefined;
       }
       // A successful compression is by definition viable progress — restart
@@ -1027,6 +1038,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
         // nothing — surface the no-op class so the host renders the
         // success-shaped receipt instead of "FAILED: no blocks created".
         ...(blocksCreated === 0 && errors.length === 0 ? { noop: true } : {}),
+        // #6720: surface the unharvested remainder of a partial tier-1 fold so
+        // the receipt says "you left X" instead of a done-shaped receipt.
+        ...(remainingPending !== undefined
+          ? { remainingPending }
+          : {}),
       },
     };
   }
@@ -1631,6 +1647,11 @@ const nudgeNode: PipelineNode = {
       // against this number to detect a non-draining T1 channel.
       if (nudge.tier === 1 && nudge.breakdown) {
         stamped.lastT1FirePending = nudge.breakdown.pendingT1;
+      }
+      // #6720: a displayed tier-1 nudge consumes the one-shot re-inject — the
+      // model got its re-offer, so disarm; the next partial fold re-arms it.
+      if (nudge.tier === 1) {
+        stamped.partialFoldReinjectArmed = false;
       }
     }
 
@@ -2560,6 +2581,29 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           : `T3 condense ready: ${tiers[3]!.targetBlocks.length} tier-2 blocks (${t3Pen} tokens) >= ${tierThresholds[3]}${config.nudge.tierGrowthTokens?.t3 === undefined ? " (1.5x)" : ""} and > T2 ${t2Pen} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
       }
     }
+  }
+
+  // #6720: partial-fold re-inject. The last tier-1 fold was PARTIAL (armed the
+  // one-shot flag in applyCompression) and it left >= half the T1 threshold on
+  // the table. Re-offer T1 on THIS request without waiting for the full growth
+  // floor — the ratchet (#6720) is exactly the wait: each partial fold's
+  // remainder rides along, the tail grows 10-20K by the next nudge, and the
+  // post-fold floor rises monotonically. Not gated on usage: a low-usage long
+  // session (1M window, usage <= 24%) never crosses minContextLimitPct, so the
+  // first-sight/backlog bypasses never fire and the remainder would stall for
+  // a full growth interval every round. At most one re-inject per partial fold:
+  // the flag is cleared when the re-injected nudge is displayed (nudge-stamp
+  // node) or by a compliant full fold; an ignored re-offer keeps
+  // lastNudgeShownTokens set so the normal growth gate re-asserts and this
+  // never loops on an unresponsive session.
+  if (
+    injectedTier === null &&
+    !pressure &&
+    state.nudge.partialFoldReinjectArmed === true &&
+    t1Eff >= 0.5 * tierThresholds[1]
+  ) {
+    injectedTier = 1;
+    injectedReason = `T1 partial-fold re-inject: last fold left ${t1Eff} pending (>= 50% of ${tierThresholds[1]}) — re-offering without the full ${growthFloor} growth wait, usage ${Math.round(usage * 100)}%`;
   }
 
   const shouldInject = injectedTier !== null;

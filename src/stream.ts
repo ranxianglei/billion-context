@@ -1878,7 +1878,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // #6855: headline echoes the EFFECTIVE (kernel-clamped) range, not the
         // requested one — the requested number stays in `warn` for correlation.
         const effectiveDetail = effectiveCompressedDetail(ranges, highestMappedRef(ctx.session.state), r.warnings);
-        let msg = `[Compressed ${effectiveDetail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}${applyErrorNote(r)}]`;
+        // #6720: a partial tier-1 fold must not read as a clean "done" — the
+        // kernel reports the unharvested remainder so the model sees there is
+        // more to fold instead of treating the partial fold as complete (the
+        // ratchet's model-side enabler).
+        const remainingNote =
+            r.remainingPending !== undefined
+                ? ` ${r.remainingPending} tokens of the offered ranges remain unfolded — include them in your next compress call.`
+                : "";
+        let msg = `[Compressed ${effectiveDetail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${remainingNote}${warn}${applyErrorNote(r)}]`;
         // 2026-11-18 (owner): receipts are the only system lines that quote
         // user speech (Last-user anchor / summary content) yet carry NO <acp>
         // time tag on the wire — a weak model cannot tell when a fold happened
