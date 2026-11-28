@@ -195,8 +195,9 @@ type LogFn = (level: "info" | "warn", message: string) => void;
 
 /** Evaluate one prepared round. Pure w.r.t. inputs; mutates only the WeakMap
  * counters and (on transitions) session.metadata.selfHeal. Called once per
- * HTTP request after prepare (nudge-carrying rounds only — bypass lanes
- * never reach it). */
+ * HTTP request after prepare, on EVERY main round — the kernel emits a
+ * NudgeDecision whether it injects or not (#4578); bypass lanes leave nudge
+ * undefined and never reach it. */
 export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInputs, log: LogFn): void {
     const st = counters.get(session) ?? { lastReductionKey: undefined, zombieStreak: 0, idleStreak: 0 };
     counters.set(session, st);
@@ -237,18 +238,23 @@ export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInp
     }
 
     const pluginBound = typeof session.metadata["pluginAgent"] === "string";
-    // Streaks advance only on rounds that actually carried a nudge — an idle
-    // session (no traffic, side requests) must not accumulate zombie credit,
-    // and a reduction or an agent-side tool use always resets both streaks.
-    if (inputs.nudgeActive) {
-        const zombieSignal = pluginBound && !inputs.pluginHeaderPresent && !inputs.biliToolsDeclared;
-        if (reduction || inputs.biliToolUses > 0) {
-            st.zombieStreak = 0;
-            st.idleStreak = 0;
-        } else {
-            st.idleStreak += 1;
-            st.zombieStreak = zombieSignal ? st.zombieStreak + 1 : 0;
-        }
+    // #4578: the IDLE streak counts IGNORED nudges, so its reset is NOT
+    // gated on the nudge — this hook runs on every main round (the kernel
+    // emits a NudgeDecision whether it injects or not), and a fold lands
+    // BETWEEN injections, first observed by an ordinary round. Old code
+    // consumed that reduction without resetting, so every 5th INJECTED
+    // nudge armed suppression regardless of intervening compressions.
+    // Evidence resets whenever seen; only nudge-carrying rounds earn idle
+    // credit (an idle session must not accrue it). Zombie credit stays
+    // nudge-gated: a dead lane surviving on preflight refolds must still
+    // degrade.
+    const zombieSignal = pluginBound && !inputs.pluginHeaderPresent && !inputs.biliToolsDeclared;
+    if (reduction || inputs.biliToolUses > 0) {
+        st.idleStreak = 0;
+        if (inputs.nudgeActive) st.zombieStreak = 0;
+    } else if (inputs.nudgeActive) {
+        st.idleStreak += 1;
+        st.zombieStreak = zombieSignal ? st.zombieStreak + 1 : 0;
     }
 
     if (selfHealOf(session) !== undefined) return;
