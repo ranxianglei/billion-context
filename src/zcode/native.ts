@@ -28,7 +28,7 @@ import {
 } from "./json-edit.js";
 
 const SIGNING_BLOCK_MESSAGE =
-    'zcode v3.14+ client signing (#1621) rejects the http://127.0.0.1 /bili/ origin at model creation ("Client signing handshake requires HTTPS.") — skipping native routing; provider store left untouched. For compression on this build use the GUI cert-MITM setup (Settings → Network: HTTP proxy + root CA path).';
+    'zcode v3.14+ client signing (#1621) rejects the http://127.0.0.1 /bili/ origin at model creation ("Client signing handshake requires HTTPS.") — skipping native routing; provider store left untouched. For compression on this build use the GUI cert-MITM setup (Settings → Network: HTTP proxy + combined CA path).';
 
 type ZcodeNativePlan =
     | { readonly mode: "off" }
@@ -200,7 +200,7 @@ function logNoRouteNextSteps(opts: {
 }): void {
     const { kind, dataDir, env, origin, policy, skipped, log } = opts;
     if (skipped.length > 0 && skipped.every((s) => s.reason.includes("#1621"))) {
-        log("every provider rule you defined is a v3.14+ client-signing coding-plan account (#1621); native URL-rewriting cannot compress them — use the cert-MITM path (Settings → Network: HTTP proxy + root CA path), the documented #1621 workaround (confirm it on your build/account).");
+        log("every provider rule you defined is a v3.14+ client-signing coding-plan account (#1621); native URL-rewriting cannot compress them — use the cert-MITM path (Settings → Network: HTTP proxy + combined CA path), the documented #1621 workaround (confirm it on your build/account).");
         return;
     }
     if (skipped.length === 0) {

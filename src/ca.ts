@@ -47,9 +47,11 @@ const secureContextCache = new Map<string, tls.SecureContext>();
 // to MITM-whitelisted hosts, so this stays small in practice. LRU via Map order.
 const SECURE_CONTEXT_CACHE_MAX = 64;
 
-/** Path to the PEM-encoded root CA certificate. Clients that support a proxy
- *  CA override (ZCode httpProxyCaCertPath → NODE_EXTRA_CA_CERTS) point at this
- *  file so they trust the dynamically-signed host certs. */
+/** Path to the PEM-encoded root CA certificate. Append-semantics consumers
+ *  (NODE_EXTRA_CA_CERTS in the pi/omp/opencode launchers) point at this file so
+ *  they trust the dynamically-signed host certs. Replace-semantics fields — a
+ *  GUI "proxy CA path" that swaps the whole trust store, or SSL_CERT_FILE & co. —
+ *  must point at combinedCaPath() instead, or non-MITM fetches break (#152/#1807). */
 export function rootCaPath(): string {
     return path.join(caDir(), ROOT_CERT_FILE);
 }
