@@ -202,6 +202,10 @@ function makeCtx(id: string, messages: CoreMessage[]) {
     return {
         core: createCore(),
         config: { modelContextLimit: 200000 } as Config,
+        // The loop subtests assert the draft-tail retry DECISION (#2612 guard
+        // vs #2303 protection); arm the opt-in switch (default OFF) so they
+        // exercise the guard instead of the default pass-through.
+        degenerateRetry: true,
         messages,
         session: {
             id,

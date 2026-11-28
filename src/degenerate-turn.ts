@@ -52,7 +52,8 @@ export function degenerateTurnWarning(o: TurnOutcome): string | null {
     }
     return (
         `[degenerate-turn] ${o.wire}: turn ended ${o.terminalReason} with zero visible text and zero tool calls (${bits.join("; ")}) ` +
-        `— the agent receives an empty turn and may stall until nudged (#673)`
+        `— the agent receives an empty turn and may stall until nudged (#673). ` +
+        `Pass-through is the default; enable degenerateRetry: true / BILI_DEGENERATE_RETRY=1 to auto-retry once with a continuation nudge`
     );
 }
 

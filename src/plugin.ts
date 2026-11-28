@@ -3168,7 +3168,7 @@ export async function pipePluginChatWithStrip(
      *  (#2171) no longer shares this budget — each retry kind keeps its own
      *  one-shot, so a turn may spend one of each. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
-        if (refetch === undefined || maxDegenerateRetries === 0) return false;
+        if (maxDegenerateRetries === 0) return false;
         // #2303: a terminal turn whose visible prose ends with a compression-draft
         // closing tag and no tool call is non-converged even though it has visible
         // text — the model wrote a handoff/compression draft in prose instead of
@@ -3198,6 +3198,16 @@ export async function pipePluginChatWithStrip(
         // retry byte-for-byte, so a delivered answer is never duplicated.
         const answerChars = answerProse.trim().length;
         if (!stalledTail && (answerChars > 0 || sawToolUse)) return false;
+        if (refetch === undefined) {
+            // The continuation retry is not armed on this lane (degenerateRetry
+            // default-off, or a plain pass-through caller): the empty turn passes
+            // through unchanged. Leave a trace so "the model replied nothing" is
+            // diagnosable from the log instead of reading as an idle session.
+            if (reason !== undefined && CLEAN_TURN_REASONS.has(reason)) {
+                log?.("[plugin] degenerate terminal turn (no visible output); continuation retry not armed on this lane — pass through unchanged (enable with degenerateRetry: true / BILI_DEGENERATE_RETRY=1)");
+            }
+            return false;
+        }
         if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) {
             if (!sawToolUse && !stalledTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (finish ${reason ?? "none"} is not a clean stop): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
             return false;
@@ -4986,8 +4996,7 @@ export async function pipePluginResponsesWithStrip(
         // #7666: budget is the configured degenerate count, NOT a shared
         // stream-level one-shot — the truncation re-issues keep their own
         // budget (see the chat-pipe twin).
-        if (refetch === undefined || maxDegenerateRetries === 0) return false;
-        if (degenerateRetries >= maxDegenerateRetries) return false;
+        if (maxDegenerateRetries === 0 || degenerateRetries >= maxDegenerateRetries) return false;
         // #2303: same shape as the chat-pipe twin — visible prose ending in a
         // compression-draft closing tag with no function call is non-converged.
         // #2612: except when the request itself demands that shape (client
@@ -5005,6 +5014,14 @@ export async function pipePluginResponsesWithStrip(
         // Real answer text still refuses the retry byte-for-byte.
         const answerChars = answerProse.trim().length;
         if (!stalledTail && (answerChars > 0 || sawFunctionCall)) return false;
+        if (refetch === undefined) {
+            // Same as the chat-pipe twin: retry not armed on this lane — leave
+            // a trace, then pass the empty turn through unchanged.
+            if (status === "completed") {
+                log?.("[plugin] degenerate terminal turn (no visible output); continuation retry not armed on this lane — pass through unchanged (enable with degenerateRetry: true / BILI_DEGENERATE_RETRY=1)");
+            }
+            return false;
+        }
         if (status !== "completed") {
             if (!sawFunctionCall && !stalledTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (status ${status ?? "none"} is not completed): visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars} (#2756)`);
             return false;

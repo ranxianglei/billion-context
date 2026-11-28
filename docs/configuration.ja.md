@@ -114,6 +114,7 @@
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude Code サブエージェントは、メインセッションのキューに並ぶ代わりに、独自のセッション名前空間（<session>\|sub:<agent-id>）を取得します。Anthropic-wire 専用 — Responses wire ではこのスイッチは no-op です（`subagentSplit` / BOTH-mechanisms スコープ注記を参照）。 |
 | `personaSplit` | boolean | true | BILI_PERSONA_SPLIT | 指示テキストが変更され、かつ受信履歴が追跡中のチェーンを継続していない場合、指示フィンガープリントでキー付けされた Responses-wire レーンを分割します（Claude Code の /v1/responses 経由; Codex ルートスレッド / 旧ビルド）。デフォルトで有効。環境変数 BILI_PERSONA_SPLIT=0 または personaSplit: false で無効化可能（環境変数が優先）。 |
 | `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | 匿名フォークは、フォークされたリクエストにソースコンテンツが完全に存在する親の圧縮ブロックを継承します。 |
+| `degenerateRetry` | boolean | false | BILI_DEGENERATE_RETRY | エージェント向けプラグイン/プロキシレーンでの opt-in 退化ターン継続リトライ（#732/#821/#2303）：ターンがゼロの可視出力で終わった場合、中立的な継続ナッジを付加してエージェント自身のリクエストを一度だけ再発行します。リトライ後も空だった場合はインバンドで #870 エラーで終了します。圧縮ループ内部のリトライは影響を受けません。degenerateRetry: true または環境変数 BILI_DEGENERATE_RETRY=1 で有効にします。 |
 | `autoModeForge.enabled` | boolean | true | BILI_AUTO_MODE_FORGE | Claude Code の自動モードのセーフティ分類器呼び出しを、上流へ転送する代わりに、偽造された許可判定でローカルに回答します（#2740）：そのレーンでは送信ゼロ、課金ゼロ。すべての偽造判定は監査ログに記録され、セッションには通知バッジが付与されます。false / 環境変数 0 で、実際の判定料金を支払うユーザー向けに純粋なパススルーに戻ります。 |
 | `affinitySimhash` | boolean | true | BILI_AFFINITY_SIMHASH | 匿名クライアント向けの Simhash チェーン整合性採用（#2265）：クライアント側の普遍的な装飾的書き換え（例：Trae がすべてのアシスタントメッセージにモデルタグを再スタンプする）が発生した場合、ゼロから新規発行して再折りたたむ代わりに、既存のセッションとその圧縮状態を再アタッチします。 |
 | `resumeInheritance` | boolean | true | BILI_RESUME_INHERITANCE | 新しいセッション ID で再開する識別済みクライアントは、親の ref 割り当てと完全に存在する圧縮ブロックを継承します。 |
@@ -1988,6 +1989,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
+| `BILI_DEGENERATE_RETRY` | `degenerateRetry` | false |
 | `BILI_DEGENERATE_TURN` | `compat.degenerateTurn` | error |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |
 | `BILI_DSH_CONTEXT_TAB` | `dsh.contextTab` | true |
