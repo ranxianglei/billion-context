@@ -701,9 +701,25 @@ the four have a base-URL env hook; one doesn't:
    `daily-cloudcode-pa.googleapis.com` (Antigravity's real default endpoint;
    the bare `cloudcode-pa` name 400s on `/v1internal:*`, #3129) to
    `"mitm".domains` and trust bili's root CA.
-  The desktop app and the IDE extension share this same language_server
-  channel; the launcher drives the CLI specifically — desktop users can export
-  `CLOUD_CODE_URL` manually or use the MITM recipe.
+   The desktop app and the IDE extension share this same language_server
+   channel; `bili antigravity-desktop` (#4675) drives the desktop binary
+   through the identical lane (below).
+- **`bili antigravity-desktop`** — Google Antigravity **Desktop** (the IDE
+  app) (#4675). The desktop app spawns the *same* Go `language_server` as
+  `agy` and honors the identical `CLOUD_CODE_URL` hook, so this launcher
+  reuses the exact same env lane as `bili antigravity` — it only changes which
+  binary is spawned. It probes the standard desktop install paths (Windows
+  `%LOCALAPPDATA%\Programs\antigravity\Antigravity.exe`, then
+  `%PROGRAMFILES%\antigravity\Antigravity.exe`; macOS
+  `/Applications/Antigravity.app/Contents/MacOS/Antigravity`; Linux
+  `/usr/bin/antigravity`, then `~/.local/share/antigravity/antigravity`), and
+  a `--bin`/`BILI_CLIENT_BIN` override wins for custom locations. The desktop
+  is a single-instance app: if one is already running, the new process just
+  focuses the existing window and exits (which tears down the launcher's
+  proxy) — close any open Antigravity window first. To attach a
+  manually-started instance to a running `bili start` daemon instead:
+  `export CLOUD_CODE_URL="http://localhost:8787/bili/https://daily-cloudcode-pa.googleapis.com"`
+  and launch the app from that shell (or use the MITM recipe above).
 
 None of the four has a native mode: none exposes an in-loop tool injection
 seam (gemini-cli extensions reach custom commands only; the forks inherit

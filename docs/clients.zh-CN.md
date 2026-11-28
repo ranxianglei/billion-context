@@ -79,8 +79,21 @@
    language_server 遵循 `HTTPS_PROXY` 且不锁定证书,把
    `daily-cloudcode-pa.googleapis.com`(Antigravity 真实默认端点;裸
    `cloudcode-pa` 名称在 `/v1internal:*` 上 400,#3129)加进 `"mitm".domains`
-   并信任 bili 根 CA 即可。桌面端与 IDE 扩展共用同一条 language_server 通道;启动器只驱动
-  CLI —— 桌面用户可手动导出 `CLOUD_CODE_URL`,或直接用上面的 MITM 配方。
+   并信任 bili 根 CA 即可。桌面端与 IDE 扩展共用同一条 language_server 通道;
+   `bili antigravity-desktop`(#4675)通过完全相同的 lane 驱动桌面二进制(见下)。
+ - **`bili antigravity-desktop`** —— Google Antigravity **桌面端**(IDE 应用)
+   (#4675)。桌面端启动的 Go `language_server` 与 `agy` 完全相同,遵循同一个
+   `CLOUD_CODE_URL` 钩子,因此该启动器复用 `bili antigravity` 完全相同的环境
+   lane —— 只是换掉被启动的二进制。它探测标准桌面安装路径(Windows 为
+   `%LOCALAPPDATA%\Programs\antigravity\Antigravity.exe`,其次
+   `%PROGRAMFILES%\antigravity\Antigravity.exe`;macOS 为
+   `/Applications/Antigravity.app/Contents/MacOS/Antigravity`;Linux 为
+   `/usr/bin/antigravity`,其次 `~/.local/share/antigravity/antigravity`);自定义
+   位置用 `--bin`/`BILI_CLIENT_BIN` 覆盖优先。桌面端是单实例应用:若已有实例在
+   运行,新进程只会聚焦已有窗口后退出(从而拆掉启动器的代理)—— 先关闭已打开的
+   Antigravity 窗口。若要把手动启动的实例挂到运行中的 `bili start` 守护进程上:
+   `export CLOUD_CODE_URL="http://localhost:8787/bili/https://daily-cloudcode-pa.googleapis.com"`,
+   再从该 shell 启动应用(或用上面的 MITM 配方)。
 
 四者都没有 native 模式:均无环内工具注入接缝(gemini-cli 扩展只到自定义命令,
 fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>/` 下的

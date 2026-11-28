@@ -88,6 +88,7 @@ Usage:
   bili iflow [opts --] [args]      start a proxy + launch iFlow CLI against it (IFLOW_BASE_URL /bili/ rewrite)
   bili qwen [opts --] [args]       start a proxy + launch Qwen Code against it (cert-MITM)
   bili antigravity [opts --] [args] start a proxy + launch Antigravity CLI (agy) against it (CLOUD_CODE_URL /bili/ rewrite)
+  bili antigravity-desktop [opts --] [args] start a proxy + launch Antigravity Desktop (IDE) against it (same CLOUD_CODE_URL lane; probes desktop install paths)
   bili mcode [opts --] [args]      start a proxy + launch MiniMax Code against it (cert-MITM)
   bili aider [opts --] [args]      start a proxy + launch aider against it (cert-MITM)
   bili copilot [opts --] [args]    start a proxy + launch Copilot CLI against it (cert-MITM)
@@ -174,7 +175,7 @@ Usage:
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili mcode / bili aider / bili copilot / bili amp / bili crush / bili zed / bili goose / bili kiro):
+Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili antigravity-desktop / bili mcode / bili aider / bili copilot / bili amp / bili crush / bili zed / bili goose / bili kiro):
   Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
@@ -202,6 +203,7 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili iflow                            # launch iFlow CLI through the proxy (IFLOW_BASE_URL /bili/ rewrite of apis.iflow.cn/v1)
     bili qwen                             # launch Qwen Code through the proxy (cert-MITM; DashScope/Qwen gateways whitelisted by default, custom relays via --mitm-domain)
     bili antigravity                      # launch Antigravity CLI (agy) through the proxy (CLOUD_CODE_URL /bili/ rewrite of daily-cloudcode-pa.googleapis.com — real default upstream, #3129)
+    bili antigravity-desktop              # launch Antigravity Desktop (IDE) through the proxy (same CLOUD_CODE_URL lane as the CLI; probes standard desktop install paths, #4675)
     bili mcode                            # launch MiniMax Code through the proxy (cert-MITM; provider hosts from ~/.minimax*/config.yaml or the official agent.minimax.* endpoints)
     bili aider                            # launch aider through the proxy (cert-MITM; endpoint from OPENAI_API_BASE/--openai-api-base/.aider.conf.yml or api.openai.com+api.anthropic.com by default)
     bili copilot                          # launch Copilot CLI through the proxy (cert-MITM; api.githubcopilot.com + plan subdomains whitelisted by default)

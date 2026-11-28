@@ -171,7 +171,7 @@ import { conflictRemediation } from "./conflict-watch.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "zed", "goose", "antigravity", "kiro", "pi-test", "pi-inline", "opencode-inline"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "zed", "goose", "antigravity", "antigravity-desktop", "kiro", "pi-test", "pi-inline", "opencode-inline"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
 type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "crush" | "zed" | "goose" | "antigravity" | "kiro";
 
@@ -395,7 +395,10 @@ export function isLaunchClient(value: string): value is ClientName {
 }
 
 export function baseClientName(client: ClientName): BaseClientName {
-    return client === "pi-test" || client === "pi-inline" ? "pi" : client === "opencode-inline" ? "opencode" : client;
+    return client === "pi-test" || client === "pi-inline" ? "pi"
+        : client === "opencode-inline" ? "opencode"
+        : client === "antigravity-desktop" ? "antigravity"
+        : client;
 }
 
 /** `pi-test` injects `--no-extensions` so the billion-context-pi client extension doesn't double-compress alongside the proxy. */
@@ -6866,10 +6869,34 @@ function probeInstalledBin(base: string, exts: readonly string[]): string {
     return base;
 }
 
+// #4675: ordered candidate install locations for the Antigravity Desktop app
+// (per the issue report). The desktop IDE spawns the same Go language_server as
+// the agy CLI, so the CLOUD_CODE_URL lane is identical — only the binary path
+// differs. First existing candidate wins.
+function antigravityDesktopCandidates(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string[] {
+    const home = os.homedir();
+    if (platform === "win32") {
+        const localAppData = env.LOCALAPPDATA ?? path.join(home, "AppData", "Local");
+        const programFiles = env.PROGRAMFILES ?? "C:\\Program Files";
+        return [
+            path.join(localAppData, "Programs", "antigravity", "Antigravity.exe"),
+            path.join(programFiles, "antigravity", "Antigravity.exe"),
+        ];
+    }
+    if (platform === "darwin") {
+        return [path.join("/Applications", "Antigravity.app", "Contents", "MacOS", "Antigravity")];
+    }
+    return [
+        "/usr/bin/antigravity",
+        path.join(home, ".local", "share", "antigravity", "antigravity"),
+    ];
+}
+
 export function resolveClientCommand(
     client: ClientName,
     env: NodeJS.ProcessEnv,
     platform: NodeJS.Platform = process.platform,
+    opts?: { desktop?: boolean },
 ): { command: string; prefixArgs: string[] } {
     const binOverride = env.BILI_CLIENT_BIN?.trim();
     if (binOverride) {
@@ -6922,6 +6949,23 @@ export function resolveClientCommand(
         return { command: probeInstalledBin(binBase, platform === "win32" ? [".cmd", ".bat", ".exe", ""] : [""]), prefixArgs: [] };
     }
     if (client === "antigravity") {
+        if (opts?.desktop) {
+            // #4675: the desktop IDE (+ its IDE extension) spawns the same closed
+            // Go language_server as the agy CLI and honors the same CLOUD_CODE_URL
+            // env override — the env lane is identical (buildAntigravityEnv); only
+            // the launched binary differs. Probe the standard desktop install
+            // locations (first existing wins; the bare first candidate is the
+            // ENOENT fallback so a clean error names the expected path).
+            const candidates = antigravityDesktopCandidates(env, platform);
+            for (const c of candidates) {
+                if (fs.existsSync(c)) return { command: c, prefixArgs: [] };
+            }
+            console.error(
+                "bili: no Antigravity Desktop install found (looked at: " + candidates.join(", ") +
+                "). Pass --bin /path/to/Antigravity to launch a custom location.",
+            );
+            return { command: candidates[0], prefixArgs: [] };
+        }
         // #2115: the CLI binary is named `agy` (Gemini CLI successor), not
         // `antigravity`; install.sh places it at ~/.local/bin/agy (Windows:
         // %LOCALAPPDATA%\agy\bin\agy.exe).
@@ -7881,7 +7925,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         }
     }
 
-    const { command, prefixArgs } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
+    const { command, prefixArgs } = resolveClientCommand(
+        base,
+        process.env,
+        deps.platform ?? process.platform,
+        { desktop: params.client === "antigravity-desktop" },
+    );
     const effectiveClientArgs = piTestArgs(params.client, clientArgs);
     let code = 0;
     try {
