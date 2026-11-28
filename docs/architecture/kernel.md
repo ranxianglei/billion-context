@@ -15,6 +15,7 @@ The decision core of the whole product: given canonical cores plus the session's
 - **Message ids are never reused.** A content-hash id and a ref number (`mNNNNN`) denote exactly one message forever, even after it dies — the model can cite any number it has ever seen.
 - **Lossless round-trip; protected-tool hard exclusion; canonical node order.** Structural invariants, human-gated.
 - **Human-only review, always.** Any `kernel/**` change sits at the same tier as `src/update.ts`: no auto-merge, ever; PR body must declare `kernel-change: <reason>` (CI `kernel-guard`).
+- **Diagnostics ride an injected sink, never the process console (#7791).** The core stays I/O-free, so mid-turn diagnostics (screen-drop budget, config validation) reach the host through `Ports.warn` — default `console.warn` for CLI lanes, `src/kernel-warn-channel.ts` for bili's: inline lanes write bili.log only (in an embedded host, stderr IS the TUI), server lanes go through the tee logger.
 
 ## How it works
 

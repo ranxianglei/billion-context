@@ -50,6 +50,8 @@ import {
   mergeRangesToThreshold,
   screenRecommendedUnits,
   warnScreenDrop,
+  consoleWarnSink,
+  type WarnSink,
 } from "./recommend.js";
 import {
   runPipeline,
@@ -75,6 +77,16 @@ import type {
 
 export interface Ports {
   countTokens?: (text: string) => number;
+  /** #7791: durable sink for the kernel's own mid-turn diagnostics (screen
+   *  funnel drops, config-validation warnings). The kernel stays I/O-free, so
+   *  it used to reach the outside world through `console.warn` — and hosts
+   *  that EMBED the kernel inside an interactive agent process (pi/omp/dsh
+   *  inline lanes) have that console write land on the host TUI terminal,
+   *  appending kernel diagnostics to the input-box line (#2827/#5706/#5940
+   *  are the same defect class from other sources). Hosts now inject a sink
+   *  and route these lines into their own durable log. Omitted = legacy
+   *  `console.warn` (CLI hosts, tests) — byte-identical to pre-#7791 output. */
+  warn?: (message: string) => void;
   /** #4313 (toggle, PR #5236): enable immutable message timestamps — first-
    *  sight stamp minting into state.tsStamps and the <acp> tag's time
    *  attribute on the render node. Default false: neither runs, so a
@@ -345,6 +357,10 @@ function applyRefolds(input: {
 
 export function createCore(ports: Ports = {}): CompressionCore {
   const countTokens = ports.countTokens ?? defaultCountTokens;
+  // #7791: one diagnostic sink per core. Hosts that embed the kernel inside an
+  // interactive agent process inject their durable-log writer here; everything
+  // else keeps the byte-identical `console.warn` behavior.
+  const warn: WarnSink = ports.warn ?? consoleWarnSink;
   // #4313 toggle: single gate for both pipeline nodes (stamp + render);
   // captured once per core so every lane built from this core agrees.
   const timestampsOn = ports.timestamps === true;
@@ -1034,7 +1050,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
   function processTurn(input: ProcessTurnInput): ProcessTurnResult {
     const configErrors = validateConfig(input.config);
     if (configErrors.length > 0) {
-      console.warn(
+      warn(
         `[acp-kernel] Config validation warnings: ${configErrors.join("; ")}. Thresholds may not fire correctly.`,
       );
     }
@@ -1166,7 +1182,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
       filterNode,
       hideCompressCallsNode,
       viewLatchNode,
-      recommendNode,
+      createRecommendNode(warn),
       nudgeNode,
       emergencyTruncateNode,
     ];
@@ -1479,7 +1495,7 @@ const hideCompressCallsNode: PipelineNode = {
   },
 };
 
-const recommendNode: PipelineNode = {
+const createRecommendNode = (warn: WarnSink): PipelineNode => ({
   name: "recommend",
   run(io, ctx) {
     const protectedRefs = computeProtectedRefs(
@@ -1509,15 +1525,17 @@ const recommendNode: PipelineNode = {
     // alone passed turns whose partners sit in another advertised unit, so
     // every submission of such a range threw (permanent advertise/reject
     // loop in production).
+    const mergedUnits = mergeRangesToThreshold(
+      contextRanges.compressible,
+      ctx.config.compress.minCompressRange,
+    );
     const recommendedRanges = screenRecommendedUnits(
-      mergeRangesToThreshold(
-        contextRanges.compressible,
-        ctx.config.compress.minCompressRange,
-      ),
+      mergedUnits,
       screenArray,
       io.state,
       ctx.config,
       computeProtectedRefs(screenArray, io.state, ctx.config, ctx.countTokens),
+      warn,
     );
     // Production 2026-11-09 mega-turn incident: the funnel can zero out BELOW
     // the "nothing compressible" level — segments exist and hold messages, but
@@ -1526,14 +1544,22 @@ const recommendNode: PipelineNode = {
     // counts collectible material ("collectible>0 yet ranges=0" was
     // undiagnosable from the host side for a full night). Warn (budgeted)
     // with the stage-by-stage numbers so the killing stage is named directly.
-    if (contextRanges.compressible.length > 0 && recommendedRanges.length === 0) {
+    // #7791: only an UNEXPLAINED zeroing is a diagnostic. When no segment clears
+    // the merge gate there is nothing to advertise and "host sees no-ranges" is
+    // the correct, everyday outcome of a short conversation — warning there made
+    // every ordinary turn of every short session emit an [acp-kernel] line (the
+    // field report: the pi TUI printed it several times per user turn). The
+    // incident this channel exists for is the opposite shape: units that DID
+    // clear the gate and then died at the screen.
+    if (mergedUnits.length > 0 && recommendedRanges.length === 0) {
       const segMsgs = contextRanges.compressible.reduce((s, r) => s + r.count, 0);
       const minChars = ctx.config.compress.minCompressRange;
       const subGate = contextRanges.compressible.filter(
         (r) => (r.chars ?? r.tokens * 4) < minChars,
       ).length;
       warnScreenDrop(
-        `funnel zeroed with material present: segments=${contextRanges.compressible.length} (${segMsgs} msgs, ${subGate} below ${minChars}-char merge gate) → all died at merge/screen; host sees no-ranges`,
+        warn,
+        `funnel zeroed with material present: segments=${contextRanges.compressible.length} (${segMsgs} msgs, ${subGate} below ${minChars}-char merge gate) → ${mergedUnits.length} merged unit(s) cleared the gate but died at screen; host sees no-ranges`,
       );
     }
     const recommendation: Recommendation = {
@@ -1543,7 +1569,7 @@ const recommendNode: PipelineNode = {
     };
     return { ...io, effects: { ...io.effects, recommendation } };
   },
-};
+});
 
 const nudgeNode: PipelineNode = {
   name: "nudge-inject",

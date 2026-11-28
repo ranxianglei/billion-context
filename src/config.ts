@@ -1023,8 +1023,9 @@ export type ProxyOptions = {
     upstream: string;
     /** #4571: set by the inline lane at boot (startInlineEngine) — true when
      *  these options belong to the in-process engine instead of a spawned
-     *  proxy server. Display-only downstream (the status panel appends
-     *  " · inline"), never read for control flow. */
+     *  proxy server. Downstream: the status panel appends " · inline", and
+     *  #7791 picks the kernel's diagnostic sink (inline → bili.log only,
+     *  server → tee logger). */
     inlineLane?: boolean;
     routes: ProviderRoutes;
     /** #1295: declared custom-wire model endpoints — the single source of

@@ -64,14 +64,6 @@ export const EXCEPTIONS: readonly SubsetException[] = [
       "#4313: first-sight message ts minted once per id (state.tsStamps, never overwritten). Wall-clock input only — the same stored value renders byte-identically forever, so no verified cache/coverage invariant reads this call's result. Same treatment class as createdAt above.",
   },
   {
-    file: "kernel/src/compress.ts",
-    code: "ENV_ACCESS",
-    fn: "processTurn",
-    detail: "console.warn",
-    reason:
-      "Log-only console.warn on a degraded path; modeled as a no-op observation point — never influences verified state.",
-  },
-  {
     file: "kernel/src/render-refs.ts",
     code: "DYNAMIC_REGEX",
     reason:
