@@ -163,11 +163,13 @@ test("#1321: --upstream mode caps tier-gated claude at the standard window witho
     setRegistryForTest(bundledRegistryForTestsOnly()!);
     const rig = await startRig();
     try {
-        // claude-opus-5 is 1M in the snapshot, but a plain request carries no
-        // tier evidence (context-Nm beta header / [Nm] suffix) — the client's
-        // plan serves the standard 200K, so the advertised max is capped
-        // (#1321). Variant normalization (Fix 3) still applies before the cap.
-        for (const model of ["claude-opus-5", "claude-opus-5-thinking"]) {
+        // claude-sonnet-4-6 is 1M in the snapshot, but a plain request carries
+        // no tier evidence (context-Nm beta header / [Nm] suffix) — the
+        // client's plan serves the standard 200K, so the advertised max is
+        // capped (#1321). It is a genuinely beta-gated 4.x id (not on the
+        // #6433 1M-native line), so the cap still applies; variant
+        // normalization (Fix 3) still applies before the cap.
+        for (const model of ["claude-sonnet-4-6", "claude-sonnet-4-6-thinking"]) {
             const sid = `tier-${model}`;
             const r = await fetch(`http://127.0.0.1:${rig.proxyPort}/v1/messages`, {
                 method: "POST",
@@ -184,7 +186,7 @@ test("#1321: --upstream mode caps tier-gated claude at the standard window witho
         const r = await fetch(`http://127.0.0.1:${rig.proxyPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": sid, "x-bili-plugin": "test-agent", "anthropic-beta": "context-1m-2025-08-07" },
-            body: body("claude-opus-5"),
+            body: body("claude-sonnet-4-6"),
         });
         assert.equal(r.status, 200);
         await r.text();

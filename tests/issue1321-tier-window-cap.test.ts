@@ -15,7 +15,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
 
 // #1321 (from #1310 item 2): models.dev advertises the MAX window a tier-gated
-// model id can serve (anthropic/claude-opus-5-5 → 1,000,000), but a plain
+// model id can serve (anthropic/claude-sonnet-4-5 → 1,000,000), but a plain
 // subscription serves the STANDARD 200K until the client negotiates otherwise
 // (context-Nm beta header / [Nm]-suffixed model name). The warm registry peek
 // outranks the built-in table by design (#344 fresher-source-wins), so without
@@ -25,8 +25,13 @@ import { listSessions } from "../src/session.ts";
 // standard window for tier-gated families when the request carries no tier
 // evidence; operator sources stay exempt and other families keep
 // fresher-source-wins (#344/#852).
+//
+// #6433: the canonical beta-gated model here is claude-sonnet-4-5 (4.x line,
+// 1M still requires the context-Nm beta). The original example claude-opus-5-5
+// is now 1M-NATIVE (no beta needed) and moved to the #6433 regression test —
+// keeping it here would assert a stale 200K-standard premise.
 
-const MODEL = "claude-opus-5-5"; // 200K standard; models.dev advertises 1M
+const MODEL = "claude-sonnet-4-5"; // 200K standard (beta-gated); models.dev advertises 1M
 const ONE_M = 1_000_000;
 const BETA = "context-1m-2025-08-07";
 const MEASURED = 261_206; // ~261K input from the #1310 log evidence
@@ -158,9 +163,9 @@ test("#1321: expandedContextSuffixWindow parses trailing [Nm] tier markers", () 
 // --- Unit: tier-gated standard window ---
 
 test("#1321: tierGatedStandardWindow returns the built-in window for claude only", () => {
-    assert.equal(tierGatedStandardWindow("claude-opus-5-5"), 200_000);
+    assert.equal(tierGatedStandardWindow("claude-sonnet-4-5"), 200_000);
     assert.equal(tierGatedStandardWindow("CLAUDE-SONNET-X"), 200_000, "case-insensitive");
-    assert.equal(tierGatedStandardWindow("anthropic/claude-opus-5"), 200_000, "prefixed id falls back to the basename");
+    assert.equal(tierGatedStandardWindow("anthropic/claude-sonnet-4"), 200_000, "prefixed id falls back to the basename");
     assert.equal(tierGatedStandardWindow("my-claude"), undefined, "^-anchored family match");
     assert.equal(tierGatedStandardWindow("gpt-5"), undefined, "non-tier-gated family stays uncapped (#344)");
     assert.equal(tierGatedStandardWindow("deepseek-v4"), undefined);
