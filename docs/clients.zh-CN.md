@@ -24,6 +24,22 @@
 
 **宿主侧上下文计量与模型实际视图按设计不一致(#2837):**plugin 模式下宿主本地持久会话日志有意保持无损 —— 完整未折叠历史会因前缀缓存与严格回显而重发(见 technical-notes.md「两种压缩模式」)。因此宿主或其插件从该本地日志算出的任何计量,量的都是**未折叠的本地表面**,而不是下一次请求实际携带的量;压缩生效期间本地数字远高于真实输入属预期,不是压缩卡死。有效尺寸以代理为准:读 `/acp`(或 `GET /__bili/plugin/status` 的 `contextTokens`,来源见 `contextTokensSource`),不要本地重新推算。
 
+**长会话会撞上一堵没有任何自动恢复能触及的墙(#5058)。** plugin 模式下 dsh 自己保留一份完整的本地会话日志,dsh 发送前的超窗守卫量的是**这份本地日志** —— 不是 bili 渲染上线的内容。bili 持有泳道期间 dsh 原生压缩按设计撤下(见上),于是长寿命会话(几百轮、跨天,例如 QQ 桥接陪伴)的本地日志一路涨到超过模型窗口;此后 dsh 在**发送前**拒绝每一条请求。没有 provider 报错,dsh 自己的 overflow 恢复(等 provider 回 `CONTEXT_WINDOW_EXCEEDED`)永远等不到信号;又因为什么都没发出去,bili 也收不到任何流量:nudge 驱动的压缩、手动 `/compact`、以及一切以 provider 错误为触发条件的宿主侧兜底全部够不着。会话从此永久不可用,唯一出路是删掉重建 —— 对陪伴类场景这意味着对话记忆清零,所以**持久记忆要放在上下文之外**(角色卡、日记、记忆文件)。报告案例里本地日志涨到 30 MB / 24,051 条事件,而整条生命周期内 dsh 原生压缩一次都没跑过。一点澄清:压缩动作在**模型侧**的开销是有界的 —— 重发的 compress 调用在线上被截成每段约 200 字符 —— 无界增长的是宿主的本地存储。
+
+已知拒发文案(供宿主侧检测正则使用,#5058 报告时的版本):
+
+> payload core text alone is ~… bytes … that is >= ~… tokens vs the model
+> window …; no upstream can accept it, so it was NOT forwarded even for
+> evidence.
+
+陪伴类 / 常驻会话的缓解手段:
+
+- **定期换会话**(例如每天一次),持久记忆放文件里,不押在上下文长度上。
+- **调大 `compress.nudgeGrowthTokens`**(如 `500000`)或对这类会话直接关掉 nudge,别让压缩节奏追着会话自身的增长跑。
+- **盯会话文件大小**(`~/.dsh/sessions/…/session.v4.jsonl.zstd`)—— 压缩后几个 MB 就是预警,远早于窗口撑满。
+- 本构建起 bili 的**净进展守卫**会在连续折叠不再缩小会话时停发压缩 nudge(Web UI 徽标 "swelling"、代理日志 `[net-progress]` 行、10 分钟墙钟上限)。它打断的是压缩动作自我放大的正反馈,不能替 dsh 裁剪本地存储。
+- 逐会话「仅传输不压缩」设置见 [#5052](https://github.com/ranxianglei/billion-context/issues/5052)。
+
 **dsh-go 宿主(第三方安卓 App):** 该 App(`ccch1mneyyy/dsh-Go`)自带一套 dsh 运行时 —— proot rootfs 里的 dsh `0.2.2-rc.1` / node 24.22.1 / Ubuntu 24.04.5,每次 App 更新替换约 135 个 dsh 文件。上面的 profile 泳道在这里原样可用:在它的 Linux 环境里执行 `dsh plugin --profile <name> add billion-context`,引擎即挂载该 bundle 并把代理拉成自己的子进程。已在 Redmi K80 / Android 16 / arm64-v8a 上验证:首次对话经代理转发(`[window] source=plugin`、`effective window 1048576 -> 792576 (reserved 256000)`、`forward POST → api.deepseek.com/anthropic/v1/messages`),`GET /__bili/plugin/status` 的 `contextTokens` 取自 usage。该宿主的客户端是原生实现,因此只带 `dsh.client.platform: web` 的 bundle(本插件的 Context 标签页与设置页)在那里没有落点 —— 宿主面、工具与 HTTP 面板不受影响,原生界面经 `dshGo` 槽另行接入(dsh-Go 的 `docs/plugins/native-for-free.md`)。它还定义了 `preset-dsh-go-companion` 与 `preset-dsh-go-companion-full`,其内嵌的 `compaction-basic` 行应由 #4147 的结构化遍历覆盖。
 
 ## Kimi Code(Moonshot)

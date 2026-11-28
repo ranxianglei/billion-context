@@ -90,6 +90,7 @@ billion-context/
 │   ├── fake-completion.ts        # Opt-in fake-completion retry hint (#371)
 │   ├── reasoning-drop.ts         # Drops oversized reasoning from closed-round compress calls (#651)
 │   ├── reasoning-guard.ts        # Live-fold guard for signed reasoning payloads
+│   ├── net-progress-guard.ts     # Net-progress guard: per-session nudge quiet-down when folds stop shrinking the resent context (#5058)
 │   ├── output-steering.ts        # Output-side compression: verbosity steering / effort routing (#1093)
 │   ├── image-tokens.ts           # Image token cost estimation (pixels/bytes modes, #767)
 │   ├── image-note.ts             # Image-block placeholder → rich note rendering
