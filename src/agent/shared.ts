@@ -225,6 +225,25 @@ export async function reportCompactionBoundary(proxyBase: string, conversationId
     }, COMPACT_TIMEOUT_MS);
 }
 
+// The fold before a host compaction runs summarization rounds upstream; the
+// host shows its own compaction indicator meanwhile and can abort it.
+const PRE_COMPACT_FOLD_TIMEOUT_MS = 300_000;
+
+/** #6199: ask the proxy to fold the conversation now, before the host's own
+ *  auto-compaction is cancelled (pi session_before_compact). Resolves the
+ *  proxy's answer when it said ok, undefined otherwise; throws on timeout,
+ *  abort or a network error. Callers fail open: the cancel goes ahead. */
+export async function requestPreCompactFold(proxyBase: string, conversationId: string, signal?: AbortSignal): Promise<{ folded?: boolean; skipped?: string } | undefined> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/compress`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ conversationId }),
+    }, PRE_COMPACT_FOLD_TIMEOUT_MS, signal);
+    if (!ok || !json || typeof json !== "object" || (json as { ok?: unknown }).ok !== true) return undefined;
+    const answer = json as { folded?: unknown; skipped?: unknown };
+    return { ...(typeof answer.folded === "boolean" ? { folded: answer.folded } : {}), ...(typeof answer.skipped === "string" ? { skipped: answer.skipped } : {}) };
+}
+
 /** Identity register (#162/#1333/#1362): tell the proxy which conversation
  *  this host session is (identity: true), optionally declaring the
  *  conversation it was derived from (parentConversationId). The proxy binds
