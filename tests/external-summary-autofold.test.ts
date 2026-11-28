@@ -9,6 +9,7 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { defaultConfig } from "acp-kernel";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { setLogCapture } from "../src/logger.ts";
 
 /** Anthropomorphic main upstream: records request bodies, answers SSE ok. */
 function startMainUpstream(): Promise<{ server: http.Server; url: string; bodies: unknown[] }> {
@@ -729,4 +730,115 @@ test("explicit autoFoldTargetTokens clamped to the window: classic nudges still 
     assert.equal(sum.bodies.length, 0, "clamped target is a no-op growth config — no external calls");
     const text = JSON.stringify(main.bodies.at(-1));
     assert.ok(text.includes("Context breakdown:"), "classic nudge must fire when the explicit target clamps to the window");
+});
+
+test("explicit autoFoldTargetTokens above the route bar warns once that auto-fold is inert (#4543)", async () => {
+    // The operator trap: a configured target at or above the route's overflow
+    // bar clamps to it and silently disarms the pre-forward growth fold. The
+    // warn must fire exactly once per session per route bar and name both values.
+    // Target deliberately far ABOVE the route window: the env may floor the
+    // judge window upward (fallback floor for unproven models), so a value
+    // above every plausible bar keeps the inert condition deterministic.
+    const main = await startMainUpstream(); trackClose(main.server);
+    const sum = await startSummaryUpstream("ok"); trackClose(sum.server);
+    const server = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: main.url,
+        routes: { [main.url]: { models: { "test-model": { context: 50_000 } } } },
+        modelContextLimit: 50_000,
+        kernelConfig: defaultConfig(50_000, { preserveRecentMessages: 0, preserveRecentTokens: 0, compress: { minCompressRange: 100, maxSummaryLength: 20000, minSummaryLength: 50 } }),
+        compress: {
+            injectTool: true,
+            injectNudge: true,
+            externalSummary: { enabled: true, targets: ["sum/sm"], autoFold: true, autoFoldTargetTokens: 500_000 },
+        },
+        namedProviders: { sum: { baseUrl: sum.url, api: "openai", apiKeyEnv: "E2E_SUM_KEY", models: { sm: {} } } },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: true,
+        debug: false,
+        passthrough: false,
+        passthroughSource: null,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    trackClose(server);
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    process.env.E2E_SUM_KEY = "k";
+
+    const warns: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
+    try {
+        const first = await postTurn(port, main.url, "inert-bar", 2);
+        assert.equal(first.status, 200, "turn 1 forwards cleanly despite the inert config");
+        let inertLines = warns.filter((m) => m.includes("auto-fold INERT"));
+        assert.equal(inertLines.length, 1, JSON.stringify(warns));
+        assert.ok(inertLines[0].includes("autoFoldTargetTokens=500000"), inertLines[0]);
+        assert.ok(/overflow target \d+/.test(inertLines[0]), inertLines[0]);
+        assert.ok(inertLines[0].includes("#4543"), inertLines[0]);
+
+        const second = await postTurn(port, main.url, "inert-bar", 2);
+        assert.equal(second.status, 200, "turn 2 forwards cleanly");
+        inertLines = warns.filter((m) => m.includes("auto-fold INERT"));
+        assert.equal(inertLines.length, 1, `throttled to one warn per session per route bar: ${JSON.stringify(warns)}`);
+    } finally {
+        setLogCapture(null);
+    }
+});
+
+test("no inert warning while growth folding is armed (target below the window)", async () => {
+    // Negative arm of the same gate: an explicit target that stays below the
+    // overflow bar arms growth folding and must not produce the inert warning.
+    const main = await startMainUpstream(); trackClose(main.server);
+    const sum = await startSummaryUpstream("ok"); trackClose(sum.server);
+    const server = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: main.url,
+        routes: { [main.url]: { models: { "test-model": { context: 50_000 } } } },
+        modelContextLimit: 50_000,
+        kernelConfig: defaultConfig(50_000, { preserveRecentMessages: 0, preserveRecentTokens: 0, compress: { minCompressRange: 100, maxSummaryLength: 20000, minSummaryLength: 50 } }),
+        compress: {
+            injectTool: true,
+            injectNudge: true,
+            externalSummary: { enabled: true, targets: ["sum/sm"], autoFold: true, autoFoldTargetTokens: 8192 },
+        },
+        namedProviders: { sum: { baseUrl: sum.url, api: "openai", apiKeyEnv: "E2E_SUM_KEY", models: { sm: {} } } },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: true,
+        debug: false,
+        passthrough: false,
+        passthroughSource: null,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    trackClose(server);
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    process.env.E2E_SUM_KEY = "k";
+
+    const warns: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
+    try {
+        const turn = await postTurn(port, main.url, "armed-bar", 2);
+        assert.equal(turn.status, 200, "turn forwards cleanly with an armed target");
+        assert.equal(warns.filter((m) => m.includes("auto-fold INERT")).length, 0, JSON.stringify(warns));
+    } finally {
+        setLogCapture(null);
+    }
 });
