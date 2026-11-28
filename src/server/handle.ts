@@ -89,6 +89,7 @@ import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { noteSessionLaneSwitch } from "./session-lane.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
+import { observeNativeIdentity } from "./native-identity-obs.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js";
@@ -1946,6 +1947,12 @@ async function handleRequest(
         // embed the id manually. One statement, runs in this request's own
         // async context, so concurrent requests never cross-contaminate.
         enterSessionContext(sessionId);
+        // #5571 M1: native identity observation — pure collection (profiles in
+        // src/server/native-identity-profiles.ts), fail-open inside, default
+        // OFF (rollout.features.nativeIdentityObservation / percent 0).
+        // Zero forwarded-byte changes; persists only digests under ext key
+        // "nidv:obs". Must never affect the request below.
+        observeNativeIdentity({ sessionId, headers: req.headers, urlPath, protocol, bodyText, parsedBody: parsed, log });
         if (protocol === "anthropic" && anthropicBetaMessageThreads(req.headers)) {
             const baseId = sessionId.split("|sub:")[0];
             if (!messageThreadsWarned.has(baseId)) {
