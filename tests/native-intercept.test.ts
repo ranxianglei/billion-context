@@ -786,7 +786,14 @@ test("install: an unattributed oversized request is refused before direct send (
         });
         assert.equal(res.status, 422);
         assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes");
-        assert.equal(((await res.json()) as { error: { retryable: boolean } }).error.retryable, true);
+        const parsed = (await res.json()) as { error: { retryable: boolean; message: string; silentBytes?: number; capBytes?: number; laneKey?: string } };
+        assert.equal(parsed.error.retryable, true);
+        // #7102: the 422 now carries the measured size, the cap, and the lane
+        // (hostname) so a model-switch deadlock is diagnosable from the body.
+        assert.equal(parsed.error.silentBytes, MAX_SILENT_DIRECT_BODY_BYTES + 1);
+        assert.equal(parsed.error.capBytes, MAX_SILENT_DIRECT_BODY_BYTES);
+        assert.equal(parsed.error.laneKey, "127.0.0.1");
+        assert.match(parsed.error.message, /lane is 127\.0\.0\.1/);
     });
     assert.deepEqual(sink, [], "the oversized request must not reach the provider");
 });

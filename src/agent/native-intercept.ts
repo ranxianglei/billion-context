@@ -927,22 +927,34 @@ function emptySlotOversizeRefusal(
  *  its own marker and wording; retryable:true because attribution can return.
  *  #7450: the ceiling is on TOTAL bytes but compression only acts on text —
  *  when the media split is known, name it in the message so the user can tell
- *  at a glance whether any folding could ever bring this body under the cap. */
-function unattributedByteOversizeRefusal(url: string, detail: { bytes: number; cap: number; mediaBytes?: number }): Response {
+ *  at a glance whether any folding could ever bring this body under the cap.
+ *  #7102: the body now also carries the measured size, the cap, and the
+ *  request's lane (hostname) so a user hitting the model-switch deadlock can
+ *  see WHY it fired (a fresh lane with no learned session) and what to do —
+ *  the fields are additive and undefined when the caller has no lane. */
+function unattributedByteOversizeRefusal(url: string, detail: { bytes: number; cap: number; mediaBytes?: number; laneKey?: string }): Response {
     const basis = `its body (${detail.bytes.toLocaleString("en-US")} B) is larger than the silent-direct byte ceiling (${detail.cap.toLocaleString("en-US")} B)`;
     const remedy = detail.mediaBytes !== undefined && detail.mediaBytes > 0
         ? detail.mediaBytes >= detail.cap
             ? `Of those bytes, ${detail.mediaBytes.toLocaleString("en-US")} B is inline media (images/audio) that no compression can shrink — the media alone already exceeds the ceiling, so this conversation cannot fit under it as-is: start a fresh session or attach smaller images. Routing through a bili session will not remove the media.`
             : `Of those bytes, ${detail.mediaBytes.toLocaleString("en-US")} B is inline media that compression cannot shrink; the rest is text a bili-managed session can fold. Route the conversation through a bili-managed session so the text can be compressed under the ceiling, or retry after the host re-establishes attribution.`
         : "Route the conversation through a bili-managed session so it can be compressed, or retry after the host re-establishes attribution.";
+    const laneNote = detail.laneKey !== undefined
+        ? ` This request's lane is ${detail.laneKey}; if you just switched models, the new provider's lane has no learned session yet — start a fresh session, shrink the context, or declare the endpoint under modelEndpointPatterns in ~/.config/billion-context/billion-context.json.`
+        : "";
     const message =
         "billion-context refused this request locally: it is not attributed to a bili-managed session and " + basis + ", so forwarding it would send a multi-megabyte prompt to the provider uncompressed (#5405). " +
-        remedy;
+        remedy + laneNote;
+    const extra = {
+        silentBytes: detail.bytes,
+        capBytes: detail.cap,
+        laneKey: detail.laneKey,
+    };
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed-bytes" };
     if (url.endsWith("/messages")) {
-        return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message, retryable: true } }), { status: 422, headers });
+        return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message, retryable: true, ...extra } }), { status: 422, headers });
     }
-    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_unattributed_bytes", message, retryable: true } }), { status: 422, headers });
+    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_unattributed_bytes", message, retryable: true, ...extra } }), { status: 422, headers });
 }
 
 // ———— Oversized doom math (#2924/#4068, media-aware since #4111) ——————
@@ -1909,8 +1921,13 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                         ? prep.body
                         : measured?.raw ?? (typeof init?.body === "string" ? init.body : undefined);
                     const silentMediaBytes = silentRaw !== undefined ? mediaBytesOfWireBody(silentRaw) : undefined;
+                    // #7102: the lane (hostname) is the recall net's namespace —
+                    // a fresh lane with no learned session is exactly the
+                    // model-switch deadlock, so surface it in the 422.
+                    let laneKey: string | undefined;
+                    try { laneKey = new URL(dispatchUrl).hostname; } catch { laneKey = undefined; }
                     logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B${silentMediaBytes !== undefined && silentMediaBytes > 0 ? `; ${silentMediaBytes.toLocaleString("en-US")} B inline media, incompressible` : ""}); would be sent uncompressed (#5405/#5408)`);
-                    return unattributedByteOversizeRefusal(dispatchUrl, { bytes: silentBytes, cap, mediaBytes: silentMediaBytes });
+                    return unattributedByteOversizeRefusal(dispatchUrl, { bytes: silentBytes, cap, mediaBytes: silentMediaBytes, laneKey });
                 }
             }
             // #4566: clean the stale hops only when a real send follows — the

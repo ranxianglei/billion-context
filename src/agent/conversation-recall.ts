@@ -22,6 +22,12 @@
  *  - The boundary must be CONTAINED in the incoming history and the match
  *    must be UNIQUE across the lane's remembered sessions — otherwise no
  *    stamp (behavior stays exactly today's direct send). Never guess.
+ *  - #7102: when the lane-scoped recall finds nothing (a model switch lands
+ *    on a lane that was never attributed), the claim falls back to a GLOBAL
+ *    recall whose uniqueness is required across EVERY remembered session —
+ *    strictly stronger, so the same "never guess" rule holds on the wider
+ *    namespace. The lane key stays the fast path; the global pass is the
+ *    bridge for cross-hostname switches.
  *  - A fork that diverges from mid-history does not contain the parent's
  *    latest boundary → never claimed. Only a fork copied from the very END is
  *    physically indistinguishable from a continuation; the TTL window plus
@@ -47,6 +53,7 @@ type ConversationRecallStats = {
     sessions: number;
     learned: number;
     recalled: number;
+    recalledGlobal: number;
     rejectedNoLane: number;
     rejectedNoBoundary: number;
     rejectedAmbiguous: number;
@@ -61,6 +68,7 @@ const stats: ConversationRecallStats = {
     sessions: 0,
     learned: 0,
     recalled: 0,
+    recalledGlobal: 0,
     rejectedNoLane: 0,
     rejectedNoBoundary: 0,
     rejectedAmbiguous: 0,
@@ -99,16 +107,24 @@ function sweep(now: number): void {
 }
 
 /**
- * Lane key: endpoint origin + pathname only. Query strings can carry
- * per-request noise, the model field changes on exactly the #3918 switch-
- * model retry this must catch, and auth tokens rotate (bearer refresh / key
- * swap — an auth-keyed lane would be orphaned on the very retry the bridge
- * exists for). The lane is only the SEARCH NAMESPACE; the identity evidence
- * is the boundary fingerprint plus its uniqueness across the lane.
+ * Lane key: hostname only. Query strings carry per-request noise, auth
+ * tokens rotate (bearer refresh / key swap — an auth-keyed lane would be
+ * orphaned on the very retry the bridge exists for), and the model field
+ * changes on exactly the #3918 switch-model retry this must catch.
+ *
+ * #6511: origin+pathname was too fine — the same logical session can ride
+ * two different endpoints (attributed traffic via the proxy to
+ * `http://host:9452/v1/…` while an unattributed connector dials
+ * `https://host/v2/…` directly), so the learn lane and the claim lane never
+ * intersected and the recall net was dead on arrival for that shape.
+ * Hostname is the coarsest key that still separates distinct providers;
+ * the boundary fingerprint (plus its uniqueness across the lane) remains
+ * the identity evidence, so a wider namespace only adds candidates the
+ * fingerprint filters out.
  */
 export function recallLaneKey(url: string): string {
     const u = new URL(url);
-    return `${u.origin}${u.pathname}`;
+    return u.hostname;
 }
 
 /** Cheap probe for gate-side short-circuiting: no learned session on this
@@ -117,6 +133,21 @@ export function recallLaneKey(url: string): string {
 export function recallLaneHasEntries(laneKey: string): boolean {
     const perLane = lanes.get(laneKey);
     return perLane !== undefined && perLane.size > 0;
+}
+
+/** #7102: the GLOBAL probe — no learned session on ANY lane ⇒ no body parsing
+ * or fingerprinting is worth doing at all. The lane probe (above) is the fast
+ * path; this one is what the claim side uses so a model switch — which lands
+ * on a lane that has NEVER been attributed and so has no entries of its own —
+ * still sees the session learned on the previous model's lane and parses the
+ * body for the global recall below. The cold case (no session learned
+ * anywhere) still bails before any parse, so agentless sidecars keep paying
+ * nothing when the net is empty. */
+export function recallHasAnyEntries(): boolean {
+    for (const perLane of lanes.values()) {
+        if (perLane.size > 0) return true;
+    }
+    return false;
 }
 
 /** Stable fingerprint of one wire message (byte-stable: hosts serialize
@@ -240,6 +271,51 @@ export function recallConversation(laneKey: string, historyFps: Set<string>): st
     return hits[0];
 }
 
+/**
+ * #7102: GLOBAL recall — the UNIQUE remembered session on ANY lane whose
+ * boundary fingerprint is contained in the incoming history. This is the
+ * fallback for the model-switch shape: the session was learned on the
+ * previous model's hostname (a different lane), so a lane-scoped recall on
+ * the new hostname finds nothing and the claim bails — the attribution
+ * bootstrap deadlock (the lane can never be seeded because it can never be
+ * claimed). Uniqueness is required GLOBALLY (across every remembered
+ * session), which is strictly stronger than the lane-scoped uniqueness, so
+ * the "never guess" rule holds even on the wider namespace. A sid learned on
+ * several lanes (a session that rode multiple hostnames) counts once.
+ * Undefined = no evidence anywhere, keep today's behavior.
+ */
+export function recallConversationGlobal(historyFps: Set<string>): string | undefined {
+    const now = Date.now();
+    sweep(now);
+    const hits = new Map<string, string>(); // sid → laneKey it was found in
+    for (const [laneKey, perLane] of lanes) {
+        for (const entry of perLane.values()) {
+            if (historyFps.has(entry.boundaryFp) && !hits.has(entry.sid)) {
+                hits.set(entry.sid, laneKey);
+            }
+        }
+    }
+    if (hits.size === 0) {
+        stats.rejectedNoBoundary++;
+        return undefined;
+    }
+    if (hits.size > 1) {
+        stats.rejectedAmbiguous++;
+        return undefined;
+    }
+    const [[sid, laneKey]] = [...hits.entries()];
+    // LRU touch the hit entry in its lane so an active session survives.
+    const perLane = lanes.get(laneKey);
+    const entry = perLane?.get(sid);
+    if (perLane !== undefined && entry !== undefined) {
+        perLane.delete(sid);
+        entry.at = now;
+        perLane.set(sid, entry);
+    }
+    stats.recalledGlobal++;
+    return sid;
+}
+
 export function conversationRecallStats(): Readonly<ConversationRecallStats> {
     return { ...stats };
 }
@@ -250,6 +326,7 @@ export function __resetConversationRecallForTests(): void {
     stats.sessions = 0;
     stats.learned = 0;
     stats.recalled = 0;
+    stats.recalledGlobal = 0;
     stats.rejectedNoLane = 0;
     stats.rejectedNoBoundary = 0;
     stats.rejectedAmbiguous = 0;
