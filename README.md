@@ -734,6 +734,7 @@ bili sessions restore <id>       # bring an archived session back from the log l
 bili sessions foreign-blocks     # (#5312) list fold blocks whose covered messages never belonged to this transcript — dry-run; --apply reversibly archives them, --restore <sid>:<bid> brings one back
 bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
                                  # print the sweep plan (sessions past retention, zero-ref content rows, ~pages reclaimable), then run the same gc() the HTTP endpoint calls; --dry-run stops after the plan
+bili storage migrate [--dry-run]  # (#5599) one-shot bulk import of every legacy JSON session into the unified SQLite index with per-session digest reconciliation (imported / indexed / drifted / failed); read-only over the JSON files — archive/delete them yourself once the report is clean; --dry-run plans without writing
 bili storage backup [--keep N]   # online-consistent index.db snapshot into <sessions>/backups/ (VACUUM INTO —
                                  # never rewrites the source, no exclusive lock, safe while a proxy runs); the
                                  # snapshot is quick_check-verified before it counts; keeps the newest N (default 3)
@@ -745,7 +746,7 @@ bili storage repair [--from f.db] # with --from: verify the backup (quick_check 
                                  # survives). Both swap paths refuse to run while another live process holds index.db.lock.
 ```
 
-`archive`/`restore`/`gc` require the unified store (`BILI_STORAGE_UNIFIED=sqlite|shadow|full` or `storage.unified` in the config file — the default is now pure sqlite) — legacy-only installs refuse with a hint. `--days` defaults to `storage.archiveAfterDays` (365). No scheduler: these run on demand. All commands accept `--json`.
+`archive`/`restore`/`gc`/`migrate` require the unified store (`BILI_STORAGE_UNIFIED=sqlite|shadow|full` or `storage.unified` in the config file — the default is now pure sqlite) — legacy-only installs refuse with a hint. `--days` defaults to `storage.archiveAfterDays` (365). No scheduler: these run on demand. All commands accept `--json`.
 
 **Backup & repair (#7156, 2026-11-20 production incident).** A 3.2 GB index.db proved corrupt (foreign second writer, #7156) and the only recovery path was a hand-rolled `.recover`-equivalent plus manual file surgery — those two manual moves are now the `backup`/`repair` commands above. Operational discipline that keeps the incident from recurring: run `bili storage backup` on a schedule (the retention flag is the only state it keeps), and keep **exactly one** long-lived bili process per sessions dir — a second live writer is the corruption mode, and every storage command now detects a live foreign writer and refuses rather than contending.
 

@@ -21,6 +21,7 @@
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
  *   bili sessions ls|rm|archive|restore [id]   manage persisted sessions
  *   bili storage gc [--days N]    run the storage sweep now (--dry-run plans only)
+ *   bili storage migrate          bulk-import legacy JSON sessions into the unified index (#5599)
  *   bili storage backup [--keep N]             consistent index.db snapshot (+retention)
  *   bili storage repair [--from <backup.db>]   restore from backup / salvage no-backup
  *   bili pack install <spec>      install a custom compress prompt pack from npm (#5319)
@@ -57,7 +58,7 @@ import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
-import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
+import { runSessionsCommand, runStorageGcCommand, runStorageMigrateCommand } from "./storage-maintenance.js";
 import { runStorageBackupCommand, runStorageRepairCommand } from "./storage-backup-repair.js";
 import { installPackFromNpm, removePackFile } from "./pack-install.js";
 import { listResolvedPacks } from "./compress-settings.js";
@@ -119,6 +120,13 @@ Usage:
                                     release unreferenced content, shrink index.db
                                     (--days N overrides the age; --vacuum full|incremental;
                                     prints the sweep plan first, --dry-run stops there)
+    bili storage migrate              bulk-import every legacy JSON session into the unified
+                                    SQLite index with per-session digest reconciliation (#5599):
+                                    imports what is missing or newer than the index, then
+                                    verifies every session against its source file and lists
+                                    drifted/failed ones. Read-only over the JSON files
+                                    (--dry-run plans without writing; --json machine-readable).
+                                    Safest while no host process is running.
   bili storage backup               online-consistent index.db snapshot into <sessions>/backups/
                                     (VACUUM INTO; verified with quick_check; --keep N retention,
                                     default 3) — safe while the proxy runs
@@ -281,7 +289,7 @@ type Parsed = {
     storageDays?: number;
     storageVacuum?: "full" | "incremental";
     storageDryRun?: boolean;
-    storageSub?: "gc" | "backup" | "repair";
+    storageSub?: "gc" | "migrate" | "backup" | "repair";
     storageKeep?: number;
     storageFrom?: string;
     jsonOutput?: boolean;
@@ -682,8 +690,8 @@ export function parseArgs(argv: string[]): Parsed {
             // A bare `bili storage` stays an error (the existing contract,
             // pinned by cli-parseargs): gc archives real sessions, so no
             // action may be the silent default.
-            if (sub !== "gc" && sub !== "backup" && sub !== "repair") {
-                console.error(`bili storage: unknown action "${sub ?? ""}" (try "bili storage gc|backup|repair")`);
+            if (sub !== "gc" && sub !== "migrate" && sub !== "backup" && sub !== "repair") {
+                console.error(`bili storage: unknown action "${sub ?? ""}" (try "bili storage gc|migrate|backup|repair")`);
                 process.exit(2);
             }
             storageSub = sub as Parsed["storageSub"];
@@ -906,11 +914,13 @@ export async function main(): Promise<void> {
         try {
             const r = command === "sessions"
                 ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum, apply: sessionsApply, restoreTarget: sessionsRestoreTarget })
-                : storageSub === "backup"
-                    ? await runStorageBackupCommand({ keep: storageKeep, json: jsonOutput })
-                    : storageSub === "repair"
-                        ? await runStorageRepairCommand({ from: storageFrom, json: jsonOutput })
-                        : await runStorageGcCommand({ days: storageDays, vacuum: storageVacuum, dryRun: storageDryRun, json: jsonOutput });
+                : storageSub === "migrate"
+                    ? await runStorageMigrateCommand({ dryRun: storageDryRun, json: jsonOutput })
+                    : storageSub === "backup"
+                        ? await runStorageBackupCommand({ keep: storageKeep, json: jsonOutput })
+                        : storageSub === "repair"
+                            ? await runStorageRepairCommand({ from: storageFrom, json: jsonOutput })
+                            : await runStorageGcCommand({ days: storageDays, vacuum: storageVacuum, dryRun: storageDryRun, json: jsonOutput });
             process.stdout.write(r.text);
             if (r.code !== 0) process.exit(r.code);
         } catch (error) {
