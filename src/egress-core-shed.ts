@@ -71,7 +71,7 @@ export interface CoreImageShedTargets {
     maxBytes?: number;
 }
 
-export interface CoreImageShedResult<T> {
+interface CoreImageShedResult<T> {
     /** The conversation with archived rows rewritten in place (other rows
      * are the SAME object references — only rewritten rows are new
      * objects). Unchanged input → a new array of the same references. */
