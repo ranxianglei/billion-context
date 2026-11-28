@@ -3444,7 +3444,7 @@ async function handleRequest(
                         (work as ResponsesRequestBody).previous_response_id!.length > 0 &&
                         (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0);
                     const preparedOut = protocol === "anthropic"
-                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
+                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
                           ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText, bodyParseDeferred)
                           : pureChainContinuation

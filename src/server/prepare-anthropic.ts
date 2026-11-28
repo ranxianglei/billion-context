@@ -8,7 +8,7 @@ import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforg
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { applyReasoningDrop, dedupeAdjacentOutputConfig, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, dedupeAdjacentOutputConfig, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
 import { isSubagentPrompt } from "../session-title.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
@@ -42,7 +42,7 @@ import { egressPlaneGateOn, imageRescaleMaxDim, renderNone as knobRenderNone } f
 import { SessionStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { isAutoModeClassifier } from "../auto-mode-forge.js";
-import { countSystemAndToolsTokens, emergencyNudgeArmed, emergencyNudgeForConfig, projectThinkingMass } from "./budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudgeArmed, emergencyNudgeForConfig, projectThinkingMass } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
@@ -69,6 +69,7 @@ export async function prepareAnthropic(
     session: Session,
     pluginMode: boolean,
     upstreamOrigin: string,
+    nativeWindow: number,
     reasoning: CompressReasoningConfig | undefined,
     visibilityMarkers: boolean,
     /** The route's resolved model, when the caller already has one. On the
@@ -811,6 +812,14 @@ export async function prepareAnthropic(
     // main-scale tiebreak sees this request's own upper bound.
     probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
+    // #5880: egress output-budget clamp, same call-site family as the openai/
+    // responses/google lanes (prepare-openai.ts). Wrapper providers on this
+    // wire bill completion against the SAME stated window as input (DeepSeek's
+    // 400: "N in the messages, M in the completion" against one wall), so an
+    // input-only fit judgment must be backed by an output clamp here too; for
+    // canonical Anthropic (separate input/output limits) the requested
+    // max_tokens already rides under the window and the clamp is a no-op.
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_tokens", { systemText: extractSystem(systemOut), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserve, kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", responseExtraHeaders: msgidModeHeaders, stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
