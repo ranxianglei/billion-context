@@ -266,6 +266,13 @@ function channelRunner(home: string, calls: string[][]): { sync: (p: DshPlan) =>
         const pi = tokens.indexOf("--profile");
         const name = tokens[pi + 1];
         const action = tokens[pi + 2];
+        // #7901: the real dsh CLI refuses the Electron-owned profile outright
+        // (rejectElectronProfile) — mirror that so any channel spawn against
+        // desktop fails the suite instead of silently "succeeding".
+        if (name === "desktop") {
+            calls.push(tokens);
+            throw Object.assign(new Error('profile "desktop" is managed exclusively by the Electron application'), { status: 1 });
+        }
         const dir = path.join(home, "profiles", name);
         if (action === "add") {
             fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: `dsh-profile-${name}`, dependencies: { "billion-context": "^0.1.120" }, dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", "billion-context"] } } }));
@@ -371,6 +378,94 @@ test("dsh remove uninstalls through the same channel and migrates legacy blocks"
 
             assert.match(pluginRemove("dsh"), /nothing to remove/);
             assert.equal(calls.length, 1);
+        });
+    } finally {
+        _setDshRunnersForTest(undefined);
+        rmrf(home);
+    }
+});
+
+// #7901: the dsh CLI refuses `--profile desktop` by design (Electron-owned);
+// the install/remove lane must skip it and continue with the remaining
+// profiles instead of aborting the whole loop at the first doomed spawn.
+
+test("dsh install skips the desktop profile and continues with the rest (#7901)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-desktop-"));
+    const calls: string[][] = [];
+    _setDshRunnersForTest(channelRunner(home, calls));
+    try {
+        await withEnv({ DSH_HOME: home }, async () => {
+            // the issue's field state: desktop initialized by the Electron app
+            // (its manifest already declares billion-context, written by the
+            // in-app plugin manager), plus the CLI profiles the install must
+            // still reach.
+            const desktopDir = path.join(home, "profiles", "desktop");
+            fs.mkdirSync(desktopDir, { recursive: true });
+            fs.writeFileSync(path.join(desktopDir, "package.json"), JSON.stringify({ name: "dsh-profile-desktop", dependencies: { "billion-context": "^0.1.217" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+            for (const name of ["dsh-tui", "headless", "web"]) {
+                fs.mkdirSync(path.join(home, "profiles", name), { recursive: true });
+            }
+
+            const msg = pluginInstall("dsh");
+            assert.match(msg, /3 dsh profile/);
+            assert.match(msg, /desktop: skipped/);
+            assert.deepEqual(calls.map((c) => c.join(" ")).sort(), [
+                `plugin --profile dsh-tui add ${expectedSpec()}`,
+                `plugin --profile headless add ${expectedSpec()}`,
+                `plugin --profile web add ${expectedSpec()}`,
+            ].sort());
+            // the desktop copy is left exactly as the app manager wrote it
+            const desktopManifest = JSON.parse(fs.readFileSync(path.join(desktopDir, "package.json"), "utf8")) as Record<string, unknown>;
+            assert.equal((desktopManifest.dependencies as Record<string, string>)["billion-context"], "^0.1.217");
+        });
+    } finally {
+        _setDshRunnersForTest(undefined);
+        rmrf(home);
+    }
+});
+
+test("dsh remove skips the desktop profile and continues with the rest (#7901)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-desktop-rm-"));
+    const calls: string[][] = [];
+    _setDshRunnersForTest(channelRunner(home, calls));
+    try {
+        await withEnv({ DSH_HOME: home }, async () => {
+            const desktopDir = path.join(home, "profiles", "desktop");
+            fs.mkdirSync(desktopDir, { recursive: true });
+            fs.writeFileSync(path.join(desktopDir, "package.json"), JSON.stringify({ name: "dsh-profile-desktop", dependencies: { "billion-context": "^0.1.217" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+            const webDir = path.join(home, "profiles", "web");
+            fs.mkdirSync(webDir, { recursive: true });
+            fs.writeFileSync(path.join(webDir, "package.json"), JSON.stringify({ name: "dsh-profile-web", dependencies: { "billion-context": "^0.1.120" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+
+            const removed = pluginRemove("dsh");
+            assert.match(removed, /removed bili from 1 dsh profile/);
+            assert.match(removed, /web: uninstalled via the dsh plugin channel/);
+            assert.match(removed, /desktop: left in place/);
+            assert.deepEqual(calls.map((c) => c.join(" ")), [`plugin --profile web remove billion-context`]);
+            // the desktop copy survives the remove
+            const desktopManifest = JSON.parse(fs.readFileSync(path.join(desktopDir, "package.json"), "utf8")) as Record<string, unknown>;
+            assert.equal((desktopManifest.dependencies as Record<string, string>)["billion-context"], "^0.1.217");
+        });
+    } finally {
+        _setDshRunnersForTest(undefined);
+        rmrf(home);
+    }
+});
+
+test("dsh install/remove on a desktop-only home report honestly instead of aborting (#7901)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-desktop-only-"));
+    const calls: string[][] = [];
+    _setDshRunnersForTest(channelRunner(home, calls));
+    try {
+        await withEnv({ DSH_HOME: home }, async () => {
+            const desktopDir = path.join(home, "profiles", "desktop");
+            fs.mkdirSync(desktopDir, { recursive: true });
+            fs.writeFileSync(path.join(desktopDir, "package.json"), JSON.stringify({ name: "dsh-profile-desktop", dependencies: { "billion-context": "^0.1.217" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+
+            assert.match(pluginInstall("dsh"), /no CLI-managed dsh profiles found/);
+            assert.equal(calls.length, 0, "no doomed CLI spawn on a desktop-only home");
+            assert.match(pluginRemove("dsh"), /nothing removed from CLI-managed dsh profiles \(desktop: left in place/);
+            assert.equal(calls.length, 0, "no doomed CLI spawn on a desktop-only home");
         });
     } finally {
         _setDshRunnersForTest(undefined);

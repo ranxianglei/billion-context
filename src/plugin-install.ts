@@ -44,7 +44,7 @@ import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome, read
 import { stripBiliWrappers, vertexBaseUrlForLocation } from "./vertex.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { isPidAlive, isProxyInstanceFile, lanePreferredPort, readProxyInstanceFile } from "./instance.js";
-import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
+import { DSH_DESKTOP_PROFILE, DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { piNpmCopyRoot } from "./pi-channel.js";
 import { clearOwnerLaneBackoff, fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
@@ -1766,21 +1766,40 @@ function dshInstall(): string {
     const root = selfPackageRoot();
     requireDistFile(path.join(root, "dist", "agent", "dsh-native.js"));
     const dirs = dshProfileDirs();
+    // #1575 owner decision: the desktop profile is owned by the dsh desktop
+    // app — the dsh CLI refuses `--profile desktop` by design, so the CLI
+    // install lane must skip it (its copy is kept in place by bili's
+    // auto-update, #1872). Spawning it here would throw and abort the whole
+    // loop, leaving the remaining profiles uninstalled (#7901).
+    const targets = dirs.filter((dir) => path.basename(dir) !== DSH_DESKTOP_PROFILE);
     const notes: string[] = [];
-    for (const dir of dirs) {
+    for (const dir of targets) {
         if (stripLegacyManagedBlock(dir)) notes.push(`${path.basename(dir)}: legacy managed block stripped`);
     }
     const spec = isNpmInstallForm(root) ? DSH_PACKAGE : path.resolve(root);
-    for (const dir of dirs) {
+    for (const dir of targets) {
         runDshPlugin(["plugin", "--profile", path.basename(dir), "add", spec]);
     }
-    return `installed ${DSH_PACKAGE} into ${dirs.length} dsh profile(s) under ${path.join(resolveDshHome(process.env), "profiles")} via 'dsh plugin --profile <name> add ${spec}'${notes.length > 0 ? ` (${notes.join("; ")})` : ""} — restart dsh to load it`;
+    if (targets.length === 0) {
+        return `no CLI-managed dsh profiles found — the desktop profile is owned by the dsh desktop app (its copy is kept in place by bili's auto-update, #1575); nothing to install`;
+    }
+    if (targets.length < dirs.length) {
+        notes.push("desktop: skipped — owned by the dsh desktop app (its copy is kept in place by bili's auto-update, #1575)");
+    }
+    return `installed ${DSH_PACKAGE} into ${targets.length} dsh profile(s) under ${path.join(resolveDshHome(process.env), "profiles")} via 'dsh plugin --profile <name> add ${spec}'${notes.length > 0 ? ` (${notes.join("; ")})` : ""} — restart dsh to load it`;
 }
 
 function dshRemove(): string {
+    const dirs = dshProfileDirs();
+    // #1575 owner decision: the desktop profile is owned by the dsh desktop
+    // app — the dsh CLI refuses `--profile desktop` by design, so the CLI
+    // remove lane must skip it (its copy is kept in place by bili's
+    // auto-update, #1872). Spawning it here would throw and abort the whole
+    // loop, leaving the remaining profiles unremoved (#7901).
+    const targets = dirs.filter((dir) => path.basename(dir) !== DSH_DESKTOP_PROFILE);
     const notes: string[] = [];
     const touched = new Set<string>();
-    for (const dir of dshProfileDirs()) {
+    for (const dir of targets) {
         const name = path.basename(dir);
         if (dshProfileDependsOnBili(dir)) {
             runDshPlugin(["plugin", "--profile", name, "remove", DSH_PACKAGE]);
@@ -1792,7 +1811,16 @@ function dshRemove(): string {
             notes.push(`${name}: legacy managed block stripped`);
         }
     }
-    if (touched.size === 0) return "nothing to remove — no dsh profile carries billion-context";
+    const desktopDir = dirs.find((dir) => path.basename(dir) === DSH_DESKTOP_PROFILE);
+    if (desktopDir !== undefined && dshProfileDependsOnBili(desktopDir)) {
+        notes.push("desktop: left in place — owned by the dsh desktop app (its copy is kept in place by bili's auto-update, #1575)");
+    }
+    if (touched.size === 0) {
+        if (notes.length > 0) {
+            return `nothing removed from CLI-managed dsh profiles (${notes.join("; ")})`;
+        }
+        return "nothing to remove — no dsh profile carries billion-context";
+    }
     return `removed bili from ${touched.size} dsh profile(s) under ${path.join(resolveDshHome(process.env), "profiles")} (${notes.join("; ")}) — restart dsh to finish`;
 }
 
