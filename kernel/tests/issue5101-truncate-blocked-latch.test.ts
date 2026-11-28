@@ -61,7 +61,7 @@ function history(): CoreMessage[] {
   ];
 }
 
-test("#5101: truncating a protected result cannot seed a shared latch or corrupt another call", () => {
+test("#5101/#7771: a protected result is never truncated, so it cannot seed a shared latch or corrupt another call", () => {
   const core = createCore();
   const messages = history();
   const first = core.processTurn({
@@ -72,10 +72,13 @@ test("#5101: truncating a protected result cannot seed a shared latch or corrupt
     renderTags: "none",
   });
   assert.equal(first.state.messageRefs.byRaw.result1, BLOCKED_REF);
-  assert.ok(
-    first.messages
-      .find((m) => m.id === "result1")!
-      .text!.includes("[truncated for context space]"),
+  // #7771: the emergency path now hard-excludes protected results (Kernel
+  // Boundary rule 6), so result1 is NEVER clipped — the #5101 workaround
+  // (clip but don't seed the shared BLOCKED_REF latch) is subsumed: with no
+  // clip there is nothing to seed. The protected bytes stay verbatim.
+  assert.equal(
+    first.messages.find((m) => m.id === "result1")!.text,
+    longResult,
   );
   assert.ok(
     !first.state.emergencyTruncateLatch?.some(
