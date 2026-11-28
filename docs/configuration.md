@@ -322,6 +322,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.absorb` | object | opt-in (disabled) | — | Opt-in instant distillation of tool results into short abstracts; originals go to the content store. By default only image-bearing results qualify. |
 | `compress.degenerateRetry` | object | 1 attempt (built-in nudge) | — | Retry budget and nudge sentences for turns that end with zero client-visible output (degenerate terminal turns). The continuation nudge rides the retry body only — it is never persisted into session state and never replayed on the client's next request. |
 | `compress.blockOps` | object | off | — | Opt-in block-lifecycle tools (acp_retire / acp_restore / acp_rewrite) for compressed-block management; default-off keeps the wire byte-identical to pre-#5765. |
+| `compress.anchorSidecar` | object | off | — | Opt-in deterministic anchor sidecar: mechanically appends a bounded verbatim index of file paths, error signatures, and durable IDs to folded summaries and carries them forward across T2/T3 distillation. |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
 | `compress.search` | object | off | — | Search-behavior settings for search_context; currently holds planAware re-ranking. |
 | `compress.search.planAware` | boolean | false | — | When on, search_context candidates are re-ranked against current plan state; off keeps byte-identical lexical results. |
@@ -340,6 +341,9 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.degenerateRetry.maxAttempts` | integer | 1 | — | Degenerate-terminal retry budget (#7666): when a turn ends with nothing client-visible, the agent's own request is re-issued with a trailing user nudge. 0 = off (the turn passes through bare), 1 = once (pre-#7666 behavior), max 5; attempt i sends nudges[i] (cycling). Independent of the zero-byte-cut re-issue (#2171) — a turn may spend one of each. |
 | `compress.degenerateRetry.nudges` | string[] | 3 built-in | — | Custom nudge sentences for degenerate-terminal retries (#7666); retry i sends sentence i (cycling when shorter). Unset = the built-in rotation, whose first entry is the default continuation nudge. |
 | `compress.blockOps.enabled` | boolean | false | — | Enable the three block-lifecycle tools (injection + prompt + manifest). Off = no tools, no prompt section, zero per-request cost. |
+| `compress.anchorSidecar.enabled` | boolean | false | — | Enable deterministic anchor sidecar extraction on folded blocks. Off = byte-identical summaries. |
+| `compress.anchorSidecar.maxAnchors` | number | 16 | — | Maximum number of deterministic anchors emitted per folded block (integer >= 1). |
+| `compress.anchorSidecar.maxSectionChars` | number | 1200 | — | Hard character cap for the appended ANCHORS section per folded block (integer >= 120). |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | Enable the content-cache-and-retrieve block. |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | Minimum estimated token size of a tool result eligible for CCR storage. |
 | `compress.ccr.excludeTools` | string[] | [] | — | Tool names excluded from CCR storage. |

@@ -394,3 +394,23 @@ test("applyCompressSettings: maps tierNudgeTokens onto kernel nudge.tierGrowthTo
     assert.equal(absent.nudge.tierGrowthTokens, undefined);
     assert.equal(base.nudge.tierGrowthTokens, undefined, "base config not mutated");
 });
+
+test("mergeCompress / parseCompressSettings / applyCompressSettings: anchorSidecar", () => {
+    const merged = mergeCompress(
+        { anchorSidecar: { enabled: true, maxAnchors: 12 } },
+        { anchorSidecar: { maxSectionChars: 900 } },
+        undefined,
+    );
+    assert.deepEqual(merged.anchorSidecar, { enabled: true, maxAnchors: 12, maxSectionChars: 900 });
+    assert.deepEqual(
+        parseCompressSettings({ anchorSidecar: { enabled: true, maxAnchors: 20, maxSectionChars: 1500 } })?.anchorSidecar,
+        { enabled: true, maxAnchors: 20, maxSectionChars: 1500 },
+    );
+    assert.equal(parseCompressSettings({ anchorSidecar: true }), undefined);
+    assert.equal(parseCompressSettings({ anchorSidecar: { maxAnchors: 0 } }), undefined);
+    assert.equal(parseCompressSettings({ anchorSidecar: { maxSectionChars: 50 } }), undefined);
+    const base = defaultConfig(200000);
+    const out = applyCompressSettings(base, 200000, { anchorSidecar: { enabled: true, maxAnchors: 12, maxSectionChars: 800 } });
+    assert.deepEqual(out.anchorSidecar, { enabled: true, maxAnchors: 12, maxSectionChars: 800 });
+    assert.equal(applyCompressSettings(base, 200000, {}).anchorSidecar, undefined);
+});

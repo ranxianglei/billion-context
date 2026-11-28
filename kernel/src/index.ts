@@ -363,6 +363,16 @@ export * from "./filter/index.js";
 
 export { VIABLE_RANGE_MIN_TOKENS, viableRanges } from "./viable.js";
 export {
+  ANCHOR_SIDECAR_MARKER,
+  DEFAULT_ANCHOR_SIDECAR_MAX_ANCHORS,
+  DEFAULT_ANCHOR_SIDECAR_MAX_CHARS,
+  extractMessageAnchors,
+  collectFoldAnchors,
+  parseAnchorSidecarSection,
+  appendAnchorSidecarSection,
+} from "./anchor-sidecar.js";
+export type { AnchorKind, DeterministicAnchor } from "./anchor-sidecar.js";
+export {
   classifyTurn,
   verbosityDirective,
   renderSteeringBlock,

@@ -592,6 +592,20 @@ export type CompressSettings = {
         /** Enable the block-lifecycle tools for this scope. Absent/false = off. */
         enabled?: boolean;
     };
+    /** Deterministic Anchor Sidecar (kernel `Config.anchorSidecar`, acp-kernel
+     *  >= 0.0.212): mechanically appends a bounded verbatim index of file
+     *  paths, failure signatures, and durable IDs to folded summaries and
+     *  carries them forward across T2/T3 distillation and refolds. Default off
+     *  (byte-identical summaries). Merged sub-field-wise across global →
+     *  provider → model. */
+    anchorSidecar?: {
+        /** Enable deterministic anchor sidecar extraction. Absent/false = off. */
+        enabled?: boolean;
+        /** Maximum anchors emitted per block (integer >= 1; kernel default 16). */
+        maxAnchors?: number;
+        /** Maximum characters for the appended ANCHORS section (integer >= 120; kernel default 1200). */
+        maxSectionChars?: number;
+    };
     /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
      *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
      *  ID-referenced at arrival by the kernel's ccr-store node (prune →
@@ -2677,7 +2691,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "messageTimestamps", "rules", "injectTool", "injectNudge",
-    "acknowledgePromptsRisk", "absorb", "blockOps", "ccr", "search",
+    "acknowledgePromptsRisk", "absorb", "blockOps", "anchorSidecar", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary", "externalSummary",
     // #3635: summary-length caps — previously accepted nowhere, silently dropped.
@@ -3604,6 +3618,30 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 cleaned.enabled = v;
             }
             if (ok) out.blockOps = cleaned;
+        }
+    }
+    if ("anchorSidecar" in obj && obj.anchorSidecar !== undefined) {
+        const a = obj.anchorSidecar;
+        if (!a || typeof a !== "object" || Array.isArray(a)) {
+            ok = false;
+        } else {
+            const ao = a as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["anchorSidecar"]> = {};
+            for (const key of ["enabled", "maxAnchors", "maxSectionChars"] as const) {
+                if (!(key in ao)) continue;
+                const v = ao[key];
+                if (key === "enabled") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    cleaned.enabled = v;
+                } else if (key === "maxAnchors") {
+                    if (typeof v !== "number" || !Number.isInteger(v) || v < 1) { ok = false; continue; }
+                    cleaned.maxAnchors = v;
+                } else {
+                    if (typeof v !== "number" || !Number.isInteger(v) || v < 120) { ok = false; continue; }
+                    cleaned.maxSectionChars = v;
+                }
+            }
+            if (ok) out.anchorSidecar = cleaned;
         }
     }
     if ("ccr" in obj && obj.ccr !== undefined) {

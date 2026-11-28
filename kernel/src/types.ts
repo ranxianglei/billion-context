@@ -652,7 +652,20 @@ export interface Config {
   crush?: CrushConfig;
   /** Lossless content-cached retrieval for oversized tool results (see ccr.ts). Absent/disabled = feature off. */
   ccr?: CcrConfig;
+  /** Deterministic Anchor Sidecar (see anchor-sidecar.ts): mechanically
+   *  appends a compact verbatim index of file paths, error signatures, and
+   *  durable identifiers to folded summaries and carries them across T2/T3
+   *  distillation. Absent/disabled = feature off (byte-identical summaries). */
+  anchorSidecar?: AnchorSidecarConfig;
   messageFilters?: import("./filter/types.js").MessageFiltersConfig;
+}
+
+export interface AnchorSidecarConfig {
+  enabled: boolean;
+  /** Maximum anchors emitted per block (default 16). */
+  maxAnchors?: number;
+  /** Maximum characters for the appended ANCHORS section (default 1200). */
+  maxSectionChars?: number;
 }
 
 export type CompressMode = "range" | "message";

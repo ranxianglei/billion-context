@@ -43,6 +43,11 @@ import {
   collectFoldMediaRefs,
   parseMediaRefsSection,
 } from "./media-refs.js";
+import {
+  appendAnchorSidecarSection,
+  collectFoldAnchors,
+  parseAnchorSidecarSection,
+} from "./anchor-sidecar.js";
 import { evaluateRefold, type RefoldDecision } from "./refold.js";
 import {
   computeProtectedRefs,
@@ -333,9 +338,17 @@ function applyRefolds(input: {
     const carriedRefs = parseMediaRefsSection(block.summary).map(
       scrubLoneSurrogates,
     );
+    const withMedia = appendMediaRefsSection(input.spec.summary, carriedRefs);
+    const summary = input.config.anchorSidecar?.enabled
+      ? appendAnchorSidecarSection(
+          withMedia,
+          parseAnchorSidecarSection(block.summary),
+          input.config.anchorSidecar,
+        )
+      : withMedia;
     return {
       ...block,
-      summary: appendMediaRefsSection(input.spec.summary, carriedRefs),
+      summary,
       topic: input.spec.topic ?? block.topic,
       runId: input.runId,
       restoredInline: false,
@@ -1997,9 +2010,15 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   // the stored summary — appended mechanically (never model discretion; on
   // the wire a URL part is often invisible to the summarizer), and carried
   // forward from consumed blocks so merges/distillations drop none.
+  const directMessagesForFold = filteredIds.map((id) =>
+    input.messages.find((entry) => entry.id === id),
+  );
+  const consumedBlocksForFold = consumedBlockIds.map((id) =>
+    blockById(input.state, id),
+  );
   const foldMediaRefs = collectFoldMediaRefs(
-    filteredIds.map((id) => input.messages.find((entry) => entry.id === id)),
-    consumedBlockIds.map((id) => blockById(input.state, id)),
+    directMessagesForFold,
+    consumedBlocksForFold,
   ).map(scrubLoneSurrogates);
 
   const blockId = allocateBlockId(input.state);
@@ -2007,15 +2026,30 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   // block. The claim is recorded only when it is EXACT — see
   // resolveCoverageInterval.
   const interval = resolveCoverageInterval(
-    filteredIds.map((id) => input.messages.find((entry) => entry.id === id)),
-    consumedBlockIds.map((id) => blockById(input.state, id)),
+    directMessagesForFold,
+    consumedBlocksForFold,
   );
+  const summaryWithMedia = appendMediaRefsSection(
+    input.spec.summary,
+    foldMediaRefs,
+  );
+  const summary = input.config.anchorSidecar?.enabled
+    ? appendAnchorSidecarSection(
+        summaryWithMedia,
+        collectFoldAnchors(
+          directMessagesForFold,
+          consumedBlocksForFold,
+          input.config.anchorSidecar,
+        ),
+        input.config.anchorSidecar,
+      )
+    : summaryWithMedia;
   const block: CompressionBlock = {
     blockId,
     runId: input.runId,
     tier: outputTier,
     topic: input.spec.topic,
-    summary: appendMediaRefsSection(input.spec.summary, foldMediaRefs),
+    summary,
     directMessageIds: filteredIds,
     effectiveMessageIds: [...effectiveMessageIds],
     directBlockIds: [...consumedBlockIds],
