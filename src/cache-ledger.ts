@@ -1908,6 +1908,17 @@ export const CALIBRATION_CLAMP_MAX = 4;
 // One lucky/degenerate pair must not flip every estimate on the route.
 export const CALIBRATION_SAMPLE_WINDOW = 3;
 const CALIBRATION_CONSISTENCY_RATIO = 2;
+// #7778: mass-gate — the local estimate excludes the relay's fixed system+
+// tools prefix (invisible to bili), so a small request's ratio billed/est is
+// dominated by that prefix (ratio = k_true + prefix/est, bias ∝ 1/est). A
+// 2-message side call (est ≈ 2.5k, billed ≈ 10.7k) samples ≈4.2 — inside the
+// plausibility band, so it was admitted and, three in a row, evicted the
+// honest session-sized samples from the 3-slot ring → k̂ clamped to 4 → the
+// next main request estimated ×4 → a futile 413. A sample whose estimate is
+// below this FRACTION of the session's peak local estimate is side-call-
+// shaped (fixed-overhead-dominated, biased ratio) and must never teach the
+// ring; only session-sized samples (whose ratio ≈ k_true) may.
+const CALIBRATION_MASS_GATE_FRACTION = 0.25;
 
 /** #2867/#2973: the canonical incoming system fp is a responses-LANE-ONLY
  *  classification input — its sole writer is prepare-responses'
@@ -1952,6 +1963,20 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
     const pendingEst = capturePair !== undefined ? capturePair.estimate : session.stats.lastLocalTextEstimate;
     const pendingOrigin = capturePair !== undefined ? normalizeUpstreamOrigin(capturePair.origin) : normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
     if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
+        // #7778: mass-gate — track the session's peak local estimate and
+        // reject side-call-shaped samples (a small fraction of that peak:
+        // fixed-overhead-dominated, biased ratio). See
+        // CALIBRATION_MASS_GATE_FRACTION. The peak is a high-water mark (it
+        // only grows within a session); it is NOT reset on a size jump — the
+        // k̂ is a route+model property that is valid across size regimes, so
+        // a legitimate session growth must not clear a learned factor (the
+        // #2129 regression: a growth turn jumped the peak and wiped a valid
+        // k̂≈0.5, re-arming the raw-estimate preflight).
+        const newPeak = Math.max(session.stats.calibrationPeakEstimate ?? 0, pendingEst);
+        session.stats.calibrationPeakEstimate = newPeak;
+        if (newPeak > 0 && pendingEst < CALIBRATION_MASS_GATE_FRACTION * newPeak) {
+            return; // side call — never let it teach the ring
+        }
         const rawSample = billed / pendingEst;
         // #5952: provenance of THIS sample — text-only only when it arrived
         // on a capture pair. A legacy shared-slot sample carries none, so a
