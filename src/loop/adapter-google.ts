@@ -2,7 +2,7 @@ import type { CoreMessage } from "acp-kernel";
 import { coreToGoogle } from "acp-kernel/wire";
 import type { GooglePart } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "./core.js";
-import { ACP_NAME_ALT, composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
+import { ACP_NAME_ALT, composeStreamFilters, createBareRefHeadFilter, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { createSseFramer, sseEventData } from "../sse-util.js";
@@ -535,6 +535,7 @@ export function createGoogleAdapter(
             // m00885: the shipped request text lets the filter keep an
             // emission-shaped span the user asked to be output verbatim.
             const requestText = JSON.stringify(requestBody);
+            // #5259: outermost — the bare-ref head guard acts on final outgoing bytes.
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
                     createTagEchoFilter((snippet, duringDrain) => {
@@ -548,9 +549,14 @@ export function createGoogleAdapter(
                         loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }),
                 ),
-                createBiliArtifactFilter((snippet) => {
-                    loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-                }),
+                composeStreamFilters(
+                    createBiliArtifactFilter((snippet) => {
+                        loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                    createBareRefHeadFilter((snippet) => {
+                        loggerLog("warn", `[bare-ref-head] stripped model-emitted bare ref head (#5259): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                ),
             );
             const tagFilter = makeFilter();
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
