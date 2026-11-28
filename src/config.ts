@@ -3010,7 +3010,7 @@ function warnInertResignPassthrough(obj: Record<string, unknown>): void {
     if (sig === "" || sig === inertResignPassthroughSignature) return;
     inertResignPassthroughSignature = sig;
     const list = inert.map((k) => `resign["${k}"].passthrough`).join(", ");
-    loggerLog("warn", `[acp-config] ${list}=true is INERT — since the #2090 compress-or-refuse contract, unsigned pass-through exists ONLY for the built-in scheme "${RESIGN_BUILTIN_SCHEME}"; those signed requests stay REFUSED until bili ships a re-signer for them. Restore pre-resign handling with resign["<scheme>"].enabled=false or BILI_RESIGN=0 (the upstream will then reject the rewritten bodies).`);
+    loggerLog("warn", `[acp-config] ${list}=true is INERT — since the #2090 compress-or-refuse contract, unsigned pass-through exists ONLY for the built-in scheme "${RESIGN_BUILTIN_SCHEME}"; those signed requests stay REFUSED — per-scheme status (including schemes refused permanently by policy, #4632) is in the bili web UI (Configuration → Signed upstreams). Restore pre-resign handling with resign["<scheme>"].enabled=false or BILI_RESIGN=0 (the upstream will then reject the rewritten bodies).`);
 }
 
 /** #1660: the self-managed zone port base. Every launcher-spawned lane

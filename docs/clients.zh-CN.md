@@ -24,6 +24,15 @@
 
 **宿主侧上下文计量与模型实际视图按设计不一致(#2837):**plugin 模式下宿主本地持久会话日志有意保持无损 —— 完整未折叠历史会因前缀缓存与严格回显而重发(见 technical-notes.md「两种压缩模式」)。因此宿主或其插件从该本地日志算出的任何计量,量的都是**未折叠的本地表面**,而不是下一次请求实际携带的量;压缩生效期间本地数字远高于真实输入属预期,不是压缩卡死。有效尺寸以代理为准:读 `/acp`(或 `GET /__bili/plugin/status` 的 `contextTokens`,来源见 `contextTokensSource`),不要本地重新推算。
 
+**免费模型插件(`x-ofm-signature`)—— 已知冲突,按策略永久拒收(#4632):** dsh 免费模型插件对它 EAC 渠道的每个请求都盖 `x-ofm-signature`(对时间戳+方法+路径+body hash 的 HMAC-SHA256)。服务方屏蔽经 bili 路由的该渠道流量,且其条款不允许第三方代理拦截或重签这些请求 —— 所以 bili **有意不**为该方案提供重签器。该渠道的每个请求都在本地响亮拒收(403,绝不静默改写到上游变验签失败),bili 会在启动横幅、dsh 插件日志与 web UI 里持续告知,并写明你的选项:
+
+- 两个插件都留:该渠道响亮拒收,profile 里其余所有模型照常压缩 —— 不用卸载任何东西;
+- **用 `/bili/` 前缀选择性路由(两边都能用):** 先从 profile 移除 billion-context 插件(`bili plugin remove dsh`)——它装着时会把免费模型渠道的流量拉进代理,拒收就是这么触发的——然后只把想压缩的 provider 设为 `baseURL = http://localhost:8787/bili/<上游>`,免费模型端点保持不动(需运行 `bili start`):这些模型直连且签名有效,其余照常压缩。若你的 profile 开着 dsh 自带自动压缩(web 预设),移除插件后它会回来 —— 最多留一个压缩器;
+- 移除插件且不换路由:整个 profile 直连、无压缩;
+- 等服务方出官方 bili 兼容模式。
+
+**不要**用 `resign["x-ofm-signature"].enabled: false` / `BILI_RESIGN=0` 去「修」它:那会恢复 pre-resign 改写行为,等于向一个本来就屏蔽你的服务方发验签必失败的请求 —— 有账号风险、零收益。立场声明:本项目不支持违反他人协议的软件;针对该方案的兼容处理只为了让你的其余链路能用上 bili。详见 [configuration.zh-CN.md](configuration.zh-CN.md)(服务端设置 → `resign`)。
+
 **dsh-go 宿主(第三方安卓 App):** 该 App(`ccch1mneyyy/dsh-Go`)自带一套 dsh 运行时 —— proot rootfs 里的 dsh `0.2.2-rc.1` / node 24.22.1 / Ubuntu 24.04.5,每次 App 更新替换约 135 个 dsh 文件。上面的 profile 泳道在这里原样可用:在它的 Linux 环境里执行 `dsh plugin --profile <name> add billion-context`,引擎即挂载该 bundle 并把代理拉成自己的子进程。已在 Redmi K80 / Android 16 / arm64-v8a 上验证:首次对话经代理转发(`[window] source=plugin`、`effective window 1048576 -> 792576 (reserved 256000)`、`forward POST → api.deepseek.com/anthropic/v1/messages`),`GET /__bili/plugin/status` 的 `contextTokens` 取自 usage。该宿主的客户端是原生实现,因此只带 `dsh.client.platform: web` 的 bundle(本插件的 Context 标签页与设置页)在那里没有落点 —— 宿主面、工具与 HTTP 面板不受影响,原生界面经 `dshGo` 槽另行接入(dsh-Go 的 `docs/plugins/native-for-free.md`)。它还定义了 `preset-dsh-go-companion` 与 `preset-dsh-go-companion-full`,其内嵌的 `compaction-basic` 行应由 #4147 的结构化遍历覆盖。
 
 ## Kimi Code(Moonshot)
