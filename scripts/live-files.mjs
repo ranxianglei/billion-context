@@ -167,6 +167,13 @@ export const LIVE_FILES = [
     // the zone band is irrelevant; the entry is for the tripwire, like
     // #5046/#4612.
     "tests/storage-integrity-cache.test.ts",
+    // #5241 phase-0 startup-contract stakes: both spawn children — verify-attach
+    // drives one child per lane (sequential await), latches drives the stderr
+    // flip child. No shared ports (mock bili server + spawn stubs are listen(0)
+    // or unbound), so no real zone band is needed — the entries exist for the
+    // spawn tripwire alone, like #3890's
+    "tests/contract-v2-stake-latches.test.ts",
+    "tests/contract-v2-stake-verify-attach.test.ts",
     // #7156: the only child is spawnSync("true") in freshDeadPid() — a
     // guaranteed-dead pid for the stale-lock fixture; no ports, no servers,
     // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
