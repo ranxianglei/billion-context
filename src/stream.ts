@@ -2033,7 +2033,12 @@ function* rewriteJsonSteps(body: unknown, ctx: RewriteCtx): Generator<JsonToolCa
             converted = true;
             const args = (blk.input && typeof blk.input === "object" ? blk.input : {}) as Record<string, unknown>;
             const text = yield { name: blk.name, args, id: blk.id };
-            newContent.push({ type: "text", text });
+            // Internal proxy tool failure receipts belong to the control-plane; suppress them from client assistant text.
+            if (typeof text === "string" && (text.includes("Compression FAILED") || text.includes("FAILED:"))) {
+                ctx.log(`[warn: proxy tool suppressed] non-stream proxy tool ${blk.name} failed (${text.slice(0, 120).replace(/\n/g, " ")}); dropped from client text`);
+            } else if (typeof text === "string" && text.trim().length > 0) {
+                newContent.push({ type: "text", text });
+            }
         } else {
             if (blk.type === "tool_use") sawRealToolUse = true;
             newContent.push(block);
