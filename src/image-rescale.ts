@@ -333,6 +333,18 @@ export function matchesOriginalImageReceipt(b64: string, parts: unknown[]): bool
     return hashes.has(createHash("sha256").update(Buffer.from(b64, "base64")).digest("hex"));
 }
 
+export function googleFunctionResponseTextParts(response: unknown): { text: string }[] {
+    const parts: { text: string }[] = [];
+    const pending = [response];
+    while (pending.length > 0) {
+        const value = pending.pop();
+        if (typeof value === "string") parts.push({ text: value });
+        else if (Array.isArray(value)) for (const item of value) pending.push(item);
+        else if (asPart(value)) for (const item of Object.values(value as Record<string, unknown>)) pending.push(item);
+    }
+    return parts;
+}
+
 async function rescaleAnthropic(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessage[] | undefined> {
     const block = asPart(m.rawAnthropicBlock);
     if (!block) return undefined;
@@ -440,10 +452,40 @@ async function rescaleGoogle(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessa
     const parts = m.rawGoogleParts as unknown[];
     const changed: unknown[] = [];
     let any = false;
+    let nestedChanged = false;
     const notes: string[] = [];
     const ref = refFor(ctx.session, m.id);
     for (const part of parts) {
         const p = asPart(part);
+        const response = asPart(p?.functionResponse);
+        if (response && Array.isArray(response.parts)) {
+            const nested: unknown[] = [];
+            let textParts: { text: string }[] | undefined;
+            let resized = false;
+            for (const item of response.parts) {
+                const np = asPart(item);
+                const inline = asPart(np?.inlineData);
+                if (response.name !== READ_ORIGINAL_IMAGE_TOOL_NAME && inline && typeof inline.data === "string" &&
+                    typeof inline.mimeType === "string" && /^image\//i.test(inline.mimeType) &&
+                    !matchesOriginalImageReceipt(inline.data, textParts ??= googleFunctionResponseTextParts(response.response))) {
+                    const r = await rescaleImage(inline.mimeType, inline.data, ctx.maxDim);
+                    if (r) {
+                        resized = true;
+                        logCompression(ctx, ref, r);
+                        nested.push({ ...np, inlineData: { ...inline, data: r.base64 } });
+                        notes.push(noteFor(ctx, ref, r));
+                        continue;
+                    }
+                }
+                nested.push(item);
+            }
+            if (resized) {
+                any = true;
+                nestedChanged = true;
+                changed.push({ ...p, functionResponse: { ...response, parts: nested } });
+                continue;
+            }
+        }
         const inline = p ? asPart(p.inlineData) : undefined;
         if (inline && typeof inline.data === "string" && !matchesOriginalImageReceipt(inline.data, parts)) {
             const r = await rescaleImage(typeof inline.mimeType === "string" ? inline.mimeType : "image/png", inline.data, ctx.maxDim);
@@ -458,6 +500,14 @@ async function rescaleGoogle(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessa
         changed.push(part);
     }
     if (!any) return undefined;
+    if (nestedChanged && (m.role === "tool" || m.contentType === "tool-result")) {
+        // Raw function responses ignore core text; the adjacent user core is
+        // ordered by coreToGoogle for the target provider without changing response JSON.
+        return [
+            { ...m, rawGoogleParts: changed },
+            { id: `acp_imgnote_${m.id}`, role: "user", contentType: "text", text: notes.join("\n") },
+        ];
+    }
     // The note appends to the core TEXT (never as a raw text part): the
     // codec's re-render path drops raw text parts whose joined value diverges
     // from m.text, but a changed m.text re-renders cleanly with every

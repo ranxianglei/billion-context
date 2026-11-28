@@ -14,14 +14,14 @@
 // repeated resends of the same history produce stable bytes (prefix cache). Kernel state
 // is NEVER mutated here — same outbound-copy-only discipline as the #3400 image rescale.
 
-import { parseDataUrl } from "acp-kernel/wire";
+import { normalizeGoogleUserPartOrder, parseDataUrl, type GooglePart } from "acp-kernel/wire";
 import type { Session } from "./session.js";
 import type { WireProtocol } from "./util.js";
 import { currentFetchTransport, isWsLaneTransport } from "./fetch-transport.js";
 import { limitsHttpOutboundBytes, limitsWsOutboundBytes } from "./knobs.js";
 import { decodeImageDims } from "./image-tokens.js";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
-import { matchesOriginalImageReceipt, refForItemBytes, shedDownscaleImage } from "./image-rescale.js";
+import { googleFunctionResponseTextParts, matchesOriginalImageReceipt, refForItemBytes, shedDownscaleImage } from "./image-rescale.js";
 import { ResponsesWsUpstreamError } from "./responses-ws.js";
 
 type Part = Record<string, unknown>;
@@ -159,12 +159,13 @@ export function postShedImageView(body: string, protocol: WireProtocol): { body:
         archived++;
     }
     if (archived === 0) return { body, sheddable: false };
-    return { body: JSON.stringify(parsed), sheddable: true };
+    return { body: serializeShedBody(parsed, occurrences), sheddable: true };
 }
 
 interface ShedOptions {
     /** Best-effort mNNNNN resolver (session incoming-image index); placeholders quote it. */
     resolveRef?: (mediaType: string, b64: string) => Promise<string | undefined>;
+    model?: string;
 }
 
 interface Occurrence {
@@ -178,6 +179,32 @@ interface Occurrence {
     archived: boolean;
     applyArchive: (note: string) => void;
     applyShrink: (b64: string) => void;
+    finalize?: () => void;
+}
+
+function serializeShedBody(body: Part, occurrences: Occurrence[]): string {
+    for (const finalize of new Set(occurrences.map(o => o.finalize))) finalize?.();
+    return JSON.stringify(body);
+}
+
+function googleImageRefReplacers(response: Part): Map<string, ((note: string) => void)[]> {
+    const refs = new Map<string, ((note: string) => void)[]>();
+    const pending: [unknown, (value: unknown) => void][] = [[response.response, value => { response.response = { output: value }; }]];
+    while (pending.length > 0) {
+        const [value, replace] = pending.pop()!;
+        if (Array.isArray(value)) {
+            value.forEach((item, i) => pending.push([item, next => { value[i] = next; }]));
+        } else if (isObj(value)) {
+            if (typeof value.$ref === "string" && Object.keys(value).length === 1) {
+                const setters = refs.get(value.$ref) ?? [];
+                setters.push(replace);
+                refs.set(value.$ref, setters);
+            } else {
+                for (const [key, item] of Object.entries(value)) pending.push([item, next => { value[key] = next; }]);
+            }
+        }
+    }
+    return refs;
 }
 
 function byteLen(s: string): number {
@@ -250,7 +277,7 @@ function isExemptOutput(protocol: WireProtocol, item: Part, names: Map<string, s
     return typeof id === "string" && names.get(id) === READ_ORIGINAL_IMAGE_TOOL_NAME;
 }
 
-function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
+function collectOccurrences(protocol: WireProtocol, body: Part, model?: string): Occurrence[] {
     const occ: Occurrence[] = [];
     const addAnthropicImages = (parts: unknown[], entryIndex: number, toolOutput: boolean, exemptOutput = false): void => {
         parts.forEach((part, pos) => {
@@ -276,7 +303,14 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
         contents.forEach((c, entryIndex) => {
             if (!isObj(c) || !Array.isArray(c.parts)) return;
             const parts = c.parts as unknown[];
-            parts.forEach((part, pos) => {
+            const notes: Part[] = [];
+            let archived = false;
+            const finalize = (): void => {
+                if (!archived) return;
+                const next = [...parts, ...notes];
+                c.parts = next.every(isObj) ? normalizeGoogleUserPartOrder(next as GooglePart[], { model }) : next;
+            };
+            const addImage = (part: unknown, exempt: (b64: string) => boolean, applyArchive: (note: string) => void): void => {
                 if (!isObj(part)) return;
                 const inline = part.inlineData;
                 if (!isObj(inline) || typeof inline.data !== "string" || inline.data.length === 0) return;
@@ -286,12 +320,36 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                     entryIndex,
                     b64: inline.data,
                     mediaType,
-                    exempt: matchesOriginalImageReceipt(inline.data, parts),
+                    exempt: exempt(inline.data),
                     protectedTail: false,
                     archived: false,
-                    applyArchive: (note) => { parts[pos] = { text: note }; },
+                    applyArchive: (note) => { archived = true; applyArchive(note); },
                     applyShrink: (b64) => { inline.data = b64; },
+                    finalize,
                 });
+            };
+            parts.forEach((part, pos) => {
+                addImage(part, b64 => matchesOriginalImageReceipt(b64, parts), note => { parts[pos] = { text: note }; });
+                if (!isObj(part) || !isObj(part.functionResponse)) return;
+                const response = part.functionResponse;
+                if (!Array.isArray(response.parts)) return;
+                const nested = response.parts;
+                let textParts: { text: string }[] | undefined;
+                let references: ReturnType<typeof googleImageRefReplacers> | undefined;
+                for (const item of nested) {
+                    addImage(item, b64 => response.name === READ_ORIGINAL_IMAGE_TOOL_NAME ||
+                        matchesOriginalImageReceipt(b64, textParts ??= googleFunctionResponseTextParts(response.response)), note => {
+                        // FunctionResponsePart permits media only. Referenced images
+                        // become notes at their JSON reference; other notes ride outside it.
+                        const position = nested.indexOf(item);
+                        if (position >= 0) nested.splice(position, 1);
+                        const inline = isObj(item) && isObj(item.inlineData) ? item.inlineData : undefined;
+                        const name = inline?.displayName;
+                        const setters = typeof name === "string" ? (references ??= googleImageRefReplacers(response)).get(name) : undefined;
+                        if (setters?.length) for (const set of setters) set(note);
+                        else notes.push({ text: note });
+                    });
+                }
             });
         });
         return occ;
@@ -381,7 +439,7 @@ export async function shedWireImages(
         return { body, stats: noop };
     }
     if (!isObj(parsed)) return { body, stats: noop };
-    const occurrences = collectOccurrences(protocol, parsed).filter((o) => !o.exempt);
+    const occurrences = collectOccurrences(protocol, parsed, opts.model).filter((o) => !o.exempt);
     if (occurrences.length === 0) return { body, stats: noop };
 
     const totalEntries = protocol === "google" ? (Array.isArray(parsed.contents) ? parsed.contents.length : 0)
@@ -435,7 +493,7 @@ export async function shedWireImages(
     }
 
     if (archived === 0 && downscaled === 0) return { body, stats: noop };
-    const next = JSON.stringify(parsed);
+    const next = serializeShedBody(parsed, occurrences);
     return {
         body: next,
         stats: { originalBytes, finalBytes: byteLen(next), archived, downscaled, changed: true },
@@ -472,7 +530,7 @@ export async function shedWireImagesToCount(
         return { body, stats: noop };
     }
     if (!isObj(parsed)) return { body, stats: noop };
-    const occurrences = collectOccurrences(protocol, parsed);
+    const occurrences = collectOccurrences(protocol, parsed, opts.model);
     if (occurrences.length <= maxImages) return { body, stats: noop };
 
     const totalEntries = protocol === "google" ? (Array.isArray(parsed.contents) ? parsed.contents.length : 0)
@@ -499,13 +557,14 @@ export async function shedWireImagesToCount(
     }
 
     if (archived === 0) return { body, stats: noop };
-    const next = JSON.stringify(parsed);
+    const next = serializeShedBody(parsed, occurrences);
     return { body: next, stats: { originalBytes, finalBytes: byteLen(next), archived, downscaled: 0, changed: true } };
 }
 
 interface ShedContext {
     sessionId?: string;
     session?: Session;
+    model?: string;
     log?: (level: string, message: string) => void;
     phase?: string;
 }
@@ -548,6 +607,7 @@ export async function shedEgressIfOverBudget(
     const metaKey = lane === "ws" ? "wsByteShed" : "httpByteShed";
     const { body: next, stats } = await shedWireImages(body, protocol, budget, {
         resolveRef: ctx.session ? (mt, b64) => refForItemBytes(ctx.session!, mt, b64) : undefined,
+        model: ctx.model,
     });
     if (!stats.changed) {
         ctx.log?.("warn", `[${ctx.sessionId ?? "?"}] [${tag}] ${ctx.phase ?? "send"}: outbound ${formatMiB(originalBytes)} MiB over budget ${formatMiB(budget)} MiB but no sheddable images outside the protected tail — sending as-is`);

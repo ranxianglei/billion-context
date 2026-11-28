@@ -98,6 +98,18 @@ test("WC-015 validates message-item IDs without constraining provider namespaces
     assert.match(VALIDATORS.responses({ input: [{ type: "message", role: "assistant", id: "marker-1791393957942-2", content: "x" }] })[0], /WC-015/);
 });
 
+test("WC-027 Google function responses carry media-only parts and local named references", () => {
+    const image = { inlineData: { mimeType: "image/png", data: "AAAA", displayName: "shot.png" } };
+    const body = (parts: unknown[], response: unknown = { image: { $ref: "shot.png" } }) => ({ contents: [{ role: "user", parts: [{ functionResponse: { name: "screenshot", response, parts } }] }] });
+    assert.deepEqual(VALIDATORS.google(body([image])), []);
+    assert.deepEqual(VALIDATORS.google(body([], { output: "[image: omitted for size limit]" })), []);
+    assert.deepEqual(VALIDATORS.google(body([{ fileData: { mimeType: "image/png", fileUri: "gs://bucket/shot.png", displayName: "shot.png" } }])), []);
+    for (const invalid of [body([{ text: "omitted" }]), body([]), body([image, image]), body([image], { images: [{ $ref: "missing.png" }] }), body([{ ...image, fileData: { fileUri: "gs://bucket/shot.png" } }])]) {
+        assert.ok(VALIDATORS.google(invalid).some(error => error.startsWith("WC-027")));
+    }
+    assert.deepEqual(VALIDATORS.google(body([], { $ref: "literal", sibling: true })), [], "arbitrary JSON objects are not exact media references");
+});
+
 test("WC-022 tool_addition/tool_removal blocks are only valid inside role:system messages", () => {
     const addition = { type: "tool_addition", tool: { type: "tool_definition", definition: { name: "t", input_schema: { type: "object", properties: {} } } } };
     assert.deepEqual(VALIDATORS.anthropic({
@@ -371,6 +383,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { input: [{ role: "user", content: "u" }, { role: "system", content: "s" }] },
         ],
         google: [
+            { contents: [{ role: "user", parts: [{ functionResponse: { name: "screenshot", response: {}, parts: [{ text: "omitted" }] } }] }] },
             { tools: [{ functionDeclarations: [{ name: "bad-name", parameters: { type: "object", properties: {} } }] }] },
             { tools: [{ functionDeclarations: [{ name: "ok", parameters: { anyOf: [] } }] }] },
             // WC-018: the #3159 shape — plain text after a functionResponse part.
