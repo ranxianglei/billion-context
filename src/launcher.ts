@@ -7349,10 +7349,14 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // #535 phase 2: file-free — no overlay HERMES_HOME, no config.yaml
         // runs on its REAL home — including a user-set HERMES_HOME (discovery
         // resolved the same path, so the MITM whitelist matches). Its httpx
-        // stack resolves ONE proxy env var (HTTPS_PROXY first) for both
-        // schemes: https upstreams ride CONNECT + cert MITM, plain-http
-        // upstreams ride absolute-form forward-proxy requests the server
-        // understands. CA trust (#1375): current hermes resolves the main
+        // stack resolves proxy envs PER SCHEME (#5116, field-verified on Hermes
+        // v0.22.5): https upstreams read HTTPS_PROXY (CONNECT + cert MITM),
+        // plain-http upstreams read HTTP_PROXY (absolute-form forward-proxy
+        // requests the server understands) — HTTPS_PROXY alone left plain-http
+        // providers going straight out, invisible to bili. NO_PROXY keeps the
+        // loopback legs (local model endpoints, MCP) direct; the env was
+        // stripped above, so the static constant is the whole value. CA trust
+        // (#1375): current hermes resolves the main
         // client via agent/ssl_verify.py — platform store + per-provider
         // ssl_ca_cert, ambient trust only through SSL_CERT_FILE (OpenSSL
         // replace semantics → the COMBINED bundle keeps blind-tunnelled hosts
@@ -7362,6 +7366,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // carrier is present (anonymous requests are accepted, #286).
         env = stripInheritedProxy(process.env);
         env.HTTPS_PROXY = origin;
+        env.HTTP_PROXY = origin;
         // #6862: keep hermes' own toolchain children (git/uv/npm update runners, shell tasks) off
         // the lane for code/dependency hosts — they inherit HTTPS_PROXY and a flaky lane egress or
         // dead port then takes the host's whole toolchain down. Model hosts are not listed, so

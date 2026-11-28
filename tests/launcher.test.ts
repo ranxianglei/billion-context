@@ -875,6 +875,9 @@ test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real con
         assert.deepEqual(exitCalls, [0]);
         assert.ok(childEnv, "client spawned");
         assert.match(childEnv!.HTTPS_PROXY ?? "", /^http:\/\/127\.0\.0\.1:\d+$/);
+        // #5116: per-scheme proxy resolution — plain-http upstreams read HTTP_PROXY (HTTPS_PROXY
+        // alone left them going straight out).
+        assert.equal(childEnv!.HTTP_PROXY, childEnv!.HTTPS_PROXY, "plain-http upstreams ride the same origin");
         assert.ok(childEnv!.HERMES_CA_BUNDLE, "CA bundle exported");
         assert.ok(
             String(childEnv!.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")),
