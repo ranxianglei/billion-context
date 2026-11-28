@@ -374,7 +374,14 @@ export function maskIpsInText(text: string): string {
 export function redactSecretsInText(text: string): string {
     if (!text) return text;
     return text
-        .replace(/\b(bearer|basic)\s+([A-Za-z0-9._~+\/=-]{8,})/gi, (_m, scheme: string, tok: string) => `${scheme} <masked ${tok.length} chars>`)
+        // The scheme must START a token: a hyphen or word character right
+        // before it means it is the tail of an identifier, not a scheme.
+        // `compaction-basic override is GONE` is prose, and masking
+        // "basic override" turned the P1-1 boot alarm into
+        // "compaction-basic <masked 8 chars> is GONE" — the one noun the
+        // operator needs. Real headers ("Authorization: Basic …", "bearer
+        // eyJ…") keep a space/colon before the scheme and still mask.
+        .replace(/(?<![A-Za-z0-9_-])(bearer|basic)\s+([A-Za-z0-9._~+\/=-]{8,})/gi, (_m, scheme: string, tok: string) => `${scheme} <masked ${tok.length} chars>`)
         .replace(/(?<![A-Za-z0-9])(?:sk|xai)-[A-Za-z0-9_-]{8,}/g, "<masked key>")
         // Groq (gsk_…) and Hugging Face (hf_…) keys, both on PUBLIC_HOST_SUFFIXES.
         .replace(/(?<![A-Za-z0-9])(?:gsk|hf)_[A-Za-z0-9]{20,}/g, "<masked key>")
