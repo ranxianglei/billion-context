@@ -11,6 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { compareWires, parseUsageLog, renderJson, renderText, runDiff } from "../src/acp-cache-diff.ts";
+import { DUMP_PLAINTEXT_BANNER } from "../src/dump-banner.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #1266: `bili acp-cache diff <dump-dir>` — synthetic dump pairs covering the
@@ -164,6 +165,10 @@ test("runDiff: client-side rewrite forwarded verbatim attributes client", async 
 
 test("runDiff: stable outgoing prefix + collapsed cached tokens classifies prefix-stable-miss", async () => {
     const dir = tmpdir("acp-diff-miss-");
+    // Hermetic: runDiff's default log enumeration also scans the state-dir
+    // log — pin XDG_STATE_HOME so a host's live log cannot contribute samples.
+    const prevXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = dir;
     try {
         twoRequestSession(dir, "ses_a", T_A, T_B, {
             aIn: chatBody("gpt-x", [M1]), bIn: chatBody("gpt-x", [M1, M2]),
@@ -185,7 +190,11 @@ test("runDiff: stable outgoing prefix + collapsed cached tokens classifies prefi
         assert.equal(p.usage?.missedPrefix, 99000);
         assert.equal(p.usage?.hitPctB, 1);
         assert.ok(report.worst.some((w) => w.session === "ses_a" && w.pair.category === "prefix-stable-miss"));
-    } finally { rmrf(dir); }
+    } finally {
+        if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdg;
+        rmrf(dir);
+    }
 });
 
 test("runDiff: dense request cadence (<2s apart, compress-loop regime) still aligns usage — a later request must not steal its predecessor's response line", async () => {
@@ -195,6 +204,10 @@ test("runDiff: dense request cadence (<2s apart, compress-loop regime) still ali
     // undetected (pure-append + "no [acp-usage] data") precisely in the dense
     // compress-loop cadence this tool exists to diagnose.
     const dir = tmpdir("acp-diff-dense-");
+    // Hermetic: same as the prefix-stable-miss test above — keep the host's
+    // state-dir log out of runDiff's default enumeration.
+    const prevXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = dir;
     try {
         const tA = Date.parse("2026-09-24T14:32:04.500Z");
         const tB = tA + 1500; // 1.5s apart
@@ -213,7 +226,11 @@ test("runDiff: dense request cadence (<2s apart, compress-loop regime) still ali
         assert.equal(p.category, "prefix-stable-miss");
         assert.equal(p.usage?.inputA, 100000);
         assert.equal(p.usage?.cachedB, 1000);
-    } finally { rmrf(dir); }
+    } finally {
+        if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdg;
+        rmrf(dir);
+    }
 });
 
 test("runDiff: healthy usage (cached ≈ previous input) stays pure-append", async () => {
@@ -412,4 +429,136 @@ test("server: INCOMING dump filename carries the bound session id (#1266)", asyn
         if (upstream) await new Promise<void>((resolve, reject) => upstream!.close((e) => (e ? reject(e) : resolve())));
         rmrf(tmpRoot);
     }
+});
+
+// #6788: the long-retention body-only dumps (dumps/req-*.json, written by the
+// relay and the compress loop) must be picked up, paired, and deduped against
+// their wire-exact REQ.txt siblings — they are the only dumps that survive
+// past the raw/ retention window.
+
+function writeJsonDump(dir: string, ts: number, sid: string, body: string, reRequest = false): void {
+    const name = reRequest ? `req-${ts}-${sid}-REREQUEST.json` : `req-${ts}-${sid}.json`;
+    const pretty = JSON.stringify(JSON.parse(body), null, 2);
+    fs.writeFileSync(path.join(dir, name), `${DUMP_PLAINTEXT_BANNER}\n${pretty}`);
+}
+
+test("#6788: dumps/req-*.json body-only dumps are picked up and paired (long-retention format)", async () => {
+    const dir = tmpdir("acp-diff-json-");
+    try {
+        const dumps = path.join(dir, "dumps");
+        fs.mkdirSync(dumps);
+        writeJsonDump(dumps, T_A, "ses_j", chatBody("gpt-x", [M1]));
+        writeJsonDump(dumps, T_B, "ses_j", chatBody("gpt-x", [M1, M2]));
+        const report = await runDiff(dir, { noLog: true });
+        assert.equal(report.sessions.length, 1);
+        assert.equal(report.sessions[0]!.sid, "ses_j");
+        assert.equal(report.sessions[0]!.requests, 2);
+        assert.equal(report.totalPairs, 1);
+        const p = report.sessions[0]!.pairs[0]!;
+        assert.equal(p.category, "pure-append");
+        assert.equal(p.outgoingAppend?.kind, "json-tail");
+        assert.equal(p.modelA, "gpt-x");
+        assert.equal(p.modelB, "gpt-x");
+        assert.equal(p.incoming, "missing");
+    } finally { rmrf(dir); }
+});
+
+test("#6788: REREQUEST dumps (loop re-request rounds) are picked up and never deduped away", async () => {
+    const dir = tmpdir("acp-diff-rereq-");
+    try {
+        const dumps = path.join(dir, "dumps");
+        fs.mkdirSync(dumps);
+        // initial request: wire-exact REQ.txt capture (compact)
+        writeDump(dir, T_A, "ses_r", "REQ", chatBody("gpt-x", [M1]));
+        // loop round 1 lands 100ms after the initial capture — inside the
+        // dedup window, but a REREQUEST has no REQ.txt sibling and must survive
+        // (without the exemption it would be dropped as a same-request capture)
+        writeJsonDump(dumps, T_A + 100, "ses_r", chatBody("gpt-x", [M1, M2]), true);
+        // loop round 2
+        writeJsonDump(dumps, T_B, "ses_r", chatBody("gpt-x", [M1, M2, M3]), true);
+        const report = await runDiff(dir, { noLog: true });
+        assert.equal(report.sessions[0]!.requests, 3, "REREQUEST within the dedup window must not be dropped");
+        assert.equal(report.totalPairs, 2);
+        // pair 1: compact REQ.txt vs pretty REREQUEST — mixed formats, the
+        // byte divergence is formatting and the note must say so
+        const p1 = report.sessions[0]!.pairs[0]!;
+        assert.equal(p1.category, "mid-stream-rewrite");
+        assert.ok(p1.notes.some((n) => n.includes("mixed capture formats")), p1.notes.join("; "));
+        // pair 2: both pretty JSON — clean json-tail append
+        const p2 = report.sessions[0]!.pairs[1]!;
+        assert.equal(p2.category, "pure-append");
+        assert.equal(p2.outgoingAppend?.kind, "json-tail");
+    } finally { rmrf(dir); }
+});
+
+test("#6788: same-request dual capture (req-*.json + REQ.txt) dedups to the wire-exact REQ.txt", async () => {
+    const dir = tmpdir("acp-diff-dedup-");
+    try {
+        const dumps = path.join(dir, "dumps");
+        fs.mkdirSync(dumps);
+        // each request writes both captures a few ms apart (same relay call)
+        writeJsonDump(dumps, T_A, "ses_d", chatBody("gpt-x", [M1]));
+        writeDump(dir, T_A + 2, "ses_d", "REQ", chatBody("gpt-x", [M1]));
+        writeJsonDump(dumps, T_B, "ses_d", chatBody("gpt-x", [M1, M2]));
+        writeDump(dir, T_B + 2, "ses_d", "REQ", chatBody("gpt-x", [M1, M2]));
+        const report = await runDiff(dir, { noLog: true });
+        assert.equal(report.sessions[0]!.requests, 2, "each request counted once, not twice");
+        assert.equal(report.totalPairs, 1, "no spurious same-request pair");
+        const p = report.sessions[0]!.pairs[0]!;
+        assert.equal(p.category, "pure-append", "pretty-vs-compact of the SAME request must not read as a rewrite");
+        assert.equal(p.outgoingAppend?.kind, "json-tail");
+    } finally { rmrf(dir); }
+});
+
+test("#6788: other dumps/ files (err-*.json, summary-err-*.json, *-raw.sse, RES.txt) are not picked up", async () => {
+    const dir = tmpdir("acp-diff-neg-");
+    try {
+        const dumps = path.join(dir, "dumps");
+        const raw = path.join(dir, "raw");
+        fs.mkdirSync(dumps);
+        fs.mkdirSync(raw);
+        fs.writeFileSync(path.join(dumps, `err-${T_A}-ses_e-400.json`), `${DUMP_PLAINTEXT_BANNER}\n${JSON.stringify({ error: "boom" }, null, 2)}`);
+        fs.writeFileSync(path.join(dumps, `summary-err-${T_A}-ses_e-400.json`), `${DUMP_PLAINTEXT_BANNER}\n${JSON.stringify({ status: 400 }, null, 2)}`);
+        fs.writeFileSync(path.join(dumps, `${T_A}-ses_e-loop1-raw.sse`), "data: {\"x\":1}\n\n");
+        fs.writeFileSync(path.join(raw, `${T_A}-ses_e-RES.txt`), `${DUMP_PLAINTEXT_BANNER}\n200\ncontent-type: application/json\n`);
+        // the only genuine outgoing captures for this session
+        writeJsonDump(dumps, T_A, "ses_e", chatBody("gpt-x", [M1]));
+        writeJsonDump(dumps, T_B, "ses_e", chatBody("gpt-x", [M1, M2]));
+        const report = await runDiff(dir, { noLog: true });
+        assert.equal(report.sessions.length, 1);
+        assert.equal(report.sessions[0]!.sid, "ses_e");
+        assert.equal(report.sessions[0]!.requests, 2, "only the two req-*.json dumps count as requests");
+        assert.equal(report.totalPairs, 1);
+    } finally { rmrf(dir); }
+});
+
+test("#6788: body-only dumps take the model from the body (model-change note still fires)", async () => {
+    const dir = tmpdir("acp-diff-model-");
+    try {
+        const dumps = path.join(dir, "dumps");
+        fs.mkdirSync(dumps);
+        writeJsonDump(dumps, T_A, "ses_m", chatBody("gpt-x", [M1]));
+        writeJsonDump(dumps, T_B, "ses_m", chatBody("gpt-y", [M1, M2]));
+        const report = await runDiff(dir, { noLog: true });
+        const p = report.sessions[0]!.pairs[0]!;
+        assert.equal(p.modelA, "gpt-x");
+        assert.equal(p.modelB, "gpt-y");
+        assert.ok(p.notes.some((n) => n.includes("model changed gpt-x→gpt-y")), p.notes.join("; "));
+    } finally { rmrf(dir); }
+});
+
+test("#6788: mixed-format pair (pretty JSON vs wire-exact REQ.txt) carries a formatting caveat note", async () => {
+    const dir = tmpdir("acp-diff-mixed-");
+    try {
+        const dumps = path.join(dir, "dumps");
+        fs.mkdirSync(dumps);
+        // old request: only the pretty JSON survived (raw/ already GC'd);
+        // new request: wire-exact REQ.txt
+        writeJsonDump(dumps, T_A, "ses_x", chatBody("gpt-x", [M1]));
+        writeDump(dir, T_B + 1, "ses_x", "REQ", chatBody("gpt-x", [M1, M2]));
+        const report = await runDiff(dir, { noLog: true });
+        const p = report.sessions[0]!.pairs[0]!;
+        assert.equal(p.category, "mid-stream-rewrite");
+        assert.ok(p.notes.some((n) => n.includes("mixed capture formats")), p.notes.join("; "));
+    } finally { rmrf(dir); }
 });
