@@ -1710,6 +1710,20 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const noViableAnywhere = minChars > 0 && totalChars < minChars
                 ? ` This conversation holds only ${totalChars} char(s) — below the ${minChars}-char minimum, so NO range can succeed yet; do not retry compress or call acp_status/search_context about it — continue answering the user's task.`
                 : "";
+            // #7890: noViableAnywhere covers the sub-floor CONVERSATION. The
+            // other too-small shape — a LARGE conversation whose requested span
+            // is inherently below the minimum — still got only the kernel's
+            // fixable-shaped "Combine more messages" advice with no stop
+            // signal, so the model walked spec space probing range variants of
+            // the same doomed span (incident: 11 distinct too-small probes in
+            // one turn, every output token burned on a call that cannot pass
+            // the gate as shaped). The size is a property of the content, not
+            // the call shape — no re-issuing of the same span can pass. The
+            // single-error condition keeps mixed batches (unknown refs +
+            // too small) on the ref-fixing advice instead.
+            const tooSmallStop = minChars > 0 && noViableAnywhere === "" && r.errors.length === 1 && /too small/.test(errs)
+                ? ` That size is a property of the content, not the call shape — no re-issuing of this range in another form can pass the minimum, so do not retry this range in this turn. If this content must be folded, extend the range to include adjacent messages until the total reaches the minimum (acp_status lists the current compressible ranges); otherwise continue your task without compressing.`
+                : "";
             const dropped = droppedEntriesNote(diagnostics);
             const specKey = normalizedSpecKey(ranges);
             const repeatGuard = recordCompressFailure(ctx.session, specKey);
@@ -1720,7 +1734,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // to lead with has proven unread by the looping model — swap it for
             // the hard-stop paragraph instead of stacking more ignored advice.
             const hints = loopGuard === ""
-                ? `${beyond}${clamp}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
+                ? `${beyond}${clamp}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}${tooSmallStop}`
                 : `${beyond}${loopGuard}`;
             // #2360 §2: one instruction per receipt — while armed, the kernel's
             // "run acp_status and retry" guidance is scrubbed from the model-
