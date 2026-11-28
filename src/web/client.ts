@@ -3350,11 +3350,13 @@ function changelogCatOf(rawLine) {
     }
 
 
-    function buildTreePane(blocks) {
+    function buildTreePane(blocks, authoredCheckpointLanded) {
         const parts = [];
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: blocks.filter(function (b) { return b.active; }).length }) + '</span></div><div class="card-b">');
         if (!blocks.length) {
-            parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div></div></div>");
+            // #7788: after an authored-checkpoint rebase the blocks are wiped by
+            // design — explain it instead of letting "0" read as data loss.
+            parts.push('<div class="dim small" style="padding:8px 0">' + t(authoredCheckpointLanded ? "det.blocks_empty_rebased" : "det.blocks_empty") + "</div></div></div>");
             return parts.join("");
         }
         window.__biliDetailBlocks = blocks; // consumed by bindTreeModeActions() after insertion
@@ -3815,7 +3817,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             parts.push("</div></div>");
         }
         parts.push("</div>");
-        parts.push('<div class="det-pane" data-pane="blocks" hidden>' + buildTreePane(blocks) + "</div>");
+        parts.push('<div class="det-pane" data-pane="blocks" hidden>' + buildTreePane(blocks, !!d.authoredCheckpointLanded) + "</div>");
         parts.push('<div class="det-pane" data-pane="handoff" hidden>');
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.handoff") + '</span><span class="hint">' + t("det.handoff_hint") + '</span></div><div class="card-b">');
         // #1426: copy / download actions over the rendered handoff document

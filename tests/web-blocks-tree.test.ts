@@ -497,7 +497,7 @@ test("#4608: the pane's strings exist in both locales with identical placeholder
 
 test("#4608: the web client bundle stays parseable JS with the master-detail pane wired", () => {
     assert.doesNotThrow(() => new vm.Script(WEB_CLIENT), "WEB_CLIENT must compile as a standalone script");
-    assert.match(WEB_CLIENT, /function buildTreePane\(blocks\)/);
+    assert.match(WEB_CLIENT, /function buildTreePane\(blocks,\s*authoredCheckpointLanded\)/);
     assert.match(WEB_CLIENT, /\/block-content\?blockId=/);
     // collapsible tree reading (default) + the restored classic list
     assert.match(WEB_CLIENT, /function collapTreeLayout\(blocks/);
