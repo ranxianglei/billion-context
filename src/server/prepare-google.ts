@@ -355,8 +355,16 @@ export async function prepareGoogle(
                 recordConflict(session, "id-churn-adoption", `${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known; fold-reconcile re-anchored every covered id (0 unmatched) — bili-side id re-mint across builds (#3642), not a client rewrite — no compaction boundary (#4131)`);
                 log("info", `[${sessionId}] cross-build id churn adopted: hash-identity collapse (${rewrite.knownIncoming}/${rewrite.incomingTotal} pre-turn refs of ${rewrite.knownBefore} known) explained by fold-reconcile full re-anchor (0 unmatched) — skipping compaction boundary (#4131/#3642)`);
             } else if (rewrite.detected) {
-                log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);
-                recordConflict(session, "unannounced-rewrite", `${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known`);
+                // #6653: a rewrite with no active fold blocks to lose is a clean rebase — the
+                // client's own native compaction, not a second compressor. Classify as
+                // native-compaction (handled tier, quiet) instead of unannounced-rewrite (alarm).
+                const cleanRebase = activeBefore.size === 0;
+                log("warn", `[${sessionId}] ${cleanRebase ? "client-native compaction landing (clean rebase; no active fold blocks to lose)" : "unannounced client history rewrite"} detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001${cleanRebase ? "/#6653" : ""})`);
+                if (cleanRebase) {
+                    recordConflict(session, "native-compaction", `clean rebase: no active fold blocks before processTurn; ${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming carry pre-turn refs of ${rewrite.knownBefore} known — client-native compaction, no fold base lost (#6653)`);
+                } else {
+                    recordConflict(session, "unannounced-rewrite", `${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known`);
+                }
                 markCompactionBoundary(session);
             }
         }

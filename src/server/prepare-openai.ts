@@ -674,9 +674,15 @@ export async function prepareOpenai(
             } else if (rewrite.detected) {
                 // #2709: attribute a framing-absent rewrite to client-native compaction when bili witnessed the client's own compaction being refused — stops the phantom-second-compressor errand.
                 const dshWitness = dshNativeCompactionWitness(session, { incomingTotal: rewrite.incomingTotal, knownBefore: rewrite.knownBefore });
-                log("warn", `[${sessionId}] ${dshWitness !== undefined ? "client-native compaction landing (framing absent; attributed from refusal ledger)" : "unannounced client history rewrite"} detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001${dshWitness !== undefined ? "/#2709" : ""})`);
+                // #6653: a rewrite with no active fold blocks to lose is a clean rebase — the
+                // client's own native compaction, not a second compressor. Classify as
+                // native-compaction (handled tier, quiet) instead of unannounced-rewrite (alarm).
+                const cleanRebase = activeBefore.size === 0;
+                log("warn", `[${sessionId}] ${dshWitness !== undefined ? "client-native compaction landing (framing absent; attributed from refusal ledger)" : cleanRebase ? "client-native compaction landing (clean rebase; no active fold blocks to lose)" : "unannounced client history rewrite"} detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001${dshWitness !== undefined ? "/#2709" : cleanRebase ? "/#6653" : ""})`);
                 if (dshWitness !== undefined) {
                     recordConflict(session, "native-compaction-inferred", `framing absent on replay; bili refused ${dshWitness} client-native compaction call(s) this session (#1729/#2028) — attributed to client-native compaction [inferred] (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming carry pre-turn refs of ${rewrite.knownBefore} known, #2709)`);
+                } else if (cleanRebase) {
+                    recordConflict(session, "native-compaction", `clean rebase: no active fold blocks before processTurn; ${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming carry pre-turn refs of ${rewrite.knownBefore} known — client-native compaction, no fold base lost (#6653)`);
                 } else {
                     recordConflict(session, "unannounced-rewrite", `${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known`);
                 }
