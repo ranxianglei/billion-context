@@ -36,6 +36,35 @@ test("streaming digest escapes long strings without splitting surrogate pairs", 
     });
 });
 
+test("streaming digest includes own __proto__ fields in retained JSON (#6222)", () => {
+    const withOriginal = JSON.parse('{"__proto__":{"value":"original"},"text":"kept"}');
+    const withChanged = JSON.parse('{"__proto__":{"value":"changed"},"text":"kept"}');
+    const without = JSON.parse('{"text":"kept"}');
+    // Nested retained tool-argument shape has the same blind spot.
+    const nestedOriginal = JSON.parse('{"args":{"__proto__":{"v":"a"},"k":"x"}}');
+    const nestedChanged = JSON.parse('{"args":{"__proto__":{"v":"b"},"k":"x"}}');
+
+    // Three failures on unchanged master:
+    // 1. Changing the __proto__ value changes the digest.
+    assert.notEqual(canonicalDigest(withOriginal), canonicalDigest(withChanged));
+    // 2. Presence of __proto__ changes the digest.
+    assert.notEqual(canonicalDigest(withOriginal), canonicalDigest(without));
+    // 3. canonicalize creates an OWN __proto__ data property (not the prototype setter).
+    const canon = canonicalize(withOriginal) as object;
+    assert.ok(Object.hasOwn(canon, "__proto__"));
+    // The output prototype is untouched — only an own property is added.
+    assert.equal(Object.getPrototypeOf(canon), Object.prototype);
+    // Nested retained content contributes too.
+    assert.notEqual(canonicalDigest(nestedOriginal), canonicalDigest(nestedChanged));
+
+    // One passing control: the streaming digest still matches the legacy oracle.
+    matchesLegacy(withOriginal);
+    matchesLegacy(withChanged);
+    matchesLegacy(without);
+    matchesLegacy(nestedOriginal);
+    matchesLegacy(nestedChanged);
+});
+
 test("streaming digest changes when retained history changes", () => {
     const before = { blockContents: new Map([["b1", { full: { text: "original" } }]]) };
     const after = { blockContents: new Map([["b1", { full: { text: "changed" } }]]) };
