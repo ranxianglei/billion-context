@@ -123,11 +123,15 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // re-anchor the client answers with a full-form resend (one-round
     // convergence); flipping the key back to 0 400s every delta turn, which
     // is the rollback path (clients converge to the full form within one
-    // turn). Default OFF until the shim send-sides ship — a delta body is
-    // unprocessable by older servers, so both ends must roll together.
-    // Force with `rollout.features.pluginDeltaResend: true` or
-    // `BILI_ROLLOUT_PLUGIN_DELTA_RESEND=1`.
-    pluginDeltaResend: { percent: 0 },
+    // turn). ON under eg-on (owner ruling 2026-11-28, regression-conservative): the
+    // delta arm is SCOPED to the egress plane - active only when the global
+    // egress gate is on; an eg-off instance 400-reanchors a delta claim so the
+    // client resends this turn in full form (no new code path touches a legacy
+    // deployment). The server handles the delta arm (direct-append) ALONGSIDE
+    // the full / incremental / tail / non-intersecting shapes; it is inert
+    // until a shim actually claims delta (x-bili-pf-delta: 1). Roll back with
+    // `BILI_ROLLOUT_PLUGIN_DELTA_RESEND=0`.
+    pluginDeltaResend: { percent: 100 },
     // #7398/#7439: the egress plane — ONE switch for the whole new path.
     // ON: every lane (OpenAI/Anthropic/Responses/Google) records its
     // outbound conversation view as sparse ops (I/D/U) into the
@@ -141,26 +145,12 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // partial swap, never client-as-authority). OFF = legacy chain, zero
     // rows, byte-identical to pre-feature.
     // Force with `rollout.features.egressPlane: true` or
-    // `BILI_ROLLOUT_EGRESS_PLANE=1`.
-    egressPlane: { percent: 100 }, // ci:full verification branch: default ON (not to be merged as-is)
-    // #7658 PR-B (owner ruling 2026-11-25): the egress-on kstate retirement,
-    // two independent gates so the rollout (and the rollback) is staged.
-    // egressKstateRetireWrites: the sessions.kstate_json column stops
-    // carrying the FULL kernel state of egress-on sessions — only the
-    // bounded residual (the same field set the block-ledger sidecar carries);
-    // blocks/messageRefs/tsStamps/tokenSnapshot/lastPassIds are all
-    // reconstructable from the op log. 0 = legacy double-write.
-    // Force with BILI_ROLLOUT_EGRESS_KSTATE_RETIRE_WRITES=1.
-    egressKstateRetireWrites: { percent: 100 }, // ci:full verification branch: default ON (not to be merged as-is)
-    // egressKstateRebuild: at LOAD, the egress-on kstate is rebuilt from
-    // (message flow → messageRefs/tsStamps) + (block ledger → blocks +
-    // sidecar residual); any replay corruption keeps the stored column
-    // verbatim (no fuzzy guessing). 0 = legacy (read the column verbatim).
-    // Force with BILI_ROLLOUT_EGRESS_KSTATE_REBUILD=1.
-    // Rollback order matters: flip RetireWrites back to 0 FIRST (the next
-    // save re-fills the full column), only then Rebuild back to 0 — a
-    // residual-only column has nothing to read verbatim.
-    egressKstateRebuild: { percent: 100 }, // ci:full verification branch: default ON (not to be merged as-is)
+    // `BILI_ROLLOUT_EGRESS_PLANE=1`. NOTE: this entry's percent is
+    // structurally inert — the plane has ONE side-effect-free gate
+    // (egressPlaneGateOn in knobs.ts) that reads env > config boolean only;
+    // install-id bucketing is unusable on the store-open path (KDD #25 wx
+    // race), and two disagreeing gates manufacture mixed states.
+    egressPlane: { percent: 0 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
     // message identity aligned from their OWN local transcript/sqlite
@@ -501,6 +491,14 @@ export function warnRolloutConfigProblems(): void {
         }
         if (raw.percent !== undefined && percentBp(raw.percent) === undefined) {
             problems.push(`${name}.percent (ignored: must be a number 0–100, got ${JSON.stringify(raw.percent)})`);
+        }
+        // egressPlane has a single side-effect-free gate (egressPlaneGateOn)
+        // that ignores install-id bucketing (KDD #25: featureEnabled's
+        // bootstrap races inside UnifiedStore.open) — a percent-only
+        // override for it does nothing at all; name it like every other
+        // inert entry instead of letting it silently no-op.
+        if (name === "egressPlane" && raw.percent !== undefined && raw.enabled !== true) {
+            problems.push(`${name}.percent (no effect: the egress plane's single gate ignores bucketing — use enabled: true or BILI_ROLLOUT_EGRESS_PLANE=1)`);
         }
     }
     if (problems.length === 0) return;

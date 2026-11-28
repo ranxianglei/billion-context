@@ -7,6 +7,12 @@ import { SessionStore } from "../src/persist.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import type { Session } from "../src/session.ts";
 
+// KDD #25: this suite contracts the LEGACY kv budget (4 MB byte limit on
+// every key). The eg-plane 256-char cap is covered by
+// tests/eg-sweep-egress-identity.test.ts (A4) with the flag on; pin the flag
+// off so host configs cannot flip the cap on and break these assertions.
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
+
 /**
  * #3069 extension namespaces (schema v4): session_ext (per-session
  * arbitrary state) and kv_store (namespaced cross-session state).

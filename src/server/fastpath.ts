@@ -36,6 +36,7 @@ import type { OpenAIRequestBody } from "acp-kernel/wire";
 import { openaiToCore } from "acp-kernel/wire";
 import type http from "node:http";
 import { featureEnabled } from "../rollout.js";
+import { egressPlaneGateOn } from "../knobs.js";
 import { getStore } from "../persist.js";
 import type { Session } from "../session.js";
 import { type RawStripCounts, stripRawStage } from "../marker/engine.js";
@@ -613,6 +614,11 @@ export function evaluateDeltaResend(
     };
     if (String(rawDelta) !== "1") return reanchor("delta-bad-value");
     if (!featureEnabled("pluginDeltaResend")) return reanchor("rollout-off");
+    // #7875 (owner ruling 2026-11-28, regression-conservative): the delta arm is
+    // scoped to the egress plane - active only under eg-on. An eg-off instance
+    // 400-reanchors a delta claim so the client resends this turn in full form
+    // (no new code path touches a legacy deployment).
+    if (!egressPlaneGateOn()) return reanchor("eg-off");
     if (!input.pluginMode || input.titleGen) return reanchor("gate");
     const tail: unknown[] | null = Array.isArray(parsed.messages) ? parsed.messages : null;
     const seed = seeds.get(session);
