@@ -20,6 +20,7 @@ import { contextAnalysisView, type ContextAnalysisView } from "../context-analys
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
 import { isExternalSummaryBlock } from "../external-summary-marker.js";
+import { parentConversationId } from "../plugin.js";
 import { readdirSync, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import * as path from "node:path";
@@ -43,14 +44,24 @@ import * as path from "node:path";
 // not "notable".
 const SLOW_SESSION_REQUESTS_WARN = 5000;
 
+// #7876: "live" in the sessions UI means ACTIVE, not merely resident. The
+// in-memory pool only evicts when full, so on a long-running daemon every
+// session seen since process start stays resident — residency is a no-op
+// filter. A session is "live" only while in memory AND seen within this
+// window. 10 min is the repo's existing active/fresh convention
+// (SPLIT_CANARY_FRESH_MS, PERSONA_LINEAGE_FRESH_MS).
+const WEB_ACTIVE_WINDOW_MS = 10 * 60_000;
+
 interface WebSessionSummary {
     id: string;
     title?: string;
     label?: string;
     protocol?: string;
     upstreamOrigin?: string;
-    /** true = present in the live in-memory pool (active or recently restored);
-     *  false = disk-only (evicted or from before this process started). */
+    /** #7876: true = ACTIVE — present in the in-memory pool AND seen within
+     *  WEB_ACTIVE_WINDOW_MS (10 min). Residency alone is NOT live: the pool only
+     *  evicts when full, so an idle-but-resident session is history, not live.
+     *  false = evicted, disk-only, or resident-but-idle. */
     live: boolean;
     requests: number;
     /** #5796: set once requests reach SLOW_SESSION_REQUESTS_WARN — the host-side
@@ -85,8 +96,15 @@ interface WebSessionSummary {
     /** Display-name fallback: collapsed lead of the first compression block's topic/summary. */
     firstBlockHint?: string;
     /** Which client produced this session: plugin agents stamp metadata.pluginAgent,
-     *  non-plugin clients get a sniffed/UA-derived metadata.clientHint (server.ts #1426). */
+     *  non-plugin clients get a sniffed/UA-derived metadata.clientHint (server.ts #1426).
+     *  #7876: child (:side:/:sub:) sessions inherit their parent's clientHint. */
     clientHint?: string;
+    /** #7876: true when this is a client-minted child conversation
+     *  (`<parent>:side:<id>` / `<parent>:sub:<id>`, CHILD_CONVERSATION_SUFFIX) —
+     *  a one-shot auxiliary call, not a top-level session. Hidden from the list
+     *  by default; `parent` is the parent conversation id. */
+    child?: boolean;
+    parent?: string;
     /** #4571: which engine served this session — "inline" (pi in-process) or
      *  "server" (standalone proxy process). Absent on pre-stamp sessions. */
     engineLane?: "inline" | "server";
@@ -793,7 +811,11 @@ function hitPct(input: number, cached: number): number | null {
     return input > 0 ? Math.round((cached / input) * 100) : null;
 }
 
-function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
+function summaryOf(s: SummarySource, resident: boolean): WebSessionSummary {
+    // #7876: "live" = ACTIVE (in memory AND seen within WEB_ACTIVE_WINDOW_MS).
+    // The resident param is the pool-membership signal (drives keepalive below);
+    // the returned `live` field is the recency-gated active state the UI filters on.
+    const active = resident && Date.now() - s.lastSeen < WEB_ACTIVE_WINDOW_MS;
     // Dual-source token counters: session.stats accumulates upstream-reported
     // usage; metadata.cacheLedger.agg accumulates the ACP/web ledger samples.
     // Per-field MAX (the sources overlap, never sum). Read-only on purpose:
@@ -957,11 +979,14 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
+    // #7876: child (:side:/:sub:) conversations are one-shot auxiliary calls; mark
+    // them so the list can hide them by default and inherit the parent's clientHint.
+    const parent = parentConversationId(s.id);
     // #4571: engine-lane stamp (handle.ts); only the two known values pass —
     // anything else in a hand-edited file renders as "not stamped".
     const engineLane = metaRec["engineLane"] === "inline" || metaRec["engineLane"] === "server" ? metaRec["engineLane"] : undefined;
     // #3376: idle cache-keepalive state — memory-only, so live rows only.
-    const keepalive = live ? keepaliveStatusFor(s.id) : undefined;
+    const keepalive = resident ? keepaliveStatusFor(s.id) : undefined;
     const best = displayContextBest(s);
     return {
         id: s.id,
@@ -977,7 +1002,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(shadowBlob && (shadowBlob.turns ?? 0) > 0
             ? { snapshotShadow: { turns: shadowBlob.turns as number, errors: shadowBlob.errors ?? 0, lastClass: (shadowBlob.lastClass as "watch" | "degraded" | "error") ?? "watch", ...(shadowBlob.lastReason ? { lastReason: shadowBlob.lastReason } : {}) } }
             : {}),
-        live,
+        live: active,
         requests,
         ...(requests >= SLOW_SESSION_REQUESTS_WARN ? { slowSession: { requests } } : {}),
         contextTokens: s.stats.contextTokens,
@@ -1022,6 +1047,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             ? { keySwitches: agg.agg.keySwitches, keySwitchMissedTokens: agg?.agg?.keySwitchMissed ?? 0 }
             : {}),
         ...(clientHint ? { clientHint } : {}),
+        ...(parent ? { child: true, parent } : {}),
         ...(engineLane ? { engineLane } : {}),
     };
 }
@@ -1059,6 +1085,19 @@ async function mergedSummaries(): Promise<WebSessionSummary[]> {
         for (const e of files.values()) if (e.summary) out.set(e.summary.id, e.summary);
     }
     for (const s of listSessions()) out.set(s.id, summaryOf(s, true));
+    // #7876: child (:side:/:sub:) sessions carry a UA-sniffed clientHint (e.g.
+    // "claude") even when the parent is a stamped plugin agent (e.g. "omp") — they
+    // never register runtime-info under their own id. Inherit the parent's hint so
+    // the row shows the real client. Parent absent (evicted + no disk file) → keep
+    // the child's own hint (graceful degradation).
+    const hintById = new Map<string, string>();
+    for (const s of out.values()) if (s.clientHint) hintById.set(s.id, s.clientHint);
+    for (const s of out.values()) {
+        if (s.child && s.parent) {
+            const inherited = hintById.get(s.parent);
+            if (inherited) s.clientHint = inherited;
+        }
+    }
     return [...out.values()].sort((a, b) => b.lastSeen.localeCompare(a.lastSeen));
 }
 
@@ -1076,6 +1115,9 @@ interface SessionPageQuery {
     protocol?: string;
     client?: string;
     state?: SessionPageState;
+    /** #7876: include child (:side:/:sub:) sessions in the list. Default false =
+     *  hidden — they are one-shot auxiliary calls that flood the list. */
+    showChildren?: boolean;
     page?: number;
     pageSize: number;
 }
@@ -1097,8 +1139,11 @@ interface SessionPageResult {
  *  much history lies behind the requested page. */
 export async function buildSessionPage(query: SessionPageQuery): Promise<SessionPageResult> {
     const all = await mergedSummaries();
-    const vis = all.filter((s) => !isEmptyStub(s));
-    lastHiddenEmpty = all.length - vis.length;
+    const nonStub = all.filter((s) => !isEmptyStub(s));
+    lastHiddenEmpty = all.length - nonStub.length;
+    // #7876: child (:side:/:sub:) sessions are one-shot auxiliary calls that flood
+    // the list (65:39 in the report). Hidden by default; `showChildren` reveals them.
+    const vis = query.showChildren ? nonStub : nonStub.filter((s) => !s.child);
     const unfilteredTotal = vis.length;
     const q = (query.q ?? "").trim().toLowerCase();
     const protocol = (query.protocol ?? "").trim().toLowerCase();
@@ -1113,8 +1158,8 @@ export async function buildSessionPage(query: SessionPageQuery): Promise<Session
         }
         if (protocol && (s.protocol ?? "unknown").toLowerCase() !== protocol) return false;
         if (client && (s.clientHint ?? "").toLowerCase() !== client) return false;
-        if (query.state === "live" && (!s.live || s.restored)) return false;
-        if (query.state === "history" && s.live && !s.restored) return false;
+        if (query.state === "live" && !s.live) return false;
+        if (query.state === "history" && s.live) return false;
         return true;
     });
     const total = filtered.length;
@@ -1157,9 +1202,10 @@ export async function buildOverview(): Promise<WebOverview> {
         output += s.outputTokens;
         saved += s.tokensSaved;
         blocks += s.blocks;
-        // Disk-restored sessions count as history: the pool still holds them,
-        // but their process died — only never-restored entries are "live".
-        if (s.live && !s.restored) live += 1;
+        // #7876: "live" is now recency-gated active (in memory AND seen within
+        // WEB_ACTIVE_WINDOW_MS) — a recently-used restored session IS live, so the
+        // old !restored exclusion is gone.
+        if (s.live) live += 1;
         // tokensSaved is a local estimate (upstream never reports it); flag
         // the share coming from sessions without usage samples (ledger).
         const key = s.protocol ?? "unknown";
@@ -1378,7 +1424,7 @@ export async function buildSessionTree(id: string): Promise<{ blocks: WebSession
     return { blocks };
 }
 
-function renderDetail(session: Session, live: boolean): WebSessionDetail {
+function renderDetail(session: Session, resident: boolean): WebSessionDetail {
     // renderHandoff reads lastMessages (a bounded snapshot) — safe for disk
     // sessions; the v2 fallback path renders header + block summaries.
     let handoffMd = "";
@@ -1524,7 +1570,7 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     };
 
     return {
-        ...summaryOf(session, live),
+        ...summaryOf(session, resident),
         lastInputTokens: session.stats.lastInputTokens,
         compressCreditTokens: session.stats.compressCreditTokens,
         retrieveCalls: session.stats.retrieveCalls,

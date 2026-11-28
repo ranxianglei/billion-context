@@ -1312,6 +1312,82 @@ test("#1937: buildSessionPage filters stubs first so hiddenEmpty keeps its meani
     }
 });
 
+// #7876 P1: `live` means ACTIVE (in memory AND seen within the 10-min window),
+// not merely resident. A long-running daemon's pool keeps idle sessions forever
+// (eviction is count/byte-cap only), so residency alone marked everything live.
+withSessionsDir("#7876 P1: live = active (recent), not merely resident", async (_dir) => {
+    _resetSessionsForTest();
+    const idle = getSession("idle-7876", { protocol: "openai" });
+    idle.lastSeen = Date.now() - 2 * 60 * 60 * 1000; // 2h ago — resident but idle
+    idle.stats.requests = 5;
+    idle.stats.inputTokens = 100;
+    idle.stats.contextTokens = 50;
+    const fresh = getSession("fresh-7876", { protocol: "openai" });
+    fresh.lastSeen = Date.now(); // just now — resident and active
+    fresh.stats.requests = 5;
+    fresh.stats.inputTokens = 100;
+    fresh.stats.contextTokens = 50;
+    _resetDiskCacheForTest();
+
+    const list = await buildSessionList();
+    const idleRow = list.find((s) => s.id === "idle-7876");
+    const freshRow = list.find((s) => s.id === "fresh-7876");
+    assert.ok(idleRow && freshRow, "both non-stub resident sessions are listed");
+    assert.equal(freshRow.live, true, "recently-seen resident session is live");
+    assert.equal(idleRow.live, false, "idle (2h) resident session is NOT live — residency alone is not live");
+
+    // The state filter now discriminates: live returns only the active one.
+    const livePage = await buildSessionPage({ state: "live", pageSize: 50 });
+    assert.deepEqual(livePage.sessions.map((s) => s.id), ["fresh-7876"]);
+    const histPage = await buildSessionPage({ state: "history", pageSize: 50 });
+    assert.deepEqual(histPage.sessions.map((s) => s.id), ["idle-7876"]);
+    // Overview counts active sessions only.
+    const ov = await buildOverview();
+    assert.equal(ov.live, 1, "overview live count is active-only");
+});
+
+// #7876 P2: child (:side:/:sub:) sessions are one-shot auxiliary calls that flood
+// the list. Hidden by default; `showChildren` reveals them and they inherit the
+// parent's clientHint (so omp's auxiliary calls read as omp, not the UA-sniffed claude).
+withSessionsDir("#7876 P2: child sessions hidden by default, inherit parent clientHint", async (_dir) => {
+    _resetSessionsForTest();
+    const parent = getSession("parent-7876", { protocol: "openai" });
+    parent.metadata = { pluginAgent: "omp" };
+    parent.stats.requests = 5;
+    parent.stats.inputTokens = 100;
+    parent.stats.contextTokens = 50;
+    const side = getSession("parent-7876:side:abc123", { protocol: "openai" });
+    side.metadata = { clientHint: "claude" }; // UA-sniffed, wrong for an omp auxiliary call
+    side.stats.requests = 1;
+    side.stats.inputTokens = 20;
+    side.stats.contextTokens = 10;
+    const sub = getSession("parent-7876:sub:xyz789", { protocol: "openai" });
+    sub.stats.requests = 1;
+    sub.stats.inputTokens = 20;
+    sub.stats.contextTokens = 10;
+    _resetDiskCacheForTest();
+
+    // Default: children hidden.
+    const def = await buildSessionPage({ pageSize: 50 });
+    assert.deepEqual(def.sessions.map((s) => s.id), ["parent-7876"], "children hidden by default");
+    assert.equal(def.unfilteredTotal, 1, "unfiltered total reflects the child-hidden view");
+
+    // showChildren: children revealed, marked, and inherit the parent's clientHint.
+    const all = await buildSessionPage({ showChildren: true, pageSize: 50 });
+    assert.equal(all.sessions.length, 3);
+    const sideRow = all.sessions.find((s) => s.id === "parent-7876:side:abc123");
+    const subRow = all.sessions.find((s) => s.id === "parent-7876:sub:xyz789");
+    const parentRow = all.sessions.find((s) => s.id === "parent-7876");
+    assert.ok(sideRow && subRow && parentRow);
+    assert.equal(sideRow.child, true);
+    assert.equal(sideRow.parent, "parent-7876");
+    assert.equal(sideRow.clientHint, "omp", "child inherits the parent's clientHint (omp, not the UA-sniffed claude)");
+    assert.equal(subRow.child, true);
+    assert.equal(subRow.parent, "parent-7876");
+    assert.equal(subRow.clientHint, "omp", "child with no own hint still inherits the parent's");
+    assert.ok(!parentRow.child, "the parent row is not marked as a child");
+});
+
 // ---------------------------------------------------------------------------
 // #2960 R2.2: unified-first web surfaces (full mode)
 // ---------------------------------------------------------------------------

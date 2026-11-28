@@ -1414,7 +1414,8 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
             u.searchParams.has("q") ||
             u.searchParams.has("protocol") ||
             u.searchParams.has("client") ||
-            u.searchParams.has("state");
+            u.searchParams.has("state") ||
+            u.searchParams.has("children");
         if (paged) {
             const rawSize = Number(u.searchParams.get("pageSize"));
             const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
@@ -1428,6 +1429,7 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
                     protocol: u.searchParams.get("protocol") ?? undefined,
                     client: u.searchParams.get("client") ?? undefined,
                     state,
+                    showChildren: u.searchParams.get("children") === "1",
                     page,
                     pageSize,
                 })),

@@ -722,7 +722,7 @@ export const WEB_CLIENT = `(function () {
         // not live.
         const named = Boolean(s.title || s.label || s.firstBlockHint);
         const name = s.title || s.label || s.firstBlockHint || t("ses.no_title");
-        const live = s.live && !s.restored;
+        const live = s.live;
         // Only actively running sessions get a status tag; disk/restored rows carry none.
         // The whole cell is a real hash anchor: plain clicks route inside the SPA exactly as
         // before (the row handler bails on <a>), while Ctrl/Cmd+click or middle-click opens
@@ -803,9 +803,14 @@ export const WEB_CLIENT = `(function () {
             const laneChip = s.engineLane === "inline"
                 ? ' <span class="badge proto" title="' + escapeHtml(t("det.engine_lane_inline")) + '">inline</span>'
                 : s.engineLane === "server" ? ' <span class="badge proto dim" title="' + escapeHtml(t("det.engine_lane_server")) + '">srv</span>' : "";
+            // #7876: child (:side:/:sub:) sessions are one-shot auxiliary calls —
+            // mark them so the row reads as a sub-call, not a top-level session.
+            const childChip = s.child
+                ? ' <span class="badge child" title="' + escapeHtml(t("ses.badge_child_tip")) + '">' + t("ses.badge_child") + "</span>"
+                : "";
             const clientCell = clientHint
-                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>" + laneChip
-                : '<span class="dim">' + t("common.none") + "</span>" + laneChip;
+                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>" + laneChip + childChip
+                : '<span class="dim">' + t("common.none") + "</span>" + laneChip + childChip;
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td class="client-cell">' + clientCell + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
@@ -1847,11 +1852,14 @@ function changelogCatOf(rawLine) {
         const protocol = filterValue("ses-protocol");
         const client = filterValue("ses-client");
         const state = filterValue("ses-state");
+        const childrenEl = $("ses-children");
+        const showChildren = Boolean(childrenEl && childrenEl.checked);
         return API_ROOT + "/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE +
             (q ? "&q=" + encodeURIComponent(q) : "") +
             (protocol ? "&protocol=" + encodeURIComponent(protocol) : "") +
             (client ? "&client=" + encodeURIComponent(client) : "") +
-            (state ? "&state=" + encodeURIComponent(state) : "");
+            (state ? "&state=" + encodeURIComponent(state) : "") +
+            (showChildren ? "&children=1" : "");
     }
     function filterValue(id) {
         const el = $(id);
@@ -1893,7 +1901,8 @@ function changelogCatOf(rawLine) {
     }
     function hasActiveFilters() {
         const q = (($("ses-search") && $("ses-search").value) || "").trim();
-        return Boolean(q || filterValue("ses-protocol") || filterValue("ses-client") || filterValue("ses-state"));
+        const childrenEl = $("ses-children");
+        return Boolean(q || filterValue("ses-protocol") || filterValue("ses-client") || filterValue("ses-state") || (childrenEl && childrenEl.checked));
     }
     function updatePager() {
         const prev = $("ses-prev");
@@ -1922,6 +1931,8 @@ function changelogCatOf(rawLine) {
         const search = $("ses-search");
         if (search) search.value = "";
         ["ses-protocol", "ses-client", "ses-state"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
+        const childrenEl = $("ses-children");
+        if (childrenEl) childrenEl.checked = false;
         return refreshSessions(false, 1);
     }
     function renderSessionTable() {
@@ -2735,7 +2746,7 @@ function changelogCatOf(rawLine) {
         return plain.length > 48 ? plain.slice(0, 48) + "…" : plain || b.blockId;
     }
     function detailBadges(d) {
-        const live = d.live && !d.restored;
+        const live = d.live;
         let html = "";
         if (live) html = '<span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>";
         if (d.protocol) html += (html ? " " : "") + protoBadge(d.protocol);
@@ -5743,6 +5754,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const el = $(id);
             if (el) el.addEventListener("change", () => refreshSessions(false, 1));
         });
+        const sesChildren = $("ses-children");
+        if (sesChildren) sesChildren.addEventListener("change", () => refreshSessions(false, 1));
         const reset = $("ses-reset-filters");
         if (reset) reset.addEventListener("click", resetSessionFilters);
         const prev = $("ses-prev");
