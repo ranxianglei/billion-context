@@ -48,12 +48,27 @@ function fnv1a32(text: string, basis: number): number {
     return h >>> 0;
 }
 
+/** Normalize Arabic Tashkeel/Tatweel, Alef/Teh-Marbuta/Yeh variants, and
+ *  Eastern-Arabic digits so vocalized and unvocalized Arabic messages yield
+ *  identical word-token bigram shingles in SimHash. */
+export function normalizeArabicForSimhash(input: string): string {
+    return input
+        .replace(/[\u0640\u064B-\u065F\u0670\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g, "")
+        .replace(/[أإآٱ]/g, "ا")
+        .replace(/ة/g, "ه")
+        .replace(/ى/g, "ي")
+        .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+        .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x06f0));
+}
+
 /** 64-bit simhash of a canonical message string, as 16 lowercase hex chars.
  *  Features are consecutive word-token pairs (bigram shingles); Unicode word
- *  runs so CJK behaves. Degenerate inputs (< 2 tokens) fall back to unigrams
+ *  runs so CJK and Arabic (with combining marks \p{M} normalized) behave.
+ *  Degenerate inputs (< 2 tokens) fall back to unigrams
  *  so a short message still yields a stable, comparable sketch. */
 export function simhashHex(canonical: string): string {
-    const tokens = canonical.match(/[\p{L}\p{N}_]+/gu) ?? [];
+    const normalized = normalizeArabicForSimhash(canonical);
+    const tokens = normalized.match(/[\p{L}\p{M}\p{N}_]+/gu) ?? [];
     const featureCount = Math.max(1, tokens.length - 1);
     const stride = Math.max(1, Math.ceil(featureCount / MAX_FEATURES));
     const v = new Int16Array(64);
