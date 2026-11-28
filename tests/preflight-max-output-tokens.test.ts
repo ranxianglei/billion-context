@@ -124,10 +124,14 @@ function isSummaryCall(parsed: ParsedBody): boolean {
     return typeof parsed.instructions === "string" && Array.isArray(parsed.input) && parsed.input.length === 1;
 }
 
-function longResponsesInput(count: number) {
+// #5738: scenarios run against ONE process-wide prefix-affinity resolver, so
+// byte-identical transcripts under different session ids would look like fork
+// shapes and inherit each other's fold state. Each scenario gets a tag (kept
+// OUTSIDE the repeated filler so token budgets stay put).
+function longResponsesInput(count: number, tag = "") {
     const input: { type: string; role: string; content: string }[] = [];
     for (let i = 0; i < count; i++) {
-        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation${tag ? ` (${tag})` : ""}. ` + `MARKER_${i}_content_`.repeat(250) });
     }
     return input;
 }
@@ -189,7 +193,7 @@ test("e2e #663 (order A, stream-first): learn both rejections, summary recovers,
     const upstreamUrl = `http://127.0.0.1:${upstreamPort}/responses`;
 
     try {
-        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-a", "gpt-6-astra", longResponsesInput(12));
+        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-a", "gpt-6-astra", longResponsesInput(12, "a"));
         assert.equal(r.status, 200, `first request must succeed, got ${r.status}`);
 
         const summaries = calls.filter((c) => c.summary);
@@ -227,7 +231,7 @@ test("e2e #663 (order A, stream-first): learn both rejections, summary recovers,
         // #1195 in-request refold). The first-shot compatibility property is
         // already proven by request 1's post-rejection summaries above.
         const callsBefore = calls.length;
-        const r2 = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-a", "gpt-6-astra", longResponsesInput(24));
+        const r2 = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-a", "gpt-6-astra", longResponsesInput(24, "a"));
         assert.equal(r2.status, 200, `second request must succeed, got ${r2.status}`);
         const newSummaries = calls.slice(callsBefore).filter((c) => c.summary);
         assert.equal(newSummaries.length, 0, "one-shot gate: the managed session's second request is forwarded as-is, no re-fold");
@@ -255,7 +259,7 @@ test("e2e #663 (order B, param-first): max_output_tokens rejected before stream 
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-b", "gpt-6-astra", longResponsesInput(12));
+        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-b", "gpt-6-astra", longResponsesInput(12, "b"));
         assert.equal(r.status, 200, `request must succeed, got ${r.status}`);
 
         const summaries = calls.filter((c) => c.summary);
@@ -317,7 +321,7 @@ test("e2e #663 (standard provider): max_output_tokens retained, no capability le
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-c", "gpt-6-astra", longResponsesInput(12));
+        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-c", "gpt-6-astra", longResponsesInput(12, "c"));
         assert.equal(r.status, 200, `request must succeed, got ${r.status}`);
 
         const summaries = calls.filter((c) => c.summary);
@@ -366,7 +370,7 @@ test("e2e #663 (model scoping): rejection learned for model A keeps model B's 32
     const upstreamUrl = `http://127.0.0.1:${upstreamPort}/responses`;
 
     try {
-        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-d", "gpt-6-astra", longResponsesInput(12));
+        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-d", "gpt-6-astra", longResponsesInput(12, "d"));
         assert.equal(r.status, 200, `first request (model A) must succeed, got ${r.status}`);
         const astraSummaries = calls.filter((c) => c.summary && c.model === "gpt-6-astra");
         // Model A accepts non-stream, so the first attempt is non-stream +
@@ -386,7 +390,7 @@ test("e2e #663 (model scoping): rejection learned for model A keeps model B's 32
         // below: model B's key was never learned, so a future first-shot
         // session for B would carry the cap).
         const callsBefore = calls.length;
-        const r2 = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-d", "gpt-6-standard", longResponsesInput(24));
+        const r2 = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-d", "gpt-6-standard", longResponsesInput(24, "d"));
         assert.equal(r2.status, 200, `second request (model B) must succeed, got ${r2.status}`);
         const standardSummaries = calls.slice(callsBefore).filter((c) => c.summary);
         assert.equal(standardSummaries.length, 0, "one-shot gate: the managed session's second request is forwarded as-is, no re-fold for model B either");
@@ -445,7 +449,7 @@ test("e2e #663 (codex lite header): summary drops the Lite header, main request 
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-lite", "gpt-6-astra", longResponsesInput(12), {
+        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-lite", "gpt-6-astra", longResponsesInput(12, "lite"), {
             "x-openai-internal-codex-responses-lite": "true",
             "authorization": "Bearer test-token",
         });
