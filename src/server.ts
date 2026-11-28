@@ -56,7 +56,7 @@ import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER } from "./msgid-pin.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
+import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, applyPostRebuildBaselineAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
 import type { SeparatorManifest } from "./server/responses-ordering.js";
 import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
@@ -4686,18 +4686,7 @@ export async function preflightCompressIfNeeded(
         const rebuiltImageTokens = imageReserveFor(session, rebuilt.protocol, rebuilt.body, opts, upstreamUrl);
         remainingImageTokens = rebuiltImageTokens;
         reducedImageWire = result.compressedRanges > 0 && rebuiltImageTokens < imageTokens;
-        // #6865: same guard as the #5974 probe above — the post-rebuild anchor
-        // must not demote an active overflow-arm either. The probe guard alone
-        // does not hold the arm through the turn: this anchor runs in the same
-        // preflight flow, on the same local estimate, and rewrites the armed
-        // tag to "estimate" before the #5880 guard reads it (same doctrine as
-        // relay.ts #2484 armFailureShrink — an upstream-proven ceiling must
-        // never be demoted by a local payload estimate).
-        if (rebuiltTextSize > session.stats.lastInputTokens
-            && session.stats.lastInputTokensSource !== "overflow-arm") {
-            session.stats.lastInputTokens = rebuiltTextSize;
-            session.stats.lastInputTokensSource = "estimate";
-        }
+        applyPostRebuildBaselineAnchor(session, rebuiltTextSize);
         // Same calibrated caliber as the trigger above — gate, per-round exit
         // and this final fit must judge the payload on one scale (#1933 F1).
         // The baseline anchor above stays raw deliberately: it is a floor for
