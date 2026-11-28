@@ -1110,11 +1110,14 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
     /** #6034 (option E): delivered on EVERY drop (the one-shot notices above
      *  only reach the first) — does this dropped artifact leave interior
      *  bytes behind that a consumer's answer ledger must count as markup
-     *  (true: a session-start open whose body verdict is still open, and a
-     *  close that releases its prose body), or does the artifact die whole /
+     *  (true: a word-preceded bare opening — the #2769 wrap shape, whose
+     *  released prefix IS the span's interior (#7862) — and a close that
+     *  releases its prose body), or does the artifact die whole /
      *  release content (false: complete refs-only units, dead orphans, a
-     *  refs-only close, discarded payloads)? Default false; only the sites
-     *  below that provably leave or release interior pass true. */
+     *  refs-only close, discarded payloads, an attributes-bearing opening —
+     *  a complete tag quote releases nothing after itself)? Default false;
+     *  only the sites below that provably leave or release interior pass
+     *  true. */
     const recordDrop = (snippet: string, duringDrain = false, leavesInterior = false) => {
         onDropVerdict?.(leavesInterior);
         droppedAny = true;
@@ -1503,7 +1506,14 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
                     continue;
                 }
                 swallowSessionCounted = false;
-                recordDrop(m[0], false, true);
+                // #7862: an attributes-bearing opening is a complete kernel
+                // tag quote — the frame's released bytes precede it, so they
+                // are the model's prose, not the span's interior (the interior
+                // of a span that does resolve with a body re-arms at its close).
+                // A BARE opening reached here only as the #2769 wrap shape (its
+                // LONE_OPEN head is word-preceded, so the released prefix IS the
+                // span's own interior) — that one keeps the frame armed.
+                recordDrop(m[0], false, bare);
                 // An odd number of quotes means the opening's attribute list
                 // never closed: the model wrapped its turn inside the value (the
                 // sibling shape opens with such a value and then runs into a `<`,
