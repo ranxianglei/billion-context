@@ -238,7 +238,21 @@ const PRESET_REGISTER_WRAP_MARK = Symbol.for("bili.dshPresetRegisterWrapped");
 type PresetRegistry = { register?: (definition: unknown) => Promise<unknown> } & Record<string, unknown>;
 
 function presetRegistryOf(ctx: CompactionDisableHost): PresetRegistry | undefined {
-    if (ctx.agentPresets !== undefined) return ctx.agentPresets;
+    // A strict fiber host (cordis) THROWS on a property no service
+    // resolution can back — `cannot get property "agentPresets" without
+    // inject` (gate evidence, dsh 0.2.2-rc.5 / cordis 4.1.0) — instead of
+    // returning undefined. An uncaught throw here kills the WHOLE entry at
+    // apply time, so even the load-time overlay is lost. Catch it and fall
+    // back to the generic accessor (the documented non-throwing path); a
+    // host without the service then degrades to no runtime coverage, which
+    // is exactly the pre-#7190 behavior.
+    let direct: unknown;
+    try {
+        direct = ctx.agentPresets;
+    } catch {
+        direct = undefined;
+    }
+    if (direct !== undefined) return direct as PresetRegistry;
     if (typeof ctx.get !== "function") return undefined;
     const candidate = ctx.get("agentPresets");
     return candidate === null || typeof candidate !== "object" ? undefined : candidate as PresetRegistry;

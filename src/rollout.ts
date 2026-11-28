@@ -115,10 +115,11 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL=0`. Requires
     // pluginLaneServerHistory.
     pluginMsgIdIncremental: { percent: 100 },
-    // #5403 family, delta arm: the client sends body.messages as the TAIL
-    // SLICE [T-L .. T-1] (anchor included) plus x-bili-pf-count = T and
-    // x-bili-pf-tail-ids (width L) — the server rebuilds the view from the
-    // stashed prefix cores + the small re-parsed slice. Inbound bytes drop
+    // #5403 family, delta arm: the client sends body.messages as the NEW
+    // elements [stampT .. T-1] ONLY (the anchor stays in the ledger) plus
+    // x-bili-pf-count = T and x-bili-pf-tail-ids (width L+1 = anchor + the
+    // L new ids) — the server rebuilds the view from the stashed prefix
+    // cores + the small re-parsed slice. Inbound bytes drop
     // from O(history) to O(delta). Every unsatisfiable claim is a 400
     // re-anchor the client answers with a full-form resend (one-round
     // convergence); flipping the key back to 0 400s every delta turn, which
