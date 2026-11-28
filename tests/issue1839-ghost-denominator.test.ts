@@ -34,6 +34,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest, type Session } from "../src/session.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { NUDGE_STANDING_REMINDER } from "../src/marker/anchors.ts";
 
 const WINDOW = 120_000;
 const NUDGE_MARKER = "Context limit reached";
@@ -284,6 +285,9 @@ test("#1839 G3: overflow arming is tagged 'overflow-arm', never billing-grade 'u
         // verdict so the rejection passes through and the arm keeps its
         // 'overflow-arm' provenance (this test's actual subject).
         { when: "when the tool returns, continue the task directly", status: 400, body: '{"error":{"message":"prompt is too long"}}' },
+        // Complete standing rules let the rescue use the short nudge tail.
+        // It must receive the same overflow verdict as the full fallback.
+        { when: NUDGE_STANDING_REMINDER.trim(), status: 400, body: '{"error":{"message":"prompt is too long"}}' },
     ]);
     try {
         const base = baseConversation();

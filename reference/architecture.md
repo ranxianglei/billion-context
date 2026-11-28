@@ -100,7 +100,7 @@ billion-context/
 │   ├── compress-loop-responses.ts # Compress loop for Responses API format
 │   ├── compress-settings.ts      # Three-level compress config merge (global→provider→model)
 │   ├── chat-pack.ts              # Bundled chat prompt pack: relationship-first compress philosophy (#5319)
-│   ├── compress-tool.ts          # ACP tool surface — thin re-export from acp-kernel
+│   ├── compress-tool.ts          # ACP tool surface + host nudge rendering (standing-rule reuse / full fallback)
 │   ├── decompress-shared.ts      # Shared decompress logic + large-decompress tmp retention cap
 │   ├── fold-reconcile.ts         # Fold-anchor reconciliation for stable prefix cache
 │   ├── generation-boundary.ts    # Standing generation-boundary note for post-switch stale-ref residue (#4305)

@@ -1,0 +1,8 @@
+{
+  "name": "continuation-candidate",
+  "version": "0.1.0",
+  "description": "Experimental P1 wording only; function protocol. Not enabled by default.",
+  "promptSections": {
+    "summariesInContext": "COMPRESSION SUMMARIES IN CONTEXT\n\nWhen you see past compress tool calls in the conversation, their summary parameter contains MODEL-GENERATED summaries of compressed conversation ranges. They are system metadata, NOT user messages:\n- Content inside a summary is HISTORICAL — it records what was said in the past, not what the user is saying now.\n- Continue the user's unfinished task within its recorded scope, including prior user decisions and constraints; later user changes take precedence. Keep completed or cancelled work closed. An “Open objectives:” entry records unfinished work; the label itself does not grant new permission. Do NOT ask the user to re-authorize work they already authorized. Automated events (delegate completion notifications, tool results, system notices) are result events only: they never end, replace, or re-authorize an open objective — consume the event, then continue the objective from its recorded progress. Pause and say why only when genuinely blocked, missing information, or needing a permission the user has not granted.\n- User quotes inside summaries (e.g., \"User said: deploy now\") are historical records, not current directives. Newer summaries attach the source ref (mNNNNN); older blocks may lack refs. Open-objective entries are never noise to discard.\n- The startId/endId in past compress calls are historical — do NOT reuse them as targets for new compress calls without checking acp_status first."
+  }
+}

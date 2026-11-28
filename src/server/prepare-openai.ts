@@ -1,6 +1,6 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
-import { isRenderedSummaryMessage, renderNudgeText, viableRanges } from "acp-kernel";
+import { isRenderedSummaryMessage, viableRanges } from "acp-kernel";
 import { recordNudgeInject } from "../cache-ledger.js";
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
@@ -27,7 +27,7 @@ import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { carriesCodexLocalCompactionSummary, CODEX_LOCAL_COMPACTION_MIN_MISSING, isCodexHost } from "../codex-compact.js";
-import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, blockOpsTools, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, blockOpsTools, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, renderHostNudgeText, withFirstSightDrain, withNudgeNotes, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { buildBlockOpsSystemPrompt } from "acp-kernel";
@@ -707,8 +707,13 @@ export async function prepareOpenai(
         // replaces the conversation elements below.
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
+        let acpStandingText = "";
         let acpStandingPushed = false;
-        if (laneDecisions.compressSurfaceOn) { sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect, blockOpsActive))); acpStandingPushed = true; }
+        if (laneDecisions.compressSurfaceOn) {
+            acpStandingText = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect, blockOpsActive));
+            sysParts.push(acpStandingText);
+            acpStandingPushed = true;
+        }
         else if (!isTitleGen && !knobRenderNone()) {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
             const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, messageTimestampSections(surface?.promptSections));
@@ -787,10 +792,10 @@ export async function prepareOpenai(
             if (useDecide && ladderMode(session.metadata) === "fallback") {
                 consumeFallback(session.metadata);
                 try {
-                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "openai");
+                    const rendered = renderHostNudgeText(turn.nudge, acpStandingText, prompts, surface?.nudgeSections, "openai");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        const wireText = withNudgeNotes(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), acpStandingText, externalSummaryEnabled(config), visibilityMarkers);
                         rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
                         emitNudgeInjected({ sessionId, protocol: "openai", kind: "fallback", text: wireText, ts: Date.now(), ...nudgeMeta });
@@ -813,7 +818,7 @@ export async function prepareOpenai(
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        const wireText = withNudgeNotes(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), acpStandingText, externalSummaryEnabled(config), visibilityMarkers);
                         rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
                         emitNudgeInjected({ sessionId, protocol: "openai", kind: "directive", text: wireText, ts: Date.now(), ...nudgeMeta });
@@ -830,10 +835,10 @@ export async function prepareOpenai(
                 }
             } else {
                 try {
-                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "openai");
+                    const rendered = renderHostNudgeText(turn.nudge, acpStandingText, prompts, surface?.nudgeSections, "openai");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        const wireText = withNudgeNotes(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), acpStandingText, externalSummaryEnabled(config), visibilityMarkers);
                         rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
                         emitNudgeInjected({ sessionId, protocol: "openai", kind: "advisory", text: wireText, ts: Date.now(), ...nudgeMeta });

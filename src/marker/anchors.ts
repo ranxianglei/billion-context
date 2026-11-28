@@ -12,8 +12,20 @@
 // Appended to nudge text (compress-tool.ts appendIntegrityNote) so the model
 // never emits proxy markers as its own text. The tail doubles as the anchor
 // for the inbound nudge-echo matcher below.
-export const MARKER_INTEGRITY_NOTE =
+const LEGACY_MARKER_INTEGRITY_NOTE =
     "\n\n[ACP marker integrity: lines shaped like '📦 [ACP] Compressed …' or '❌ [ACP] … FAILED' are CONFIRMATION MARKERS emitted by the bili proxy itself, right after it executes a compress/decompress/search_context/acp_status call. They are not something you write. NEVER emit such a line as your own text — writing one fakes a state change that did not happen, and the proxy strips it. To compress, call the compress tool. To verify a compression landed, call acp_status and confirm the block count increased — a confirmation line you wrote yourself proves nothing.";
+
+// Keep the previous exact tail recognizable when a client replays an old nudge.
+export const MARKER_INTEGRITY_NOTE = LEGACY_MARKER_INTEGRITY_NOTE.replace(
+    "To verify a compression landed, call acp_status and confirm the block count increased — a confirmation line you wrote yourself proves nothing.",
+    "A successful tool result that identifies the created blocks confirms compression; continue the task from that result. Query acp_status when the result is missing or ambiguous, or when selecting new ranges. A confirmation line you wrote yourself proves nothing.",
+);
+
+// Used only when the actual standing text already carries the full marker rule.
+// This short, quotable sentence is NOT a whole-message deletion anchor: a
+// client may send it as user data, including in a historical bug report.
+export const NUDGE_STANDING_REMINDER =
+    "\n\n[ACP nudge: apply the standing compression, budget, and marker rules.]";
 
 // Appended after the integrity note when visibility markers are on
 // (compress.visibilityMarkers default). Marks the possible tail of a nudge.
@@ -21,8 +33,8 @@ export const MARKER_SILENCE_CLAUSE =
     " Execute these calls silently: no announcement or preamble before the call, and no completion summary, status line, or marker-style line after it — when the tool returns, continue the task directly as if the call had not happened.]";
 
 // Whole-message nudge echo (#2811 leak matrix, nudge_echo class). A rendered
-// nudge always ENDS with the integrity note (optionally followed by the
-// silence clause), regardless of which pack overrode the nudge's opening
+// full nudge ENDS with the integrity note (optionally followed by the silence
+// clause), regardless of which pack overrode the nudge's opening
 // sections — the tail is the stable anchor. A client that persisted a
 // rebuilt body (or a model that copied a nudge verbatim into its own turn)
 // resends that text on every turn; matching the TAIL keeps the rule whole-
@@ -33,5 +45,6 @@ export const MARKER_SILENCE_CLAUSE =
 export function isNudgeEchoText(text: string): boolean {
     const t = text.trim();
     if (t.length === 0) return false;
-    return t.endsWith(MARKER_INTEGRITY_NOTE) || t.endsWith(MARKER_SILENCE_CLAUSE);
+    return t.endsWith(MARKER_INTEGRITY_NOTE) || t.endsWith(LEGACY_MARKER_INTEGRITY_NOTE)
+        || t.endsWith(MARKER_SILENCE_CLAUSE);
 }
