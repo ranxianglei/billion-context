@@ -10,6 +10,7 @@ import {
     installRuntimePresetCoverage,
     registerCompactionDisable,
 } from "../src/agent/dsh-compaction-disable.ts";
+import { apply as gateApply } from "../src/agent/dsh-compaction-gate.ts";
 
 // #7190: runtime-registered presets (a plugin calling ctx.agentPresets.register
 // after boot) bypass every config layer — no loader row for the internal/config
@@ -192,6 +193,67 @@ test("#7190: ctx.get fallback — the registry is found by service name; a host 
         _resetDshCompactionGateTelemetryForTest();
         installRuntimePresetCoverage({ get: () => null });
         assert.equal(dshCompactionGateTelemetry()?.runtimeWrapped, undefined);
+    } finally {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+    }
+});
+
+// #7857 review (gate evidence, dsh 0.2.2-rc.5 / cordis 4.1.0): a strict fiber
+// host THROWS on a property no service resolution can back —
+// `cannot get property "agentPresets" without inject` — instead of returning
+// undefined. Before the guard that throw escaped the entry's apply() and killed
+// the WHOLE bili-compaction-gate entry (dsh: "1 entry did not activate"), losing
+// even the load-time overlay. The Proxy mimics cordis's context contract:
+// declared keys resolve, undeclared string keys throw.
+function strictCordisHost(declared: Record<string, unknown>): unknown {
+    const allowed = new Set(Object.keys(declared));
+    const target = declared as Record<PropertyKey, unknown>;
+    return new Proxy(declared, {
+        get(t, prop) {
+            if (typeof prop === "string" && !allowed.has(prop)) throw new Error(`cannot get property "${prop}" without inject`);
+            return target[prop];
+        },
+    });
+}
+
+test("#7857: a strict fiber host without the registry cannot kill entry activation (the gate's dsh-lane crash)", () => {
+    try {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+        declareDshCompactionActive();
+        let middlewareSeen = false;
+        const host = strictCordisHost({
+            on: (event: string) => { if (event === "internal/config") middlewareSeen = true; },
+            reflect: { provide: () => {} },
+            get: (_name: string) => undefined,
+            inject: () => {},
+        });
+        // the entry's FULL apply — exactly what the fiber runs at boot; before
+        // the guard it threw here and dsh reported "1 entry did not activate"
+        gateApply(host as never);
+        assert.equal(middlewareSeen, true, "the load-time overlay still registers");
+        assert.equal(dshCompactionGateTelemetry()?.runtimeWrapped, undefined, "no registry → no wrap claim, no crash");
+    } finally {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+    }
+});
+
+test("#7857: a strict fiber host that resolves the registry via get still gets the wrap", () => {
+    try {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+        declareDshCompactionActive();
+        const registry = { register: async (d: unknown) => d };
+        const host = strictCordisHost({
+            on: () => {},
+            reflect: { provide: () => {} },
+            get: (name: string) => (name === "agentPresets" ? registry : undefined),
+            inject: () => {},
+        });
+        gateApply(host as never);
+        assert.equal(dshCompactionGateTelemetry()?.runtimeWrapped, true, "the accessor path finds the registry");
     } finally {
         _resetDshCompactionVerdictForTest();
         _resetDshCompactionGateTelemetryForTest();

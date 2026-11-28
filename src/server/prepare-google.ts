@@ -4,7 +4,7 @@ import { renderNudgeText, viableRanges } from "acp-kernel";
 import { recordNudgeInject } from "../cache-ledger.js";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
-import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, applyWireMsgIdPin, validateMsgIds, validateWireMsgIds, wirePinGroups } from "../msgid-pin.js";
 import { featureEnabled } from "../rollout.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
@@ -36,7 +36,7 @@ import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generatio
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
-import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { egressPlaneGateOn, imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { SessionStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudgeArmed, emergencyNudgeForConfig } from "./budget.js";
@@ -44,7 +44,8 @@ import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
-import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority, stampEgressSeqs } from "./egress-lane-io.js";
+import { EgressAuthorityRejectError } from "../storage/egress-record.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -166,9 +167,18 @@ export async function prepareGoogle(
         let msgidPinned = false;
         if (pluginMode && incomingMsgIds !== undefined) {
             if (featureEnabled("pluginLaneServerHistory")) {
-                const v = validateMsgIds(incomingMsgIds, msgs.length);
+                // #7439 follow-up: per-CORE or per-WIRE-ELEMENT full list
+                // (dual-mode, same rule as stage0 — a split group guarantees
+                // element count < core count, no ambiguity).
+                const wireG = (() => { const g = wirePinGroups(msgs); return g !== null && g.split ? g : null; })();
+                const wireHit = wireG !== null && Array.isArray(incomingMsgIds) && incomingMsgIds.length === wireG.size;
+                const v = wireHit
+                    ? validateWireMsgIds(incomingMsgIds, wireG!)
+                    : validateMsgIds(incomingMsgIds, msgs.length);
                 if (v.ok) {
-                    msgs = applyMsgIdPin(msgs, v.ids);
+                    msgs = wireHit
+                        ? applyWireMsgIdPin(msgs, wireG!, v.ids)
+                        : applyMsgIdPin(msgs, v.ids);
                     originalMessages = msgs;
                     msgidPinned = true;
                 } else {
@@ -186,7 +196,9 @@ export async function prepareGoogle(
         // (#651 keeps reasoning-drop off this wire — Gemini validates
         // thoughtSignature — so only tokenCount + processTurn consume the
         // render view, unlike the openai/responses lanes' third consumer.)
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        let renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #7439 follow-up (C6): egress-on sequence authority (see egress-lane-io).
+        renderMsgs = stampEgressSeqs(getStore()?.egressOpLogStore(), sessionId, renderMsgs);
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.
@@ -396,10 +408,16 @@ export async function prepareGoogle(
         // #7574: the swap (server authority) is armed by the ONE shared rule
         // (egressAuthorityArmed — same as the OpenAI lane). Every other main
         // turn is only recorded.
-        if (!isTitleGen && featureEnabled("egressPlane")) {
+        if (!isTitleGen && egressPlaneGateOn()) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinned, sideRequest: isTitleGen });
+                // The reject check sits AFTER processTurn here (the openai
+                // lane has it pre-kernel, prepare-openai.ts:384): the decision
+                // does not depend on the turn content, but the record needs
+                // the transformed lane shape. A rejected turn leaves only
+                // in-memory kernel state — nothing is recorded and the retry
+                // self-heals (single-txn, idempotent).
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
                 const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log, egressBlockLedgerFor(session), session.state.messageRefs);
                 if (served !== null) {
@@ -469,6 +487,11 @@ export async function prepareGoogle(
             nudgeOutcome = "gated";
         }
     } catch (err) {
+        // Ruling 7439-5 (C3, PR #7684): an unreadable op-log on an armed turn
+        // is a HARD fail (500 + x-bili-egress: unreadable) — the generic
+        // forward below would send the CLIENT'S bytes, which the ruling
+        // forbids (the openai lane already rethrows this exact error).
+        if (err instanceof EgressAuthorityRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
     }

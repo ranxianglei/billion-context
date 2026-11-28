@@ -437,7 +437,6 @@ interface MessageTokenEstimate {
     tokens: number;
 }
 const messageTokenMemo = new Map<string, WeakRef<MessageTokenEstimate>>();
-let messageTokenOwners = new WeakMap<CoreMessage, MessageTokenEstimate>();
 const MESSAGE_TOKEN_MEMO_CAP = 200_000;
 const KERNEL_MINTED_ID = /^h_[0-9a-f]{16}(?:_\d+)?$/;
 
@@ -450,14 +449,12 @@ export function estimateCoreMessages(messages: CoreMessage[]): number {
             const key = `${id}|${textLength}|${m.thinkingTokens ?? ""}`;
             const cached = messageTokenMemo.get(key)?.deref();
             if (cached !== undefined && cached.text === m.text) {
-                messageTokenOwners.set(m, cached);
                 tokens += cached.tokens;
                 continue;
             }
             const counted = countMessageTokens(m, defaultCountTokens);
             if (messageTokenMemo.size >= MESSAGE_TOKEN_MEMO_CAP) messageTokenMemo.clear();
             const entry = { text: m.text, tokens: counted };
-            messageTokenOwners.set(m, entry);
             messageTokenMemo.set(key, new WeakRef(entry));
             tokens += counted;
         } else {
@@ -469,7 +466,6 @@ export function estimateCoreMessages(messages: CoreMessage[]): number {
 
 export function clearEstimateCoreMessagesMemoForTests(): void {
     messageTokenMemo.clear();
-    messageTokenOwners = new WeakMap();
 }
 
 // #554: side requests bypass the pipeline (#388) and are forwarded VERBATIM,
@@ -2999,7 +2995,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         const range = ordered[oi];
                         const skipKey = `${range.startRef}:${range.endRef}`;
                         if (skipSet.has(skipKey)) continue;
-                        const { refToIdx } = refMaps(messages, deps.session.state);
+                        const maps = refMaps(messages, deps.session.state);
+                        const { refToIdx } = maps;
                         const startIdx = refToIdx.get(range.startRef);
                         const endIdx = refToIdx.get(range.endRef);
                         if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) {
@@ -3040,7 +3037,6 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         }
                         const span = spans.pop();
                         if (!span) continue;
-                        const maps = refMaps(messages, deps.session.state);
                         // #2672 parity with the walk: snap instead of dropping —
                         // a boundary without a plain ref loses at most its
                         // unreferencable rim (the kernel excludes it anyway).
