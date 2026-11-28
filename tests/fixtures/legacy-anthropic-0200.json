@@ -1,0 +1,175 @@
+{
+  "provenance": "Synthetic body decoded by the pinned 0.1.200 kernel; no private corpus content",
+  "body": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Summarize this synthetic lookup."
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "synthetic-call-1",
+            "name": "lookup",
+            "input": {
+              "key": "invented"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "synthetic-call-1",
+            "content": "invented lookup result"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": "Synthetic tail 0."
+      },
+      {
+        "role": "assistant",
+        "content": "Synthetic tail 1."
+      },
+      {
+        "role": "user",
+        "content": "Synthetic tail 2."
+      },
+      {
+        "role": "assistant",
+        "content": "Synthetic tail 3."
+      },
+      {
+        "role": "user",
+        "content": "Synthetic tail 4."
+      },
+      {
+        "role": "assistant",
+        "content": "Synthetic tail 5."
+      },
+      {
+        "role": "user",
+        "content": "Synthetic tail 6."
+      },
+      {
+        "role": "assistant",
+        "content": "Synthetic tail 7."
+      },
+      {
+        "role": "user",
+        "content": "Synthetic tail 8."
+      },
+      {
+        "role": "assistant",
+        "content": "Synthetic tail 9."
+      }
+    ]
+  },
+  "legacyMessages": [
+    {
+      "id": "h_dd37bf0d01f1f2c2",
+      "role": "user",
+      "contentType": "text",
+      "text": "Summarize this synthetic lookup.",
+      "wireIndex": 0
+    },
+    {
+      "id": "h_ad375fbf578d70f4",
+      "role": "assistant",
+      "contentType": "tool-call",
+      "toolName": "lookup",
+      "toolCallId": "synthetic-call-1",
+      "text": "{\"key\":\"invented\"}",
+      "wireIndex": 1
+    },
+    {
+      "id": "h_5acf06bd84245dbd",
+      "role": "tool",
+      "contentType": "tool-result",
+      "toolCallId": "synthetic-call-1",
+      "text": "invented lookup result",
+      "toolName": "lookup",
+      "wireIndex": 2
+    },
+    {
+      "id": "h_dd7c34c8f76f8de0",
+      "role": "user",
+      "contentType": "text",
+      "text": "Synthetic tail 0.",
+      "wireIndex": 3
+    },
+    {
+      "id": "h_ecbe503530c507a1",
+      "role": "assistant",
+      "contentType": "text",
+      "text": "Synthetic tail 1.",
+      "wireIndex": 4
+    },
+    {
+      "id": "h_91cd90107009cd4c",
+      "role": "user",
+      "contentType": "text",
+      "text": "Synthetic tail 2.",
+      "wireIndex": 5
+    },
+    {
+      "id": "h_cc36cc6011d0bf55",
+      "role": "assistant",
+      "contentType": "text",
+      "text": "Synthetic tail 3.",
+      "wireIndex": 6
+    },
+    {
+      "id": "h_39dc1e2dc520545c",
+      "role": "user",
+      "contentType": "text",
+      "text": "Synthetic tail 4.",
+      "wireIndex": 7
+    },
+    {
+      "id": "h_fa8ed6aa56f9e474",
+      "role": "assistant",
+      "contentType": "text",
+      "text": "Synthetic tail 5.",
+      "wireIndex": 8
+    },
+    {
+      "id": "h_f5b2ff5752bc2354",
+      "role": "user",
+      "contentType": "text",
+      "text": "Synthetic tail 6.",
+      "wireIndex": 9
+    },
+    {
+      "id": "h_3309f696e463ee67",
+      "role": "assistant",
+      "contentType": "text",
+      "text": "Synthetic tail 7.",
+      "wireIndex": 10
+    },
+    {
+      "id": "h_377cfa6ea7c6261e",
+      "role": "user",
+      "contentType": "text",
+      "text": "Synthetic tail 8.",
+      "wireIndex": 11
+    },
+    {
+      "id": "h_ec73340115ef30cb",
+      "role": "assistant",
+      "contentType": "text",
+      "text": "Synthetic tail 9.",
+      "wireIndex": 12
+    }
+  ],
+  "coveredIds": [
+    "h_ad375fbf578d70f4",
+    "h_5acf06bd84245dbd"
+  ]
+}
