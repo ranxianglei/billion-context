@@ -19,7 +19,7 @@ import { createEngineContext, type EngineContext } from "./server.js";
 import { handle } from "./server/handle.js";
 import { withFetchTransport } from "./fetch-transport.js";
 import type { FetchOptions } from "./fetch-util.js";
-import { log as loggerLog, muteStderrLeg } from "./logger.js";
+import { log as loggerLog, muteStderrLeg, isUpstreamTerminated, describeUpstreamTerminated } from "./logger.js";
 import { buildProxyFailureResponse, isExpectedFailFast } from "./upstream-fail.js";
 
 /** Pseudo-origin of the inline lane. Never DNS-resolved: any request reaching
@@ -311,6 +311,7 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
                 else if (err instanceof Error && (err as Error & { biliTransportFailure?: boolean }).biliTransportFailure === true) ctx.log("error", msg);
                 // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
                 // throttled [warn] at the throw site is the canonical record.
+                else if (isUpstreamTerminated(err)) ctx.log("error", `${msg} — ${describeUpstreamTerminated(err)}`);
                 else if (!isExpectedFailFast(err)) {
                     if (err instanceof Error && err.stack) ctx.log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
                     else ctx.log("error", msg);
@@ -373,6 +374,7 @@ function makeHttpDispatch(ctx: EngineContext): InlineEngine["dispatchHttp"] {
             const e = err as { name?: string; message?: string };
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
             if (clientAbort) ctx.log("info", `client aborted mid-stream: ${msg}`);
+            else if (isUpstreamTerminated(err)) ctx.log("error", `${msg} — ${describeUpstreamTerminated(err)}`);
             else if (err instanceof Error && err.stack) ctx.log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
             else ctx.log("error", msg);
             if (res.destroyed) return;

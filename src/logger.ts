@@ -188,6 +188,20 @@ export function isBenignSocketRaceError(err: unknown): boolean {
     return stack.includes("node:_http_server") || stack.includes("node:internal/streams/writable");
 }
 
+/** undici's "terminated": the upstream closed a response mid-body (socket cause
+ *  attached). The message and cause code already say everything, so callers log
+ *  one line instead of eight stack frames. Matched exactly so no other TypeError
+ *  loses its stack. */
+export function isUpstreamTerminated(err: unknown): err is TypeError {
+    if (!(err instanceof TypeError) || err.message !== "terminated") return false;
+    const cause = err.cause as { code?: unknown } | undefined;
+    return typeof cause?.code === "string" && cause.code.startsWith("UND_ERR_");
+}
+
+export function describeUpstreamTerminated(err: TypeError): string {
+    return `upstream closed the connection mid-response (${(err.cause as { code: string }).code})`;
+}
+
 /** Flip to file-only logging after stderr died. Idempotent; the [warn] goes
  *  through log(), which now skips stderr — the logger's error path never
  *  re-enters the writer that produced the error. */
