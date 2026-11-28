@@ -958,7 +958,7 @@ function changelogCatOf(rawLine) {
     let upBusyAction = false;
     let upReleases = [];
     function upSetButtons(on) {
-        [$("up-check"), $("up-upgrade-now"), $("up-install")].forEach((b) => {
+        [$("up-check"), $("up-upgrade-now"), $("up-install"), $("up-install-input"), $("up-pin"), $("up-unpin")].forEach((b) => {
             if (!b) return;
             b.classList.toggle("busy", on);
             b.disabled = on;
@@ -1044,6 +1044,37 @@ function changelogCatOf(rawLine) {
             if (cur) sel.value = cur;
         }
         applyUpdateButtons(st);
+        // #6804: local pin state line (+ the temp-build hint — a prerelease
+        // install is check-only for auto-upgrade even without a pin) and the
+        // duration select (rebuilt like up-select, preserving the selection).
+        const pstate = $("up-pin-state");
+        if (pstate) {
+            const p = (st && typeof st.pin === "object") ? st.pin : {};
+            let txt;
+            if (p.active) {
+                txt = p.until ? t("up.pin_active_until", { v: String(p.version || ""), until: new Date(p.until).toLocaleString() }) : t("up.pin_active_indef", { v: String(p.version || "") });
+            } else {
+                txt = t("up.pin_none");
+            }
+            if (p.tempBuild) txt += " " + t("up.pin_tempbuild");
+            // #7806: dev-install provenance (bili install <ref> pins carry the
+            // git ref + sha) — say WHAT is installed, not just that it is held.
+            if (p.source && p.source.kind === "git") txt += " " + t("up.pin_git", { ref: String(p.source.ref), sha: String(p.source.sha).slice(0, 8) });
+            pstate.textContent = txt;
+        }
+        const pdur = $("up-pin-duration");
+        if (pdur) {
+            const cur = pdur.value;
+            // #6804 follow-up: the DEFAULT duration is 7d — "forever" means
+            // "never auto-update", which must be an explicit choice, so it is
+            // kept as the last option but no longer the default selection.
+            const fresh = pdur.options.length === 0;
+            let opt = "";
+            ["1h", "12h", "1d", "7d", "30d"].forEach((d) => { opt += '<option value="' + d + '">' + d + "</option>"; });
+            opt += '<option value="">' + escapeHtml(t("up.pin_forever")) + "</option>";
+            pdur.innerHTML = opt;
+            pdur.value = fresh ? "7d" : cur;
+        }
         // A check/install started from another tab of this process shows in
         // the snapshot — keep the buttons held down until it settles.
         if (st.checking || st.installing) upSetButtons(true);
@@ -1176,6 +1207,57 @@ function changelogCatOf(rawLine) {
     }
     function upUpgradeNow() { upInstall(upNewestVersion(null).replace(/^v/, "")); }
     function upInstallSelected() { const sel = $("up-select"); if (sel && sel.value) upInstall(String(sel.value).replace(/^v/, "")); }
+    // #6804: free-text install — any published version (master temp builds
+    // included). Same upInstall path as the dropdown (rollback confirm, busy
+    // flag, result line); the server rejects anything outside semver chars.
+    function upInstallInput() {
+        const el = $("up-version-input");
+        if (!el) return;
+        const v = String(el.value || "").trim().replace(/^v/, "");
+        if (v) upInstall(v);
+    }
+    function showPinResult(msg, ok) {
+        const el = $("up-pin-result");
+        if (!el || !msg) return;
+        el.hidden = false;
+        el.textContent = msg;
+        el.style.color = ok ? "var(--green)" : "var(--red)";
+    }
+    async function upPin() {
+        if (upBusyAction) return;
+        const pdur = $("up-pin-duration");
+        const duration = pdur && pdur.value ? String(pdur.value) : undefined;
+        upBusyAction = true;
+        upSetButtons(true);
+        showPinResult(t("up.installing", {}), true);
+        try {
+            const r = await json(API_ROOT + "/update/pin", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(duration ? { duration } : {}) });
+            if (r.ok) showPinResult(t("up.pin_ok", { v: String(r.version || "") }), true);
+            else showPinResult(String(r.error || t("toast.failed", { msg: "pin failed" })), false);
+        } catch (e) {
+            showPinResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
+    async function upUnpin() {
+        if (upBusyAction) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        try {
+            const r = await json(API_ROOT + "/update/pin/clear", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+            if (r.ok) showPinResult(t("up.unpin_ok"), true);
+            else showPinResult(String(r.error || t("toast.failed", { msg: "unpin failed" })), false);
+        } catch (e) {
+            showPinResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
     async function upCheckNow() {
         if (upBusyAction) return;
         upBusyAction = true;
@@ -1184,7 +1266,7 @@ function changelogCatOf(rawLine) {
             const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
             if (r.already) showUpdateResult(t("up.already_in_flight"), true);
             else if (!r.ok) showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
-            else if (r.status === "update-available") showUpdateResult(t("up.check_available", { v: String(r.candidate || r.latest || "") }), true);
+            else if (r.status === "update-available") showUpdateResult(t("up.check_available", { v: String(r.candidate || r.latest || "") }) + (r.note ? " · " + String(r.note) : ""), true);
             else if (r.status === "up-to-date") showUpdateResult(t("up.check_up_to_date"), true);
             else if (r.status === "blocked-advisory") showUpdateResult(t("up.check_blocked", { v: String(r.latest || "") }), true);
             else if (r.status === "deferred-advisory") showUpdateResult(t("up.check_deferred"), true);
@@ -3347,7 +3429,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // as legacy rather than a dash. Literal t() branches (not concat) keep
         // every catalog key statically referenceable for the #1024 dead-key gate.
         const sm = d.storageMode || "legacy";
-        const smLabel = sm === "full" ? t("det.storage_mode_full") : sm === "shadow" ? t("det.storage_mode_shadow") : t("det.storage_mode_legacy");
+        const smLabel = sm === "full" ? t("det.storage_mode_full") : sm === "shadow" ? t("det.storage_mode_shadow") : sm === "egress" ? t("det.storage_mode_egress") : t("det.storage_mode_legacy");
         kv(parts, t("det.storage_mode"), smLabel || sm, true);
         kv(parts, t("det.active_pack"), d.activePack || null, true);
         parts.push('<div class="k">' + t("det.log") + '</div><div class="v"><a href="#/logs?q=' + encodeURIComponent(d.id) + '">' + t("det.log_view") + "</a></div>");
@@ -5834,6 +5916,15 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const unins = $("up-install");
         if (usel) usel.addEventListener("change", () => { if (unins) unins.disabled = upBusyAction || !usel.value; focusChangelogRelease(usel.value); });
         if (unins) unins.addEventListener("click", () => upInstallSelected());
+        // #6804: free-text install + local version pin controls.
+        const uinsInp = $("up-install-input");
+        if (uinsInp) uinsInp.addEventListener("click", () => upInstallInput());
+        const uvinp = $("up-version-input");
+        if (uvinp) uvinp.addEventListener("keydown", (e) => { if (e.key === "Enter") upInstallInput(); });
+        const upin = $("up-pin");
+        if (upin) upin.addEventListener("click", () => upPin());
+        const uunpin = $("up-unpin");
+        if (uunpin) uunpin.addEventListener("click", () => upUnpin());
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });

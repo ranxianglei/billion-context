@@ -2,17 +2,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { coreToOpenai, openaiToCore } from "../src/wire/openai.js";
 import { coreToGoogle, googleToCore } from "../src/wire/google.js";
-import { anthropicToCore, coreToAnthropic } from "../src/wire/anthropic.js";
+import { coreToAnthropic, anthropicToCore } from "../src/wire/anthropic.js";
 import { coreToResponses, responsesToCore } from "../src/wire/responses.js";
 
 // #3938 / #3939⑥ — wire byte fidelity. The upstream prefix cache only holds
 // when the SAME logical shape serializes to IDENTICAL bytes on every
-// request. openaiToCore/coreToOpenai and googleToCore/coreToGoogle are pure
-// functions of the request body; these pins make that stability explicit
-// (the "explicit canonical" half of the #3939⑥ contract) so any future
-// reorder — however well-intentioned — fails here before it breaks a live
-// session's cache. Goldens below were characterized against the current
-// emission (probe-verified 2026-10-20), not invented.
+// request. The four codec pairs below pin that stability explicitly (the
+// "explicit canonical" half of the #3939⑥ contract) so any future reorder —
+// however well-intentioned — fails here before it breaks a live session's
+// cache. Goldens below were characterized against the current emission
+// (probe-verified 2026-10-20; anthropic/responses sections added 2026-11-27,
+// #7825 — the two lanes this PR changed most had no byte-level pin at all).
 
 const FILE = {
   type: "file",
@@ -215,17 +215,129 @@ test("google: repeated parses of one body mint identical ids", () => {
   assert.deepEqual(b, a);
 });
 
-// #7825 — extend the #3939⑥ byte-stability pin to the two lanes PR #7738
-// changed the most (anthropic + responses, via #7684's render-fidelity work).
-// Same contract as openai/google above: a fixed logical shape must serialize
-// to IDENTICAL bytes on every request, or the upstream prefix cache breaks.
-// Goldens characterized against the current emission (probe-verified
-// 2026-11-27), not invented.
+// ── anthropic ──────────────────────────────────────────────────────────
 
 const A_IMG = {
   type: "image",
   source: { type: "base64", media_type: "image/png", data: "QQ==" },
 };
+
+function aRebuild(messages: object[]) {
+  return coreToAnthropic(
+    anthropicToCore({ messages } as never).msgs as never,
+  );
+}
+
+test("anthropic: user [text, image] + unsigned thinking/text rebuild verbatim", () => {
+  assert.deepEqual(
+    aRebuild([
+      { role: "user", content: [{ type: "text", text: "hi" }, A_IMG] },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "T-THINK" }, { type: "text", text: "hello" }],
+      },
+    ]),
+    [
+      { role: "user", content: [{ type: "text", text: "hi" }, A_IMG] },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "T-THINK" }, { type: "text", text: "hello" }],
+      },
+    ],
+  );
+});
+
+test("anthropic: plain string content normalizes to the text-parts array shape", () => {
+  assert.deepEqual(aRebuild([{ role: "user", content: "next" }]), [
+    { role: "user", content: [{ type: "text", text: "next" }] },
+  ]);
+});
+
+test("anthropic: parse is a structural fixed point over rebuild", () => {
+  const msgs = anthropicToCore({
+    messages: [
+      { role: "user", content: [{ type: "text", text: "hi" }, A_IMG] },
+      { role: "assistant", content: [{ type: "text", text: "hello" }] },
+    ],
+  } as never).msgs;
+  const once = anthropicToCore({
+    messages: coreToAnthropic(msgs as never),
+  } as never).msgs;
+  assert.deepEqual(once.map((m) => m.id), msgs.map((m) => m.id));
+  assert.deepEqual(once.map((m) => m.text), msgs.map((m) => m.text));
+});
+
+test("anthropic: repeated parses of one body mint identical ids", () => {
+  const body = { messages: [{ role: "user", content: [{ type: "text", text: "hi" }, A_IMG] }] };
+  const a = anthropicToCore(body as never).msgs.map((m) => m.id);
+  const b = anthropicToCore(body as never).msgs.map((m) => m.id);
+  assert.deepEqual(b, a);
+});
+
+// ── responses ──────────────────────────────────────────────────────────
+
+function rRebuild(input: object[]) {
+  return coreToResponses(responsesToCore({ input } as never).msgs);
+}
+
+test("responses: two single-image user items stay distinct verbatim items (#7824)", () => {
+  const itemA = {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_image", image_url: "data:image/png;base64,QUJD" }],
+  };
+  const itemB = {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_image", image_url: "data:image/png;base64,RURG" }],
+  };
+  assert.deepEqual(rRebuild([itemA, itemB]), [itemA, itemB]);
+});
+
+test("responses: single [text, image] item rebuilds byte-stable (fullCover path)", () => {
+  const item = {
+    type: "message",
+    role: "user",
+    content: [
+      { type: "input_text", text: "T" },
+      { type: "input_image", image_url: "data:image/png;base64,QUJD" },
+    ],
+  };
+  assert.deepEqual(rRebuild([item]), [item]);
+});
+
+test("responses: parse is a structural fixed point over rebuild", () => {
+  const msgs = responsesToCore({
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "T" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "A" }] },
+    ],
+  } as never).msgs;
+  const once = responsesToCore({
+    input: coreToResponses(msgs),
+  } as never).msgs;
+  assert.deepEqual(once.map((m) => m.id), msgs.map((m) => m.id));
+  assert.deepEqual(once.map((m) => m.text), msgs.map((m) => m.text));
+});
+
+test("responses: repeated parses of one body mint identical ids", () => {
+  const body = {
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "T" }] },
+    ],
+  };
+  const a = responsesToCore(body as never).msgs.map((m) => m.id);
+  const b = responsesToCore(body as never).msgs.map((m) => m.id);
+  assert.deepEqual(b, a);
+});
+
+// #7825 (PR #7837) — additional byte-stability pins for the two lanes above:
+// the mechanisms master's section does not cover — tool_use input insertion
+// order, sidecar verbatim blocks (image / redacted_thinking / document),
+// cache_control id-keyed map, custom_tool_call set, prefix-cache loops,
+// cross-lane image id. Goldens characterized against the current emission
+// (probe-verified 2026-11-27), not invented.
+
 const A_DOC = {
   type: "document",
   source: { type: "base64", media_type: "application/pdf", data: "PDF" },
@@ -233,7 +345,7 @@ const A_DOC = {
 const A_TOOL_USE = { type: "tool_use", id: "call_1", name: "f", input: { b: 1, a: 2 } };
 const A_TOOL_RESULT = { type: "tool_result", tool_use_id: "call_1", content: "ok" };
 
-function aRebuild(messages: object[]) {
+function aRebuildFull(messages: object[]) {
   const flat = anthropicToCore({ messages } as never);
   return coreToAnthropic(flat.msgs, flat.cacheControls);
 }
@@ -246,12 +358,12 @@ test("anthropic: text + tool_use + tool_result round-trips byte-exact (input obj
   ];
   // The tool_use input object must keep the host's insertion order
   // ({ b, a }, not { a, b }) — a reorder here desyncs the prefix cache.
-  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+  assert.equal(JSON.stringify(aRebuildFull(body)), JSON.stringify(body));
 });
 
 test("anthropic: image block rides the sidecar verbatim (never re-laid-out)", () => {
   const body = [{ role: "user", content: [A_IMG, { type: "text", text: "look" }] }];
-  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+  assert.equal(JSON.stringify(aRebuildFull(body)), JSON.stringify(body));
 });
 
 test("anthropic: redacted_thinking rides the sidecar verbatim (signature-verified, never rewritten)", () => {
@@ -261,26 +373,26 @@ test("anthropic: redacted_thinking rides the sidecar verbatim (signature-verifie
       content: [{ type: "redacted_thinking", data: "REDACTED" }, { type: "text", text: "A3" }],
     },
   ];
-  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+  assert.equal(JSON.stringify(aRebuildFull(body)), JSON.stringify(body));
 });
 
 test("anthropic: unknown top-level block (document) rides the sidecar verbatim", () => {
   const body = [{ role: "user", content: [A_DOC, { type: "text", text: "read" }] }];
-  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+  assert.equal(JSON.stringify(aRebuildFull(body)), JSON.stringify(body));
 });
 
 test("anthropic: unsigned thinking round-trips as { type: thinking, thinking } (no signature key)", () => {
   const body = [
     { role: "assistant", content: [{ type: "thinking", thinking: "hmm" }, { type: "text", text: "A4" }] },
   ];
-  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+  assert.equal(JSON.stringify(aRebuildFull(body)), JSON.stringify(body));
 });
 
 test("anthropic: cache_control rides the id-keyed map and is re-attached on rebuild (byte-exact)", () => {
   const body = [
     { role: "user", content: [{ type: "text", text: "T1", cache_control: { type: "ephemeral" } }] },
   ];
-  assert.equal(JSON.stringify(aRebuild(body)), JSON.stringify(body));
+  assert.equal(JSON.stringify(aRebuildFull(body)), JSON.stringify(body));
 });
 
 const A_SHAPES: [string, object[]][] = [
@@ -301,8 +413,8 @@ const A_SHAPES: [string, object[]][] = [
 ];
 for (const [name, first] of A_SHAPES) {
   test(`anthropic: ${name} — appended turns leave the rebuilt prefix byte-identical`, () => {
-    const req1 = aRebuild(first);
-    const req2 = aRebuild([
+    const req1 = aRebuildFull(first);
+    const req2 = aRebuildFull([
       ...first,
       { role: "assistant", content: [{ type: "text", text: "A1" }] },
       { role: "user", content: [{ type: "text", text: "next" }] },
@@ -312,7 +424,7 @@ for (const [name, first] of A_SHAPES) {
   });
 }
 
-test("anthropic: parse is a structural fixed point over rebuild", () => {
+test("anthropic: parse is a structural fixed point over rebuild (full core shape incl. sidecar fields)", () => {
   const pick = (m: { [k: string]: unknown }) => ({
     id: m.id,
     ct: m.contentType,
@@ -329,7 +441,7 @@ test("anthropic: parse is a structural fixed point over rebuild", () => {
   assert.deepEqual(twice, once);
 });
 
-test("anthropic: repeated parses of one body mint identical ids", () => {
+test("anthropic: repeated parses mint identical ids (image-first body)", () => {
   const body = { messages: [{ role: "user", content: [A_IMG, { type: "text", text: "T1" }] }] };
   const a = anthropicToCore(body as never).msgs.map((m) => m.id);
   const b = anthropicToCore(body as never).msgs.map((m) => m.id);
@@ -342,7 +454,7 @@ const R_FUNC_OUT = { type: "function_call_output", call_id: "call_1", output: "o
 const R_CT_CALL = { type: "custom_tool_call", call_id: "ct_1", name: "", input: "do it", status: "completed" };
 const R_CT_OUT = { type: "custom_tool_call_output", call_id: "ct_1", output: "done" };
 
-function rRebuild(input: object[]) {
+function rRebuildFull(input: object[]) {
   const proj = responsesToCore({ input } as never);
   return coreToResponses(proj.msgs, proj.customToolCallIds);
 }
@@ -353,7 +465,7 @@ test("responses: message + function_call + function_call_output round-trips byte
     R_FUNC_CALL,
     R_FUNC_OUT,
   ];
-  assert.equal(JSON.stringify(rRebuild(body)), JSON.stringify(body));
+  assert.equal(JSON.stringify(rRebuildFull(body)), JSON.stringify(body));
 });
 
 test("responses: reasoning item re-emits the raw item verbatim (never re-laid-out)", () => {
@@ -361,24 +473,24 @@ test("responses: reasoning item re-emits the raw item verbatim (never re-laid-ou
     { type: "reasoning", id: "rs_1", summary: [] },
     { type: "message", role: "assistant", content: "A2" },
   ];
-  assert.equal(JSON.stringify(rRebuild(body)), JSON.stringify(body));
+  assert.equal(JSON.stringify(rRebuildFull(body)), JSON.stringify(body));
 });
 
 test("responses: image-only user item is preserved (tracked via [image] placeholder, never vanishes)", () => {
   const body = [{ type: "message", role: "user", content: [R_IMG] }];
-  assert.equal(JSON.stringify(rRebuild(body)), JSON.stringify(body));
+  assert.equal(JSON.stringify(rRebuildFull(body)), JSON.stringify(body));
 });
 
 test("responses: text+image user message preserves both parts (split cores rebuild verbatim)", () => {
   const body = [
     { type: "message", role: "user", content: [{ type: "input_text", text: "look at" }, R_IMG] },
   ];
-  assert.equal(JSON.stringify(rRebuild(body)), JSON.stringify(body));
+  assert.equal(JSON.stringify(rRebuildFull(body)), JSON.stringify(body));
 });
 
 test("responses: custom_tool_call canonical form (status present) round-trips byte-exact", () => {
   const body = [R_CT_CALL, R_CT_OUT];
-  assert.equal(JSON.stringify(rRebuild(body)), JSON.stringify(body));
+  assert.equal(JSON.stringify(rRebuildFull(body)), JSON.stringify(body));
 });
 
 const R_SHAPES: [string, object[], object][] = [
@@ -389,14 +501,14 @@ const R_SHAPES: [string, object[], object][] = [
 ];
 for (const [name, first, append] of R_SHAPES) {
   test(`responses: ${name} — appended turns leave the rebuilt prefix byte-identical`, () => {
-    const req1 = rRebuild(first);
-    const req2 = rRebuild([...first, append]);
+    const req1 = rRebuildFull(first);
+    const req2 = rRebuildFull([...first, append]);
     assert.equal(req2.length, req1.length + 1);
     assert.equal(JSON.stringify(req2.slice(0, req1.length)), JSON.stringify(req1));
   });
 }
 
-test("responses: parse is a structural fixed point over rebuild", () => {
+test("responses: parse is a structural fixed point over rebuild (full core shape incl. sidecar fields)", () => {
   const pick = (m: { [k: string]: unknown }) => ({
     id: m.id,
     ct: m.contentType,
@@ -416,7 +528,7 @@ test("responses: parse is a structural fixed point over rebuild", () => {
   assert.deepEqual(twice, once);
 });
 
-test("responses: repeated parses of one body mint identical ids", () => {
+test("responses: repeated parses mint identical ids (text+image body)", () => {
   const body = {
     input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "look at" }, R_IMG] }],
   };

@@ -12,6 +12,11 @@ import path from "node:path";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugc-"));
 process.env.BILI_STORAGE_UNIFIED = "full";
+// KDD #25 hermeticity: this suite exercises the LEGACY (egress-off) kv
+// routing table. Pin the plane OFF so a host config with
+// rollout.features.egressPlane forced on cannot flip the egress-mode
+// retirement gates (writeConversationsFile / hydration) mid-suite.
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 process.env.BILI_SESSIONS_DIR = path.join(root, "sessions");
 process.env.XDG_STATE_HOME = path.join(root, "state");
 process.env.XDG_CACHE_HOME = path.join(root, "cache");

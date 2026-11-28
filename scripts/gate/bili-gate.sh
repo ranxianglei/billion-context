@@ -158,7 +158,7 @@ fi
 # OLD image without a word. On failure we may reuse the existing image ONLY
 # after proving its lane scripts are byte-identical to this working tree;
 # any drift is FATAL — the gate must never run on stale lane logic.
-LIVE_FILES="entrypoint.sh docker-lanes.mjs plugin-lanes.mjs restart-lanes.mjs upstream-recorder.mjs patch-gate.mjs verdaccio.config.yaml"
+LIVE_FILES="entrypoint.sh docker-lanes.mjs plugin-lanes.mjs restart-lanes.mjs wire-lanes.mjs upstream-recorder.mjs patch-gate.mjs verdaccio.config.yaml"
 if ! docker build -q -t bili-gate . >/dev/null; then
   echo "WARN: docker build failed — verifying existing image before reuse" >&2
   stale_guard_ok=1

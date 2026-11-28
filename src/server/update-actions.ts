@@ -15,7 +15,8 @@
  * (autoUpdate off, embedded use, tests) degrades to plain error strings;
  * nothing here throws into the HTTP handlers.
  */
-import { checkForUpdate, findInstallDir, forceInstallVersion, lastUpdateCheckTime, readDiskVersion, staleInstallStatus, type UpdateCheckOutcome, type UpdateOptions } from "../update.js";
+import { checkForUpdate, findInstallDir, forceInstallVersion, isPrereleaseVersion, lastUpdateCheckTime, readDiskVersion, staleInstallStatus, type UpdateCheckOutcome, type UpdateOptions } from "../update.js";
+import { clearPin, formatPinUntil, parsePinDuration, readPin, resolvePinState, writePin } from "../update-pin.js";
 import { getUpdateVisibility } from "../update-notes.js";
 import { log as loggerLog } from "../logger.js";
 
@@ -44,6 +45,17 @@ interface UpdateStateSnapshotData {
     checking: boolean;
     /** True while a pinned install is in flight in this process. */
     installing: boolean;
+    /** #6804 local version pin (machine-level, `bili pin` / this tab's pin
+     *  control) + whether the installed version is a master temp build —
+     *  temp builds are check-only for auto-upgrade even without a pin. */
+    pin: {
+        active: boolean;
+        version?: string;
+        until?: number;
+        tempBuild: boolean;
+        /** #7806: git-ref provenance, present only for `bili install` pins. */
+        source?: { kind: "git"; ref: string; sha: string };
+    };
 }
 
 let registeredOpts: UpdateOptions | undefined;
@@ -139,6 +151,11 @@ export async function updateStateSnapshot(runningVersion: string): Promise<Updat
         }
     }
     const lastCheckAt = await lastUpdateCheckTime();
+    // #6804: local pin state (resolvePinState self-sweeps expired/stale
+    // records) + the temp-build flag (pure computation from the version — a
+    // prerelease install is check-only for auto-upgrade even without a pin).
+    const installed = disk ?? runningVersion;
+    const pin = await resolvePinState(installed);
     return {
         running: runningVersion,
         ...(disk !== undefined ? { disk } : {}),
@@ -148,7 +165,65 @@ export async function updateStateSnapshot(runningVersion: string): Promise<Updat
         ...(lastCheckAt !== undefined ? { lastCheckAt } : {}),
         checking,
         installing,
+        pin: {
+            active: pin.kind === "active",
+            ...(pin.kind !== "none" ? { version: pin.pin.version, ...(pin.pin.until !== undefined ? { until: pin.pin.until } : {}) } : {}),
+            tempBuild: isPrereleaseVersion(installed),
+            // #7806: git-ref provenance (present only for `bili install` pins)
+            // so the panel can say WHAT dev build is installed, not just that
+            // it is held.
+            ...(pin.kind !== "none" && pin.pin.source !== undefined ? { source: pin.pin.source } : {}),
+        },
     };
+}
+
+/** Hold the INSTALLED version (#6804): write the machine-level pin state so
+ *  the auto-updater keeps checking + reporting but never installs. `durationText`
+ *  is the same duration vocabulary as `bili pin` ("1h"/"12h"/"1d"/"7d"/
+ *  "forever"); undefined/empty = indefinite. The pin target is the on-disk
+ *  version when detectable (that is what the updater compares against), else
+ *  the running version. An explicit panel install later still breaks through.
+ *  Never throws. */
+export async function pinCurrentAction(runningVersion: string, durationText?: string): Promise<{ ok: boolean; error?: string; version?: string; until?: number }> {
+    let version = runningVersion;
+    const opts = registeredOpts;
+    if (opts !== undefined) {
+        try {
+            const dir = opts.installDir ?? (await findInstallDir(opts.packageName));
+            if (dir !== undefined) version = (await readDiskVersion(dir)) ?? runningVersion;
+        } catch {
+            // keep the running version
+        }
+    }
+    const parsed = parsePinDuration(durationText);
+    if ("error" in parsed) return { ok: false, error: parsed.error };
+    const now = Date.now();
+    const until = parsed.ms !== undefined ? now + parsed.ms : undefined;
+    try {
+        // Keep the `bili install` git provenance when re-pinning the SAME
+        // version — dropping it would make the next same-ref install do a
+        // pointless rebuild instead of skipping (#7806 review).
+        const existing = await readPin();
+        const source = existing && existing.version === version ? existing.source : undefined;
+        await writePin({ v: 1, version, setAt: now, ...(until !== undefined ? { until } : {}), ...(source ? { source } : {}) });
+        loggerLog("info", `[update] web panel pinned ${version} ${formatPinUntil({ until })}`);
+        return { ok: true, version, ...(until !== undefined ? { until } : {}) };
+    } catch (e) {
+        loggerLog("warn", `[update] web panel pin failed: ${String(e)}`);
+        return { ok: false, error: String(e) };
+    }
+}
+
+/** Release the local pin (#6804). Never throws. */
+export async function clearPinAction(): Promise<{ ok: boolean; error?: string }> {
+    try {
+        const removed = await clearPin();
+        loggerLog("info", `[update] web panel pin ${removed ? "released" : "already clear"}`);
+        return { ok: true };
+    } catch (e) {
+        loggerLog("warn", `[update] web panel unpin failed: ${String(e)}`);
+        return { ok: false, error: String(e) };
+    }
 }
 
 /** Test seam: clear the registered options and both in-flight flags. */
