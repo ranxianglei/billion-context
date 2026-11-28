@@ -4,7 +4,8 @@
 // Covers the bounded walk-up version resolver, the
 // BILI_<LANE>_MAX_TESTED_VERSION cap knob (tri-state), and the message
 // composer's decision table (one direction only: STRICTLY NEWER warns;
-// at/below-cap, unresolvable and unparseable all fail open to silence).
+// at/below-cap and unparseable fail open to silence; UNRESOLVED says so
+// explicitly instead of staying silent, #5302).
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -77,8 +78,6 @@ test("maxTestedVersion tri-state: default / override / off", () => {
 });
 
 test("newerClientBuildMessage decision table: only STRICTLY newer warns", () => {
-    // nothing resolved — absence of evidence ≠ broken build
-    assert.equal(newerClientBuildMessage(DSH_BUILD_CHECK, undefined, {}), null);
     // at the cap: verified territory, silent
     assert.equal(newerClientBuildMessage(DSH_BUILD_CHECK, "0.2.0-rc.2", {}), null);
     // older builds: silent by design (their break modes have dedicated probes)
@@ -97,6 +96,22 @@ test("newerClientBuildMessage decision table: only STRICTLY newer warns", () => 
         assert.ok(msg!.includes("[dsh]"), "labels the lane");
         assert.ok(msg!.includes("@deepseek-ai/dsh"), "names the npm id");
     }
+});
+
+test("newerClientBuildMessage: unresolvable version is explicit, not silent (#5302)", () => {
+    const msg = newerClientBuildMessage(DSH_BUILD_CHECK, undefined, {});
+    assert.ok(msg !== null, "check ON + undetectable host must not stay silent");
+    assert.ok(msg!.includes("[dsh]"), "labels the lane");
+    assert.ok(msg!.includes("@deepseek-ai/dsh"), "names the npm id");
+    assert.ok(msg!.includes("Could not detect"), "EN names the failure mode");
+    assert.ok(msg!.includes(DSH_BUILD_CHECK.knobEnv), "names the escape-hatch knob");
+    assert.ok(!msg!.includes("NEWER than the newest build"), "not the strictly-newer note");
+    assert.ok(msg!.includes("未能检测到"), "CN half present");
+    // knob OFF silences even the unknown-layout note (the user chose silence)
+    assert.equal(newerClientBuildMessage(DSH_BUILD_CHECK, undefined, { [DSH_BUILD_CHECK.knobEnv]: "" }), null);
+    assert.equal(newerClientBuildMessage(DSH_BUILD_CHECK, undefined, { [DSH_BUILD_CHECK.knobEnv]: "   " }), null);
+    // an explicitly raised cap changes nothing about the unknown outcome
+    assert.equal(newerClientBuildMessage(DSH_BUILD_CHECK, undefined, { [DSH_BUILD_CHECK.knobEnv]: "9.9.9" }), msg);
 });
 
 test("newerClientBuildMessage: knob-off silences; raised cap re-baselines (bilingual text)", () => {
@@ -142,21 +157,27 @@ test("emitNewerClientBuildNote: channels and tri-state outcomes", () => {
     const banners: string[] = [];
     console.warn = ((...parts: unknown[]) => { banners.push(parts.join(" ")); }) as typeof console.warn;
     try {
-        // silent: nothing resolved / below cap / check off
-        assert.equal(emitNewerClientBuildNote(DSH_BUILD_CHECK, undefined, {}), false);
+        // silent: below cap / check off
         assert.equal(emitNewerClientBuildNote(DSH_BUILD_CHECK, "0.2.0-rc.2", {}), false);
         assert.equal(emitNewerClientBuildNote(DSH_BUILD_CHECK, "9.9.9", { [DSH_BUILD_CHECK.knobEnv]: "" }), false);
         assert.equal(banners.length, 0, "no banner when silent");
-        // fires: console banner + durable bili.log line
-        assert.equal(emitNewerClientBuildNote(DSH_BUILD_CHECK, "0.2.1-rc.2", {}), true);
+        // fires: undetectable host → explicit unknown-layout banner (#5302)
+        assert.equal(emitNewerClientBuildNote(DSH_BUILD_CHECK, undefined, {}), true);
         assert.equal(banners.length, 1);
         assert.ok(banners[0]!.includes("[dsh]"), "banner carries the lane label");
-        assert.ok(banners[0]!.includes("v0.2.1-rc.2") && banners[0]!.includes("v0.2.0-rc.2"), "banner carries both versions");
+        assert.ok(banners[0]!.includes("Could not detect"), "unknown-layout banner names the failure mode");
         const log = fs.readFileSync(path.join(logDir, "billion-context", "bili.log"), "utf8");
         assert.ok(log.includes("[warn]") && log.includes("[native-client]"), "durable warn record present");
-        assert.ok(log.includes("v0.2.1-rc.2"), "durable record carries the found version");
-        // per-lane knob OFF suppresses even a far-newer build
+        assert.ok(log.includes("Could not detect"), "durable record carries the unknown-layout note");
+        // fires: strictly newer → both versions named
+        assert.equal(emitNewerClientBuildNote(DSH_BUILD_CHECK, "0.2.1-rc.2", {}), true);
+        assert.equal(banners.length, 2);
+        assert.ok(banners[1]!.includes("[dsh]"), "banner carries the lane label");
+        assert.ok(banners[1]!.includes("v0.2.1-rc.2") && banners[1]!.includes("v0.2.0-rc.2"), "banner carries both versions");
+        // per-lane knob OFF suppresses a far-newer build AND the unknown note
         assert.equal(emitNewerClientBuildNote(DSH_BUILD_CHECK, "9.9.9", { [DSH_BUILD_CHECK.knobEnv]: "  " }), false);
+        assert.equal(emitNewerClientBuildNote(DSH_BUILD_CHECK, undefined, { [DSH_BUILD_CHECK.knobEnv]: "  " }), false);
+        assert.equal(banners.length, 2, "knob-off stays silent in every direction");
     } finally {
         console.warn = origWarn;
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = prevXdg;
