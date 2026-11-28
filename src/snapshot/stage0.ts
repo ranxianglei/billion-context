@@ -538,8 +538,9 @@ export function tryIncrementalPin(
 function isEgressPinLedger(sessionId: string): boolean {
     if (!egressPlaneGateOn()) return false;
     try {
-        // Non-empty AFTER dropping the system row — a system-only view means
-        // snapPinLiveIds reads the empty (messages) ledger, so stay legacy.
+        // Non-empty AFTER dropping the system row — a system-only view leaves
+        // snapPinLiveIds with an empty id list (the egress view filters to
+        // nothing; the messages ledger is never read), so stay legacy.
         return (getStore()?.egressOpLogStore()?.egressStateView(sessionId) ?? []).some((r) => r.msgid !== EGRESS_SYSTEM_MSGID);
     } catch {
         return false; // corrupt view → the legacy messages ledger is in play
