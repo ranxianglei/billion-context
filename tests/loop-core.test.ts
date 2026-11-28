@@ -577,6 +577,10 @@ test("replay retry: 429 then success → retried", async () => {
 });
 
 test("isTransientUpstreamError: classifier matrix", () => {
+    for (const identity of [{ code: "content-blocked" }, { type: "agent_router_content_blocked" }]) {
+        const body = JSON.stringify({ error: { ...identity, message: "Risk control: please retry; try again" } });
+        assert.equal(isTransientUpstreamError(400, body), false, "explicit content rejection outranks generic transient wording");
+    }
     assert.equal(isTransientUpstreamError(400, CAPTCHA_400_BODY), true, "captcha 400 is transient");
     assert.equal(isTransientUpstreamError(400, '{"error":{"message":"Invalid model"}}'), false, "plain 400 is not");
     assert.equal(isTransientUpstreamError(401, ""), false, "401 never retried");

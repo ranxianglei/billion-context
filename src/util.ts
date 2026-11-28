@@ -575,6 +575,7 @@ function parseOverflowCounts(text: string): { total?: number; messages?: number;
  *  rejection under 502/503 rather than 400 (#2484). */
 export function inspectContextOverflow(status: number, bodyText: string): ContextOverflowInfo {
     const message = (bodyText ?? "").slice(0, 300);
+    if (parseContentRejection(status, bodyText)) return { isOverflow: false, message };
     const plausible = status === 400 || status === 413 || status >= 500;
     if (!plausible) return { isOverflow: false, message };
     if (!bodyText) return { isOverflow: false, message };
@@ -599,6 +600,38 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
             : {}),
         message,
     };
+}
+
+export interface ContentRejection {
+    code?: string;
+    type?: string;
+    message: string;
+}
+
+/** A structured content rejection is not evidence of a bad cache key or context size.
+ *  Match the provider's explicit identity, never words quoted inside its message. */
+export function parseContentRejection(status: number, bodyText: string, requestId?: string): ContentRejection | null {
+    if (status !== 400) return null;
+    try {
+        const body: unknown = JSON.parse(bodyText);
+        if (typeof body !== "object" || body === null || !("error" in body)) return null;
+        const error = body.error;
+        if (typeof error !== "object" || error === null) return null;
+        const code = "code" in error && typeof error.code === "string" ? error.code : undefined;
+        const type = "type" in error && typeof error.type === "string" ? error.type : undefined;
+        if (code !== "content-blocked" && type !== "agent_router_content_blocked") return null;
+        let message = "message" in error && typeof error.message === "string" ? error.message : bodyText;
+        const requestIds = [requestId];
+        for (const envelope of [body, error]) {
+            if ("request_id" in envelope && typeof envelope.request_id === "string") requestIds.push(envelope.request_id);
+        }
+        for (const id of requestIds) {
+            if (id && !message.includes(id)) message += `\nRequest ID: ${id}`;
+        }
+        return { code, type, message };
+    } catch {
+        return null;
+    }
 }
 
 // #4452: an intermediate gateway that rewrites a payload-size rejection into one

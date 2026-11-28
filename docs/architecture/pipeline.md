@@ -1,6 +1,6 @@
 # Module: request pipeline (`src/server` + `src/loop`)
 
-> Part of the [architecture hub](../architecture.md) · 中文: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · as of 2026-11-10, master
+> Part of the [architecture hub](../architecture.md) · 中文: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · as of 2026-11-15, candidate
 
 ![Request pipeline module](./assets/pipeline.en.svg)
 (bitmap fallback: [pipeline.en.png](./assets/pipeline.en.png))
@@ -28,6 +28,8 @@ Every model-traffic request that reaches the proxy passes through this module: i
 **Egress.** `stream-*` rewrites the upstream SSE per wire (chunk framing, cache-control breakpoints #1637, `wire-body` trailing-user-turn append). On the request side, a user-registerable `egressTransforms[]` pipeline (`src/egress-transforms.ts`, #6003) runs ESM plugins over every outbound model-request body after session processing and before re-sign/v1Wrap — fail-open per plugin, hot-reloadable via `/__bili/config/reload`, an exact no-op when unconfigured. Protocol headers (pf-*/envelope) never leave the proxy — the upstream hop-header list strips them.
 
 **Gates & recovery.** `preflight.ts` (hold grace, dead-end cooldown), `reasoning-guard` (signed payloads are never fold inputs), `request-body-budget` (receive/decode/send byte caps, availability over performance #3128), `content-encoding` (decompression-bomb guard, 413). Error shapes: `stream-error` (minimal SSE error + finish), `fake-completion` (opt-in retry hint), `degenerate-turn` / `degenerate-retry`, and `exit-matrix` (wire-exit × concerns, #588).
+
+**Explicit content rejection.** HTTP 400 with error code `content-blocked` or type `agent_router_content_blocked` stops generic replay, cache-key probes, thinking removal and overflow recovery. Recovery loops forward the rejection instead of an empty successful completion, after settling the original attempt's reported usage. Anthropic EOF retains partial usage without claiming completion. Native error frames retain diagnostics and available request IDs from the body or `x-request-id` / `request-id` headers. Responses maps the identity to `error.code`; Google uses 400 / `INVALID_ARGUMENT`. Existing explicit `streamErrorShape="completion"` compatibility rendering remains. Unknown 400, genuine schema/cache/context errors and transient failures keep their recovery paths. `WC-026` records the observed envelope; its fake scripts a verdict without inventing a content policy.
 
 ## Key entries
 

@@ -3,11 +3,49 @@ import assert from "node:assert/strict";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter } from "../src/loop/index.ts";
+import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter, createGoogleAdapter } from "../src/loop/index.ts";
+import { createCommandcodeAdapter } from "../src/loop/adapter-commandcode.ts";
 import type { ParsedStreamEvent } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { responsesToCore } from "acp-kernel/wire";
 import type { ResponsesRequestBody, AnthropicTextBlock } from "acp-kernel/wire";
+
+test("native loop error frames retain content rejection identity and complete diagnostic", () => {
+    const rejection = { code: "content-blocked", type: "agent_router_content_blocked", message: "Synthetic diagnostic: " + "detail ".repeat(40) + "request id: fixture-adapter" };
+    const frames = (text: string) => text.split("\n").filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
+    const responses = frames(createResponsesAdapter().emitError(rejection.message, rejection).toString());
+    const failed = responses.find((frame) => frame.type === "response.failed");
+    assert.deepEqual(failed?.response.error, { code: rejection.code, message: rejection.message });
+    for (const adapter of [createOpenaiAdapter({ model: "test" }), createAnthropicAdapter({ model: "test" })]) {
+        const failure = frames(adapter.emitError(rejection.message, rejection).toString()).find((frame) => frame.error);
+        assert.deepEqual(failure?.error, rejection);
+    }
+    const google = frames(createGoogleAdapter({}).emitError(rejection.message, rejection).toString())[0];
+    assert.deepEqual(google.error, { code: 400, status: "INVALID_ARGUMENT", message: rejection.message });
+    const commandcode = JSON.parse(createCommandcodeAdapter({}).emitError(rejection.message, rejection).toString());
+    assert.deepEqual(commandcode, { type: "error", error: rejection.code, message: rejection.message });
+
+    const typeOnly = { type: rejection.type, message: rejection.message };
+    const typeOnlyFrames = frames(createResponsesAdapter().emitError(typeOnly.message, typeOnly).toString());
+    assert.equal(typeOnlyFrames.find((frame) => frame.type === "response.failed")?.response.error.code, typeOnly.type);
+    const generic = frames(createResponsesAdapter().emitError("transport failed").toString());
+    assert.equal(generic.find((frame) => frame.type === "response.failed")?.response.error.code, "server_error");
+});
+
+for (const terminal of [false, true]) {
+    test(`anthropic start output is retained and cumulative delta replaces it (terminal=${terminal})`, async () => {
+        const frame = (type: string, data: unknown) => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+        const start = frame("message_start", { type: "message_start", message: { id: "partial-usage", usage: { input_tokens: 5, output_tokens: 2, cache_read_input_tokens: 0 } } });
+        const end = terminal ? frame("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } }) + frame("message_stop", { type: "message_stop" }) : "";
+        const events: ParsedStreamEvent[] = [];
+        for await (const event of createAnthropicAdapter({ model: "test" }).parseStream(new Response(start + end).body!, 1)) events.push(event);
+        const usage = events.filter((event) => event.kind === "usage");
+        assert.equal(usage.length, 1, "one measurement, including at EOF");
+        assert.equal(usage[0].inputTokens, 5);
+        assert.equal(usage[0].outputTokens, terminal ? 5 : 2, "delta is cumulative, not added to the start count");
+        assert.equal(events.some((event) => event.kind === "done"), terminal, "EOF must not invent completion");
+    });
+}
 
 function makeCtx(id: string, messages: CoreMessage[] = []): {
     core: ReturnType<typeof createCore>;

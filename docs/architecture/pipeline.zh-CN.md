@@ -1,6 +1,6 @@
 # 模块：请求管道（`src/server` + `src/loop`）
 
-> [架构总览](../architecture.zh-CN.md) 的一个模块 · English: [pipeline.md](./pipeline.md) · 截至 2026-11-10，master
+> [架构总览](../architecture.zh-CN.md) 的一个模块 · English: [pipeline.md](./pipeline.md) · 截至 2026-11-15，candidate
 
 ![请求管道模块](./assets/pipeline.zh-CN.svg)
 （位图备选：[pipeline.zh-CN.png](./assets/pipeline.zh-CN.png)）
@@ -28,6 +28,8 @@
 **出站。** `stream-*` 按 wire 改写上游 SSE（块框架、cache-control 断点 #1637、`wire-body` 尾 user 回合补位）。请求侧另有用户可注册的 `egressTransforms[]` 管道（`src/egress-transforms.ts`，#6003）：ESM 插件在所有会话处理之后、re-sign/v1Wrap 之前改写每个出站模型请求体——逐插件 fail-open，可经 `/__bili/config/reload` 热重载，未配置时严格 no-op。协议头（pf-*/信封）永不出代理——上游 hop 头白名单剥掉它们。
 
 **闸门与恢复。** `preflight.ts`（hold 宽限、死路冷却）、`reasoning-guard`（签名载荷永不进折叠输入）、`request-body-budget`（收/解/发字节预算，可用性大于性能 #3128）、`content-encoding`（解压炸弹守卫，413）。错误形态：`stream-error`（最小 SSE 错误+收尾）、`fake-completion`（可选重试提示）、`degenerate-turn` / `degenerate-retry`、`exit-matrix`（wire 出口 × 关注点，#588）。
+
+**明确的内容拒绝。** HTTP 400 的 error code 为 `content-blocked` 或 type 为 `agent_router_content_blocked` 时，停止通用重发、缓存键探测、去掉 thinking 重试和溢出恢复。恢复分支结算原轮已报告的 usage 后传递拒绝，不输出空的成功结束；Anthropic EOF 保留部分 usage，但不宣称完成。原生错误帧保留诊断及正文或 `x-request-id` / `request-id` 响应头中可用的请求 ID；Responses 将标识放入 `error.code`，Google 使用 400 / `INVALID_ARGUMENT`。已有显式 `streamErrorShape="completion"` 兼容渲染保持原语义。未知 400、真正的 schema／缓存／上下文错误和暂时性故障继续各自恢复路径。`WC-026` 登记已观察到的错误封装；fake 只模拟判决，不臆造内容检测规则。
 
 ## 关键入口
 

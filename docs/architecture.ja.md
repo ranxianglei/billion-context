@@ -22,7 +22,7 @@
 | モジュール | 一行説明 | ページ | ステータス |
 |---|---|---|---|
 | `storage` | 統合 SQLite: テーブルファミリー、kstate、チェックポイント、GC | [storage.md](./architecture/storage.md) · [zh](./architecture/storage.zh-CN.md) · [ja](./architecture/storage.ja.md) | ✅ |
-| `pipeline` | リクエストパイプライン（handle / prepare-* / relay / inject） | [pipeline.md](./architecture/pipeline.md) · [zh](./architecture/pipeline.zh-CN.md) · [ja](./architecture/pipeline.ja.md) | ✅ |
+| `pipeline` | リクエストパイプライン（終端コンテンツ拒否／usage） | [pipeline.md](./architecture/pipeline.md) · [zh](./architecture/pipeline.zh-CN.md) · [ja](./architecture/pipeline.ja.md) | ✅ |
 | `lanes` | ホストレーン（dsh / pi / opencode / codex / ベアプロキシ + lane-decisions） | [lanes.md](./architecture/lanes.md) · [zh](./architecture/lanes.zh-CN.md) · [ja](./architecture/lanes.ja.md) | ✅ |
 | `kernel` | 圧縮エンジン（acp-kernel: フォールド、サマリー、リファレンス台帳） | [kernel.md](./architecture/kernel.md) · [zh](./architecture/kernel.zh-CN.md) · [ja](./architecture/kernel.ja.md) | ✅ |
 | `identity` | セッションおよびメッセージのアイデンティティ（セッション ID、ペルソナフォーク、msgid チャネル） | [identity.md](./architecture/identity.md) · [zh](./architecture/identity.zh-CN.md) · [ja](./architecture/identity.ja.md) | ✅ |

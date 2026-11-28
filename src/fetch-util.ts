@@ -10,6 +10,7 @@ import {
     maxShrinkPerCompress as knobMaxShrinkPerCompress,
 } from "./knobs.js";
 import { log } from "./logger.js";
+import { parseContentRejection } from "./util.js";
 
 /** HTTP robustness helpers for the proxy.
 
@@ -410,12 +411,14 @@ export class UpstreamHttpError extends Error {
     readonly status: number;
     readonly body: string;
     readonly attempts: number;
-    constructor(status: number, body: string, attempts: number) {
+    readonly requestId?: string;
+    constructor(status: number, body: string, attempts: number, requestId?: string) {
         super(`upstream error ${status}`);
         this.name = "UpstreamHttpError";
         this.status = status;
         this.body = body;
         this.attempts = attempts;
+        this.requestId = requestId;
     }
 }
 
@@ -451,6 +454,7 @@ const DECLARATION_NODE_BUDGET = 4_096;
 export function isTransientUpstreamError(status: number, body: string): boolean {
     if (status === 429 || status >= 500) return true;
     if (status < 400) return false;
+    if (parseContentRejection(status, body)) return false;
     const lower = body.toLowerCase();
     if (TRANSIENT_BODY_MARKERS.some((marker) => lower.includes(marker))) return true;
     return bodyDeclaresRetryable(body);
@@ -606,7 +610,8 @@ export async function fetchWithRetry(
             await sleep(delayMs, externalSignal);
             continue;
         }
-        throw new UpstreamHttpError(result.response.status, errText, attempt);
+        throw new UpstreamHttpError(result.response.status, errText, attempt,
+            result.response.headers.get("x-request-id") ?? result.response.headers.get("request-id") ?? undefined);
     }
 }
 

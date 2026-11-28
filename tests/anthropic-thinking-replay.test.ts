@@ -201,6 +201,28 @@ test("issue #221/#5495: an attempt that SAW a signature keeps the requirement â€
     }
 });
 
+test("content rejection does not strip signed thinking or resend the same task", async () => {
+    const captured: CapturedRequest[] = [];
+    const error = { code: "content-blocked", type: "agent_router_content_blocked", message: "Synthetic rejection; request id: fixture-thinking" };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (_input, init) => {
+        captured.push({ body: JSON.parse(String(init?.body)) });
+        return new Response(JSON.stringify({ error }), { status: 400 });
+    };
+    try {
+        const output = await drain(new Response(round1Thinking(true)).body!, makeCtx(), captured);
+        assert.equal(captured.length, 1, "a content rejection cannot be repaired by removing thinking");
+        assert.equal(assistantThinkingBlocks(captured[0].body).length, 1, "preserve the original signed thinking");
+        const events = output.split("\n").filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
+        const failure = events.find((event) => event.type === "error");
+        assert.equal(failure?.error.type, error.type);
+        assert.equal(failure?.error.code, error.code);
+        assert.equal(failure?.error.message, error.message);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
 test("issue #221: degraded retry also rejected â†’ error surfaced (visible failure, not a silent stop)", async () => {
     const captured: CapturedRequest[] = [];
     let fetchCalls = 0;

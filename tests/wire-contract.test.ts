@@ -22,7 +22,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import { emitStreamError } from "../src/stream-error.ts";
-import { validateResponsesContentIndex } from "./wire-contract-fakes.ts";
+import { contentRejectionEnvelope, validateResponsesContentIndex } from "./wire-contract-fakes.ts";
 
 process.env.NODE_ENV = "test";
 
@@ -390,6 +390,15 @@ test("wire-contract ledger: every lane-scoped rule has a live enforcement clause
     // Lane-scoped constraints hold on ONE client's lane only — the shared wire validator
     // cannot enforce them (WC-013 forbids exactly what WC-017 requires, same frame shape).
     const laneProbes: Array<{ ruleId: string; validate: (body: unknown) => string[]; body: unknown }> = [
+        {
+            ruleId: "WC-027", body: null,
+            validate: () => {
+                const rejection = contentRejectionEnvelope();
+                const error = JSON.parse(rejection.body).error;
+                return rejection.status === 400 && error.code === "content-blocked" && error.type === "agent_router_content_blocked"
+                    ? ["WC-027 explicit content rejection envelope"] : [];
+            },
+        },
         { ruleId: "WC-026", validate: validateResponsesContentIndex, body: { type: "response.output_text.delta", output_index: 0, delta: "x" } },
         { ruleId: "WC-017", validate: validateCodexResponsesWsCreate, body: { type: "response.create", input: [] } },
         // WC-019/020/021 are the Vertex Anthropic lane (lane: "vertex-anthropic") — the wire rules that
@@ -769,6 +778,26 @@ for (const lane of LANES) {
         }
     });
 }
+
+test("WC-027: explicit content rejection is forwarded once without a cache-key probe", async () => {
+    const lane = LANES.find((candidate) => candidate.wire === "responses")!;
+    const fake = await startFakeUpstream("responses", { lane: "agentrouter-content-rejected" });
+    let rig: Rig | undefined;
+    try {
+        rig = await startRig(fake.url, lane.model, {});
+        const response = await fetch(`${rig.proxyUrl}${lane.path}`, {
+            method: "POST", headers: { "content-type": "application/json", "x-acp-session": "wc-content" },
+            body: JSON.stringify({ ...lane.clientBody, prompt_cache_key: "wc-content-key" }),
+        });
+        assert.equal(response.status, 400);
+        assert.equal(await response.text(), contentRejectionEnvelope().body);
+        assert.equal(fake.requests.length, 1, "no internal retry for the explicit upstream verdict");
+        assert.deepEqual(fake.violations, [], "the fixture rejects content independently of wire validity");
+    } finally {
+        if (rig) await rig.close();
+        await fake.close();
+    }
+});
 
 test("wire-contract D: opt-in lane (absorb+rules+ccr) forwards the extended surface legally", async () => {
     const lane = LANES[0];

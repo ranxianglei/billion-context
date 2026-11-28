@@ -39,6 +39,13 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance: "OpenAI openai-node v6.26.0 requires content_index in ResponseTextDeltaEvent/ResponseTextDoneEvent/ResponseContentPartAddedEvent/ResponseContentPartDoneEvent (https://github.com/openai/openai-node/blob/v6.26.0/src/resources/responses/responses.ts); ResponseStream indexes output.content[event.content_index] (https://github.com/openai/openai-node/blob/v6.26.0/src/lib/responses/ResponseStream.ts). Reproduced against that official SDK: bili's synthesized messages, legacy stream-error completions and filtered text tails omitted indices, so finalResponse() rejected with 'missing content at index undefined'. Gates exercise the actual SDK in proxy/plugin paths and the emitted error frames; the fake validates its outgoing SSE frames with the same constraint.",
     },
     {
+        id: "WC-027",
+        wire: "responses",
+        lane: "agentrouter-content-rejected",
+        summary: "An explicit HTTP 400 content-blocked / agent_router_content_blocked verdict is terminal for the current request: preserve its diagnostic and request ID even when received by a compatibility retry; do not rewrite roles, probe the cache key, strip thinking or infer context overflow.",
+        provenance: "https://github.com/ranxianglei/billion-context/issues/6832: Codex Desktop / GPT-6 through bili 0.1.213 received the explicit verdict after committed compression, then a key-less probe failed again. The issue records the sanitized envelope; the matched content and upstream rule are unknown. This fake scripts the observed verdict, not a content-detection policy.",
+    },
+    {
         id: "WC-017",
         wire: "responses",
         lane: "codex",
@@ -765,7 +772,7 @@ export interface CapturedRequest {
 
 /** Lane-scoped fakes: a constraint that holds only on one client's or endpoint's lane lives in that lane's own
  *  fake, not in the wire's shared VALIDATOR (WC-017's rule-scoping precedent). */
-type FakeLane = "vertex-anthropic";
+type FakeLane = "vertex-anthropic" | "agentrouter-content-rejected";
 
 interface FakeUpstream {
     wire: Wire;
@@ -956,6 +963,14 @@ const PATH_MATCHERS: Record<Wire, (url: string) => boolean> = {
     google: (u) => /\/v1beta\/models\/[^/:]+:(streamGenerateContent|generateContent)/.test(u),
 };
 
+/** WC-026: a scripted upstream verdict; no inferred trigger words or content policy. */
+export function contentRejectionEnvelope(): { status: number; body: string } {
+    return { status: 400, body: JSON.stringify({ error: {
+        code: "content-blocked", type: "agent_router_content_blocked",
+        message: "Synthetic content rejection (request id: wc-content-01)",
+    } }) };
+}
+
 /** Start a deterministic fake upstream for one wire protocol on a random loopback port. */
 export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string; lane?: FakeLane }): Promise<FakeUpstream> {
     const replyText = opts?.replyText ?? "ok";
@@ -996,6 +1011,12 @@ export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string;
                         : errorEnvelope(wire, `wire-contract violation(s): ${found.join("; ")}`);
                 res.writeHead(env.status, { "content-type": "application/json" });
                 res.end(env.body);
+                return;
+            }
+            if (lane === "agentrouter-content-rejected") {
+                const rejection = contentRejectionEnvelope();
+                res.writeHead(rejection.status, { "content-type": "application/json" });
+                res.end(rejection.body);
                 return;
             }
             const p = isPlainObject(parsed) ? parsed : {};

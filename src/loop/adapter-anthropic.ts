@@ -430,6 +430,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     }
                     const u = (msg.usage ?? {}) as Record<string, unknown>;
                     if (typeof u.input_tokens === "number") roundInput = u.input_tokens;
+                    if (typeof u.output_tokens === "number") roundOutput = u.output_tokens;
                     if (typeof u.cache_read_input_tokens === "number") roundCached = u.cache_read_input_tokens;
                     if (typeof u.cache_creation_input_tokens === "number") roundCreation = u.cache_creation_input_tokens;
                     // #4128: an anthropic-wire relay stamps billing_usage on the start frame.
@@ -775,6 +776,20 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
             }
+            // EOF can precede the terminal frames. Preserve any usage already reported
+            // by message_start so a failed continuation still settles the original
+            // attempt. This is a partial measurement, not a successful completion.
+            if (!usageYielded && (roundInput !== undefined || roundCached !== undefined || roundCreation !== undefined || roundOutput !== undefined)) {
+                yield {
+                    kind: "usage",
+                    inputTokens: roundInput,
+                    outputTokens: roundOutput,
+                    cachedTokens: roundCached,
+                    creationTokens: roundCreation,
+                    declaredInclusive: roundDeclaredInclusive,
+                    cacheCreation: roundCacheCreation,
+                } as ParsedStreamEvent;
+            }
         },
 
         emitText(delta) {
@@ -824,7 +839,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             return [...threadResponseIds];
         },
 
-        emitError(message) {
+        emitError(message, rejection) {
             const parts: Buffer[] = [];
             if (!messageStartForwarded) {
                 parts.push(buildSyntheticMessageStart());
@@ -846,7 +861,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                 parts.push(buildTerminal("end_turn", 0, 0, 0));
             } else {
                 parts.push(Buffer.from(
-                    `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "upstream_error", message: `[acp-proxy: ${message}]` } })}\n\n`,
+                    `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: rejection?.type ?? rejection?.code ?? "server_error", code: rejection?.code ?? rejection?.type ?? "upstream_error", message: rejection ? message : `[acp-proxy: ${message}]` } })}\n\n`,
                     "utf8",
                 ));
             }

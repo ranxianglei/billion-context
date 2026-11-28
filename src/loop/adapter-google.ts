@@ -1013,8 +1013,8 @@ export function createGoogleAdapter(
             return buildChunk([], { candidate: { finishReason: googleFinishReason(opts?.finishReason) }, top: usage });
         },
 
-        emitError(message) {
-            return sseFrame({ error: { code: 500, message, status: "INTERNAL" } });
+        emitError(message, rejection) {
+            return sseFrame({ error: { code: rejection ? 400 : 500, message, status: rejection ? "INVALID_ARGUMENT" : "INTERNAL" } });
         },
     };
 }

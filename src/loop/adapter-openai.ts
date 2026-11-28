@@ -767,7 +767,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             return Buffer.concat([buildFinish(finishReason, usage), Buffer.from("data: [DONE]\n\n", "utf8")]);
         },
 
-        emitError(message) {
+        emitError(message, rejection) {
             // #1455: present the failure AS a failure (see the anthropic twin). The
             // legacy shape — error text + finish_reason "stop" + [DONE] — read as a
             // normal completion to clients and suppressed their retry logic. The
@@ -782,7 +782,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 ]);
             }
             return Buffer.concat([
-                Buffer.from(`data: ${JSON.stringify({ error: { type: "server_error", code: "upstream_error", message: `[acp-proxy: ${message}]` } })}\n\n`, "utf8"),
+                Buffer.from(`data: ${JSON.stringify({ error: { type: rejection?.type ?? rejection?.code ?? "server_error", code: rejection?.code ?? rejection?.type ?? "upstream_error", message: rejection ? message : `[acp-proxy: ${message}]` } })}\n\n`, "utf8"),
                 Buffer.from("data: [DONE]\n\n", "utf8"),
             ]);
         },

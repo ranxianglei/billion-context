@@ -66,7 +66,7 @@ import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, throttle429ModelScope, type ThrottleLocalReject, upstreamThrottleGate, upstreamThrottlePeekReject } from "../upstream-throttle.js";
-import { applyEstimateCalibration, BILI_HOST_RECOVERY_OWNER_HEADER, BILI_HOST_RECOVERY_OWNER_OMP, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { applyEstimateCalibration, BILI_HOST_RECOVERY_OWNER_HEADER, BILI_HOST_RECOVERY_OWNER_OMP, currentCalibrationFactor, inspectContextOverflow, parseContentRejection, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
@@ -1435,7 +1435,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // auto-retry with the offending role rewritten to "system". On success the
     // mapping is remembered on the session (never written to config — the log
     // carries the permanent per-provider snippet instead). On failure the
-    // original response continues downstream verbatim. Error bodies for these
+    // original response continues downstream verbatim unless the retry returns
+    // an explicit terminal content verdict. Error bodies for these
     // request-validation statuses are small (buffered below).
     if (
         compatProtocol &&
@@ -1462,7 +1463,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 clearTimer: upstreamResult.clearTimer,
                 stopIdleTimer: upstreamResult.stopIdleTimer,
             };
-            const namedRejection = detectRoleRejection(upstreamResult.response.status, roleErrText);
+            const contentRejected = parseContentRejection(upstreamResult.response.status, roleErrText) !== null;
+            const namedRejection = contentRejected ? null : detectRoleRejection(upstreamResult.response.status, roleErrText);
             // #1996: placement-only rejections name no role (vLLM+Qwen
             // chat_template: "System message must be at the beginning.") — enter
             // the ladder when the error matches a placement marker AND the wire
@@ -1470,7 +1472,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // system item (plugin-mode #1638 verbatim pass-through) gets the same
             // single-hop repair instead of a permanent 400 loop on every retry.
             const rejection = namedRejection ??
-                (detectSystemPlacementError(upstreamResult.response.status, roleErrText) &&
+                (!contentRejected && detectSystemPlacementError(upstreamResult.response.status, roleErrText) &&
                     hasOffHeadSystem(wireBody, compatProtocol)
                     ? { role: "system" }
                     : null);
@@ -1483,7 +1485,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // rewrites the one offending role to a single target and forwards
                 // exactly once; the sequence is fixed (never a loop), hard-capped
                 // at original + 2 retries. Any other failure stops the ladder and
-                // the original 400 passes through verbatim.
+                // the original 400 passes through verbatim, except that an
+                // explicit content verdict from a later hop takes precedence.
                 // (#1996): placement-only errors that name no role enter here
                 // directly as { role: "system" } (see above) and skip the
                 // identity hop straight to the system→user placement fix.
@@ -1532,6 +1535,20 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         }
                     }
                     r.clearTimer();
+                    if (errText !== null && parseContentRejection(r.response.status, errText) !== null) {
+                        // A repair can itself receive a terminal verdict. Preserve
+                        // that response and stop before the placement fallback.
+                        upstreamResult.clearTimer();
+                        upstreamResult = {
+                            ...r,
+                            response: new Response(errText, {
+                                status: r.response.status,
+                                statusText: r.response.statusText,
+                                headers: new Headers(r.response.headers),
+                            }),
+                        };
+                        return "other";
+                    }
                     return errText !== null && detectSystemPlacementError(r.response.status, errText) ? "placement-400" : "other";
                 };
                 // #1996: an already-system offender needs no identity hop — go
@@ -1553,7 +1570,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // origin+model pair process-locally (src/pck-probe.ts; surfaced via log /
     // acp_status / web panel), every later prepare withholds the key there
     // until proxy restart. Still failing ⇒ NOT this field — discard the
-    // second response, forward the original 400 verbatim, learn nothing (the
+    // second response unless it is an explicit content verdict, forward the
+    // selected error verbatim, learn nothing (the
     // next turn carries the key again and re-runs the probe). One attempt per
     // request, no loops; the error body is buffered so the passthrough below
     // re-reads the same bytes (same pattern as the #552 ladder above).
@@ -1603,7 +1621,10 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             if (contentWall) {
                 log("debug", `[${prepared.session.id}] [pck] 400 names a content wall (${pckInspection!.imageCountCap !== undefined ? `image count > ${pckInspection!.imageCountCap}` : "context overflow"}) — prompt_cache_key exonerated by inspection, A/B probe skipped (#4124)`);
             }
-            if (strippedPckBody !== null && !contentWall) {
+            const contentRejected = parseContentRejection(400, pckErrText) !== null;
+            // Removing a routing key cannot resolve an explicit content rejection.
+            // Preserve the first error and leave the cache-routing registry unchanged.
+            if (strippedPckBody !== null && !contentWall && !contentRejected) {
                 let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
                 try {
                     retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(strippedPckBody) }, undefined, clientAbort.signal);
@@ -1627,15 +1648,29 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         log("info", `[${prepared.session.id}] [pck] egress carried prompt_cache_key \u2192 400; identical request without the key was accepted — withholding the key for ${maskUrlForLog(upstreamUrl)} until proxy restart (#2645)`);
                         upstreamResult = retried;
                     } else {
+                        let retryErrText: string | null = null;
                         if (retried.response.body) {
                             try {
-                                await readStreamToBuffer(retried.response.body);
+                                retryErrText = (await readStreamToBuffer(retried.response.body)).toString("utf8");
                             } catch {
-                                /* discarded either way */
+                                /* unreadable retry — preserve the original error */
                             }
                         }
                         retried.clearTimer();
-                        log("debug", `[${prepared.session.id}] [pck] A/B retry without prompt_cache_key also failed (${retried.response.status}) — not the key's fault; key stays, original 400 forwarded (#2645)`);
+                        if (retryErrText !== null && parseContentRejection(retried.response.status, retryErrText) !== null) {
+                            upstreamResult.clearTimer();
+                            upstreamResult = {
+                                ...retried,
+                                response: new Response(retryErrText, {
+                                    status: retried.response.status,
+                                    statusText: retried.response.statusText,
+                                    headers: new Headers(retried.response.headers),
+                                }),
+                            };
+                            log("debug", `[${prepared.session.id}] [pck] retry received a terminal content verdict — preserving it without learning a key ablation`);
+                        } else {
+                            log("debug", `[${prepared.session.id}] [pck] A/B retry without prompt_cache_key also failed (${retried.response.status}) — not the key's fault; key stays, original 400 forwarded (#2645)`);
+                        }
                     }
                 }
             }
@@ -1647,8 +1682,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // re-send once with exactly those blocks dropped. Accepted ⇒ causation
     // confirmed: adopt the retry, remember the strict posture for THIS session
     // only (later sends drop proactively above). Still failing ⇒ NOT this field
-    // — discard the second response, forward the original 400 verbatim, learn
-    // nothing (same controlled-experiment discipline as the #2645 ladder).
+    // — discard the second response unless it is an explicit content verdict,
+    // forward the selected error verbatim, learn nothing (as in #2645).
     // Never-signing relays (#5495) word their 400 differently ("must be passed
     // back"), so they never enter this branch and keep their verbatim replay.
     if (
@@ -1677,7 +1712,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 clearTimer: upstreamResult.clearTimer,
                 stopIdleTimer: upstreamResult.stopIdleTimer,
             };
-            if (detectThinkingSignatureRejection(400, tsErrText)) {
+            if (parseContentRejection(400, tsErrText) === null && detectThinkingSignatureRejection(400, tsErrText)) {
                 const dropped = stripUnsignedThinkingFromWire(wireBody);
                 if (dropped.removed > 0) {
                     let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
@@ -1699,15 +1734,29 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                             log("info", `[${prepared.session.id}] [thinking-posture] upstream rejected signature-less thinking ("${tsErrText.slice(0, 120)}") — stripped ${dropped.removed} block(s), retry accepted; dropping them proactively for this session (#5998)`);
                             upstreamResult = retried;
                         } else {
+                            let retryErrText: string | null = null;
                             if (retried.response.body) {
                                 try {
-                                    await readStreamToBuffer(retried.response.body);
+                                    retryErrText = (await readStreamToBuffer(retried.response.body)).toString("utf8");
                                 } catch {
-                                    /* discarded either way */
+                                    /* unreadable retry — preserve the original error */
                                 }
                             }
                             retried.clearTimer();
-                            log("warn", `[${prepared.session.id}] [thinking-posture] strip-and-resend probe also failed (${retried.response.status}) — not the unsigned blocks' fault; original 400 forwarded verbatim, nothing learned (#5998)`);
+                            if (retryErrText !== null && parseContentRejection(retried.response.status, retryErrText) !== null) {
+                                upstreamResult.clearTimer();
+                                upstreamResult = {
+                                    ...retried,
+                                    response: new Response(retryErrText, {
+                                        status: retried.response.status,
+                                        statusText: retried.response.statusText,
+                                        headers: new Headers(retried.response.headers),
+                                    }),
+                                };
+                                log("warn", `[${prepared.session.id}] [thinking-posture] retry received a terminal content verdict — preserving it without learning a strict posture`);
+                            } else {
+                                log("warn", `[${prepared.session.id}] [thinking-posture] strip-and-resend probe also failed (${retried.response.status}) — not the unsigned blocks' fault; original 400 forwarded verbatim, nothing learned (#5998)`);
+                            }
                         }
                     }
                 }
@@ -2150,7 +2199,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // #2169: match BOTH field spellings — the chat wire says
             // reasoning_content, DeepSeek's Responses wire says reasoning_text.
             // #5495: DeepSeek's Anthropic-wire endpoint spells it content[].thinking.
-            if (upstream.status === 400 && /reasoning_(?:content|text)|content\[\]\.thinking/i.test(errText)) {
+            // A terminal content verdict may quote these fields without establishing a schema constraint.
+            if (upstream.status === 400 && parseContentRejection(upstream.status, errText) === null && /reasoning_(?:content|text)|content\[\]\.thinking/i.test(errText)) {
                 if (s.metadata.strictReasoningEcho !== true) {
                     s.metadata.strictReasoningEcho = true;
                     markDirty(s);

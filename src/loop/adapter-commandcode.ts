@@ -263,8 +263,8 @@ export function createCommandcodeAdapter(
             return lineBuf(JSON.stringify({ type: "finish", finishReason: opts?.finishReason ?? "stop", totalUsage }));
         },
 
-        emitError(message: string): Buffer {
-            return lineBuf(JSON.stringify({ type: "error", error: "acp_proxy_error", message }));
+        emitError(message, rejection): Buffer {
+            return lineBuf(JSON.stringify({ type: "error", error: rejection?.code ?? rejection?.type ?? "acp_proxy_error", message }));
         },
     };
 }

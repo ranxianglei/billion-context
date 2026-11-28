@@ -28,7 +28,7 @@ billion-context/
 │   │   ├── prepare-google.ts     #   Gemini request preparation incl. :countTokens twin (#1440)
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
-│   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
+│   │   ├── relay.ts             #   Upstream relay; classified recovery excludes terminal content rejection
 │   │   ├── rejection-diagnostics.ts #   Bounded terminal-cause diagnostic for a relayed upstream rejection: one nested attempts[].details.error.message, scrubbed + bounded, appended to the relay log line (#4452)
 │   │   ├── request-cost.ts       #   Per-request local-cost line (outbound measured at the real wire body) + #5408 heartbeat + wall-clock slow-session advisory, facts only (#903/#4528/#5744)
 │   │   ├── responses-ordering.ts #   #564 Responses assistant-run ordering repair + producer-owned turn-separator provenance (#2627)
@@ -98,6 +98,7 @@ billion-context/
 │   ├── absorb.ts                 # absorb tool (kernel ACP_TOOL_NAMES extension)
 │   ├── compress-loop-anthropic.ts # Non-stream Anthropic proxy-tool loop (#5957)
 │   ├── compress-loop-responses.ts # Compress loop for Responses API format
+│   ├── responses-system-sections.ts # Shared Responses developer-section join for steady + proxy-loop rebuild paths (#6922)
 │   ├── compress-settings.ts      # Three-level compress config merge (global→provider→model)
 │   ├── chat-pack.ts              # Bundled chat prompt pack: relationship-first compress philosophy (#5319)
 │   ├── compress-tool.ts          # ACP tool surface — thin re-export from acp-kernel
@@ -378,7 +379,7 @@ billion-context/
 When navigating this codebase, these are the load-bearing entry points:
 
 - **Request pipeline** — `src/server.ts` is the single HTTP entry; everything flows through `createServer()` → route matching → `forward()`. The file is large by design (one pipeline, many wire shapes).
-- **Loop core** — `src/loop/core.ts` owns the protocol-neutral event model and all tool-call adjudication. Wire adapters (`adapter-*.ts`) translate between wire events and the core's event vocabulary.
+- **Loop core** — `src/loop/core.ts` owns the protocol-neutral event model and all tool-call adjudication. Wire adapters (`adapter-*.ts`) translate between wire events and the core's event vocabulary. Terminal content rejections retain diagnostics and request IDs across tool and recovery continuations; measured attempts settle before recovery exits.
 - **Knobs** — every behavior knob resolves through `src/knobs.ts` (env > config file > default, #2030). Never add a new `process.env` read in a leaf module — see AGENTS.md "Environment Variable Discipline".
 - **Update path** — `src/update.ts` is deliberately self-contained and conservative; it installs via tarball extraction (not `npm install`) to avoid lifecycle-script surprises on user machines. It is load-bearing infrastructure: changes require a no-op validation release first (§5).
 - **Agent plugins** — `src/agent/*.ts` are thin host-specific adapters; shared logic lives in `src/agent/shared.ts`. Each host has a `-native.ts` bootstrap gate variant.

@@ -46,7 +46,7 @@ import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim } from "../k
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
-import { promptInputTotal, type WireProtocol } from "../util.js";
+import { parseContentRejection, promptInputTotal, type ContentRejection, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 import { endsWithAnnouncement, endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogateEscapesOnJson } from "../text-safe.js";
@@ -432,7 +432,7 @@ export interface CompressLoopAdapter {
     emitToolCall(call: ToolCallEmit): Buffer;
     emitMarker(toolName: string, result: string): Buffer;
     emitCompletion(opts?: EmitCompletionOpts): Buffer;
-    emitError(message: string): Buffer;
+    emitError(message: string, rejection?: ContentRejection): Buffer;
     extractTextTriggers?(text: string): ExtractedTextTriggers;
     // #2701 (anthropic Threads only): the id of the LATEST upstream response
     // observed on the wire — the thread tail a re-request must continue from.
@@ -922,11 +922,11 @@ export async function* runCompressLoop(
             // recordUsage below runs once per ROUND, but a successful retry re-fetches within
             // the same round and the top-of-loop `usage = {}` reset drops the replaced attempt's
             // usage before it is ever recorded — billed tokens vanish from the internal ledger.
-            // Called on the success path only: each upstream attempt is accounted exactly once.
-            // A FAILED retry never reaches these call sites (it catches and falls through to
-            // break), so the surviving original attempt is settled once by recordUsage — no
-            // double counting. The client-facing completion still carries only the FINAL
-            // attempt's usage (emitCompletion reads `usage`, which this never mutates), so the
+            // Settle before a successful retry replaces this attempt, or a terminal rejection
+            // returns before the round-level settlement. Other failed retries fall through
+            // to recordUsage below. Each branch records only the measured original attempt,
+            // never usage for an HTTP rejection. The client-facing completion still carries
+            // only the FINAL attempt's usage (emitCompletion reads `usage`, unchanged here), so the
             // internal ledger and the response's usage representation stay separate.
             const settleAttemptUsage = (): void => {
                 if (
@@ -1167,6 +1167,13 @@ export async function* runCompressLoop(
                         settleAttemptUsage();
                         continue;
                     } catch (e) {
+                        const rejection = e instanceof UpstreamHttpError ? parseContentRejection(e.status, e.body, e.requestId) : null;
+                        if (rejection) {
+                            settleAttemptUsage();
+                            ctx.log("[acp-loop] recovery rejected for content; ending the turn with the original diagnostic");
+                            yield adapter.emitError(rejection.message, rejection);
+                            return;
+                        }
                         if (e instanceof UpstreamHttpError) {
                             const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
                             ctx.log(`[acp-loop] round ${round}: truncation retry failed (upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)})`);
@@ -1233,6 +1240,13 @@ export async function* runCompressLoop(
                         settleAttemptUsage();
                         continue;
                     } catch (e) {
+                        const rejection = e instanceof UpstreamHttpError ? parseContentRejection(e.status, e.body, e.requestId) : null;
+                        if (rejection) {
+                            settleAttemptUsage();
+                            ctx.log("[acp-loop] recovery rejected for content; ending the turn with the original diagnostic");
+                            yield adapter.emitError(rejection.message, rejection);
+                            return;
+                        }
                         if (e instanceof UpstreamHttpError) {
                             ctx.log(`[acp-loop] round ${round}: continuation retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); falling back to the truncation error`);
                         } else {
@@ -1282,6 +1296,13 @@ export async function* runCompressLoop(
                         settleAttemptUsage();
                         continue;
                     } catch (e) {
+                        const rejection = e instanceof UpstreamHttpError ? parseContentRejection(e.status, e.body, e.requestId) : null;
+                        if (rejection) {
+                            settleAttemptUsage();
+                            ctx.log("[acp-loop] recovery rejected for content; ending the turn with the original diagnostic");
+                            yield adapter.emitError(rejection.message, rejection);
+                            return;
+                        }
                         if (e instanceof UpstreamHttpError) {
                             ctx.log(`[acp-loop] round ${round}: degenerate retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); passing the empty turn through`);
                         } else {
@@ -1363,6 +1384,13 @@ export async function* runCompressLoop(
                         settleAttemptUsage();
                         continue;
                     } catch (e) {
+                        const rejection = e instanceof UpstreamHttpError ? parseContentRejection(e.status, e.body, e.requestId) : null;
+                        if (rejection) {
+                            settleAttemptUsage();
+                            ctx.log("[acp-loop] recovery rejected for content; ending the turn with the original diagnostic");
+                            yield adapter.emitError(rejection.message, rejection);
+                            return;
+                        }
                         if (e instanceof UpstreamHttpError) {
                             ctx.log(`[acp-loop] round ${round}: stalled-tail retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); passing the turn through`);
                         } else {
@@ -1858,6 +1886,7 @@ export async function* runCompressLoop(
                         e.status < 400 ||
                         e.status >= 500 ||
                         degradedRetried ||
+                        parseContentRejection(e.status, e.body, e.requestId) !== null ||
                         isThinkingModifiedError(e) ||
                         isReasoningRequiredError(e) ||
                         (ctx.protocol !== "anthropic" && ctx.protocol !== "google") ||
@@ -1914,6 +1943,7 @@ export async function* runCompressLoop(
                 // #5495: DeepSeek's Anthropic-wire endpoint spells it content[].thinking.
                 if (
                     e.status === 400 &&
+                    parseContentRejection(e.status, e.body, e.requestId) === null &&
                     /reasoning_(?:content|text)|content\[\]\.thinking/i.test(e.body) &&
                     ctx.session.metadata.strictReasoningEcho !== true
                 ) {
@@ -1928,7 +1958,8 @@ export async function* runCompressLoop(
                 const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
                 ctx.log(`[acp-proxy: compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);
                 loggerLog("error", `[acp-loop] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
-                yield adapter.emitError(`upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
+                const rejection = parseContentRejection(e.status, e.body, e.requestId);
+                yield adapter.emitError(rejection?.message ?? `upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`, rejection ?? undefined);
                 return;
             }
 
