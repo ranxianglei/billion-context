@@ -174,3 +174,49 @@ test("#2952: tiers=false keeps the existing behavior — no distillation, old fu
     assert.ok(!logs.some((l) => l.includes("#2952")), `tiers=false must not enter tier recovery (logs: ${logs.join(" | ")})`);
     assert.equal(session.state.blocks.filter((b) => b.active).length, activeBlocks.length, "no blocks may be created or destroyed when tiers=false");
 });
+
+test("#4563: a structurally exhausted tier-recovery round is deterministic (→ 413/non-retryable, not a 502 spin)", async () => {
+    // Same structurally-exhausted fixture as the all-tier-exhaustion test above:
+    // a protected tail whose mass alone exceeds the window is an invariant floor,
+    // so recovery distills down to "no tier held two or more active blocks" and the
+    // payload is still over. Before #4563 this verdict omitted the deterministic
+    // flag (→ undefined → 502, and status-code-driven hosts spun on a payload that
+    // can never fit). It must now be deterministic.
+    const { core, config, messages, session } = buildFixture({ limit: 4000, blockCount: 6, blockChars: 18000, tailChars: 24000 });
+    const { server, url } = await startSummaryUpstream(openAiBody(filler(300, "CONDENSED")));
+    try {
+        const deps: PreflightDeps = {
+            core, session, config, prompts: defaultPrompts, protocol: "responses",
+            url: "http://127.0.0.1:9/v1/chat/completions", headers: {}, model: "test",
+            externalSummary: makePlan(url), log: (_l, _m) => { /* ignore */ },
+        };
+        const result = await preflightCompress(deps, messages);
+        assert.equal(result.failure?.kind, "exhausted", `expected exhaustion, got: ${JSON.stringify(result.failure)}`);
+        assert.equal(result.failure?.deterministic, true, `a structurally exhausted tier-recovery round must be deterministic (got ${JSON.stringify(result.failure?.deterministic)})`);
+        assert.equal(result.fitsWindow, false, "the doomed payload must not be marked fit-to-forward");
+    } finally {
+        server.close();
+    }
+});
+
+test("#4563: a relay-dependent tier-recovery failure (summary call errors) stays non-deterministic (→ 502/retryable)", async () => {
+    // The summary upstream errors on the distillation call. This is relay-dependent
+    // (a recovered relay can complete the distill), so the verdict must NOT be marked
+    // deterministic — it stays 502/retryable, never a premature 413.
+    const { core, config, messages, session } = buildFixture({ limit: 12000, blockCount: 6, blockChars: 18000, tailChars: 200 });
+    const server = http.createServer((_req, res) => { res.writeHead(500, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "summary upstream down" })); });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const addr = server.address() as { port: number };
+    try {
+        const deps: PreflightDeps = {
+            core, session, config, prompts: defaultPrompts, protocol: "responses",
+            url: "http://127.0.0.1:9/v1/chat/completions", headers: {}, model: "test",
+            externalSummary: makePlan(`http://127.0.0.1:${addr.port}`), log: (_l, _m) => { /* ignore */ },
+        };
+        const result = await preflightCompress(deps, messages);
+        assert.equal(result.failure?.kind, "exhausted", `expected exhaustion, got: ${JSON.stringify(result.failure)}`);
+        assert.equal(result.failure?.deterministic, false, `a relay-dependent tier-recovery failure must NOT be deterministic (got ${JSON.stringify(result.failure?.deterministic)})`);
+    } finally {
+        server.close();
+    }
+});
