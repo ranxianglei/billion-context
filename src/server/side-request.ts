@@ -207,6 +207,36 @@ export function isAudioOutputCall(parsed: unknown): boolean {
     return Object.keys(audio).length > 0;
 }
 
+// #7882: a body that resends real model-round-trip history — an `assistant`/
+// `model`/`tool` role, or a `function_call`/`function_call_output`/`reasoning`/
+// `item_reference`/`custom_tool_call`/`custom_tool_call_output` item — is a
+// main turn, not a one-shot side call. Title-gen/probe/one-shot side requests
+// never carry model-round-trip evidence: they are the FIRST model call of the
+// conversation (or a stateless utility), so no prior assistant/tool round-trip
+// can be in their body. The declared output budget is CLIENT-CONTROLLED — Pi's
+// clamp (pi-ai simple-options) decays it as the raw transcript nears the window
+// (7602 -> ... -> 16 in one session) — so it must not be the sole signal that
+// demotes a main turn to the side lane. Proto-safe: reads the entry arrays of
+// every wire shape (responses `input`, openai/anthropic `messages`, google
+// `contents`), no protocol argument.
+function hasResentHistory(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    const entries = p.input ?? p.messages ?? p.contents;
+    if (!Array.isArray(entries)) return false;
+    for (const e of entries) {
+        if (!e || typeof e !== "object") continue;
+        const o = e as Record<string, unknown>;
+        const role = o.role;
+        if (role === "assistant" || role === "model" || role === "tool") return true;
+        const type = o.type;
+        if (type === "function_call" || type === "function_call_output"
+            || type === "reasoning" || type === "item_reference"
+            || type === "custom_tool_call" || type === "custom_tool_call_output") return true;
+    }
+    return false;
+}
+
 export function isSideRequest(parsed: unknown, requestAgent?: string, purpose?: string): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     if (requestAgent !== undefined && SIDE_REQUEST_AGENTS.has(requestAgent)) return true;
@@ -238,6 +268,13 @@ export function isSideRequest(parsed: unknown, requestAgent?: string, purpose?: 
     // would corrupt the spoken text (per-message tags), so it rides the
     // #388 side passthrough verbatim like the utility shapes above.
     if (isAudioOutputCall(parsed)) return true;
+    // #7882: a body that resends real model-round-trip history is a main turn —
+    // the budget rung below must not demote it to the side lane on the strength
+    // of a client-shrunk budget (Pi's clamp decays max_output_tokens as the raw
+    // transcript nears the window, so a long no-tools main turn lands in the
+    // <=200 "title call" band and is refused by the side guard instead of being
+    // compressed). Explicit host intent (the rungs above) still outranks this.
+    if (hasResentHistory(parsed)) return false;
     const field = outputBudgetField(parsed);
     if (!field) return false;
     const raw = readOutputBudget(p, field);
@@ -933,7 +970,12 @@ export function restoreOutputBudget(
     }
     // Starved or #3438-collapsed main request (budget + tools present). A side
     // request (no tools) never reaches here — restoring it would break its side status.
-    if (!Array.isArray(p.tools) || p.tools.length === 0) return;
+    // #7882: the one exception is a no-tools main turn that resends real
+    // model-round-trip history — Pi's clamp starves it (max_output_tokens -> 16)
+    // and the isSideRequest replay veto above keeps it on the main lane, so it
+    // must be restored here too or it would forward at the starved budget. A
+    // no-tools ONE-SHOT (a genuine side request, no history) still returns early.
+    if ((!Array.isArray(p.tools) || p.tools.length === 0) && !hasResentHistory(parsed)) return;
     const highWaterRaw = session.metadata.outputBudgetHighWater;
     const highWater = typeof highWaterRaw === "number" && highWaterRaw > SIDE_REQUEST_MAX_TOKENS ? highWaterRaw : undefined;
     let target = highWater;
@@ -1032,7 +1074,7 @@ export function sideRequestGuard(
      *  model evidence the guard cannot); default false keeps non-reserving
      *  callers byte-identical. */
     reserveHeadroom: boolean = false,
-): { blocked: boolean; estimate: number; limit: number } {
+): { blocked: boolean; estimate: number; limit: number; window: number; maxOut: number } {
     let limit = modelContextLimit;
     // #987: no learned window exists, but a usage-grounded arm left by an
     // overflow 400 (the upstream STATED that size) is live evidence this
@@ -1040,10 +1082,14 @@ export function sideRequestGuard(
     // guaranteed 400 (#554 loop). The arm is one-shot memory (a successful
     // turn's usage overwrites it); it never re-centers the declared window.
     if (armedLimit > 0 && (limit <= 0 || armedLimit < limit)) limit = armedLimit;
+    // #7882: the pre-headroom ceiling, kept so the refusal can name the model
+    // window and the output reservation separately instead of printing the
+    // headroom-adjusted number as if it were the window itself.
+    const window = limit;
     const field = outputBudgetField(parsed);
     const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
     if (reserveHeadroom && limit > 0) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
     const imageMass = imageReserve ?? imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
     const estimate = estimateRawBodyTokens(parsed) + imageMass;
-    return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
+    return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit, window, maxOut };
 }

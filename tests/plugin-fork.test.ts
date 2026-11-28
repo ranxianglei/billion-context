@@ -410,8 +410,16 @@ test("HTTP missing or unknown intent keeps all-bili demotion; anonymous main can
             assert.equal(resolveConversation(id).session!.stats.requests, 0);
         }
         await sendIntentModel(h, "anonymous-main", h.messages, [], "main", 100, false);
-        assert.deepEqual(h.forwarded.at(-1)!.messages, h.messages, "unannounced persona must still pass through as a tiny utility request");
-        assert.equal(getSession("anonymous-main").stats.requests, 0);
+        // #7882: the replay veto makes a no-tools body that resends model-round-trip
+        // history a MAIN turn regardless of the tiny budget, so the unannounced
+        // persona is now a proxy main turn (compressed on the main lane) — but it
+        // still cannot claim PLUGIN intent (no x-bili-plugin announcement), so no
+        // plugin snapshot is created and pluginAgent stays unset.
+        const anonForwarded = h.forwarded.at(-1)!.messages as { role: string; content: string }[];
+        assert.equal(anonForwarded[0].role, "system");
+        assert.match(anonForwarded[0].content, /^Compression Philosophy:/);
+        assert.deepEqual(anonForwarded.slice(1).map((message) => ({ role: message.role, content: message.content.replace(/^\x3cacp\b[^\n]*\x3c\/acp\x3e\n/, "") })), h.messages, "anonymous main is a proxy main turn (compressed), not a plugin main turn");
+        assert.equal(getSession("anonymous-main").stats.requests, 1);
         assert.equal(getSession("anonymous-main").metadata.pluginAgent, undefined);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=anonymous-main")).status, 409);
     } finally { await h.close(); }
