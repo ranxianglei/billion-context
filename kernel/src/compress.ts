@@ -935,6 +935,10 @@ export function createCore(ports: Ports = {}): CompressionCore {
     state.stats.compressionCount += blocksCreated;
     state.stats.tokensCompressed += tokensCompressed;
 
+    // #6720: tokens of the last tier-1 offer this fold left unharvested — set
+    // only on a partial tier-1 fold, rendered into the receipt below.
+    let remainingPending: number | undefined;
+
     if (blocksCreated > 0) {
       // #3769: record where THIS fold starts so the next processTurn sweeps
       // orphan failures at/after it cache-neutrally, leaving orphans before it
@@ -988,10 +992,17 @@ export function createCore(ports: Ports = {}): CompressionCore {
       const firePending = state.nudge.lastT1FirePending;
       if (distilled) {
         state.nudge.t1HarvestStall = false;
+        state.nudge.partialFoldReinjectArmed = false;
         state.nudge.lastT1FirePending = undefined;
       } else if (firePending !== undefined && firePending > 0) {
-        state.nudge.t1HarvestStall =
-          tokensCompressed < STALL_HARVEST_RATIO * firePending;
+        const partial = tokensCompressed < STALL_HARVEST_RATIO * firePending;
+        state.nudge.t1HarvestStall = partial;
+        // #6720: arm the one-shot re-inject on a partial fold so the next
+        // processTurn re-offers T1 without waiting for the full growth floor.
+        state.nudge.partialFoldReinjectArmed = partial;
+        if (partial) {
+          remainingPending = Math.max(0, firePending - tokensCompressed);
+        }
         state.nudge.lastT1FirePending = undefined;
       }
       // A successful compression is by definition viable progress — restart
@@ -1027,6 +1038,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
         // nothing — surface the no-op class so the host renders the
         // success-shaped receipt instead of "FAILED: no blocks created".
         ...(blocksCreated === 0 && errors.length === 0 ? { noop: true } : {}),
+        // #6720: surface the unharvested remainder of a partial tier-1 fold so
+        // the receipt says "you left X" instead of a done-shaped receipt.
+        ...(remainingPending !== undefined
+          ? { remainingPending }
+          : {}),
       },
     };
   }
@@ -1631,6 +1647,11 @@ const nudgeNode: PipelineNode = {
       // against this number to detect a non-draining T1 channel.
       if (nudge.tier === 1 && nudge.breakdown) {
         stamped.lastT1FirePending = nudge.breakdown.pendingT1;
+      }
+      // #6720: a displayed tier-1 nudge consumes the one-shot re-inject — the
+      // model got its re-offer, so disarm; the next partial fold re-arms it.
+      if (nudge.tier === 1) {
+        stamped.partialFoldReinjectArmed = false;
       }
     }
 
@@ -2321,6 +2342,25 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     input.tokenCountSource === "estimate" &&
     config.nudge.requireUsageSampleForPressure !== false &&
     estimateHoldStreak <= maxEstimateHoldRounds;
+  // #6762: a FAILED tool result at the tail means the model's LAST action just
+  // failed. A pressure-band nudge fired this round would push the model to
+  // compress, and the failure context (the error message, the failed command)
+  // is the first thing a fold drops — the model then "forgets" the error and
+  // retries blindly. Hold the pressure-band injection for THIS round only: the
+  // nudge re-arms on the next turn (self-recovering), so a session that keeps
+  // failing still gets its nudge on the first non-failure turn. Pressure-band
+  // only — the growth band has a cadence and does not re-fire every turn, so
+  // the "re-fires on a failed turn" pathology is pressure-specific. The sidecar
+  // survives the pre-nudge transforms (crush/absorb-prompt/filter spread the
+  // message object; none append a new tail message), so the last element is
+  // the original failed tool result.
+  const lastMsg = input.messages[input.messages.length - 1];
+  const toolFailureHold =
+    pressure &&
+    lastMsg !== undefined &&
+    lastMsg.role === "tool" &&
+    lastMsg.contentType === "tool-result" &&
+    lastMsg.toolIsError === true;
 
   const baseline = state.nudge.lastPerMessageNudgeTokens;
   const hadPendingNudge = state.nudge.lastNudgeShownTokens > 0;
@@ -2487,7 +2527,8 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     if (
       best !== null &&
       bestPending >= minPressureBenefit &&
-      !pressureDeferredNoSample
+      !pressureDeferredNoSample &&
+      !toolFailureHold
     ) {
       injectedTier = best;
       stallEscalated = t1HarvestStall && best !== 1;
@@ -2562,6 +2603,29 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     }
   }
 
+  // #6720: partial-fold re-inject. The last tier-1 fold was PARTIAL (armed the
+  // one-shot flag in applyCompression) and it left >= half the T1 threshold on
+  // the table. Re-offer T1 on THIS request without waiting for the full growth
+  // floor — the ratchet (#6720) is exactly the wait: each partial fold's
+  // remainder rides along, the tail grows 10-20K by the next nudge, and the
+  // post-fold floor rises monotonically. Not gated on usage: a low-usage long
+  // session (1M window, usage <= 24%) never crosses minContextLimitPct, so the
+  // first-sight/backlog bypasses never fire and the remainder would stall for
+  // a full growth interval every round. At most one re-inject per partial fold:
+  // the flag is cleared when the re-injected nudge is displayed (nudge-stamp
+  // node) or by a compliant full fold; an ignored re-offer keeps
+  // lastNudgeShownTokens set so the normal growth gate re-asserts and this
+  // never loops on an unresponsive session.
+  if (
+    injectedTier === null &&
+    !pressure &&
+    state.nudge.partialFoldReinjectArmed === true &&
+    t1Eff >= 0.5 * tierThresholds[1]
+  ) {
+    injectedTier = 1;
+    injectedReason = `T1 partial-fold re-inject: last fold left ${t1Eff} pending (>= 50% of ${tierThresholds[1]}) — re-offering without the full ${growthFloor} growth wait, usage ${Math.round(usage * 100)}%`;
+  }
+
   const shouldInject = injectedTier !== null;
   if (shouldInject && firstSightMassReady) {
     injectedReason += " [first-sight mass]";
@@ -2576,6 +2640,9 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   } else if (pressure && pressureDeferredNoSample) {
     const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
     reason = `${label}: usage ${Math.round(usage * 100)}% but the meter reading is estimate-grade (no billing sample landed this cycle, max pending ${maxPending}) — pressure injection held (estimate round ${estimateHoldStreak} of ${maxEstimateHoldRounds}) until a usage-grade reading decides or the estimate-hold backstop elapses; hard-overflow backstop unaffected`;
+  } else if (pressure && toolFailureHold) {
+    const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
+    reason = `${label}: usage ${Math.round(usage * 100)}% but the latest tool result FAILED — pressure injection held this round so the model handles the failure first (max pending ${maxPending}); the nudge re-arms on the next turn`;
   } else if (pressure) {
     const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
     reason =
@@ -2671,6 +2738,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
       overLimit: overLimit ? 1 : 0,
       emergencyOverride: emergencyOverride ? 1 : 0,
       pressureDeferredNoSample: pressureDeferredNoSample ? 1 : 0,
+      toolFailureHold: toolFailureHold ? 1 : 0,
       estimateHoldStreak,
       minPressureBenefit,
       pendingT1: tiers[1]!.pending,

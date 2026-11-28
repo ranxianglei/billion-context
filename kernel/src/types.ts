@@ -52,6 +52,12 @@ export interface CoreMessage {
    *  The render path only ever READS this stored value — it never calls
    *  Date.now() itself (prefix-cache invariant). */
   ts?: number;
+  /** #6762: the tool result FAILED (Anthropic tool_result.is_error). Set by the
+   *  wire adapters on a `role:"tool"` / `contentType:"tool-result"` core so the
+   *  nudge decision can see a failed turn: while the model's LAST action just
+   *  failed, a pressure-band nudge would push it to compress and the failure
+   *  context is the first thing lost. Metering/decision-only: never rendered. */
+  toolIsError?: boolean;
 }
 
 export type CompressionTier = 1 | 2 | 3;
@@ -172,6 +178,16 @@ export interface NudgeState {
    *  a mass-qualified T2/T3 fire ahead of T1 instead of starving forever.
    *  Cleared by a compliant harvest or any distillation. */
   t1HarvestStall?: boolean;
+  /** #6720: one-shot re-inject armed by a PARTIAL tier-1 fold (the fold
+   *  harvested < STALL_HARVEST_RATIO of the offered pending, leaving >= half
+   *  the threshold on the table). While armed, the NEXT processTurn re-offers
+   *  T1 without waiting for the full growth floor — this kills the ratchet
+   *  where each partial fold's remainder rides along and the post-fold floor
+   *  rises monotonically (#6720). Cleared when the re-injected T1 nudge is
+   *  displayed (the model gets its one re-offer) or by a compliant full fold;
+   *  an ignored re-offer keeps lastNudgeShownTokens set so the normal growth
+   *  gate re-asserts and this never loops on an unresponsive session. */
+  partialFoldReinjectArmed?: boolean;
   /** #5865 estimate-hold backstop: count of CONSECUTIVE processTurn events
    *  whose meter reading was estimate-grade. Reset to 0 by any usage-grade
    *  reading. Only consulted while nudge.requireUsageSampleForPressure is on:
@@ -809,6 +825,10 @@ export interface NudgeBreakdown {
    *     (NudgeConfig.requireUsageSampleForPressure); the host early-
    *     advertising arm (emergencyNudge) must mirror this bit. Absent on
    *     hand-built decisions — pre-fix semantics apply there.
+   *   - toolFailureHold (1/0, #6762): the pressure-band injection was held
+   *     because the latest tool result FAILED — the model is about to act on
+   *     a fresh failure, so a nudge would make it compress and lose the error
+   *     context. Self-recovering: the nudge re-arms on the next turn.
    */
   [key: string]: number;
 }
@@ -843,6 +863,13 @@ export interface ApplyCompressionResult {
      *  source. Hosts render it with the "[Compression no-op:" prefix and fold
      *  the exchange away like other zero-applied compress results (#4289). */
     noop?: true;
+    /** #6720: tokens of the last tier-1 offer that this fold did NOT harvest
+     *  (offered pending minus what actually folded, floored at 0). Present
+     *  only on a PARTIAL tier-1 fold — the host renders it into the compress
+     *  receipt so the model sees the remainder instead of a "done" receipt,
+     *  which is what let weak models treat a partial fold as complete and let
+     *  the floor ratchet up. Omitted on full/compliant folds and no-ops. */
+    remainingPending?: number;
   };
 }
 

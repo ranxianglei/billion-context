@@ -470,6 +470,12 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
     // cycle) — this early-advertising arm must not re-arm against the same
     // bad reading. Hand-built decisions without the bit keep pre-fix semantics.
     if ((nudge.breakdown?.pressureDeferredNoSample ?? 0) === 1) return false;
+    // #6762 mirror: the kernel held the pressure band because the latest tool
+    // result FAILED — the model is about to act on a fresh failure, and a
+    // nudge would make it compress and lose the error context. This arm must
+    // not re-arm against the same round. Hand-built decisions without the bit
+    // keep pre-fix semantics.
+    if ((nudge.breakdown?.toolFailureHold ?? 0) === 1) return false;
     if (!nudge.compressibleRanges.some((r) => minCompressRange <= 0 || (r.chars ?? r.tokens * 4) >= minCompressRange)) return false;
     const b = nudge.breakdown;
     const minBenefit = b?.minPressureBenefit;
