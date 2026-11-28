@@ -115,6 +115,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normali
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import type { CommandcodeEnvelopeMeta } from "./commandcode-wire.js";
+import type { TraeEnvelopeMeta } from "./trae-wire.js";
 import type { ZedEnvelopeMeta } from "./zed-wire.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { emitPreflightError } from "./stream-error.js";
@@ -2182,6 +2183,12 @@ export type Prepared = {
      *  via wireTransform) using this meta. Presence also gates the JSONL
      *  response codecs and disables #371 fake-completion retry. */
     commandcode?: { meta: CommandcodeEnvelopeMeta };
+    /** #1295: the request came from a declared `trae` endpoint — an
+     *  openai-completions conversation behind Trae's envelope and message
+     *  shapes (trae-wire.ts). forward() rewraps it at the final boundary and on
+     *  every compress-loop re-send via wireTransform; presence also disables the
+     *  #371 fake-completion retry (the SSE dialect has no [DONE] sentinel). */
+    traeWire?: { meta: TraeEnvelopeMeta };
     /** zed cloud wire: the request came as a cloud.zed.dev /completions
      *  envelope — the pipeline ran on the UNWRAPPED provider wire body;
      *  forward() rewraps it into the envelope at the final boundary (and every
