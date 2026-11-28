@@ -135,7 +135,7 @@ test("#3354 registerCompactionDisable: transform honors the entry predicate and 
         assert.equal(customOut.plugins?.[0]?.disabled, true);
         const untouched: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-other" }] };
         assert.equal(mw?.call(null, { entry: { options: { name: "other-entry" } } }, () => untouched), untouched);
-        assert.equal(mw?.call(undefined, null, () => untouched), untouched);
+        assert.equal(mw?.call(null, undefined, () => untouched), untouched);
         // next() returning nothing → verbatim passthrough
         assert.equal(mw?.call(null, presetFiber, () => undefined), undefined);
     } finally {

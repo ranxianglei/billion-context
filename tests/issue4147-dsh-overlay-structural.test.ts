@@ -107,7 +107,7 @@ test("#3962: telemetry dedups per entry, keeps the max row count, flags the fact
         const factory = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
         mw.call(null, { entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, () => factory);
         const unnamed = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
-        mw.call(undefined, null, () => unnamed);
+        mw.call(null, undefined, () => unnamed);
         const t = dshCompactionGateTelemetry()!;
         assert.deepEqual(t.covered.find((c) => c.entry === "preset-general"), { entry: "preset-general", rows: 2 }, "dedup keeps the max count");
         assert.equal(t.covered.some((c) => c.entry === "unnamed-entry"), true, "missing entry name still recorded");
