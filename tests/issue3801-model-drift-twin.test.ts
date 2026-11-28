@@ -102,7 +102,31 @@ test("entryShape: absent fields normalize to the empty value", () => {
         mitmDomains: [],
         modelWindows: {},
         modelMaxOutputs: {},
+        sessionsDir: undefined,
     });
+});
+
+// ---------------------------------------------------------------------------
+// #7878: store identity is a shape cell — a same-build same-lane holder on a
+// DIFFERENT sessions dir is a drift (ladder off, coexist), never a twin.
+// ---------------------------------------------------------------------------
+
+test("sameInstanceShape: same sessions dir matches (the true duplicate)", () => {
+    assert.equal(sameInstanceShape(ownShape({ sessionsDir: "/srv/store" }), ownShape({ sessionsDir: "/srv/store" })), true);
+});
+
+test("sameInstanceShape: a DIFFERENT sessions dir mismatches (#7878 repro)", () => {
+    assert.equal(sameInstanceShape(ownShape({ sessionsDir: "/home/u/.local/share/billion-context/sessions" }), ownShape({ sessionsDir: "/home/u/tests/eg" })), false);
+    assert.equal(sameInstanceShape(ownShape({ sessionsDir: "/home/u/tests/eg" }), ownShape({ sessionsDir: "/home/u/.local/share/billion-context/sessions" })), false);
+});
+
+test("sameInstanceShape: sessions dirs compare resolved (trailing slash / . entries are the same store)", () => {
+    assert.equal(sameInstanceShape(ownShape({ sessionsDir: "/srv/store" }), ownShape({ sessionsDir: "/srv/store/." })), true);
+});
+
+test("sameInstanceShape: a missing sessions dir on EITHER side is not a mismatch (pre-#5046 markers — conservative)", () => {
+    assert.equal(sameInstanceShape(ownShape({ sessionsDir: "/srv/store" }), ownShape()), true);
+    assert.equal(sameInstanceShape(ownShape(), ownShape({ sessionsDir: "/srv/store" })), true);
 });
 
 // ---------------------------------------------------------------------------
@@ -131,6 +155,22 @@ test("classify: drifted max outputs / host / passthrough / domain order all clas
 test("classify: a holder with NO recorded shape cells is drifted against any non-empty own shape", () => {
     const bare = holder({ host: undefined, passthrough: undefined, mitmDomains: undefined, modelWindows: undefined, modelMaxOutputs: undefined });
     assert.equal(classify(ownShape(), [bare])?.kind, "drifted");
+});
+
+test("classify: a live same-lane same-build holder on a DIFFERENT sessions dir is DRIFTED, not a twin (#7878)", () => {
+    const peer = classify(ownShape({ sessionsDir: "/home/u/tests/eg" }), [holder({ sessionsDir: "/home/u/.local/share/billion-context/sessions" })]);
+    assert.equal(peer?.kind, "drifted");
+    assert.equal(peer?.entry.instanceId, "holder-1");
+});
+
+test("classify: a same-lane same-build holder on the SAME sessions dir is still a twin (#7878 no over-separation)", () => {
+    const peer = classify(ownShape({ sessionsDir: "/srv/store" }), [holder({ sessionsDir: "/srv/store" })]);
+    assert.equal(peer?.kind, "twin");
+});
+
+test("classify: a holder with NO recorded sessions dir stays a twin (pre-#5046 marker — conservative)", () => {
+    const peer = classify(ownShape({ sessionsDir: "/srv/store" }), [holder({ sessionsDir: undefined })]);
+    assert.equal(peer?.kind, "twin");
 });
 
 test("classify: wrong port, wrong lane, or undeclared lanes never classify", () => {

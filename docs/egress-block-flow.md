@@ -6,7 +6,7 @@
 
 | Table | Role | PK |
 |---|---|---|
-| `egress_block_flow` | Append-only block canonical history (I/U/B rows) | `(session_id, op_seq)` |
+| `egress_block_flow` | Append-only block canonical history (I/U/D rows) | `(session_id, op_seq)` |
 | `egress_block_state` | Read replica: latest snapshot per block | `(session_id, block_id)` |
 
 **Dual clocks** (owner ruling 2026-11-24 — the original shared-clock design was
@@ -33,8 +33,8 @@ would start two op_seqs past the last flow row and every egress read's
 | row_type | Meaning |
 |---|---|
 | `I` | Block born (one fold). Payload = full snapshot. |
-| `U` | State change (superseded / reaped / content revision). Payload = full snapshot (no diff). |
-| `B` | Compaction base. Payload = `{entries: [{blockId, snapshot}], watermark}`. |
+| `U` | State change (superseded / content revision). Payload = full snapshot (no diff). |
+| `D` | Block reaped — the row carries the block's **full terminal snapshot** (`reaped: true`), and the `egress_block_state` row is physically deleted in the same transaction (#7773). The retired `B` compaction-base row no longer exists. |
 
 ### Snapshot shape
 
@@ -57,7 +57,7 @@ Self-contained bytes (D2): zero content-CAS refs in both tables.
 
 ## kstate sidecar
 
-Every I/U/B row carries a `kstate_json` column: the bounded residual snapshot at write time (<2KB). The 13 residual fields: `viewLatches`, `emergencyTruncateLatch`, `absorbed`, `rules`, `nudge`, `stats`, `terminalStreak`, `nextRuleId`, `deadRefs`, `sweptOrphanCallIds`, `renderDeferredRefs`, `refLedgerAligned`, `timestampsHighWaterRefSeq`. `lastPassIds` is excluded (self-heal field).
+Every I/U/D row carries a `kstate_json` column: the bounded residual snapshot at write time (<2KB). The 13 residual fields: `viewLatches`, `emergencyTruncateLatch`, `absorbed`, `rules`, `nudge`, `stats`, `terminalStreak`, `nextRuleId`, `deadRefs`, `sweptOrphanCallIds`, `renderDeferredRefs`, `refLedgerAligned`, `timestampsHighWaterRefSeq`. `lastPassIds` is excluded (self-heal field).
 
 Replay takes the last sidecar at or before the watermark (else fresh default).
 

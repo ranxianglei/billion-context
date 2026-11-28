@@ -17,7 +17,7 @@
 <text x="352" y="270" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">不是块自己的编号——双时钟的意义）</text>
 <text x="352" y="285" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">然后重放重建两个 state 副本</text>
 <text x="352" y="300" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">低于最新 base ⇒ 拒绝（400）：</text>
-<text x="352" y="315" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">那些行被压实按设计删掉</text>
+<text x="352" y="315" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">保守门，非数据约束（flow 保留了那些行）</text>
 <text x="352" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">（point-reconstruction materializer 落地前）</text>
 <rect x="820" y="70" width="380" height="130" rx="8" fill="#f3e6f5" stroke="#3a5a8a" stroke-width="1.5"/>
 <text x="832" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">回滚 / 降级（关开关或跑旧二进制）</text>
@@ -32,5 +32,5 @@
 <text x="832" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">无健康点 ⇒ 响亮硬失败（7439-5）</text>
 <line x1="260" y1="100" x2="336" y2="100" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/><line x1="260" y1="130" x2="336" y2="260" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/><text x="298" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#7a3b0f" text-anchor="middle" font-weight="bold">wm = 历史某点</text><line x1="740" y1="130" x2="816" y2="130" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/><text x="778" y="120" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11" fill="#7a3b0f" text-anchor="middle" font-weight="bold">opt-out / 旧版本</text><rect x="340" y="400" width="860" height="55" rx="8" fill="#fff6e6" stroke="#3a5a8a" stroke-width="1.5"/>
 <text x="352" y="420" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">保留底线 = 最新 B base</text>
-<text x="352" y="440" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">低于它的历史被物理删除 ⇒ 低于它的 fork 点不可达（拒绝而非猜测）；块行永远跟着 flow 指针走，点位切片不串表</text>
+<text x="352" y="440" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">低于它的历史 flow 全部保留（append-only，#7439）⇒ 低于它的 fork 点仍拒绝（保守门，绝不猜测）；块行永远跟着 flow 指针走，点位切片不串表</text>
 </svg>

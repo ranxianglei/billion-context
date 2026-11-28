@@ -17,9 +17,9 @@ Get every copy of bili on a machine to the newest version without bricking anyth
 
 ## How it works
 
-**Self-updater (`update.ts`).** Checks the npm registry every 3 min by default (`CHECK_INTERVAL_MS`, knob-overridable #2030; the first check per process ignores the throttle). Updates are tarball extraction, NOT `npm install` — no lifecycle scripts ever run on user boxes. The global install swaps in place. In plugin mode the injected code lives in the HOST process: new code only takes effect after a host restart, and a broken injection degrades model traffic to uncompressed direct — visible via the panel banner and `/__bili/status` `attribution` (#3581).
+**Self-updater (`update.ts`).** Checks the npm registry every 3 min by default (`CHECK_INTERVAL_MS`, knob-overridable #2030; the first check per process ignores the throttle). Updates are tarball extraction, NOT `npm install` — no lifecycle scripts ever run on user boxes. The global install swaps in place. In plugin mode the injected code lives in the HOST process: new code only takes effect after a host restart, and a broken injection degrades model traffic to uncompressed direct — visible via the panel banner and `/__bili/status` `attribution` (#3581). Version locking: a local pin (`bili pin [duration]`, state in `src/update-pin.ts`) or an installed prerelease/temp build is *reported* when a newer tag-channel version exists but never auto-installed — auto-upgrade only moves within its own tag channel; an explicit `bili update`, `bili unpin`, or an advisory repair releases it (#6804).
 
-**Install lanes.** Global (`npm i -g`, self-updating) · reference lanes (omp/claude/codex/kimi/zcode/hermes — no copy, point at the global dist) · host worlds (dsh profile bundle, opencode/pi trees — updated through the host's own channel, driven by the global self-update AND by the copy's own periodic check when no global ever runs, #1196) · launchers (`bili <client>` overlay mode: zero persistent copy).
+**Install lanes.** Global (`npm i -g`, self-updating) · reference lanes (omp/claude/codex/kimi/zcode/hermes — no copy, point at the global dist) · host worlds (dsh profile bundle, opencode/pi trees — updated through the host's own channel, driven by the global self-update AND by the copy's own periodic check when no global ever runs, #1196) · launchers (`bili <client>` overlay mode: zero persistent copy) · source lane (`bili install <ref>`: `src/install-ref.ts` shallow-clones a branch / tag / PR head into a cache dir, builds, backs up the current install (keeps 2), and `npm i -g <dir> --install-links` — a real copy, never a symlink (#1225); installs are auto-pinned, default 30 days, check-only: an unpublished build never auto-sweeps, #7806).
 
 **Ledger convergence.** The desktop dsh profile is the one copy bili owns outright; its self-heal swaps `node_modules/billion-context` directly, so `convergeDshLedger` (`src/dsh-ledger.ts`) also moves the profile manifest's declared spec AND the lockfile's recorded resolution in the same operation (#3496) — a writer that moves only the copy manufactures the drift #3224 detects. Pre-existing drift converges on explicit demand only: `bili doctor --fix`. `plugin-install.ts` only drives the host's own channel (`dsh plugin add`), never installs a second copy beside it (#966).
 
@@ -31,7 +31,7 @@ Human-review tier (§7.4) — no auto-merge; changing `update.ts` requires a NO-
 
 ## Key entries
 
-`src/update.ts` (updater — load-bearing) · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
+`src/update.ts` (updater — load-bearing) · `src/update-pin.ts` · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
 
 ## Related
 

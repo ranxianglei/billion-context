@@ -384,7 +384,6 @@ export function externalSummaryBreakerRefusal(ctx: RewriteCtx, planFingerprint: 
     const previous = ctx.session.metadata[key];
     const streak = readCompressLoopStreak(ctx.session);
     if (streak?.cause === "external-summary" && ((typeof previous === "string" && previous !== fingerprint) || Date.now() - streak.lastAt > COMPRESS_LOOP_DECAY_MS)) {
-        clearCompressFailures(ctx.session);
         // #7300 reworked clearCompressLoopStreak into a success gate with a
         // substantial-fold guard; a config repair is not a compression success,
         // so erase the streak directly (original #6905 repair semantics).

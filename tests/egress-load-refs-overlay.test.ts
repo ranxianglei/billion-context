@@ -19,7 +19,11 @@
 
 process.env.BILI_PERSIST_ZSTD = "0";
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
-process.env.BILI_ROLLOUT_EGRESS_KSTATE_REBUILD = "1";
+// KDD #25: kstate rebuild is folded into egressPlane — no separate env.
+// KDD #25: this suite asserts the legacy `refs` ledger shape — simulate a
+// pre-gate DB (full 19-table set) so host egressPlane configs cannot drop it
+// onto the 7-table eg layout.
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
