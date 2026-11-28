@@ -5,16 +5,16 @@
 <text x="52" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_flow — 消息 op log（正史）</text>
 <text x="52" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq)，表内稠密</text>
 <text x="52" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">row_type：I 插入 / D 删除 / U 更新（无 B）</text>
-<text x="52" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">I 行：msgid + log_seq（规范编号，永不复用）；</text>
-<text x="52" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">前沿 = flow 上的 MAX(log_seq)</text>
-<text x="52" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">D 行：(start_msgid, end_msgid) + 终态全量快照；</text>
-<text x="52" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">U 行：新字节（再引用时带 num）</text>
+<text x="52" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">I 行：msgid + rid（规范编号，一次性）；</text>
+<text x="52" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">前沿 = flow 上的 MAX(rid)</text>
+<text x="52" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">D 行：(start, end) rid 区间 + 终态全量快照；</text>
+<text x="52" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">U 行：新字节（永不带编号）</text>
 <text x="52" y="200" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">append-only：任何机制都不裁剪它（#7439）；</text>
 <text x="52" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">任意点位可完整重建（egressStateAt）</text>
 <text x="52" y="230" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" font-weight="bold">退役的 B base 行已不存在（#7773）</text>
 <rect x="40" y="290" width="360" height="120" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
 <text x="52" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_state — 物化 live 视图</text>
-<text x="52" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, msgid)；pos 序，每条存活消息一行；</text>
+<text x="52" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, rid)；pos 序，每条存活消息一行；</text>
 <text x="52" y="345" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">没有压实、没有 base 行</text>
 <text x="52" y="360" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">同事务应用：I 插入 + 后移、U 就地改、</text>
 <text x="52" y="375" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">D 物理删 + 前移（7773）</text>

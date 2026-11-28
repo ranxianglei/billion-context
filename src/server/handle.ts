@@ -3506,7 +3506,7 @@ async function handleRequest(
                                         const auth = resolveEgressAuthority({ session, st, sessionId: session.id, core, log, armed: false });
                                         const sysFromFlow = base0.view.find((r) => r.msgid === EGRESS_SYSTEM_MSGID)?.bytes ?? "";
                                         const systemText = b3Fresh.systemParts.length > 0 ? b3Fresh.systemParts.join("\n\n") : sysFromFlow;
-                                        recordAuthorityTurn(st, session.id, auth, systemText, log, egressBlockLedgerFor(session), session.state.messageRefs);
+                                        recordAuthorityTurn(st, session.id, auth, systemText, log, egressBlockLedgerFor(session));
                                     }
                                 }
                             }

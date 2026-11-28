@@ -733,7 +733,6 @@ export async function prepareOpenai(
                         systemText: openaiOutboundSystem,
                         nowMs: Date.now(),
                         blockLedger: egressBlockLedgerFor(session),
-                        refMap: session.state.messageRefs,
                     });
                     const reb = rebuildOutboundFromLog(view);
                     if (reb !== null) {
@@ -993,14 +992,18 @@ export async function prepareOpenai(
                     systemText: openaiOutboundSystem ?? openaiSystemText,
                     nowMs: Date.now(),
                     blockLedger: egressBlockLedgerFor(session),
-                    refMap: session.state.messageRefs,
                 });
             }
         } catch (err) {
             if (err instanceof EgressConcurrentWriteError) {
                 log("warn", `[${sessionId}] egress op-log recording skipped this turn (another request on this session recorded first): ${String(err)}`);
             } else {
-                log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
+                // Honest wording (2026-11-28, incident #7884 follow-up): a
+                // corrupt log point does NOT self-heal by itself — the same
+                // batch is re-derived every turn and refuses every turn,
+                // so the log simply stops advancing until the point is
+                // repaired (rebuild from the flow, or a fresh session).
+                log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — the log will NOT advance until the corruption is repaired; this turn serves the last healthy base): ${String(err)}`);
             }
         }
     }

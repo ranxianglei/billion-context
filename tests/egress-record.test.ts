@@ -132,15 +132,15 @@ test("recording: turn1 = full +I batch; turn2 tail append = exactly one +I", () 
         assert.equal(view.length, 3);
         let rows = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?").get(S) as { c: number };
         assert.equal(rows.c, 3, "flow has one +I row per view row");
-        assert.equal(view.every((r) => r.ref === "" || /^m\d{4,}$/.test(r.ref)), true);
+        assert.equal(view.every((r) => typeof r.rid === "number" && r.rid > 0), true, "every row carries its rid (the sole number)");
 
         const t2 = [t1[0], t1[1], M("c", "three")];
         view = recordEgressTurn({ store: H.store, sessionId: S, prev: view, conversation: t2, systemText: "SYS", nowMs: 2000 });
         // Renumber (2026-11-25): turn1's rows are system=0, a=1, b=2 (the
         // system row no longer consumes number 1) — the new tail row is 3.
-        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND log_seq > 2").get(S) as { c: number };
+        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND op_seq > 3").get(S) as { c: number };
         assert.equal(added.c, 1, "tail append records exactly ONE new op row");
-        const last = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? ORDER BY log_seq DESC LIMIT 1").get(S) as { row_type: string; msgid: string };
+        const last = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? ORDER BY op_seq DESC LIMIT 1").get(S) as { row_type: string; msgid: string };
         assert.deepEqual({ row_type: last.row_type, msgid: last.msgid }, { row_type: "I", msgid: "c" });
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), [EGRESS_SYSTEM_MSGID, "a", "b", "c"]);
     } finally {
@@ -216,49 +216,45 @@ test("recording: nudge-shaped churn is EXCLUDED (ephemeral rows never recorded)"
         // nudge is appended AFTER this seam by design, so it is structurally
         // absent; pin that the recorder's contract is the kernel view shape:
         view = recordEgressTurn({ store, sessionId: S, prev: view, conversation: [M("a", "1"), M("b", "2", "assistant")], systemText: "SYS", nowMs: 2000 });
-        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND log_seq > 3").get(S) as { c: number };
+        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND op_seq > 3").get(S) as { c: number };
         assert.equal(added.c, 0, "identical view → zero ops");
     } finally {
         close(H);
     }
 });
 
-test("recording with refs ledger: protection rows lose their dense numbers and the kernel's re-citation lands (cited-vs-dense divergence)", () => {
+test("recording: rids are dense, one-shot, and never re-issued — kernel citations play no part (2026-11-28 owner ruling)", () => {
     const H = open();
     try {
         const S = "sess-rcite";
-        // turn 1: the compress call + result are protected (BLOCKED — no
-        // kernel citation), so their rows are dense-allocated; "a" is cited
+        // turn 1: three messages → the system row and the messages each take
+        // the next fresh rid (1,2,3,4). A refs ledger may still be passed by
+        // callers (the argument survives as a no-op marker), but it has NO
+        // effect: rows are allocated densely, never onto citations.
         const t1 = [M("a", "one"), M("p1", "two", "assistant"), M("p2", "three")];
         let view = recordEgressTurn({
             store: H.store, sessionId: S, prev: undefined, conversation: t1, systemText: "SYS", nowMs: 1000,
             refMap: { byRaw: { a: "m00002", p1: "BLOCKED", p2: "BLOCKED" } },
         });
-        assert.deepEqual(view.map((r) => r.num), [0, 2, 3, 4], "a is cited 2; the two protection rows are dense 3/4");
-        // turn 2: the protection cleared in a different order — the fresh
-        // reply "r" was cited by the kernel counter at 3 (it never saw the
-        // dense numbers), while p1/p2 stay protected for this turn
+        assert.deepEqual(view.map((r) => r.rid), [1, 2, 3, 4], "system + three messages = rids 1..4, dense, no citations");
+        // turn 2: a fresh reply is appended — it takes the next rid (5),
+        // regardless of what the kernel ledger calls it
         const t2 = [M("a", "one"), M("p1", "two", "assistant"), M("p2", "three"), M("r", "four", "assistant")];
         view = recordEgressTurn({
             store: H.store, sessionId: S, prev: view, conversation: t2, systemText: "SYS", nowMs: 2000,
             refMap: { byRaw: { a: "m00002", p1: "BLOCKED", p2: "BLOCKED", r: "m00003" } },
         });
-        const byMsg = new Map(view.map((r) => [r.msgid, r.num]));
-        assert.equal(byMsg.get("r"), 3, "the kernel's citation lands on the slot the demotion retired");
-        assert.equal(byMsg.get("p1"), 0, "p1 demoted to 0 — its dense number is retired");
-        assert.equal(byMsg.get("p2"), 0);
-        // no rows were lost: the log advanced, not froze
-        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?").get(S) as { c: number }).c, 7, "turn 1's 4 +I rows + turn 2's two demote-U + one +I");
-        // turn 3: p1/p2 finally leave protection and the kernel cited them
-        // at 5/6 — the rows re-home onto their citations
-        const t3 = t2.map((m) => m);
+        const byMsg = new Map(view.map((r) => [r.msgid, r.rid]));
+        assert.equal(byMsg.get("r"), 5, "the fresh row takes the next fresh rid — no citation, no re-homing");
+        assert.equal(byMsg.get("a"), 2, "existing rows keep their rids");
+        // turn 3: no view change → zero ops, no rid churn
         view = recordEgressTurn({
-            store: H.store, sessionId: S, prev: view, conversation: t3, systemText: "SYS", nowMs: 3000,
-            refMap: { byRaw: { a: "m00002", p1: "m00005", p2: "m00006", r: "m00003" } },
+            store: H.store, sessionId: S, prev: view, conversation: t2.map((m) => m), systemText: "SYS", nowMs: 3000,
+            refMap: { byRaw: { a: "m00005", p1: "m00006", p2: "m00007", r: "m00008" } },
         });
-        const byMsg3 = new Map(view.map((r) => [r.msgid, r.num]));
-        assert.equal(byMsg3.get("p1"), 5, "re-homing onto the kernel citation");
-        assert.equal(byMsg3.get("p2"), 6);
+        const byMsg3 = new Map(view.map((r) => [r.msgid, r.rid]));
+        assert.equal(byMsg3.get("a"), 2, "a changed citation never moves a row's rid");
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?").get(S) as { c: number }).c, 5, "turn 1's 4 +I rows + turn 2's one +I; turn 3 wrote nothing");
     } finally {
         close(H);
     }

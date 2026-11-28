@@ -563,12 +563,12 @@ test("C1 (KDD #25 gate): deleteSession on a 7-table instance — the identity ro
     try {
         store.ensureEgressIdentity(identityInput("c1-s1"));
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
-             VALUES ('c1-s1', 1, 0, 'I', 'egress-system', '{"t":1}', '7', 1000)`,
+            `INSERT INTO egress_flow (session_id, op_seq, rid, row_type, msgid, payload, bytes, created_at)
+             VALUES ('c1-s1', 1, 1, 'I', 'egress-system', '{"t":1}', '7', 1000)`,
         ).run();
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
-             VALUES ('c1-s1', 2, 1, 'I', 'm1', '{"t":2}', '7', 1000)`,
+            `INSERT INTO egress_flow (session_id, op_seq, rid, row_type, msgid, payload, bytes, created_at)
+             VALUES ('c1-s1', 2, 2, 'I', 'm1', '{"t":2}', '7', 1000)`,
         ).run();
         // Pre-gate this threw on the missing messages table and rolled the
         // whole transaction back — silently keeping every row of the session.
@@ -590,7 +590,7 @@ test("C2 (KDD #25 gate): gc on a 7-table instance — the legacy CAS sweep is sk
     try {
         store.ensureEgressIdentity(identityInput("c2-s1"));
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+            `INSERT INTO egress_flow (session_id, op_seq, rid, row_type, msgid, payload, bytes, created_at)
              VALUES ('c2-s1', 1, 1, 'I', 'm1', '{"t":2}', '7', 1000)`,
         ).run();
         // Pre-gate this threw on the missing content table (the zero-ref
@@ -619,7 +619,7 @@ test("C3 (KDD #25 gate): gcPlan on a 7-table instance — the zero-ref report is
     try {
         store.ensureEgressIdentity(identityInput("c3-s1"));
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+            `INSERT INTO egress_flow (session_id, op_seq, rid, row_type, msgid, payload, bytes, created_at)
              VALUES ('c3-s1', 1, 1, 'I', 'm1', '{"t":2}', '7', 1000)`,
         ).run();
         const plan = store.gcPlan(30);
@@ -682,7 +682,7 @@ test("C5: a latched record-only turn still refreshes the identity row (title lan
         assert.equal(row.title, null, "title not derived yet on turn 1");
         assert.equal(JSON.parse(row.metadata_json).egressAuthority, true, "the latch PERSISTS in the row (load restores it from metadata_json)");
         // The turn-1 record (what recordAuthorityTurn appends for the lane).
-        store.egressAppendTurn(sid, [{ type: "I", rid: 1, msgid: "m1", after: null, ref: "m00001", tokens: 5, typeTag: "text", bytes: "hello" }], 0, Date.now());
+        store.egressAppendTurn(sid, [{ type: "I", rid: 1, msgid: "m1", after: null, tokens: 5, typeTag: "text", bytes: "hello" }], 0, Date.now());
         // Turn 2 — the pin FAILED this turn (host declared no ids): the lane
         // calls the seam with armed=false. The record-only path must STILL
         // refresh the identity row (meta.title now carries the lane's

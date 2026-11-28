@@ -65,8 +65,8 @@ const recordEgTurn = (stub: StubStore, fullSoFar: unknown[]): void => {
     const oracle = openaiToCore(body);
     stub.eg.sysIn = oracle.systemText;
     stub.eg.view = [
-        { num: 0, msgid: "egress-system", ref: "", tokens: 0, type: "system", bytes: oracle.systemText },
-        ...oracle.msgs.map((m, i): EgressViewRow => ({ num: i + 1, msgid: String(m.id), ref: "", tokens: 0, type: "text", bytes: JSON.stringify(m) })),
+        { rid: 1, msgid: "egress-system", tokens: 0, type: "system", bytes: oracle.systemText },
+        ...oracle.msgs.map((m, i): EgressViewRow => ({ rid: i + 2, msgid: String(m.id), tokens: 0, type: "text", bytes: JSON.stringify(m) })),
     ];
 };
 const savedKey = (id: string): string => `${id}\u0000pf:state`;
@@ -803,15 +803,15 @@ test("#7884: degraded durable states re-anchor with honest reasons (the client s
     const deltaBody = bodyOf([USR("c"), ASST("d")]);
     const ev = (): { reanchor?: string; hit?: unknown } | null =>
         evaluateDeltaResend(JSON.parse(deltaBody) as Parameters<typeof evaluateDeltaResend>[0], deltaBody, headersOf({ [PF_COUNT_HEADER]: "5", [PF_DELTA_HEADER]: "1", ...TAIL(dTail(5).slice(2)) }), session, { pluginMode: true, titleGen: false, model: "m1" }, log) as { reanchor?: string } | null;
-    const sysRow: EgressViewRow = { num: 0, msgid: "egress-system", ref: "", tokens: 0, type: "system", bytes: "s" };
+    const sysRow: EgressViewRow = { rid: 1, msgid: "egress-system", tokens: 0, type: "system", bytes: "s" };
     // stamped state but an empty conversation view (a reset / pre-eg flow)
     stub.eg.view = [sysRow];
     assert.deepEqual(ev(), { reanchor: "flow-empty" });
     // a row that cannot be rebuilt byte-exactly (corruption reaches the floor)
-    stub.eg.view = [sysRow, { num: 1, msgid: "h_x", ref: "", tokens: 0, type: "text", bytes: "{not-json" }];
+    stub.eg.view = [sysRow, { rid: 2, msgid: "h_x", tokens: 0, type: "text", bytes: "{not-json" }];
     assert.deepEqual(ev(), { reanchor: "flow-corrupt" });
     // a healthy view but no system row — the raw system (A) is unknowable
-    stub.eg.view = [{ num: 1, msgid: "h_x", ref: "", tokens: 0, type: "text", bytes: JSON.stringify({ id: "h_x", role: "user", text: "a" }) }];
+    stub.eg.view = [{ rid: 2, msgid: "h_x", tokens: 0, type: "text", bytes: JSON.stringify({ id: "h_x", role: "user", text: "a" }) }];
     stub.eg.sysIn = null;
     assert.deepEqual(ev(), { reanchor: "system-unavailable" });
     // and a store without the egress seam at all (an eg-off instance shape)

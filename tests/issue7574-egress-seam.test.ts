@@ -35,7 +35,7 @@ class MemStore implements EgressOpLogStore {
     egressAppendTurn(sessionId: string, ops: EgressOp[], baseSeq: number): EgressViewRow[] {
         if (this.race) throw new EgressConcurrentWriteError(sessionId, baseSeq, baseSeq + 2);
         this.seq += ops.length;
-        this.rows = egressReplay(this.rows, ops, undefined, sessionId);
+        this.rows = egressReplay(this.rows, ops, sessionId);
         return this.rows;
     }
     egressStateView(): EgressViewRow[] {

@@ -419,7 +419,7 @@ export async function prepareGoogle(
                 // in-memory kernel state — nothing is recorded and the retry
                 // self-heals (single-txn, idempotent).
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
-                const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log, egressBlockLedgerFor(session), session.state.messageRefs);
+                const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log, egressBlockLedgerFor(session));
                 if (served !== null) {
                     rebuiltContents = coreToGoogle(served, { model });
                 }

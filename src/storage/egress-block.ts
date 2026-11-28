@@ -65,7 +65,7 @@
  */
 
 import type { SqliteDatabase } from "./driver.js";
-import { egressMaterializeState, egressStateAt, type EgressViewRow } from "./egress-state.js";
+import { egressMaterializeState, egressStateAt, EGRESS_SYSTEM_MSGID, type EgressViewRow } from "./egress-state.js";
 import { egressUsageForkCopy, egressUsageForkCopyPrefix } from "./egress-usage.js";
 import type { CompressionState } from "acp-kernel";
 
@@ -137,7 +137,7 @@ export type EgressBlockLedgerInput = {
  *  the egress clock. */
 export function buildEgressBlockSnapshots(ledger: EgressBlockLedgerInput, view: readonly EgressViewRow[]): Map<string, EgressBlockSnapshot> {
     const numByMsgid = new Map<string, number>();
-    for (const r of view) if (r.num > 0) numByMsgid.set(r.msgid, r.num);
+    for (const r of view) if (typeof r.rid === "number" && r.rid > 0) numByMsgid.set(r.msgid, r.rid);
     const out = new Map<string, EgressBlockSnapshot>();
     for (const b of ledger.state.blocks) {
         const c = ledger.blockContents.get(b.blockId);
@@ -151,7 +151,7 @@ export function buildEgressBlockSnapshots(ledger: EgressBlockLedgerInput, view: 
             const n = numByMsgid.get(id);
             if (startMsgid === null) startMsgid = id;
             endMsgid = id;
-            if (n === undefined || n <= 0) continue;
+            if (n === undefined || n < 1) continue;
             if (startSeq === 0 || n < startSeq) startSeq = n;
             if (n > endSeq) endSeq = n;
         }
@@ -237,8 +237,12 @@ export function rebuildEgressKstateOverlay(
     const byRef: Record<string, string> = {};
     const tsStamps: Record<string, number> = {};
     for (const row of view) {
-        if (row.num <= 0 || row.msgid === undefined || row.msgid === "") continue;
-        const ref = typeof row.ref === "string" && row.ref.length > 0 ? row.ref : "m" + String(row.num).padStart(5, "0");
+        // 2026-11-28 (discussions/7903): the model-visible ref IS "m" + rid,
+        // derived here and never stored; the system row stays outside the
+        // citation space (it is the session's standing preamble, not a
+        // message a kernel ref could point at).
+        if (row.msgid === EGRESS_SYSTEM_MSGID || row.msgid === undefined || row.msgid === "") continue;
+        const ref = "m" + String(row.rid).padStart(5, "0");
         byRaw[row.msgid] = ref;
         byRef[ref] = row.msgid;
         if (row.ts !== undefined) tsStamps[row.msgid] = row.ts;
@@ -630,16 +634,16 @@ export function egressPointFork(db: SqliteDatabase, fromSessionId: string, toSes
         }
         if (forkToNow) {
             db.prepare(
-                `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at)
-                 SELECT ?, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ?`,
+                `INSERT INTO egress_flow (session_id, op_seq, row_type, rid, msgid, payload, bytes, created_at)
+                 SELECT ?, op_seq, row_type, rid, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ?`,
             ).run(toSessionId, fromSessionId);
             db.prepare(
                 `INSERT INTO egress_block_flow (session_id, op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at)
                  SELECT ?, op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at FROM egress_block_flow WHERE session_id = ?`,
             ).run(toSessionId, fromSessionId);
             db.prepare(
-                `INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at)
-                 SELECT ?, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at FROM egress_state WHERE session_id = ?`,
+                `INSERT INTO egress_state (session_id, rid, msgid, pos, tokens, type, role, ts, sys_in, bytes, created_at)
+                 SELECT ?, rid, msgid, pos, tokens, type, role, ts, sys_in, bytes, created_at FROM egress_state WHERE session_id = ?`,
             ).run(toSessionId, fromSessionId);
             db.prepare(
                 `INSERT INTO egress_block_state (session_id, block_id, pos, op_seq, flow_op_seq, payload, created_at)
@@ -649,8 +653,8 @@ export function egressPointFork(db: SqliteDatabase, fromSessionId: string, toSes
         }
         // True point fork: copy the FLOW tables (append-only, op_seq <= wm).
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at)
-             SELECT ?, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ? AND op_seq <= ?`,
+            `INSERT INTO egress_flow (session_id, op_seq, row_type, rid, msgid, payload, bytes, created_at)
+             SELECT ?, op_seq, row_type, rid, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ? AND op_seq <= ?`,
         ).run(toSessionId, fromSessionId, wm);
         // Block rows align on the FLOW clock via their pointer column
         // (dual clocks: their own op_seq is unrelated to wm).

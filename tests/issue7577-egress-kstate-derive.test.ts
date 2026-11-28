@@ -47,10 +47,10 @@ test("egressTsStamps derives the live view's msgid→ts map verbatim", () => {
     try {
         const sid = "egress-on-session";
         h.store.egressAppendTurn(sid, [
-            { type: "I", rid: 1, msgid: "rawA", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "hello", ts: 1_730_000_000_000 },
+            { type: "I", rid: 1, msgid: "rawA", after: null, tokens: 3, typeTag: "text", bytes: "hello", ts: 1_730_000_000_000 },
         ], 0, 1_730_000_000_000);
         h.store.egressAppendTurn(sid, [
-            { type: "I", rid: 2, msgid: "rawB", after: 1, ref: "m00002", tokens: 4, typeTag: "text", bytes: "there", ts: 1_730_000_001_500 },
+            { type: "I", rid: 2, msgid: "rawB", after: 1, tokens: 4, typeTag: "text", bytes: "there", ts: 1_730_000_001_500 },
         ], 1, 1_730_000_001_500);
         assert.deepEqual(h.store.egressTsStamps(sid), {
             rawA: 1_730_000_000_000,
@@ -64,8 +64,8 @@ test("folded messages drop out of the derived stamps (they are not rendered)", (
     try {
         const sid = "egress-on-fold";
         h.store.egressAppendTurn(sid, [
-            { type: "I", rid: 1, msgid: "rawA", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "hello", ts: 1_730_000_000_000 },
-            { type: "I", rid: 2, msgid: "rawB", after: 1, ref: "m00002", tokens: 4, typeTag: "text", bytes: "there", ts: 1_730_000_001_500 },
+            { type: "I", rid: 1, msgid: "rawA", after: null, tokens: 3, typeTag: "text", bytes: "hello", ts: 1_730_000_000_000 },
+            { type: "I", rid: 2, msgid: "rawB", after: 1, tokens: 4, typeTag: "text", bytes: "there", ts: 1_730_000_001_500 },
         ], 0, 1_730_000_001_500);
         // fold both away (compaction in the same write)
         h.store.egressAppendTurn(sid, [
@@ -76,7 +76,7 @@ test("folded messages drop out of the derived stamps (they are not rendered)", (
         // a message that survived the fold keeps its birth stamp
         // (the D turn consumed op 3 — 7773 has no in-step compaction row)
         h.store.egressAppendTurn(sid, [
-            { type: "I", rid: 3, msgid: "rawC", after: null, ref: "m00003", tokens: 5, typeTag: "text", bytes: "survivor", ts: 1_730_000_012_000 },
+            { type: "I", rid: 3, msgid: "rawC", after: null, tokens: 5, typeTag: "text", bytes: "survivor", ts: 1_730_000_012_000 },
         ], 3, 1_730_000_012_000);
         assert.deepEqual(h.store.egressTsStamps(sid), { rawC: 1_730_000_012_000 });
     } finally { closeH(h); }
@@ -94,12 +94,12 @@ test("a corrupt egress log derives null — it never throws into the load path",
     try {
         const sid = "egress-on-corrupt";
         h.store.egressAppendTurn(sid, [
-            { type: "I", rid: 1, msgid: "rawA", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "hello", ts: 1_730_000_000_000 },
+            { type: "I", rid: 1, msgid: "rawA", after: null, tokens: 3, typeTag: "text", bytes: "hello", ts: 1_730_000_000_000 },
         ], 0, 1_730_000_000_000);
         // damage the log so the serving read goes to the rebuild path and
         // the rebuild replay meets the damaged row: a structurally stray
         // state row (pos density breaks) + an unreplayable flow payload
-        h.db.prepare(`INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 9)`).run(sid);
+        h.db.prepare(`INSERT INTO egress_state (session_id, rid, msgid, pos, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 'text', 'user', 0, 0, 'x', 9)`).run(sid);
         h.db.prepare(`UPDATE egress_flow SET payload = 'not-json' WHERE session_id = ? AND row_type = 'I'`).run(sid);
         assert.equal(h.store.egressTsStamps(sid), null);
     } finally { closeH(h); }

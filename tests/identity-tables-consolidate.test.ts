@@ -95,7 +95,7 @@ function egressOnRow(db: ReturnType<typeof openSqliteDatabase>["db"], sid: strin
     for (const m of msgids) {
         rid += 1;
         egressStateAppend(db, sid, [
-            { type: "I", rid, msgid: m, after, ref: "", tokens: 3, typeTag: "text", bytes: `{"id":"${m}","role":"user","text":"${m}"}`, role: "user" },
+            { type: "I", rid, msgid: m, after, tokens: 3, typeTag: "text", bytes: `{"id":"${m}","role":"user","text":"${m}"}`, role: "user" },
         ], atMs);
         after = rid;
     }
@@ -322,7 +322,7 @@ test("S5: GC — an egress-on session with RECENT op-log activity is not stale e
     try {
         insertSession(h.db, sid, Date.now() - 100 * 86_400_000, { egressAuthority: true }); // row froze 100 days ago
         egressStateAppend(h.db, sid, [
-            { type: "I", rid: 1, msgid: "m1", after: null, ref: "", tokens: 3, typeTag: "text", bytes: '{"id":"m1","role":"user","text":"m1"}', role: "user" },
+            { type: "I", rid: 1, msgid: "m1", after: null, tokens: 3, typeTag: "text", bytes: '{"id":"m1","role":"user","text":"m1"}', role: "user" },
         ], Date.now() - 60_000); // but the op log moved a minute ago
         const plan = h.store.gcPlan(30);
         assert.ok(!plan.candidates.some((c) => c.sessionId === sid), "freshness = max(updated_at, last op-log row) — the session is active");

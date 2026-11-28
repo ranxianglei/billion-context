@@ -93,8 +93,8 @@ test("(c) forkEgressSnapshot: egress-on parent forks to now — loadable, conten
         const parentView = ustore.egressStateView("parent-eg");
         assert.equal(childView.length, parentView.length, "child inherited every egress row");
         assert.deepEqual(
-            childView.map((r) => [r.msgid, r.bytes, r.ref]),
-            parentView.map((r) => [r.msgid, r.bytes, r.ref]),
+            childView.map((r) => [r.msgid, r.bytes, r.rid]),
+            parentView.map((r) => [r.msgid, r.bytes, r.rid]),
             "child egress content is byte-equal to the parent's",
         );
         // the kernel-state marker was COPIED at fork time (snapshot, not alias)
