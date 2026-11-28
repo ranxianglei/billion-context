@@ -5,6 +5,9 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { installNativeFetchIntercept, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import * as pfChannel from "../src/agent/pf-channel.ts";
 import { laneMsgIdsForOpenAiWire } from "../src/agent/pi-msgids.ts";
@@ -559,6 +562,38 @@ test("pf-channel: tail payload over the byte budget ⇒ no tail header AND no su
     pfChannel.pfCaptureIds(sid, gen(500));
     assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], gen(500).join(","), "short ids ⇒ the tail goes out");
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 500), true);
+});
+
+// #7811: the carrier's size and drop reason must be greppable from bili.log —
+// the 16 KB header-overflow class is invisible from the proxy side (the
+// header dies in the client's socket layer before any request line exists).
+test("pf-channel: tail-ids emit and drop land in bili.log with size/reason (#7811)", () => {
+    const saved = process.env.XDG_STATE_HOME;
+    const root = mkdtempSync(path.join(os.tmpdir(), "pf-channel-log-"));
+    process.env.XDG_STATE_HOME = root;
+    const logFile = path.join(root, "billion-context", "bili.log");
+    const log = (): string => (existsSync(logFile) ? readFileSync(logFile, "utf8") : "");
+    try {
+        const sid = "sid-log-1";
+        const inH = { [CONVO]: sid };
+        learn(inH, "2");
+        // count-only pre-capture ⇒ no pf-channel line (no noise)
+        pfChannel.pfRequestHeaders(inH);
+        assert.equal(log().includes("[pf-channel]"), false, "count-only pre-capture writes nothing");
+        // tail emitted ⇒ info line with T, id count, encoded byte count
+        pfChannel.pfCaptureIds(sid, ["a", "b", "c"]);
+        pfChannel.pfRequestHeaders(inH);
+        assert.match(log(), /\[pf-channel\] pf-tail-ids sid=sid-log-1 T=2 ids=2 bytes=3/, "emit line: T + id count + byte count");
+        // over the byte budget ⇒ warn line with the drop reason and measured bytes
+        const sidBig = "sid-log-big";
+        learn({ [CONVO]: sidBig }, "1");
+        pfChannel.pfCaptureIds(sidBig, Array.from({ length: 500 }, (_, i) => `${"a".repeat(28)}${i}`));
+        pfChannel.pfRequestHeaders({ [CONVO]: sidBig });
+        assert.match(log(), /pf-tail-ids dropped sid=sid-log-big T=1 ids=500 base=0 reason=over-byte-budget \d+B>8192B/, "drop line: reason with the measured bytes");
+    } finally {
+        if (saved === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = saved;
+        rmSync(root, { recursive: true, force: true });
+    }
 });
 
 // #7064 §8 phase 2: pfIdTailForm — the client-side tail derivation for

@@ -29,13 +29,18 @@
 // id-bearing element travels with its id, an id-less one (native-compaction
 // summaries, personas) rides the UNIDENTIFIED placeholder below; nothing is
 // ever dropped from or re-ordered inside the captured span.
+
+import { logHostEvent } from "./host-log.js";
+
 const COUNT_HEADER = "x-bili-pf-count";
 const TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
 const CONVERSATION_HEADER = "x-bili-plugin-conversation";
 const SEQ_HEADER = "x-bili-pf-seq";
 // #7064 §8: the pin-mode signal (server stamps it WITH the pf-seq header;
-// the literal duplicates src/msgid-pin.ts MSGID_MODE_HEADER — the agent
-// bundles are import-free leaves, same rule as PF_SLOT_UNKNOWN).
+// the literal duplicates src/msgid-pin.ts MSGID_MODE_HEADER — server-state
+// modules stay out of this leaf, same rule as PF_SLOT_UNKNOWN; host-log is
+// the one import, the host-safe diagnostic channel already inlined in every
+// bundle that carries this module).
 const MSGID_MODE_HEADER = "x-bili-msgid-mode";
 export const PF_SLOT_UNKNOWN = "?";
 
@@ -191,29 +196,45 @@ export function pfRequestHeaders(incoming: Record<string, string>): Record<strin
     const k = slot.t;
     if (k < 1) return {};
     const out: Record<string, string> = { [COUNT_HEADER]: String(k) };
-    const tail = tailPayloadFor(slot);
-    if (tail !== undefined) out[TAIL_IDS_HEADER] = tail;
+    const verdict = tailVerdictFor(slot);
+    if (verdict.payload !== undefined) {
+        out[TAIL_IDS_HEADER] = verdict.payload;
+        // #7811: the ops-visible carrier size — the 16 KB header-overflow
+        // class is invisible from the proxy side (the header dies in the
+        // client's socket layer before any request line exists), so this
+        // line is the only record of how close the carrier rides.
+        logHostEvent("info", "[pf-channel]", `pf-tail-ids sid=${sid} T=${k} ids=${verdict.payload.split(",").length} bytes=${verdict.payload.length}`);
+    } else if (verdict.drop !== undefined) {
+        logHostEvent("warn", "[pf-channel]", `pf-tail-ids dropped sid=${sid} T=${k} ids=${slot.ids?.length ?? 0} base=${slot.baseOffset ?? 0} reason=${verdict.drop}; count-only + full form ride`);
+    }
     return out;
 }
 
-/** #6785 review fix: the encoded tail-ids payload this turn, or undefined
- *  when the carrier must stay off: not enough captured ids, a slice reaching
- *  BELOW the kept tail window (a >2048 capture whose stamp predates the
- *  window — the full form rides instead), or the joined value exceeding
- *  TAIL_MAX_BYTES. The SAME verdict feeds the header emit
- *  (pfRequestHeaders) and the full-form suppression (pfSuppressFullMsgIds):
- *  suppressing the body while the header carrier is absent strands the
- *  session pin-less FOREVER — the server sees neither form, sends no mode
- *  signal, and the client keeps suppressing. */
-function tailPayloadFor(slot: Tracked): string | undefined {
+/** #6785 review fix: the tail-ids VERDICT for this turn — the encoded
+ *  payload that may ride, or the drop reason when the carrier must stay
+ *  off: not enough captured ids, a slice reaching BELOW the kept tail
+ *  window (a >2048 capture whose stamp predates the window — the full form
+ *  rides instead), or the joined value exceeding TAIL_MAX_BYTES. The SAME
+ *  verdict feeds the header emit (pfRequestHeaders) and the full-form
+ *  suppression (pfSuppressFullMsgIds): suppressing the body while the header
+ *  carrier is absent strands the session pin-less FOREVER — the server sees
+ *  neither form, sends no mode signal, and the client keeps suppressing.
+ *  #7811: the drop reason feeds the host log — the carrier's absence was
+ *  otherwise un-greppable. */
+function tailVerdictFor(slot: Tracked): { payload?: string; drop?: string } {
     const t = slot.t;
     const ids = slot.ids;
-    if (t === undefined || t < 1 || ids === undefined) return undefined;
+    if (t === undefined || t < 1 || ids === undefined) return {};
     const base = slot.baseOffset ?? 0;
-    if (t - 1 < base) return undefined; // slice reaches below the kept window
-    if (ids.length < t - base) return undefined;
+    if (t - 1 < base) return { drop: "slice-below-kept-window" }; // slice reaches below the kept window
+    if (ids.length < t - base) return { drop: "captured-list-short" };
     const payload = ids.slice(t - 1 - base).map(encodeURIComponent).join(",");
-    return payload.length <= TAIL_MAX_BYTES ? payload : undefined;
+    if (payload.length > TAIL_MAX_BYTES) return { drop: `over-byte-budget ${payload.length}B>${TAIL_MAX_BYTES}B` };
+    return { payload };
+}
+
+function tailPayloadFor(slot: Tracked): string | undefined {
+    return tailVerdictFor(slot).payload;
 }
 
 /** #7064 §8: whether the full msgid list may be SUPPRESSED on THIS outbound
