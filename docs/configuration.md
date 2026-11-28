@@ -1318,6 +1318,8 @@ A URL-keyed lane (or a named entry with `bind`) can send **its own** credential 
   }
   ```
 
+  > **Route matching is exact.** A request matches a providers key only when its destination URL equals the key or starts with `key + "/"` (longest key wins). Port, scheme, and trailing slash all count as differences — a key `https://zcode.z.ai:18999` does NOT match a request to `https://zcode.z.ai:18998`. When a request that has a configured `providers` block misses every key, bili falls back to the kernel rewrite path, so a `passthrough: true` that was meant for that host silently does not apply. Since #6811 bili now logs a near-miss warning naming the same-host key(s) that differ only in port or scheme, so such drift is visible in the log instead of silent.
+
 ### `direct`
 
 - **Type:** `boolean`

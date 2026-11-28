@@ -1315,6 +1315,8 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
   }
   ```
 
+  > **路由匹配是精确的。** 一个请求只有在其目标 URL 等于某个 providers 键、或以 `key + "/"` 开头时才会命中该键（最长键优先）。端口、scheme、结尾斜杠都算差异 —— 键 `https://zcode.z.ai:18999` **不会**命中发往 `https://zcode.z.ai:18998` 的请求。当一个带有已配置 `providers` 块的请求未命中任何键时，bili 回退到 kernel 重写路径，因此本意给该 host 用的 `passthrough: true` 会静默地不生效。自 #6811 起，bili 会打出一条 near-miss 警告，点出仅差端口或 scheme 的同 host 键，让这类漂移在日志里可见而非静默。
+
 ### `direct`
 
 - **类型：** `boolean`

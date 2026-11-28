@@ -3805,6 +3805,43 @@ export function _resetRouteMissWarnedForTest(): void {
     routeMissWarned.clear();
 }
 
+interface NearMissRouteKey {
+    key: string;
+    diff: string;
+}
+
+/** #6811: config keys that share the origin's host but differ in port and/or
+ *  scheme — the near-miss shapes (port drift, http vs https) that the generic
+ *  "known providers keys" listing leaves to guesswork. The host is compared
+ *  case-insensitively; the differing dimensions are named (scheme verbatim,
+ *  port by kind) so the operator can fix the drift without reverse-engineering
+ *  the masked fingerprints. */
+function nearMissRouteKeys(origin: string, knownKeys: string[]): NearMissRouteKey[] {
+    let o: URL;
+    try {
+        o = new URL(origin);
+    } catch {
+        return [];
+    }
+    const oHost = o.hostname.toLowerCase();
+    if (!oHost) return [];
+    const out: NearMissRouteKey[] = [];
+    for (const k of knownKeys) {
+        let u: URL;
+        try {
+            u = new URL(k);
+        } catch {
+            continue;
+        }
+        if (u.hostname.toLowerCase() !== oHost) continue;
+        const diffs: string[] = [];
+        if (u.protocol !== o.protocol) diffs.push(`scheme (${o.protocol.replace(/:$/, "")} vs ${u.protocol.replace(/:$/, "")})`);
+        if (u.port !== o.port) diffs.push("port");
+        if (diffs.length > 0) out.push({ key: k, diff: diffs.join(" and ") });
+    }
+    return out;
+}
+
 /** #2317: warn at most once per (upstream-origin, model). Origin (scheme+host+port)
  *  keys the dedupe so two relays on one host with different ports each warn — a
  *  hostname-only key would collide across them. */
@@ -3824,6 +3861,7 @@ export function warnRouteMissIfNew(
     // under the WRONG SCHEME for the same host (https:// where the lane
     // looks up mitm://). Name it instead of leaving "add a matching key"
     // to guesswork.
+    let namedSameHostKey = false;
     if (origin.startsWith("mitm://")) {
         const host = origin.slice("mitm://".length);
         const siblings: string[] = [];
@@ -3843,6 +3881,21 @@ export function warnRouteMissIfNew(
             // the scheme, which is the whole point of the hint.
             const twin = `mitm://${hostIdForLog(`https://${host}`)}`;
             msg += ` Scheme mismatch: your settings sit under ${siblings.map((s) => hostIdForLog(s)).join(", ")} but MITM-lane lookups use "${twin}" — add that key (the https:// entries keep serving /bili/-embedded requests).`;
+            namedSameHostKey = true;
+        }
+    }
+    // #6811: generalize the near-miss hint beyond the #3632 MITM-scheme case.
+    // A same-host key that differs only in port and/or scheme (port drift,
+    // http vs https) is the other #1 silent-miss shape — the generic "known
+    // providers keys" listing leaves it to guesswork. Name the near-miss key
+    // and WHAT differs so the operator can fix the drift. Skipped when the
+    // #3632 hint already named the same-host key (avoids a duplicate line).
+    if (!namedSameHostKey) {
+        const nearMiss = nearMissRouteKeys(origin, knownKeys);
+        if (nearMiss.length > 0) {
+            const named = nearMiss.map((n) => `${hostIdForLog(n.key)} (differs in ${n.diff})`).join(", ");
+            const verb = nearMiss.length === 1 ? "is" : "are";
+            msg += ` Near-miss: ${named} ${verb} on the same host but did not match ${hostIdForLog(origin)} — per-provider settings (incl. passthrough) did not apply to this request. Route matching is exact (the key or key+"/"); port and scheme must match verbatim.`;
         }
     }
     log("warn", msg);
