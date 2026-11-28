@@ -64,7 +64,7 @@ interface EgressRecordSourceMsg {
 }
 import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
 import { resolveEgressAuthority, egressAuthorityArmed, egressBlockLedgerFor, buildEgressIdentityInput, stampEgressSeqs } from "./egress-lane-io.js";
-import { EgressConcurrentWriteError } from "../storage/egress-state.js";
+import { EgressConcurrentWriteError, EgressStateCorruptError } from "../storage/egress-state.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
@@ -180,6 +180,11 @@ export async function prepareOpenai(
     let egressBootstrap = false;
     let egressArmed = false;
     let egressServedFromLog = false;
+    // #7906: a corrupt op-log (EgressStateCorruptError) is detected once per
+    // turn at the first read (seg 4b) and the remaining reads (seg 3 / seg 4a)
+    // are skipped — aligns the old serve path's degrade with the new lane's
+    // non-armed behavior (one loud failure + skip, no re-scan, no 3× warn spam).
+    let egressLogCorrupt = false;
     // The EXACT array fed to the outbound chain (post reasoning-drop / ccr /
     // image-rescale) — segment 3 records this, not processedMessages, so the
     // log view is position-for-position what outbound saw.
@@ -743,6 +748,7 @@ export async function prepareOpenai(
                     }
                 } catch (err) {
                     egressServedFromLog = false;
+                    if (err instanceof EgressStateCorruptError) egressLogCorrupt = true;
                     log("warn", `[${sessionId}] egress-serve rebuild failed — legacy kept: ${String(err)}`);
                 }
             }
@@ -980,7 +986,7 @@ export async function prepareOpenai(
     // empty flow records the client view ONCE — that is the cold start, not
     // "untrusted bytes advancing the flow" (there is no flow to advance
     // against; from turn 2 the armed gate is fully enforced again).
-    if (!isTitleGen && egressPlaneGateOn() && !egressServedFromLog && !(egressArmed && !egressSwapApplied && !egressBootstrap)) {
+    if (!isTitleGen && egressPlaneGateOn() && !egressServedFromLog && !egressLogCorrupt && !(egressArmed && !egressSwapApplied && !egressBootstrap)) {
         try {
             const st = getStore().egressOpLogStore();
             if (st) {
@@ -1010,7 +1016,7 @@ export async function prepareOpenai(
     // identity rate the swap will rely on (rollout egressPlane, default 0;
     // reads the hydrated flow view — on a bootstrap turn that is the view
     // the record above just wrote, i.e. an exact self-compare).
-    if (!isTitleGen && egressPlaneGateOn() && !egressServedFromLog) {
+    if (!isTitleGen && egressPlaneGateOn() && !egressServedFromLog && !egressLogCorrupt) {
         try {
             const st = getStore().egressOpLogStore();
             const view = egressBaseRows ?? (st ? st.egressStateView(sessionId) : undefined);
