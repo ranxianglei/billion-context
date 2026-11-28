@@ -235,9 +235,11 @@ test("loop #9: mixed compress + real tool → forwarded (no re-request), compres
     }
 });
 
-test("loop #5: limit-hit graceful — 10 re-request rounds never degenerate empty, no crash", async () => {
+test("loop #5: limit-hit internal-only turn → interrupted outcome, never degenerate empty, no crash", async () => {
     // acp_status drives the re-request path without tripping the failed-only
     // breaker (#156/#4186), so this fixture actually reaches the loop limit.
+    // #6465: no assistant text in any round → the cap surfaces an interrupted
+    // outcome (response.failed), not a fake success (response.completed).
     const mutatingRound = [
         sse("response.created", { response: { id: "resp_m", status: "in_progress" } }),
         fcEvents(0, "call_status", "acp_status", "{}"),
@@ -256,10 +258,50 @@ test("loop #5: limit-hit graceful — 10 re-request rounds never degenerate empt
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.ok(/response\.completed/.test(out), "graceful completion at limit (NOT degenerate empty)");
+        assert.ok(/response\.failed/.test(out), "interrupted outcome at limit (NOT a fake success, #6465)");
         assert.ok(!/^data: \[\]\n\n$/.test(out), "no degenerate empty payload");
-        const completedCount = (out.match(/event: response\.completed/g) || []).length;
-        assert.equal(completedCount, 1, "exactly one completion event (one SSE event line)");
+        const failedCount = (out.match(/event: response\.failed/g) || []).length;
+        assert.equal(failedCount, 1, "exactly one failed event (one SSE event line)");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+// #6465 exact repro: 12 consecutive successful decompress calls, then assistant
+// text. The cap (MAX_LOOP_ROUNDS=10) is hit before the assistant text arrives.
+// Before the fix: the cap emitted response.completed (fake success) → Codex
+// recorded the turn as completed with no assistant final message.
+// After the fix: the cap emits response.failed (interrupted outcome) → Codex
+// sees the failure and can retry.
+test("#6465: 12 successful decompress calls, no assistant text → interrupted outcome at cap, never fake success", async () => {
+    // Each round: one successful decompress call (no assistant text).
+    // The loop re-requests after each decompress, running to the cap.
+    const decompressRound = [
+        sse("response.created", { response: { id: "resp_d", status: "in_progress" } }),
+        fcEvents(0, "call_decompress", "decompress", JSON.stringify({ blockId: "b1" })),
+        COMPLETED,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(decompressRound, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(decompressRound, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        // The loop runs to the cap (MAX_LOOP_ROUNDS - 1 re-requests).
+        assert.equal(fetchCalls, MAX_LOOP_ROUNDS - 1, "ran to the loop limit (10 rounds)");
+        // #6465: no assistant text in any round → the cap surfaces an
+        // interrupted outcome (response.failed), NOT a fake success.
+        assert.ok(/response\.failed/.test(out), "interrupted outcome at cap (NOT a fake success, #6465)");
+        assert.ok(!/response\.completed/.test(out), "no fake success (response.completed) emitted");
+        // The error message names the safety limit so the user can understand.
+        assert.ok(out.includes("safety limit"), "error message names the safety limit");
     } finally {
         globalThis.fetch = orig;
     }
@@ -297,7 +339,9 @@ test("loop #5220: failed-only compress round → recovery-receipt re-request, id
             { url: "http://mock", headers: {} },
         );
         assert.equal(fetchCalls, 1, "first-time failure re-requests ONCE (recovery receipt); the identical round-2 resubmit hits the #156 signature breaker");
-        assert.ok(/response\.completed/.test(out), "graceful completion present (not degenerate empty)");
+        // #6465: no assistant text in any round → the breaker surfaces an
+        // interrupted outcome (response.failed), not a fake success.
+        assert.ok(/response\.failed/.test(out), "interrupted outcome present (not a fake success, #6465)");
         assert.ok(out.includes("❌"), "failure receipt surfaced to the client so the reason survives the turn");
         const body = bodies[0]!;
         assert.ok(body.includes("❌"), "retry body carries the recovery receipt as assistant text");
@@ -326,7 +370,9 @@ test("loop #156 guard: failing compress + other proxy call → no early break", 
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.ok(/response\.completed/.test(out), "graceful completion present");
+        // #6465: no assistant text in any round → the cap surfaces an
+        // interrupted outcome (response.failed), not a fake success.
+        assert.ok(/response\.failed/.test(out), "interrupted outcome present (not a fake success, #6465)");
         assert.equal(fetchCalls, MAX_LOOP_ROUNDS - 1, "NOT broken early: ran to the normal loop limit");
     } finally {
         globalThis.fetch = orig;

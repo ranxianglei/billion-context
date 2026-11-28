@@ -154,9 +154,14 @@ export async function compressLoopResponsesJson(
     requestOptions: RequestOptions,
 ): Promise<Record<string, unknown>> {
     let current = initialResponse;
+    // #6465: whether ANY round of this turn produced assistant text. At the
+    // loop cap an internal-only turn (no assistant final message) must surface
+    // a failed response, not a 200 that reads as a clean completed turn.
+    let sawAssistantTextThisTurn = false;
     for (let loopCount = 1; loopCount <= MAX_LOOP_ROUNDS; loopCount++) {
         current = stripResponsesText(current);
         const output = responsesJsonOutput(current);
+        if (output.text.length > 0) sawAssistantTextThisTurn = true;
         const extracted = extractResponsesTextTriggers(output.text);
         const allCalls = [...output.calls, ...extracted.calls.map((c): FunctionCallAccumulator => ({ itemId: `fc_${c.callId}`, callId: c.callId, name: c.name, arguments: c.arguments }))].filter((call) => call.name.length > 0);
         const proxyCalls = allCalls.filter((call) => PROXY_TOOL_NAMES.has(call.name));
@@ -247,5 +252,21 @@ export async function compressLoopResponsesJson(
         }
     }
     ctx.log(`[acp-proxy: responses JSON compress loop limit (${MAX_LOOP_ROUNDS}) reached]`);
+    // #6465: an internal-only turn (no assistant text in any round) must not be
+    // relayed as a 200 with a bare function_call tail — that reads as a clean
+    // completed turn to the client. Surface a failed response instead.
+    if (!sawAssistantTextThisTurn) {
+        const id = typeof current.id === "string" ? current.id : `resp-error-${Date.now()}`;
+        loggerLog("warn", `[acp-proxy: responses JSON loop limit (${MAX_LOOP_ROUNDS}) reached with no assistant final; surfacing a failed response (#6465)]`);
+        return {
+            id,
+            status: "failed",
+            error: {
+                code: "server_error",
+                message: `internal operation loop hit the safety limit (${MAX_LOOP_ROUNDS} rounds) without an assistant final message — the turn was interrupted; resend your last message to continue`,
+            },
+            output: [],
+        };
+    }
     return current;
 }
