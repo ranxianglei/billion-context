@@ -12,6 +12,14 @@ export interface TruncateOptions {
    *  applied only after tool-result truncation fails to reach the target
    *  (#300). Rendered block summaries are never touched. */
   includeTextMessages?: boolean;
+  /** #7771: ids the host declared hard-protected (protectedTools /
+   *  isToolProtected). Protected candidates are ordered AFTER every
+   *  unprotected one and are only clipped when the unprotected set alone
+   *  cannot reach the target — clipping them is the lesser evil versus an
+   *  over-limit request, but they must never win the size sort against
+   *  ordinary output. Ids (not a predicate) keep this module inside the
+   *  verifiable subset. */
+  protectedIds?: ReadonlySet<string>;
 }
 
 export interface TruncateResult {
@@ -28,7 +36,9 @@ export interface TruncateResult {
 
 const TRUNCATION_MARKER = "[truncated for context space]";
 
-const DEFAULTS: Required<Omit<TruncateOptions, "includeTextMessages">> = {
+const DEFAULTS: Required<
+  Omit<TruncateOptions, "includeTextMessages" | "protectedIds">
+> = {
   minOutputTokens: 1000,
   keepPrefixChars: 2000,
   keepSuffixChars: 2000,
@@ -49,6 +59,7 @@ export function truncateLargeToolOutputs(
   }
 
   const protectedIndex = messages.length - opts.protectRecentMessages;
+  const protectedIds = opts.protectedIds;
 
   const findCandidates = (
     predicate: (message: CoreMessage) => boolean,
@@ -62,9 +73,20 @@ export function truncateLargeToolOutputs(
       if (countTokens(text) < opts.minOutputTokens) continue;
       found.push(message);
     }
-    return found.sort(
+    const bySize = found.sort(
       (a, b) => countTokens(b.text ?? "") - countTokens(a.text ?? ""),
     );
+    if (protectedIds === undefined) return bySize;
+    // #7771: protected candidates go AFTER every unprotected one; the size
+    // order still decides within each class. applyTo stops at the target, so
+    // protected content is only reached when nothing else can close the gap.
+    const ordinary: CoreMessage[] = [];
+    const guarded: CoreMessage[] = [];
+    for (const message of bySize) {
+      if (protectedIds.has(message.id)) guarded.push(message);
+      else ordinary.push(message);
+    }
+    return [...ordinary, ...guarded];
   };
 
   const toolResults = findCandidates((m) => m.contentType === "tool-result");

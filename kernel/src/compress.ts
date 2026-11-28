@@ -1695,6 +1695,26 @@ const emergencyTruncateNode: PipelineNode = {
         },
       };
     }
+    // #7771: protected tools are hard-excluded from folding, so ordinary
+    // output must be spent first here too; protected text is the fallback.
+    // Pairing mirrors the fold gate (filterProtectedToolMessages): a result
+    // the host projects without a toolName is protected through its call's
+    // toolCallId, so both paths agree on what "protected" means.
+    const protectedCallIds = collectProtectedToolCallIds(messages, ctx.config);
+    const failedCompressCallIds = collectFailedCompressCallIds(messages, ctx.config);
+    const protectedIds = new Set<string>();
+    for (const message of messages) {
+      if (
+        isMessageProtectedWithPairing(
+          message,
+          ctx.config,
+          protectedCallIds,
+          failedCompressCallIds,
+        )
+      ) {
+        protectedIds.add(message.id);
+      }
+    }
     const trunc = truncateLargeToolOutputs(
       messages,
       // Account for replayed clips: they already shrank the real request;
@@ -1705,6 +1725,7 @@ const emergencyTruncateNode: PipelineNode = {
       {
         protectRecentMessages: ctx.config.preserveRecentMessages,
         includeTextMessages: true,
+        protectedIds,
       },
     );
 
