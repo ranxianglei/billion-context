@@ -228,6 +228,12 @@ function degradeReason(): string {
         // stays EXACTLY in place (no move, no copy, no rebuild) and bili
         // starts WITHOUT it — envelope-served until an operator repairs the
         // files or moves them aside by hand; the reason carries that fix.
+        // 2026-11-21 policy layer: in the pure-sqlite stance the same finding
+        // REFUSES instead (the envelopes are not a durable copy) — the open
+        // failure is over-recorded with a distinct prefix, say so here.
+        if (/REFUSING TO START \(pure-sqlite stance\)/.test(state.sidecarOpenError)) {
+            return `index database failed its integrity check and was left UNTOUCHED (${e}) — bili REFUSES TO START (pure-sqlite stance: the JSON envelopes are not a durable copy of your sessions); fix: back up index.db{,-wal,-shm}, move those files aside by hand, start again — or set BILI_STORAGE_ALLOW_LEGACY_DEGRADE=1 to consciously accept the envelope-served view`;
+        }
         if (/StorageIntegrityError|integrity quick_check failed/i.test(state.sidecarOpenError)) {
             return `index database failed its integrity check and was left UNTOUCHED (${e}) — bili is starting WITHOUT the index (envelope-served); fix: back up index.db{,-wal,-shm}, move those files aside by hand, start again`;
         }

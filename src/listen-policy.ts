@@ -67,6 +67,13 @@ export interface EaddrinuseContext {
     lastTriedPort: number;
 }
 
+/** Use the existing ephemeral fallback when either the retry budget or the
+ *  valid numeric port range is exhausted. Both pre- and post-bind retries
+ *  must avoid handing 65536 to Node's listener. */
+export function nextListenPort(port: number, nextAttempt: number, maxAttempts: number): number {
+    return nextAttempt >= maxAttempts || port >= 65535 ? 0 : port + 1;
+}
+
 export function decideEaddrinuse(ctx: EaddrinuseContext): EaddrinuseAction {
     // The twin rule outranks everything else: a healthy peer already serves
     // real traffic on that port, so no wait/ladder variant may touch it — the
@@ -89,7 +96,7 @@ export function decideEaddrinuse(ctx: EaddrinuseContext): EaddrinuseAction {
         return { kind: "wait-predecessor", port: ctx.lastTriedPort };
     }
     const nextAttempts = ctx.attempts + 1;
-    return { kind: "ladder", nextPort: nextAttempts === ctx.maxAttempts ? 0 : ctx.lastTriedPort + 1 };
+    return { kind: "ladder", nextPort: nextListenPort(ctx.lastTriedPort, nextAttempts, ctx.maxAttempts) };
 }
 
 /** #3044/#2941: ladder rights for the POST-BIND claim check (port-owner's

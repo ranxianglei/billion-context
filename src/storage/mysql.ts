@@ -39,7 +39,8 @@ import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
 import { mkdirSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
-import { sha256Hex, viewPointerSeqs, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
+import { sha256Hex, rewriteArchiveLog, validateExtKey, serializeExtValue, assertKvValueSize } from "./store.js";
+import { egressPlaneGateOn } from "../knobs.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
@@ -53,7 +54,6 @@ import type {
     SessionSummaryRow,
     WebSummaryRow,
     IngestSessionInput,
-    SessionViewRows,
 } from "./store.js";
 
 /** The mysql2/promise driver module, injected by openBackend() at open time.
@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id        VARCHAR(255) NOT NULL PRIMARY KEY,
     parent_session_id VARCHAR(255) NULL,
     fork_point_seq    BIGINT NULL,
+    fork_egress_watermark BIGINT NULL,
     protocol          VARCHAR(64) NULL,
     label             TEXT NULL,
     title             TEXT NULL,
@@ -139,7 +140,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     tail_json         LONGTEXT NOT NULL DEFAULT ('{}'),
     ccr_json          LONGTEXT NULL,
     last_ingested_seq BIGINT NULL,
-    orphans_json      LONGTEXT NULL
+    orphans_json      LONGTEXT NULL,
+    r3_latched_at     BIGINT NULL
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS content (
@@ -187,6 +189,9 @@ CREATE TABLE IF NOT EXISTS blocks (
     created_at          BIGINT NOT NULL,
     covered_hash        VARCHAR(64) NOT NULL,
     payload_json        LONGTEXT NOT NULL,
+    summary_bytes       LONGTEXT NULL,
+    start_msgid         VARCHAR(255) NULL,
+    end_msgid           VARCHAR(255) NULL,
     PRIMARY KEY (session_id, block_id),
     KEY idx_blocks_session (session_id, ord),
     KEY idx_blocks_one_hash (one_hash),
@@ -233,8 +238,28 @@ CREATE TABLE IF NOT EXISTS ccr_entries (
     ord         BIGINT NOT NULL,
     ccr_key     VARCHAR(255) NOT NULL,
     content_hash VARCHAR(64) NOT NULL,
+    -- #6785 step 6: the original text behind entry.hash (byHash half) —
+    -- NULL only on pre-step-6 rows (their full ccr_json envelope is the
+    -- read authority). See src/storage/slim.ts.
+    orig_hash   VARCHAR(64) NULL,
     PRIMARY KEY (session_id, ord),
-    KEY idx_ccr_entries_content_hash (content_hash)
+    KEY idx_ccr_entries_content_hash (content_hash),
+    KEY idx_ccr_entries_orig_hash (orig_hash)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+CREATE TABLE IF NOT EXISTS orphan_blocks (
+    session_id  VARCHAR(255) NOT NULL,
+    block_id    VARCHAR(255) NOT NULL,
+    one_json    LONGTEXT NULL,
+    full_json   LONGTEXT NOT NULL,
+    PRIMARY KEY (session_id, block_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+CREATE TABLE IF NOT EXISTS state_fields (
+    session_id  VARCHAR(255) NOT NULL,
+    field       VARCHAR(64) NOT NULL,
+    value_json  LONGTEXT NOT NULL,
+    PRIMARY KEY (session_id, field)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -378,6 +403,17 @@ export class MysqlBackend implements StorageBackend {
                 if (!haveIdx.has("ccr_entries.idx_ccr_entries_content_hash")) {
                     await conn.query("ALTER TABLE ccr_entries ADD INDEX idx_ccr_entries_content_hash (content_hash)");
                 }
+                // #6785 step 6: ccr_entries.orig_hash — probe-first like the v8/v10
+                // columns; every pre-existing table must pick it up, fresh
+                // installs get it from the DDL. The key rides the same ALTER.
+                const [ccrCols] = (await conn.query(
+                    "SELECT COLUMN_NAME AS col FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ccr_entries'",
+                )) as unknown as Row[][];
+                const haveCcr = new Set((ccrCols as unknown as { col?: unknown }[]).map((r) => String(r.col ?? "")));
+                if (!haveCcr.has("orig_hash")) {
+                    await conn.query("ALTER TABLE ccr_entries ADD COLUMN orig_hash VARCHAR(64) NULL");
+                    await conn.query("ALTER TABLE ccr_entries ADD INDEX idx_ccr_entries_orig_hash (orig_hash)");
+                }
                 if (!haveIdx.has("message_media.idx_message_media_media_hash")) {
                     await conn.query("ALTER TABLE message_media ADD INDEX idx_message_media_media_hash (media_hash)");
                 }
@@ -390,6 +426,48 @@ export class MysqlBackend implements StorageBackend {
                 // (see migrateV8Identities) and either fully lands or resumes
                 // from the committed sessions on the next boot.
                 await this.migrateV8Identities();
+            }
+            // 2026-11-23 (#7439-2, PR #7553): blocks self-contained columns —
+            // probe-FIRST, outside the version gate (a shared db stamped at
+            // the current version early-returns above and must still pick up
+            // new columns; same convention as the sqlite ccr probe). CREATE
+            // TABLE IF NOT EXISTS leaves existing tables untouched, so the
+            // DDL addition alone would never reach them. No version bump.
+            {
+                const [cols] = (await conn.query(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS " +
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'blocks'",
+                )) as unknown as [Row[]];
+                const have = new Set(cols.map((r) => str(r.COLUMN_NAME)));
+                if (!have.has("summary_bytes")) {
+                    await conn.query("ALTER TABLE blocks ADD COLUMN summary_bytes LONGTEXT NULL");
+                }
+                if (!have.has("start_msgid")) {
+                    await conn.query("ALTER TABLE blocks ADD COLUMN start_msgid VARCHAR(255) NULL");
+                }
+                if (!have.has("end_msgid")) {
+                    await conn.query("ALTER TABLE blocks ADD COLUMN end_msgid VARCHAR(255) NULL");
+                }
+            }
+            // 身份表收拢 (discussions/7591): the R3 breaker latch moves onto
+            // the sessions row (NULL/0 = not latched, else epoch-ms). Same
+            // probe-first discipline as the blocks block above: every
+            // pre-existing table picks it up, fresh installs get it from
+            // the DDL; no version bump.
+            {
+                const [cols] = (await conn.query(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS " +
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sessions'",
+                )) as unknown as [Row[]];
+                const have = new Set(cols.map((r) => str(r.COLUMN_NAME)));
+                if (!have.has("r3_latched_at")) {
+                    await conn.query("ALTER TABLE sessions ADD COLUMN r3_latched_at BIGINT NULL");
+                }
+                // #7658: probe-first, mirrors the SQLite twin. Stays NULL on
+                // this lane — the egress tables are SQLite-only.
+                if (!have.has("fork_egress_watermark")) {
+                    await conn.query("ALTER TABLE sessions ADD COLUMN fork_egress_watermark BIGINT NULL");
+                }
             }
             // Stamp advances but never downgrades: a future library stamped
             // higher than this build keeps its stamp.
@@ -772,6 +850,11 @@ export class MysqlBackend implements StorageBackend {
                 "INSERT IGNORE INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES (?, ?, ?, ?)",
                 [s.namespace ?? "proxy", s.sessionId, s.sessionId, s.updatedAt],
             );
+            // #6785 step 7: orphans ride the orphan_blocks table (the column
+            // merges + migrates once, then retires) — same as the sqlite leg.
+            await this.applyOrphanBlocksOn(c, s.sessionId, s.orphansJson ?? null);
+            // #6785 step 8: row-backed kstate fields (state_fields table).
+            await this.applyStateFieldsOn(c, s.sessionId, input.stateFields ?? {});
             const batchTs = Date.now(); // #4313: one sample per save batch
             for (const m of messages) {
                 const hash = await this.putContent(c, m.content, m.contentHash);
@@ -811,11 +894,13 @@ export class MysqlBackend implements StorageBackend {
                 start_ref: number | null; end_ref: number | null; tier: number | string;
                 summary_hash: string | number; one_hash: string | null; supersedes_block_id: string | null;
                 active: number | string; created_at: number | string; covered_hash: string | number; payload_json: string | number;
+                summary_bytes: string | null; start_msgid: string | null; end_msgid: string | null;
             };
             const storedBlocks = new Map<string, StoredBlockRow>();
             const storedBlockRows = (await c.query(
                 "SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, " +
-                "summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json " +
+                "summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json, " +
+                "summary_bytes, start_msgid, end_msgid " +
                 "FROM blocks WHERE session_id = ?",
                 [s.sessionId],
             )) as unknown as StoredBlockRow[][];
@@ -886,12 +971,23 @@ export class MysqlBackend implements StorageBackend {
             };
             for (const b of input.blocks) {
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
+                // #7439-2 (mirror of store.ts, PR #7553): the msgid coordinate
+                // columns stay NULL on this lane — the egress tables exist
+                // only in the sqlite backend. summary_bytes: a row already
+                // stamped with UNCHANGED coverage carries its stored bytes
+                // forward (equality trivially holds, zero churn); anything
+                // else falls back to the incoming summary text.
+                const ex = storedBlocks.get(b.blockId);
+                const selfContainedStale = ex !== undefined && str(ex.payload_json) === b.payloadJson
+                    && (ex.summary_bytes === null || ex.summary_bytes === undefined ? null : ex.summary_bytes) !== null;
+                const incomingSummaryBytes = selfContainedStale
+                    ? (ex.summary_bytes === null || ex.summary_bytes === undefined ? null : ex.summary_bytes)
+                    : (b.summaryBytes ?? b.summary);
                 // #5744 (mirror of store.ts): skip the whole write + CAS dance
                 // when the effective post-upsert row equals the stored row —
                 // steady-state saves re-send every block byte-identical. The
                 // -1/unknown bound keeps its stored value via the IF(>=0)
                 // guard below, so "incoming < 0" counts as unchanged.
-                const ex = storedBlocks.get(b.blockId);
                 if (ex &&
                     num(ex.ord) === b.ord &&
                     (bStartSeq < 0 || bStartSeq === num(ex.start_seq)) &&
@@ -905,7 +1001,10 @@ export class MysqlBackend implements StorageBackend {
                     num(ex.active) === (b.active ? 1 : 0) &&
                     num(ex.created_at) === b.createdAt &&
                     str(ex.covered_hash) === b.coveredHash &&
-                    str(ex.payload_json) === b.payloadJson) {
+                    str(ex.payload_json) === b.payloadJson &&
+                    (ex.summary_bytes === null || ex.summary_bytes === undefined ? null : ex.summary_bytes) === incomingSummaryBytes &&
+                    (ex.start_msgid ?? null) === null &&
+                    (ex.end_msgid ?? null) === null) {
                     continue;
                 }
                 const summaryHash = await this.putContent(c, b.summary, b.summaryHash);
@@ -921,21 +1020,25 @@ export class MysqlBackend implements StorageBackend {
                 }
                 await c.query(
                     `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
-                       summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                     ON DUPLICATE KEY UPDATE
-                       ord = VALUES(ord),
-                       /* #4608: keep durable interval evidence when a later batch can no
-                          longer re-derive it (post-fold client resends carry no covered raws).
-                          Double-slash lines are JS comment syntax, not MySQL — they syntax-error
-                          every blocks ingest on this lane, so this note is a block comment. */
-                       start_seq = IF(VALUES(start_seq) >= 0, VALUES(start_seq), start_seq),
-                       end_seq = IF(VALUES(end_seq) >= 0, VALUES(end_seq), end_seq),
-                       start_ref = VALUES(start_ref), end_ref = VALUES(end_ref), tier = VALUES(tier),
-                       summary_hash = VALUES(summary_hash), one_hash = VALUES(one_hash),
-                       supersedes_block_id = VALUES(supersedes_block_id), active = VALUES(active),
-                       created_at = VALUES(created_at), covered_hash = VALUES(covered_hash),
-                       payload_json = VALUES(payload_json)`,
+                       summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json,
+                       summary_bytes, start_msgid, end_msgid)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      ON DUPLICATE KEY UPDATE
+                        ord = VALUES(ord),
+                        /* #4608: keep durable interval evidence when a later batch can no
+                           longer re-derive it (post-fold client resends carry no covered raws).
+                           Double-slash lines are JS comment syntax, not MySQL — they syntax-error
+                           every blocks ingest on this lane, so this note is a block comment. */
+                        start_seq = IF(VALUES(start_seq) >= 0, VALUES(start_seq), start_seq),
+                        end_seq = IF(VALUES(end_seq) >= 0, VALUES(end_seq), end_seq),
+                        start_ref = VALUES(start_ref), end_ref = VALUES(end_ref), tier = VALUES(tier),
+                        summary_hash = VALUES(summary_hash), one_hash = VALUES(one_hash),
+                        supersedes_block_id = VALUES(supersedes_block_id), active = VALUES(active),
+                        created_at = VALUES(created_at), covered_hash = VALUES(covered_hash),
+                        payload_json = VALUES(payload_json),
+                        summary_bytes = COALESCE(VALUES(summary_bytes), summary_bytes),
+                        start_msgid = COALESCE(VALUES(start_msgid), start_msgid),
+                        end_msgid = COALESCE(VALUES(end_msgid), end_msgid)`,
                     [
                         b.blockId,
                         s.sessionId,
@@ -952,6 +1055,9 @@ export class MysqlBackend implements StorageBackend {
                         b.createdAt,
                         b.coveredHash,
                         b.payloadJson,
+                        incomingSummaryBytes,
+                        null,
+                        null,
                     ],
                 );
             }
@@ -1015,7 +1121,7 @@ export class MysqlBackend implements StorageBackend {
             const incomingCcr = new Map<string, CcrEntryRow>();
             for (const e of input.ccrEntries) incomingCcr.set(e.key, e);
             const storedCcrRows = (await c.query(
-                "SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ?",
+                "SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ?",
                 [s.sessionId],
             )) as unknown as Row[][];
             const changedCcrKeys: string[] = [];
@@ -1023,11 +1129,21 @@ export class MysqlBackend implements StorageBackend {
             const releasedOldCcrHashes: string[] = [];
             for (const row of storedCcrRows[0]) {
                 const key = str(row.ccr_key);
+                const storedOrig = row.orig_hash === null || row.orig_hash === undefined ? null : str(row.orig_hash);
                 const inc = incomingCcr.get(key);
-                if (!inc) { changedCcrKeys.push(key); releasedOldCcrHashes.push(str(row.content_hash)); continue; }
-                if (num(row.ord) !== inc.ord || str(row.content_hash) !== inc.contentHash) {
+                if (!inc) {
                     changedCcrKeys.push(key);
                     releasedOldCcrHashes.push(str(row.content_hash));
+                    if (storedOrig !== null) releasedOldCcrHashes.push(storedOrig);
+                    continue;
+                }
+                // #6785 step 6 (mirror of store.ts): orig joins the unchanged
+                // test — pre-step-6 rows re-put their original and self-heal.
+                const incOrig = inc.origContent === null ? null : inc.origHash;
+                if (num(row.ord) !== inc.ord || str(row.content_hash) !== inc.contentHash || storedOrig !== incOrig) {
+                    changedCcrKeys.push(key);
+                    releasedOldCcrHashes.push(str(row.content_hash));
+                    if (storedOrig !== null) releasedOldCcrHashes.push(storedOrig);
                 } else {
                     unchangedCcrKeys.add(key);
                 }
@@ -1045,9 +1161,10 @@ export class MysqlBackend implements StorageBackend {
             for (const e of input.ccrEntries) {
                 if (unchangedCcrKeys.has(e.key)) continue;
                 const hash = await this.putContent(c, e.content, e.contentHash);
+                const orig = e.origContent === null ? null : await this.putContent(c, e.origContent, e.origHash ?? undefined);
                 await c.query(
-                    "INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)",
-                    [s.sessionId, e.ord, e.key, hash],
+                    "INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash, orig_hash) VALUES (?, ?, ?, ?, ?)",
+                    [s.sessionId, e.ord, e.key, hash, orig],
                 );
             }
             return true;
@@ -1262,8 +1379,14 @@ export class MysqlBackend implements StorageBackend {
         await this.pool.query("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?", [sessionId]);
     }
 
-    async resetAllIngestWatermarks(): Promise<void> {
-        await this.pool.query("UPDATE sessions SET last_ingested_seq = NULL");
+    // #3285 (2026-11-21 per-session rework): the open-time GLOBAL watermark
+    // reset is gone (it made open a write and touched every session); trust
+    // is primed per session on first touch instead.
+    private readonly ingestTouchedThisProcess = new Set<string>();
+    async primeIngestTrust(sessionId: string): Promise<void> {
+        if (this.ingestTouchedThisProcess.has(sessionId)) return;
+        this.ingestTouchedThisProcess.add(sessionId);
+        await this.pool.query("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?", [sessionId]);
     }
 
     async reapBlocks(
@@ -1283,24 +1406,121 @@ export class MysqlBackend implements StorageBackend {
                 if (rows[0].one_hash !== null && rows[0].one_hash !== undefined) await this.releaseContent(c, str(rows[0].one_hash));
                 await c.query("DELETE FROM blocks WHERE session_id = ? AND block_id = ?", [sessionId, blockId]);
             }
-            if (orphanContents.size > 0) {
-                const [sess] = (await c.query(
-                    "SELECT orphans_json FROM sessions WHERE session_id = ?",
-                    [sessionId],
-                )) as unknown as Row[][];
-                if (sess.length > 0) {
-                    let merged: Record<string, unknown> = {};
-                    try {
-                        const parsed = JSON.parse(str(sess[0].orphans_json ?? "{}")) as unknown;
-                        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) merged = parsed as Record<string, unknown>;
-                    } catch {
-                        /* corrupt journal → start fresh */
-                    }
-                    for (const [blockId, view] of orphanContents) merged[blockId] = view;
-                    await c.query("UPDATE sessions SET orphans_json = ? WHERE session_id = ?", [JSON.stringify(merged), sessionId]);
-                }
-            }
+            // #6785 step 7: the reaped-block journal lives in orphan_blocks
+            // now (same merge semantics as the column did — incoming wins on
+            // key collision, trimmed entries survive).
+            await this.applyOrphanBlocksOn(c, sessionId, orphanContents.size > 0 ? JSON.stringify(Object.fromEntries(orphanContents)) : null);
         });
+    }
+
+    /** #6785 step 7 (MySQL twin of UnifiedStore.applyOrphanBlocks): merge
+     *  legacy column ∪ incoming onto the orphan_blocks table, upsert each
+     *  entry, then retire the column. */
+    private async applyOrphanBlocksOn(c: PoolConnection | Pool, sessionId: string, incomingJson: string | null): Promise<void> {
+        const [col] = (await c.query("SELECT orphans_json FROM sessions WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+        const colRaw = col.length > 0 ? col[0].orphans_json : null;
+        const hadColumn = colRaw !== null && colRaw !== undefined;
+        const all: Record<string, unknown> = {};
+        if (hadColumn) {
+            try {
+                const parsed = JSON.parse(str(colRaw)) as unknown;
+                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) Object.assign(all, parsed as Record<string, unknown>);
+            } catch {
+                /* corrupt journal → start fresh */
+            }
+        }
+        if (incomingJson !== null) {
+            try {
+                const parsed = JSON.parse(incomingJson) as unknown;
+                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) Object.assign(all, parsed as Record<string, unknown>);
+            } catch {
+                /* corrupt incoming → keep existing only */
+            }
+        }
+        if (Object.keys(all).length === 0 && !hadColumn && incomingJson === null) return; // steady state: nothing to merge, nothing to migrate (PR#6785 review)
+        for (const [blockId, view] of Object.entries(all)) {
+            const v = view as { one?: unknown; full?: unknown };
+            await c.query(
+                "INSERT INTO orphan_blocks (session_id, block_id, one_json, full_json) VALUES (?, ?, ?, ?) " +
+                "ON DUPLICATE KEY UPDATE one_json = VALUES(one_json), full_json = VALUES(full_json)",
+                [sessionId, blockId, v.one === undefined ? null : JSON.stringify(v.one), JSON.stringify(v.full)],
+            );
+        }
+        if (hadColumn) {
+            await c.query("UPDATE sessions SET orphans_json = NULL WHERE session_id = ?", [sessionId]);
+        }
+    }
+
+    /** #6785 step 7 (MySQL twin of UnifiedStore.getOrphanViews). */
+    async getOrphanViews(sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null> {
+        const conn = await this.pool.getConnection();
+        try {
+            return await this.getOrphanViewsOn(conn, sessionId);
+        } finally {
+            conn.release();
+        }
+    }
+
+    private async getOrphanViewsOn(conn: Pool | PoolConnection, sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null> {
+        const [rows] = (await conn.query("SELECT block_id, one_json, full_json FROM orphan_blocks WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+        let out: Record<string, { one: unknown; full: unknown }> | null = null;
+        for (const r of rows as Row[]) {
+            if (out === null) out = {};
+            const oneRaw = r.one_json;
+            out[str(r.block_id)] = {
+                one: oneRaw === null || oneRaw === undefined ? null : JSON.parse(str(oneRaw)),
+                full: JSON.parse(str(r.full_json)),
+            };
+        }
+        const [col] = (await conn.query("SELECT orphans_json FROM sessions WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+        if (col.length > 0 && col[0].orphans_json !== null && col[0].orphans_json !== undefined) {
+            try {
+                const parsed = JSON.parse(str(col[0].orphans_json)) as Record<string, { one: unknown; full: unknown }>;
+                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                    for (const [id, view] of Object.entries(parsed)) {
+                        if (out === null) out = {};
+                        if (out[id] === undefined) out[id] = view;
+                    }
+                }
+            } catch {
+                /* corrupt legacy column → the table rows remain */
+            }
+        }
+        return out;
+    }
+
+    /** #6785 step 8 (MySQL twin of UnifiedStore.applyStateFields): row-backed
+     *  CompressionState fields — upsert on change, drop a row for a field
+     *  that becomes undefined (bounded ≤ 9). */
+    private async applyStateFieldsOn(c: PoolConnection | Pool, sessionId: string, fields: Record<string, string>): Promise<void> {
+        const [existing] = (await c.query("SELECT field, value_json FROM state_fields WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+        for (const r of existing as Row[]) {
+            if (fields[str(r.field)] === undefined) {
+                await c.query("DELETE FROM state_fields WHERE session_id = ? AND field = ?", [sessionId, str(r.field)]);
+            }
+        }
+        const have = new Map((existing as Row[]).map((r) => [str(r.field), str(r.value_json)]));
+        for (const [field, valueJson] of Object.entries(fields)) {
+            if (have.get(field) === valueJson) continue;
+            await c.query(
+                "INSERT INTO state_fields (session_id, field, value_json) VALUES (?, ?, ?) " +
+                "ON DUPLICATE KEY UPDATE value_json = VALUES(value_json)",
+                [sessionId, field, valueJson],
+            );
+        }
+    }
+
+    /** #6785 step 8 (MySQL twin of UnifiedStore.getStateFields). */
+    private async getStateFieldsOn(c: PoolConnection | Pool, sessionId: string): Promise<Record<string, string> | null> {
+        const [rows] = (await c.query("SELECT field, value_json FROM state_fields WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+        if (rows.length === 0) return null;
+        const out: Record<string, string> = {};
+        for (const r of rows as Row[]) out[str(r.field)] = str(r.value_json);
+        return out;
+    }
+
+    async getStateFields(sessionId: string): Promise<Record<string, string> | null> {
+        return this.getStateFieldsOn(this.pool, sessionId);
     }
 
     async deleteSession(sessionId: string): Promise<void> {
@@ -1315,8 +1535,11 @@ export class MysqlBackend implements StorageBackend {
                 refs.push(str(b.summary_hash));
                 if (b.one_hash !== null && b.one_hash !== undefined) refs.push(str(b.one_hash));
             }
-            const ccrRows = (await c.query("SELECT content_hash FROM ccr_entries WHERE session_id = ?", [sessionId])) as unknown as Row[][];
-            for (const e of ccrRows[0]) refs.push(str(e.content_hash));
+            const ccrRows = (await c.query("SELECT content_hash, orig_hash FROM ccr_entries WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+            for (const e of ccrRows[0]) {
+                refs.push(str(e.content_hash));
+                if (e.orig_hash !== null && e.orig_hash !== undefined) refs.push(str(e.orig_hash));
+            }
             const cpRows = (await c.query("SELECT cp_id, state_hash FROM checkpoints WHERE session_id = ? AND pinned = 0", [sessionId])) as unknown as Row[][];
             for (const cp of cpRows[0]) {
                 await c.query("DELETE FROM checkpoints WHERE cp_id = ?", [cp.cp_id]);
@@ -1328,6 +1551,11 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM dead_refs WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM refs WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM ccr_entries WHERE session_id = ?", [sessionId]);
+            await c.query("DELETE FROM orphan_blocks WHERE session_id = ?", [sessionId]);
+            // #6785 step 8: the row-backed kstate rows cascade with the
+            // session (sqlite twin, store.ts deleteSession) — without this
+            // every MySQL-mode delete leaks them forever.
+            await c.query("DELETE FROM state_fields WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM conversations WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM sessions WHERE session_id = ?", [sessionId]);
@@ -1489,9 +1717,9 @@ export class MysqlBackend implements StorageBackend {
                 if (res.affectedRows === 0) throw new Error(`cloneSessionRows: media content row missing for hash ${String(row.h).slice(0, 16)}… — refusing to fork with an uncounted ref`);
             }
             await conn.query(
-                `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)
-                 VALUES (?, ?, ?, ?, ?)
-                 ON DUPLICATE KEY UPDATE parent_session_id = VALUES(parent_session_id), fork_point_seq = VALUES(fork_point_seq)`,
+                `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq, fork_egress_watermark)
+                 VALUES (?, ?, ?, ?, ?, NULL)
+                 ON DUPLICATE KEY UPDATE parent_session_id = VALUES(parent_session_id), fork_point_seq = VALUES(fork_point_seq), fork_egress_watermark = VALUES(fork_egress_watermark)`,
                 [childId, Date.now(), Date.now(), parentId, throughSeq],
             );
             if (initial && !await this.ingestSessionOn(initial, undefined, { completeLog: true }, conn)) throw new Error("cloneSessionRows: initial child ingest failed");
@@ -1520,6 +1748,9 @@ export class MysqlBackend implements StorageBackend {
                 getBlocks: (id, opts) => this.getBlocksOn(conn, id, opts),
                 getDeadRefs: (id) => this.getDeadRefsOn(conn, id),
                 getRefs: (id) => this.getRefsOn(conn, id),
+                getCcrEntries: (id) => this.getCcrEntriesOn(conn, id),
+                getOrphanViews: (id) => this.getOrphanViewsOn(conn, id),
+                getStateFields: (id) => this.getStateFieldsOn(conn, id),
             });
         } finally {
             try {
@@ -1532,7 +1763,7 @@ export class MysqlBackend implements StorageBackend {
 
     private async getSessionRowOn(conn: Pool | PoolConnection, sessionId: string): Promise<SessionRow | null> {
         const [rows] = (await conn.query(
-            `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin, status,
+            `SELECT session_id, parent_session_id, fork_point_seq, fork_egress_watermark, protocol, label, title, host_title, namespace, origin, status,
                     created_at, updated_at, next_block_id, next_run_id,
                     meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json
              FROM sessions WHERE session_id = ?`,
@@ -1544,6 +1775,7 @@ export class MysqlBackend implements StorageBackend {
             sessionId: str(r.session_id),
             parentSessionId: nullableStr(r.parent_session_id),
             forkPointSeq: nullableNum(r.fork_point_seq),
+            forkEgressWatermark: nullableNum(r.fork_egress_watermark),
             protocol: nullableStr(r.protocol),
             label: nullableStr(r.label),
             title: nullableStr(r.title),
@@ -1563,52 +1795,6 @@ export class MysqlBackend implements StorageBackend {
             ccrJson: nullableStr(r.ccr_json),
             lastIngestedSeq: nullableNum(r.last_ingested_seq),
             orphansJson: nullableStr(r.orphans_json),
-        };
-    }
-
-    /** #4739: bounded view bundle (messages only at tail/pluginSnapshot
-     *  pointer seqs). Per-statement reads like today's viewForAsync — no
-     *  cross-query snapshot — which is safe here because ingest writes each
-     *  session row and its pointed-at message rows in ONE transaction, so
-     *  every pointer ever read resolves to rows that already exist. The
-     *  sqlite lane carries the explicit read-transaction instead. */
-    async sessionViewRows(sessionId: string): Promise<SessionViewRows> {
-        const session = await this.getSessionRow(sessionId);
-        if (!session) return null;
-        const pointers = viewPointerSeqs(session.tailJson);
-        const messages: (MessageRow & { contentHash: string })[] = [];
-        const CHUNK = 500;
-        for (let i = 0; i < pointers.length; i += CHUNK) {
-            const chunk = [...new Set(pointers.slice(i, i + CHUNK))];
-            if (chunk.length === 0) continue;
-            const [rows] = (await this.pool.query(
-                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts, c.bytes AS content_bytes FROM messages
-                 LEFT JOIN content c ON c.hash = messages.content_hash
-                 WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
-                [sessionId, ...chunk],
-            )) as unknown as Row[][];
-            for (const r of rows) {
-                const contentHash = str(r.content_hash);
-                messages.push({
-                    seq: num(r.seq),
-                    msgId: str(r.msg_id),
-                    ref: nullableStr(r.ref),
-                    refNum: nullableNum(r.ref_num),
-                    role: str(r.role),
-                    kind: str(r.kind),
-                    contentHash,
-                    ts: nullableNum(r.ts),
-                    content: await this.hydrateMediaAsync(str(r.content_bytes), this.pool),
-                });
-            }
-        }
-        messages.sort((a, b) => a.seq - b.seq);
-        return {
-            session,
-            messages,
-            blocks: await this.getBlocks(sessionId),
-            deadRefs: await this.getDeadRefs(sessionId),
-            refs: await this.getRefs(sessionId),
         };
     }
 
@@ -1699,12 +1885,17 @@ export class MysqlBackend implements StorageBackend {
     private async getBlocksOn(conn: Pool | PoolConnection, sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
         const [rows] = (await conn.query(
             `SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
-                    supersedes_block_id, active, created_at, covered_hash, payload_json
+                    supersedes_block_id, active, created_at, covered_hash, payload_json, summary_bytes
              FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}`,
             [sessionId, ...(opts ? [opts.limit, opts.offset ?? 0] : [])],
         )) as unknown as Row[][];
         const out: (BlockRow & { summaryHash: string; oneHash: string | null })[] = [];
         for (const r of rows) {
+            // #7439-2: the self-contained summary wins when present;
+            // legacy rows (NULL) keep the content-table read.
+            const inlineBytes = (r.summary_bytes ?? null) as string | Buffer | null;
+            const inlineSummary = inlineBytes === null ? null
+                : (typeof inlineBytes === "string" ? inlineBytes : inlineBytes.toString("utf8"));
             out.push({
                 blockId: str(r.block_id),
                 ord: num(r.ord),
@@ -1715,7 +1906,7 @@ export class MysqlBackend implements StorageBackend {
                 tier: num(r.tier),
                 summaryHash: str(r.summary_hash),
                 oneHash: nullableStr(r.one_hash),
-                summary: (await this.getContent(conn, str(r.summary_hash))) ?? "",
+                summary: inlineSummary ?? (await this.getContent(conn, str(r.summary_hash))) ?? "",
                 one: r.one_hash === null || r.one_hash === undefined ? null : ((await this.getContent(conn, str(r.one_hash))) ?? null),
                 supersedesBlockId: nullableStr(r.supersedes_block_id),
                 active: num(r.active) === 1,
@@ -1781,13 +1972,27 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getCcrEntries(sessionId: string): Promise<CcrEntryRow[]> {
-        const [rows] = (await this.pool.query(
-            "SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord",
+        return this.getCcrEntriesOn(this.pool, sessionId);
+    }
+
+    private async getCcrEntriesOn(conn: Pool | PoolConnection, sessionId: string): Promise<CcrEntryRow[]> {
+        const [rows] = (await conn.query(
+            "SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord",
             [sessionId],
         )) as unknown as Row[][];
         const out: CcrEntryRow[] = [];
         for (const r of rows) {
-            out.push({ ord: num(r.ord), key: str(r.ccr_key), content: (await this.getContent(this.pool, str(r.content_hash))) ?? "", contentHash: str(r.content_hash) });
+            // #6785 step 6: null marks pre-step-6 rows (the full ccr_json
+            // envelope is the read authority for those stores).
+            const origHash = r.orig_hash === null || r.orig_hash === undefined ? null : str(r.orig_hash);
+            out.push({
+                ord: num(r.ord),
+                key: str(r.ccr_key),
+                content: (await this.getContent(conn, str(r.content_hash))) ?? "",
+                contentHash: str(r.content_hash),
+                origContent: origHash === null ? null : ((await this.getContent(conn, origHash)) ?? null),
+                origHash,
+            });
         }
         return out;
     }
@@ -1810,9 +2015,15 @@ export class MysqlBackend implements StorageBackend {
         const blocks = await q("SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json FROM blocks WHERE session_id = ? ORDER BY ord");
         const refsRows = await q("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord");
         const deadRefs = await q("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord");
-        const ccr = await q("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord");
+        const ccr = await q("SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord");
         const ext = await q("SELECT ext_key AS `key`, value_json, updated_at FROM session_ext WHERE session_id = ?");
         const checkpoints = await q("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?");
+        // #6785 step 7: the reaped-block journal rides the archive too.
+        const orphanBlocks = await q("SELECT block_id, one_json, full_json FROM orphan_blocks WHERE session_id = ?");
+        // #6785 step 8: the row-backed kstate fields ride the archive too
+        // (sqlite twin) — without them a portable restore onto a rebuilt DB
+        // silently drops all nine row-backed fields.
+        const stateFields = await q("SELECT field, value_json FROM state_fields WHERE session_id = ?");
         const wanted = new Set<string>();
         for (const m of messages) wanted.add(str(m.content_hash));
         for (const mm of mediaMaps) wanted.add(str(mm.media_hash));
@@ -1820,7 +2031,10 @@ export class MysqlBackend implements StorageBackend {
             wanted.add(str(b.summary_hash));
             if (b.one_hash !== null && b.one_hash !== undefined) wanted.add(str(b.one_hash));
         }
-        for (const e of ccr) wanted.add(str(e.content_hash));
+        for (const e of ccr) {
+            wanted.add(str(e.content_hash));
+            if (e.orig_hash !== null && e.orig_hash !== undefined) wanted.add(str(e.orig_hash));
+        }
         for (const cp of checkpoints) if (num(cp.pinned) === 0) wanted.add(str(cp.state_hash));
         const content: Record<string, string> = {};
         for (const hash of wanted) {
@@ -1831,7 +2045,7 @@ export class MysqlBackend implements StorageBackend {
         // sqlite twin: appended as the last step inside the sweep
         // transaction, so a failed sweep leaves no line for a session that
         // is still active.
-        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n";
+        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints, orphanBlocks, stateFields }) + "\n";
         let contentRowsDeleted = 0;
         await this.tx(async (c) => {
             const rel: string[] = [];
@@ -1841,7 +2055,10 @@ export class MysqlBackend implements StorageBackend {
                 rel.push(str(b.summary_hash));
                 if (b.one_hash !== null && b.one_hash !== undefined) rel.push(str(b.one_hash));
             }
-            for (const e of ccr) rel.push(str(e.content_hash));
+            for (const e of ccr) {
+                rel.push(str(e.content_hash));
+                if (e.orig_hash !== null && e.orig_hash !== undefined) rel.push(str(e.orig_hash));
+            }
             for (const cp of checkpoints) {
                 if (num(cp.pinned) === 0) {
                     rel.push(str(cp.state_hash));
@@ -1854,6 +2071,10 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM dead_refs WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM refs WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM ccr_entries WHERE session_id = ?", [sessionId]);
+            await c.query("DELETE FROM orphan_blocks WHERE session_id = ?", [sessionId]);
+            // #6785 step 8: the row-backed kstate rows sweep with the archive
+            // (sqlite twin, store.ts archiveSession).
+            await c.query("DELETE FROM state_fields WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("UPDATE sessions SET status = 'archived' WHERE session_id = ?", [sessionId]);
             for (const hash of rel) await this.releaseContent(c, hash);
@@ -1879,6 +2100,8 @@ export class MysqlBackend implements StorageBackend {
             ccrEntries: Record<string, unknown>[];
             sessionExt: Record<string, unknown>[];
             checkpoints: Record<string, unknown>[];
+            orphanBlocks?: Record<string, unknown>[];
+            stateFields?: Record<string, unknown>[];
         };
         // sqlite twin: newest matching line wins.
         let lineNo = -1;
@@ -1929,7 +2152,11 @@ export class MysqlBackend implements StorageBackend {
                 addRef(b.summary_hash);
                 addRef(b.one_hash);
             }
-            for (const e of dump.ccrEntries) addRef(e.content_hash);
+            for (const e of dump.ccrEntries) {
+                addRef(e.content_hash);
+                const eh = (e as { orig_hash?: unknown }).orig_hash;
+                if (typeof eh === "string") addRef(eh);
+            }
             for (const cp of dump.checkpoints) {
                 const [twins] = await c.query("SELECT 1 FROM checkpoints WHERE cp_id = ?", [cp.cp_id]);
                 if ((twins as Row[]).length === 0) addRef(cp.state_hash);
@@ -1969,7 +2196,10 @@ export class MysqlBackend implements StorageBackend {
                 await c.query("INSERT INTO dead_refs (session_id, ord, ref, ref_num, recorded_at) VALUES (?, ?, ?, ?, ?)", [sessionId, d.ord, d.ref, d.ref_num, d.recorded_at]);
             }
             for (const e of dump.ccrEntries) {
-                await c.query("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)", [sessionId, e.ord, e.ccr_key, e.content_hash]);
+                // #6785 step 6: pre-fix dumps lack orig_hash — NULL keeps the
+                // full ccr_json envelope as the read authority (sqlite twin).
+                const eh = (e as { orig_hash?: unknown }).orig_hash;
+                await c.query("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash, orig_hash) VALUES (?, ?, ?, ?, ?)", [sessionId, e.ord, e.ccr_key, e.content_hash, typeof eh === "string" ? eh : null]);
             }
             for (const x of dump.sessionExt) {
                 await c.query(
@@ -1983,6 +2213,22 @@ export class MysqlBackend implements StorageBackend {
                     "INSERT IGNORE INTO checkpoints (cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [cp.cp_id, sessionId, cp.seq_at, cp.block_set_hash, cp.kind, cp.created_at, cp.pinned, cp.label ?? null, cp.state_hash],
                 );
+            }
+            // #6785 step 7: the journal round-trips through the archive.
+            for (const o of dump.orphanBlocks ?? []) {
+                await c.query(
+                    "INSERT IGNORE INTO orphan_blocks (session_id, block_id, one_json, full_json) VALUES (?, ?, ?, ?)",
+                    [sessionId, o.block_id, o.one_json ?? null, o.full_json],
+                );
+            }
+            // #6785 step 8: the row-backed kstate fields round-trip too
+            // (sqlite twin: INSERT ... ON CONFLICT DO NOTHING — an existing
+            // row wins, so mirror that instead of overwriting).
+            for (const f of dump.stateFields ?? []) {
+                const [existing] = await c.query("SELECT 1 FROM state_fields WHERE session_id = ? AND field = ?", [sessionId, f.field]);
+                if ((existing as Row[]).length === 0) {
+                    await c.query("INSERT INTO state_fields (session_id, field, value_json) VALUES (?, ?, ?)", [sessionId, f.field, f.value_json]);
+                }
             }
             await c.query(
                 `UPDATE sessions SET parent_session_id = ?, fork_point_seq = ?, protocol = ?, label = ?, title = ?, host_title = ?, namespace = ?, origin = ?,
@@ -2228,6 +2474,10 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async setKv(namespace: string, key: string, value: unknown): Promise<void> {
+        // KDD #25: same eg-plane cap as the SQLite lane (flag-gated; legacy
+        // mode keeps the historical 4 MB budget — pre-existing keys may hold
+        // large values).
+        if (egressPlaneGateOn()) assertKvValueSize(namespace, key, value);
         validateExtKey(namespace, "namespace");
         validateExtKey(key, "key");
         const valueJson = serializeExtValue(value);
@@ -2288,7 +2538,17 @@ export class MysqlBackend implements StorageBackend {
                     s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
                     s.updated_at AS updatedAt, s.status AS status,
                     (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
-                    (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
+                    (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt,
+                    (SELECT JSON_UNQUOTE(JSON_EXTRACT(b.payload_json, '$.topic')) FROM blocks b
+                       WHERE b.session_id = s.session_id
+                         AND (JSON_EXTRACT(b.payload_json, '$.topic') IS NOT NULL
+                              OR JSON_EXTRACT(b.payload_json, '$.summary') IS NOT NULL)
+                       ORDER BY b.ord LIMIT 1) AS firstTopic,
+                    (SELECT JSON_UNQUOTE(JSON_EXTRACT(b.payload_json, '$.summary')) FROM blocks b
+                       WHERE b.session_id = s.session_id
+                         AND (JSON_EXTRACT(b.payload_json, '$.topic') IS NOT NULL
+                              OR JSON_EXTRACT(b.payload_json, '$.summary') IS NOT NULL)
+                       ORDER BY b.ord LIMIT 1) AS firstSummary
               FROM sessions s`,
         )) as unknown as Row[][];
         return rows.map((r) => {
@@ -2311,6 +2571,11 @@ export class MysqlBackend implements StorageBackend {
                 contextTokens,
                 updatedAt: num(r.updatedAt),
                 status: str(r.status ?? "active"),
+                // #7595: raw fields for the display-title fallback (merged
+                // `title` above is unchanged for existing consumers).
+                hostTitle: r.hostTitle !== null && r.hostTitle !== undefined ? str(r.hostTitle) : undefined,
+                firstTopic: nullableStr(r.firstTopic),
+                firstSummary: nullableStr(r.firstSummary),
             };
         });
     }
@@ -2349,6 +2614,7 @@ export class MysqlBackend implements StorageBackend {
             firstTopic: nullableStr(r.firstTopic),
             firstSummary: nullableStr(r.firstSummary),
             activeCompressedTokens: num(r.activeCompressed),
+            egressRecords: 0,
             status: str(r.status ?? "active"),
         }));
     }

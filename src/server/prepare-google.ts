@@ -4,9 +4,12 @@ import { renderNudgeText, viableRanges } from "acp-kernel";
 import { recordNudgeInject } from "../cache-ledger.js";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, applyWireMsgIdPin, validateMsgIds, validateWireMsgIds, wirePinGroups } from "../msgid-pin.js";
+import { featureEnabled } from "../rollout.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { isSubagentPrompt } from "../session-title.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
@@ -33,13 +36,16 @@ import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generatio
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
-import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { egressPlaneGateOn, imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudgeArmed, emergencyNudgeForConfig } from "./budget.js";
 import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
+import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority, stampEgressSeqs } from "./egress-lane-io.js";
+import { EgressAuthorityRejectError } from "../storage/egress-record.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -89,6 +95,16 @@ export async function prepareGoogle(
 ): Promise<Prepared> {
     const sessionId = session.id;
     ++session.stats.requests;
+    // #6525: the client may stamp the envelope (`biliMsgIds`) on plugin-wire
+    // full-resend turns. Read + strip it before anything can reach the real
+    // upstream, then pin behind the rollout gate (same contract as the openai/
+    // anthropic twins). Nothing extra is ever forwarded either way.
+    const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    // Same unconditional strip for the seqs carrier (biliLedgerSeqs) — parity
+    // with the openai/anthropic/responses prepare lanes: the real upstream
+    // must never see a field it does not know.
+    delete (parsed as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
     const inboundMessageCount = Array.isArray(parsed.contents) ? parsed.contents.length : 1;
     let googleClientSystem = "";
     let sysNotes: string[] = [];
@@ -109,7 +125,11 @@ export async function prepareGoogle(
     // Title-generation requests (tiny budget) get no compress tooling — same
     // heuristic and same prefix-cache rationale as prepareOpenai.
     const isTitleGen = maxTokens <= 200;
-    const shouldInject = opts.compress.injectTool && !isTitleGen;
+    // zed cloud wire: the response is NDJSON byte-passthrough, so an in-stream
+    // acp loop is structurally unreachable (same reasoning as DSH #3177) — the
+    // model-side compress surface (tools + standing prompt + nudge) is off.
+    const zedLane = req.headers["x-bili-zed-lane"] !== undefined;
+    const shouldInject = opts.compress.injectTool && !isTitleGen && !zedLane;
     const injectTools = shouldInject && !pluginMode;
     // #3417: surface gating lives in lane-decisions (observed reachability
     // overrides the dsh default, #3401); alias kept for the remaining reads.
@@ -124,8 +144,13 @@ export async function prepareGoogle(
     const markerCounts = stripRawStage(parsed, "google");
     logRawStripCounts(markerCounts, log, sessionId);
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
     try {
-        const { msgs, systemText } = googleToCore(parsed);
+        const coreOut = googleToCore(parsed);
+        let msgs = coreOut.msgs;
+        const systemText = coreOut.systemText;
         googleClientSystem = systemText;
         // Title-gen side-requests carry their own tiny system — reconciling
         // them would pollute the conversation's anchor state.
@@ -135,6 +160,34 @@ export async function prepareGoogle(
             googleClientSystem = outcome.outbound;
         }
         originalMessages = msgs;
+        // #6525/#4491 parity: pin identity to client-supplied ids (plugin lanes
+        // only — pure proxy traffic has no msgid channel), the SAME gated
+        // contract as the openai/anthropic twins. No watermark fast-path on
+        // this wire, so there is no `wpHit` skip.
+        let msgidPinned = false;
+        if (pluginMode && incomingMsgIds !== undefined) {
+            if (featureEnabled("pluginLaneServerHistory")) {
+                // #7439 follow-up: per-CORE or per-WIRE-ELEMENT full list
+                // (dual-mode, same rule as stage0 — a split group guarantees
+                // element count < core count, no ambiguity).
+                const wireG = (() => { const g = wirePinGroups(msgs); return g !== null && g.split ? g : null; })();
+                const wireHit = wireG !== null && Array.isArray(incomingMsgIds) && incomingMsgIds.length === wireG.size;
+                const v = wireHit
+                    ? validateWireMsgIds(incomingMsgIds, wireG!)
+                    : validateMsgIds(incomingMsgIds, msgs.length);
+                if (v.ok) {
+                    msgs = wireHit
+                        ? applyWireMsgIdPin(msgs, wireG!, v.ids)
+                        : applyMsgIdPin(msgs, v.ids);
+                    originalMessages = msgs;
+                    msgidPinned = true;
+                } else {
+                    log("warn", `[${sessionId}] [msgid] google-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#6525)`);
+                }
+            } else {
+                log("info", `[${sessionId}] [msgid] google-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#6525)`);
+            }
+        }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
         // re-mints #3752); only the live tail keeps the client's bytes.
@@ -143,7 +196,9 @@ export async function prepareGoogle(
         // (#651 keeps reasoning-drop off this wire — Gemini validates
         // thoughtSignature — so only tokenCount + processTurn consume the
         // render view, unlike the openai/responses lanes' third consumer.)
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        let renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #7439 follow-up (C6): egress-on sequence authority (see egress-lane-io).
+        renderMsgs = stampEgressSeqs(getStore()?.egressOpLogStore(), sessionId, renderMsgs);
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.
@@ -216,6 +271,14 @@ export async function prepareGoogle(
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
         adoptContentStore(session, turn.contentStore);
+        // In-request ledger flush: the transcript up to THIS user message is
+        // durable before the model call (#3397 durability-before-render) and
+        // the stage-0 envelope / M2 evidence read a current ledger.
+        // snapshotMessages first: the persist build reads session.lastMessages
+        // — and it stays the RAW client resend (never the D-lane view: its
+        // synthetic acp_summary anchor is not a transcript message).
+        snapshotMessages(session, originalMessages);
+        snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -242,7 +305,7 @@ export async function prepareGoogle(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title) || isSubagentPrompt(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
@@ -260,7 +323,7 @@ export async function prepareGoogle(
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
-        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange);
+        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudgeForConfig(turn.nudge, loopConfig);
         // #3482 Step 2.5: the ONE nudge gate (lane-decisions). No compaction trigger
         // and no intercept health window on this wire — those differences are
         // explicit inputs on the responses lane. The standalone `shouldInject`
@@ -275,7 +338,7 @@ export async function prepareGoogle(
             breakerArmed: compressBreakerArmed(session),
             autoFoldEngaged: autoFoldEngaged(loopConfig, session),
             growthFoldingArmed: growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)),
-            modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
+            modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor, loopConfig.nudge.maxContextLimitPct)),
         });
         const caLine = recordNudgeObservation(sessionId, turn, tokenCount, config.modelContextLimit, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool));
         if (caLine) log("info", caLine);
@@ -301,7 +364,12 @@ export async function prepareGoogle(
         reapOrphansLogged(session, msgs, log, sessionId);
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
-        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        let egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        // #7398 all-lanes (ruling 7439-4): the pre-injection core is captured
+        // here; the egress authority seam (egress-lane-io) runs after the
+        // system is assembled below, so the recorded system row is the
+        // lane's OUTBOUND system.
+        const laneCoreForRecord = egressMessages;
         rebuiltContents = coreToGoogle(egressMessages, { model });
 
         // ONLY the static compress prompt joins the client's system text — the
@@ -333,6 +401,30 @@ export async function prepareGoogle(
         // instead of being re-serialized into a new shape.
         const extraSystemParts = sysParts.slice(googleClientSystem ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
+        // #7398 all-lanes (ruling 7439-4/5): the single shared authority
+        // seam (egress-lane-io), POST-kernel: the swapped core becomes the
+        // outbound rebuild and the recorded bytes. Unreadable flow → hard
+        // fail.
+        // #7574: the swap (server authority) is armed by the ONE shared rule
+        // (egressAuthorityArmed — same as the OpenAI lane). Every other main
+        // turn is only recorded.
+        if (!isTitleGen && egressPlaneGateOn()) {
+            const st = getStore().egressOpLogStore();
+            if (st) {
+                const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinned, sideRequest: isTitleGen });
+                // The reject check sits AFTER processTurn here (the openai
+                // lane has it pre-kernel, prepare-openai.ts:384): the decision
+                // does not depend on the turn content, but the record needs
+                // the transformed lane shape. A rejected turn leaves only
+                // in-memory kernel state — nothing is recorded and the retry
+                // self-heals (single-txn, idempotent).
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
+                const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log, egressBlockLedgerFor(session), session.state.messageRefs);
+                if (served !== null) {
+                    rebuiltContents = coreToGoogle(served, { model });
+                }
+            }
+        }
         if (injectTools) {
             toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_GOOGLE] : []), ...(blockOpsActive ? blockOps.google : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
@@ -395,6 +487,11 @@ export async function prepareGoogle(
             nudgeOutcome = "gated";
         }
     } catch (err) {
+        // Ruling 7439-5 (C3, PR #7684): an unreadable op-log on an armed turn
+        // is a HARD fail (500 + x-bili-egress: unreadable) — the generic
+        // forward below would send the CLIENT'S bytes, which the ruling
+        // forbids (the openai lane already rethrows this exact error).
+        if (err instanceof EgressAuthorityRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
     }
@@ -417,10 +514,12 @@ export async function prepareGoogle(
             + imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin);
         if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     }
-    snapshotMessages(session, originalMessages);
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, processedMessages, originalMessages, judgeBaseline, protocol: "google", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
 }

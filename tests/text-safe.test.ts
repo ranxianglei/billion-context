@@ -178,6 +178,8 @@ test("family gate: no raw negative string slices outside the allowlist", () => {
         ["src/context-analysis.ts", [/a\.injects\.slice\(-50\)/, /a\.harvests\.slice\(-50\)/]], // array receiver (#5963 context-analysis view)
         ["src/web/client.ts", [/conflicts\.slice\(-10\)/]], // array receiver (#2102 session-detail card)
         ["src/web/report.ts", [/lines\.slice\(-12\)/, /folds\.slice\(-15\)/, /evs\.slice\(-30\)/, /rec\.events \|\| \[\]\)\.slice\(-10\)/]], // array receiver (#3099 session-report tables; #6729 recovery tables)
+        ["src/storage/store.ts", [/incoming\.slice\(-64\)/]], // array receiver (#7591 egress-on stateless stage-0 window: last 64 msgids)
+        ["src/install-ref.ts", [/split\("\\n"\)\.slice\(-3\)/]], // array receiver (#7806 bili install: last 3 stderr lines of the failed step)
         ["src/text-safe.ts", [/\.slice\(/]], // the clamped implementation itself
     ]);
     const srcDir = path.join(import.meta.dirname, "..", "src");

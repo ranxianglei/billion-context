@@ -181,6 +181,61 @@ test("recordUpstreamAlert: structured skipped fields ride along for the localize
     assert.equal(a.hint, UPSTREAM_FAIL_HINTS["connect-refused"]);
 });
 
+for (const mode of ["explicit-direct", "auto", "host-bypass"] as const) {
+    test(`recordUpstreamAlert: ${mode} replaces an earlier skipped-proxy diagnosis`, () => {
+        _resetUpstreamAlertsForTest();
+        try {
+            const fallback = { biliPort: 42422, httpsProxy: ENV_PROXY, systemProxy: { enabled: false } };
+            const first = resolveProxyDecision({}, "", TARGET, { ...fallback, explicitDirect: true, defaultDirect: true });
+            const error = netError("UND_ERR_CONNECT_TIMEOUT", "connect timed out");
+            recordUpstreamAlert(TARGET, error, !!first.proxy, first.skippedProxy);
+            const firstSeen = getUpstreamAlerts()[0].firstSeen;
+            assert.ok(getUpstreamAlerts()[0].skippedProxy);
+
+            const next = mode === "auto"
+                ? resolveProxyDecision({}, undefined, TARGET, fallback)
+                : resolveProxyDecision({}, "", TARGET, {
+                    ...fallback, explicitDirect: true, defaultDirect: mode === "host-bypass",
+                    ...(mode === "host-bypass" ? { noProxy: "relay.example.com" } : {}),
+                });
+            assert.equal(next.skippedProxy, undefined);
+            assert.equal(!!next.proxy, mode === "auto");
+            recordUpstreamAlert(TARGET, error, !!next.proxy, next.skippedProxy);
+
+            const alerts = getUpstreamAlerts();
+            assert.equal(alerts.length, 1);
+            const [current] = alerts;
+            assert.equal(current.count, 2);
+            assert.equal(current.firstSeen, firstSeen);
+            assert.equal(current.code, "UND_ERR_CONNECT_TIMEOUT");
+            assert.equal(current.hint, UPSTREAM_FAIL_HINTS["connect-timeout"]);
+            assert.equal(current.skippedProxy, undefined);
+            assert.equal(current.skippedSource, undefined);
+            assert.ok(!JSON.stringify(current).includes("7890"));
+        } finally {
+            _resetUpstreamAlertsForTest();
+        }
+    });
+}
+
+test("recordUpstreamAlert: a later skipped proxy replaces the old redacted endpoint and source", () => {
+    _resetUpstreamAlertsForTest();
+    try {
+        const error = netError("UND_ERR_CONNECT_TIMEOUT", "connect timed out");
+        recordUpstreamAlert(TARGET, error, false, { proxy: ENV_PROXY, source: "HTTPS_PROXY" });
+        recordUpstreamAlert(TARGET, error, false, { proxy: "http://new-user:new-password@127.0.0.1:7897", source: "windows-system" });
+        const [current] = getUpstreamAlerts();
+        assert.equal(current.count, 2);
+        assert.equal(current.skippedProxy, "http://***:***@127.0.0.1:7897");
+        assert.equal(current.skippedSource, "windows-system");
+        assert.ok(!JSON.stringify(current).includes("new-password"));
+        assert.ok(!JSON.stringify(current).includes("7890"));
+        assert.ok(current.hint.includes(current.skippedProxy));
+    } finally {
+        _resetUpstreamAlertsForTest();
+    }
+});
+
 test("loadOptions: defaultDirect tracks UNSET mode only (model path)", () => {
     // unset mode + available env proxy → the full #2809 scenario end-to-end
     withSandboxEnv(() => {}, () => {

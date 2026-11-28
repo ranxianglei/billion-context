@@ -153,11 +153,13 @@ test("e2e: codex UA + not-in-table model → clamped to the 272K fallback", asyn
     }
 });
 
-test("e2e: codex UA + bili window below perception → untouched (min keeps bili's)", async () => {
+test("e2e: codex UA + fallback-sized window below perception → raised to codex's knowledge (#7205)", async () => {
     const rig = await startRig();
     try {
+        // claude-sonnet-4-5 resolves to bili's generic fallback window (200K), below
+        // codex's own knowledge (272K): #7205 raises it (pre-#7205: min kept 200K).
         assert.equal(await post(rig, "cw-below", "claude-sonnet-4-5", true), 200);
-        assert.equal(effectiveLimit("cw-below"), 200_000, "200K < 272K perception → no clamp");
+        assert.equal(effectiveLimit("cw-below"), 272_000, "#7205: fallback-sized 200K < 272K knowledge → raised");
     } finally {
         await closeRig(rig);
     }

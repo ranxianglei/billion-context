@@ -73,6 +73,10 @@ const DECL_RE = /^export\s+(?:declare\s+)?(?:async\s+)?(?:function|class|const|l
 // file references them today. This list is the ONLY hole in the gate — every
 // entry must carry its reason here and stay reviewable.
 const WAIVERS = new Map([
+    // #7806: PinSource is the machine-level pin's git provenance shape;
+    // consumers read it off PinRecord.source structurally (update-actions.ts
+    // status payload, web badge) — no nominal import needed.
+    ["src/update-pin.ts", new Set(["PinSource"])],
     // #2170 lane-guard: ANY hunk in src/server/side-request.ts forces a paired
     // update of the pinned side-lane suites. These type demotions are
     // behavior-neutral, so we keep the exports rather than churn suites that

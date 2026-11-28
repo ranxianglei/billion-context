@@ -11,6 +11,11 @@ import path from "node:path";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-aff-"));
 process.env.BILI_STORAGE_UNIFIED = "full";
+// KDD #25 hermeticity: this suite exercises the legacy (egress-off) prefix-affinity
+// persistence (file→kv migration + kv RMW). Pin the plane OFF so a host config with
+// rollout.features.egressPlane forced on cannot flip the eg-mode memory-only gate
+// mid-suite.
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 process.env.BILI_SESSIONS_DIR = path.join(root, "sessions");
 process.env.XDG_STATE_HOME = path.join(root, "state");
 process.env.XDG_CACHE_HOME = path.join(root, "cache");

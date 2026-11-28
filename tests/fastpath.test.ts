@@ -7,8 +7,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
 import { openaiToCore, coreToOpenai } from "acp-kernel/wire";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, clearWatermarkSeed, watermarkDebugState, PF_COUNT_HEADER, PF_SEQ_HEADER, PF_TAIL_IDS_HEADER, PF_SLOT_UNKNOWN } from "../src/server/fastpath.ts";
+import { evaluateWatermarkFastpath, evaluateDeltaResend, finalizeWatermarkTurn, stampOnlyWatermarkTurn, clearWatermarkSeed, watermarkDebugState, PF_COUNT_HEADER, PF_SEQ_HEADER, PF_TAIL_IDS_HEADER, PF_DELTA_HEADER, PF_SLOT_UNKNOWN } from "../src/server/fastpath.ts";
 import { stripRawStage } from "../src/marker/engine.ts";
+import type { EgressViewRow } from "../src/storage/egress-state.js";
+import { applyMsgIdPin } from "../src/msgid-pin.ts";
 import { INCREMENTAL_TURN_MARKER_HEADER } from "../src/incremental-lane.ts";
 import { _setStoreForTest, _resetStoreForTest, type SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
@@ -30,16 +32,42 @@ const headersOf = (h: Record<string, string>): http.IncomingMessage =>
 
 const freshSession = (id: string): Session => ({ id }) as unknown as Session;
 
-interface StubStore { ext: Map<string, unknown> }
+interface StubStore {
+    ext: Map<string, unknown>;
+    /** The egress live view + the client's raw system (A) — the delta arm's
+     *  durable prefix source (#7884). */
+    eg: { view: EgressViewRow[]; sysIn: string | null };
+}
 const makeStubStore = (): StubStore => {
     const ext = new Map<string, unknown>();
+    const eg: StubStore["eg"] = { view: [], sysIn: null };
     _setStoreForTest({
         closeQuietly: (): void => {},
         replicasAvailable: (): boolean => true,
         getSessionExt: (sid: string, k: string): unknown => ext.get(`${sid}\u0000${k}`),
         setSessionExt: (sid: string, k: string, v: unknown): void => { void ext.set(`${sid}\u0000${k}`, v); },
+        egressOpLogStore: (): unknown => ({
+            egressStateView: (): EgressViewRow[] => eg.view,
+            egressSystemInput: (): string | null => eg.sysIn,
+        }),
     } as unknown as SessionStore);
-    return { ext };
+    return { ext, eg };
+};
+
+/** Emulate what the eg-on pipeline records after a completed turn: the
+ *  live view = the system row (bytes/sys_in = the client's raw system) +
+ *  one row per conversation core (bytes = the FINAL core JSON). The oracle
+ *  is the same full-body openaiToCore the pipeline converts from — and the
+ *  strip is applied FIRST, because the record stores POST-strip cores. */
+const recordEgTurn = (stub: StubStore, fullSoFar: unknown[]): void => {
+    const body = JSON.parse(bodyOf(fullSoFar));
+    void stripRawStage(body, "openai");
+    const oracle = openaiToCore(body);
+    stub.eg.sysIn = oracle.systemText;
+    stub.eg.view = [
+        { num: 0, msgid: "egress-system", ref: "", tokens: 0, type: "system", bytes: oracle.systemText },
+        ...oracle.msgs.map((m, i): EgressViewRow => ({ num: i + 1, msgid: String(m.id), ref: "", tokens: 0, type: "text", bytes: JSON.stringify(m) })),
+    ];
 };
 const savedKey = (id: string): string => `${id}\u0000pf:state`;
 const readSaved = (stub: StubStore, id: string): Record<string, unknown> =>
@@ -65,6 +93,33 @@ const runTurn = (
     return { out, headers };
 };
 
+/** Drive one turn the way prepareOpenai does for a PINNED session
+ *  (pluginLaneServerHistory on, #4491): on a miss the seed is re-keyed to the
+ *  host msgids via applyMsgIdPin (the id namespace the stash then carries), on
+ *  a hit the pin is skipped (the seed's prefix was already pinned when it was
+ *  materialized). This is the 2x2 traffic the watermark fastpath exists to
+ *  accelerate — the seed cores carry host msgids while a fresh openaiToCore
+ *  parse mints content-hash ids, so the id namespaces differ structurally
+ *  (#7345). */
+const runPinnedTurn = (
+    session: Session,
+    reqHeaders: Record<string, string>,
+    bodyText: string,
+    hostIds: string[],
+): { out: ReturnType<typeof evaluateWatermarkFastpath>; headers: Record<string, string> } => {
+    const model = JSON.parse(bodyText).model as string;
+    const out = evaluateWatermarkFastpath(bodyText, headersOf(reqHeaders), session, { pluginMode: true, titleGen: false, model }, log);
+    const oracle = openaiToCore(JSON.parse(bodyText));
+    const stripCounts = stripRawStage(JSON.parse(bodyText), "openai");
+    const headers = finalizeWatermarkTurn(session, out, {
+        model,
+        legacyCores: out.hit !== null ? out.hit.view : applyMsgIdPin(oracle.msgs, hostIds),
+        rawSystemText: out.hit !== null ? out.hit.systemText : oracle.systemText,
+        turnStripCounts: stripCounts,
+    });
+    return { out, headers };
+};
+
 test("gate off / title-gen / incremental-turn requests are untouched", () => {
     _resetStoreForTest();
     makeStubStore();
@@ -84,6 +139,20 @@ test("gate off / title-gen / incremental-turn requests are untouched", () => {
     assert.equal(r.out.measuredT, undefined);
 
     _resetStoreForTest();
+});
+
+test("stampOnlyWatermarkTurn: flag off still emits the seq heartbeat (#7367)", () => {
+    // The x-bili-pf-seq stamp is the client's watermark advance, NOT
+    // fastpath-only state. With pluginFullResendWatermark gated off the
+    // fastpath never evaluates, so finalizeWatermarkTurn never runs — the
+    // stamp must still flow (via the structural scan) or the client's k2
+    // freezes and its tail-ids grow past the 16 KB header limit.
+    const body = bodyOf([SYS("s"), USR("hi"), USR("yo"), ASST("ok"), USR("tail")]);
+    const headers = stampOnlyWatermarkTurn(body);
+    assert.equal(headers[PF_SEQ_HEADER], "5", "stamp = measured element count T");
+    // an unscannable body degrades to no stamp (the client's cap is the backstop)
+    assert.deepEqual(stampOnlyWatermarkTurn("not-json-at-all"), {});
+    assert.deepEqual(stampOnlyWatermarkTurn(""), {});
 });
 
 test("first turn: unseeded miss, measured T, response re-stamps", () => {
@@ -463,4 +532,376 @@ test("clearWatermarkSeed forces the next turn back through verification", () => 
     const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
     const { out } = runTurn(session, { [PF_COUNT_HEADER]: "3" }, b2);
     assert.equal(out.decision, "unseeded");
+});
+
+// #7064 2×2 perf regression (2026-11-20, 100k-message sessions): in a
+// pinned session prepare-openai rebinds originalMessages to s0.pinned
+// BEFORE finalizeWatermarkTurn, so the prefix stash carries HOST-MSGID ids
+// (host/ledger namespace), while a fresh turn's openaiToCore mints
+// content-hash ids. The head check must not treat the id field as drift
+// evidence or the fastpath misses (head-prefix-drift) on EVERY steady
+// turn — the exact traffic the watermark was built for. runTurnPinned
+// simulates that reseed: a full host-id list pins, and the reseed takes
+// the pinned (host-id) cores.
+const runTurnPinned = (
+    session: Session,
+    reqHeaders: Record<string, string>,
+    bodyText: string,
+    hostIds?: string[],
+): { out: ReturnType<typeof evaluateWatermarkFastpath>; headers: Record<string, string> } => {
+    const model = JSON.parse(bodyText).model as string;
+    const out = evaluateWatermarkFastpath(bodyText, headersOf(reqHeaders), session, { pluginMode: true, titleGen: false, model }, log);
+    const oracle = openaiToCore(JSON.parse(bodyText));
+    const stripCounts = stripRawStage(JSON.parse(bodyText), "openai");
+    const base = out.hit !== null ? out.hit.view : oracle.msgs;
+    const legacyCores = hostIds !== undefined && hostIds.length === base.length
+        ? base.map((m, i) => ({ ...m, id: hostIds[i]! }))
+        : base;
+    const headers = finalizeWatermarkTurn(session, out, {
+        model,
+        legacyCores,
+        rawSystemText: out.hit !== null ? out.hit.systemText : oracle.systemText,
+        turnStripCounts: stripCounts,
+    });
+    return { out, headers };
+};
+
+test("pinned (2x2) steady state still HITS — host-id stash must not break the head check", () => {
+    _resetStoreForTest();
+    makeStubStore();
+    const session = freshSession("pf-pinned");
+    const ids = (n: number): string[] => Array.from({ length: n }, (_, i) => `host-id-${i}`); // n = NON-system core count
+    // t1: SEED turn already carries the full host-id list → stage0 pins →
+    // prepare-openai reseeds the stash from the PINNED cores (host-id
+    // namespace). This is the field sequence (first 100k turn sends the
+    // full biliMsgIds list); pre-fix the stash carried host ids from the
+    // very first stamp and every later turn missed head-prefix-drift.
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("c")]);
+    const t1 = runTurnPinned(session, {}, b1, ids(3));
+    assert.equal(t1.out.decision, "no-stamp", LOGS.join("\n"));
+    // t2: steady state — tail-ids only (anchor + new), no body list.
+    // Pre-fix: head-prefix-drift (fresh content-hash ids vs stashed host ids).
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("c"), USR("d")]);
+    const t2 = runTurnPinned(session, { [PF_COUNT_HEADER]: "4", ...TAIL([ids(4)[2]!, ids(4)[3]!]) }, b2);
+    assert.equal(t2.out.decision, "hit", LOGS.join("\n"));
+    assert.ok(t2.out.hit, "hit view expected");
+    // t3: one more steady growth — the bug was PERMANENT drift, so a second
+    // consecutive hit proves the stash stays consistent after a hit-turn
+    // reseed (hit paths stash outcome.hit.view, a mixed namespace).
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("c"), USR("d"), ASST("e")]);
+    const t3 = runTurnPinned(session, { [PF_COUNT_HEADER]: "5", ...TAIL([ids(5)[3]!, ids(5)[4]!]) }, b3);
+    assert.equal(t3.out.decision, "hit", LOGS.join("\n"));
+    assert.ok(t3.out.hit, "second consecutive hit expected");
+    assert.deepEqual(
+        t3.out.hit.view.map((m) => String((m as { text?: unknown }).text ?? "")),
+        ["a", "b", "c", "d", "e"],
+        "view = stashed prefix + rekeyed window, byte-identical texts",
+    );
+    // id-excluded head check must STILL catch a real in-place content edit
+    // in a pinned session (both directions, #3617).
+    const b4 = bodyOf([SYS("s"), USR("a"), USR("b-EDITED"), ASST("c"), USR("d"), ASST("e"), USR("f")]);
+    const t4 = runTurnPinned(session, { [PF_COUNT_HEADER]: "6", ...TAIL([ids(6)[4]!, ids(6)[5]!]) }, b4);
+    assert.equal(t4.out.decision, "head-prefix-drift", LOGS.join("\n"));
+    assert.equal(t4.out.creditedMiss, false);
+    _resetStoreForTest();
+});
+
+// #5403 family, delta arm (x-bili-pf-delta): the body carries ONLY the tail
+// slice [T-L .. T-1] (anchor = the previous turn's last element), the full
+// logical count rides x-bili-pf-count, per-element ids ride x-bili-pf-tail-ids
+// (width exactly L). A satisfiable claim yields the SAME FastpathHit the
+// full-body lane would — every assertion is against the legacy full-parse
+// oracle over the WHOLE logical body. An unsatisfiable claim is a re-anchor
+// (the 400 the client answers with a full-form resend).
+
+const dTail = (n: number): string[] => Array.from({ length: n }, (_, i) => `dhost-${i}`);
+
+const runDeltaTurn = (
+    session: Session,
+    reqHeaders: Record<string, string>,
+    sliceMessages: unknown[],
+    model = "m1",
+): { verdict: { hit: import("../src/server/fastpath.ts").FastpathHit; receivedTailIds?: string[] }; headers: Record<string, string> } => {
+    const bodyText = bodyOf(sliceMessages, model);
+    const verdict = evaluateDeltaResend(JSON.parse(bodyText) as Parameters<typeof evaluateDeltaResend>[0], bodyText, headersOf(reqHeaders), session, { pluginMode: true, titleGen: false, model }, log);
+    assert.ok(verdict !== null && "hit" in verdict, `expected a delta hit, got ${JSON.stringify(verdict)}\n${LOGS.slice(-6).join("\n")}`);
+    const hit = verdict;
+    const headers = finalizeWatermarkTurn(session, { hit: hit.hit, measuredT: hit.hit.totalT, decision: "delta-hit", creditedMiss: false, receivedTailIds: hit.receivedTailIds }, {
+        model,
+        legacyCores: hit.hit.view,
+        rawSystemText: hit.hit.systemText,
+        turnStripCounts: hit.hit.markerCounts,
+    });
+    return { verdict: hit, headers };
+};
+
+test("delta arm: hit reconstructs EXACTLY the legacy full-parse oracle across consecutive slices", () => {
+    makeStubStore();
+    process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "1";
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1"; // the delta arm is eg-on-scoped (#7875 point 1)
+    const session = freshSession("pf-delta-hit");
+    const stub = makeStubStore();
+    const full: unknown[] = [SYS("s"), USR("a"), USR("b")];
+    // Seed carries NO pf headers (field: the first request of a session
+    // never stamps) — the first delta turn opens unverified, from then on
+    // every list is chained on the previous turn's stamped last id.
+    const t1 = runTurn(session, {}, bodyOf(full));
+    assert.equal(t1.out.decision, "no-stamp"); // seed stampT=3
+    recordEgTurn(stub, full); // the pipeline would have recorded these 3 cores
+    // t2: logical T=5, L=5-3=2 -> body = NEW elements only [USR c, ASST d],
+    // tail-ids = anchor(b)+new = [dhost-2, dhost-3, dhost-4]
+    full.push(USR("c"), ASST("d"));
+    const r2 = runDeltaTurn(session, { [PF_COUNT_HEADER]: "5", [PF_DELTA_HEADER]: "1", ...TAIL(dTail(5).slice(2)) }, full.slice(3));
+    assert.equal(r2.headers[PF_SEQ_HEADER], "5");
+    recordEgTurn(stub, full); // 5 cores recorded
+    let oracle = openaiToCore(JSON.parse(bodyOf(full)));
+    assert.deepEqual(r2.verdict.hit!.view.map((m) => String((m as { text?: unknown }).text ?? "")), oracle.msgs.map((m) => m.text), "texts");
+    for (let i = 0; i < oracle.msgs.length; i++) {
+        assert.equal(r2.verdict.hit!.view[i]!.id, oracle.msgs[i]!.id, `id @${i}`);
+        assert.equal((r2.verdict.hit!.view[i]! as { wireIndex?: number }).wireIndex, (oracle.msgs[i]! as { wireIndex?: number }).wireIndex, `wireIndex @${i}`);
+    }
+    assert.equal(r2.verdict.hit!.systemText, oracle.systemText);
+    assert.equal(r2.verdict.hit!.totalT, 5);
+    // t3: logical T=6, L=1 -> body = [USR e], tail-ids = anchor(d)+new = [dhost-4, dhost-5]
+    full.push(USR("e"));
+    const r3 = runDeltaTurn(session, { [PF_COUNT_HEADER]: "6", [PF_DELTA_HEADER]: "1", ...TAIL(dTail(6).slice(4)) }, full.slice(5));
+    assert.equal(r3.headers[PF_SEQ_HEADER], "6");
+    recordEgTurn(stub, full); // 6 cores recorded
+    oracle = openaiToCore(JSON.parse(bodyOf(full)));
+    assert.deepEqual(r3.verdict.hit!.view.map((m) => String((m as { text?: unknown }).text ?? "")), oracle.msgs.map((m) => m.text), "texts after second slice");
+    for (let i = 0; i < oracle.msgs.length; i++) {
+        assert.equal(r3.verdict.hit!.view[i]!.id, oracle.msgs[i]!.id, `id @${i} (t3)`);
+        assert.equal((r3.verdict.hit!.view[i]! as { wireIndex?: number }).wireIndex, (oracle.msgs[i]! as { wireIndex?: number }).wireIndex, `wireIndex @${i} (t3)`);
+    }
+    // t4: a delta turn must NOT disturb the full lane — a full-form turn right
+    // after a delta hit still hits against the delta-advanced seed.
+    full.push(ASST("f"));
+    const t4 = runTurn(session, { [PF_COUNT_HEADER]: "6", ...TAIL(dTail(7).slice(5)) }, bodyOf(full));
+    assert.equal(t4.out.decision, "hit", LOGS.slice(-6).join("\n"));
+    assert.ok(t4.out.hit);
+    delete process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND;
+    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    _resetStoreForTest();
+});
+
+test("delta arm: every unsatisfiable claim re-anchors (both directions, #3617)", () => {
+    makeStubStore();
+    process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "1";
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1"; // the delta arm is eg-on-scoped (#7875 point 1)
+    const session = freshSession("pf-delta-reanchor");
+    const stub = makeStubStore();
+    const full: unknown[] = [SYS("s"), USR("a"), USR("b")];
+    runTurn(session, {}, bodyOf(full)); // seed stampT=3 (no pf headers — field)
+    recordEgTurn(stub, full); // 3 cores recorded — the delta arm's prefix source
+    full.push(USR("c"), ASST("d")); // logical T=5, L=2 -> body = [USR c, ASST d]
+    const deltaBody = JSON.stringify({ model: "m1", stream: false, messages: full.slice(3) });
+    const delta = { [PF_DELTA_HEADER]: "1", [PF_COUNT_HEADER]: "5", ...TAIL(dTail(5).slice(2)) } as Record<string, string>;
+    const ev = (h: Record<string, string>, bodyText = deltaBody) =>
+        evaluateDeltaResend(JSON.parse(bodyText) as Parameters<typeof evaluateDeltaResend>[0], bodyText, headersOf(h), session, { pluginMode: true, titleGen: false, model: JSON.parse(bodyText).model as string }, log);
+
+    // negative: no header = not a delta request (full lane owns it)
+    assert.equal(ev({}), null);
+    // bad header value
+    assert.deepEqual(ev({ [PF_DELTA_HEADER]: "0", [PF_COUNT_HEADER]: "5" }), { reanchor: "delta-bad-value" });
+    // wrong model for the seed
+    assert.deepEqual(ev(delta, JSON.stringify({ model: "OTHER", stream: false, messages: full.slice(3) })), { reanchor: "model" });
+    // missing count
+    assert.deepEqual(ev({ [PF_DELTA_HEADER]: "1" }), { reanchor: "no-count" });
+    // behind the stamp (client desynced backwards: L = T - stampT <= 0)
+    assert.deepEqual(ev({ ...delta, [PF_COUNT_HEADER]: "3" }), { reanchor: "behind" });
+    // window above the bound
+    assert.deepEqual(ev({ ...delta, [PF_COUNT_HEADER]: String(3 + 2048 + 1) }), { reanchor: "window-too-large" });
+    // body length does not match L
+    assert.deepEqual(ev(delta, JSON.stringify({ model: "m1", stream: false, messages: [USR("c")] })), { reanchor: "body-length" });
+    // messages not an array
+    assert.deepEqual(ev(delta, JSON.stringify({ model: "m1", stream: false, messages: "oops" })), { reanchor: "body-length" });
+    // tail-ids absent / wrong width / garbage
+    assert.deepEqual(ev({ [PF_DELTA_HEADER]: "1", [PF_COUNT_HEADER]: "5" }), { reanchor: "tail-ids-shape" });
+    assert.deepEqual(ev({ ...delta, ...TAIL(["x", "y"]) }), { reanchor: "tail-ids-shape" });
+    assert.deepEqual(ev({ ...delta, [PF_TAIL_IDS_HEADER]: "a,b%2Cc%%" }), { reanchor: "tail-ids-shape" });
+    // a system element riding the new slice (pre-chain: stamp still 3)
+    assert.deepEqual(ev(delta, JSON.stringify({ model: "m1", stream: false, messages: [SYS("intruder"), ASST("d")] })), { reanchor: "window-system-head" });
+    // anchor continuity: after a delta hit stamps a list, the NEXT list must
+    // open with its last id — wrong head re-anchors (both directions #3617)
+    const rChain = runDeltaTurn(session, { ...delta }, full.slice(3));
+    recordEgTurn(stub, full); // 5 cores recorded — the chained claim's prefix source
+    void rChain; // stamps lastTailIds = dhost-2..4, next anchor must be dhost-4
+    full.push(USR("e")); // T=6, L=1
+    const delta2 = { [PF_DELTA_HEADER]: "1", [PF_COUNT_HEADER]: "6", ...TAIL(dTail(6).slice(4)) } as Record<string, string>;
+    const ev2 = (h: Record<string, string>) =>
+        evaluateDeltaResend({ model: "m1", stream: false, messages: [USR("e")] } as Parameters<typeof evaluateDeltaResend>[0], JSON.stringify({ model: "m1", stream: false, messages: [USR("e")] }), headersOf(h), session, { pluginMode: true, titleGen: false, model: "m1" }, log);
+    assert.deepEqual(ev2({ ...delta2, ...TAIL(["WRONG", "dhost-5"]) }), { reanchor: "tail-ids-prev" });
+    assert.ok("hit" in (ev2(delta2) as object), "chained head dhost-4 must pass");
+    // unseeded session: a fresh id can never delta
+    const cold = freshSession("pf-delta-cold");
+    assert.deepEqual(evaluateDeltaResend(JSON.parse(deltaBody) as Parameters<typeof evaluateDeltaResend>[0], deltaBody, headersOf(delta), cold, { pluginMode: true, titleGen: false, model: "m1" }, log), { reanchor: "unseeded" });
+    // rollout off = the rollback kill switch (LAST: it mutes every gate below it)
+    process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "0";
+    assert.deepEqual(ev(delta), { reanchor: "rollout-off" });
+    delete process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND;
+    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    _resetStoreForTest();
+});
+
+// #7884 (the reported bug): the delta arm's prefix used to ride the
+// in-memory seed (WeakMap) — a proxy restart emptied it, and every delta
+// turn 400-reanchored ("unseeded") with the 400 preceding the pipeline, so
+// the egress flow's op_seq never advanced: a 100%-reproducible frozen flow.
+// The prefix now rides the durable plane (egress live view + the pf:state
+// ext), and a restarted proxy serves the delta turn from the flow.
+
+test("#7884: a restarted proxy serves the delta turn from the durable plane (no unseeded 400, no frozen flow)", () => {
+    makeStubStore();
+    process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "1";
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+    const stub = makeStubStore();
+    const session = freshSession("pf-delta-restart");
+    const full: unknown[] = [SYS("s"), USR("a"), USR("b")];
+    const t1 = runTurn(session, {}, bodyOf(full));
+    assert.equal(t1.out.decision, "no-stamp");
+    recordEgTurn(stub, full);
+    full.push(USR("c"), ASST("d"));
+    const r2 = runDeltaTurn(session, { [PF_COUNT_HEADER]: "5", [PF_DELTA_HEADER]: "1", ...TAIL(dTail(5).slice(2)) }, full.slice(3));
+    assert.equal(r2.headers[PF_SEQ_HEADER], "5");
+    recordEgTurn(stub, full);
+    // --- RESTART: a fresh Session object (the seed WeakMap is empty in the
+    // new process), the same store — the pf:state ext + egress flow survive.
+    const restarted = freshSession("pf-delta-restart");
+    full.push(USR("e"));
+    const r3 = runDeltaTurn(restarted, { [PF_COUNT_HEADER]: "6", [PF_DELTA_HEADER]: "1", ...TAIL(dTail(6).slice(4)) }, full.slice(5));
+    assert.equal(r3.headers[PF_SEQ_HEADER], "6");
+    const oracle = openaiToCore(JSON.parse(bodyOf(full)));
+    assert.deepEqual(r3.verdict.hit!.view.map((m) => String((m as { text?: unknown }).text ?? "")), oracle.msgs.map((m) => m.text), "texts after restart");
+    for (let i = 0; i < oracle.msgs.length; i++) {
+        assert.equal(r3.verdict.hit!.view[i]!.id, oracle.msgs[i]!.id, `id @${i} (restart)`);
+        assert.equal((r3.verdict.hit!.view[i]! as { wireIndex?: number }).wireIndex, (oracle.msgs[i]! as { wireIndex?: number }).wireIndex, `wireIndex @${i} (restart)`);
+    }
+    assert.equal(r3.verdict.hit!.systemText, oracle.systemText);
+    // tail-id continuity rode the stamp too: a wrong anchor still re-anchors
+    // after the restart (continuity is live, not reset by the restart).
+    full.push(ASST("f"));
+    const bad = evaluateDeltaResend(JSON.parse(bodyOf(full.slice(6))) as Parameters<typeof evaluateDeltaResend>[0], bodyOf(full.slice(6)), headersOf({ [PF_COUNT_HEADER]: "7", [PF_DELTA_HEADER]: "1", ...TAIL(["WRONG", "dhost-6"]) }), restarted, { pluginMode: true, titleGen: false, model: "m1" }, log);
+    assert.deepEqual(bad, { reanchor: "tail-ids-prev" });
+    // and the honest chain still hits — the flow advanced past the restart.
+    const r4 = runDeltaTurn(restarted, { [PF_COUNT_HEADER]: "7", [PF_DELTA_HEADER]: "1", ...TAIL(dTail(7).slice(5)) }, full.slice(6));
+    assert.equal(r4.headers[PF_SEQ_HEADER], "7");
+    delete process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND;
+    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    _resetStoreForTest();
+});
+
+test("#7884: degraded durable states re-anchor with honest reasons (the client self-heals in full form)", () => {
+    makeStubStore();
+    process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "1";
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+    const stub = makeStubStore();
+    const session = freshSession("pf-delta-degraded");
+    const full: unknown[] = [SYS("s"), USR("a"), USR("b")];
+    const t1 = runTurn(session, {}, bodyOf(full));
+    assert.equal(t1.out.decision, "no-stamp");
+    recordEgTurn(stub, full);
+    const deltaBody = bodyOf([USR("c"), ASST("d")]);
+    const ev = (): { reanchor?: string; hit?: unknown } | null =>
+        evaluateDeltaResend(JSON.parse(deltaBody) as Parameters<typeof evaluateDeltaResend>[0], deltaBody, headersOf({ [PF_COUNT_HEADER]: "5", [PF_DELTA_HEADER]: "1", ...TAIL(dTail(5).slice(2)) }), session, { pluginMode: true, titleGen: false, model: "m1" }, log) as { reanchor?: string } | null;
+    const sysRow: EgressViewRow = { num: 0, msgid: "egress-system", ref: "", tokens: 0, type: "system", bytes: "s" };
+    // stamped state but an empty conversation view (a reset / pre-eg flow)
+    stub.eg.view = [sysRow];
+    assert.deepEqual(ev(), { reanchor: "flow-empty" });
+    // a row that cannot be rebuilt byte-exactly (corruption reaches the floor)
+    stub.eg.view = [sysRow, { num: 1, msgid: "h_x", ref: "", tokens: 0, type: "text", bytes: "{not-json" }];
+    assert.deepEqual(ev(), { reanchor: "flow-corrupt" });
+    // a healthy view but no system row — the raw system (A) is unknowable
+    stub.eg.view = [{ num: 1, msgid: "h_x", ref: "", tokens: 0, type: "text", bytes: JSON.stringify({ id: "h_x", role: "user", text: "a" }) }];
+    stub.eg.sysIn = null;
+    assert.deepEqual(ev(), { reanchor: "system-unavailable" });
+    // and a store without the egress seam at all (an eg-off instance shape)
+    _setStoreForTest({
+        closeQuietly: (): void => {},
+        replicasAvailable: (): boolean => true,
+        getSessionExt: (sid: string, k: string): unknown => stub.ext.get(`${sid}\u0000${k}`),
+        setSessionExt: (sid: string, k: string, v: unknown): void => { void stub.ext.set(`${sid}\u0000${k}`, v); },
+    } as unknown as SessionStore);
+    assert.deepEqual(ev(), { reanchor: "egress-unavailable" });
+    delete process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND;
+    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    _resetStoreForTest();
+});
+
+test("#7884: the strip ledger and the multimodal taint bit survive a restart", () => {
+    makeStubStore();
+    process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "1";
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+    const PANEL = "[acp-cache] grand ledger: 4.8% hit rate over 9 requests\n[/acp-cache]";
+    // (a) ledger: a mid-body panel is stripped before the record — its
+    // counts ride the stamp (s), because the FLOW stores post-strip cores
+    // and the historical counts are not re-derivable from it.
+    const stub = makeStubStore();
+    const session = freshSession("pf-delta-ledger");
+    const full: unknown[] = [SYS("s"), USR(PANEL), USR("a")];
+    const t1 = runTurn(session, {}, bodyOf(full));
+    assert.equal(t1.out.decision, "no-stamp");
+    recordEgTurn(stub, full);
+    assert.ok(!JSON.stringify(stub.eg.view).includes("[acp-cache]"), "flow rows are post-strip");
+    const restart = freshSession("pf-delta-ledger");
+    full.push(USR("b"));
+    const r2 = runDeltaTurn(restart, { [PF_COUNT_HEADER]: "4", [PF_DELTA_HEADER]: "1", ...TAIL(dTail(4).slice(2)) }, full.slice(3));
+    const legacyCounts = stripRawStage(JSON.parse(bodyOf(full)), "openai"); // what a legacy full-body strip would have counted
+    assert.equal(r2.verdict.hit!.markerCounts.panels, legacyCounts.panels, "the historical panel count survived the restart (not zeroed)");
+    // (b) taint: a content-array image poisons the next delta (kernel
+    // positional rendering) — the bit rides the stamp (mm) and must still
+    // re-anchor the claim after the restart, exactly as the in-memory era did.
+    makeStubStore();
+    const session2 = freshSession("pf-delta-taint");
+    const IMG = { role: "user", content: [{ type: "text", text: "look" }, { type: "image_url", image_url: { url: "https://x/y.png" } }] };
+    const full2: unknown[] = [SYS("s"), USR("a"), IMG];
+    const t2 = runTurn(session2, {}, bodyOf(full2));
+    assert.equal(t2.out.decision, "no-stamp");
+    const deltaHdr = { [PF_COUNT_HEADER]: "4", [PF_DELTA_HEADER]: "1", ...TAIL(dTail(4).slice(2)) };
+    const delta2Body = bodyOf([USR("b")]);
+    const evTaint = (s: Session): { reanchor?: string; hit?: unknown } | null =>
+        evaluateDeltaResend(JSON.parse(delta2Body) as Parameters<typeof evaluateDeltaResend>[0], delta2Body, headersOf(deltaHdr), s, { pluginMode: true, titleGen: false, model: "m1" }, log) as { reanchor?: string } | null;
+    assert.deepEqual(evTaint(session2), { reanchor: "seeded-multimodal" }, "pre-restart taint");
+    assert.deepEqual(evTaint(freshSession("pf-delta-taint")), { reanchor: "seeded-multimodal" }, "the taint bit survived the restart (saved.mm)");
+    delete process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND;
+    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    _resetStoreForTest();
+});
+
+test("pinned seed (host msgids) + tail-only growth HITS; in-place head edit still drifts (#7345)", () => {
+    makeStubStore();
+    const session = freshSession("pf-pin");
+    // turn 1: seed. pluginLaneServerHistory pins the seed cores to host msgids
+    // (applyMsgIdPin), so the stash carries a DIFFERENT id namespace than the
+    // content-hash ids a fresh openaiToCore parse mints.
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("c"), USR("d")]);
+    const t1 = runPinnedTurn(session, {}, b1, ["host-a", "host-b", "host-c", "host-d"]);
+    assert.equal(t1.out.decision, "no-stamp", LOGS.join("\n"));
+    assert.equal(t1.out.measuredT, 5);
+    // turn 2: same prefix + one new tail element. The fresh head cores carry
+    // content-hash ids while the seed carries host msgids — the head check must
+    // ignore the id namespace and HIT on the unchanged content. Pre-fix this is
+    // a permanent head-prefix-drift miss (the field symptom: every turn of a
+    // 2x2 pinned session fell back to the full legacy parse).
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("c"), USR("d"), USR("e")]);
+    const t2 = runPinnedTurn(session, { [PF_COUNT_HEADER]: "5" }, b2, ["host-a", "host-b", "host-c", "host-d", "host-e"]);
+    assert.equal(t2.out.decision, "hit", LOGS.join("\n"));
+    assert.equal(t2.out.creditedMiss, false);
+    // the view must still be the legacy full-parse oracle on CONTENT. The
+    // prefix ids are host msgids by design in a pinned session, so assert
+    // text/role parity (not id parity — that is the namespace difference).
+    if (!t2.out.hit) throw new Error("expected hit");
+    const oracle2 = openaiToCore(JSON.parse(b2));
+    assert.equal(t2.out.hit.view.length, oracle2.msgs.length);
+    for (let i = 0; i < oracle2.msgs.length; i++) {
+        assert.equal(t2.out.hit.view[i]!.text, oracle2.msgs[i]!.text, `text @${i}`);
+        assert.equal(t2.out.hit.view[i]!.role, oracle2.msgs[i]!.role, `role @${i}`);
+    }
+    // turn 3: rewrite a HEAD element IN PLACE (prefix counts unchanged, system
+    // identical, stamp honest) + append one tail — the per-core content
+    // comparison (id excluded) must still catch the rewrite, so the fix does
+    // not mask a genuine in-place edit.
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b-EDITED"), ASST("c"), USR("d"), USR("e"), USR("f")]);
+    const t3 = runPinnedTurn(session, { [PF_COUNT_HEADER]: "6" }, b3, ["host-a", "host-b2", "host-c", "host-d", "host-e", "host-f"]);
+    assert.equal(t3.out.decision, "head-prefix-drift", LOGS.join("\n"));
+    assert.equal(t3.out.creditedMiss, false);
 });

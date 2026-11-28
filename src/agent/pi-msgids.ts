@@ -44,7 +44,11 @@
 // stripped with pi's own regex; cache_control decorations are ignored (the
 // wire may add them; they never change identity).
 
-type FpPart = { t: "text" | "img" | "tooluse" | "toolres" | "think" | "redact"; v: string };
+// #6525: the core-alignment proof below runs the KERNEL's own wire→core
+// projection (the same one the proxy runs before pinning), so a stamp that
+// passes it is guaranteed to be the exact array the server will validate.
+
+type FpPart = { t: "text" | "img" | "tooluse" | "toolres" | "think" | "redact" | "reason"; v: string };
 
 /** Mirror of pi's sanitizeSurrogates (utils/sanitize-unicode.js): strips
  *  unpaired surrogates so both sides of a comparison normalize identically. */
@@ -108,6 +112,12 @@ function assistantParts(content: unknown): FpPart[] | undefined {
             // The conversion keeps an empty-text thinking block iff a
             // signature exists — mirror that, else the block is dropped.
             if (block.thinking.trim().length > 0 || hasSignature) parts.push({ t: "think", v: stripLoneSurrogates(block.thinking) });
+        } else if (block.type === "reasoning") {
+            // pi's openai-family storage form ({"type":"reasoning","text":…}).
+            if (typeof block.text !== "string") return undefined;
+            // The conversion keeps a reasoning block iff it is non-empty —
+            // mirror that, else the block is dropped.
+            if (block.text.trim().length > 0) parts.push({ t: "think", v: stripLoneSurrogates(block.text) });
         } else if (block.type === "toolCall") {
             if (typeof block.id !== "string" || block.id.length === 0) return undefined;
             parts.push({ t: "tooluse", v: block.id });
@@ -325,13 +335,20 @@ export function lanePinnableContent(content: unknown): boolean {
 
 /** Fingerprint of one OUTGOING openai-chat wire element. undefined =
  *  unprovable (alien role/segment/shape) — the caller bails. */
-function oaiWireFingerprint(role: string, content: unknown, toolCalls: unknown, toolCallId: unknown): FpPart[] | undefined {
+function oaiWireFingerprint(role: string, content: unknown, toolCalls: unknown, toolCallId: unknown, reasoningContent: unknown): FpPart[] | undefined {
     if (role === "tool") {
         if (typeof toolCallId !== "string" || toolCallId.length === 0) return undefined;
         return [{ t: "toolres", v: toolCallId }];
     }
     if (role !== "user" && role !== "assistant") return undefined;
     const parts: FpPart[] = [];
+    // pi's openai-compat serializer puts the assistant's thinking into this
+    // field (joined with "\n"), ahead of the text — mirror that ordering.
+    // Empty string (the requiresReasoningContentOnAssistantMessages pad) is
+    // no content: the conversion drops it.
+    if (typeof reasoningContent === "string" && reasoningContent.trim().length > 0) {
+        parts.push({ t: "reason", v: stripLoneSurrogates(reasoningContent) });
+    }
     if (typeof content === "string") {
         const p = textPart(content);
         if (p !== undefined) parts.push(p);
@@ -369,17 +386,38 @@ function oaiWireFingerprint(role: string, content: unknown, toolCalls: unknown, 
 
 /** Can `eParts` (branch-entry fingerprint) lower onto `wParts` (openai-chat
  *  wire fingerprint)? Same documented transform set as partsLowerThrough,
- *  MINUS the thinking tolerances: this family bails up-front on any
- *  reasoning-family field, so a thinking entry part here is unprovable. */
+ *  MINUS the cross-model thinking→text tolerance (that shape bails), with
+ *  ONE accepted reasoning lowering: thinking entry parts onto a
+ *  `reasoning_content` field part — the conversion there is statically
+ *  provable (pi joins consecutive thinking blocks with "\n" into the one
+ *  field; any byte drift bails). `redact` stays unprovable. */
 function oaiPartsAlign(eParts: FpPart[], wParts: FpPart[]): boolean {
     let wi = 0;
     let placeholderOpen = false;
-    for (const ep of eParts) {
-        if (ep.t === "think" || ep.t === "redact") return false;
+    let i = 0;
+    while (i < eParts.length) {
+        const ep = eParts[i];
+        if (ep.t === "redact") return false;
         if (wi < wParts.length) {
             const wp = wParts[wi];
             if (ep.t === wp.t && ep.v === wp.v) {
                 wi++;
+                i++;
+                placeholderOpen = false;
+                continue;
+            }
+            if (ep.t === "think" && wp.t === "reason") {
+                // Consecutive thinking blocks join into the one field —
+                // consume the whole run and compare the joined bytes.
+                let j = i;
+                const vals: string[] = [ep.v];
+                while (j + 1 < eParts.length && eParts[j + 1].t === "think") {
+                    j++;
+                    vals.push(eParts[j].v);
+                }
+                if (vals.join("\n") !== wp.v) return false;
+                wi++;
+                i = j + 1;
                 placeholderOpen = false;
                 continue;
             }
@@ -388,20 +426,26 @@ function oaiPartsAlign(eParts: FpPart[], wParts: FpPart[]): boolean {
                     wi++;
                     placeholderOpen = true;
                 }
+                i++;
                 continue;
             }
             if (ep.t === "tooluse" && wp.t === "tooluse") {
                 wi++;
+                i++;
                 placeholderOpen = false;
                 continue;
             }
             if (ep.t === "toolres" && wp.t === "toolres") {
                 wi++;
+                i++;
                 placeholderOpen = false;
                 continue;
             }
         }
-        if (ep.t === "img" && placeholderOpen) continue;
+        if (ep.t === "img" && placeholderOpen) {
+            i++;
+            continue;
+        }
         return false;
     }
     return wi === wParts.length;
@@ -418,9 +462,13 @@ function oaiPartsAlign(eParts: FpPart[], wParts: FpPart[]): boolean {
  *     on its first system element, and a moved slot still breaks the anchor
  *     honestly (uncredited reseed, same as a real edit);
  *   - ANY non-leading system|developer element, or any reasoning-family
- *     field (`reasoning_content`/`thinking`/`redacted_thinking`/`function_call`)
- *     anywhere, bails the whole list — the conversion rules there are not
- *     statically provable, and an absent list costs one count-mode turn;
+ *     field (`thinking`/`redacted_thinking`/`function_call`) anywhere, bails
+ *     the whole list — the conversion rules there are not statically
+ *     provable, and an absent list costs one count-mode turn. The ONE
+ *     accepted reasoning field is `reasoning_content`: its entry-side source
+ *     (thinking blocks) and its wire bytes are both statically provable —
+ *     pi joins consecutive thinking blocks with "\n" into the single field,
+ *     so a drifted byte bails exactly like any other content drift;
  *   - everything else walks the SHARED entry iterator with the same
  *     order-preserving proof (never similarity, never position alone).
  * All-or-nothing: undefined ⇒ the caller sends nothing (cleared, never stale). */
@@ -440,14 +488,13 @@ export function laneMsgIdsForOpenAiWire(wire: unknown, branch: unknown): string[
         const el = els[i];
         if (el === null || typeof el !== "object") return undefined;
         if (
-            el.reasoning_content !== undefined ||
             el.thinking !== undefined ||
             el.redacted_thinking !== undefined ||
             el.function_call !== undefined
         ) return undefined;
         const role = typeof el.role === "string" ? el.role : "";
         if (role === "system" || role === "developer") return undefined; // non-leading: ambiguous placement
-        const wParts = oaiWireFingerprint(role, el.content, el.tool_calls, el.tool_call_id);
+        const wParts = oaiWireFingerprint(role, el.content, el.tool_calls, el.tool_call_id, el.reasoning_content);
         if (wParts === undefined) return undefined;
         if (wParts.every((p) => p.t === "toolres")) {
             for (let j = 0; j < wParts.length; j++) {
@@ -464,4 +511,157 @@ export function laneMsgIdsForOpenAiWire(wire: unknown, branch: unknown): string[
     }
     const leftover = take();
     return leftover === "exhausted" ? ids : undefined;
+}
+
+/** Fingerprint of a responses-wire USER content (string | input_text/
+ *  output_text / input_image parts). undefined = unprovable shape; [] = the
+ *  conversion provably drops the message. */
+function respUserParts(content: unknown): FpPart[] | undefined {
+    if (content === null || content === undefined) return [];
+    if (typeof content === "string") {
+        const p = textPart(content);
+        return p === undefined ? [] : [p];
+    }
+    if (!Array.isArray(content)) return undefined;
+    const parts: FpPart[] = [];
+    for (const raw of content) {
+        if (raw === null || typeof raw !== "object") return undefined;
+        const part = raw as Record<string, unknown>;
+        if (part.type === "input_text" || part.type === "output_text") {
+            const p = textPart(part.text);
+            if (p !== undefined) parts.push(p);
+        } else if (part.type === "input_image") {
+            if (typeof part.image_url !== "string") return undefined;
+            parts.push({ t: "img", v: part.image_url });
+        } else {
+            return undefined; // unknown part type — refuse
+        }
+    }
+    return parts;
+}
+
+/** Fingerprint of one OUTGOING responses-wire input item. undefined =
+ *  unprovable (opaque / reasoning / unknown item type — the caller bails).
+ *  system|developer message items are handled by the caller (leading run →
+ *  hoist slots, mid-history → bail) and return undefined here. */
+function respWireFingerprint(item: unknown): FpPart[] | undefined {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) return undefined;
+    const it = item as Record<string, unknown>;
+    switch (it.type) {
+        case "message": {
+            const msg = it as { role?: string; content?: unknown };
+            if (msg.role === "user") return respUserParts(msg.content);
+            if (msg.role === "assistant") {
+                // Text only — tool calls ride as SEPARATE function_call items,
+                // so an assistant message item that would split (text + a call)
+                // never appears here; anything but plain text is unprovable.
+                if (typeof msg.content === "string") {
+                    const p = textPart(msg.content);
+                    return p === undefined ? undefined : [p];
+                }
+                if (!Array.isArray(msg.content)) return undefined;
+                const parts: FpPart[] = [];
+                for (const raw of msg.content) {
+                    if (raw === null || typeof raw !== "object") return undefined;
+                    const part = raw as Record<string, unknown>;
+                    if (part.type === "input_text" || part.type === "output_text") {
+                        const p = textPart(part.text);
+                        if (p !== undefined) parts.push(p);
+                    } else {
+                        return undefined;
+                    }
+                }
+                return parts.length > 0 ? parts : undefined;
+            }
+            return undefined; // system / developer — caller's job
+        }
+        case "function_call":
+            if (typeof it.call_id !== "string" || it.call_id.length === 0) return undefined;
+            return [{ t: "tooluse", v: it.call_id }];
+        case "function_call_output":
+            if (typeof it.call_id !== "string" || it.call_id.length === 0) return undefined;
+            return [{ t: "toolres", v: it.call_id }];
+        default:
+            return undefined; // reasoning / additional_tools / item_reference / … — bail
+    }
+}
+
+/** Resolve the branch-entry id for EVERY item of a responses-wire outgoing
+ *  request — 1:1 with the INPUT-ITEM COUNT — or undefined when the alignment
+ *  cannot be proven end-to-end (all-or-nothing). The LEADING run of
+ *  system|developer message items takes position-pinned bili-ps-N slots (==
+ *  the kernel's hoisted head, responsesToCore sysDevHead). ANY non-leading
+ *  system|developer item, reasoning item, or opaque item bails: those
+ *  placements are not statically provable here, and an absent list costs one
+ *  count-mode turn. Every other item walks the SHARED entry iterator with
+ *  the same order-preserving proof (never similarity, never position alone).
+ *  All-or-nothing: undefined ⇒ the caller sends nothing. */
+export function laneMsgIdsForResponsesWire(input: unknown, branch: unknown): string[] | undefined {
+    if (!Array.isArray(input) || !Array.isArray(branch)) return undefined;
+    const items = input as Array<Record<string, unknown> | null>;
+    const isSysDev = (it: unknown): boolean => {
+        if (it === null || typeof it !== "object") return false;
+        const o = it as Record<string, unknown>;
+        return o.type === "message" && (o.role === "system" || o.role === "developer");
+    };
+    let lead = 0;
+    while (lead < items.length && isSysDev(items[lead])) lead += 1;
+    const take = makeEntryTake(branch);
+    const ids: string[] = [];
+    for (let i = 0; i < lead; i++) ids.push(`bili-ps-${i}`);
+    for (let i = lead; i < items.length; i++) {
+        if (isSysDev(items[i])) return undefined; // mid-history system/dev — ambiguous placement
+        const wParts = respWireFingerprint(items[i]);
+        if (wParts === undefined || wParts.length === 0) return undefined;
+        const n = take();
+        if (typeof n === "string") return undefined;
+        if (!partsLowerThrough(n.parts, wParts)) return undefined;
+        ids.push(n.id);
+    }
+    const leftover = take();
+    return leftover === "exhausted" ? ids : undefined;
+}
+
+// #6525 (send): full-resend msgid envelope alignment shared by every
+// client's stamp (dsh #6532 reuses this; pi/omp call it directly). Input =
+// the WALKER's wire-aligned output (openai/responses wires keep their
+// leading bili-ps-N hoist slots) + the wire elements. Returns the
+// PER-WIRE-ELEMENT id array (leading hoist slots dropped) — or undefined
+// when the pairing is not provable and the caller must send NO envelope
+// (byte-identical to before, never a misaligned array).
+//
+// #7439 follow-up (cross-lane switching): the array is ELEMENT-aligned, not
+// core-aligned. The kernel splits one wire element into N cores (agentic
+// text+tool_calls, multi-part user) — the old per-element core-count proof
+// bailed those turns to content-derived ids. The server now dual-modes:
+// all-1:1 (element count == core count) pins per-core exactly as before;
+// a split envelope (element count == wire-element groups) pins the group
+// head to the host id with deterministic derived sibling ids. The host
+// therefore stamps whenever the WALKER's element⇄host-message pairing holds
+// — no kernel re-conversion needed here (also one fewer converter run per
+// stamp). Duplicates are refused locally (validateMsgIds/validateWireMsgIds
+// would reject them server-side anyway).
+export function coreAlignEnvelopeIds(
+    wireAligned: string[],
+    wire: unknown,
+): string[] | undefined {
+    if (!Array.isArray(wire)) return undefined;
+    // The walk's contract is 1:1 with the element count — a mismatched pair
+    // here would silently misalign the envelope, so refuse it outright.
+    if (wireAligned.length !== wire.length) return undefined;
+    // OpenAI/Responses wire only: the leading system/developer run becomes synthetic
+    // bili-ps-N slots (== the kernel's hoisted prefix) — drop them; the
+    // envelope must be CORE-aligned (the server validates against the
+    // post-hoist core count). Anthropic has no hoist (system is a separate
+    // field), so lead stays 0 there. A bili-ps- slot anywhere PAST the lead
+    // run means a mid-body system the walker could not place → bail.
+    let lead = 0;
+    while (lead < wireAligned.length && (wireAligned[lead] as string).startsWith("bili-ps-")) lead += 1;
+    for (let i = lead; i < wireAligned.length; i++) {
+        if ((wireAligned[i] as string).startsWith("bili-ps-")) return undefined;
+    }
+    const elementAligned = wireAligned.slice(lead);
+    if (elementAligned.length === 0) return undefined;
+    if (new Set(elementAligned).size !== elementAligned.length) return undefined;
+    return elementAligned;
 }

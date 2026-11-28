@@ -1,6 +1,6 @@
 # billion-context
 
-<p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a> | <a href="./README.ja.md">日本語</a></p>
+<p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a> | <a href="./README.ja.md">日本語</a> | <a href="./README.ko.md">한국어</a></p>
 
 <p align="center"><strong>Context-compression plugin</strong> — <em>billion-context is all you need.</em></p>
 
@@ -502,7 +502,11 @@ bili --debug                 # verbose logging (also: set "debug": true in confi
 bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file
 bili -c dsh-test             # named config → ~/.config/billion-context/dsh-test.json (per-model files)
-bili update                  # check & install a newer version now (bypasses throttle)
+bili update [version] [--force]  # check & install a newer version now (bypasses throttle); with a version, installs exactly that published version; --force reinstalls even when already on it
+bili pin [duration]          # pin the current version (1h/12h/1d/7d/30d/forever): new versions are reported but not auto-installed (#6804)
+bili unpin                   # release the pin (same as: bili pin --clear)
+bili install <ref> [duration] [--force]  # build + install from a git ref (branch / tag / PR number / PR URL); auto-pinned (default 30d, #7806); --force rebuilds even when that ref is already installed
+bili install status          # show the installed version and its git source
 bili doctor --fix            # converge drifted dsh profile ledgers (manifest spec / lockfile record / bundle copy) to the on-disk version (#3496)
 bili --no-auto-update        # disable self-update for this run
 bili --auto-restart-on-update   # self-restart when a new version is installed (default off)
@@ -535,7 +539,7 @@ Client-facing connections close gracefully after the final response: when the pr
 
 The proxy checks npm on startup and every 3 minutes; a newer version is installed in place and a notice is logged — **restart `bili` to pick it up**, unless you enable opt-in self-restart (`--auto-restart-on-update` flag, env `ACP_AUTO_RESTART_ON_UPDATE=1`, or `"autoRestartOnUpdate": true` in config — default OFF): with zero in-flight requests it verifies the new install, stops accepting connections, drains, spawns a replacement on the same port, and exits once it accepts connections (clients reconnect automatically; session state survives on disk). Safety gates: zero in-flight through the drain window, an install sanity check before re-exec, and a 10-minute cooldown marker so a flapping version can never loop-restart; any failure resumes the original listener and falls back to the plain reminder.
 
-**Staggered rollout (#3619):** a discovered version is not applied immediately by automatic updates. Each instance draws ONE random moment inside a delay window (built-in default **15 min – 48 h**) and upgrades when it arrives; the drawn moment is persisted, so restarts never re-roll. Fleet upgrades therefore spread across the window instead of completing within minutes of a release, leaving time to catch a bad release mid-rollout (#3401/#3600/#3394). The window plus emergency controls live in a public policy file (`auto-update-policy.json` in this repo, fetched anonymously with ETag caching): `hold` freezes automatic upgrades fleet-wide, `blocked` skips listed versions, `pinned` sets an upgrade ceiling. Fail-open by design — an unreachable or malformed file simply falls back to local defaults, and the file can steer timing/skip/pin only, never what gets installed. Per-machine exits: manual `bili update` bypasses `hold`/stagger (still respects `blocked`/`pinned`), `"staggerMinDelayMs": 0` + `"staggerMaxDelayMs": 0` (or `BILI_UPDATE_STAGGER_MIN_MS`/`BILI_UPDATE_STAGGER_MAX_MS`) restore legacy immediate upgrades, and `ACP_AUTO_UPDATE=0` disables auto-updates entirely. Full format and semantics: [docs/configuration.md → `update`](docs/configuration.md#update).
+**Staggered rollout (#3619):** a discovered version is not applied immediately by automatic updates. Each instance draws ONE random moment inside a delay window (built-in default **15 min – 48 h**) and upgrades when it arrives; the drawn moment is persisted, so restarts never re-roll. Fleet upgrades therefore spread across the window instead of completing within minutes of a release, leaving time to catch a bad release mid-rollout (#3401/#3600/#3394). The window plus emergency controls live in a public policy file (`auto-update-policy.json` in this repo, fetched anonymously with ETag caching): `hold` freezes automatic upgrades fleet-wide, `blocked` skips listed versions, `pinned` sets an upgrade ceiling. Fail-open by design — an unreachable or malformed file simply falls back to local defaults, and the file can steer timing/skip/pin only, never what gets installed. Per-machine exits: manual `bili update` bypasses `hold`/stagger (still respects `blocked`/`pinned`), `"staggerMinDelayMs": 0` + `"staggerMaxDelayMs": 0` (or `BILI_UPDATE_STAGGER_MIN_MS`/`BILI_UPDATE_STAGGER_MAX_MS`) restore legacy immediate upgrades, and `ACP_AUTO_UPDATE=0` disables auto-updates entirely. Local version lock (#6804): `bili pin [duration]` (or the Updates tab in the panel) pins the installed version — checks keep reporting newer tag-channel versions but never install them until the pin expires or is released; a version installed from a prerelease/temp build (e.g. a CI `pr.N` tag) is likewise only reported — auto-upgrade follows the tag channel and only moves temp builds along it. Explicit installs (`bili update [version]`) and advisory repairs always take precedence. Full format and semantics: [docs/configuration.md → `update`](docs/configuration.md#update).
 
 While the running process is behind the on-disk install ("stale"), the web UI shows a banner (running vs installed version, auto-restart state) and `GET /__bili/status` returns `{version, diskVersion, stale, autoRestartOnUpdate, advisory, updatePolicy, inFlight}` for scripting (`advisory` is the active critical-defect entry or `null`, see below; `updatePolicy` reports the #3619 rollout state — policy source, `hold`/`pinned`/`blocked`, and the pending staggered upgrade with its due time). Disable permanently via `"autoUpdate": false` in config or `ACP_AUTO_UPDATE=0`.
 
@@ -700,7 +704,8 @@ nothing more (policy settled 2026-10-31, withdrawing the #5046/B-era
 refuse-to-start for exactly this shape). What genuinely remains hazardous is
 two installs walking the SAME *session* concurrently — that case alarms
 separately (split-brain contest, #3923). If you still want strictly separate
-histories and stores per install, give each its own `BILI_SESSIONS_DIR` (plus
+histories and stores per install, give each its own `BILI_SESSIONS_DIR` (or the
+`sessions.dir` config key when the install is driven by a config file; plus
 `BILI_CONFIG_FILE` when the config should differ too) through that install's
 launcher/profile environment — no global env changes needed. Once isolated,
 the `[instances]` notice drops off entirely. Note the distinction from the
@@ -729,9 +734,20 @@ bili sessions restore <id>       # bring an archived session back from the log l
 bili sessions foreign-blocks     # (#5312) list fold blocks whose covered messages never belonged to this transcript — dry-run; --apply reversibly archives them, --restore <sid>:<bid> brings one back
 bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
                                  # print the sweep plan (sessions past retention, zero-ref content rows, ~pages reclaimable), then run the same gc() the HTTP endpoint calls; --dry-run stops after the plan
+bili storage backup [--keep N]   # online-consistent index.db snapshot into <sessions>/backups/ (VACUUM INTO —
+                                 # never rewrites the source, no exclusive lock, safe while a proxy runs); the
+                                 # snapshot is quick_check-verified before it counts; keeps the newest N (default 3)
+bili storage repair [--from f.db] # with --from: verify the backup (quick_check + readable sessions), quarantine the
+                                 # broken index.db IN PLACE (index.db.corrupt-<ts>, evidence kept), copy the backup in
+                                 # (the backup itself stays untouched), verify again; without --from: salvage the
+                                 # corrupt file row-by-row into a freshly-migrated schema (bisects broken page ranges
+                                 # to single rows; a corrupt overflow cell nulls its own column, the rest of the row
+                                 # survives). Both swap paths refuse to run while another live process holds index.db.lock.
 ```
 
 `archive`/`restore`/`gc` require the unified store (`BILI_STORAGE_UNIFIED=sqlite|shadow|full` or `storage.unified` in the config file — the default is now pure sqlite) — legacy-only installs refuse with a hint. `--days` defaults to `storage.archiveAfterDays` (365). No scheduler: these run on demand. All commands accept `--json`.
+
+**Backup & repair (#7156, 2026-11-20 production incident).** A 3.2 GB index.db proved corrupt (foreign second writer, #7156) and the only recovery path was a hand-rolled `.recover`-equivalent plus manual file surgery — those two manual moves are now the `backup`/`repair` commands above. Operational discipline that keeps the incident from recurring: run `bili storage backup` on a schedule (the retention flag is the only state it keeps), and keep **exactly one** long-lived bili process per sessions dir — a second live writer is the corruption mode, and every storage command now detects a live foreign writer and refuses rather than contending.
 
 **Full vacuum is an offline operation on large databases (#4612).** `--vacuum full` (the default) rewrites the entire index.db under an exclusive write lock — O(db size), minutes to tens of minutes on multi-GB databases, with no intermediate progress (SQLite's VACUUM is atomic; it cannot be split). Running it while a proxy is serving from the same sessions dir starves that proxy's writes until its storage layer degrades, so `storage gc --vacuum full` **refuses to start when another live process holds the database** (`index.db.lock` pid discipline, #4175): the CLI exits 1 with an actionable message, the panel endpoint returns HTTP 409. Stop the other instance first (or wait for it to exit) and retry; for online-safe shrink use `--vacuum incremental`, which reclaims freed pages in short transactions without taking the exclusive lock. The zero-ref delete sweep itself is batched with per-batch progress output either way.
 

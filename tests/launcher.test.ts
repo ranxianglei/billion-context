@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import type { PathLike } from "node:fs";
 import { rmrf } from "./tmp-rm.ts";
+import { acquireDistFixtureLock } from "./dist-fixture-lock.ts";
 import { supportsFileSymlink } from "./platform-capabilities.ts";
 type SymlinkKind = "dir" | "file" | "junction";
 import net from "node:net";
@@ -469,6 +470,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
     // when running tests from a checkout without a prior build.
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const stubbed = !fs.existsSync(distAgent);
     if (stubbed) {
         fs.mkdirSync(path.dirname(distAgent), { recursive: true });
@@ -553,6 +555,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (stubbed) fs.rmSync(distAgent, { force: true });
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -585,6 +588,7 @@ test("runLaunch pi #5428: -s posture override reaches the child env over a hosti
     // when running tests from a checkout without a prior build.
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const stubbed = !fs.existsSync(distAgent);
     if (stubbed) {
         fs.mkdirSync(path.dirname(distAgent), { recursive: true });
@@ -646,6 +650,7 @@ test("runLaunch pi #5428: -s posture override reaches the child env over a hosti
         if (prevInline === undefined) delete process.env.BILI_PI_INLINE;
         else process.env.BILI_PI_INLINE = prevInline;
         if (stubbed) fs.rmSync(distAgent, { force: true });
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -664,6 +669,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
 
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const distBackup = `${distAgent}.bak-test`;
     const distExisted = fs.existsSync(distAgent);
     if (distExisted) fs.renameSync(distAgent, distBackup);
@@ -724,6 +730,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (distExisted) fs.renameSync(distBackup, distAgent);
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -873,6 +880,16 @@ test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real con
             String(childEnv!.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")),
             "combined CA bundle exported (#1375)",
         );
+        // #6862: hermes' own toolchain children (git/uv/npm update runners, shell tasks) inherit
+        // HTTPS_PROXY and must not ride the lane for code/dependency hosts — the default NO_PROXY
+        // keeps loopback + those hosts direct. Model hosts are not listed, so model traffic still
+        // rides the lane.
+        assert.ok(
+            (childEnv!.NO_PROXY ?? "").includes("github.com") && (childEnv!.NO_PROXY ?? "").includes("pypi.org")
+                && (childEnv!.NO_PROXY ?? "").includes("127.0.0.1"),
+            "#6862: default NO_PROXY keeps loopback + non-model code/dependency hosts direct",
+        );
+        assert.equal(childEnv!.no_proxy, childEnv!.NO_PROXY, "lowercase NO_PROXY variant matches");
         assert.equal(childEnv!.HERMES_HOME, hermesHome, "user-set real home survives to the child");
         assert.equal(fs.existsSync(`${hermesHome}-bili`), false, "no hermes overlay dir");
         const after = fs.statSync(path.join(hermesHome, "config.yaml"));
@@ -910,6 +927,7 @@ test("runLaunch pi #535: refuses launch when ONLY https (hand-wrapped) rewrites 
 
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const distBackup = `${distAgent}.bak-test`;
     const distExisted = fs.existsSync(distAgent);
     if (distExisted) fs.renameSync(distAgent, distBackup);
@@ -927,6 +945,7 @@ test("runLaunch pi #535: refuses launch when ONLY https (hand-wrapped) rewrites 
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (distExisted) fs.renameSync(distBackup, distAgent);
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -1616,31 +1635,38 @@ test("ensureProxyRunning: unarmed LANE'D listener is not attached by default —
 
 // #2877 flipped the default: an unarmed USER-ZONE daemon (manual `bili start`,
 // no lane) is no longer ridden by a LANEd launch — every agent converging on one
-// manual proxy was the bug (#2877). The hook now spawns its own session proxy.
-test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is NOT ridden by default — spawns its own (#2877)", async () => {
+// manual proxy was the bug (#2877). Pre-#7675 the hook then spawned its own
+// session proxy, which in the field laddered to base+1 behind the live manual
+// daemon — a silent second writer over the shared store (#7156 class). #7675
+// closes that drift: the lane launch REFUSES with an actionable error instead
+// (the manual daemon's own port zone, or stop it); the explicit legacy policy
+// (attachPolicy=global-fallback) still rides it (next row).
+test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is NOT ridden by default — the launch refuses instead of drifting a second writer (#2877 → #7675)", async () => {
     let spawnCalls = 0;
-    let childToken = "";
-    let spawned = false;
-    const handle = await ensureProxyRunning(
-        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
-        {
-            spawnImpl: (_cmd, _args, options) => {
-                spawned = true;
-                childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
-                spawnCalls++;
-                return makeFakeChild(42505);
+    let err: unknown;
+    try {
+        await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+            {
+                spawnImpl: (_cmd, _args, options) => {
+                    spawnCalls++;
+                    return makeFakeChild(42505);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-1", watchdog: { armed: false } }),
+                readInstanceFile: () => recordedInstance({ instanceId: "manual-1" }),
+                registerWatcher: async () => "ok",
+                sleep: () => new Promise((r) => setTimeout(r, 0)),
+                scriptPath: FP_SCRIPT,
             },
-            fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-1", watchdog: { armed: false } }),
-            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "manual-1" })),
-            registerWatcher: async () => "ok",
-            sleep: () => new Promise((r) => setTimeout(r, 0)),
-            scriptPath: FP_SCRIPT,
-        },
-    );
-    assert.equal(spawnCalls, 1, "the manual user-zone daemon is no longer ridden by default (#2877)");
-    assert.ok(handle.child);
-    assert.equal(handle.attached, undefined);
+        );
+    } catch (e) {
+        err = e;
+    }
+    assert.equal(spawnCalls, 0, "no second writer may drift behind a live manual daemon (#7675)");
+    assert.ok(err instanceof Error && err.message.includes("refusing to spawn a second writer"),
+        `actionable refusal: ${err instanceof Error ? err.message : String(err)}`);
+    assert.ok(err instanceof Error && err.message.includes("no lane declared"), "the refusal names the holder's origin");
 });
 
 // The pre-#2877 behavior (ride the user-maintained daemon) is preserved behind
@@ -3708,6 +3734,62 @@ test("ensureProxyRunning: #3521 inherited launcher channels never reach the spaw
             if (saved[k] === undefined) delete process.env[k];
             else process.env[k] = saved[k];
         }
+    }
+});
+
+test("ensureProxyRunning: a peer serving a DIFFERENT sessions dir is not rideable (#7861)", async () => {
+    const savedDir = process.env.BILI_SESSIONS_DIR;
+    const OURS = path.join(os.tmpdir(), `bili-7861-ours-${process.pid}`);
+    const THEIRS = path.join(os.tmpdir(), `bili-7861-theirs-${process.pid}`);
+    // Fixture pid for the fake spawned child — the post-spawn wait loop
+    // settles when the (injected) health report's pid equals the child pid;
+    // the spawned child's own record carries that same pid, exactly as a
+    // real child's handshake record would (a dead pid is fine here: the
+    // wait loop's stale check deliberately tolerates it).
+    const FAKE_CHILD_PID = 42781;
+    let liveInst: InstanceFile | undefined;
+    let spawns = 0;
+    const spawnImpl: SpawnFn = (_cmd, _args) => {
+        spawns++;
+        liveInst = recordedInstance({ pid: FAKE_CHILD_PID, sessionsDir: OURS });
+        return makeFakeChild(FAKE_CHILD_PID);
+    };
+    const deps = {
+        spawnImpl,
+        fetchImpl: async () => ({ ok: true }),
+        fetchHealthInfo: async () => ({ ok: true, instanceId: liveInst?.instanceId ?? "inst-1", pid: liveInst?.pid, watchdog: { armed: true } }),
+        readInstanceFile: () => liveInst,
+        sleep: () => new Promise<void>((r) => setTimeout(r, 0)),
+        scriptPath: FP_SCRIPT,
+    };
+    try {
+        process.env.BILI_SESSIONS_DIR = OURS;
+        await ensureProxyRunning({ host: "127.0.0.1", port: 8787, passthrough: false, debug: false }, deps);
+        assert.equal(spawns, 1, "first launch spawns");
+
+        // The repro: a same-build peer serving a DIFFERENT store (plain
+        // `bili pi` default dir vs a `-c eg` proxy) must not be ridden —
+        // riding would write this client's sessions into the other store.
+        liveInst = recordedInstance({ sessionsDir: THEIRS });
+        const h2 = await ensureProxyRunning({ host: "127.0.0.1", port: 8787, passthrough: false, debug: false }, deps);
+        assert.equal(spawns, 2, "sessions-dir-mismatch forces a fresh spawn (spawns=1)");
+        assert.notEqual(h2.attached, true, "the foreign-store peer is not attached");
+
+        // ...a peer serving the SAME store still attaches...
+        liveInst = recordedInstance({ sessionsDir: OURS });
+        const h3 = await ensureProxyRunning({ host: "127.0.0.1", port: 8787, passthrough: false, debug: false }, deps);
+        assert.equal(spawns, 2, "same sessions dir still attaches");
+        assert.equal(h3.attached, true);
+
+        // ...and a pre-#5046 peer that recorded no dir stays attachable
+        // (conservative: isolation cannot be claimed for old markers).
+        liveInst = recordedInstance();
+        const h4 = await ensureProxyRunning({ host: "127.0.0.1", port: 8787, passthrough: false, debug: false }, deps);
+        assert.equal(spawns, 2, "peer without a recorded dir still attaches");
+        assert.equal(h4.attached, true);
+    } finally {
+        if (savedDir === undefined) delete process.env.BILI_SESSIONS_DIR;
+        else process.env.BILI_SESSIONS_DIR = savedDir;
     }
 });
 
