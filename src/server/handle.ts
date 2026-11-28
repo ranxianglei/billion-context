@@ -785,7 +785,20 @@ async function handleRequest(
         if (protocol === "openai" && wireFamily === null && pfProto && bodyBuffer.length >= 1048576 && featureEnabled("pluginFullResendWatermark")) {
             const scanCounts = { total: 0 };
             const synth = synthesizeTopLevel(bodyText, scanCounts);
-            if (synth !== null) { parsed = synth; bodyParseDeferred = true; deferredMsgCount = scanCounts.total; }
+            // #7857 review: deferral must not break conversation identity. With
+            // NO client conversation header, conversationSignalOpenai falls to a
+            // first-user-message fingerprint — which the synthesized body
+            // (messages = null marker) cannot produce: it would yield
+            // hashId("default"), one shared key for every such client =
+            // cross-conversation compression state. A prompt_cache_key (scanned
+            // top-level) keeps identity safe via the pck promotion below; a
+            // header or a pck is required, otherwise fall back to the legacy
+            // full parse (byte-for-byte the pre-#7398 behavior).
+            const synthPck = synth !== null && typeof (synth as { prompt_cache_key?: unknown }).prompt_cache_key === "string"
+                ? (synth as { prompt_cache_key: string }).prompt_cache_key
+                : "";
+            const identitySafe = (clientConversationHeader(req.headers) ?? "").trim() !== "" || synthPck.trim() !== "";
+            if (synth !== null && identitySafe) { parsed = synth; bodyParseDeferred = true; deferredMsgCount = scanCounts.total; }
         }
         if (!bodyParseDeferred) {
             try {
