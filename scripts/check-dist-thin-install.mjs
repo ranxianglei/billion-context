@@ -61,6 +61,12 @@ try {
     const agentDir = path.join(pkgDir, "dist", "agent");
     const entries = readdirSync(agentDir).filter((f) => f.endsWith(".js") && !f.endsWith(".map")).sort();
     if (entries.length === 0) fail("no dist/agent/*.js entries found in the tarball");
+    // #4627: the compaction gate moved into its own nested package identity
+    // (dist/agent/dsh-gate/) — import it here too, or a broken gate bundle
+    // ships untested. Its absence in a post-fix tarball IS a build regression,
+    // so fail loudly rather than skip.
+    if (!existsSync(path.join(agentDir, "dsh-gate", "index.js"))) fail("dist/agent/dsh-gate/index.js missing from the tarball (#4627)");
+    entries.push("dsh-gate/index.js");
     const imported = [];
     const parsed = [];
     for (const name of entries) {
