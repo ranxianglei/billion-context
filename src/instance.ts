@@ -189,28 +189,46 @@ export function findSameLanePredecessor(
 /** #3801: the config-shape cells of a registered instance, normalized the
  *  way every consumer already normalizes them (discoverLiveInstances):
  *  absent fields ARE the empty value — a marker written before a cell
- *  existed records nothing, which means "none". */
+ *  existed records nothing, which means "none".
+ *
+ *  #7878: sessionsDir is the STORE identity — per-config `sessions.dir`
+ *  (#7804) lets two same-shape same-lane instances serve DIFFERENT stores.
+ *  A holder on a different store is a drift, not a twin: the newcomer must
+ *  ladder to a free port and coexist, not yield/adopt (adopting would write
+ *  this client's sessions into the other's directory — the crossover the
+ *  launcher-side check in #7861 closes on the attach path; this cell closes
+ *  it on every CHILD-side path: the EADDRINUSE twin verdict
+ *  (classifySameLanePeer), the pre-persistence twin adopts
+ *  (findVerifiedSameLaneTwin / findPresentUnverifiedSameLaneTwin) and the
+ *  newer-holder adoption (findNewerSameLaneHolder). Missing on either side
+ *  = pre-#5046 marker = "not proven apart" → conservative (twin), same rule
+ *  as sessionsDirsDiffer. */
 export interface InstanceShape {
     host: string;
     passthrough: boolean;
     mitmDomains: string[];
     modelWindows: Record<string, number>;
     modelMaxOutputs: Record<string, number>;
+    sessionsDir?: string;
 }
 
-export function entryShape(e: Pick<RegistryEntry, "host" | "passthrough" | "mitmDomains" | "modelWindows" | "modelMaxOutputs">): InstanceShape {
+export function entryShape(e: Pick<RegistryEntry, "host" | "passthrough" | "mitmDomains" | "modelWindows" | "modelMaxOutputs" | "sessionsDir">): InstanceShape {
     return {
         host: e.host ?? "",
         passthrough: Boolean(e.passthrough),
         mitmDomains: e.mitmDomains ?? [],
         modelWindows: e.modelWindows ?? {},
         modelMaxOutputs: e.modelMaxOutputs ?? {},
+        sessionsDir: e.sessionsDir,
     };
 }
 
 /** #3801: order-sensitive domain comparison (the launcher's want-side
  *  projection compares positionally too) plus exact map equality on the two
- *  per-model tables — the same cells instanceShapeMismatch judges on attach. */
+ *  per-model tables — the same cells instanceShapeMismatch judges on attach.
+ *  #7878: store identity joins the shape — both sides recording DIFFERENT
+ *  sessions directories is a mismatch (drift/coexist), either side unknown
+ *  is not (sessionsDirsDiffer's conservative rule). */
 export function sameInstanceShape(a: InstanceShape, b: InstanceShape): boolean {
     if (a.host !== b.host || a.passthrough !== b.passthrough) return false;
     if (a.mitmDomains.length !== b.mitmDomains.length || !a.mitmDomains.every((d, i) => d === b.mitmDomains[i])) return false;
@@ -220,6 +238,7 @@ export function sameInstanceShape(a: InstanceShape, b: InstanceShape): boolean {
     const ma = Object.keys(a.modelMaxOutputs);
     const mb = Object.keys(b.modelMaxOutputs);
     if (ma.length !== mb.length || !ma.every((k) => a.modelMaxOutputs[k] === b.modelMaxOutputs[k])) return false;
+    if (sessionsDirsDiffer(a.sessionsDir, b.sessionsDir)) return false;
     return true;
 }
 
