@@ -2669,7 +2669,7 @@ async function handleRequest(
         const imageRescaleArmed = imageRescaleEnabled()
             && !(protocol === "responses" && isCodexHost(req.headers))
             && ((opts.compress.injectTool && storeChannelOk) || pluginMode);
-        storeEffectiveImageRescale(session, imageRescaleArmed || undefined);
+        storeEffectiveImageRescale(session, imageRescaleArmed);
         // [#1336] no channel gating: search_context is already available on
         // whichever mode served this session and the re-rank is pure output-
         // side policy on its result — both proxy and plugin lanes apply it.

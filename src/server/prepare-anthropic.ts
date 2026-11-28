@@ -14,7 +14,7 @@ import { recordNudgeObservation } from "../context-analysis.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { emitNudgeInjected, nudgeDebugMeta } from "../nudge-debug.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
-import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { outboundBiliSurface, reconcileFoldCoverage, noteBiliToolSurface, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
@@ -631,6 +631,8 @@ export async function prepareAnthropic(
         if (injectTools) {
             toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL] : []), ...(blockOpsActive ? blockOps.anthropic : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
+        // #4789: observe the FINAL outbound array — in plugin lanes the proxy injects nothing, so host-declared presence must be read off the artifact itself.
+        noteBiliToolSurface(session, outboundBiliSurface(toolsOut, retrieveToolName(session)), { sessionId, log });
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
         // Injected in BOTH modes (#451): in plugin mode the agent supplies the
