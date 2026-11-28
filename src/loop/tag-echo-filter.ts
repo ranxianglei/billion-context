@@ -85,6 +85,37 @@ function buildAcplikeName(): string {
 export const ACP_NAME_ALT = `(?:${buildAcplikeName()})`;
 const NAME = ACP_NAME_ALT;
 
+// #5440: a model can echo a render tag as a tool-call NAME (not text): the
+// provider returns it as a regular tool_use/function_call block whose name is
+// `acp tokens=`, a bare `acp`, the full tag, or a #5175 drift name. The host
+// has no such tool → UNKNOWN_TOOL + an extra full-context step per occurrence.
+// The NAME channel needs its own vocabulary check: the prose strippers above
+// never see it (INVARIANT #1039 keeps tool payloads out of this file's
+// filters), so the pipe/loop consults this predicate by name before
+// forwarding/executing a call.
+//
+// Anchored + boundary-checked: a real tool name (`acp_status`, `bash`, …) never
+// matches — the boundary class after the acplike name excludes word chars, so
+// `acp_status` stops at `_`. The optional `\x3c/?` prefix covers the
+// full-tag-as-name shape. Case folding lives in NAME's letter classes (#1731).
+const RENDER_TAG_TOOL_NAME_RE = new RegExp(
+    "^\\s*(?:\\x3c/?\\s*)?" + NAME + "(?=[\\s=>\"'/<]|$)",
+);
+
+/** True when a tool-call name is a render-tag echo (#5440), not a real tool.
+ *  An empty name is NOT an echo here — the nameless-drop path (#1501) owns it. */
+export function isRenderTagToolName(name: string): boolean {
+    if (name === "") return false;
+    return RENDER_TAG_TOOL_NAME_RE.test(name);
+}
+
+/** The canned tool result the proxy feeds back when it answers an echoed
+ *  tool-call name internally (#5440): tells the model nothing was executed and
+ *  to continue, so the turn keeps its chance to go on without the host ever
+ *  seeing the bogus call. */
+export const ECHOED_TOOL_RESULT_TEXT =
+    "[billion-context] That tool-call name is a history annotation from earlier context, not a real tool — nothing was executed. Continue with your task.";
+
 // Opening-tag attrs carry NO length cap (#1731): [^<>] cannot cross an angle
 // bracket, so these matchers stay linear for arbitrarily long attr runs, and
 // a cap silently defined a bypass — a longer run escaped every open-tag

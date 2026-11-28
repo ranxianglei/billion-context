@@ -136,10 +136,10 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
     return async () => {
         if (opts.signal.aborted) return null;
         // A body whose final input item is a compaction trigger must never be
-        // re-issued: appending the nudge after it breaks the wire shape (#283:
-        // the trigger stays the last input item), and the trigger's terminal is
-        // decided by the compaction flow, not by an empty-turn retry. Parsed
-        // here, at retry time, so healthy turns pay nothing.
+        // re-issued: appending the nudge after it breaks the wire shape
+        // (#283: the trigger stays the last input item), and the trigger's
+        // terminal is decided by the compaction flow, not by a terminal retry.
+        // Parsed here, at retry time, so healthy turns pay nothing.
         if (opts.protocol === "responses") {
             try {
                 const parsed = JSON.parse(typeof opts.body === "string" ? opts.body : opts.body.toString("utf8")) as Record<string, unknown>;
@@ -148,7 +148,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
                     return null;
                 }
             } catch {
-                /* unparseable body: injectContinuationNudge below reports and skips */
+                /* unparseable body: the body builders below report and skip */
             }
         }
         const attemptNudge = nudges[attempt % nudges.length];
@@ -184,7 +184,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             if (throttleReject !== undefined) {
                 classificationReservation.release();
                 classificationReservation = undefined;
-                opts.log("info", `[${opts.label}] [plugin] degenerate-terminal retry answered locally by the 429 hold (#4204) — passing the empty turn through`);
+                opts.log("info", `[${opts.label}] [plugin] degenerate-terminal retry answered locally by the 429 hold (#4204) — passing the original turn through`);
                 return null;
             }
             const r = await fetchWithTimeout(
@@ -244,7 +244,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
                     // A discarded body has no consumer; do not wait for a tee sibling to cancel.
                     void r.response.body?.cancel().catch(() => undefined);
                 }
-                opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry rejected (HTTP ${r.response.status}); passing the empty turn through`);
+                opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry rejected (HTTP ${r.response.status}); passing the original turn through`);
                 return null;
             }
             noteUpstreamThrottleResolved(opts.upstreamUrl, opts.reqHeaders, r.response.status, Date.now(), requestModel, probeToken);
@@ -261,7 +261,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             settleProvisional?.();
             classificationReservation?.release();
             releaseUpstreamThrottleProbe(probeToken);
-            opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
+            opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the original turn through`);
             return null;
         }
     };
