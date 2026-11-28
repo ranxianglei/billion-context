@@ -630,16 +630,16 @@ export function egressPointFork(db: SqliteDatabase, fromSessionId: string, toSes
         }
         if (forkToNow) {
             db.prepare(
-                `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
-                 SELECT ?, op_seq, log_seq, row_type, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ?`,
+                `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at)
+                 SELECT ?, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ?`,
             ).run(toSessionId, fromSessionId);
             db.prepare(
                 `INSERT INTO egress_block_flow (session_id, op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at)
                  SELECT ?, op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at FROM egress_block_flow WHERE session_id = ?`,
             ).run(toSessionId, fromSessionId);
             db.prepare(
-                `INSERT INTO egress_state (session_id, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at)
-                 SELECT ?, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at FROM egress_state WHERE session_id = ?`,
+                `INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at)
+                 SELECT ?, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at FROM egress_state WHERE session_id = ?`,
             ).run(toSessionId, fromSessionId);
             db.prepare(
                 `INSERT INTO egress_block_state (session_id, block_id, pos, op_seq, flow_op_seq, payload, created_at)
@@ -649,8 +649,8 @@ export function egressPointFork(db: SqliteDatabase, fromSessionId: string, toSes
         }
         // True point fork: copy the FLOW tables (append-only, op_seq <= wm).
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
-             SELECT ?, op_seq, log_seq, row_type, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ? AND op_seq <= ?`,
+            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at)
+             SELECT ?, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ? AND op_seq <= ?`,
         ).run(toSessionId, fromSessionId, wm);
         // Block rows align on the FLOW clock via their pointer column
         // (dual clocks: their own op_seq is unrelated to wm).

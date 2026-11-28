@@ -7,22 +7,35 @@
  * alphabet is I/U/D; the B base row never existed in the ruling and is
  * removed everywhere: not written, not read, no letter, no DDL CHECK).
  *
- * THE ROW ALPHABET (7773 §2):
- *   I  insert          msgid required  {"after": msgid|null, ref, tokens,
+ * THE ROW ALPHABET (7773 §2, addressing re-ruled 2026-11-27):
+ *   I  insert          msgid required  {"after": rid|null, ref, tokens,
  *                                       type, role?} + bytes column;
- *                                       log_seq column = the canonical
- *                                       number (one number per message,
- *                                       session-scoped, never re-issued)
+ *                                       rid column = the self-issued row id
+ *                                       (see ROW ID below); log_seq column =
+ *                                       the canonical number (one number
+ *                                       per message, session-scoped)
  *   U  update-after    msgid required  {"role"?} + bytes column (the NEW
  *                                       bytes; detected by byte inequality);
+ *                                       rid column = the target row's rid;
  *                                       an explicit num demotes/re-cites
  *                                       (num→0 = demote: the number is
  *                                       retired — permanently occupied by
  *                                       the flow's I row, never re-issued)
- *   D  delete-range    msgid NULL      {"start": msgid, "end": msgid}
+ *   D  delete-range    msgid NULL      {"start": rid, "end": rid}
  *                                       inclusive view-order range
  * There is no -U letter: the flow is never pruned, so a before-image is
- * always derivable from the msgid's earlier I/U rows.
+ * always derivable from the rid's earlier I/U rows.
+ *
+ * ROW ID (owner ruling 2026-11-27, follow-up to #7773): every log address
+ * is the self-issued `rid`, NEVER the msgid. The msgid is the CLIENT-facing
+ * identity (pin channel, kernel refs) — a content-hash mint on the proxy
+ * side, collidable in principle, and ambiguous across D/I churn. The rid is
+ * dense per session (1, 2, 3, …), issued at I from the flow's MAX(rid) + 1
+ * (the flow is append-only and physically never deleted, so the frontier
+ * always sees every rid ever issued), and NEVER re-issued: a D retires the
+ * rid forever, an I takes a fresh one. log_seq stays the kernel CITATION
+ * number (mNNNNN) — a separate axis that a fold summary may re-cite after
+ * retirement, which is exactly why it cannot serve as a row id.
  *
  * THE TWO TABLES (7773 §2):
  *   egress_flow  — the record: EVERY I/U/D op in order, append-only,
@@ -30,11 +43,13 @@
  *                  separate, deferred project (#7475 family) — nothing
  *                  here ever prunes it.
  *   egress_state — the MATERIALIZED live view: one row per live message
- *                  (PK (session_id, msgid)), pos = the row's position in
- *                  the current view. I inserts (suffix shifts), U edits in
- *                  place, D physically deletes the range (suffix shifts).
- *                  Serving reads are `ORDER BY pos` DIRECT reads — no
- *                  replay, no compaction, no base concept.
+ *                  (PK (session_id, rid); msgid kept as an indexed column —
+ *                  the client-facing identity, read by the pin channel),
+ *                  pos = the row's position in the current view. I inserts
+ *                  (suffix shifts), U edits in place, D physically deletes
+ *                  the range (suffix shifts). Serving reads are `ORDER BY
+ *                  pos` DIRECT reads — no replay, no compaction, no base
+ *                  concept.
  *
  * SINGLE SOURCE OF TRUTH: every turn's batch of I/U/D is appended to the
  * flow AND applied in place to the state, in ONE transaction — the two
@@ -68,7 +83,7 @@
  * row (a U edits the state in place), so the serving read checks
  * STRUCTURAL invariants, cheaply:
  *   - the state's pos sequence is dense 0..n-1;
- *   - every state row has its I twin in the flow (same msgid AND same
+ *   - every state row has its I twin in the flow (same rid AND same
  *     I-time log_seq);
  * a failed check = rebuild the state by replaying the flow's FULL
  * history (rare path — #7475 measured ~2.6s at 100k rows, one-shot,
@@ -79,12 +94,13 @@
  * the same ops in one transaction, and the state's row count is asserted
  * to equal the stamped view's length after the apply.
  *
- * Anchors are MSGIDS, never display positions — positions shift under
- * other ops, msgids do not (KDD#11: content may change, msgid does not).
- * Any anchor/endpoint violation, missing update target, or duplicate
- * msgid is a HARD ERROR (EgressStateCorruptError) — no fuzzy guessing,
- * same discipline as every other lane's "any doubt, fall back whole-
- * turn" rule.
+ * Anchors are RIDS, never display positions — positions shift under
+ * other ops, rids do not (self-issued, one-shot, never re-issued; the
+ * msgid is the client-facing identity and stays out of the log's
+ * addressing — owner ruling 2026-11-27). Any anchor/endpoint violation,
+ * missing update target, or duplicate rid is a HARD ERROR
+ * (EgressStateCorruptError) — no fuzzy guessing, same discipline as every
+ * other lane's "any doubt, fall back whole-turn" rule.
  */
 
 import type { SqliteDatabase } from "./driver.js";
@@ -128,6 +144,11 @@ export const EGRESS_SYSTEM_MSGID = "egress-system";
  * row it is the system text itself. The row is self-contained: replay +
  * serve need nothing beyond the flow table. */
 export interface EgressViewRow {
+    /** Self-issued row id (dense per session, one-shot, never re-issued —
+     *  the log's addressing key; 2026-11-27 owner ruling). Absent only on
+     *  client-built diff inputs (buildEgressViewRows) — diffEgressView
+     *  allocates it for every row that enters the log. */
+    rid?: number;
     /** Current canonical session-scoped message number (0 = not cited). */
     num: number;
     msgid: string;
@@ -151,6 +172,7 @@ interface FlowRow {
     op_seq: number;
     log_seq: number | null;
     row_type: EgressOpType;
+    rid: number | null;
     msgid: string | null;
     payload: string;
     bytes: string | null;
@@ -164,6 +186,7 @@ interface FlowRow {
  * outbound (A + server blocks); A's home inside the egress tables (the
  * 2026-11-25 renumber retires the session_ext inc:system copy). */
 interface StateRow {
+    rid: number;
     msgid: string;
     pos: number;
     log_seq: number;
@@ -177,9 +200,9 @@ interface StateRow {
     bytes: string;
 }
 
-const INSERT_FLOW = `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
-const INSERT_STATE_ROW = `INSERT INTO egress_state (session_id, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-const SELECT_STATE_ROWS = `SELECT msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes FROM egress_state WHERE session_id = ? ORDER BY pos ASC`;
+const INSERT_FLOW = `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+const INSERT_STATE_ROW = `INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+const SELECT_STATE_ROWS = `SELECT rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes FROM egress_state WHERE session_id = ? ORDER BY pos ASC`;
 
 /** The canonical message frontier: the highest number ever ISSUED
  * (retired messages included — I rows only advance it, D/U never do).
@@ -191,6 +214,19 @@ const SELECT_STATE_ROWS = `SELECT msgid, pos, log_seq, num, ref, tokens, type, r
 export function egressMessageHighWater(db: SqliteDatabase, sessionId: string): number {
     const row = db
         .prepare("SELECT COALESCE(MAX(log_seq), 0) AS n FROM egress_flow WHERE session_id = ?")
+        .get(sessionId) as { n: number } | undefined;
+    return Number(row?.n) || 0;
+}
+
+/** The row-id frontier (2026-11-27): the highest rid ever ISSUED (retired
+ * rows included — rids are never re-issued, and the flow is append-only /
+ * never deleted, so MAX(rid) always sees every rid the session has used).
+ * U rows carry their target's rid (never a new one), D rows carry NULL, so
+ * the plain MAX over the table is the MAX over the I rows. diffEgressView
+ * allocates new rids strictly above it. */
+export function egressRowHighWater(db: SqliteDatabase, sessionId: string): number {
+    const row = db
+        .prepare("SELECT COALESCE(MAX(rid), 0) AS n FROM egress_flow WHERE session_id = ?")
         .get(sessionId) as { n: number } | undefined;
     return Number(row?.n) || 0;
 }
@@ -219,7 +255,13 @@ function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: 
 interface InsertOp {
     type: "I";
     msgid: string;
-    after: string | null;
+    /** The row's self-issued id — allocated by diffEgressView (dense, above
+     *  the flow's rid frontier), REQUIRED (replay/apply hard-fail without
+     *  it). 2026-11-27: the log's addressing key. */
+    rid: number;
+    /** Anchor: the rid of the preceding row of the new view (null = the
+     *  row goes to the FRONT — a replaced system prompt). */
+    after: number | null;
     ref: string;
     tokens: number;
     typeTag: string;
@@ -243,11 +285,13 @@ interface InsertOp {
 }
 interface DeleteOp {
     type: "D";
-    start: string;
-    end: string;
+    start: number;
+    end: number;
 }
 interface UpdateOp {
     type: "U";
+    /** The target row's self-issued id (2026-11-27: the addressing key). */
+    rid: number;
     msgid: string;
     bytes: string;
     role?: string;
@@ -279,7 +323,7 @@ function egressViewHighWater(view: EgressViewRow[]): number {
  * read from the flow, which includes numbers of rows a fold retired. */
 export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?: number, sessionId = "diff"): EgressViewRow[] {
     const view: EgressViewRow[] = prev.map((r) => ({ ...r }));
-    const idxOf = (msgid: string): number => view.findIndex((r) => r.msgid === msgid);
+    const idxOf = (rid: number): number => view.findIndex((r) => r.rid === rid);
     let num = startHigh ?? egressViewHighWater(view);
     // Renumber (2026-11-25) — citation rules:
     //  - the live set's numbers must stay UNIQUE; a cited number is
@@ -294,6 +338,10 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
     //    while the host's fold cell does — both land in one turn).
     const liveNums = new Set<number>();
     for (const r of view) if (r.num > 0) liveNums.add(r.num);
+    // Row ids (2026-11-27): unique among LIVE rows — a D retires its rids
+    // forever (the flow keeps them spent), an I reuses none of them.
+    const liveRids = new Set<number>();
+    for (const r of view) if (typeof r.rid === "number") liveRids.add(r.rid);
     let maxCited = 0;
     for (const op of ops) {
         if (op.type === "I" && op.msgid !== EGRESS_SYSTEM_MSGID && typeof op.num === "number" && op.num > 0) maxCited = Math.max(maxCited, op.num);
@@ -301,13 +349,14 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
     }
     for (const op of ops) {
         if (op.type === "I") {
-            if (idxOf(op.msgid) >= 0) throw new EgressStateCorruptError(sessionId, `duplicate msgid ${op.msgid}`);
+            if (!Number.isInteger(op.rid) || op.rid < 1) throw new EgressStateCorruptError(sessionId, `insert ${op.msgid} has no row id`);
+            if (liveRids.has(op.rid)) throw new EgressStateCorruptError(sessionId, `duplicate row id ${op.rid} (msgid ${op.msgid})`);
             // `after: null` = the first row of the new view → the front.
             // #7574: idxOf answers -1 for a missing anchor, so the old
             // `at < -1` test could never fire and a missing anchor inserted
             // the row at index 0 in silence.
             const at = op.after === null ? -1 : idxOf(op.after);
-            if (at === -1 && op.after !== null) throw new EgressStateCorruptError(sessionId, `insert anchor ${op.after} missing`);
+            if (at === -1 && op.after !== null) throw new EgressStateCorruptError(sessionId, `insert anchor rid ${op.after} missing`);
             const isSystem = op.msgid === EGRESS_SYSTEM_MSGID;
             let assign = 0;
             if (isSystem) {
@@ -326,25 +375,32 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
                     assign = num;
                 }
             }
-            const entry: EgressViewRow = { num: assign, msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, bytes: op.bytes };
+            liveRids.add(op.rid);
+            const entry: EgressViewRow = { rid: op.rid, num: assign, msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, bytes: op.bytes };
             if (op.role !== undefined) entry.role = op.role;
             if (op.ts !== undefined) entry.ts = op.ts;
             view.splice(at + 1, 0, entry);
         } else if (op.type === "D") {
             const s = idxOf(op.start);
             const e = idxOf(op.end);
-            if (s < 0) throw new EgressStateCorruptError(sessionId, `delete start ${op.start} missing`);
-            if (e < 0) throw new EgressStateCorruptError(sessionId, `delete end ${op.end} missing`);
+            if (s < 0) throw new EgressStateCorruptError(sessionId, `delete start rid ${op.start} missing`);
+            if (e < 0) throw new EgressStateCorruptError(sessionId, `delete end rid ${op.end} missing`);
             if (s > e) throw new EgressStateCorruptError(sessionId, "delete range inverted");
             for (let i = s; i <= e; i++) {
                 const r = view[i];
-                if (r !== undefined && r.num > 0) liveNums.delete(r.num);
+                if (r !== undefined) {
+                    if (r.num > 0) liveNums.delete(r.num);
+                    if (typeof r.rid === "number") liveRids.delete(r.rid);
+                }
             }
             view.splice(s, e - s + 1);
         } else {
-            const i = idxOf(op.msgid);
-            if (i < 0) throw new EgressStateCorruptError(sessionId, `update target ${op.msgid} missing`);
+            const i = idxOf(op.rid);
+            if (i < 0) throw new EgressStateCorruptError(sessionId, `update target rid ${op.rid} missing`);
             const row = view[i];
+            // Cross-check: the flow row's msgid column must name the same
+            // row the rid resolves to — a stale column is corruption.
+            if (row.msgid !== op.msgid) throw new EgressStateCorruptError(sessionId, `update rid ${op.rid} points at msgid ${row.msgid}, not ${op.msgid}`);
             if (typeof op.num === "number") {
                 if (row.num > 0) liveNums.delete(row.num);
                 if (op.num > 0) {
@@ -362,12 +418,20 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
 
 /** Deterministic diff between two consecutive views (owner design, 4 upper
  * cases: tail append / nudge appear+vanish / fold replace / content edit).
- * The diff keys on msgid + bytes; a spine row's effective num (0 = uncited)
- * is a third input that can flip it to a +U carrying `num` (see below).
+ * The diff keys on msgid OCCURRENCE + bytes; a spine row's effective num
+ * (0 = uncited) is a third input that can flip it to a +U carrying `num`
+ * (see below).
  *
- * Spine = a monotonically increasing subsequence of `next` whose msgids
- * appear in `prev` (greedy pointer scan, O(n+m); any monotone sub-spine
- * replays equivalently, the greedy one is what this implementation picks).
+ * Spine = a monotonically increasing subsequence of `next` matched to
+ * SPECIFIC prev occurrences (greedy pointer scan, O(n+m); any monotone
+ * sub-spine replays equivalently, the greedy one is what this implementation
+ * picks). Matching is OCCURRENCE-AWARE, not first-wins on msgid (#7851): a
+ * collision pair (two prev rows, same msgid, distinct rids) is addressed per
+ * occurrence — a next row prefers the occurrence whose bytes agree (the
+ * survivor keeps its own rid, a pure -D), else the first occurrence after
+ * the pointer (msgid-only, so a content edit still emits a U). No-collision
+ * views have one occurrence per msgid, so the match is identical to the old
+ * first-wins key there.
  * Spine rows with CHANGED BYTES (direct inequality — no hash) OR a changed
  * effective num (0 = uncited — a kernel protection row that lost or gained
  * its citation) emit +U (with `num` set on a num change, so the log follows
@@ -389,66 +453,115 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[], startHigh?:
  * spine every turn — so num tracking is OFF and the diff keys on msgid +
  * bytes only, as before.
  */
-export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[], trackNums = false): EgressOp[] {
-    const prevIdx = new Map<string, number>();
-    prev.forEach((r, i) => { if (!prevIdx.has(r.msgid)) prevIdx.set(r.msgid, i); });
-    const prevByMsg = new Map<string, EgressViewRow>();
-    prev.forEach((r) => { if (!prevByMsg.has(r.msgid)) prevByMsg.set(r.msgid, r); });
-    const spine = new Set<string>();
-    let p = -1;
-    for (const r of next) {
-        const i = prevIdx.get(r.msgid);
-        if (i !== undefined && i > p) {
-            spine.add(r.msgid);
-            p = i;
+export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[], trackNums = false, ridHighWater = 0): EgressOp[] {
+    // RID ALLOCATION (2026-11-27): every row that ENTERS the log gets a
+    // fresh rid — dense, strictly above max(the flow's rid frontier, the
+    // max rid of prev), in `next` order. `ridHighWater` is the FLOW's
+    // MAX(rid) (includes retired rows — rids are never re-issued); prev
+    // rows keep their rids. Defensive: a prev row missing a rid (test
+    // shims) gets one from the same counter before it can anchor anything.
+    let rid = Math.max(ridHighWater, 0);
+    for (const r of prev) {
+        if (typeof r.rid !== "number" || r.rid < 1) {
+            rid += 1;
+            r.rid = rid;
+        } else if (r.rid > rid) {
+            rid = r.rid;
         }
     }
+    // OCCURRENCE-AWARE SPINE (2026-11-27, #7851): a msgid can appear MORE
+    // THAN ONCE in prev when the host minted a collision pair (same msgid,
+    // distinct rids). Keying the spine on msgid (first-wins) made the two
+    // rows indistinguishable — deleting one of the pair left the survivor
+    // "spine" for BOTH, so the D-run never fired (ghost row) and the U wrote
+    // to the first row's rid with the second's bytes (content mismatch).
+    // Match each next row to a SPECIFIC prev occurrence instead: prefer the
+    // occurrence whose bytes agree (the survivor keeps its own rid — a pure
+    // -D, no spurious U), else the first occurrence after the pointer
+    // (msgid-only, so a content edit still emits a U). No-collision views
+    // have at most one occurrence per msgid, so this is a no-op there.
+    const prevOcc = new Map<string, number[]>();
+    prev.forEach((r, i) => {
+        const occs = prevOcc.get(r.msgid);
+        if (occs) occs.push(i);
+        else prevOcc.set(r.msgid, [i]);
+    });
+    const spinePrev = new Map<number, number>();
+    let p = -1;
+    for (let j = 0; j < next.length; j++) {
+        const r = next[j];
+        const occs = prevOcc.get(r.msgid);
+        if (!occs) continue;
+        let match = -1;
+        for (const i of occs) {
+            if (i > p && prev[i].bytes === r.bytes) { match = i; break; }
+        }
+        if (match === -1) {
+            for (const i of occs) {
+                if (i > p) { match = i; break; }
+            }
+        }
+        if (match !== -1) {
+            spinePrev.set(j, match);
+            p = match;
+        }
+    }
+    const matchedPrev = new Set<number>();
+    for (const i of spinePrev.values()) matchedPrev.add(i);
     const ops: EgressOp[] = [];
-    let runStart: string | null = null;
-    let runEnd: string | null = null;
-    for (const r of prev) {
-        if (!spine.has(r.msgid)) {
-            if (runStart === null) runStart = r.msgid;
-            runEnd = r.msgid;
+    let runStart: EgressViewRow | null = null;
+    let runEnd: EgressViewRow | null = null;
+    for (let i = 0; i < prev.length; i++) {
+        const r = prev[i];
+        if (!matchedPrev.has(i)) {
+            if (runStart === null) runStart = r;
+            runEnd = r;
         } else if (runStart !== null) {
-            ops.push({ type: "D", start: runStart, end: runEnd! });
+            ops.push({ type: "D", start: runStart.rid!, end: runEnd!.rid! });
             runStart = runEnd = null;
         }
     }
-    if (runStart !== null) ops.push({ type: "D", start: runStart, end: runEnd! });
-    for (const r of next) {
-        if (spine.has(r.msgid)) {
-            const old = prevByMsg.get(r.msgid)!;
+    if (runStart !== null) ops.push({ type: "D", start: runStart.rid!, end: runEnd!.rid! });
+    for (let j = 0; j < next.length; j++) {
+        const r = next[j];
+        const pi = spinePrev.get(j);
+        if (pi !== undefined) {
+            const old = prev[pi];
             const oldNum = trackNums && typeof old.num === "number" && old.num > 0 ? old.num : 0;
             const newNum = trackNums && typeof r.num === "number" && r.num > 0 ? r.num : 0;
             if (old.bytes !== r.bytes || oldNum !== newNum) {
-                const u: UpdateOp = { type: "U", msgid: r.msgid, bytes: r.bytes };
+                const u: UpdateOp = { type: "U", rid: old.rid!, msgid: r.msgid, bytes: r.bytes };
                 if (r.role !== undefined) u.role = r.role;
                 if (oldNum !== newNum) u.num = newNum;
                 ops.push(u);
             }
         }
     }
-    let last: string | null = null;
-    for (const r of next) {
-        if (!spine.has(r.msgid)) {
-            const ins: InsertOp = { type: "I", msgid: r.msgid, after: last, ref: r.ref, tokens: r.tokens, typeTag: r.type, bytes: r.bytes };
+    let last: number | null = null;
+    for (let j = 0; j < next.length; j++) {
+        const r = next[j];
+        const pi = spinePrev.get(j);
+        if (pi !== undefined) {
+            last = prev[pi].rid!;
+        } else {
+            rid += 1;
+            const ins: InsertOp = { type: "I", rid, msgid: r.msgid, after: last, ref: r.ref, tokens: r.tokens, typeTag: r.type, bytes: r.bytes };
             if (r.role !== undefined) ins.role = r.role;
             // Renumber (2026-11-25): a next-view row may already carry its
             // kernel citation number (recordEgressTurn stamps it from the
             // refs ledger); the I op preserves it.
             if (typeof r.num === "number" && r.num > 0) ins.num = r.num;
             ops.push(ins);
+            last = rid;
         }
-        last = r.msgid;
     }
     return ops;
 }
 
 /** Write one FLOW row (the record). The state table is applied separately
  * (materialized, 7773) — there is no twin-pair copy anymore. */
-function writeFlowRow(db: SqliteDatabase, sessionId: string, opSeq: number, logSeq: number | null, rowType: EgressOpType, msgid: string | null, payload: string, bytes: string | null, nowMs: number): void {
-    db.prepare(INSERT_FLOW).run(sessionId, opSeq, logSeq, rowType, msgid, payload, bytes, nowMs);
+function writeFlowRow(db: SqliteDatabase, sessionId: string, opSeq: number, logSeq: number | null, rowType: EgressOpType, rid: number | null, msgid: string | null, payload: string, bytes: string | null, nowMs: number): void {
+    db.prepare(INSERT_FLOW).run(sessionId, opSeq, logSeq, rowType, rid, msgid, payload, bytes, nowMs);
 }
 
 /** Write a batch of ops to the FLOW. Every op gets the next op_seq; each I
@@ -493,9 +606,11 @@ function writeFlowOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], fi
             if (op.sysIn !== undefined) payload["sysIn"] = op.sysIn;
             const citedLog = !isSystem && typeof op.num === "number" && op.num > 0 ? op.num : 0;
             const logSeq = isSystem ? 0 : (citedLog > 0 ? citedLog : num);
-            writeFlowRow(db, sessionId, opSeq, logSeq, "I", op.msgid, JSON.stringify(payload), op.bytes, nowMs);
+            writeFlowRow(db, sessionId, opSeq, logSeq, "I", op.rid, op.msgid, JSON.stringify(payload), op.bytes, nowMs);
         } else if (op.type === "D") {
-            writeFlowRow(db, sessionId, opSeq, null, "D", null, JSON.stringify({ start: op.start, end: op.end }), null, nowMs);
+            // 2026-11-27: the range endpoints are RIDS (self-issued, never
+            // re-issued) — the msgid never indexes the log again.
+            writeFlowRow(db, sessionId, opSeq, null, "D", null, null, JSON.stringify({ start: op.start, end: op.end }), null, nowMs);
         } else {
             const payload: Record<string, unknown> = { role: op.role };
             if (op.sysIn !== undefined) payload["sysIn"] = op.sysIn;
@@ -503,7 +618,7 @@ function writeFlowOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], fi
                 payload["num"] = op.num;
                 num = Math.max(num, op.num);
             }
-            writeFlowRow(db, sessionId, opSeq, null, "U", op.msgid, JSON.stringify(payload), op.bytes, nowMs);
+            writeFlowRow(db, sessionId, opSeq, null, "U", op.rid, op.msgid, JSON.stringify(payload), op.bytes, nowMs);
         }
     }
 }
@@ -519,12 +634,14 @@ function writeFlowOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], fi
  * serving read's twin check rejects) and throws. Runs inside the caller's
  * transaction. Returns the number of rows removed. */
 export function egressMaterializeState(db: SqliteDatabase, sessionId: string, view: EgressViewRow[], nowMs: number): number {
-    const anchors = new Map<string, number>();
+    const anchors = new Map<number, number>();
     for (const r of db
-        .prepare("SELECT msgid, log_seq FROM egress_flow WHERE session_id = ? AND row_type = 'I' ORDER BY op_seq ASC")
-        .all(sessionId) as { msgid: string; log_seq: number | null }[]) {
-        if (typeof r.log_seq !== "number") throw new EgressStateCorruptError(sessionId, `I row for ${r.msgid} has no log_seq`);
-        anchors.set(r.msgid, r.log_seq);
+        .prepare("SELECT rid, log_seq FROM egress_flow WHERE session_id = ? AND row_type = 'I' ORDER BY op_seq ASC")
+        .all(sessionId) as { rid: number | null; log_seq: number | null }[]) {
+        if (typeof r.rid !== "number") throw new EgressStateCorruptError(sessionId, `I row has no rid`);
+        if (typeof r.log_seq !== "number") throw new EgressStateCorruptError(sessionId, `I row rid ${r.rid} has no log_seq`);
+        if (anchors.has(r.rid)) throw new EgressStateCorruptError(sessionId, `duplicate I row for rid ${r.rid}`);
+        anchors.set(r.rid, r.log_seq);
     }
     const removed = db
         .prepare("DELETE FROM egress_state WHERE session_id = ?")
@@ -532,12 +649,15 @@ export function egressMaterializeState(db: SqliteDatabase, sessionId: string, vi
     for (let i = 0; i < view.length; i++) {
         const r = view[i];
         const isSystem = r.msgid === EGRESS_SYSTEM_MSGID;
-        const anchor = anchors.get(r.msgid);
+        if (typeof r.rid !== "number" || r.rid < 1) {
+            throw new EgressStateCorruptError(sessionId, `materialized entry ${r.msgid} has no row id`);
+        }
+        const anchor = anchors.get(r.rid);
         if (typeof r.num !== "number" || r.num < 0 || anchor === undefined || (isSystem ? r.num !== 0 || anchor !== 0 : anchor < 1)) {
             throw new EgressStateCorruptError(sessionId, `materialized entry ${r.msgid} has no canonical number`);
         }
         db.prepare(INSERT_STATE_ROW).run(
-            sessionId, r.msgid, i, anchor, r.num, r.ref, r.tokens, r.type,
+            sessionId, r.rid, r.msgid, i, anchor, r.num, r.ref, r.tokens, r.type,
             r.role ?? null, r.ts ?? null, null, r.bytes, nowMs,
         );
     }
@@ -567,7 +687,7 @@ export function egressStateView(db: SqliteDatabase, sessionId: string): EgressVi
         if (r.num < 0 || (r.msgid === EGRESS_SYSTEM_MSGID && r.num !== 0)) {
             throw new EgressStateCorruptError(sessionId, `state row ${r.msgid} has an invalid current number (num ${r.num})`);
         }
-        const row: EgressViewRow = { num: r.num, msgid: r.msgid, ref: r.ref, tokens: r.tokens, type: r.type, bytes: r.bytes };
+        const row: EgressViewRow = { rid: r.rid, num: r.num, msgid: r.msgid, ref: r.ref, tokens: r.tokens, type: r.type, bytes: r.bytes };
         if (r.role !== null) row.role = r.role;
         if (r.ts !== null) row.ts = r.ts;
         view.push(row);
@@ -577,7 +697,7 @@ export function egressStateView(db: SqliteDatabase, sessionId: string): EgressVi
 
 /** The STRUCTURAL integrity check (7773): state and flow are no longer
  * byte twins row-for-row (a U edits the state in place), so the check is
- * (a) every state row has its I twin in the flow — same msgid AND same
+ * (a) every state row has its I twin in the flow — same rid AND same
  * I-time log_seq; (b) no state row exists for a session whose flow has no
  * rows. Cheap (index join), runs inside the caller's read transaction.
  * Throws EgressStateCorruptError on any stray row. */
@@ -585,7 +705,7 @@ function assertStateTwinOfFlow(db: SqliteDatabase, sessionId: string): void {
     const stray = db
         .prepare(
             `SELECT COUNT(*) AS c FROM egress_state s
-               LEFT JOIN egress_flow f ON f.session_id = s.session_id AND f.msgid = s.msgid AND f.log_seq = s.log_seq AND f.row_type = 'I'
+               LEFT JOIN egress_flow f ON f.session_id = s.session_id AND f.rid = s.rid AND f.log_seq = s.log_seq AND f.row_type = 'I'
               WHERE s.session_id = ? AND f.op_seq IS NULL`,
         )
         .get(sessionId) as { c: number };
@@ -647,11 +767,11 @@ export function egressStateRead(db: SqliteDatabase, sessionId: string): EgressVi
     return rebuilt;
 }
 
-/** msgid → pos over the session's materialized rows (the batch apply's
+/** rid → pos over the session's materialized rows (the batch apply's
  * working index; a direct read replaces it after every transaction). */
-function posIndex(rows: StateRow[]): Map<string, number> {
-    const posOf = new Map<string, number>();
-    for (const r of rows) posOf.set(r.msgid, r.pos);
+function posIndex(rows: StateRow[]): Map<number, number> {
+    const posOf = new Map<number, number>();
+    for (const r of rows) posOf.set(r.rid, r.pos);
     return posOf;
 }
 
@@ -665,38 +785,38 @@ function posIndex(rows: StateRow[]): Map<string, number> {
  * the caller's write transaction. */
 function applyOpsToState(db: SqliteDatabase, sessionId: string, ops: EgressOp[], stamped: EgressViewRow[], nowMs: number): void {
     const posOf = posIndex(readStateRows(db, sessionId));
-    const numOf = new Map<string, number>();
-    for (const r of stamped) numOf.set(r.msgid, r.num);
+    const numOf = new Map<number, number>();
+    for (const r of stamped) if (typeof r.rid === "number") numOf.set(r.rid, r.num);
     for (const op of ops) {
         if (op.type === "I") {
-            if (posOf.has(op.msgid)) throw new EgressStateCorruptError(sessionId, `state apply: insert ${op.msgid} already present`);
+            if (posOf.has(op.rid)) throw new EgressStateCorruptError(sessionId, `state apply: insert rid ${op.rid} already present`);
             const at = op.after === null ? -1 : posOf.get(op.after);
-            if (at === undefined && op.after !== null) throw new EgressStateCorruptError(sessionId, `state apply: insert anchor ${op.after} missing`);
+            if (at === undefined && op.after !== null) throw new EgressStateCorruptError(sessionId, `state apply: insert anchor rid ${op.after} missing`);
             const pos = (at ?? -1) + 1;
-            const assign = numOf.get(op.msgid) ?? 0;
+            const assign = numOf.get(op.rid) ?? 0;
             db.prepare("UPDATE egress_state SET pos = pos + 1 WHERE session_id = ? AND pos >= ?").run(sessionId, pos);
             db.prepare(INSERT_STATE_ROW).run(
-                sessionId, op.msgid, pos, assign, assign, op.ref, op.tokens, op.typeTag,
+                sessionId, op.rid, op.msgid, pos, assign, assign, op.ref, op.tokens, op.typeTag,
                 op.role ?? null, op.ts ?? null, op.sysIn ?? null, op.bytes, nowMs,
             );
-            for (const [m, p] of posOf) if (p >= pos) posOf.set(m, p + 1);
-            posOf.set(op.msgid, pos);
+            for (const [k, p] of posOf) if (p >= pos) posOf.set(k, p + 1);
+            posOf.set(op.rid, pos);
         } else if (op.type === "D") {
             const s = posOf.get(op.start);
             const e = posOf.get(op.end);
-            if (s === undefined) throw new EgressStateCorruptError(sessionId, `state apply: delete start ${op.start} missing`);
-            if (e === undefined) throw new EgressStateCorruptError(sessionId, `state apply: delete end ${op.end} missing`);
+            if (s === undefined) throw new EgressStateCorruptError(sessionId, `state apply: delete start rid ${op.start} missing`);
+            if (e === undefined) throw new EgressStateCorruptError(sessionId, `state apply: delete end rid ${op.end} missing`);
             if (s > e) throw new EgressStateCorruptError(sessionId, "state apply: delete range inverted");
             const span = e - s + 1;
             db.prepare("DELETE FROM egress_state WHERE session_id = ? AND pos BETWEEN ? AND ?").run(sessionId, s, e);
             db.prepare("UPDATE egress_state SET pos = pos - ? WHERE session_id = ? AND pos > ?").run(span, sessionId, e);
-            for (const [m, p] of posOf) {
-                if (p >= s && p <= e) posOf.delete(m);
-                else if (p > e) posOf.set(m, p - span);
+            for (const [k, p] of posOf) {
+                if (p >= s && p <= e) posOf.delete(k);
+                else if (p > e) posOf.set(k, p - span);
             }
         } else {
-            const pos = posOf.get(op.msgid);
-            if (pos === undefined) throw new EgressStateCorruptError(sessionId, `state apply: update target ${op.msgid} missing`);
+            const pos = posOf.get(op.rid);
+            if (pos === undefined) throw new EgressStateCorruptError(sessionId, `state apply: update target rid ${op.rid} missing`);
             const sets = ["bytes = ?", "created_at = ?"];
             const params: unknown[] = [op.bytes, nowMs];
             if (op.role !== undefined) {
@@ -711,7 +831,7 @@ function applyOpsToState(db: SqliteDatabase, sessionId: string, ops: EgressOp[],
                 sets.push("num = ?");
                 params.push(op.num);
             }
-            db.prepare(`UPDATE egress_state SET ${sets.join(", ")} WHERE session_id = ? AND msgid = ?`).run(...params, sessionId, op.msgid);
+            db.prepare(`UPDATE egress_state SET ${sets.join(", ")} WHERE session_id = ? AND rid = ?`).run(...params, sessionId, op.rid);
         }
     }
 }
@@ -789,7 +909,7 @@ export function egressAppendTurn(
 export function egressStateAt(db: SqliteDatabase, sessionId: string, x: number): EgressViewRow[] {
     const rows = db
         .prepare(
-            "SELECT op_seq, log_seq, row_type, msgid, payload, bytes FROM egress_flow WHERE session_id = ? AND op_seq <= ? ORDER BY op_seq ASC",
+            "SELECT op_seq, log_seq, row_type, rid, msgid, payload, bytes FROM egress_flow WHERE session_id = ? AND op_seq <= ? ORDER BY op_seq ASC",
         )
         .all(sessionId, x) as unknown as FlowRow[];
     return applyOps(sessionId, rows);
@@ -815,12 +935,12 @@ export function egressFork(db: SqliteDatabase, fromSessionId: string, toSessionI
         db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(toSessionId);
         db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(toSessionId);
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
-             SELECT ?, op_seq, log_seq, row_type, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ?`,
+            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at)
+             SELECT ?, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ?`,
         ).run(toSessionId, fromSessionId);
         db.prepare(
-            `INSERT INTO egress_state (session_id, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at)
-             SELECT ?, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at FROM egress_state WHERE session_id = ?`,
+            `INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at)
+             SELECT ?, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at FROM egress_state WHERE session_id = ?`,
         ).run(toSessionId, fromSessionId);
         // The usage event stream rides with the whole copy (owner ruling:
         // one usage stream per session) — idempotent re-fork: replace.
@@ -842,20 +962,22 @@ function applyRow(sessionId: string, view: EgressViewRow[], row: FlowRow): Egres
         throw new EgressStateCorruptError(sessionId, `payload at op_seq=${row.op_seq} is not an object`);
     }
     const p: Record<string, unknown> = parsed;
-    const idxOf = (msgid: string): number => view.findIndex((e) => e.msgid === msgid);
+    const idxOf = (rid: number): number => view.findIndex((e) => e.rid === rid);
     if (row.row_type === "I") {
         if (typeof row.msgid !== "string") throw new EgressStateCorruptError(sessionId, `insert at op_seq=${row.op_seq} has no msgid`);
+        if (typeof row.rid !== "number" || row.rid < 1) throw new EgressStateCorruptError(sessionId, `insert at op_seq=${row.op_seq} has no row id`);
+        if (idxOf(row.rid) >= 0) throw new EgressStateCorruptError(sessionId, `duplicate row id ${row.rid} at op_seq=${row.op_seq}`);
         // Renumber (2026-11-25): 0 is the system row's number (outside the
         // citation space); every real message stores >= 1.
         const isSystem = row.msgid === EGRESS_SYSTEM_MSGID;
         if (typeof row.log_seq !== "number" || (isSystem ? row.log_seq !== 0 : row.log_seq < 1)) {
             throw new EgressStateCorruptError(sessionId, `insert at op_seq=${row.op_seq} has no canonical number`);
         }
-        if (idxOf(row.msgid) >= 0) throw new EgressStateCorruptError(sessionId, `duplicate msgid ${row.msgid} at op_seq=${row.op_seq}`);
         if (typeof p.ref !== "string" || typeof p.tokens !== "number" || typeof p.type !== "string" || typeof row.bytes !== "string") {
             throw new EgressStateCorruptError(sessionId, `insert at op_seq=${row.op_seq} has a malformed payload or missing bytes`);
         }
         const entry: EgressViewRow = {
+            rid: row.rid,
             num: row.log_seq,
             msgid: row.msgid,
             ref: p.ref as string,
@@ -867,26 +989,31 @@ function applyRow(sessionId: string, view: EgressViewRow[], row: FlowRow): Egres
         if (typeof p.ts === "number") entry.ts = p.ts;
         // `after: null` = the row goes to the FRONT — it was the first
         // row of the view the diff described (a replaced system prompt).
-        const at = p.after == null ? -1 : typeof p.after === "string" ? idxOf(p.after) : -2;
+        // 2026-11-27: the anchor is a rid (never a msgid).
+        const at = p.after == null ? -1 : typeof p.after === "number" ? idxOf(p.after) : -2;
         if (at === -2) throw new EgressStateCorruptError(sessionId, `insert at op_seq=${row.op_seq} has a malformed anchor`);
-        if (at < 0 && p.after != null) throw new EgressStateCorruptError(sessionId, `insert anchor ${String(p.after)} missing at op_seq=${row.op_seq}`);
+        if (at < 0 && p.after != null) throw new EgressStateCorruptError(sessionId, `insert anchor rid ${String(p.after)} missing at op_seq=${row.op_seq}`);
         view.splice(at + 1, 0, entry);
     } else if (row.row_type === "D") {
-        if (typeof p.start !== "string" || typeof p.end !== "string") {
+        if (typeof p.start !== "number" || typeof p.end !== "number") {
             throw new EgressStateCorruptError(sessionId, `delete at op_seq=${row.op_seq} has a malformed payload`);
         }
         const s = idxOf(p.start);
         const e = idxOf(p.end);
-        if (s < 0) throw new EgressStateCorruptError(sessionId, `delete start ${p.start} missing at op_seq=${row.op_seq}`);
-        if (e < 0) throw new EgressStateCorruptError(sessionId, `delete end ${p.end} missing at op_seq=${row.op_seq}`);
+        if (s < 0) throw new EgressStateCorruptError(sessionId, `delete start rid ${p.start} missing at op_seq=${row.op_seq}`);
+        if (e < 0) throw new EgressStateCorruptError(sessionId, `delete end rid ${p.end} missing at op_seq=${row.op_seq}`);
         if (s > e) throw new EgressStateCorruptError(sessionId, `delete range inverted (start after end) at op_seq=${row.op_seq}`);
         view.splice(s, e - s + 1);
     } else if (row.row_type === "U") {
+        if (typeof row.rid !== "number" || row.rid < 1) {
+            throw new EgressStateCorruptError(sessionId, `update at op_seq=${row.op_seq} has no row id`);
+        }
         if (typeof row.msgid !== "string" || typeof row.bytes !== "string") {
             throw new EgressStateCorruptError(sessionId, `update at op_seq=${row.op_seq} has a malformed payload or missing bytes`);
         }
-        const i = idxOf(row.msgid);
-        if (i < 0) throw new EgressStateCorruptError(sessionId, `update target ${row.msgid} missing at op_seq=${row.op_seq}`);
+        const i = idxOf(row.rid);
+        if (i < 0) throw new EgressStateCorruptError(sessionId, `update target rid ${row.rid} missing at op_seq=${row.op_seq}`);
+        if (view[i].msgid !== row.msgid) throw new EgressStateCorruptError(sessionId, `update at op_seq=${row.op_seq}: rid ${row.rid} points at msgid ${view[i].msgid}, not ${row.msgid}`);
         view[i] = {
             ...view[i],
             bytes: row.bytes,
@@ -931,7 +1058,7 @@ function applyOps(sessionId: string, rows: FlowRow[]): EgressViewRow[] {
 export function egressFlowWalkBack(db: SqliteDatabase, sessionId: string): { seq: number; view: EgressViewRow[] } | null {
     const rows = db
         .prepare(
-            "SELECT op_seq, log_seq, row_type, msgid, payload, bytes FROM egress_flow WHERE session_id = ? ORDER BY op_seq ASC",
+            "SELECT op_seq, log_seq, row_type, rid, msgid, payload, bytes FROM egress_flow WHERE session_id = ? ORDER BY op_seq ASC",
         )
         .all(sessionId) as unknown as FlowRow[];
     let view: EgressViewRow[] = [];

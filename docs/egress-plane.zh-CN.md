@@ -34,8 +34,8 @@
 
 | 表 | 主键 | 作用 | 关键列 |
 |---|---|---|---|
-| `egress_flow` | `(session_id, op_seq)` | **消息**操作日志。表内稠密（#7574 不变量）。**append-only：任何机制都不裁剪它**（#7439）；恢复 = 回退到最新健康点；任意点位可完整重建（`egressStateAt`）。 | `row_type` I/D/U（退役的 `B` base 行已不存在，#7773）· I 行：`msgid`、`log_seq`（规范消息号，永不复用）、`ref`、`tokens`、`bytes`、`role`、`type_tag` · D 行：区间 `(start_msgid, end_msgid)` + 终态全量快照 · U 行：`msgid` + 新字节（再引用时带 `num`） |
-| `egress_state` | `(session_id, msgid)` | **物化 live 视图**（7773）：每条**存活**消息一行，按 `pos` 排序。每次 append 在同一事务内把 op 应用到行上——`I` 插入（`pos` 后移）、`U` 就地改、`D` 物理删 + 前移。构造上以 live 视图大小为界；没有压实、没有 base 行、没有 op 镜像。 | `pos`、`log_seq`（I 孪生在 flow 里的编号，不可变——孪生锚点）、`num`（当前内核引用号；0 = 无引用/已退役）、`msgid`、`ref`、`tokens`、`type`、`role`、`ts`、`sys_in`、`bytes`、`created_at`。`snapPinLiveIds`/serving 读命中它。 |
+| `egress_flow` | `(session_id, op_seq)` | **消息**操作日志。表内稠密（#7574 不变量）。**append-only：任何机制都不裁剪它**（#7439）；恢复 = 回退到最新健康点；任意点位可完整重建（`egressStateAt`）。 | `row_type` I/D/U（退役的 `B` base 行已不存在，#7773）· I 行：`rid`（行 id，见下）、`msgid`、`log_seq`（规范消息号，永不复用）、`ref`、`tokens`、`bytes`、`role`、`type_tag` · D 行：区间 `(start, end)`（rid 值）——用行 id 寻址，**永不**用 msgid（2026-11-27 owner 裁定）+ 终态全量快照 · U 行：`rid`（目标行；该行的 msgid 保留为交叉校验）+ 新字节（再引用时带 `num`） |
+| `egress_state` | `(session_id, rid)` | **物化 live 视图**（7773）：每条**存活**消息一行，按 `pos` 排序。每次 append 在同一事务内把 op 应用到行上——`I` 插入（`pos` 后移）、`U` 就地改、`D` 物理删 + 前移。构造上以 live 视图大小为界；没有压实、没有 base 行、没有 op 镜像。msgid **可以**在 live 视图里重现（内容 hash 代理可以合法冲突、re-home 可以重现同一 msgid）；`rid` 不可以——所以主键与日志里的一切锚点都是 `rid`，`idx_egress_state_msgid`（session_id, msgid）只做 serving 查找。 | `rid`（稠密、每会话、永不重发——flow 永不删，所以 `MAX(rid)+1` 永远安全）、`pos`、`log_seq`（I 孪生在 flow 里的编号，不可变——孪生锚点）、`num`（当前内核引用号；0 = 无引用/已退役）、`msgid`、`ref`、`tokens`、`type`、`role`、`ts`、`sys_in`、`bytes`、`created_at`。`snapPinLiveIds`/serving 读命中它。 |
 | `egress_block_flow` | `(session_id, op_seq)` | 追加式**块**历史。**独立编号池**（双时钟）。 | `row_type` I/U/D（reap = 一条 `D` 行，带该块的**终态全量快照**，#7773；退役的 `B` 行已不存在）· 快照 payload `{tier, startMsgid, startSeq, endMsgid, endSeq, supersedesBlockId, active, reaped, one, full}` · **`flow_op_seq`** = 写入时刻 flow 的 `MAX(op_seq)`（跨表指针）· kstate 边车（残差字段清单） |
 | `egress_block_state` | `(session_id, block_id)` | **物化** live 块：每个未 reap 的块一行，按 `pos` 排序；reap 物理删行（flow 保留终态 `D` 快照）。 | 快照 payload + `pos` + `op_seq`/`flow_op_seq` |
 | `egress_usage` | `(session_id, op_seq)` | 追加式**缓存/用量事件流**（owner 裁定 2026-11-27）：把内存 cache ledger 的变更记成 op log，进程重启后可重建（§12）。第三个 egress 时钟，独立编号池。 | `row_type` M/S/F · `at`（epoch ms——点位 fork 水位）· `payload` = 有界 JSON（S：`recordCacheSample` 的**精确**参数 + model · F：原始 fold 行） |
@@ -44,7 +44,23 @@
 
 保留规则：**flow append-only、从不裁剪**（#7439——它的增长是已推迟的优化项 #7475，另行解决，绝不用裁剪解决）；**state 表 = 物化 live 视图**——它的大小就是 live 视图的大小，被覆盖行在折叠时物理删除（base 行/压实路径 `egressStateCompact`/`egressBlockCompact` 已退役，#7773）；block_flow 与消息 flow 一样 append-only；**egress_usage** 与它的兄弟们一样 append-only（只在会话删除 / fork 拷贝时清除，§12）。
 
-**结构不变量（7773 §6，每次写入后断言，两平面）。** ① flow 总行数只增（append-only）；② state 行数 == live 视图行数（物化，不是聚合、不是 op 镜像）；③ flow/state 里最大 value 大小 == 历史最大**单行**大小——针对退役 `B` 行全视图聚合 payload 的回归防线；④ 行字母表恰为 I/D/U（消息平面）与 I/U/D（块平面）——`B` 永不出现。套件：`tests/egress-invariants-7773.test.ts`。
+**结构不变量（7773 §6，每次写入后断言，两平面）。** ① flow 总行数只增（append-only）；② state 行数 == live 视图行数（物化，不是聚合、不是 op 镜像）；③ flow/state 里最大 value 大小 == 历史最大**单行**大小——针对退役 `B` 行全视图聚合 payload 的回归防线；④ 行字母表恰为 I/D/U（消息平面）与 I/U/D（块平面）——`B` 永不出现；⑤ **日志寻址一律用 `rid`**——稠密、永不重发的每会话行 id：`egress_flow` payload 里的 D 端点、U 目标、I 锚点都是 rid，永不 msgid（msgid 是内核身份，proxy 可能从内容 hash 映射而来、还可能合法重现；rid 是我们自己派的，不可能——owner 裁定 2026-11-27，#7773 后续）。套件：`tests/egress-invariants-7773.test.ts`。
+
+### id 总表——每个数字回答哪个问题
+
+五张表里出现五个数字，它们回答**五个不同的问题**，没有一个是冗余的：
+
+| id | 在哪 | 它回答的问题 | 可否复用 |
+|---|---|---|---|
+| `op_seq` | flow / block_flow / usage 主键 | 「**这张表的第 N 次写盘**」——物理日志游标；fork 与 point 水位骑在它上（或块平面用 `flow_op_seq` 指针挂到它上） | 单调，但指**事件**不指行：一行的生命（I→U→U→D）要占好几个 op_seq——行用它的 I 行 `rid` 寻址，不指望写在哪 |
+| `log_seq` | flow I 行 / state | 「**kernel 引用**这行用几号」——`mNNNNN` = m + log_seq，一个号不是两个（§10） | 可被重引：fold summary 合法接手退役槽位（demote → re-home，§10 规则 7）——正因如此它**不能**当行身份 |
+| `num` | state 行 + U payload | 该行**当前**的 kernel 引用号；`0` = 未被引用/已 demote | 跟着 kernel 事实走，+U num |
+| `pos` | state 表 | 「它在**当前 live 视图**里排第几」 | 瞬态，每次插入/删除都变 |
+| `rid` | flow I/U 行 + state 主键 | 「**哪一行**」——每个 op payload 的指针目标（D 端点、U 目标、I 锚点） | 会话内稠密（`MAX(rid)+1`），永不重发（flow 永不裁剪） |
+
+一句话：**log_seq/num 是引用号（允许重发），rid 是行身份（禁止复用），op_seq 是写盘计数，pos 是视图偏移。** #7849 之前的形状让 msgid 一个人同时扛引用身份和行身份两件事——内容 hash 派生的 msgid 可能合法重现，D 行寻址就是这么坏的（owner 裁定 2026-11-27）。
+
+fork **不需要任何 id 转换**：所有主键都是 `(session_id, rid)`，子会话的拷贝行由会话 id 隔离命名空间，op 永不跨会话——子的 rid 原样保留（血缘身份），从自己的 `MAX(rid)+1` 续编。**usage** 流（§12）根本不携带 rid（事件只引用 kernel 块 id 和时间戳），所以 fork 拷贝——整拷（to-now）或 `at <= W` 前缀（point）——就是纯行拷贝，重放重建 ledger，没有任何重映射。
 
 ## 4. 一轮的生命周期
 
@@ -99,7 +115,7 @@
 - **R3 latch 卡住**：`SELECT r3_latched_at FROM sessions WHERE session_id = ?`（旧二进制另查 `l1_world`）；清除**两个载体都清**。
 - **GC / 归档**：egress-on 会话**完全排除在按龄 GC 之外**，手动归档（`bili sessions archive`）**被拒绝**——归档格式尚未承载 op log（遗留项）。
 - **诊断**：`/__bili/status`；恢复事件（回退截断、降级轮）在代理日志里响。
-- **交接——毁库重建开发库（7773 §7，owner 执行）**：egress 表从未以旧形态随版本发布，所以**没有迁移**——持有 #7773 前旧 egress 表的开发库靠删库文件 + 重启重建：停掉 bili，删 `<sessions 目录>/index.db`、`index.db-wal`、`index.db-shm`（默认 sessions 目录：`~/.local/share/billion-context/sessions/`，即 `$XDG_DATA_HOME/billion-context/sessions/`），再启动 bili——`migrateSchema` 探针本来就会检测到旧形态（`op_seq` 列 / 缺 `pos` 列 / flow CHECK 含 `B`）并在首次打开时 drop 重建四张 egress 表；手动删除只是干净路径。旧库里 egress-on 会话历史按设计丢弃（仅开发数据——平面从未发给过用户）。
+- **交接——毁库重建开发库（7773 §7，owner 执行）**：egress 表从未以旧形态随版本发布，所以**没有迁移**——持有 #7773 前旧 egress 表的开发库靠删库文件 + 重启重建：停掉 bili，删 `<sessions 目录>/index.db`、`index.db-wal`、`index.db-shm`（默认 sessions 目录：`~/.local/share/billion-context/sessions/`，即 `$XDG_DATA_HOME/billion-context/sessions/`），再启动 bili——`migrateSchema` 探针本来就会检测到旧形态（`op_seq` 列 / 缺 `pos` 列 / flow CHECK 含 `B` / 缺 `rid` 列）并在首次打开时 drop 重建五张 egress 表；手动删除只是干净路径。旧库里 egress-on 会话历史按设计丢弃（仅开发数据——平面从未发给过用户）。
 
 ## 9. PR / 提案时间线
 
@@ -113,6 +129,7 @@
 | **#7659（本 PR，2026-11-24）** | 文档收尾：本文档；[deprecations.zh-CN.md](./deprecations.zh-CN.md)；KDD #24；图。egressPlane 默认按 owner 裁定保持 **0**——GA 翻转被提议后否决。 |
 | 讨论 [#7735](https://github.com/ranxianglei/billion-context/discussions/7735)（2026-11-25） | **扫尾**：arm 时身份行（§11）、7 表创建门、kv_store 256 字符策略 + 大 blob 退役、l1 死行清理、三个 flag 默认值修正回 0。 |
 | 讨论 [#7773](https://github.com/ranxianglei/billion-context/discussions/7773)（2026-11-26） | **形态再裁定**：两平面的 `B` base 行退役；state 表变为**物化 live 视图**（PK `(session_id, msgid)`、`pos` 序；D 物理删、折叠 O(尾长)）；恢复变为一趟全史 walk（`egressFlowWalkBack`）；点位 fork 重放物化到**任意**点位；每次写入后断言结构不变量（§3）。存量不迁移——表从未随版本发布，已有库把四张 egress 表 drop 重建（owner 操作手册：删 `index.db*` + 重启）。 |
+| Owner 裁定（2026-11-27，#7773 后续——实测 D 行审计） | **行寻址改用自派行 id（`rid`）**：日志 payload 里的 msgid 不是可靠地址——proxy 会把宿主 id 映射成内容 hash、客户端 id 可能冲突、折叠/re-home 之后同一个 msgid 分不清指哪一次。所有 egress 表改由稠密、append-only、永不重发的 `rid` 寻址：`egress_state` PK `(session_id, rid)`（+ `idx_egress_state_msgid` 供 serving 查找），`egress_flow` I 行带 `rid`、D/U payload 引用 rid。内核身份缝（prev↔next diff 匹配）继续用 msgid——只有**持久寻址层**变了。从未发布规则再次适用：旧形态探针（缺 `rid`）首开 drop 重建；开发库按 §7 手册毁库重建。 |
 
 **遗留**（已跟踪）：egressPlane 默认翻 100（等 owner 点头）；归档格式承载 op log；退役身份载体的物理 DROP 批次；按退役登记表删开关（硬编码开）。（point-reconstruction materializer 与 `egressBlockCompact` 生产调用方已被 #7773 退役——点位 fork 重放物化，块压实不复存在。）
 
@@ -136,7 +153,7 @@
 
 **身份行。** #7591 假设 egress-on 会话的 sessions 行在 arm turn 由首次 ingest 落地——不成立：`egressAuthority` latch 在该次保存**之前**就已打入（`src/server/egress-lane-io.ts`），第一次 ingest 就被 `egressProjectionFrozen` 冻结，行**永远落不了**。线上后果：重启后会话丢失（无行⇒不可 load、不可见、不进 GC 视野），metadata（pluginAgent/lastModel/title）只活在内存，血缘列永未持久化。修复：arm（latch 行）时 seam 调 `UnifiedStore.ensureEgressIdentity()`——一次性、幂等的 **13 列身份 upsert**（session_id、parent_session_id、protocol、label、title、host_title、namespace、origin、status、created_at、updated_at、meta_json、metadata_json；parent 用 `COALESCE(存量,新)` 与 ingest 同语义，第一个父赢；fork_point_seq 与全部 payload 列不碰）。每个 armed turn 都执行，删行下一轮自愈。同一事务里还删掉该会话的 **arm-turn 死 l1_world 占位行**（`armed_at IS NULL AND r3_latched_at IS NULL AND witness_probe <> ''`）——arm turn 的 stage-0 仍走 legacy（故意不预 latch），以前每个会话永久留一行死行。**该行的 metadata_json 只写身份键白名单**（`EGRESS_IDENTITY_METADATA_KEYS`：egressAuthority、pluginAgent、derivedFromSessionId、egressFlowUnreadable、lastModel），绝不写整个运行时袋：#6947 的 turn-final 回复暂存（handoffReply/handoffResponse，各最多 1.5MB 聊天内容）与每请求状态（effectiveConfig/cacheLedger/publicSnapshot*）只活在内存/op log（owner 2026-11-26：sessions 表放身份，不放聊天内容）。
 
-**表创建门。** eg 模式**新建**库只建：`sessions` + `session_ext` + `kv_store`（核心三件套）+ 四张 egress 表 = **7 张表**；12 张 legacy 表**不创建**（probe-first 收敛保证 flag 日后关闭时任何一次打开都会补建）。已有库保留全部现有表——门只管不建、从不删。`session_ext` 按 owner 裁定豁免（fastpath `pf:state` 熔断记忆住在里面）。直接调 `UnifiedStore.open` 的调用方默认建全表；开关判定在 `UnifiedShadow.maybeOpen`（`src/knobs.ts` 的 `egressPlaneGateOn()`——无副作用读法，现已是建表 DDL、kv256、affinity 退役与全部运行时行为的平面唯一门；`featureEnabled()` 在该平面任何位置都不可用，因为它的 install-id 引导会在 store open 中途做 wx 文件竞态写）。load/fork 路径对缺失的 legacy 表按"无数据"处理（7 个读 getter 短路），eg 模式实例完整可用。`BILI_TEST_FORCE_FULL_DDL=1` 是**测试专用**逃生口：断言 legacy 表形状而 flag 又开的套件（模拟门禁前的库）用它，生产永不设。
+**表创建门。** eg 模式**新建**库只建：`sessions` + `session_ext` + `kv_store`（核心三件套）+ 五张 egress 表（含 `egress_usage`，§12）= **8 张表（完整收敛 20）**；12 张 legacy 表**不创建**（probe-first 收敛保证 flag 日后关闭时任何一次打开都会补建）。已有库保留全部现有表——门只管不建、从不删。`session_ext` 按 owner 裁定豁免（fastpath `pf:state` 熔断记忆住在里面）。直接调 `UnifiedStore.open` 的调用方默认建全表；开关判定在 `UnifiedShadow.maybeOpen`（`src/knobs.ts` 的 `egressPlaneGateOn()`——无副作用读法，现已是建表 DDL、kv256、affinity 退役与全部运行时行为的平面唯一门；`featureEnabled()` 在该平面任何位置都不可用，因为它的 install-id 引导会在 store open 中途做 wx 文件竞态写）。load/fork 路径对缺失的 legacy 表按"无数据"处理（7 个读 getter 短路），eg 模式实例完整可用。`BILI_TEST_FORCE_FULL_DDL=1` 是**测试专用**逃生口：断言 legacy 表形状而 flag 又开的套件（模拟门禁前的库）用它，生产永不设。
 
 **kv_store 策略。** `kv_store` 是小配置面（install id、notices、host flags），不是 blob 库：开启 `egressPlane` 时每个值 JSON 序列化后不得超过 **256 字符**（`KV_VALUE_MAX_CHARS`，sqlite/mysql 两后端 `setKv` 入口按调用时刻判定）。**legacy 模式保持原有 4MB 字节预算**——存量键可能已经存着非常大的值，上限不能把非 eg 部署炸掉（owner 裁定 2026-11-26）。冻结白名单（`KV_VALUE_WHITELIST`，加条目 = review 事件，须登记 [deprecations.zh-CN.md](./deprecations.zh-CN.md)）给两个已知会长大的键保留 4MB 上限：`prefix-affinity|v1`、`plugin-conversations|table`。eg 模式下大 blob 在写入侧退役：`session-order` 早已退役（写入模块已被上游移除——孤儿行不再触碰，新库干净）；`plugin-conversations` 不写（路由表纯内存；重启 miss 等下一个模型请求重建——既有 miss 语义）；`prefix-affinity` 持久化在 eg 下整体退役（owner 裁定 2026-11-26）：显式 ID 分支、file→kv 一次性迁移、kv/文件持久化路径全部加门——链表仍每轮计算、但 eg 模式下永不落盘（匿名客户端在 eg 下丢失跨重启链连续性，已接受），legacy JSON 文件降为只读 hydration 源，legacy 模式字节级不变。
 

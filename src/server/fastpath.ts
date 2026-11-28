@@ -36,6 +36,7 @@ import type { OpenAIRequestBody } from "acp-kernel/wire";
 import { openaiToCore } from "acp-kernel/wire";
 import type http from "node:http";
 import { featureEnabled } from "../rollout.js";
+import { egressPlaneGateOn } from "../knobs.js";
 import { getStore } from "../persist.js";
 import type { Session } from "../session.js";
 import { type RawStripCounts, stripRawStage } from "../marker/engine.js";
@@ -46,12 +47,14 @@ import { scanMessagesSpans, type RawSpan } from "./fastpath-scan.js";
 export const PF_COUNT_HEADER = "x-bili-pf-count";
 export const PF_SEQ_HEADER = "x-bili-pf-seq";
 export const PF_TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
-// #5403 family, delta arm: the client claims body.messages is the TAIL SLICE
-// [T-L .. T-1] (anchor = element T-1 of the PREVIOUS turn included), with the
-// full logical count in x-bili-pf-count and per-element ids in x-bili-pf-tail-ids
-// (width exactly L). The server rebuilds the view from the seed prefix cores +
-// the re-parsed slice — the same FastpathHit the full-body lane produces, so
-// every downstream stage (stage0 pin, kernel, ingest, snapshot) is untouched.
+// #5403 family, delta arm: the client sends body.messages as the NEW
+// elements [stampT .. T-1] ONLY — the anchor (element stampT-1) stays in
+// the server ledger and is NOT re-sent — with the full logical count in
+// x-bili-pf-count and per-element ids in x-bili-pf-tail-ids (width exactly
+// L+1 = anchor + the L new ids, L = T - stampT). The server rebuilds the
+// view from the seed prefix cores + the re-parsed slice — the same
+// FastpathHit the full-body lane produces, so every downstream stage
+// (stage0 pin, kernel, ingest, snapshot) is untouched.
 // Any unsatisfiable claim is a 400 re-anchor (DeltaReanchorError): the body
 // CANNOT be processed by the legacy path (the prefix bytes are absent), so the
 // only honest answer is "resend this turn in full form"; the client converges
@@ -613,6 +616,11 @@ export function evaluateDeltaResend(
     };
     if (String(rawDelta) !== "1") return reanchor("delta-bad-value");
     if (!featureEnabled("pluginDeltaResend")) return reanchor("rollout-off");
+    // #7875 (owner ruling 2026-11-28, regression-conservative): the delta arm is
+    // scoped to the egress plane - active only under eg-on. An eg-off instance
+    // 400-reanchors a delta claim so the client resends this turn in full form
+    // (no new code path touches a legacy deployment).
+    if (!egressPlaneGateOn()) return reanchor("eg-off");
     if (!input.pluginMode || input.titleGen) return reanchor("gate");
     const tail: unknown[] | null = Array.isArray(parsed.messages) ? parsed.messages : null;
     const seed = seeds.get(session);

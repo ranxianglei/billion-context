@@ -611,6 +611,7 @@ const runDeltaTurn = (
 test("delta arm: hit reconstructs EXACTLY the legacy full-parse oracle across consecutive slices", () => {
     makeStubStore();
     process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "1";
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1"; // the delta arm is eg-on-scoped (#7875 point 1)
     const session = freshSession("pf-delta-hit");
     const full: unknown[] = [SYS("s"), USR("a"), USR("b")];
     // Seed carries NO pf headers (field: the first request of a session
@@ -648,12 +649,14 @@ test("delta arm: hit reconstructs EXACTLY the legacy full-parse oracle across co
     assert.equal(t4.out.decision, "hit", LOGS.slice(-6).join("\n"));
     assert.ok(t4.out.hit);
     delete process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND;
+    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
     _resetStoreForTest();
 });
 
 test("delta arm: every unsatisfiable claim re-anchors (both directions, #3617)", () => {
     makeStubStore();
     process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "1";
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1"; // the delta arm is eg-on-scoped (#7875 point 1)
     const session = freshSession("pf-delta-reanchor");
     const full: unknown[] = [SYS("s"), USR("a"), USR("b")];
     runTurn(session, {}, bodyOf(full)); // seed stampT=3 (no pf headers — field)
@@ -702,6 +705,7 @@ test("delta arm: every unsatisfiable claim re-anchors (both directions, #3617)",
     process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "0";
     assert.deepEqual(ev(delta), { reanchor: "rollout-off" });
     delete process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND;
+    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
     _resetStoreForTest();
 });
 

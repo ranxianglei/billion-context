@@ -271,7 +271,10 @@ test("D: the incremental tail pin maps at wire-element granularity (split cores 
         ];
         recordEgressTurn({ store: store.egressOpLogStore()!, sessionId: sid, prev: undefined, conversation: prefix, systemText: "sys", nowMs: 1_000_000 });
         const liveIds = store.snapPinLiveIds(sid);
-        assert.deepEqual(liveIds, ["u0", "a1", "a1#p1"], "flow msgids in order (system row filtered)");
+        // Path A (coarsened op-log, #7855): a split element's part-rows share
+        // ONE msgid (the element id) — the ledger is element-granular, not
+        // core-granular (pre-#7855 stored a1 + a1#p1 as separate rows).
+        assert.deepEqual(liveIds, ["u0", "a1", "a1#p1"], "flow per-core ids in order (system row filtered; #f7e2d1a25 egressRowPinId reads the per-core id from the row bytes, so a split element's part-rows are distinct cores)");
 
         const nextTurn = (): BiliMessage[] => [
             bm("u0", { wireIndex: 0 }),
@@ -288,9 +291,12 @@ test("D: the incremental tail pin maps at wire-element granularity (split cores 
             ["u0", "a1", "a1#p1", "u2", "u2#p1"],
             "prefix raw (siblings included), new element leader u2 + derived sibling u2#p1",
         );
-        // a wrong anchor still degrades (never rejects)
+        // #B2: the egress pin NEVER degrades to null — an unknown anchor
+        // triggers REANCHOR_NOW (the client's list is applied as the new
+        // increment; the #7851 occurrence-aware diff rebuilds the ledger under
+        // the host ids on the next record). It never returns null.
         const pinBad = tryIncrementalPin(sid, "openai", nextTurn(), ["WRONG", "u2"], (m) => log.push(String(m)));
-        assert.equal(pinBad, null, "anchor mismatch degrades (returns null), never rejects");
+        assert.ok(Array.isArray(pinBad) && pinBad.length === 5, "an unknown anchor never returns null (reanchor-now); it still pins the full view");
         // 1:1 sessions keep the legacy per-core mapping (fresh 1:1 ledger)
         const sid2 = "c6-pins-1to1";
         recordEgressTurn({ store: store.egressOpLogStore()!, sessionId: sid2, prev: undefined, conversation: [bm("u0", { wireIndex: 0 }), asst("a1", "t", "text", 1)], systemText: "sys", nowMs: 1_000_000 });
@@ -314,7 +320,16 @@ test("D: the incremental tail pin maps at wire-element granularity (split cores 
             bm("u2-0", { role: "tool", originalRole: "tool", wireIndex: 3, contentType: "tool-result", toolName: "t", toolResultText: "ok" }),
             bm("u2-1", { wireIndex: 3 }),
         ], ["a1", "u2"], (m) => log.push(String(m)));
-        assert.equal(stale, null, "a stale anchor degrades to the full signal (returns null)");
+        // #B2: a stale anchor no longer degrades to null. The grown prefix
+        // still maps via the ledger (server authority) and only the unlisted
+        // new element is content-derived (self-heals next turn) — never a
+        // permanent h_.
+        assert.ok(Array.isArray(stale) && stale.length === 6, "a stale anchor never returns null (best-effort, self-healing)");
+        assert.deepEqual(
+            (stale as BiliMessage[]).map((m) => m.id).slice(0, 4),
+            ["u0", "a1", "a1#p1", "z1"],
+            "the grown prefix (incl. z1) still maps via the ledger despite the stale anchor",
+        );
         // and the FRESH anchor for the same turn pins again
         const fresh = tryIncrementalPin(sid, "openai", [
             bm("u0", { wireIndex: 0 }),
@@ -330,6 +345,54 @@ test("D: the incremental tail pin maps at wire-element granularity (split cores 
             ["u0", "a1", "a1#p1", "z1", "u2", "u2#p1"],
             "the grown prefix maps raw, the new split element leader + sibling",
         );
+    } finally {
+        closeStore(store, dir, null);
+    }
+});
+
+test("E: post-fold full-list resend anchors (no permanent h_, no 'reanchor next turn')", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "c6-seq-"));
+    const store = openStore(dir);
+    const log: string[] = [];
+    try {
+        const sid = "c6-postfold";
+        const asst = (id: string, text: string, contentType: string, wireIndex: number, extra: Record<string, unknown> = {}): BiliMessage =>
+            bm(id, { role: "assistant", originalRole: "assistant", contentType, wireIndex, ...extra });
+        // the ledger is already FOLDED: u0, a0, <kernel summary>, a1. The
+        // kernel fold-summary carries the reserved acp_summary_ prefix (the
+        // client can never echo it — it's server-side).
+        const folded = [
+            bm("u0", { wireIndex: 0 }),
+            asst("a0", "t0", "text", 1),
+            { ...bm("acp_summary_mid", { wireIndex: 2 }), role: "user" as const, contentType: "text" as const },
+            asst("a1", "t1", "text", 3),
+        ];
+        recordEgressTurn({ store: store.egressOpLogStore()!, sessionId: sid, prev: undefined, conversation: folded, systemText: "sys", nowMs: 1_000_000 });
+        assert.deepEqual(
+            store.snapPinLiveIds(sid),
+            ["u0", "a0", "acp_summary_mid", "a1"],
+            "folded ledger (system row filtered)",
+        );
+        // the client re-sends the full conversation (watermark miss → full
+        // list) and ADOPTS the fold: its view has the summary element + a
+        // fresh increment u2. It declares 6 ids but the parse yields 5 wire
+        // elements (one surplus trailing id) — the exact L > T shape the
+        // pre-fix positional tail-align rejected.
+        const resend = [
+            bm("cu0", { wireIndex: 0 }),
+            asst("ca0", "t0", "text", 1),
+            { ...bm("csum", { wireIndex: 2 }), role: "user" as const, contentType: "text" as const },
+            asst("ca1", "t1", "text", 3),
+            bm("u2", { wireIndex: 4 }),
+        ];
+        const pin = tryIncrementalPin(sid, "openai", resend, ["u0", "a0", "csum", "a1", "u2", "cextra"], (m) => log.push(String(m)));
+        assert.ok(Array.isArray(pin), "the post-fold full-list resend ANCHORS (pre-fix: 'incremental list longer than the view' → null → h_ forever)");
+        const ids = (pin as BiliMessage[]).map((m) => m.id);
+        assert.equal(ids[0], "u0", "matched prefix keeps the ledger's host id (no h_)");
+        assert.equal(ids[1], "a0", "matched prefix keeps the ledger's host id (no h_)");
+        assert.ok(!ids[2]!.startsWith("h_"), "the fold-summary view element stays content-derived, never a host id");
+        assert.equal(ids[3], "a1", "matched prefix ACROSS the fold keeps the ledger's host id (no h_)");
+        assert.equal(ids[4], "u2", "the fresh increment takes the client's id (pre-fix: h_ + 'reanchor next turn' — the permanent-degradation loop)");
     } finally {
         closeStore(store, dir, null);
     }
