@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "native": {
+      "command": "${RECALL_PYTHON:-python3}",
+      "args": [
+        "-X",
+        "utf8",
+        "${CLAUDE_PLUGIN_ROOT}/billion_context_native/mcp_server.py"
+      ]
+    }
+  }
+}
