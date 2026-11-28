@@ -7,11 +7,13 @@ import path from "node:path";
 import {
     activateZcodePluginMode,
     bootstrapZcodeNative,
+    detectZcodeBuiltinAccount,
     handoffZcodeRoutingOnExit,
     planNativeZcode,
     planZcodeRouting,
     probeProxyHealth,
     repairSharedStoreDrift,
+    reportZcodeBuiltinAccount,
     restoreZcodeBackup,
     routeZcodeConfig,
     unrouteZcode,
@@ -858,5 +860,99 @@ test("bootstrapZcodeNative returns degraded, without proxy bring-up, for an empt
         assert.equal(proxyTouched, false);
     } finally {
         rmrf(dir);
+    }
+});
+
+// ── #4692: z.ai built-in account (ZAI_BUSINESS_BASE_URL) bypasses the store ──
+
+test("detectZcodeBuiltinAccount classifies the built-in-account surface (#4692)", () => {
+    assert.equal(detectZcodeBuiltinAccount({}), undefined);
+    assert.equal(detectZcodeBuiltinAccount({ ZAI_BUSINESS_BASE_URL: "" }), undefined);
+    assert.equal(detectZcodeBuiltinAccount({ ZAI_BUSINESS_BASE_URL: "   " }), undefined);
+    // Non-http(s) or unparseable → not a bypass surface, and never throws.
+    assert.equal(detectZcodeBuiltinAccount({ ZAI_BUSINESS_BASE_URL: "ftp://api.z.ai" }), undefined);
+    assert.equal(detectZcodeBuiltinAccount({ ZAI_BUSINESS_BASE_URL: "not a url" }), undefined);
+    // Loopback targets are not public-bypass surfaces (incl. a /bili/ wrapper on one).
+    assert.equal(detectZcodeBuiltinAccount({ ZAI_BUSINESS_BASE_URL: "http://127.0.0.1:18787/bili/https://api.z.ai" }), undefined);
+    assert.equal(detectZcodeBuiltinAccount({ ZAI_BUSINESS_BASE_URL: "http://localhost:8787" }), undefined);
+    assert.equal(detectZcodeBuiltinAccount({ ZAI_BUSINESS_BASE_URL: "http://[::1]:8787" }), undefined);
+    // An already-/bili/-wrapped URL on a non-loopback proxy is covered, not a bypass.
+    assert.equal(detectZcodeBuiltinAccount({ ZAI_BUSINESS_BASE_URL: "https://proxy.example.com/bili/https://upstream.example" }), undefined);
+    assert.deepEqual(detectZcodeBuiltinAccount({ ZAI_BUSINESS_BASE_URL: "https://api.z.ai" }), { baseUrl: "https://api.z.ai", host: "api.z.ai" });
+    // Trims surrounding whitespace; lowercases the host.
+    assert.deepEqual(detectZcodeBuiltinAccount({ ZAI_BUSINESS_BASE_URL: "  https://API.Z.AI/  " }), { baseUrl: "https://API.Z.AI/", host: "api.z.ai" });
+});
+
+test("reportZcodeBuiltinAccount names the surface and the cert-MITM exit (#4692)", () => {
+    const lines: string[] = [];
+    reportZcodeBuiltinAccount({ baseUrl: "https://api.z.ai", host: "api.z.ai" }, (m) => lines.push(m));
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /ZAI_BUSINESS_BASE_URL=https:\/\/api\.z\.ai/);
+    assert.match(lines[0], /BYPASSES bili/);
+    assert.match(lines[0], /cert-MITM/);
+    assert.match(lines[0], /#661/);
+});
+
+test("bootstrapZcodeNative signals the built-in account instead of going silent (#4692)", async () => {
+    // The blind case: personal store emptied by the switch, built-in account active.
+    const empty = emptyPersonalStoreDir();
+    try {
+        let proxyTouched = false;
+        const logs: string[] = [];
+        const out = await bootstrapZcodeNative({
+            env: { ZAI_BUSINESS_BASE_URL: "https://api.z.ai" },
+            dataDir: empty,
+            log: (m) => logs.push(m),
+            ensureProxy: async () => {
+                proxyTouched = true;
+                return { origin: "http://127.0.0.1:1", attached: false };
+            },
+        });
+        assert.deepEqual(out, { mode: "degraded", reason: "empty-rules" });
+        assert.equal(proxyTouched, false);
+        assert.match(logs.join(" "), /z\.ai built-in account detected \(ZAI_BUSINESS_BASE_URL=https:\/\/api\.z\.ai\)/);
+        assert.match(logs.join(" "), /BYPASSES bili/);
+    } finally {
+        rmrf(empty);
+    }
+    // …and it stays loud even when the store DOES route (the active account moved outside it).
+    const dir = dataDir();
+    try {
+        const logs: string[] = [];
+        const out = await bootstrapZcodeNative({
+            env: { ZAI_BUSINESS_BASE_URL: "https://api.z.ai" },
+            dataDir: dir,
+            log: (m) => logs.push(m),
+            ensureProxy: async () => ({ origin: "http://127.0.0.1:1", attached: false }),
+        });
+        assert.equal(out.mode, "active");
+        const joined = logs.join(" ");
+        assert.match(joined, /z\.ai built-in account detected/);
+        assert.match(joined, /routed .* via http:\/\/127\.0\.0\.1:1/);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("bootstrapZcodeNative does not signal the built-in account when routing is opted out (#4692)", async () => {
+    const optOutEnvs: Array<Record<string, string>> = [
+        { BILI_NATIVE_ZCODE: "0" },
+        { BILI_ZCODE_ROUTE: "none" },
+    ];
+    for (const extra of optOutEnvs) {
+        const dir = dataDir();
+        try {
+            const logs: string[] = [];
+            const out = await bootstrapZcodeNative({
+                env: { ...extra, ZAI_BUSINESS_BASE_URL: "https://api.z.ai" },
+                dataDir: dir,
+                log: (m) => logs.push(m),
+                ensureProxy: async () => ({ origin: "http://127.0.0.1:1", attached: false }),
+            });
+            assert.equal(out.mode, "off");
+            assert.doesNotMatch(logs.join(" "), /built-in account detected/);
+        } finally {
+            rmrf(dir);
+        }
     }
 });
