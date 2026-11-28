@@ -45,10 +45,28 @@ test("whole-text: \\u003c-escaped chain form is stripped after unescaping", () =
     assert.equal(stripBiliArtifacts(halfEscaped), "", "escaped close handled too");
 });
 
-test("whole-text: header blocks cut to end of text at position 0 or line start only", () => {
+test("whole-text: header leading the field cuts to end of text", () => {
     assert.equal(stripBiliArtifacts(`${H1}\nsummary body\nmore`), "");
-    assert.equal(stripBiliArtifacts(`intro\n${H2} — topic\nbody`), "intro\n");
     assert.equal(stripBiliArtifacts(`${H2} — topic\nbody`), "");
+    assert.equal(
+        stripBiliArtifacts(`\n${H1}\nsummary`),
+        "\n",
+        "newline before a column-0 header still leads the field",
+    );
+    // Column-0 anchor (same discipline as the #717 marker-line pass): an
+    // indented header is prose, not a block lead.
+    assert.equal(
+        stripBiliArtifacts(`\n  ${H1}\nsummary`),
+        `\n  ${H1}\nsummary`,
+        "indented header passes through",
+    );
+});
+
+test("whole-text: header after real prose drops the marker LINE only (#5900)", () => {
+    // Old behavior swallowed everything after a line-start marker mid-turn,
+    // truncating the answer. Only the marker line itself is provably internal.
+    assert.equal(stripBiliArtifacts(`intro\n${H2} — topic\nbody`), "intro\nbody");
+    assert.equal(stripBiliArtifacts(`text\n${H2} inline extra\nrest`), "text\nrest", "same-line continuation dies with the line");
     assert.equal(
         stripBiliArtifacts(`the ${H2} covers old turns`),
         `the ${H2} covers old turns`,
@@ -131,13 +149,72 @@ test("streaming: chain carrier stripped at every split point (literal + escaped,
     }
 });
 
-test("streaming: header block swallowed to end of field at every split point", () => {
-    const payload = `intro\n${H2} — topic\nbody continues`;
-    for (const n of [1, 2, 4, 9]) {
-        const { out, filter } = streamThrough(payload, n);
-        assert.equal(out, "intro\n", `chunk ${n}: block-to-end semantics, got ${JSON.stringify(out)}`);
-        assert.equal(filter.dropped(), true);
+test("streaming: header leading the field swallows to end at every split point", () => {
+    for (const payload of [`${H1}\nsummary body`, `${H2} — topic\nbody`, `\n${H2}\nbody`]) {
+        for (const n of [1, 2, 4, 9]) {
+            const { out, filter } = streamThrough(payload, n);
+            assert.equal(out.replace(/\n/g, ""), "", `chunk ${n}: forged turn yields no visible text, got ${JSON.stringify(out)}`);
+            assert.equal(filter.dropped(), true);
+        }
     }
+});
+
+test("streaming: header after prose drops the marker line only, byte-exact at every split (#5900)", () => {
+    // Production repro: an answer that quotes a summary marker on its own line
+    // mid-turn lost everything after the marker. The rest of the turn must
+    // survive, identically under EVERY chunking (determinism contract #3198).
+    const payload = `PREFIX.\n${H2}\nthe rest of the answer continues here.`;
+    const expected = `PREFIX.\nthe rest of the answer continues here.`;
+    assert.equal(stripBiliArtifacts(payload), expected, "whole-text ground truth");
+    for (const n of [1, 2, 3, 4, 5, 7, 8, 13]) {
+        const { out, filter } = streamThrough(payload, n);
+        assert.equal(out, expected, `chunk ${n}: tail must survive, got ${JSON.stringify(out)}`);
+        assert.equal(filter.dropped(), true, `chunk ${n}: marker line drop notified`);
+    }
+    // Every split point, not just fixed sizes: char-by-char sweep.
+    for (let k = 0; k <= payload.length; k++) {
+        const f = createBiliArtifactFilter();
+        const out = f.push(payload.slice(0, k)) + f.push(payload.slice(k)) + f.flush();
+        assert.equal(out, expected, `split @${k}: chunk-boundary dependence, got ${JSON.stringify(out)}`);
+    }
+});
+
+test("streaming: mid-line markers promoted to buffer start by chunking stay prose (#5900)", () => {
+    // A chunk boundary landing right before a mid-line marker used to make it
+    // start a fresh buffer → position 0 → swallow-to-end. The same generation
+    // now passes through byte-exact under every chunking, matching whole-text.
+    const payload = `First part.\nIt detects ${H2} and also ${H1}: here.\nThird part continues.`;
+    assert.equal(stripBiliArtifacts(payload), payload, "whole-text ground truth");
+    for (let k = 0; k <= payload.length; k++) {
+        const f = createBiliArtifactFilter();
+        const out = f.push(payload.slice(0, k)) + f.push(payload.slice(k)) + f.flush();
+        assert.equal(out, payload, `split @${k}: mid-line marker must not claim a block, got ${JSON.stringify(out)}`);
+        assert.equal(f.dropped(), false, `split @${k}: no drop for prose`);
+    }
+});
+
+test("streaming: carrier before a header block is dropped, not emitted raw", () => {
+    // Left-to-right event order: the carrier sits earlier than the header, so
+    // it must be stripped (the old cut-first ordering leaked it as prose).
+    const carrier = tag();
+    const payload = `${carrier}\n${H1}\nbody`;
+    assert.equal(stripBiliArtifacts(payload), "\n", "whole-text: carrier gone, whitespace prefix kept");
+    const { out, filter } = streamThrough(payload, 1);
+    assert.equal(out, "\n", `streaming must match whole-text, got ${JSON.stringify(out)}`);
+    assert.ok(!out.includes("bili-chain"), "carrier never reaches the client");
+    assert.equal(filter.dropped(), true);
+});
+
+test("streaming: marker line running to EOF is dropped at flush (whole-text parity)", () => {
+    const f = createBiliArtifactFilter();
+    let out = f.push(`text\n${H2}`);
+    assert.equal(out, "text\n", "prefix settles, line held");
+    assert.equal(f.pending(), true);
+    out += f.push(` inline extra`);
+    assert.equal(out, "text\n", "line still open, nothing visible");
+    out += f.flush();
+    assert.equal(out, "text\n", "EOF ends the line: marker line dropped, parity with whole-text");
+    assert.equal(f.dropped(), true);
 });
 
 test("streaming: pure prose passes byte-exact including tricky boundaries", () => {
@@ -192,6 +269,65 @@ test("degenerate-turn gate parity: a fully forged turn yields zero visible outpu
         const { out, filter } = streamThrough(payload, 1);
         assert.equal(out.length, 0, "no visible chars survive a fully forged turn");
         assert.equal(filter.stats().outputChars, 0);
+        assert.equal(filter.dropped(), true);
+    }
+});
+
+test("streaming: dead carrier opening no longer shields line-start headers behind it (#5900)", () => {
+    // An unterminated <bili-chain opening is prose, but while the filter held
+    // the whole tail behind it, a line-start header further back leaked raw at
+    // flush (short tails) or was stripped inconsistently per chunking once the
+    // tail crossed the void budget (#3198 determinism). Both must match
+    // whole-text now.
+    const deadOpen = `${L}bili-chain v="1" processor="b"`;
+    const shortPayload = `${deadOpen}\n${H2} topic\nbody survives`;
+    const shortExpected = stripBiliArtifacts(shortPayload);
+    assert.equal(shortExpected, `${deadOpen}\nbody survives`, "whole-text: opener prose, marker line drops");
+    for (let k = 0; k <= shortPayload.length; k++) {
+        const f = createBiliArtifactFilter();
+        const out = f.push(shortPayload.slice(0, k)) + f.push(shortPayload.slice(k)) + f.flush();
+        assert.equal(out, shortExpected, `split @${k}: header behind dead opener must match whole-text, got ${JSON.stringify(out)}`);
+    }
+    const longPayload = `${deadOpen}\n${"z".repeat(700)}\n${H2}\ntail`;
+    const longExpected = stripBiliArtifacts(longPayload);
+    assert.equal(longExpected, `${deadOpen}\n${"z".repeat(700)}\ntail`, "whole-text ground truth (over budget)");
+    for (const n of [1, 2, 4, 64, 257, 700]) {
+        const { out } = streamThrough(longPayload, n);
+        assert.equal(out, longExpected, `chunk ${n}: over-budget void must be chunk-boundary independent, got ${JSON.stringify(out)}`);
+    }
+    for (let k = 0; k <= longPayload.length; k += 37) {
+        const f = createBiliArtifactFilter();
+        const out = f.push(longPayload.slice(0, k)) + f.push(longPayload.slice(k)) + f.flush();
+        assert.equal(out, longExpected, `split @${k}: over-budget sweep, got ${JSON.stringify(out)}`);
+    }
+});
+
+test("streaming: second carrier behind a dead opening keeps whole-text parity (#5900)", () => {
+    // Recognition is first-opener-wins (pre-existing boundary, documented in
+    // nextChainSpan): a malformed first opening blocks span validation of a
+    // later well-formed carrier. Pin parity so the void path cannot silently
+    // change that boundary.
+    const deadOpen = `${L}bili-chain v="1" b`;
+    const payload = `${deadOpen}\nmid ${tag()} end\n${H1}\nbody`;
+    const expected = stripBiliArtifacts(payload);
+    assert.ok(expected.includes("bili-chain"), "documented limit: later carrier stays prose");
+    for (const n of [1, 3, 8, 40]) {
+        const { out } = streamThrough(payload, n);
+        assert.equal(out, expected, `chunk ${n}: parity with whole-text, got ${JSON.stringify(out)}`);
+    }
+});
+
+test("streaming: stripped carrier does not unseat a flush-following header from the leading tier (#5900)", () => {
+    // Dropped bytes are invisible to the client: a header sitting flush behind
+    // a removed carrier still leads the VISIBLE field, so the degenerate-turn
+    // swallow must fire exactly as in whole-text (dropped bytes must not move
+    // the line-head cursor).
+    const escBoth = (): string => tag().replace(L, "\\u003c").replace(R, "\\u003e");
+    const payload = `${escBoth()}${H1}body`;
+    assert.equal(stripBiliArtifacts(payload), "", "whole-text: forged carrier + forged block = zero visible output");
+    for (const n of [1, 2, 7, 33]) {
+        const { out, filter } = streamThrough(payload, n);
+        assert.equal(out, "", `chunk ${n}: must converge to zero visible output, got ${JSON.stringify(out)}`);
         assert.equal(filter.dropped(), true);
     }
 });
