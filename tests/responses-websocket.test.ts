@@ -13,7 +13,7 @@ import { Agent } from "undici";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { ResponsesWsHistory, ResponsesWsUpstream, finalizeResponsesWsUpstreamHeaders } from "../src/responses-ws.ts";
-import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
+import { _liveUpstreamTimersForTest, _resetIdleTimerSeamsForTest, _setIdleTimerDelayForTest } from "../src/fetch-util.ts";
 import { proxyDispatcher } from "../src/upstream-proxy.ts";
 import { _resetUpstreamThrottleForTest } from "../src/upstream-throttle.ts";
 import { ensureRootCA, mintHostCert, rootCaPath } from "../src/ca.ts";
@@ -659,8 +659,64 @@ test("Responses WS faults: an overlapping create is rejected without corrupting 
         assert.equal(f.rows[1].request.previous_response_id, response.id);
         assert.equal(f.rows[1].full.filter(item => item.call_id === call.call_id).length, 2);
         assert.ok(!JSON.stringify(f.rows[1].full).includes("must not reach upstream"));
-        await readLogUntil(f.logPath, [/client rejected reason=response-in-progress/]);
+        // #6172: the rejection line must reconstruct the lane state — which
+        // request holds it (kind/gen/prev_id/items), for how long, and how we
+        // got here — WITHOUT leaking the rejected frame's message body into
+        // the log (ids/counts/bytes only).
+        await readLogUntil(
+            f.logPath,
+            [
+                /client rejected reason=response-in-progress req_bytes=\d+/,
+                /client rejected reason=response-in-progress .*req_items=1/,
+                /client rejected reason=response-in-progress .*active_gen=1 .*active_kind=turn .*active_age_ms=\d+/,
+                /client rejected reason=response-in-progress .*active_prev_id=none .*active_items=\d+ .*active_terminal=false/,
+                /client rejected reason=response-in-progress .*admitted=1 .*transitions=\[turn-admit#1@\d+s\]/,
+            ],
+            /must not reach upstream/,
+        );
     } finally { await f.close(); }
+});
+
+test("Responses WS faults: a wedged prewarm probe fails bounded and releases the lane (#6172)", { timeout: 30000 }, async () => {
+    _setIdleTimerDelayForTest(400);
+    const f = await fixture();
+    // Black-hole upstream: accepts the WS upgrade and then answers nothing —
+    // the exact wedge the unbounded probe used to sit in forever. Kept OUT of
+    // the shared fixture on purpose: its wire-contract validator (WC-013) would
+    // answer the probe body's forced stream:true before any stall could bite.
+    const hole = http.createServer((_req, res) => { res.writeHead(404).end(); });
+    const holeWss = new WebSocketServer({ server: hole });
+    holeWss.on("connection", peer => { peer.on("message", () => {}); });
+    hole.listen(0, "127.0.0.1");
+    await once(hole, "listening");
+    try {
+        const holeOrigin = `http://127.0.0.1:${(hole.address() as { port: number }).port}`;
+        const peer = new WebSocket(`${f.proxyOrigin.replace(/^http/, "ws")}/bili/responses/${holeOrigin}/v1/responses`, { headers: { authorization: "Bearer fake-credential", "x-bili-plugin": "opencode", "x-bili-plugin-conversation": f.sid, "x-bili-plugin-model": "gpt-5.2", "x-bili-plugin-context-window": "200000" } });
+        await once(peer, "open");
+        const probeFrame = JSON.stringify({ type: "response.create", model: "gpt-5.2", store: false, generate: false, input: [] });
+        const firstProbe = nextEvent(peer, "error");
+        peer.send(probeFrame);
+        const first = await firstProbe;
+        // The watchdog fired on the first-byte budget and the probe surfaced as
+        // the explicit relay-failure frame — NOT a silent forever-hang.
+        assert.equal((first.error as Item).code, "invalid_request");
+        assert.match(String((first.error as Item).message), /Probe relay failed/);
+        await readLogUntil(f.logPath, [/upstream watchdog fired \(first-byte phase/, /exchange settled kind=probe gen=1 outcome=aborted duration_ms=\d+/]);
+        // Lane released: a second probe on the SAME connection is admitted
+        // instead of 409 response_in_progress (the pre-fix wedge symptom).
+        const secondProbe = nextEvent(peer, "error");
+        peer.send(probeFrame);
+        const second = await secondProbe;
+        assert.equal((second.error as Item).code, "invalid_request");
+        await readLogUntil(f.logPath, [/exchange settled kind=probe gen=2 outcome=aborted/]);
+        peer.terminate();
+        await until(() => _liveUpstreamTimersForTest() === 0);
+    } finally {
+        _resetIdleTimerSeamsForTest();
+        for (const client of holeWss.clients) client.terminate();
+        await Promise.all([new Promise<void>(resolve => hole.close(() => resolve())), f.close()]);
+        holeWss.close();
+    }
 });
 
 for (const code of ["previous_response_not_found", "websocket_connection_limit_reached"]) {
