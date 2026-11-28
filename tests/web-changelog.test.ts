@@ -10,7 +10,9 @@ import assert from "node:assert/strict";
 import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { once } from "node:events";
-import { getChangelog, latestChangelog, _resetChangelogForTest } from "../src/web/changelog.ts";
+import { Agent, ProxyAgent } from "undici";
+import { configureChangelogProxy, getChangelog, latestChangelog, _resetChangelogForTest } from "../src/web/changelog.ts";
+import { resetProxyCache } from "../src/upstream-proxy.ts";
 
 const GH = "https://api.github.com/repos/ranxianglei/billion-context/releases?per_page=20";
 
@@ -37,9 +39,11 @@ const origFetch = globalThis.fetch;
 
 beforeEach(() => {
     _resetChangelogForTest();
+    resetProxyCache();
 });
 afterEach(() => {
     _resetChangelogForTest();
+    resetProxyCache();
     globalThis.fetch = origFetch;
 });
 
@@ -257,4 +261,40 @@ test("handleChangelogGet answers 200 JSON — cached path and offline path", asy
     const parsedCold = JSON.parse(cold.body) as { releases: unknown[]; error: string };
     assert.deepEqual(parsedCold.releases, []);
     assert.equal(parsedCold.error, "offline");
+});
+
+test("routes GitHub Releases fetch through configured proxy dispatcher", async () => {
+    let seenUrl: string | undefined;
+    let seenDispatcher: unknown;
+    configureChangelogProxy((url) => {
+        seenUrl = url;
+        return "http://127.0.0.1:6785";
+    });
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+        assert.equal(String(input), GH);
+        seenDispatcher = (init as { dispatcher?: unknown } | undefined)?.dispatcher;
+        return Promise.resolve(new Response(JSON.stringify([ghRelease(0)]), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    const data = await getChangelog();
+    assert.equal(seenUrl, GH);
+    assert.ok(seenDispatcher instanceof ProxyAgent, "configured proxy must pass a ProxyAgent dispatcher");
+    assert.equal(data.releases[0]?.tag, "v0.9.100");
+    assert.equal(data.error, undefined);
+});
+
+test("falls back to direct Agent dispatcher when changelog proxy resolves to undefined", async () => {
+    let seenDispatcher: unknown;
+    configureChangelogProxy(() => undefined);
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+        assert.equal(String(input), GH);
+        seenDispatcher = (init as { dispatcher?: unknown } | undefined)?.dispatcher;
+        return Promise.resolve(new Response(JSON.stringify([ghRelease(1)]), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    const data = await getChangelog();
+    assert.ok(seenDispatcher instanceof Agent, "unset proxy must fall back to direct Agent dispatcher");
+    assert.ok(!(seenDispatcher instanceof ProxyAgent));
+    assert.equal(data.releases[0]?.tag, "v0.9.99");
+    assert.equal(data.error, undefined);
 });
