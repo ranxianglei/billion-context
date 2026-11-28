@@ -4436,6 +4436,11 @@ export async function pipePluginJsonlWithStrip(
                     await flushFieldTails();
                 }
                 if (!res.write(Buffer.from(outLine + "\n", "utf8"))) await awaitDrain(res);
+                if (sawTerminal) {
+                    settleUsage();
+                    maybeWarnDegenerate();
+                    return;
+                }
             }
         }
         await flushFieldTails();
@@ -4455,6 +4460,7 @@ export async function pipePluginJsonlWithStrip(
         emitUpstreamTruncation(res, "commandcode", finalFinishReason !== undefined, log);
         return;
     } finally {
+        if (sawTerminal) void reader.cancel().catch(() => {});
         reader.releaseLock();
         res.end();
     }

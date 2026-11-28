@@ -213,6 +213,7 @@ export function createCommandcodeAdapter(
                         yield { kind: "meta", chunk: lineBuf(line) } as ParsedStreamEvent;
                     }
                     yield { kind: "done", finishReason: finalFinishReason ?? "stop", thinking: sawReasoning, ...(sawRealToolCall ? { suppressCompletion: true } : {}) } as ParsedStreamEvent;
+                    return;
                 } else if (type === "error") {
                     const message = typeof ev.message === "string" ? ev.message
                         : typeof ev.error === "string" ? ev.error
