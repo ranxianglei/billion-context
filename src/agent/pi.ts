@@ -803,7 +803,7 @@ function noProxyWarning(agent: string): string {
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> }; registeredTools?: ManifestTool[] };
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> }; registeredTools?: ManifestTool[]; compatThreadsDisabledSids?: Set<string> };
 
 // #2708: pi rebuilds its executable tool list per request — _refreshToolRegistry() walks
 // the live extension instances' tool maps into _toolRegistry, and setActiveToolsByName()
@@ -1818,6 +1818,56 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: payload, msgIds: forkMsgIds });
         }
         pi.on("before_provider_request", async (event, ctx) => {
+            // #6796: Pi native Anthropic continuations are rewritten after
+            // fingerprinting and can return generic 429. The pi host's
+            // prepareThreadRequest fingerprints the full original request and
+            // creates a native delta (threads continue + previous_message_id).
+            // Bili's inline transport processes that delta afterward, and in
+            // pluginMode the byte-faithful threads branch is skipped (guarded
+            // by !pluginMode in prepare-anthropic.ts), so the wire payload no
+            // longer matches the host's thread assumptions → generic 429.
+            //
+            // Fix: negotiate session-local compat.supportsMessageThreads=false
+            // for Anthropic Messages models actually routed through bili,
+            // using Pi's official model API (setModel). Pi then sends full
+            // requests through the existing compression pipeline, without
+            // requiring a user models.json edit, disabling bili, filtering
+            // payloads, or retrying deterministic failures.
+            //
+            // The latch is per-SESSION, not per-process: `state` is one plugin
+            // instance shared across every session in the host process (see
+            // lastReportedNames / carriedSids), so a process-global boolean
+            // would latch on the first anthropic session and leave every later
+            // session still on native threads → 429. Key by sid; a missing sid
+            // degrades to the process-global key "" (one setModel for the
+            // whole no-sid process, same as before).
+            if (agent === "pi" && typeof pi.setModel === "function") {
+                const model = ctx.model;
+                if (model && model.provider === "anthropic" && model.api === "anthropic-messages") {
+                    const proxyBase = proxyBaseForCtx(ctx);
+                    if (proxyBase !== undefined) {
+                        const key = sessionIdOf(ctx) ?? "";
+                        const latched = state.compatThreadsDisabledSids ?? (state.compatThreadsDisabledSids = new Set<string>());
+                        if (!latched.has(key)) {
+                            latched.add(key);
+                            try {
+                                const m = model as unknown as Record<string, unknown>;
+                                const compat = (m.compat ?? {}) as Record<string, unknown>;
+                                await pi.setModel({
+                                    ...m,
+                                    compat: {
+                                        ...compat,
+                                        supportsMessageThreads: false,
+                                    },
+                                });
+                            } catch (err) {
+                                latched.delete(key);
+                                logHostEvent("warn", "[native-client]", `bili-plugin(pi): failed to disable native threads for Anthropic Messages model (${err instanceof Error ? err.message : String(err)}) — continuing with native threads`);
+                            }
+                        }
+                    }
+                }
+            }
             // #5403/#5418 unified watermark channel: capture THIS request's
             // host msgids per family for the ONE chokepoint emitter. Runs on
             // EVERY model request — including the OpenAI-family turns the
