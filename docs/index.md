@@ -1,5 +1,7 @@
 # Documentation Index
 
+- [DSH model-selective native compaction](dsh-native-compaction.md) / [中文](dsh-native-compaction.zh-CN.md): configuration, same-session handoff, compatibility and patch maintenance.
+
 > All system documentation lives under `docs/`. The repo root keeps only four **core** entry files — `README.md`, `README.zh-CN.md`, `AGENTS.md`, `CHANGELOG.md` — and recognized community-maintained README translations (`README.<locale>.md`, e.g. `README.ja.md`, approved 2026-11-09, #6000). Former root doc paths keep one-line redirect stubs (scheduled for removal after 1–2 releases; tracked in [lifecycle §5](lifecycle.md#5-卫生记录)).
 > Lazy-load procedures (architecture / env-vars / testing / release / git-pr): [reference/](../reference/README.md).
 
