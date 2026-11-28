@@ -67,6 +67,7 @@ import { resolveEgressAuthority, egressAuthorityArmed, egressBlockLedgerFor, bui
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
+import { noteLocalTextEstimate } from "../cache-ledger.js";
 
 /** #7398: put the conversation array back into a body whose parse handle.ts
  *  deferred. Everything else is kept EXACTLY as it stands on `parsed`.
@@ -929,11 +930,10 @@ export async function prepareOpenai(
             + imageReserve;
         // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
         // see the anthropic-lane counterpart above.
-        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+        // #4425: an aux-sized body must not clobber the outstanding main-turn pair.
+        noteLocalTextEstimate(session, estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
-            + imageReserve;
-        const openaiPairOrigin = billingUpstream ?? upstreamOrigin;
-        if (openaiPairOrigin) session.stats.lastLocalTextEstimateOrigin = openaiPairOrigin;
+            + imageReserve, billingUpstream ?? upstreamOrigin);
         // #4805: id-membership evidence for the settle gate (see the
         // anthropic-lane counterpart) — chat wire has no msgid envelope, so
         // evidence is the tool-call ids resent in the history.

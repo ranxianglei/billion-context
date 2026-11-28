@@ -16,13 +16,23 @@ import type { CoreMessage } from "acp-kernel";
 // 1.2M — compression permanently stopped, and once requests started failing
 // (no usage on failure) nothing could repair the anchor. Two guards, each
 // independently breaking the loop:
-//  Final design (settle-side magnitude gate REJECTED during PR review):
-//  a far-smaller usage sample CANNOT be distinguished from the #1492 B
-//  self-heal (next real report superseding a poisoned 1.2M anchor) at the
-//  settle chokepoint — magnitude alone is ambiguous there. Settle stays
-//  unconditional (usage-grade truth always supersedes) and records WHICH
-//  request produced the anchor (stats.lastUsagePayloadUpper = the producer's
-//  own payload upper estimate, snapshotted at settle from localInputEstimate):
+// - WRITE-SIDE (#4425, landed after this suite was written): a usage sample
+//   billing below NON_MAIN_USAGE_RATIO (1/10) of the session's established
+//   load is auxiliary-shaped and settles billing-only — no anchor, arms,
+//   overflow evidence, k-hat pair or cache lines. This suite's original
+//   review REJECTED a settle-side magnitude gate as ambiguous with the
+//   #1492 B self-heal; the field repro behind #4425 (id-less aux shapes where
+//   the membership probe below is structurally blind) settled the ambiguity
+//   by failure direction: a gated sample errs toward OVERSTATING the context
+//   (conservative folds, healed by the next main-scale report), an accepted
+//   one toward UNDERSTATING it (preflight-floor collapse, overflow 400s).
+//   Every realistic shrinkage path keeps its samples above the ratio:
+//   post-fold re-requests bill the UNFOLDED body, native compaction resets
+//   the anchor to zero.
+// - READ-SIDE (this suite's original design, kept as defense-in-depth):
+//   settle snapshots WHICH request produced the anchor
+//   (stats.lastUsagePayloadUpper = the producer's own payload upper estimate,
+//   snapshotted at settle from localInputEstimate):
 //  - effectiveTokenCount refuses an anchor only when the payload at hand
 //    towers over BOTH the anchor and its producer's snapshot (8x each, >25K
 //    absolute) — a #4805 side-lane sample (producer ~2600 upper, main payload
@@ -53,12 +63,12 @@ function bigHistory(count: number): CoreMessage[] {
     return msgs;
 }
 
-test("T1 settle keeps usage truth: the far-smaller sample supersedes AND snapshots its producer's payload", () => {
+test("T1 sub-scale side-lane samples settle billing-only; main-lane reports write and snapshot", () => {
     const session = sessionWith(300_000);
     session.stats.localInputEstimate = 2_600; // the side-lane request's own outbound upper
     settleUsageReport(session, { total: 5_100, reportedCached: 128, output: 30, protocol: "openai" });
-    assert.equal(session.stats.lastInputTokens, 5_100, "usage-grade samples supersede unconditionally (#1492 B self-heal)");
-    assert.equal(session.stats.lastUsagePayloadUpper, 2_600, "the anchor now carries its producing request's payload snapshot");
+    assert.equal(session.stats.lastInputTokens, 300_000, "#4425: a sub-scale sample must not clobber the main anchor (billing-only)");
+    assert.equal(session.stats.lastUsagePayloadUpper, undefined, "the gated settle takes no producer snapshot either");
     assert.equal(session.stats.inputTokens, 5_100, "the sample still counts toward cumulative usage");
     // A same-lane report (producer at main scale) writes and re-snapshots.
     session.stats.localInputEstimate = 295_000;
@@ -72,9 +82,12 @@ test("T1b settle anchors: empty anchors always write; post-fold credit nets thro
     settleUsageReport(fresh, { total: 5_100, reportedCached: null });
     assert.equal(fresh.stats.lastInputTokens, 5_100, "first settle on an empty anchor always writes");
 
-    const folded = sessionWith(300_000);
-    (folded.stats as { compressCreditTokens?: number }).compressCreditTokens = 40_000;
-    settleUsageReport(folded, { total: 30_000, reportedCached: null });
+    // Post-fold shape a real wire can produce: the re-request bills the
+    // unfolded body (above the #4425 ratio of anchor+credit), the credit nets
+    // it back down, and the clamp-to-zero path still holds.
+    const folded = sessionWith(200_000);
+    (folded.stats as { compressCreditTokens?: number }).compressCreditTokens = 50_000;
+    settleUsageReport(folded, { total: 45_000, reportedCached: null });
     assert.equal(folded.stats.lastInputTokens, 0, "a credit-carrying (post-fold) settle nets against the credit and writes — our own shrinkage is not side-lane");
 });
 

@@ -35,16 +35,21 @@ import { setLogCapture } from "../src/logger.ts";
 // the fixture's way — same rationale as #1119):
 //   A. poisoned ESTIMATE baseline + folded payload → no preflight calls, no
 //      nudge, history intact, self-heal via the next real usage report.
-//   B. poisoned USAGE baseline → preflight STILL fires (real overflow evidence
-//      must keep driving compression — the fix must not over-correct).
+//   B. poisoned USAGE baseline → the fitting payload forwards silently
+//      (#4288 re-land, PR #4725); self-heal via the next real usage report.
+// Billing caliber (#4425 follow-up, same conversion as #2033): the relay bills
+// at chars/4 so each report tracks its own payload's scale — the #4425
+// non-main settle gate rejects reports an order of magnitude below the
+// established session load, and a constant tiny-billing mock would read as
+// aux-shaped against the poisoned incumbent.
 
 const WINDOW = 120_000;
 const POISON = 1_200_000; // mirrors the reported 1.27M raw-history estimate
 const NUDGE_MARKER = "Context limit reached";
 
-function okSse(): string {
+function okSse(inputTokens: number): string {
     return (
-        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m1", role: "assistant", usage: { input_tokens: 5000 } } })}\n\n` +
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m1", role: "assistant", usage: { input_tokens: inputTokens } } })}\n\n` +
         `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n` +
         `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n` +
         `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n` +
@@ -87,6 +92,7 @@ function baseConversation(): Msg[] {
  *  streaming turns, records what it received. */
 function makeRelay() {
     const received: Buffer[] = [];
+    const billedCalls: number[] = [];
     let nonStream = 0;
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -106,11 +112,15 @@ function makeRelay() {
                 res.end(summaryJson());
                 return;
             }
+            // Billing caliber: chars/4 of the body actually forwarded, so the
+            // usage report tracks this request's own payload scale.
+            const inputTokens = Math.round(raw.length / 4);
+            billedCalls.push(inputTokens);
             res.writeHead(200, { "content-type": "text/event-stream" });
-            res.end(okSse());
+            res.end(okSse(inputTokens));
         });
     });
-    return { server, received, nonStreamCalls: () => nonStream };
+    return { server, received, billedCalls, nonStreamCalls: () => nonStream };
 }
 
 async function runCase(sessionId: string, poisonSource: "usage" | "estimate", conversation?: Msg[]) {
@@ -161,8 +171,12 @@ async function runCase(sessionId: string, poisonSource: "usage" | "estimate", co
         assert.equal(r1.status, 200, "turn 1 succeeds");
         await r1.text();
 
-        const s = listSessions().find((x) => x.stats.lastInputTokens === 5000);
-        assert.ok(s, "turn 1 reported usage (lastInputTokens = 5000)");
+        const s = listSessions().find((x) => x.id === sessionId);
+        assert.ok(s, "turn 1 established the session");
+        assert.equal(s!.stats.lastInputTokensSource, "usage", "turn 1 settled a real usage report");
+        // The rebuild prepare zeroes the compress credit before settle, so the
+        // accepted report lands exactly at the billed total (credit netting = 0).
+        assert.equal(s!.stats.lastInputTokens, relay.billedCalls[relay.billedCalls.length - 1], "turn 1's real usage report anchored the session baseline");
         // Poison exactly what armFailureShrink writes after an upstream failure
         // on a turn whose outbound was the unfolded raw history.
         s!.stats.lastInputTokens = POISON;
@@ -201,14 +215,15 @@ async function runCase(sessionId: string, poisonSource: "usage" | "estimate", co
 }
 
 test("#1492 A: poisoned estimate baseline must not drive nudge/preflight on a folded payload", async () => {
-    const { streamed, nonStream, session, logs } = await runCase("issue1492-est-sess", "estimate");
+    const { streamed, nonStream, session, relay, logs } = await runCase("issue1492-est-sess", "estimate");
     assert.equal(nonStream, 0, "preflight must stay silent — the payload's own post-fold estimate fits the window (pre-fix: the stale 1.2M baseline fired it and burned summarization rounds)");
     assert.equal(streamed.length, 2, "two streaming forwards (one per turn)");
     assert.ok(!streamed[1].includes(NUDGE_MARKER), `turn 2 must not carry a nudge (pre-fix: 1.2M/120K ≈ 1000% lit the pressure/emergency bands), got tail: ${streamed[1]?.slice(-400)}`);
     for (let i = 0; i < 6; i++) {
         assert.ok(streamed[1].includes(`CODE_${i}_`), `heavy ${i} must survive unfolded (no fold ran)`);
     }
-    assert.equal(session.stats.lastInputTokens, 5000, "the recovered turn's real usage report overwrote the poisoned value");
+    assert.equal(session.stats.lastInputTokensSource, "usage", "the recovered turn's real usage report overwrote the poisoned value");
+    assert.equal(session.stats.lastInputTokens, relay.billedCalls[relay.billedCalls.length - 1], "the recovered turn's real usage report overwrote the poisoned value");
     assert.ok(
         !logs.some((l) => l.includes("preflight target reached") || l.includes("preflight made no progress") || l.includes("preflight")),
         `preflight must not even ENTER on a folded fitting payload with an estimate-grade baseline (trigger gate): ${JSON.stringify(logs.filter((l) => l.toLowerCase().includes("preflight")))}`,
@@ -228,13 +243,14 @@ test("#1492 B (post-#4288): a usage-sourced baseline above the window on a FITTI
     // rescue folds. Estimate-grade stays silent (case A); usage-grade on a
     // fitting payload is now silent too — the arm is the overflow evidence
     // channel, not the stale usage number.
-    const { streamed, nonStream, session } = await runCase("issue1492-usage-sess", "usage");
+    const { streamed, nonStream, session, relay } = await runCase("issue1492-usage-sess", "usage");
     assert.equal(nonStream, 0, `a fitting payload forwards without summarization even under a usage-grade stale baseline (nonStream=${nonStream})`);
     assert.equal(streamed.length, 2, "two streaming forwards (one per turn)");
     for (let i = 0; i < 6; i++) {
         assert.ok(streamed[1].includes(`CODE_${i}_`), `heavy ${i} must survive unfolded (no fold ran)`);
     }
-    assert.equal(session.stats.lastInputTokens, 5000, "self-heal via the next real usage report");
+    assert.equal(session.stats.lastInputTokensSource, "usage", "self-heal via the next real usage report");
+    assert.equal(session.stats.lastInputTokens, relay.billedCalls[relay.billedCalls.length - 1], "self-heal via the next real usage report");
 });
 
 // Test C pins the INNER layer (preflight.ts loop floor): a legitimately-entered
@@ -253,6 +269,5 @@ test("#1492 C: preflight loop sizes from the payload, not a poisoned estimate fl
     const { nonStream, session } = await runCase("issue1492-loop-sess", "estimate", big);
     const active = session.state.blocks.filter((b) => b.active).length;
     assert.ok(nonStream >= 1, "the over-target payload legitimately enters preflight");
-    console.error(`DIAG nonStream=${nonStream} active=${active} blocks=${session.state.blocks.length} msgs-folded-check`);
     assert.ok(active <= 16, `gated loop folds only enough to fit (active=${active}); an ungated poisoned floor would fold every viable range (~27+)`);
 });
