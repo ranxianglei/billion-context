@@ -13,6 +13,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
 import { IMAGE_PLACEHOLDER, imagePlaceholders, messageImages } from "../src/image-note.ts";
+import type { IndexedImage } from "../src/image-restore.ts";
 
 // Issue #781: renderRange only read m.text while images ride BiliMessage
 // sidecars — so every image in a folded range vanished from the tier-1 summary
@@ -47,6 +48,7 @@ function jpegB64(w: number, h: number): string {
 }
 
 const PNG_B64 = pngB64(1024, 768);
+const SMALL_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAcAAAACCAYAAACUn8ZgAAAAE0lEQVR4AWNkYPj/nwEHYGLAAwBtQQICIRGfXAAAAABJRU5ErkJggg==";
 const JPEG_B64 = jpegB64(768, 1024);
 const GARBAGE_B64 = "A".repeat(8000);
 
@@ -244,7 +246,10 @@ test("e2e #781/#2607 (Responses): archivable media folds — placeholders reach 
         const input: unknown[] = [
             { type: "message", role: "user", content: [{ type: "input_text", text: "here is the failing screen" }, { type: "input_image", image_url: `data:image/png;base64,${PNG_B64}` }] },
             { type: "message", role: "assistant", content: `Message 0 of the long conversation. ${filler(0)}` },
-            { type: "message", role: "user", content: [{ type: "input_text", text: "and another screenshot" }, { type: "input_image", image_url: `data:image/png;base64,${PNG_B64}` }] },
+            { type: "message", role: "user", content: [{ type: "input_text", text: "and two more screenshots" },
+                { type: "input_image", image_url: `data:image/png;base64,${PNG_B64}` },
+                { type: "input_image", image_url: `data:image/png;base64,${SMALL_PNG_B64}` },
+            ] },
         ];
         for (let i = 1; i < 12; i++) {
             input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ${filler(i)}` });
@@ -262,6 +267,7 @@ test("e2e #781/#2607 (Responses): archivable media folds — placeholders reach 
         // Placeholders carry the ref suffix ("[image: png 1024x768 · m00001]"),
         // so count on the prefix, not the closed-bracket literal.
         assert.equal(countOcc(all, "[image: png 1024x768"), 2, "#2607: archivable media folds like text — each folded image rides the summary input as its placeholder (#781)");
+        assert.equal(countOcc(all, "[image: png 7x2"), 1, "split image cores contribute only their own image to the summary request");
         assert.ok(!all.includes(PNG_B64.slice(0, 24)), "no image bytes leak into the summary request");
         assert.ok((all.match(/· m\d{5}/g) ?? []).length >= 2, "the summary-input placeholders carry the mNNNNN refs decompress({ imageRef }) needs");
         assert.equal(forwards.length, 1, "exactly one forward upstream");
@@ -275,6 +281,14 @@ test("e2e #781/#2607 (Responses): archivable media folds — placeholders reach 
         const s = listSessions().find((x) => x.meta.label === "img-sess-781-resp");
         assert.ok(s, "session exists");
         assert.ok((s!.state.blocks ?? []).some((b) => b.active), "compression block recorded from preflight");
+        const notes = [...all.matchAll(/\[image: png (\d+)x(\d+) · (m\d+)\]/g)];
+        assert.equal(notes.length, 3, "three physical images produce three model-visible notes");
+        for (const [, width, height, ref] of notes) {
+            const images: IndexedImage[] | undefined = s.incomingImageIndex?.get(ref);
+            assert.ok(images, `summary ref ${ref} has recovery bytes`);
+            assert.equal(images.length, 1);
+            assert.deepEqual([images[0].width, images[0].height], [Number(width), Number(height)], "summary dimensions belong to the referenced image");
+        }
     } finally {
         await closeAll(proxy, upstream);
     }

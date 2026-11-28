@@ -81,9 +81,16 @@ export function messageImages(m: CoreMessage): ImageRef[] {
         }
         if (refs.length > 0) return refs;
     }
-    // Responses: the original item keeps every input_image part (the singular
-    // imageBase64 sidecar covers only the first), so walk it when present.
+    // Responses split cores own one image; unsplit carriers and tool outputs
+    // can still carry several images in the original item.
     const ri = mm.rawResponsesItem;
+    if (isObj(ri) && mm.imagePart === true) {
+        // A split image core shares the whole carrier with its siblings, but
+        // its ref owns only this occurrence. Remote images have no own bytes.
+        return [typeof mm.imageBase64 === "string"
+            ? { mediaType: mm.imageMediaType, b64: mm.imageBase64 }
+            : {}];
+    }
     const responseParts = isObj(ri) && Array.isArray(ri.content) ? ri.content : responsesToolImageParts(ri);
     if (responseParts) {
         const refs: ImageRef[] = [];
