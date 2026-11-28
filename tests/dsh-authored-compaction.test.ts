@@ -326,7 +326,7 @@ test("e2e: authored compaction answers locally — zero egress, tagged checkpoin
         assert.equal(h.bodies.length, before, "upstream never contacted (zero egress)");
         const s = h.sessionOf("s-auth")!;
         assert.equal(s.metadata["dshAuthoredCompactions"], 1, "authored counter");
-        assert.ok(typeof s.metadata["dshCompactionRefusedBytes"] === "number", "raw ledger high-water still marked");
+        assert.equal(s.metadata["dshCompactionRefusedBytes"], Buffer.byteLength(r.body), "#5289: floor follows the snapshot we sent, not the ~600K pre-answer envelope peak");
         assert.equal(s.metadata["dshCompactionRefusals"], undefined, "not counted as a refusal");
     });
 });
