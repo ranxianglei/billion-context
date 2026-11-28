@@ -1356,6 +1356,7 @@ function deepSizeOf(value: unknown): number {
         if (Buffer.isBuffer(v)) return 64 + v.byteLength;
         if (v instanceof LazyBlockContents && v.isDropped) return 64; // #3050 R3 ②b: folded away — measuring must not re-materialize it
         if (droppedMetadataProxies.has(v)) return 64; // #3050 R3 ②c: same for folded metadata records
+        if (droppedContentStoreProxies.has(v)) return 64;
         let bytes = 64;
         if (v instanceof Map) {
             for (const [key, item] of v) bytes += size(key) + size(item) + 32;
@@ -1381,6 +1382,10 @@ export function sessionWeight(session: Session): number {
     const bytes = deepSizeOf(session);
     residentWeights.set(session, { revision, bytes });
     return bytes;
+}
+
+export function invalidateResidentWeight(session: Session): void {
+    residentWeights.delete(session);
 }
 
 /** Per-field resident bytes for one session (#R3 diagnostics). The `total` leg
@@ -2267,6 +2272,7 @@ function evictOldest(opts?: { overrideGrace?: boolean }): boolean {
     if (!oldestId) return false;
     const s = sessions.get(oldestId)!;
     const graceOverride = isColdLoadGraced(s);
+    const liveWeight = sessionWeight(s);
     const ok = getStore().flushSync(s);
     if (!ok) {
         // A prior save does not contain the latest mutations. Keep newer
@@ -2274,12 +2280,12 @@ function evictOldest(opts?: { overrideGrace?: boolean }): boolean {
         return false;
     }
     sessions.delete(oldestId);
-    stampEvictedWeight(oldestId, sessionWeight(s));
+    stampEvictedWeight(oldestId, liveWeight);
     // #3126: eviction is the trigger for the empty-view compress window (the
     // session's message bytes live only here; state reloads from disk but the
     // view self-heals only on the next model request). Log it so operators can
     // correlate ctx=0 receipts with the exact moment a session left memory.
-    loggerLog("info", `[session] evicted ${oldestId} from resident pool (weight ${sessionWeight(s)} bytes, ${sessions.size} session(s) remain, budget ${MAX_RESIDENT_BYTES} bytes${graceOverride ? ", cold-load grace overridden for count-cap admission" : ""})`);
+    loggerLog("info", `[session] evicted ${oldestId} from resident pool (weight ${liveWeight} bytes, ${sessions.size} session(s) remain, budget ${MAX_RESIDENT_BYTES} bytes${graceOverride ? ", cold-load grace overridden for count-cap admission" : ""})`);
     return true;
 }
 

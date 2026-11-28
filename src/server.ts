@@ -3917,12 +3917,20 @@ interface MeasuredOutbound {
 // #5000 item 3: dimension clause for the measured-doom messages — which part
 // of the body carries the mass, so "trim the oversized content" tells the
 // operator WHERE (a 55.2 MiB #5000 body with 1.44 MiB of messages[] means the
-// mass is tools[], not a giant paste).
+// mass is tools[], not a giant paste). #6844: `other` is a catch-all bucket —
+// when it is non-empty the clause also names the top-level field dominating
+// it, so the operator sees WHICH host-attached field is being metered without
+// manual arithmetic (the incident's 88%-`other` body took a body dump to
+// attribute).
 export function measuredBreakdownClause(b: RawBodyBreakdown): string {
-    return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
+    const top = b.otherTop[0];
+    const other = b.other > 0 && top
+        ? `other ~${b.other.toLocaleString("en-US")} (top field: ${top.field} ~${top.tokens.toLocaleString("en-US")})`
+        : `other ~${b.other.toLocaleString("en-US")}`;
+    return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · ${other}`;
 }
 
-export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {
+export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown; protocol?: WireProtocol }): MeasuredOutbound | undefined {
     let parsed: unknown = prepared.parsedBody;
     if (parsed === undefined) {
         const raw = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
@@ -3932,7 +3940,10 @@ export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?:
             return undefined;
         }
     }
-    const breakdown = estimateRawBodyBreakdown(parsed);
+    // #6828: pass the lane's protocol so a dual-shape body's foreign conversation
+    // field (e.g. Responses `input` riding alongside OpenAI `messages`) is not
+    // metered — the upstream never bills it, and counting it false-trips the fuse.
+    const breakdown = estimateRawBodyBreakdown(parsed, prepared.protocol);
     return { tokens: breakdown.total, breakdown };
 }
 
@@ -4822,7 +4833,9 @@ export async function preflightCompressIfNeeded(
     let outboundBreakdown: RawBodyBreakdown | undefined;
     try {
         const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
-        outboundBreakdown = estimateRawBodyBreakdown(outBody);
+        // #6828: same protocol-scoped meter as the relay fuse — a dual-shape
+        // body's foreign conversation field must not doom-gate the rebuild.
+        outboundBreakdown = estimateRawBodyBreakdown(outBody, prepared.protocol);
         outboundRawTokens = outboundBreakdown.total;
         const outField = outputBudgetField(outBody);
         const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;

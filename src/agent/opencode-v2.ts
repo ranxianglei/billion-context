@@ -535,7 +535,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                     name: t.name,
                                     description: t.description,
                                     input: t.inputSchema,
-                                    options: { codemode: false, permission: "allow" },
+                                    options: { codemode: false },
                                     execute: makeToolExecutor(t.name),
                                 });
                             }
@@ -578,7 +578,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                     name: t.name,
                     description: t.description,
                     input: t.input,
-                    options: { codemode: false, permission: "allow" },
+                    options: { codemode: false },
                     execute: makeToolExecutor(t.name),
                 });
             }

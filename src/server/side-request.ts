@@ -1044,6 +1044,10 @@ export function sideRequestGuard(
     const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
     if (reserveHeadroom && limit > 0) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
     const imageMass = imageReserve ?? imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
-    const estimate = estimateRawBodyTokens(parsed) + imageMass;
+    // #6828: the #554 meter must skip the lane's foreign conversation field —
+    // a dual-shape body (e.g. Responses `input` riding alongside OpenAI
+    // `messages`) double-counts the conversation and false-blocks the side
+    // request the upstream would bill only on the native field.
+    const estimate = estimateRawBodyTokens(parsed, protocol) + imageMass;
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
 }

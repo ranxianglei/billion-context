@@ -50,32 +50,15 @@ const DSH_COMPACTION_BASIC_PACKAGE = "@deepseek-ai/dsh-compaction-basic";
 const DSH_COMMAND_COMPACT_PACKAGE = "@deepseek-ai/dsh-command-compact";
 /** The agent-preset entry whose resolved config carries the plugin rows. */
 const DSH_AGENT_PRESET_PACKAGE = "@deepseek-ai/dsh-agent-preset";
-/** Gate service name referenced by the preset `inject:` entries in
- *  dsh.bundle.patch.yml and the launcher overlay patch. A preset cannot
- *  register until this service is provided, so the middleware below is
- *  guaranteed registered before any protected preset resolves its config even
- *  when sibling imports finish out of order. #3662: the provider is the
- *  always-on gate entry (dsh-compaction-gate.ts), NOT bili-native — disabling
- *  or kill-switching bili-native must keep the latch satisfiable so the
- *  presets fall back to stock instead of pending forever; only disabling the
- *  gate entry itself leaves them pending (see the bundle patch header).
+/** Gate service name the bundle patch and the launcher overlay used to gate
+ *  the four Web presets on. #7111: that gate is gone — an entry-level inject is
+ *  fail-closed (no optional dependency, no timeout, no fallback), so a missing
+ *  service bricked session creation instead of degrading compression. The name
+ *  is still published as a presence marker (see `dsh-compaction-gate.ts`), so
+ *  older profiles keep activating and external diagnostics keep resolving it.
  *  Coexistence with the upstream plugin is safe: its service name differs and
  *  both overlays are idempotent (disabled:true twice = disabled:true). */
 export const BILI_COMPACTION_DISABLE_SERVICE = "biliBasicCompactionPolicy";
-/** The four Web agent presets the overlay must reach (dsh-web-app roster;
- *  preset-minimal ships no compaction group today — the row is a no-op there
- *  and future-proofs it if one lands). */
-const DSH_WEB_PRESET_IDS = ["preset-standard", "preset-ptc", "preset-minimal", "preset-cordis"] as const;
-
-/** The bundle-patch rows gating each Web preset on the overlay service — the
- *  single source of truth shared by the launcher overlay string and pinned
- *  against dsh.bundle.patch.yml by tests (the two layers must stay in sync,
- *  cf. #2605). Entry inject lists are REPLACED by patches, not concatenated —
- *  if a future dsh ships its own inject list on these entries, merge manually
- *  here AND in both patch layers. */
-export function compactionDisablePatchRows(): string {
-    return DSH_WEB_PRESET_IDS.map((id) => `- id: ${id}\n  inject: [${BILI_COMPACTION_DISABLE_SERVICE}]\n`).join("");
-}
 
 // #3662: process-level verdict between the two entries. They are SEPARATE
 // bundles in the dsh host (separate module instances — module state cannot
@@ -389,4 +372,38 @@ export function hostPlaneRowsMissingAutoFalse(entries: Iterable<unknown>): strin
 export function hostPlaneOverrideLostWarning(entryIds: readonly string[]): string {
     const rows = entryIds.map((id) => JSON.stringify(id)).join(", ");
     return `bili: the host-plane compaction-basic override is GONE (entry ${rows}): a later patch layer replaced that row's whole config, so "auto" fell back to its default true and dsh native auto-compaction is ARMED again. Restate "auto: false" in the LAST patch row that touches id compaction-basic, or remove that override (a landed checkpoint destroys the fold base).`;
+}
+
+type ReconcileEntry = {
+    options?: { id?: unknown; name?: unknown; config?: unknown } | undefined;
+    update?: (options: { config: unknown }, create?: boolean, force?: boolean) => unknown;
+};
+
+/** #7111: fail-open replacement for the retired preset inject gate. The four
+ *  Web presets are mounted before this entry activates, so their resolved
+ *  config already carries live compaction rows; re-submitting that config
+ *  restarts each entry and the `internal/config` middleware above rewrites the
+ *  rows exactly as it does on a cold resolve. Entries that never nest a
+ *  compaction row, and hosts whose entries expose no `update`, are left alone.
+ *  Returns how many entries were re-submitted (0 = nothing to do, which is the
+ *  only outcome a missing gate service can now produce). */
+export function reconcileLoadedPresets(entries: Iterable<unknown>): number {
+    let touched = 0;
+    for (const raw of entries) {
+        if (raw === null || typeof raw !== "object") continue;
+        const entry = raw as ReconcileEntry;
+        const config = entry.options?.config;
+        if (config === null || typeof config !== "object" || Array.isArray(config)) continue;
+        const plugins = (config as { plugins?: unknown }).plugins;
+        if (!Array.isArray(plugins) || countCompactionRows(plugins) === 0) continue;
+        if (typeof entry.update !== "function") continue;
+        const next = { ...(config as Record<string, unknown>), plugins: disableBasicCompaction(plugins) };
+        try {
+            entry.update({ config: next });
+            touched += 1;
+        } catch {
+            // A failing reconcile must never take the gate entry down with it.
+        }
+    }
+    return touched;
 }
