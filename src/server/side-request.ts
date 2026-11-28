@@ -219,7 +219,7 @@ export function isAudioOutputCall(parsed: unknown): boolean {
 // demotes a main turn to the side lane. Proto-safe: reads the entry arrays of
 // every wire shape (responses `input`, openai/anthropic `messages`, google
 // `contents`), no protocol argument.
-export function hasResentHistory(parsed: unknown): boolean {
+function hasResentHistory(parsed: unknown): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     const p = parsed as Record<string, unknown>;
     const entries = p.input ?? p.messages ?? p.contents;
