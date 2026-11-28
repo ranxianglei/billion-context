@@ -274,15 +274,29 @@ test("#3380 P2 integration: failures escalate on the ladder, then heal clean", a
             _resetRegisterForTest(undefined);
             resetRootLayer();
             let failing = true;
-            const raw = mockCtx({ registerError: () => (failing ? new Error("manifest down (transient)") : undefined) });
+            const armTimes: number[] = [];
+            const raw = mockCtx({
+                registerError: () => {
+                    const err = failing ? new Error("manifest down (transient)") : undefined;
+                    if (err !== undefined) armTimes.push(Date.now());
+                    return err;
+                },
+            });
             const ctx = mockCtxTyped(raw);
             apply(ctx);
             // Third consecutive failure arms the third ladder step (4×base).
             await waitFor(() => _registerStateForTest().failStreak >= 3, "three consecutive failures");
             const snap = _registerStateForTest();
             assert.equal(snap.lastRegistrationError, "manifest down (transient)", "last error recorded for status surfaces");
-            const delta = snap.retryAt - Date.now();
-            assert.ok(delta >= 30 && delta <= 95, `retryAt sits on the 80ms ladder step (got ${delta}ms)`);
+            // #3571: the throw lands in the same event-loop turn as the
+            // back-off arm (registerTools .catch), so retryAt minus the arm
+            // time IS the applied ladder step — immune to runner stalls
+            // between the arm and this observation.
+            const armTime = armTimes[snap.failStreak - 1];
+            assert.ok(armTime !== undefined, "failing registration threw before the arm");
+            const step = snap.retryAt - armTime;
+            const expected = _regBackoffForTest(snap.failStreak);
+            assert.ok(step >= expected - 20 && step <= expected + 25, `retryAt sits on the ${expected}ms ladder step (got ${step}ms)`);
             // Heal: the transient fault clears, the next attempt succeeds, and
             // the bookkeeping resets.
             failing = false;
