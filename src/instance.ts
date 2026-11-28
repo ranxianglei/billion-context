@@ -32,6 +32,11 @@ export interface ProxyInstanceFile {
      *  fingerprint means pre-#1225 code — attaching new code to it would
      *  serve stale behavior, so readers must treat absence as incompatible. */
     codeFingerprint?: string;
+    /** #7861: resolved sessions dir this instance serves, carried over from
+     *  the registry marker (discoverLiveInstances). Absent for origin-file
+     *  views and pre-#5046 markers — readers treat absence as UNKNOWN, not
+     *  "same as ours" (conservative: old peers stay attachable). */
+    sessionsDir?: string;
 }
 
 export function isProxyInstanceFile(v: ProxyInstanceFile | { origin: string } | undefined): v is ProxyInstanceFile {
@@ -713,7 +718,7 @@ function lanesOverlap(a: string | undefined, b: string | undefined): boolean {
  *  differ after normalization. Unknown on either side = "not proven apart" →
  *  false (conservative): pre-#5046 markers carry no dir, so isolation cannot
  *  be claimed for them. */
-function sessionsDirsDiffer(a: string | undefined, b: string | undefined): boolean {
+export function sessionsDirsDiffer(a: string | undefined, b: string | undefined): boolean {
     if (a === undefined || b === undefined) return false;
     const x = path.resolve(a);
     const y = path.resolve(b);
@@ -806,6 +811,9 @@ export function discoverLiveInstances(): ProxyInstanceFile[] {
             modelMaxOutputs: e.modelMaxOutputs,
             lane: e.lane,
             codeFingerprint: e.codeFingerprint,
+            // #7861: carry the store identity so the attach decision can
+            // refuse peers serving a DIFFERENT sessions dir.
+            sessionsDir: e.sessionsDir,
         });
     }
     return out;

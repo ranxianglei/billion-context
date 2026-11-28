@@ -146,6 +146,9 @@ export const LIVE_FILES = [
     // script with env fixtures; results land in mkdtemp dirs — no ports, no
     // credentials, no long-lived listeners, safe under --test-concurrency.
     "tests/ci-stale-pr-gate.test.ts",
+    // #7858: spawns `node --import tsx src/index.ts -c <name> sessions ls`
+    // in an mkdtemp XDG sandbox (hermetic dirs, no network/ports/creds).
+    "tests/cli-config-flag-store.test.ts",
     // #7806: spawns short-lived fake `git`/`npm` PATH-shim children against
     // mkdtemp dirs (shimmed global root, fixture source tree); no network,
     // no ports, no credentials, safe under --test-concurrency.
