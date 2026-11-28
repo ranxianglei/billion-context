@@ -42,6 +42,37 @@ test("isSideRequest: tiny output budget across protocol field names", () => {
     assert.equal(isSideRequest({ max_output_tokens: 16, tools: [{ type: "function", function: { name: "f" } }] }), false, "#546: responses wire, starved budget + tools → main");
 });
 
+test("isSideRequest: a no-tools body that resends model-round-trip history is a MAIN turn (#7882)", () => {
+    // Pi's clamp (pi-ai simple-options) decays max_output_tokens as the raw
+    // transcript nears the window (7602 -> ... -> 16 in one session). A long
+    // no-tools main turn that resends its full history then lands in the <=200
+    // "title call" band and was refused by the side guard instead of being
+    // compressed. The replay veto keeps it on the main lane: model-round-trip
+    // evidence (assistant/tool/model roles, or function_call /
+    // function_call_output / reasoning / item_reference / custom_tool_call /
+    // custom_tool_call_output items) is a main turn regardless of the declared
+    // output budget — a one-shot side call never carries such evidence.
+    // responses wire: assistant message + function_call/function_call_output items
+    assert.equal(isSideRequest({ max_output_tokens: 16, input: [{ type: "message", role: "assistant", content: [] }, { type: "function_call", name: "f", arguments: "{}" }, { type: "function_call_output", call_id: "c1", output: "ok" }] }), false, "responses: assistant + tool round-trip → main even at budget 16");
+    // responses wire: a single function_call_output item is enough evidence
+    assert.equal(isSideRequest({ max_output_tokens: 100, input: [{ type: "function_call_output", call_id: "c1", output: "ok" }] }), false, "responses: a function_call_output item alone is main-round-trip evidence");
+    // openai wire: assistant + tool roles
+    assert.equal(isSideRequest({ max_tokens: 50, messages: [{ role: "assistant", content: "hi" }, { role: "tool", tool_call_id: "c1", content: "ok" }] }), false, "openai: assistant + tool roles → main");
+    // anthropic wire: assistant role
+    assert.equal(isSideRequest({ max_tokens: 100, messages: [{ role: "assistant", content: [{ type: "text", text: "hi" }] }] }), false, "anthropic: assistant role → main");
+    // google wire: model role
+    assert.equal(isSideRequest({ generationConfig: { maxOutputTokens: 100 }, contents: [{ role: "model", parts: [{ text: "hi" }] }] }), false, "google: model role → main");
+    // A one-shot (no history) with a tiny budget is STILL a side request
+    assert.equal(isSideRequest({ max_tokens: 100, messages: [{ role: "user", content: "title this" }] }), true, "one-shot user-only body stays a side request");
+    assert.equal(isSideRequest({ max_tokens: 200, input: [{ type: "message", role: "user", content: [] }] }), true, "responses: user-only one-shot stays a side request");
+    // A tool-carrying body is already main (the non-empty-tools rung) — the
+    // veto is a no-op there, but the history must not flip it back to side.
+    assert.equal(isSideRequest({ max_tokens: 100, tools: [{ name: "f" }], messages: [{ role: "assistant", content: "hi" }] }), false, "tools + history → main (unchanged)");
+    // Explicit host intent still outranks the veto: a declared side agent with
+    // history is still a side request (the host knows better than the shape).
+    assert.equal(isSideRequest({ max_tokens: 100, input: [{ type: "message", role: "assistant", content: [] }] }, "title"), true, "declared side agent outranks the replay veto");
+});
+
 test("isSideRequest: a toolless structured-output request is a side request", () => {
     // A memory-extraction daemon (Hindsight) inherits the host's HTTPS_PROXY and
     // sends JSON-schema extraction calls with a large budget. Injected wire tools
@@ -159,6 +190,30 @@ test("restoreOutputBudget: high-water learning + starved-budget restore (#546)",
     const responsesStarved = { max_output_tokens: 1, tools: [{ type: "function" }] } as { max_output_tokens: number };
     restoreOutputBudget(responsesStarved, s2, noopLog);
     assert.equal(responsesStarved.max_output_tokens, 49152, "responses field restored on the same field");
+});
+
+test("restoreOutputBudget: a no-tools body that resends history is a MAIN turn and gets restored (#7882)", () => {
+    // Pi's clamp decays max_output_tokens as the raw transcript nears the window.
+    // A long no-tools main turn that resends its full history then lands in the
+    // <=200 "title call" band. Before #7882 the no-tools gate in
+    // restoreOutputBudget returned early, so the budget was never restored and
+    // the turn forwarded with a tiny budget (the model could not produce useful
+    // output). Now the no-tools gate also lets through history-resend main
+    // turns, so the budget is restored like any other starved main turn.
+    const s = metaSession("hw7882");
+    // Healthy request → learns the high-water.
+    restoreOutputBudget({ max_tokens: 32768 }, s, noopLog);
+    assert.equal(s.metadata.outputBudgetHighWater, 32768);
+    // No-tools main turn with history (assistant + tool round-trip) + starved
+    // budget → restored to the high-water.
+    const noToolsHistory = { max_tokens: 16, messages: [{ role: "assistant", content: "hi" }, { role: "tool", tool_call_id: "c1", content: "ok" }] } as { max_tokens: number };
+    restoreOutputBudget(noToolsHistory, s, noopLog);
+    assert.equal(noToolsHistory.max_tokens, 32768, "no-tools history-resend main turn restored to high-water");
+    // A no-tools one-shot (NO history) with a starved budget is still a side
+    // request → NOT restored (the side gate is unchanged).
+    const noToolsOneShot = { max_tokens: 100, messages: [{ role: "user", content: "title this" }] } as { max_tokens: number };
+    restoreOutputBudget(noToolsOneShot, s, noopLog);
+    assert.equal(noToolsOneShot.max_tokens, 100, "no-tools one-shot side request NOT restored");
 });
 
 test("restoreOutputBudget: configured-output-limit floor for poisoned or missing high-water (#1665)", () => {
@@ -678,6 +733,30 @@ test("sideRequestGuard: raw-body fit against declared ∩ armed window minus out
     assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.20), undefined, undefined, 1).blocked, true, "genuinely oversized CJK still blocks");
 });
 
+test("sideRequestGuard: the honest ceiling fields (window, maxOut) name the model window and output reservation separately (#7882)", () => {
+    // Before #7882 the refusal message printed the headroom-adjusted limit as
+    // "the effective context window", so 271984 (= 272000 - 16) read as if the
+    // model window were 271,984. Now the guard returns `window` (the pre-
+    // headroom ceiling) and `maxOut` (the output reservation) so the refusal
+    // can name them separately.
+    const txt = "z".repeat(8000);
+    const body = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: txt }] };
+    // Non-reserving route: window == model window, maxOut == 0, limit == window.
+    const g1 = sideRequestGuard(body, "anthropic", 272_000, undefined, undefined, 1, 0, undefined, false);
+    assert.equal(g1.window, 272_000, "window is the model window (non-reserving)");
+    assert.equal(g1.maxOut, 100, "maxOut is the declared output budget");
+    assert.equal(g1.limit, 272_000, "limit == window when not reserving");
+    // Reserving route: window stays the model window, limit = window - maxOut.
+    const g2 = sideRequestGuard(body, "anthropic", 272_000, undefined, undefined, 1, 0, undefined, true);
+    assert.equal(g2.window, 272_000, "window stays the model window (reserving)");
+    assert.equal(g2.maxOut, 100, "maxOut is the declared output budget");
+    assert.equal(g2.limit, 272_000 - 100, "limit = window - maxOut (reserving)");
+    // Armed limit lower than the model window: window = armed limit.
+    const g3 = sideRequestGuard(body, "anthropic", 272_000, undefined, undefined, 1, 100_000, undefined, false);
+    assert.equal(g3.window, 100_000, "window = armed limit when armed < model window");
+    assert.equal(g3.limit, 100_000, "limit == window when not reserving");
+});
+
 function okSse(inputTokens: number): string {
     return (
         `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m1", role: "assistant", usage: { input_tokens: inputTokens } } })}\n\n` +
@@ -693,6 +772,17 @@ function mainConversation(n: number): Array<{ role: string; content: string }> {
     const msgs: Array<{ role: string; content: string }> = [];
     for (let i = 0; i < n; i++) {
         msgs.push({ role: i % 2 === 0 ? "user" : "assistant", content: `Main message ${i} ${"z".repeat(500)}` });
+    }
+    return msgs;
+}
+
+/** A large one-shot body (user-only, no history) — a genuine side request shape
+ *  that the #7882 replay veto must NOT demote to main. Used by the side-guard
+ *  e2e tests so they keep testing the side lane after the replay veto landed. */
+function sideOnlyConversation(n: number): Array<{ role: string; content: string }> {
+    const msgs: Array<{ role: string; content: string }> = [];
+    for (let i = 0; i < n; i++) {
+        msgs.push({ role: "user", content: `Side message ${i} ${"z".repeat(500)}` });
     }
     return msgs;
 }
@@ -1136,7 +1226,8 @@ test("e2e: oversized side request is blocked locally (413), never reaches the up
         const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
 
         // ~40 × ~130 tokens ≈ 5k+ > 4_000 window → guaranteed upstream 400 if forwarded.
-        const r = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: mainConversation(40) }) });
+        // #7882: user-only (no history) so the replay veto keeps it on the side lane.
+        const r = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: sideOnlyConversation(40) }) });
         assert.equal(r.status, 413);
         const j = (await r.json()) as { error: { type: string; code: string; retryable: boolean; message: string } };
         assert.equal(j.error.type, "server_error");
@@ -1177,7 +1268,8 @@ test("e2e: overflow 400 on a side request arms the stated window; next one is bl
         // reports in its overflow marker. #987: the marker's number is no longer
         // LEARNED, but it arms the one-shot evidence at 120k — enough for the
         // guard to block the second attempt locally.
-        const big = mainConversation(1200);
+        // #7882: user-only (no history) so the replay veto keeps it on the side lane.
+        const big = sideOnlyConversation(1200);
         rig.sideErrorStatus = 400;
         rig.sideErrorBody = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 120,000)" } });
 
@@ -1258,7 +1350,8 @@ test("e2e: real usage report RETIRES the overflow arm — the blocked side reque
         // 1) ARM — same shape as the #554 arm test: ~155k payload fits the
         //    declared 200k window (first attempt forwards) but exceeds the real
         //    120,000 the upstream states in its overflow marker.
-        const big = mainConversation(1200);
+        //    #7882: user-only (no history) so the replay veto keeps it on the side lane.
+        const big = sideOnlyConversation(1200);
         rig.sideErrorStatus = 400;
         rig.sideErrorBody = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 120,000)" } });
         const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });
@@ -1310,7 +1403,8 @@ test("e2e: the overflow arm survives a restart round-trip; usage after reload re
         const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
 
         // ARM: overflow 400 → arm at the stated 120k.
-        const big = mainConversation(1200);
+        // #7882: user-only (no history) so the replay veto keeps it on the side lane.
+        const big = sideOnlyConversation(1200);
         rig.sideErrorStatus = 400;
         rig.sideErrorBody = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 120,000)" } });
         const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });

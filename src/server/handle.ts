@@ -2985,14 +2985,18 @@ async function handleRequest(
             const armedForGuard = typeof session.stats.overflowArmTokens === "number" && session.stats.overflowArmTokens > 0 ? session.stats.overflowArmTokens : 0;
             const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), imageTokenCapFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard, imageReserveFor(session, protocol, parsed, opts, route?.rewrittenUrl ?? upstreamOrigin), shouldReserveOutputHeadroom(protocol, normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin), requestModel));
             if (guard.blocked) {
-                log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
+                // #7882: name the ceiling honestly — the limit is the model
+                // window MINUS the output reservation, not a window of its own
+                // (271984 = 272000 - 16 read as a 272k/16k model variant).
+                const ceilingDetail = `ceiling ${guard.limit} (window ${guard.window}${guard.maxOut > 0 ? ` minus output budget ${guard.maxOut}` : ""})`;
+                log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ ${ceilingDetail} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
                     res.writeHead(413, { "content-type": "application/json" });
                     res.end(JSON.stringify({
                         error: {
                             type: "server_error",
                             code: "side_request_payload_too_large",
-                            message: `side request payload ~${guard.estimate} tokens reaches the effective context window ${guard.limit} (model=${reqModel ?? "unknown"}); NOT forwarded — side requests bypass compression by design (#388). Shrink the conversation or raise the model's context window.`,
+                            message: `side request payload ~${guard.estimate} tokens reaches the side-lane ${ceilingDetail} (model=${reqModel ?? "unknown"}); NOT forwarded — side requests bypass compression by design (#388). Shrink the conversation or raise the model's context window.`,
                             retryable: false,
                         },
                     }));
