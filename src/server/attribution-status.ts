@@ -19,6 +19,10 @@ interface AttributionReport {
     error?: string;
     /** #3651: masked endpoint (origin+pathname) of the last refused request. */
     endpoint?: string;
+    /** #5066: the episode contains a local oversize refusal — host attribution
+     *  dead AND body provably over the model window: every retry stays
+     *  refused until the host restarts (session wedged). Sticky until recovery. */
+    wedged?: boolean;
 }
 
 const reports = new Map<string, AttributionReport>();
@@ -32,6 +36,7 @@ export function recordAttributionReport(agent: string, report: AttributionReport
         since: report.since,
         ...(report.error !== undefined ? { error: report.error } : {}),
         ...(report.endpoint !== undefined ? { endpoint: report.endpoint } : {}),
+        ...(report.wedged === true ? { wedged: true } : {}),
     });
 }
 
@@ -47,6 +52,7 @@ export function attributionStatusWire(): Record<string, AttributionReport> {
         since: r.since,
         ...(r.error !== undefined ? { error: r.error } : {}),
         ...(r.endpoint !== undefined ? { endpoint: r.endpoint } : {}),
+        ...(r.wedged === true ? { wedged: true } : {}),
     };
     return out;
 }
