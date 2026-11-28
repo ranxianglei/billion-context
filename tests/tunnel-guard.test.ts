@@ -312,7 +312,27 @@ test("checkTunnelDestination: unresolvable surfaces the raw resolver code + reme
     assert.match(v.message, /\(EAI_AGAIN\)/, "raw resolver error code is surfaced");
     assert.match(v.message, /local name resolution failed/, "diagnostic hint points at a poisoned/unreachable resolver");
     assert.match(v.message, /upstream proxy/, "hint offers the proxy remediation");
-    assert.match(v.message, /restart the bili proxy process/, "#5224: hint offers the stale-resolver restart remedy");
+    assert.match(v.message, /never resolved no-such-host\.invalid/, "#7747: never-green host → restart remedy withheld (a fresh process would hit the same resolver)");
+    assert.doesNotMatch(v.message, /restart the bili proxy process/, "cold-start must not promise a restart that cannot help");
+});
+
+test("checkTunnelDestination: previously-green host keeps the restart remedy (#5224)", async () => {
+    let green = true;
+    const ok = await checkTunnelDestination("https://wedge.host/v1", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps, resolveBackoffMs: 1,
+        workerFallback: false,
+        resolveHost: async () => { if (green) return ["93.184.216.34"]; throw Object.assign(new Error("EAI_AGAIN"), { code: "EAI_AGAIN" }); },
+    });
+    assert.equal(ok.ok, true, "first resolution is green");
+    green = false;
+    const v = await checkTunnelDestination("https://wedge.host/v1", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps, resolveBackoffMs: 1,
+        workerFallback: false,
+        resolveHost: async () => { throw Object.assign(new Error("EAI_AGAIN"), { code: "EAI_AGAIN" }); },
+    });
+    assert.equal(v.ok, false);
+    assert.equal(v.code, "unresolvable");
+    assert.match(v.message, /restart the bili proxy process/, "#5224: previously-green host → the stale-resolver restart remedy is offered");
 });
 
 test("tunnelAllowlistFromEnv: comma parsing, case normalization, blanks dropped", () => {

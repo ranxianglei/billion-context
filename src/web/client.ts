@@ -1706,7 +1706,8 @@ function changelogCatOf(rawLine) {
             if (w && w.tripped) {
                 wb.hidden = false;
                 wb.classList.add("show");
-                wb.innerHTML = '<strong>' + t("wedge.on") + '</strong> <span class="mono">' + w.hosts.join(", ") + '</span>' + t("wedge.desc") + t("wedge.hint");
+                const hint = (w.coldStartHosts && w.coldStartHosts.length > 0) ? t("wedge.hintColdStart") : t("wedge.hint");
+                wb.innerHTML = '<strong>' + t("wedge.on") + '</strong> <span class="mono">' + w.hosts.join(", ") + '</span>' + t("wedge.desc") + hint;
             } else {
                 wb.hidden = true;
                 wb.classList.remove("show");

@@ -2,7 +2,7 @@ import { lookup } from "node:dns/promises";
 import { networkInterfaces } from "node:os";
 import { Worker } from "node:worker_threads";
 import { log as loggerLog } from "./logger.js";
-import { getResolverWedgeState, resolverWedgeRecord } from "./resolver-wedge.js";
+import { getResolverWedgeState, resolverWedgeHostEverResolved, resolverWedgeRecord } from "./resolver-wedge.js";
 
 /**
  * Tunnel admission for the `/bili/<absolute-url>` zero-config branch (#409).
@@ -337,14 +337,23 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
                 // main pool's own measurement.
             }
         }
-        if (resolved === undefined) return {
-            ok: false,
-            code: "unresolvable",
+        if (resolved === undefined) {
             // #5224: a long-lived process can hold stale OS-resolver state after a
             // WSL/VPN change (glibc caches resolv.conf; libuv getaddrinfo ages out),
             // so every admission fails until restart even though a fresh process resolves.
-            message: `cannot resolve tunnel destination ${host}${lastErrCode ? ` (${lastErrCode})` : ""}: local name resolution failed${workerStageRan ? " and a fresh resolver thread also failed" : ""} — the local resolver may be unreachable or taken over by another DNS service (VPN/MagicDNS); route egress through an upstream proxy to have the destination resolved remotely, or restart the bili proxy process (a long-lived process can hold a stale system-resolver state after a WSL/VPN network change; a fresh process re-reads it)`,
-        };
+            // #7747: but a process BORN wedged (DNS takeover before first launch, or a
+            // machine where direct egress is structurally impossible) NEVER resolved this
+            // host, so a fresh process would hit the same resolver — a restart can't help.
+            // Do not promise it; point at the proxy instead.
+            const remedy = resolverWedgeHostEverResolved(host)
+                ? "route egress through an upstream proxy to have the destination resolved remotely, or restart the bili proxy process (a long-lived process can hold a stale system-resolver state after a WSL/VPN network change; a fresh process re-reads it)"
+                : `route egress through an upstream proxy to have the destination resolved remotely — this process has never resolved ${host}, so restarting the bili proxy is unlikely to help (a fresh process would hit the same resolver)`;
+            return {
+                ok: false,
+                code: "unresolvable",
+                message: `cannot resolve tunnel destination ${host}${lastErrCode ? ` (${lastErrCode})` : ""}: local name resolution failed${workerStageRan ? " and a fresh resolver thread also failed" : ""} — the local resolver may be unreachable or taken over by another DNS service (VPN/MagicDNS); ${remedy}`,
+            };
+        }
         ips = resolved;
         if (ips.length === 0) return { ok: false, code: "unresolvable", message: `no addresses for tunnel destination ${host}` };
         // #2143: mDNS names (.local / single-label) answer with an unreachable
