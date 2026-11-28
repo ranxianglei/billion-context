@@ -409,9 +409,11 @@ export async function forwardTool(proxyBase: string, conversationId: string, too
 }
 
 /** Soft-fail by design: the status read is best-effort UI data; undefined
- *  means "no data" whether the proxy is down or the session is unknown. */
-export async function fetchStatus(proxyBase: string, conversationId: string): Promise<Record<string, unknown> | undefined> {
-    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/status?conversationId=${encodeURIComponent(conversationId)}`, undefined, STATUS_TIMEOUT_MS);
+ *  means "no data" whether the proxy is down or the session is unknown.
+ *  `init` lets a caller tighten the fetch (e.g. redirect: "manual" so a
+ *  sensitive id is never carried into a redirect target, #7582). */
+export async function fetchStatus(proxyBase: string, conversationId: string, init?: RequestInit): Promise<Record<string, unknown> | undefined> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/status?conversationId=${encodeURIComponent(conversationId)}`, init, STATUS_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") return undefined;
     return json as Record<string, unknown>;
 }
