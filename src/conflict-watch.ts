@@ -13,7 +13,7 @@ import { markDirty, type Session } from "./session.js";
 import { isCodexClient } from "./codex-compact.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "./thirdparty-scan.js";
 
-type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred" | "identity-orphan" | "id-churn-adoption";
+type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred" | "identity-orphan" | "id-churn-adoption" | "host-content-mutation";
 
 export interface ConflictEvent {
     at: number;
@@ -203,8 +203,14 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     // landing was fully rebased onto (#2372/#2432) — handled, no ongoing risk. Gated to the
     // pure case so mixed ledgers keep their existing tier verbatim.
     const handledNativeOnly = meaningful.length > 0 && meaningful.every((e) => e.kind === "native-compaction");
+    // #5395: byte-verified host-side MUTATION (a host tool-result pruner spliced
+    // its sentinel into folded content; bili re-anchored onto the pruned bytes).
+    // Own tier: it IS confirmed second-compressor evidence (the header says so),
+    // but unlike a native-compaction landing bili already REPAIRED it — the
+    // advice must name the mechanism and the switch, not command a hunt.
+    const hostMutationPresent = meaningful.some((e) => e.kind === "host-content-mutation");
     const activeConfirmed = confirmed.some((e) => now - e.at <= CONFLICT_ACTIVE_WINDOW_MS);
-    lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). ${foreignConfirmed || nativePresent
+    lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). ${foreignConfirmed || nativePresent || hostMutationPresent
         ? "Two compressors on one conversation (bili + another compression plugin — third-party or bili's own sibling — or client native compaction) double-compress and corrupt message refs:"
         : "Diagnostic evidence that something outside bili touched this conversation — how strong that evidence is is tiered below:"}`);
     for (const e of events.slice(-10)) {
@@ -247,6 +253,15 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
         advice = active.length > 0
             ? "The events above are client-native compaction landings bili ALREADY rebased onto (#2372/#2432): each detected checkpoint rebuilt the fold base, so there is no ongoing double-compression risk and nothing to disable. If you did not expect these sessions to auto-compact, review the client's own auto-compaction setting; otherwise clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
             : "All events above are client-native compaction landings older than 7 days (historical stock) that bili already rebased onto (#2372/#2432): handled at the time, no ongoing risk. Clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
+    } else if (hostMutationPresent) {
+        // #5395: already-repaired mutation — say so plainly (the conversation
+        // stayed coherent; bili re-anchored automatically) and name the switch
+        // that stops recurrence. Gated to ledgers carrying at least one such
+        // event; mixed ledgers keep their existing tier verbatim (first match
+        // wins, same as every branch above).
+        advice = active.length > 0
+            ? "The events above are byte-verified host-side mutations: a host compression plugin (tool-result pruner) rewrote content bili had folded, and bili re-anchored its fold state onto the rewritten bytes automatically — the conversation stays coherent, but two compressors ARE touching this session. To stop the recurrence disable the host's tool-result pruning/compaction plugins (keep exactly one compressor per conversation); otherwise clear this ledger."
+            : "All events above are byte-verified host-side mutations older than 7 days (historical stock) that bili already re-anchored onto automatically: no ongoing corruption, but the host's tool-result pruning/compaction plugins were active alongside bili. If you did not expect them, disable them; otherwise clear this ledger.";
     } else if (orphanOnly) {
         // A headerless replay does not prove that the original client moved.
         // Older ledgers may contain tail-only matches; neither proves state loss.
