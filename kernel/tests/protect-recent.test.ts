@@ -354,35 +354,49 @@ test("warnings accumulate across multiple ranges in one batch", () => {
   const state = seededState(messages);
   const cfg = config({ preserveRecentMessages: 3 });
 
-  // Two ranges: the second now ends inside the recent zone, which under the
-  // #3939 all-or-nothing contract would reject the whole batch (a fully-
-  // protected range is a fatal apply error, pinned in issue3939-fold-boundary-
-  // pins.test.ts), so it instead OVERLAPS the first range's span — overlap
-  // warn+skip keeps the batch valid while still exercising multi-range
-  // warning accumulation.
-  const result = core.applyCompression({
+  // Pre-fold the head so one batch range is already consumed (skip-with-
+  // warning) while the other stays live and gets clipped by the recent zone
+  // (exclusion warning): two distinct per-range warnings in one valid batch.
+  // Overlapping ranges can no longer play this role — since #5541 an overlap
+  // rejects the whole batch atomically (pinned in regression-bugfixes.test.ts).
+  const setup = core.applyCompression({
     ranges: [
       {
-        startRef: "m00004",
-        endRef: "m00009",
-        summary: "first partial range summary",
-        topic: "a",
-      },
-      {
-        startRef: "m00008",
-        endRef: "m00010",
-        summary: "second range overlaps the first",
-        topic: "b",
+        startRef: "m00001",
+        endRef: "m00003",
+        summary: "head fold",
+        topic: "h",
       },
     ],
     messages,
     state,
     config: cfg,
   });
+  assert.equal(setup.result.blocksCreated, 1, "setup fold lands");
+
+  const result = core.applyCompression({
+    ranges: [
+      {
+        startRef: "m00001",
+        endRef: "m00003",
+        summary: "already folded head",
+        topic: "h2",
+      },
+      {
+        startRef: "m00004",
+        endRef: "m00009",
+        summary: "live range clipped by the recent zone",
+        topic: "a",
+      },
+    ],
+    messages,
+    state: setup.state,
+    config: cfg,
+  });
 
   assert.ok(
     result.result.blocksCreated >= 1,
-    "at least the unprotected head compresses",
+    "the live range still compresses",
   );
   assert.ok(result.result.warnings.length >= 2, "warnings surfaced");
 });
