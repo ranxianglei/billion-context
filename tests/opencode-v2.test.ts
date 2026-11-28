@@ -304,7 +304,7 @@ test("v2 setup: registers the bundled bili tools synchronously with exact schema
             assert.deepEqual(fake.addedTools.map((t) => t.name), EXPECTED_TOOLS);
             for (const t of fake.addedTools) {
                 assert.equal(t.options?.codemode, false);
-                assert.equal(t.options?.permission, "allow");
+                assert.equal(t.options?.permission, undefined);
             }
             const compressSrc = [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].find((t) => t.function.name === "compress")!;
             assert.deepEqual(fake.addedTools.find((t) => t.name === "compress")!.input, compressSrc.function.parameters);
@@ -877,7 +877,7 @@ test("#2443: a manifest-advertised conditional tool (acp_retrieve) is registered
             const retrieve = fake.addedTools.find((t) => t.name === "acp_retrieve")!;
             assert.deepEqual(retrieve.input, rt.parameters);
             assert.equal(retrieve.options?.["codemode"], false);
-            assert.equal(retrieve.options?.["permission"], "allow");
+            assert.equal(retrieve.options?.["permission"], undefined);
             // The registered executor forwards to the live proxy dispatcher (reachable, not a dead pointer).
             const out = await retrieve.execute({ ref: "m00001" }, { sessionID: "ses_ccr" });
             assert.ok(typeof out.content === "string" && out.content.length > 0, "retrieve executes against the proxy");
