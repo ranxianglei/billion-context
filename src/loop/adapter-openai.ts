@@ -724,6 +724,30 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     yield { kind: "text", delta: ctOut ?? "", raw: fin(raw) } as ParsedStreamEvent;
                 } else if (delta.role || (Object.keys(delta).length === 0 && !finishReason)) {
                     yield { kind: "meta", chunk: fin(rawBuf), firstRoundOnly: true } as ParsedStreamEvent;
+                } else if (Object.keys(delta).length > 0 && !finishReason) {
+                    // #7694: a delta carrying only fields bili doesn't track
+                    // (e.g. delta.reasoning_details) used to be dropped as
+                    // "empty" — the client lost the thinking metadata. The #7432
+                    // alias fix handles reasoning/reasoning_content/reasoning_text,
+                    // but a reasoning_details-only frame (no thinking-string
+                    // field) still fell through. Forward it verbatim: it is not
+                    // empty from the client's view. The empty-delta finish frame
+                    // is handled by the finish branch above; a finish_reason here
+                    // would double-finish the client's stream, so it is left out.
+                    // No firstRoundOnly: like text/reasoning frames it is
+                    // content, forwarded on every round.
+                    //
+                    // #7694 follow-up: OpenRouter's `reasoning_details` is the
+                    // structured thinking channel, not an opaque extra. A turn
+                    // whose ONLY thinking arrives this way is the #732 "silent
+                    // thought" shape — it must reach `done.thinking` so the
+                    // degenerate-turn recovery fires, exactly as a
+                    // reasoning_content turn does. Pure unknown fields stay out
+                    // of that count: they are not evidence of thinking.
+                    if (Array.isArray(delta.reasoning_details) && delta.reasoning_details.length > 0) {
+                        sawReasoning = true;
+                    }
+                    yield { kind: "meta", chunk: fin(rawBuf) } as ParsedStreamEvent;
                 }
             }
         },
