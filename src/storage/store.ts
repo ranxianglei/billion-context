@@ -665,6 +665,18 @@ export class UnifiedStore {
      * prepared once stays valid until close(). */
     private releaseDecrement: ReturnType<SqliteDatabase["prepare"]> | null = null;
     private releaseDelete: ReturnType<SqliteDatabase["prepare"]> | null = null;
+    /** #6325: per-session last-written SHA-256 of the four large sessions
+     *  columns (metadata/kstate/tail/ccr). ingestSession hashes the incoming
+     *  bytes and skips the rewrite of any column whose hash matches — a
+     *  steady-state delta save used to push the full ~13 MB overflow-page
+     *  chain through the WAL every turn even when only the small tail/stats
+     *  columns changed. Hashes (not full bytes) keep the cache 128 B/session
+     *  instead of ~13 MB; the hash cost is the same O(bytes) as a byte
+     *  comparison. In-memory by design: a fresh process has no entry, so the
+     *  first save after boot conservatively full-writes (no stale-column risk
+     *  on restart). The sampled digest drift path clears the entry to re-arm
+     *  the full write, so a foreign-writer heal still converges. */
+    private lastWrittenColumns: Map<string, { metadataHash: string; kstateHash: string; tailHash: string; ccrHash: string }> = new Map();
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, dbPath: string) {
         this.db = db;
@@ -1337,6 +1349,10 @@ export class UnifiedStore {
         reanchor?: { trustedTailSeqs: number[] },
     ): boolean {
         const s = input.session;
+        // #6325: the four large-column hashes, computed inside the transaction
+        // (after the delta branch re-points s.tailJson) and hoisted here so the
+        // post-commit Map update reuses them instead of re-hashing.
+        let colHashes: { metadataHash: string; kstateHash: string; tailHash: string; ccrHash: string } | null = null;
         const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
@@ -1544,6 +1560,25 @@ export class UnifiedStore {
             }
             // Lineage belongs to the first parent, including its nullable fork
             // point. Later metadata must not reparent or mix the stored pair.
+            // #6325: per-column change detection for the four large JSON
+            // columns — a steady-state delta save rewrites only what changed
+            // instead of pushing the full ~13 MB overflow-page chain through
+            // the WAL every turn. Hashes (not full bytes) keep the cache
+            // 128 B/session; hashing is the same O(bytes) as a byte compare.
+            // s.tailJson was already re-pointed by the delta branch above, so
+            // the hashes see exactly the bytes the upsert is about to write.
+            // No entry (first save after boot) → all changed → the
+            // conservative full write.
+            const lastCols = this.lastWrittenColumns.get(s.sessionId);
+            const metadataHash = sha256Hex(s.metadataJson);
+            const kstateHash = sha256Hex(s.kstateJson);
+            const tailHash = sha256Hex(s.tailJson);
+            const ccrHash = sha256Hex(s.ccrJson ?? "");
+            colHashes = { metadataHash, kstateHash, tailHash, ccrHash };
+            const metadataChanged = lastCols === undefined || lastCols.metadataHash !== metadataHash;
+            const kstateChanged = lastCols === undefined || lastCols.kstateHash !== kstateHash;
+            const tailChanged = lastCols === undefined || lastCols.tailHash !== tailHash;
+            const ccrChanged = lastCols === undefined || lastCols.ccrHash !== ccrHash;
             this.db
                 .prepare(
                     `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
@@ -1566,29 +1601,29 @@ export class UnifiedStore {
                        next_block_id = excluded.next_block_id,
                        next_run_id = excluded.next_run_id,
                        meta_json = excluded.meta_json,
-                       -- 2026-11-21 (#7156 incident): an ENVELOPE import must never
-                       -- REGRESS the stored lifetime counters. The envelope's stats
-                       -- come from whichever process last rendered it — a degraded
-                       -- zero-copy instance carries only its own few requests, so a
-                       -- blind overwrite replaced a 1563-request/169M-token row with
-                       -- {"requests":2}. Counters are lifetime-monotonic within a
-                       -- lineage, so a smaller incoming total names a partial or
-                       -- foreign lineage: keep the stored row. Organic saves keep
-                       -- the blind overwrite — the live writer IS the counter.
-                       stats_json = CASE
-                           WHEN @statsGuard = 1
-                                AND json_valid(sessions.stats_json)
-                                AND json_valid(excluded.stats_json)
-                                AND json_extract(excluded.stats_json, '$.requests') IS NOT NULL
-                                AND json_extract(sessions.stats_json, '$.requests')
-                                    >= json_extract(excluded.stats_json, '$.requests')
-                           THEN sessions.stats_json
-                           ELSE excluded.stats_json
-                       END,
-                       metadata_json = CASE WHEN metadata_json IS excluded.metadata_json THEN sessions.metadata_json ELSE excluded.metadata_json END,
-                       kstate_json = CASE WHEN kstate_json IS excluded.kstate_json THEN sessions.kstate_json ELSE excluded.kstate_json END,
-                       tail_json = excluded.tail_json,
-                       ccr_json = CASE WHEN ccr_json IS excluded.ccr_json THEN sessions.ccr_json ELSE excluded.ccr_json END,
+                        -- 2026-11-21 (#7156 incident): an ENVELOPE import must never
+                        -- REGRESS the stored lifetime counters. The envelope's stats
+                        -- come from whichever process last rendered it — a degraded
+                        -- zero-copy instance carries only its own few requests, so a
+                        -- blind overwrite replaced a 1563-request/169M-token row with
+                        -- {"requests":2}. Counters are lifetime-monotonic within a
+                        -- lineage, so a smaller incoming total names a partial or
+                        -- foreign lineage: keep the stored row. Organic saves keep
+                        -- the blind overwrite — the live writer IS the counter.
+                        stats_json = CASE
+                            WHEN @statsGuard = 1
+                                 AND json_valid(sessions.stats_json)
+                                 AND json_valid(excluded.stats_json)
+                                 AND json_extract(excluded.stats_json, '$.requests') IS NOT NULL
+                                 AND json_extract(sessions.stats_json, '$.requests')
+                                     >= json_extract(excluded.stats_json, '$.requests')
+                            THEN sessions.stats_json
+                            ELSE excluded.stats_json
+                        END,
+                          metadata_json = CASE WHEN @metadataChanged THEN excluded.metadata_json ELSE sessions.metadata_json END,
+                          kstate_json = CASE WHEN @kstateChanged THEN excluded.kstate_json ELSE sessions.kstate_json END,
+                          tail_json = CASE WHEN @tailChanged THEN excluded.tail_json ELSE sessions.tail_json END,
+                          ccr_json = CASE WHEN @ccrChanged THEN excluded.ccr_json ELSE sessions.ccr_json END,
                        last_ingested_seq = excluded.last_ingested_seq,
                        -- #6780: no same-value skip here (or for the #6325 columns): an unchanged
                        -- OVERFLOW blob (a JSON column big enough to spill onto overflow pages) is
@@ -1618,6 +1653,10 @@ export class UnifiedStore {
                     kstateJson: s.kstateJson,
                     tailJson: s.tailJson,
                     ccrJson: s.ccrJson,
+                    metadataChanged: metadataChanged ? 1 : 0,
+                    kstateChanged: kstateChanged ? 1 : 0,
+                    tailChanged: tailChanged ? 1 : 0,
+                    ccrChanged: ccrChanged ? 1 : 0,
                     statsGuard: opts?.envelopeImport === true ? 1 : 0,
                     lastIngestedSeq: watermark,
                     // #4216/#4242: orphan journal rides the normal upsert with
@@ -2178,6 +2217,12 @@ export class UnifiedStore {
             }
             return true;
         });
+        // #6325: record the hashes this process just committed so the next
+        // save can skip the unchanged large columns. Only on success — a
+        // rolled-back transaction wrote nothing, so the last-written state
+        // must stay as it was. colHashes is null when the delta guards
+        // bailed before the upsert (nothing written) — same guard as ok.
+        if (ok && colHashes) this.lastWrittenColumns.set(s.sessionId, colHashes);
         if (ok) this.maybeCheckpointWal();
         return ok;
     }
@@ -3087,6 +3132,18 @@ export class UnifiedStore {
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
     }
 
+    /** #6325: drop the per-column last-written cache for one session so its
+     *  next save full-writes all four large columns. The sampled digest drift
+     *  path calls this: the stored view has PROVEN to diverge from the live
+     *  one (a foreign writer or a below-watermark rewrite), so the in-memory
+     *  "unchanged" verdict is no longer trustworthy — re-arming the full
+     *  write is what makes the existing watermark-clear heal converge
+     *  (without it the heal's full re-ingest would skip the very columns that
+     *  diverged and the drift would persist). */
+    clearLastWrittenColumns(sessionId: string): void {
+        this.lastWrittenColumns.delete(sessionId);
+    }
+
     /** #3248 lane-ownership probe for the message sweep (#3285): every ext
      *  key the incremental lane persists is "inc:"-prefixed, so any such key
      *  marks a session whose messages table the lane consumes positionally. */
@@ -3311,6 +3368,10 @@ export class UnifiedStore {
             // released hashes (see collectZeroRefIn) — never the whole table.
             this.collectZeroRefIn(refs);
         });
+        // #6325: the session row is gone — its last-written entry is dead. Drop
+        // it so the in-memory map stays bounded to live sessions (a re-created
+        // session id re-ingests through the INSERT leg, which full-writes anyway).
+        this.clearLastWrittenColumns(sessionId);
     }
 
     /** #3928: per-session storage footprint for `bili sessions ls`. Counts
@@ -3722,6 +3783,13 @@ export class UnifiedStore {
                     sess.lastIngestedSeq ?? null, sess.orphansJson ?? null, sessionId,
                 );
         });
+        // #6325: this restore writes the four large columns directly (bypassing
+        // ingestSession's per-column change-detection), so the stored bytes no
+        // longer match the last-written map — a later ingest of the pre-restore
+        // live state would be seen as "unchanged" and skipped, leaving the
+        // restored (archived) bytes in place. Clear the entry so the next save
+        // conservatively full-writes every column, same as the drift-heal path.
+        this.clearLastWrittenColumns(sessionId);
         // Drop the restored session's line(s) from the JSONL. #6317: a
         // pre-fix failed archive can leave more than one line; restore now
         // already used the newest match and removes all matches, warning when
