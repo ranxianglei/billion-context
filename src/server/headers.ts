@@ -48,6 +48,15 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     // host↔bili bookkeeping like the pf-* handshake above; the real upstream
     // must never see it.
     "x-bili-msg-ids",
+    // Codex cloud-compaction boundary signal (dsh-codex-subscription →
+    // proxy): checkpoint identity of the encrypted item the client just
+    // installed. Host↔proxy bookkeeping only — the real upstream must never
+    // see the proxy's generation bookkeeping.
+    "x-bili-codex-checkpoint",
+    "x-bili-codex-checkpoint-seq",
+    "x-bili-codex-checkpoint-state",
+    "x-bili-codex-checkpoint-covered",
+    "x-bili-codex-checkpoint-digest",
     // zed cloud lane marker: stamped by the /completions envelope classifier in
     // handle() so the prepare* layers can tell the zed wire apart (its response
     // is NDJSON byte-passthrough, so the model-side compress surface is off).

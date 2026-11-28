@@ -148,7 +148,7 @@ const PRE_COMPACT_ARCHIVE_DETAIL_CAP = 50;
 function formatPreCompactionArchive(archive: Record<string, { at: number; reason: string }>, detail: boolean): string[] {
     const ids = Object.keys(archive);
     const lines: string[] = [
-        `PRE-COMPACTION ARCHIVE — ${ids.length} block(s): content left the session history (client native compaction or an unannounced history rewrite) and decompress is unavailable.`,
+        `PRE-COMPACTION ARCHIVE — ${ids.length} block(s): content left the session history (client native compaction or an unannounced history rewrite). Blocks closed into a history generation stay restorable read-only through decompress / search_context / the retrieve tool; archives predating generations cannot be recovered.`,
     ];
     if (detail) {
         const shown = ids.slice(0, PRE_COMPACT_ARCHIVE_DETAIL_CAP);

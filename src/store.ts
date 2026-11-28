@@ -19,7 +19,8 @@ import { stateDir } from "./paths.js";
 import { getStore } from "./persist.js";
 import type { CompressSettings } from "./config.js";
 import { ccrRetrievalTtlMs as knobCcrRetrievalTtlMs } from "./knobs.js";
-import type { PendingRetrieval, Session } from "./session.js";
+import { historyGenerationsOf, type PendingRetrieval, type Session } from "./session.js";
+import { archivedRefText, findArchivedRef } from "./history-generations.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 export type CcrSettings = NonNullable<CompressSettings["ccr"]>;
@@ -206,6 +207,27 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
     }
     const result = applyRetrieve({ store: contentStoreOf(session), ref, exportDir: retrievalExportDir() });
     if (!result.ok) {
+        // A ref folded BEFORE a remote compaction left the live store with the
+        // reset; the closed generation still holds the verbatim original, so
+        // retrieval across generations is a plain read-only fallback.
+        const found = findArchivedRef(historyGenerationsOf(session), ref);
+        const archivedText = found ? archivedRefText(found) : null;
+        if (found && archivedText !== null) {
+            session.stats.retrieveHits = (session.stats.retrieveHits ?? 0) + 1;
+            loggerLog("info", `[ccr] retrieve ${ref}: hit in history generation ${found.generation.generation} (read-only)`);
+            const header = `[${retrieveToolName(session)} ${ref} — original from history generation ${found.generation.generation} (${found.generation.cause || "client compaction"}), read-only]`;
+            if (archivedText.length > 10000) {
+                const outPath = join(retrievalExportDir(), `${found.ref.replace(/[^a-zA-Z0-9_-]/g, "-")}.txt`);
+                try {
+                    mkdirSync(dirname(outPath), { recursive: true });
+                    writeFileSync(outPath, archivedText, { encoding: "utf8", mode: 0o600 });
+                    return toolOk(`${header}\nContent (${archivedText.length} chars) written to: ${outPath}\nUse the read tool to access it.`);
+                } catch (e) {
+                    loggerLog("warn", `[ccr] archived retrieve export write failed (${outPath}): ${String(e)}`);
+                }
+            }
+            return toolOk(`${header}\n${archivedText}`);
+        }
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         loggerLog("info", `[ccr] retrieve ${ref}: miss (${result.reason})`);
         return toolFail(result.toolResultText);
