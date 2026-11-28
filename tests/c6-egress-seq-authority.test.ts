@@ -274,7 +274,7 @@ test("D: the incremental tail pin maps at wire-element granularity (split cores 
         // Path A (coarsened op-log, #7855): a split element's part-rows share
         // ONE msgid (the element id) — the ledger is element-granular, not
         // core-granular (pre-#7855 stored a1 + a1#p1 as separate rows).
-        assert.deepEqual(liveIds, ["u0", "a1", "a1"], "flow msgids in order (system row filtered; split element's part-rows share the element id)");
+        assert.deepEqual(liveIds, ["u0", "a1", "a1#p1"], "flow per-core ids in order (system row filtered; #f7e2d1a25 egressRowPinId reads the per-core id from the row bytes, so a split element's part-rows are distinct cores)");
 
         const nextTurn = (): BiliMessage[] => [
             bm("u0", { wireIndex: 0 }),
