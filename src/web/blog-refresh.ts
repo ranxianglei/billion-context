@@ -40,6 +40,7 @@
  */
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog } from "../logger.js";
+import { proxyDispatcher } from "../upstream-proxy.js";
 import {
     ASSET_TYPES,
     buildRemoteBlogPosts,
@@ -83,6 +84,14 @@ let remoteSnapshotPresent = false;
 /** Hourly self-chain handle (#4906 follow-up); unref'd, cleared on reset. */
 let scheduleHandle: ReturnType<typeof setTimeout> | undefined;
 let disabled = false; // test seam
+let resolveProxyForBlogRefresh: ((url: string) => string | undefined) | undefined;
+
+/** Configure the proxy resolver used for this module's GitHub egress
+ *  (mirrors web/changelog.ts): proxy-only networks cannot reach the
+ *  first-party GitHub hosts directly. */
+export function configureBlogRefreshProxy(resolver?: (url: string) => string | undefined): void {
+    resolveProxyForBlogRefresh = resolver;
+}
 
 export function _resetBlogRefreshForTest(): void {
     lastRoundStartedAt = 0;
@@ -92,6 +101,7 @@ export function _resetBlogRefreshForTest(): void {
     if (scheduleHandle !== undefined) clearTimeout(scheduleHandle);
     scheduleHandle = undefined;
     disabled = false;
+    resolveProxyForBlogRefresh = undefined;
 }
 
 export function _setBlogRefreshDisabledForTest(disabledFlag: boolean): void {
@@ -313,7 +323,7 @@ function sourceChainFor(rel: string): { name: SourceName; url: string }[] {
 }
 
 async function getJsonList(url: string): Promise<ContentsEntry[]> {
-    const result = await fetchWithTimeout(url, ghHeaders("application/json"), FETCH_TIMEOUT_MS);
+    const result = await ghFetch(url, "application/json");
     try {
         if (!result.response.ok) throw new Error(`GitHub contents API returned HTTP ${result.response.status}`);
         const raw = await result.response.json();
@@ -329,7 +339,7 @@ async function getJsonList(url: string): Promise<ContentsEntry[]> {
  *  the raw source. Any HTTP error, oversize body or budget miss THROWS — the
  *  caller treats it as "this source failed" and walks the chain. */
 async function fetchPlainText(url: string, account?: (bytes: number) => void): Promise<string> {
-    const result = await fetchWithTimeout(url, ghHeaders(), FETCH_TIMEOUT_MS);
+    const result = await ghFetch(url);
     try {
         if (result.response.status === 404) throw new TextFileNotFound(`plain GET ${url} → HTTP 404`);
         if (!result.response.ok) throw new Error(`plain GET ${url} → HTTP ${result.response.status}`);
@@ -352,7 +362,7 @@ async function fetchPlainText(url: string, account?: (bytes: number) => void): P
  *  the >1 MiB body omission, which surfaces as `content: null`). */
 async function fetchApiText(rel: string, account?: (bytes: number) => void): Promise<string> {
     const url = `${GITHUB_CONTENTS_URL}/${encRelPath(rel)}?ref=${BRANCH}`;
-    const result = await fetchWithTimeout(url, ghHeaders("application/json"), FETCH_TIMEOUT_MS);
+    const result = await ghFetch(url, "application/json");
     try {
         if (result.response.status === 404) throw new TextFileNotFound(`contents GET ${url} → HTTP 404`);
         if (!result.response.ok) throw new Error(`contents GET ${url} → HTTP ${result.response.status}`);
@@ -409,7 +419,7 @@ async function fetchPlainImage(url: string, account?: (bytes: number) => void): 
     if (dot !== -1) ext = url.slice(dot).toLowerCase();
     const type = ASSET_TYPES[ext];
     if (type === undefined) return undefined;
-    const result = await fetchWithTimeout(url, ghHeaders(), FETCH_TIMEOUT_MS);
+    const result = await ghFetch(url);
     try {
         if (result.response.status === 404) return undefined;
         if (!result.response.ok) throw new Error(`image GET ${url} → HTTP ${result.response.status}`);
@@ -435,7 +445,7 @@ async function fetchApiImage(rel: string, account?: (bytes: number) => void): Pr
     const type = ASSET_TYPES[ext.toLowerCase()];
     if (type === undefined) return undefined;
     const url = `${GITHUB_CONTENTS_URL}/${encRelPath(rel)}?ref=${BRANCH}`;
-    const result = await fetchWithTimeout(url, ghHeaders("application/json"), FETCH_TIMEOUT_MS);
+    const result = await ghFetch(url, "application/json");
     try {
         if (result.response.status === 404) return undefined;
         if (!result.response.ok) throw new Error(`contents image GET ${url} → HTTP ${result.response.status}`);
@@ -518,6 +528,14 @@ function ghHeaders(accept?: string): Record<string, string> {
     const h: Record<string, string> = { "user-agent": "billion-context-blog-refresh" };
     if (accept !== undefined) h.Accept = accept;
     return h;
+}
+
+/** Every GitHub egress in this module goes through the configured upstream
+ *  proxy when one resolves for the target URL (mirrors web/changelog.ts);
+ *  an unresolved proxy keeps the direct path byte-identical to before. */
+function ghFetch(url: string, accept?: string) {
+    const dispatcher = proxyDispatcher(resolveProxyForBlogRefresh?.(url), FETCH_TIMEOUT_MS);
+    return fetchWithTimeout(url, { ...ghHeaders(accept), ...(dispatcher !== undefined ? { dispatcher } : {}) }, FETCH_TIMEOUT_MS);
 }
 
 /** Rejection-immune settle twin of a round promise — the guard BOTH

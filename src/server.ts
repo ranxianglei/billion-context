@@ -96,6 +96,7 @@ import { postShedImageView } from "./egress-shed.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, flushResignPending, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals, type ApigCredential } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { configureChangelogProxy } from "./web/changelog.js";
+import { configureBlogRefreshProxy } from "./web/blog-refresh.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
@@ -1243,7 +1244,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         exposureTimer.unref?.();
     }
     setMaskHostsEnabled(opts.maskHosts ?? true);
-    configureChangelogProxy((url) => resolveProxy(opts.routes, opts.proxy, url, opts.auxProxyFallback ?? opts.proxyFallback));
+    const webGithubProxyResolver = (url: string) => resolveProxy(opts.routes, opts.proxy, url, opts.auxProxyFallback ?? opts.proxyFallback);
+    configureChangelogProxy(webGithubProxyResolver);
+    configureBlogRefreshProxy(webGithubProxyResolver);
     if (opts.mitm.enabled) {
         // Non-loopback bind (--host 0.0.0.0 / LAN IP) opts into serving
         // remote clients: CONNECT is then allowed for non-loopback clients
