@@ -19,7 +19,7 @@
 // backstop against compression starvation — over-limit tier-1 arms DO route
 // through the decision, by design).
 
-import type { CompressibleRange } from "acp-kernel";
+import { orderedRefPair, type CompressibleRange } from "acp-kernel";
 
 /** Output budget for the decision call. Matches the SIDE_REQUEST_MAX_TOKENS=200
  *  system (title-gen side requests use the same ceiling class). */
@@ -59,9 +59,14 @@ function formatK(n: number): string {
  *  feature is that the model gets a real veto instead of an instruction with
  *  a checklist attached. */
 export function buildDecisionPrompt(ranges: CompressibleRange[]): string {
-    const spans = ranges.slice(0, SPANS_SHOWN).map(
-        (r) => `  ${r.startRef}\u2013${r.endRef}  ${r.count} msgs  ${formatK(r.tokens)} [tool ${r.toolPct}% | text ${r.textPct}%]`,
-    );
+    // #5680: canonicalize endpoint labels to ascending order — after a
+    // generation reset a positional span's stored endpoints can be numerically
+    // descending, and the model must copy the span back verbatim into its
+    // answer (RANGE_RE + the containment check below both assume lo-hi order).
+    const spans = ranges.slice(0, SPANS_SHOWN).map((r) => {
+        const [lo, hi] = orderedRefPair(r.startRef, r.endRef);
+        return `  ${lo}\u2013${hi}  ${r.count} msgs  ${formatK(r.tokens)} [tool ${r.toolPct}% | text ${r.textPct}%]`;
+    });
     return [
         "[bili-compress-decision] Side-channel question \u2014 answer ONLY this. Do not continue your task, do not call any tools.",
         "Given the conversation above exactly as it stands now, is compressing older consumed context NOW net-beneficial for the current task?",
@@ -134,11 +139,16 @@ function refNum(ref: string): number {
  *  compressible view (turn.nudge.compressibleRanges, already filtered by
  *  viableRanges at the call site). A proposed span is honored only when it is
  *  fully contained in one live range; the returned span is that live range's
- *  endpoints (the program finalizes boundaries \u2014 sub-span granularity is
- *  out of scope for v1). No proposal, an out-of-view proposal, or an empty
- *  live view falls back to the LARGEST live range by tokens; no live range at
- *  all yields undefined (the caller skips injection \u2014 never invent a
- *  target). */
+ *  endpoints in ascending label order (the program finalizes boundaries
+ *  \u2014 sub-span granularity is out of scope for v1). No proposal, an
+ *  out-of-view proposal, or an empty live view falls back to the LARGEST live
+ *  range by tokens; no live range at all yields undefined (the caller skips
+ *  injection \u2014 never invent a target). #5680: after a generation reset a
+ *  positional span's stored endpoints can be numerically descending, so both
+ *  the containment test and the returned labels are direction-canonicalized
+ *  (min/max + orderedRefPair) \u2014 previously the containment test was
+ *  unsatisfiable for such a range and the model's choice silently fell back to
+ *  the largest range. */
 export function resolveDecisionRange(
     decision: { range?: string },
     ranges: CompressibleRange[],
@@ -151,8 +161,11 @@ export function resolveDecisionRange(
             const b = parseInt(m[2]!, 10);
             if (a <= b) {
                 for (const r of ranges) {
-                    if (a >= refNum(r.startRef) && b <= refNum(r.endRef)) {
-                        return { startRef: r.startRef, endRef: r.endRef };
+                    const lo = Math.min(refNum(r.startRef), refNum(r.endRef));
+                    const hi = Math.max(refNum(r.startRef), refNum(r.endRef));
+                    if (a >= lo && b <= hi) {
+                        const [loRef, hiRef] = orderedRefPair(r.startRef, r.endRef);
+                        return { startRef: loRef, endRef: hiRef };
                     }
                 }
             }
@@ -162,7 +175,9 @@ export function resolveDecisionRange(
     for (const r of ranges) {
         if (!best || r.tokens > best.tokens) best = r;
     }
-    return best ? { startRef: best.startRef, endRef: best.endRef } : undefined;
+    if (!best) return undefined;
+    const [loRef, hiRef] = orderedRefPair(best.startRef, best.endRef);
+    return { startRef: loRef, endRef: hiRef };
 }
 
 export function ladderMode(metadata: Record<string, unknown>): "try" | "fallback" {
