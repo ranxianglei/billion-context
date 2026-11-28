@@ -53,8 +53,8 @@ for (const ending of ["\n", "\r\n", "\r"]) {
     });
 }
 
-function frameChunks(parts: string[]): string[] {
-    const framer = createSseFramer();
+function frameChunks(parts: string[], retainSeparator = false): string[] {
+    const framer = createSseFramer(retainSeparator);
     return [...parts.flatMap(part => [...framer.push(part)]), ...framer.finish()];
 }
 
@@ -75,6 +75,7 @@ test("incremental framing preserves complete-field whitespace and EOF residuals 
         const expected = wholeFrames(input);
         for (let cut = 0; cut <= input.length; cut++) {
             assert.deepEqual(frameChunks([input.slice(0, cut), input.slice(cut)]), expected, `split ${cut}: ${JSON.stringify(input)}`);
+            assert.equal(frameChunks([input.slice(0, cut), input.slice(cut)], true).join(""), finalizeSseLineEndings(input));
         }
         assert.deepEqual(frameChunks(input.split("")), expected, `one-character chunks: ${JSON.stringify(input)}`);
     }
@@ -88,6 +89,7 @@ test("all short CR/LF combinations match the previous whole-buffer framing", () 
             const expected = wholeFrames(value);
             for (let cut = 0; cut <= value.length; cut++) {
                 assert.deepEqual(frameChunks([value.slice(0, cut), value.slice(cut)]), expected);
+                assert.equal(frameChunks([value.slice(0, cut), value.slice(cut)], true).join(""), finalizeSseLineEndings(value));
             }
         }
         values = values.flatMap(value => alphabet.map(char => value + char));

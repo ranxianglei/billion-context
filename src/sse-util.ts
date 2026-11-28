@@ -34,8 +34,10 @@ export function finalizeSseLineEndings(buf: string): string {
 /** Frame newly decoded chunks without repeatedly scanning an unfinished
  *  event. Normalize only the new chunk plus a possible split CR, and join
  *  incomplete line fragments once when that line ends. Frames preserve the
- *  existing LF-normalized `split("\n\n")` semantics, including EOF residuals. */
-export function createSseFramer(): {
+ *  existing LF-normalized `split("\n\n")` semantics, including EOF residuals.
+ *  Retaining separators lets stream transforms distinguish complete frames
+ *  from an unterminated EOF residual without changing the output bytes. */
+export function createSseFramer(retainSeparator = false): {
     push(chunk: string): Generator<string>;
     finish(): Generator<string>;
 } {
@@ -52,12 +54,12 @@ export function createSseFramer(): {
         while ((end = text.indexOf("\n", start)) !== -1) {
             if (end > start) lineParts.push(text.slice(start, end));
             if (lineParts.length === 0 && frameParts.length > 0) {
-                // The preceding line's LF and this blank line's LF are the
-                // separator; neither belongs to the returned raw frame.
+                // The preceding LF and this blank line's LF are the separator;
+                // remove them from the parts before optional reattachment.
                 frameParts.pop();
                 const frame = frameParts.join("");
                 frameParts = [];
-                yield frame;
+                yield retainSeparator ? frame + "\n\n" : frame;
             } else {
                 if (lineParts.length > 0) frameParts.push(lineParts.join(""));
                 frameParts.push("\n");

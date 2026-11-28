@@ -92,7 +92,7 @@ function makeUpstream(calls: Call[], modelHandlers: ((res: http.ServerResponse) 
     });
 }
 
-function startProxy(upstreamPort: number): Promise<http.Server> {
+function startProxy(upstreamPort: number, injectTool = true): Promise<http.Server> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     return startServer({
@@ -102,7 +102,7 @@ function startProxy(upstreamPort: number): Promise<http.Server> {
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { [MODEL]: { context: 10_000 } } } },
         modelContextLimit: 10_000,
         kernelConfig: defaultConfig(10_000),
-        compress: { injectTool: true, injectNudge: true },
+        compress: { injectTool, injectNudge: true },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
@@ -142,13 +142,14 @@ function ssePayloads(text: string): unknown[] {
 
 test("#3280 A: round-2+ of the compress loop reads the standard shape and reaches the client", async () => {
     const calls: Call[] = [];
+    const thinking = { text: "Private reasoning 你好🔥\n", thought: true, thoughtSignature: "c2lnbmVkLXRob3VnaHQ=" };
     // Round 1: the model calls the acp_status proxy tool. Round 2+: the final
     // answer. Both arrive inside the CloudCode response envelope.
     const upstream = makeUpstream(calls, [
         (res) => {
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
             res.write(sse(envelope({
-                candidates: [{ index: 0, content: { role: "model", parts: [{ functionCall: { name: "acp_status", args: {} } }] }, finishReason: "STOP" }],
+                candidates: [{ index: 0, content: { role: "model", parts: [thinking, { functionCall: { name: "acp_status", args: {} } }] }, finishReason: "STOP" }],
             })));
             res.end();
         },
@@ -178,6 +179,8 @@ test("#3280 A: round-2+ of the compress loop reads the standard shape and reache
         assert.ok(Array.isArray(inner.contents) && (inner.contents as unknown[]).length > 0, "round-2 inner carries the rebuilt contents");
         assert.equal(inner.sessionId, INNER_SESSION_ID, "round-2 rebuild preserves the inner sessionId across loop rounds");
         assert.equal(inner.request, undefined, "round-2 rebuild must not double-nest the envelope into the inner request");
+        const replayParts = (inner.contents as { parts: unknown[] }[]).flatMap(message => message.parts);
+        assert.ok(replayParts.some(part => JSON.stringify(part) === JSON.stringify(thinking)), "signed thinking replays byte-exact through the transformed stream");
 
         // Every client frame keeps the {"response":...} envelope Antigravity
         // requires — including bili's synthesized acp_status visibility marker.
@@ -188,10 +191,48 @@ test("#3280 A: round-2+ of the compress loop reads the standard shape and reache
         }
         assert.match(text, /acp_status result/, "round-1 visibility marker reached the client");
         assert.match(text, /Final answer after status\./, "round-2+ content reached the client (the #3280 regression)");
+        const clientParts = (frames as { response: { candidates?: { content?: { parts?: unknown[] } }[] } }[])
+            .flatMap(frame => frame.response.candidates?.flatMap(candidate => candidate.content?.parts ?? []) ?? []);
+        assert.ok(clientParts.some(part => JSON.stringify(part) === JSON.stringify(thinking)), "the client receives the identical signed thinking part");
     } finally {
         proxy.close(); upstream.close();
     }
 });
+
+for (const injectTool of [true, false]) {
+    test(`CloudCode fragmented image replies retain the envelope with injectTool=${injectTool}`, async () => {
+        const calls: Call[] = [];
+        const image = { inlineData: { mimeType: "image/png", data: "A".repeat(256 * 1024) } };
+        const response = {
+            candidates: [{ index: 0, content: { role: "model", parts: [{ text: "Image result." }, image] }, finishReason: "STOP" }],
+            usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 5, totalTokenCount: 105 },
+        };
+        const upstream = makeUpstream(calls, [(res) => {
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            const wire = Buffer.from(sse(envelope(response)).replaceAll("\n", "\r\n"));
+            for (let offset = 0; offset < wire.length; offset += 4096) res.write(wire.subarray(offset, offset + 4096));
+            res.end();
+        }]);
+        upstream.listen(0, "127.0.0.1");
+        await once(upstream, "listening");
+        const upstreamPort = (upstream.address() as { port: number }).port;
+        const proxy = await startProxy(upstreamPort, injectTool);
+        await once(proxy, "listening");
+        try {
+            const proxyPort = (proxy.address() as { port: number }).port;
+            const { status, text } = await drive(proxyPort, upstreamPort, "/v1internal:streamGenerateContent?alt=sse", v1Request({ convId: CONV_ID }));
+            assert.equal(status, 200);
+            assert.equal(calls.length, 1);
+            const frames = ssePayloads(text) as { response: typeof response }[];
+            assert.ok(frames.length > 0);
+            const parts = frames.flatMap(frame => frame.response.candidates?.flatMap(candidate => candidate.content?.parts ?? []) ?? []);
+            assert.deepEqual(parts.find(part => "inlineData" in part), image, "opaque inlineData bytes are forwarded intact; no image decoding is involved");
+            assert.deepEqual(frames.find(frame => frame.response.usageMetadata)?.response.usageMetadata, response.usageMetadata);
+        } finally {
+            proxy.close(); upstream.close();
+        }
+    });
+}
 
 test("#3280 B: the non-streaming generateContent lane parses the enveloped reply", async () => {
     const calls: Call[] = [];
