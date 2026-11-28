@@ -467,30 +467,34 @@ CREATE TABLE IF NOT EXISTS state_fields (
  *  ruling: not written, not read, no letter in this CHECK); growth
  *  optimization is a separate, deferred project (#7475 family), nothing
  *  here ever prunes it. egress_state is the MATERIALIZED live view — one
- *  row per LIVE message (PK (session_id, msgid), pos = its position in the
+ *  row per LIVE message (PK (session_id, rid), pos = its position in the
  *  current view); I inserts (suffix shifts), U edits in place, D physically
  *  deletes the range. Serving reads are `ORDER BY pos` DIRECT reads — no
  *  replay, no compaction, no base concept. SELF-CONTAINED BYTES (ruling
  *  7439-1): the `bytes` column holds the message's final core JSON; replay
- *  needs only the flow table. TWO NUMBER COLUMNS on the state row (7773
- *  dual clocks of citation): log_seq = the number the I op assigned,
- *  IMMUTABLE (the row's anchor to its I twin in the flow — same msgid AND
- *  same I-time log_seq); num = the row's CURRENT canonical number (a U with
- *  an explicit num changes it; 0 = demoted/uncited — the system row is 0 by
- *  construction, outside the citation space). The number frontier is the
- *  flow's MAX(log_seq) — the ONLY source (the flow is never pruned). The
- *  state PK covers (session_id, msgid), so no separate state index. The
- *  flow index serves +U targeting and -D endpoint resolution.
+ *  needs only the flow table.
+ *  RID IS THE NUMBER (owner ruling 2026-11-28, proposal discussions/7903):
+ *  the state row carries NO number columns — its PK rid IS the message
+ *  number (dense per session, one-shot, issued at I from the flow's
+ *  MAX(rid)+1); the model-visible tag is "m" + rid, DERIVED at render time
+ *  and never stored; the I-time anchor ("after") lives in the flow's
+ *  payload, where the replay reads it from. `op_seq` is the flow's page
+ *  cursor (op ordering + the concurrent-write CAS) — it numbers
+ *  operations, never messages. The old dual number columns (state.log_seq
+ *  / state.num / state.ref, flow.log_seq) and the old payload keys (num,
+ *  ref) are GONE with no compatibility layer (owner ruling): the tables
+ *  never shipped, a dev DB in the old shape is dropped and recreated below
+ *  (the same one-step never-shipped rule), and the state rebuilds from the
+ *  flow on demand. The state PK covers (session_id, rid); the msgid index
+ *  stays (the pin channel keys on it). The flow index serves +U targeting
+ *  and -D endpoint resolution.
  *  Probe-first, no version bump (the tables never shipped). */
-const EGRESS_STATE_DDL = `-- #6785 perf (proposals discussions/7398 + 7439, materialized at 7773): op-log outbound view (flow record + materialized live state), self-contained bytes, canonical per-message numbers.
+const EGRESS_STATE_DDL = `-- #6785 perf (proposals discussions/7398 + 7439, materialized at 7773): op-log outbound view (flow record + materialized live state), self-contained bytes; the rid IS the message number (2026-11-28 owner ruling, discussions/7903).
 CREATE TABLE IF NOT EXISTS egress_state (
     session_id TEXT NOT NULL,
     rid INTEGER NOT NULL,
     msgid TEXT NOT NULL,
     pos INTEGER NOT NULL,
-    log_seq INTEGER NOT NULL,
-    num INTEGER NOT NULL,
-    ref TEXT NOT NULL,
     tokens INTEGER NOT NULL,
     type TEXT NOT NULL,
     role TEXT,
@@ -503,7 +507,6 @@ CREATE TABLE IF NOT EXISTS egress_state (
 CREATE TABLE IF NOT EXISTS egress_flow (
     session_id TEXT NOT NULL,
     op_seq INTEGER NOT NULL,
-    log_seq INTEGER,
     row_type TEXT NOT NULL CHECK (row_type IN ('I','D','U')),
     rid INTEGER,
     msgid TEXT,
@@ -713,7 +716,12 @@ export function migrateSchema(db: {
     // the state PK and no longer an op anchor). A state table without the
     // rid column is an old-shape dev DB — same never-shipped rule, one-step
     // drop + recreate (the owner's live DBs are rebuilt by the operator).
-    const egressOldShape = (egressCols.length > 0 && (egressCols.includes("op_seq") || !egressCols.includes("pos") || !egressCols.includes("rid")))
+    // 2026-11-28 (owner ruling, discussions/7903): the rid became THE
+    // message number — the dual number columns (state.log_seq/num/ref,
+    // flow.log_seq) are gone. A state table that still carries log_seq/
+    // num/ref is an old-shape dev DB: same one-step drop + recreate, no
+    // compatibility layer (owner ruling — no migration, no alias).
+    const egressOldShape = (egressCols.length > 0 && (egressCols.includes("op_seq") || !egressCols.includes("pos") || !egressCols.includes("rid") || egressCols.includes("log_seq") || egressCols.includes("num") || egressCols.includes("ref")))
         || egressFlowSql.includes("('B','I','D','U')");
     if (egressOldShape) {
         // #7574 item 10: drop + recreate is one step (same transaction rule).

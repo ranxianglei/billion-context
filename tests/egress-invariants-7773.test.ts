@@ -69,7 +69,7 @@ let view: ReturnType<typeof egressAppendTurn> | undefined;
 const t1 = [msg("a", 1), msg("b", 2), msg("c", 3), msg("d", 2), msg("e", 1)];
 for (const m of t1) flowMaxBytes = Math.max(flowMaxBytes, JSON.stringify(m).length);
 for (const m of t1) stateMaxBytes = Math.max(stateMaxBytes, m.text.length);
-view = egressAppendTurn(db, S, [{ type: "I", rid: 1, msgid: "sys", after: null, ref: "", tokens: 0, typeTag: "text", bytes: "" }, { type: "I", rid: 2, msgid: "a", after: 1, ref: "m00001", tokens: 1, typeTag: "text", bytes: t1[0]!.text }, { type: "I", rid: 3, msgid: "b", after: 2, ref: "m00002", tokens: 2, typeTag: "text", bytes: t1[1]!.text }, { type: "I", rid: 4, msgid: "c", after: 3, ref: "m00003", tokens: 3, typeTag: "text", bytes: t1[2]!.text }, { type: "I", rid: 5, msgid: "d", after: 4, ref: "m00004", tokens: 2, typeTag: "text", bytes: t1[3]!.text }, { type: "I", rid: 6, msgid: "e", after: 5, ref: "m00005", tokens: 1, typeTag: "text", bytes: t1[4]!.text }], 1_000, { baseSeq: 0 });
+view = egressAppendTurn(db, S, [{ type: "I", rid: 1, msgid: "sys", after: null, tokens: 0, typeTag: "text", bytes: "" }, { type: "I", rid: 2, msgid: "a", after: 1, tokens: 1, typeTag: "text", bytes: t1[0]!.text }, { type: "I", rid: 3, msgid: "b", after: 2, tokens: 2, typeTag: "text", bytes: t1[1]!.text }, { type: "I", rid: 4, msgid: "c", after: 3, tokens: 3, typeTag: "text", bytes: t1[2]!.text }, { type: "I", rid: 5, msgid: "d", after: 4, tokens: 2, typeTag: "text", bytes: t1[3]!.text }, { type: "I", rid: 6, msgid: "e", after: 5, tokens: 1, typeTag: "text", bytes: t1[4]!.text }], 1_000, { baseSeq: 0 });
 checkMessagePlane("turn 1");
 
 // the block plane lives alongside: two blocks, one reaped later
@@ -105,7 +105,7 @@ flowMaxBytes = Math.max(flowMaxBytes, summaryText.length);
 stateMaxBytes = Math.max(stateMaxBytes, summaryText.length);
 view = egressAppendTurn(db, S, [
     { type: "D", start: 3, end: 5 },
-    { type: "I", rid: 7, msgid: "sum", after: 2, ref: "m00006", tokens: 5, typeTag: "text", bytes: summaryText },
+    { type: "I", rid: 7, msgid: "sum", after: 2, tokens: 5, typeTag: "text", bytes: summaryText },
 ], 2_000, { baseSeq: 6 });
 checkMessagePlane("fold turn");
 assert.deepEqual(egressStateView(db, S).map((r) => r.msgid), ["sys", "a", "sum", "e"]);

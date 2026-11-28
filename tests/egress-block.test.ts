@@ -139,7 +139,7 @@ test("point fork: the block set aligns to the FLOW watermark via flow_op_seq (du
         const P = "parent";
         // flow point 1
         egressAppendTurn(H.db, P, [
-            { type: "I", rid: 1, msgid: "m00001", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "a" },
+            { type: "I", rid: 1, msgid: "m00001", after: null, tokens: 3, typeTag: "text", bytes: "a" },
         ], 1_000, { baseSeq: 0 });
         // block born — its flow_op_seq pointer is 1 (flow's MAX at write time)
         egressBlockAppend(H.db, P, [
@@ -147,7 +147,7 @@ test("point fork: the block set aligns to the FLOW watermark via flow_op_seq (du
         ], null, 1_500);
         // flow point 2
         egressAppendTurn(H.db, P, [
-            { type: "I", rid: 2, msgid: "m00002", after: 1, ref: "m00002", tokens: 4, typeTag: "text", bytes: "b" },
+            { type: "I", rid: 2, msgid: "m00002", after: 1, tokens: 4, typeTag: "text", bytes: "b" },
         ], 2_000, { baseSeq: 1 });
         // block updated at flow point 2
         egressBlockAppend(H.db, P, [
@@ -180,10 +180,10 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
         const P = "parent-a";
         // two message turns (flow ops 1, 2)
         egressAppendTurn(H.db, P, [
-            { type: "I", rid: 1, msgid: "m00001", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "hello" },
+            { type: "I", rid: 1, msgid: "m00001", after: null, tokens: 3, typeTag: "text", bytes: "hello" },
         ], 1_000, { baseSeq: 0 });
         egressAppendTurn(H.db, P, [
-            { type: "I", rid: 2, msgid: "m00002", after: 1, ref: "m00002", tokens: 4, typeTag: "text", bytes: "there" },
+            { type: "I", rid: 2, msgid: "m00002", after: 1, tokens: 4, typeTag: "text", bytes: "there" },
         ], 2_000, { baseSeq: 1 });
         // a block birth (block op 1 on the block's OWN clock; flow_op_seq 2)
         egressBlockAppend(H.db, P, [{ type: "I", blockId: "blk_1", snapshot: snap() }], null, 3_000);
@@ -200,9 +200,9 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
 
         // every one of the four tables is byte-identical to the parent's
         for (const [table, cols] of [
-            ["egress_flow", "op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at"],
+            ["egress_flow", "op_seq, row_type, rid, msgid, payload, bytes, created_at"],
             ["egress_block_flow", "op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at"],
-            ["egress_state", "rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at"],
+            ["egress_state", "rid, msgid, pos, tokens, type, role, ts, sys_in, bytes, created_at"],
             ["egress_block_state", "block_id, pos, op_seq, flow_op_seq, payload, created_at"],
         ] as const) {
             const q = (id: string) => H.db.prepare(`SELECT ${cols} FROM ${table} WHERE session_id = ? ORDER BY 1, 2`).all(id);
@@ -210,7 +210,7 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
         }
         // the child continues the FLOW clock past the parent's high water
         egressAppendTurn(H.db, C, [
-            { type: "I", rid: 3, msgid: "m00009", after: null, ref: "m00009", tokens: 2, typeTag: "text", bytes: "after fork" },
+            { type: "I", rid: 3, msgid: "m00009", after: null, tokens: 2, typeTag: "text", bytes: "after fork" },
         ], 9_000, { baseSeq: parentMax });
         const childMax = (H.db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(C) as { m: number }).m;
         assert.equal(childMax, parentMax + 1);
@@ -222,10 +222,10 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
         // and the flow rows 1,2 are still the fork's source.
         const P2 = "parent-a2";
         egressAppendTurn(H.db, P2, [
-            { type: "I", rid: 1, msgid: "m00001", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "hello" },
+            { type: "I", rid: 1, msgid: "m00001", after: null, tokens: 3, typeTag: "text", bytes: "hello" },
         ], 1_000, { baseSeq: 0 });
         egressAppendTurn(H.db, P2, [
-            { type: "I", rid: 2, msgid: "m00002", after: 1, ref: "m00002", tokens: 4, typeTag: "text", bytes: "there" },
+            { type: "I", rid: 2, msgid: "m00002", after: 1, tokens: 4, typeTag: "text", bytes: "there" },
         ], 2_000, { baseSeq: 1 });
         // blk_1's flow_op_seq pointer is 2 — it "exists at flow point 2"
         egressBlockAppend(H.db, P2, [{ type: "I", blockId: "blk_1", snapshot: snap() }], null, 3_000);
@@ -246,8 +246,8 @@ test("interleave regression (the review-critical bug): flow stays DENSE when mes
         const S = "sess-interleave";
         // turn 1: two messages
         egressAppendTurn(H.db, S, [
-            { type: "I", rid: 1, msgid: "m00001", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "a" },
-            { type: "I", rid: 2, msgid: "m00002", after: 1, ref: "m00002", tokens: 4, typeTag: "text", bytes: "b" },
+            { type: "I", rid: 1, msgid: "m00001", after: null, tokens: 3, typeTag: "text", bytes: "a" },
+            { type: "I", rid: 2, msgid: "m00002", after: 1, tokens: 4, typeTag: "text", bytes: "b" },
         ], 1_000, { baseSeq: 0 });
         // a fold turn lands a block at SAVE time (production write order:
         // message rows at prepare, block rows at save)
@@ -257,7 +257,7 @@ test("interleave regression (the review-critical bug): flow stays DENSE when mes
         // applyOps' density check (`op_seq === prevSeq + 1`) threw "jumps
         // from 2 to 4" on every subsequent egress read.
         egressAppendTurn(H.db, S, [
-            { type: "I", rid: 3, msgid: "m00003", after: 2, ref: "m00003", tokens: 5, typeTag: "text", bytes: "c" },
+            { type: "I", rid: 3, msgid: "m00003", after: 2, tokens: 5, typeTag: "text", bytes: "c" },
         ], 2_000, { baseSeq: 2 });
         // ALL egress reads must work on the interleaved session — this is
         // exactly what broke in production (read threw, recoverEgressBase

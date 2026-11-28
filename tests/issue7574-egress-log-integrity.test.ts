@@ -110,7 +110,7 @@ test("a batch that would break the log is refused before anything is written", (
         const baseSeq = H.store.egressStateMaxSeq(S);
         const before = shape(H, S);
         assert.throws(
-            () => H.store.egressAppendTurn(S, [{ type: "I", rid: 98, msgid: "x", after: 99, ref: "m00009", tokens: 1, typeTag: "text", bytes: "h_x" }], baseSeq, 2),
+            () => H.store.egressAppendTurn(S, [{ type: "I", rid: 98, msgid: "x", after: 99, tokens: 1, typeTag: "text", bytes: "h_x" }], baseSeq, 2),
             (e: unknown) => e instanceof EgressStateCorruptError && /insert anchor rid 99 missing/.test(e.message),
         );
         assert.deepEqual(shape(H, S), before, "nothing was written");
@@ -132,10 +132,10 @@ test("a turn that deletes removes the state rows in the same write; the flow kee
         assert.deepEqual(s.state, [SYS, "a", "sum", "e"], "state: the live rows only — b..d physically deleted with the D op");
         assert.deepEqual(s.flow, ["I", "I", "I", "I", "I", "I", "D", "I"], "flow: append-only — turn 1's six +I rows (system + a..e), then the fold's D + I; no base row (7773)");
         // the next message gets the next number, none is issued twice
-        const high = Math.max(...view.map((r) => r.num));
-        assert.equal(high, 6, "five messages (numbers 1..5) + the summary row = six numbers issued (the system row is number 0, outside the citation space — renumber 2026-11-25)");
+        const high = Math.max(...view.map((r) => r.rid!));
+        assert.equal(high, 7, "system row + five messages (rids 1..6) + the summary row (rid 7) = seven rids issued (2026-11-28: the system row takes its own rid like any row)");
         const grown = recordEgressTurn({ store: H.ops, sessionId: S, prev: view, conversation: [M("a", "1"), M("sum", "…", "assistant"), M("e", "5"), M("f", "6")], systemText: "sys", nowMs: 3 });
-        assert.equal(grown.find((r) => r.msgid === "f")!.num, high + 1, "numbering continues after the fold — none is issued twice");
+        assert.equal(grown.find((r) => r.msgid === "f")!.rid, high + 1, "numbering continues after the fold — none is issued twice");
         assert.deepEqual(shape(H, S).flow, ["I", "I", "I", "I", "I", "I", "D", "I", "I"], "the flow never loses rows; only the state plane is materialized");
     } finally {
         close(H);
@@ -169,14 +169,14 @@ test("the materialized state is healed by a full-history replay; a state row the
         const max = H.store.egressStateMaxSeq(S);
         // 1. the state alone is damaged (an orphan row): the self-healing
         //    read replays the flow and rebuilds the state in place
-        H.db.prepare("INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 9)")
+        H.db.prepare("INSERT INTO egress_state (session_id, rid, msgid, pos, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 'text', 'user', 0, 0, 'x', 9)")
             .run(S);
         assert.deepEqual(ids(H.store.egressStateView(S)), good, "the read answers from the flow, healed");
         assert.equal(H.store.egressStateMaxSeq(S), max, "the flow is untouched");
         assert.deepEqual(shape(H, S).state, good, "the orphan row was removed when the state was rebuilt");
         // 2. the state alone runs AHEAD of the flow (a write that reached
         //    one table): the row the flow does not carry is not served
-        H.db.prepare("INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 9, 9, 'm00009', 1, 'text', 'user', 0, 0, 'x', 9)")
+        H.db.prepare("INSERT INTO egress_state (session_id, rid, msgid, pos, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 1, 'text', 'user', 0, 0, 'x', 9)")
             .run(S);
         assert.deepEqual(ids(H.store.egressStateView(S)), good, "a row the flow does not have is not served");
         assert.deepEqual(shape(H, S).state, good, "the state is the flow, row for row");
@@ -195,7 +195,7 @@ test("the rebuild replays the flow row for row and leaves nothing of the old sta
         const S = "s-rebuild";
         const view = recordEgressTurn({ store: H.ops, sessionId: S, prev: undefined, conversation: [M("a", "1"), M("b", "2")], systemText: "sys", nowMs: 1 });
         H.db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(S);
-        H.db.prepare("INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 9)")
+        H.db.prepare("INSERT INTO egress_state (session_id, rid, msgid, pos, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 'text', 'user', 0, 0, 'x', 9)")
             .run(S);
         const rebuilt = egressRebuildState(H.db, S);
         assert.deepEqual(rebuilt, view, "the view comes back from the flow");

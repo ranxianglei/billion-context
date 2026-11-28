@@ -2012,11 +2012,11 @@ export class UnifiedStore {
             const flowBoundsForCovered = (payloadJson: string): [number, number] => {
                 if (egressNum === null) {
                     try {
-                        egressNum = new Map(
-                            egressStateView(this.db, s.sessionId)
-                                .filter((r) => r.num > 0 && r.msgid !== EGRESS_SYSTEM_MSGID)
-                                .map((r) => [r.msgid, r.num] as const),
-                        );
+                        const m = new Map<string, number>();
+                        for (const r of egressStateView(this.db, s.sessionId)) {
+                            if (typeof r.rid === "number" && r.rid > 0 && r.msgid !== EGRESS_SYSTEM_MSGID) m.set(r.msgid, r.rid);
+                        }
+                        egressNum = m;
                     } catch {
                         egressNum = new Map(); // corrupt/absent flow: no claim, never fail the save
                     }

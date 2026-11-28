@@ -44,7 +44,7 @@
 // Rollout gate (egressPlane, default 0 — opt-in per owner ruling 2026-11-24) and each lane's arming condition
 // are owned by the caller.
 
-import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, EGRESS_SYSTEM_MSGID, sanitizeEgressIdentityMetadata, type EgressIdentityInput, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
+import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, EGRESS_SYSTEM_MSGID, sanitizeEgressIdentityMetadata, type EgressIdentityInput, type EgressOpLogStore } from "../storage/egress-record.js";
 import type { EgressBlockLedgerInput } from "../storage/egress-block.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { egressPlaneGateOn } from "../knobs.js";
@@ -327,7 +327,6 @@ export function recordAuthorityTurn(
     systemText: string,
     log: LaneLog,
     blockLedger?: EgressBlockLedgerInput,
-    refMap?: EgressRefMap,
 ): BiliMessage[] | null {
     if (outcome.recordCore === null) return null;
     try {
@@ -340,7 +339,6 @@ export function recordAuthorityTurn(
             systemText,
             nowMs: Date.now(),
             blockLedger,
-            refMap,
         });
     } catch (err) {
         if (err instanceof EgressConcurrentWriteError) {
@@ -356,12 +354,13 @@ export function recordAuthorityTurn(
 /**
  * #7439 follow-up (C6): egress-on sequence authority. For a session the
  * op log records, the FLOW is the transcript: each core carries its
- * canonical message number (egress_flow.log_seq — the renumbered citation
- * space: the system row is 0, the first real message 1) as `ledgerSeq`, the
- * same display space the kernel's refs/prune/sync/compress consume (CoreMessage
- * .ledgerSeq, refs #4316 L3). Block coordinates resolved from the same flow
- * (ingestSession) live in the identical space, so seq coverage, block
- * pruning and the ref ledger all line up without any conversion.
+ * canonical message number — 2026-11-28 (discussions/7903): that number
+ * IS the row's rid (one-shot, dense per session, the model-visible tag is
+ * "m" + rid) — as `ledgerSeq`, the same display space the kernel's
+ * refs/prune/sync/compress consume (CoreMessage .ledgerSeq, refs #4316 L3).
+ * Block coordinates resolved from the same flow (ingestSession) live in
+ * the identical space, so seq coverage, block pruning and the ref ledger
+ * all line up without any conversion.
  *
  * A core not yet in the flow (fresh this turn) is left un-stamped — its
  * number exists only after recordEgressTurn assigns it, and the id path
@@ -384,7 +383,7 @@ export function stampEgressSeqs(
     if (view.length === 0) return msgs as BiliMessage[];
     const byId = new Map<string, number>();
     for (const row of view) {
-        if (row.msgid !== EGRESS_SYSTEM_MSGID && row.num > 0) byId.set(row.msgid, row.num);
+        if (row.msgid !== EGRESS_SYSTEM_MSGID && typeof row.rid === "number" && row.rid > 0) byId.set(row.msgid, row.rid);
     }
     if (byId.size === 0) return msgs as BiliMessage[];
     let touched = false;

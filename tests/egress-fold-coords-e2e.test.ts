@@ -38,7 +38,7 @@ import { peekSession } from "../src/session.ts";
 const MODEL = "fold-coords-model";
 const SID = "fold-coords-sess";
 const WINDOW = 100_000;
-const FOLD_N = 15; // d0..d14 get folded (flow numbers 5..19); d15..d29 stay as the recency buffer
+const FOLD_N = 15; // d0..d14 get folded (rids 6..20); d15..d29 stay as the recency buffer
 
 function listen(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();
@@ -139,8 +139,8 @@ test("egress flow: a fold carries its EXACT flow-space coordinates through the r
         const v1 = live().filter((v) => v.msgid !== "egress-system");
         assert.deepEqual(v1.map((v) => v.msgid), ["c0", "c1", "c2", "c3"], `the pinned ids are the flow (${v1.map((v) => v.msgid).join(",")})`);
         const sys = live().find((v) => v.msgid === "egress-system");
-        assert.equal(sys?.num, 0, `the system row holds num 0 (got ${sys?.num})`);
-        assert.deepEqual(v1.map((v) => v.num), [1, 2, 3, 4], `messages are numbered in the citation space right after the system row (got ${v1.map((v) => v.num).join(",")})`);
+        assert.equal(sys?.rid, 1, `the system row takes its own rid 1 (2026-11-28: no reserved 0) (got ${sys?.rid})`);
+        assert.deepEqual(v1.map((v) => v.rid), [2, 3, 4, 5], `messages take the next fresh rids after the system row (got ${v1.map((v) => v.rid).join(",")})`);
 
         // ---- turn 2: the full history arrives; the MODEL asks for a fold --
         // (a real switching/compacting host relays the model's compress
@@ -172,15 +172,15 @@ test("egress flow: a fold carries its EXACT flow-space coordinates through the r
         assert.equal(fold.status, 200, `plugin tool channel fold -> ${fold.status}: ${foldText.slice(0, 300)}`);
         await settle();
 
-        // The fold covered d0..d14 — whose FLOW numbers are 5..19
-        // (system=0, c0..c3 = 1..4, d0 = m00005 = 5). The kernel attested exactly
+        // The fold covered d0..d14 — whose rids are 6..20
+        // (system=1, c0..c3 = 2..5, d0 = m00006 = 6). The kernel attested exactly
         // that interval onto the block when it executed the call on the
         // stamped cores. Pre-fix the same fold landed [-1,-1] because
         // those ids never existed in the frozen unified-index table.
         const v3 = live().filter((v) => v.msgid !== "egress-system");
-        const numOf = new Map(v3.map((v) => [v.msgid, v.num]));
-        assert.equal(numOf.get("d0"), 5, `d0 holds flow number 5 (got ${numOf.get("d0")})`);
-        assert.equal(numOf.get("d14"), 19, `d14 holds flow number 19 (got ${numOf.get("d14")})`);
+        const numOf = new Map(v3.map((v) => [v.msgid, v.rid]));
+        assert.equal(numOf.get("d0"), 6, `d0 holds rid 6 (got ${numOf.get("d0")})`);
+        assert.equal(numOf.get("d14"), 20, `d14 holds rid 20 (got ${numOf.get("d14")})`);
 
         // While the plane is ON the session's live authority is the kernel
         // state itself (the unified-index projection is FROZEN — #7474 P2):
@@ -192,8 +192,8 @@ test("egress flow: a fold carries its EXACT flow-space coordinates through the r
         if (kernelBlocks.length === 0 || (kernelBlocks[0]?.startSeq ?? -1) < 1) {
             console.log("FOLD-COORDS-DEBUG kernel blocks:", JSON.stringify(kernelBlocks.map((b) => [b.blockId, b.startSeq, b.endSeq, b.active, b.directMessageIds?.length])));
         }
-        const kblk = kernelBlocks.find((b) => b.startSeq === 5 && b.endSeq === 19);
-        assert.ok(kblk, `the fold attested the EXACT flow-space interval of d0..d14 — [5,19] (kernel blocks: ${JSON.stringify(kernelBlocks.map((b) => [b.blockId, b.startSeq, b.endSeq]))})`);
+        const kblk = kernelBlocks.find((b) => b.startSeq === 6 && b.endSeq === 20);
+        assert.ok(kblk, `the fold attested the EXACT flow-space interval of d0..d14 — [6,20] (kernel blocks: ${JSON.stringify(kernelBlocks.map((b) => [b.blockId, b.startSeq, b.endSeq]))})`);
         console.log(`  ✓ plugin-channel fold attested flow-space interval [${kblk.startSeq},${kblk.endSeq}] over ${kblk.directMessageIds.length} direct messages`);
 
         // ---- turn 3: the host resends the post-fold view (summary + tail) -
@@ -227,14 +227,14 @@ test("egress flow: a fold carries its EXACT flow-space coordinates through the r
         };
         const rows = readBlocksTable();
         assert.ok(rows.length >= 1, `the rollback re-ingest kept the fold block in the blocks table (rows: ${JSON.stringify(rows)})`);
-        assert.ok(rows.some((r) => r.start_seq === 5 && r.end_seq === 19), `the table row carries the SAME flow-space coordinates the fold attested ([5,19]; rows: ${JSON.stringify(rows)})`);
+        assert.ok(rows.some((r) => r.start_seq === 6 && r.end_seq === 20), `the table row carries the SAME flow-space coordinates the fold attested ([6,20]; rows: ${JSON.stringify(rows)})`);
         console.log(`  ✓ rollback re-ingest: blocks table keeps the flow-space coordinates (${JSON.stringify(rows)})`);
         const eview = [...(store!.egressOpLogStore()!.egressBlockView(SID).values())];
         if (eview.length === 0) {
             console.log("FOLD-COORDS-DEBUG egressBlockView empty | logs:", logs.filter((l) => /fold|compress|block|ingest|egress/i.test(l)).slice(-12).join(" | ").slice(0, 1400));
         }
-        const blk = eview.find((b) => b.startSeq === 5 && b.endSeq === 19);
-        assert.ok(blk, `the rollback unified save landed the fold block in the egress block table with the SAME flow-space coordinates ([5,19]; egress blocks: ${JSON.stringify(eview.map((b) => [b.startMsgid, b.startSeq, b.endMsgid, b.endSeq]))})`);
+        const blk = eview.find((b) => b.startSeq === 6 && b.endSeq === 20);
+        assert.ok(blk, `the rollback unified save landed the fold block in the egress block table with the SAME flow-space coordinates ([6,20]; egress blocks: ${JSON.stringify(eview.map((b) => [b.startMsgid, b.startSeq, b.endMsgid, b.endSeq]))})`);
     } finally {
         process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
         setLogCapture(null);

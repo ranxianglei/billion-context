@@ -248,7 +248,7 @@ test("#7658 T2: mid-history fork — child's first turn converges one D-run, log
         const ustore = h.store.egressOpLogStore();
         assert(ustore, "unified egress op-log store present");
         const parentView = ustore.egressStateView("p2");
-        const parentHighWater = Math.max(...parentView.map((r) => r.num));
+        const parentHighWater = Math.max(...parentView.map((r) => r.rid!));
         // view index 0 is the system row; the 3-cell prefix is indices 1-3
         // (p2-id-0..2), so the dropped tail starts at index 4.
         const tailMsgids = new Set(parentView.slice(4).map((r) => r.msgid));
@@ -281,7 +281,7 @@ test("#7658 T2: mid-history fork — child's first turn converges one D-run, log
         for (const t of tailMsgids) assert(!childMsgids.has(t), `dropped parent tail msgid ${t} must not be live in the child`);
         assert.equal(childView.length, 5, "child view = system + 3-cell prefix + 1 new tail cell");
         assert(childMsgids.has("c2-new-0"), "the fresh tail cell rides its host id");
-        const nums = childView.map((r) => r.num).sort((a, b) => a - b);
+        const nums = childView.map((r) => r.rid!).sort((a, b) => a - b);
         for (const n of nums.slice(0, 3)) assert(n <= parentHighWater, `prefix numbers are inherited, not re-issued (${n})`);
         const fresh = nums[nums.length - 1]!;
         assert(fresh > parentHighWater, `new tail number ${fresh} continues strictly above the parent high water ${parentHighWater}`);
@@ -297,7 +297,7 @@ test("#7658 T2: mid-history fork — child's first turn converges one D-run, log
         // asserted on the log itself, not on captured strings.
         await turn(h.base, "c2", [...childMsgs, m("assistant", 7)], [...childIds, "c2-new-1"]);
         const childView2 = ustore.egressStateView("c2");
-        const num2 = childView2.find((r) => r.msgid === "c2-new-1")?.num;
+        const num2 = childView2.find((r) => r.msgid === "c2-new-1")?.rid;
         assert.equal(childView2.length, 6, "second turn adds exactly one cell");
         assert.equal(num2, fresh + 1, `the second tail cell takes the next number (${num2} after ${fresh})`);
     } finally {
@@ -402,7 +402,7 @@ test("#7658 T5: fork-then-compress — the child's client-side fold books correc
         await settle(h.store, "p5");
         const ustore = h.store.egressOpLogStore()!;
         const parentView = ustore.egressStateView("p5");
-        const parentHighWater = Math.max(...parentView.map((r) => r.num));
+        const parentHighWater = Math.max(...parentView.map((r) => r.rid!));
 
         const snap = await snapshot(h.origin, "p5");
         const { status, body } = await postFork(h.origin, {
@@ -425,7 +425,7 @@ test("#7658 T5: fork-then-compress — the child's client-side fold books correc
         assert.ok(liveIds.has("p5-id-0") && liveIds.has("p5-id-4"), "the uncovered head/tail cells survive the fold");
         const summaryRow = childView.find((r) => r.bytes.includes(T5_SUMMARY));
         assert(summaryRow, "the fold summary rides its own flow row");
-        assert(summaryRow!.num > parentHighWater, `summary number ${summaryRow!.num} continues above the parent high water ${parentHighWater}`);
+        assert(summaryRow!.rid! > parentHighWater, `summary number ${summaryRow!.rid} continues above the parent high water ${parentHighWater}`);
         for (const id of ["p5-id-1", "p5-id-2", "p5-id-3"]) assert(!liveIds.has(id), `covered cell ${id} must be retired from the child flow`);
 
         // 7773: the flow is a raw append-only dump — the fold's D ops stay in
@@ -446,8 +446,8 @@ test("#7658 T5: fork-then-compress — the child's client-side fold books correc
         const childView2 = ustore.egressStateView("c5");
         const row2 = childView2.find((r) => r.msgid === "c5-new-1");
         assert(row2, "the second turn cell landed");
-        const preTurn2Max = Math.max(...childView.map((r) => r.num));
-        assert.equal(row2!.num, preTurn2Max + 1, `the second cell takes the next flow number (${row2!.num} after ${preTurn2Max})`);
+        const preTurn2Max = Math.max(...childView.map((r) => r.rid!));
+        assert.equal(row2!.rid, preTurn2Max + 1, `the second cell takes the next flow number (${row2!.rid} after ${preTurn2Max})`);
 
         // Parent isolation holds through the fold too.
         assert.deepEqual(ustore.egressStateView("p5"), parentView, "parent flow untouched by the child fold");
@@ -501,7 +501,7 @@ test("#7658 T6: real client adoption — tryForkAdoption (the #2399 client half)
         // (stamped) bytes — flow is the content authority, so that is exactly
         // what the host holds after an adopted fork — plus the fresh tail.
         const before = ustore.egressStateMaxSeq("c6");
-        const inheritedMax = Math.max(...ustore.egressStateView("c6").map((r) => r.num ?? 0));
+        const inheritedMax = Math.max(...ustore.egressStateView("c6").map((r) => r.rid ?? 0));
         const childMsgs = [...snap.messages.map((row) => ({ role: row.role, content: row.text ?? "" })), m("user", 6)];
         await turn(h.base, "c6", childMsgs, [...snap.orderedMessages.map((o) => o.rawId), "c6-new-0"]);
         await settle(h.store, "c6");
@@ -511,7 +511,7 @@ test("#7658 T6: real client adoption — tryForkAdoption (the #2399 client half)
         // egress numbers are the same space now, so the kernel mints
         // highWater+1 (or the dense fallback does). The op_seq count
         // (before) is a different sequence and no longer predicts it.
-        assert.equal(v2.find((r) => r.msgid === "c6-new-0")?.num, inheritedMax + 1, `served from its own flow: one new number above the inherited high water ${inheritedMax}, no downgrade (op_seq at fork was ${before})`);
+        assert.equal(v2.find((r) => r.msgid === "c6-new-0")?.rid, inheritedMax + 1, `served from its own flow: one new number above the inherited high water ${inheritedMax}, no downgrade (op_seq at fork was ${before})`);
     } finally {
         await h.close(h.store);
     }
@@ -595,8 +595,8 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         const p7LedgerAfterFold = (await rawBlockRows(h.dir, "p7", "egress_block_flow")) as Array<{ row_type: string; block_id: string }>;
         assert(p7LedgerAfterFold.some((r) => r.row_type === "I" && r.block_id === "b1"), "the parent's fold turn books b1 into its block ledger");
         assert.deepEqual(await rawBlockRows(h.dir, "c7", "egress_block_flow"), c7Ledger, "the child ledger is untouched by the parent's fold");
-        const c7WatermarkAtFork = Math.max(...c7BeforeFold.map((r) => r.num));
-        const p7FoldNum = p7AfterFold.find((r) => r.msgid === "p7-fold-0")?.num;
+        const c7WatermarkAtFork = Math.max(...c7BeforeFold.map((r) => r.rid!));
+        const p7FoldNum = p7AfterFold.find((r) => r.msgid === "p7-fold-0")?.rid;
         assert(p7FoldNum !== undefined && p7FoldNum > c7WatermarkAtFork, `the post-fork parent summary takes a fresh number above the fork watermark (${p7FoldNum} > ${c7WatermarkAtFork})`);
         // 新会话不受原会话影响: the child is byte-for-byte the fork-time copy.
         assert.deepEqual(ustore.egressStateView("c7"), c7BeforeFold, "the parent's post-fork fold must not touch the child flow");
@@ -618,7 +618,7 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         const c7Live = new Set(c7AfterFold.map((r) => r.msgid));
         for (const gone of ["p7-id-1", "p7-id-2", "p7-id-3"]) assert(!c7Live.has(gone), `child covered cell ${gone} retired by its own fold`);
         assert(c7Live.has("c7-fold-0") && c7Live.has("c7-new-0"), "the child's fold and fresh cell book in its own flow");
-        const c7NewNum = c7AfterFold.find((r) => r.msgid === "c7-new-0")?.num;
+        const c7NewNum = c7AfterFold.find((r) => r.msgid === "c7-new-0")?.rid;
         assert(c7NewNum !== undefined && c7NewNum > c7WatermarkAtFork, `the child's fresh cell continues above the inherited watermark (${c7NewNum} > ${c7WatermarkAtFork})`);
         assert.deepEqual(ustore.egressStateView("p7"), p7FlowBeforeChildFold, "the child's fold must not touch the parent flow");
         assert(!peekSession("p7")!.state.blocks.some((b) => b.blockId === "b2"), "the child's own block b2 never leaks into the parent's block set");
@@ -684,7 +684,7 @@ test("#7658 T8: fork-after-fork — the grandchild inherits the whole chain", as
         await turn(h.base, "c8", c8Msgs, [...p8Ids, "c8-new-0"]);
         await settle(h.store, "c8");
         const c8View = ustore.egressStateView("c8");
-        assert.equal(c8View.find((r) => r.msgid === "c8-new-0")?.num, Math.max(...p8View.map((r) => r.num)) + 1, "c8's cell continues above the inherited number space");
+        assert.equal(c8View.find((r) => r.msgid === "c8-new-0")?.rid, Math.max(...p8View.map((r) => r.rid!)) + 1, "c8's cell continues above the inherited number space");
 
         // c8 → g8: MID-HISTORY fork (prefix = first 3 cells).
         const snapC8 = await snapshotFull(h.origin, "c8");
@@ -716,8 +716,8 @@ test("#7658 T8: fork-after-fork — the grandchild inherits the whole chain", as
         const g8View = ustore.egressStateView("g8");
         const g8Live = new Set(g8View.map((r) => r.msgid));
         for (const gone of ["p8-new-0", "c8-new-0"]) assert(!g8Live.has(gone), `tail cell ${gone} retired from g8 by the mid-history fork D-run`);
-        const c8NumHighWater = Math.max(...c8ViewAtG8Fork.map((r) => r.num));
-        assert.equal(g8View.find((r) => r.msgid === "g8-new-0")?.num, c8NumHighWater + 1, "g8's fresh cell continues strictly above c8's number high water at its fork time");
+        const c8NumHighWater = Math.max(...c8ViewAtG8Fork.map((r) => r.rid!));
+        assert.equal(g8View.find((r) => r.msgid === "g8-new-0")?.rid, c8NumHighWater + 1, "g8's fresh cell continues strictly above c8's number high water at its fork time");
         // Both ancestors untouched by the grandchild.
         assert.deepEqual(ustore.egressStateView("c8"), c8ViewAtG8Fork, "c8 untouched by g8's turn");
         assert.deepEqual(ustore.egressStateView("p8"), p8View, "p8 untouched by its descendants' turns");

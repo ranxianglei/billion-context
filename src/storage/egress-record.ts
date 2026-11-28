@@ -24,17 +24,22 @@
  * the cache anchor relies on, and a system change shows up as a +U on that
  * row — content identity is bytes, position/identity is the msgid).
  *
- * RENUMBER (2026-11-25, egress-plane.md §10): the row's canonical `num`
- * (stored as log_seq) IS the kernel citation number — mNNNNN = m + num —
- * stamped here from the session's refs ledger when the caller supplies it
- * (`refMap`); the constant system row is number 0, outside the citation
- * space, so it can never claim m00001 and every derived view (pin ledgers,
- * the kstate overlay rebuild) inherits that exclusion for free. The first
- * record pass of a session whose log is empty is the ARM-TIME BACKFILL: it
- * sees the whole conversation and I's every pre-existing message with its
- * existing number, so the op log becomes the complete history with no
- * separate migration (a log that lost rows re-I's whatever the diff sees
- * missing — the same mechanism self-heals a corrupted/truncated log).
+ * NUMBERING (2026-11-28 owner ruling, proposal discussions/7903 — replaces
+ * the 2026-11-25 renumber): the row's `rid` IS the message number — dense
+ * per session, one-shot, issued at I from the flow's MAX(rid) frontier
+ * (diffEgressView allocates it). The model sees "m" + rid, derived at
+ * render time (egress-block) and never stored. The old dual number
+ * (kernel refs-ledger citation num + dense fallback, re-citable by a fold)
+ * is GONE — it allowed a fold to re-cite a retired number onto a row that
+ * collided with a live row's number, corrupting the whole log (the
+ * 2026-11-28 incident). The kernel's refs ledger is rebuilt FROM the flow
+ * (rebuildEgressKstateOverlay), so every consumer lines up on the rid by
+ * construction. The first record pass of a session whose log is empty is
+ * the ARM-TIME BACKFILL: it sees the whole conversation and I's every
+ * pre-existing message with a fresh number, so the op log becomes the
+ * complete history with no separate migration (a log that lost rows
+ * re-I's whatever the diff sees missing — the same mechanism self-heals a
+ * corrupted/truncated log).
  */
 
 import { diffEgressView, EgressStateCorruptError, EGRESS_SYSTEM_MSGID, type EgressOp, type EgressViewRow } from "./egress-state.js";
@@ -61,25 +66,12 @@ export class EgressAuthorityRejectError extends Error {
  * here for the historical import path. */
 export { EGRESS_SYSTEM_MSGID } from "./egress-state.js";
 
-/** The session's kernel refs ledger (state.messageRefs.byRaw): rawId →
- * "mNNNNN". Renumber (2026-11-25): the citation source for I-row numbering.
- * Optional — a caller without it (tests, legacy legs) gets the dense
- * high-water+1 numbering for uncited rows. */
+/** 2026-11-28 (owner ruling, discussions/7903): the refs-ledger citation
+ * machinery is retired — the rid IS the message number (see the module
+ * header's NUMBERING paragraph). Kept as an empty marker type only for the
+ * import path; nothing reads it any more. */
 export interface EgressRefMap {
     byRaw?: Record<string, string>;
-}
-
-/** The kernel citation number of a message id: from the refs ledger first,
- * then a direct mNNNNN-shaped id (lanes that mint ids in kernel space). 0
- * = no citation known (the dense fallback applies). */
-// Internal: the caller (buildEgressViewRows, below) is the only consumer — the gate
-// (scripts/check-unused-exports.mjs) rejects file-scope exports without one.
-function citationNumber(id: string, refMap: EgressRefMap | undefined): number {
-    const direct = /^m\d{4,}$/.test(id) ? id : undefined;
-    const ref = refMap?.byRaw?.[id] ?? direct;
-    if (ref === undefined || ref === "") return 0;
-    const n = Number(ref.slice(1));
-    return Number.isInteger(n) && n > 0 ? n : 0;
 }
 
 /** Minimal structural shape — accepts both BiliMessage (wire sidecar) and
@@ -99,21 +91,18 @@ export interface EgressSourceMsg {
  * (byte-equal), which is what makes the next diff sparse. `tokens` is a
  * chars/4 estimate (it only needs to be stable while the content is
  * unchanged); `bytes` is the FINAL core JSON of the message — the same
- * bytes the serve path rebuilds from. Renumber (2026-11-25): each row's
- * `num` is its kernel citation number (from `refMap`; 0 = uncited → the
- * append's dense fallback) — the system row is ALWAYS 0 (outside the
- * citation space). */
+ * bytes the serve path rebuilds from. 2026-11-28 (discussions/7903): the
+ * rows carry NO number field — the rid (= the message number, the
+ * model-visible "m" + rid tag) is allocated by diffEgressView from the
+ * flow's frontier; there is no refs-ledger stamping any more. */
 export function buildEgressViewRows(
     conversation: readonly EgressSourceMsg[],
     systemText: string | undefined,
-    refMap?: EgressRefMap,
 ): EgressViewRow[] {
     const rows: EgressViewRow[] = [];
     if (systemText !== undefined && systemText.length > 0) {
         rows.push({
-            num: 0,
             msgid: EGRESS_SYSTEM_MSGID,
-            ref: "",
             tokens: Math.max(1, Math.ceil(systemText.length / 4)),
             type: "system",
             role: "system",
@@ -138,12 +127,10 @@ export function buildEgressViewRows(
         // the protocol (the client resends element ids) and shares one msgid
         // across a message's parts. The shared msgid is safe because
         // addressing is by rid and the diff is occurrence-aware (#7849/#7851).
-        // num/ref stay keyed on the core id (m.id): only the head part carries
-        // the message's citation/block-ref, exactly as before.
+        // 2026-11-28: no num/ref stamping — every part row gets its own rid
+        // (its own message number) exactly like the head part.
         rows.push({
-            num: citationNumber(m.id, refMap),
             msgid: elementOfCore(m.id).element,
-            ref: /^m\d{4,}$/.test(m.id) ? m.id : "",
             tokens: Math.max(1, Math.ceil(text.length / 4)),
             type: m.id.startsWith("acp_summary") ? "acp_summary" : m.role === "tool" ? "tool" : "text",
             role: m.role,
@@ -263,11 +250,12 @@ export function sanitizeEgressIdentityMetadata(metadata: Record<string, unknown>
  * degrade ladder (no fuzzy fallback, KDD discipline).
  *
  * Returns the STAMPED view — the replay of the log as the tables now hold
- * it, whose rows carry the canonical numbers (I rows: the number their
- * append assigned; spine rows: inherited). The client-built `next` (num 0
- * everywhere) is diff input only; nothing unnumbered ever leaves this
- * function. `baseSeq` belongs with a caller-supplied `prev` (the op_seq that
- * view was read at); without it the guard is off (single-writer callers). */
+ * it, whose rows carry their rids (2026-11-28: the rids ARE the message
+ * numbers — the model-visible tag is "m" + rid, derived at render time;
+ * nothing numbers a message anywhere else). The client-built `next` is
+ * diff input only. `baseSeq` belongs with a caller-supplied `prev` (the
+ * op_seq that view was read at); without it the guard is off
+ * (single-writer callers). */
 export function recordEgressTurn(args: {
     store: EgressOpLogStore;
     sessionId: string;
@@ -277,10 +265,6 @@ export function recordEgressTurn(args: {
     conversation: readonly EgressSourceMsg[];
     systemText: string | undefined;
     nowMs: number;
-    /** Kernel messageRefs.byRaw (rawId → "mNNNNN"). Renumber (2026-11-25):
-     *  citation source for I-row numbers; optional — a caller without it
-     *  (tests, pre-arm legs) gets dense high-water+1 numbers for uncited
-     *  rows. */
     refMap?: EgressRefMap;
     /** #7664 (PR-A): when present (the egress-on latch is set), the
      *  in-memory kernel block set is diffed into the block ledger AFTER the
@@ -288,7 +272,7 @@ export function recordEgressTurn(args: {
      *  sessions never run (their unified ingest is frozen). */
     blockLedger?: EgressBlockLedgerInput;
 }): EgressViewRow[] {
-    const { store, sessionId, conversation, systemText, nowMs, refMap } = args;
+    const { store, sessionId, conversation, systemText, nowMs } = args;
     let prev = args.prev;
     let baseSeq = args.baseSeq;
     if (prev === undefined) {
@@ -297,13 +281,12 @@ export function recordEgressTurn(args: {
         baseSeq = store.egressStateMaxSeq(sessionId);
         prev = store.egressStateView(sessionId);
     }
-    const next = buildEgressViewRows(conversation, systemText, refMap);
-    // trackNums: the next rows were stamped against the live refs ledger —
-    // a spine row's num change is a kernel citation-fact change (demote /
-    // re-cite / re-homing) and must reach the log as a +U carrying num.
-    // ridHighWater: row ids continue from the flow's MAX(rid) — ids never
-    // reuse (2026-11-27), a retired row's rid stays spent forever.
-    const ops = diffEgressView(prev, next, refMap !== undefined, store.egressStateMaxRid?.(sessionId) ?? 0);
+    const next = buildEgressViewRows(conversation, systemText);
+    // ridHighWater: row ids (2026-11-28: = message numbers) continue from
+    // the flow's MAX(rid) — ids never reuse, a retired row's rid stays
+    // spent forever, and an I takes a FRESH number above every number ever
+    // issued — the old cited-number collision class is impossible.
+    const ops = diffEgressView(prev, next, store.egressStateMaxRid?.(sessionId) ?? 0);
     let stamped: EgressViewRow[];
     if (ops.length === 0) {
         stamped = prev;

@@ -84,8 +84,8 @@ test("deleteSession cascades egress_state/egress_flow (plain rows, no CAS to rel
         const sid = "sess-egress-cascade";
 
         egressStateAppend(db, sid, [
-            { type: "I", rid: 1, msgid: "m1", after: null, ref: "", tokens: 5, typeTag: "text", bytes: '{"id":"m1","role":"user","text":"alpha"}', role: "user" },
-            { type: "I", rid: 2, msgid: "m2", after: 1, ref: "", tokens: 5, typeTag: "text", bytes: '{"id":"m2","role":"user","text":"beta"}', role: "user" },
+            { type: "I", rid: 1, msgid: "m1", after: null, tokens: 5, typeTag: "text", bytes: '{"id":"m1","role":"user","text":"alpha"}', role: "user" },
+            { type: "I", rid: 2, msgid: "m2", after: 1, tokens: 5, typeTag: "text", bytes: '{"id":"m2","role":"user","text":"beta"}', role: "user" },
             { type: "D", start: 1, end: 1 },
             { type: "U", rid: 2, msgid: "m2", bytes: '{"id":"m2","role":"user","text":"beta!"}', role: "user" },
         ], Date.now());
