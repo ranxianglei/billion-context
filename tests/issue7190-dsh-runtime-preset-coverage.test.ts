@@ -161,6 +161,62 @@ test("#7190: the wrap forwards to the original register with the registry as `th
     }
 });
 
+test("#7190: a cordis-proxy host whose uninjected service read throws must not fail the gate entry", () => {
+    try {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+        declareDshCompactionActive();
+        // A real cordis context is a proxy: reading a service this fiber does not
+        // inject throws "cannot get property ... without inject". This gate entry
+        // declares `inject: []`, so that read has to be optional — otherwise
+        // apply() dies and every preset row after it never registers.
+        const registry = { register: async (d: unknown) => d };
+        const unavailable = new Proxy({ on: () => {}, reflect: { provide: () => {} } }, {
+            get(target, prop, receiver) {
+                if (typeof prop !== "string" || prop in target) return Reflect.get(target, prop, receiver);
+                throw new Error(`cannot get property "${prop}" without inject`);
+            },
+        });
+        assert.doesNotThrow(() => registerCompactionDisable(unavailable as never));
+        assert.equal(dshCompactionGateTelemetry()?.runtimeWrapped, undefined, "no service → nothing to wrap, no claim");
+
+        const serving = new Proxy(
+            { on: () => {}, reflect: { provide: () => {} }, get: (service: string) => (service === "agentPresets" ? registry : undefined) },
+            {
+                get(target, prop, receiver) {
+                    if (typeof prop !== "string" || prop in target) return Reflect.get(target, prop, receiver);
+                    throw new Error(`cannot get property "${prop}" without inject`);
+                },
+            },
+        );
+        assert.doesNotThrow(() => registerCompactionDisable(serving as never));
+        assert.equal(dshCompactionGateTelemetry()?.runtimeWrapped, true, "the accessor finds the registry the property read cannot");
+    } finally {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+    }
+});
+
+test("#7190: a frozen host registry refuses the wrap without failing the gate entry", () => {
+    try {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+        declareDshCompactionActive();
+        const frozen = Object.freeze({ register: async (d: unknown) => d });
+        assert.doesNotThrow(() => installRuntimePresetCoverage({ agentPresets: frozen }));
+        assert.equal(dshCompactionGateTelemetry()?.runtimeWrapped, undefined, "a refused patch never claims coverage");
+        assert.equal(Object.isFrozen(frozen), true);
+
+        _resetDshCompactionGateTelemetryForTest();
+        const writable = { register: async (d: unknown) => d };
+        installRuntimePresetCoverage({ agentPresets: writable });
+        assert.equal(dshCompactionGateTelemetry()?.runtimeWrapped, true, "a writable registry still wraps");
+    } finally {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+    }
+});
+
 test("#7190: no registry / no register — install is a silent no-op (a host without the registry cannot runtime-register presets)", () => {
     try {
         _resetDshCompactionVerdictForTest();
