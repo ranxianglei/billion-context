@@ -569,31 +569,46 @@ export function estimateRawBodyTokens(parsed: unknown): number {
  *  oversized content" is actively misleading for a 55.2 MiB body whose
  *  messages[] is only 1.44 MiB. Same walk + same exclusions as
  *  estimateRawBodyTokens, split on the TOP-LEVEL field, so `total` always
- *  equals estimateRawBodyTokens(parsed) exactly. */
+ *  equals estimateRawBodyTokens(parsed) exactly.
+ *
+ *  #6876: the Responses lane carries the conversation in a top-level `input`
+ *  field (not `messages`), so it previously landed in the opaque `other`
+ *  bucket — the fuse refused a 1.07M-token Responses body as "other ~1,045,895"
+ *  with no way to see that the mass was the conversation + accumulated
+ *  `encrypted_content` (reasoning/compaction state blobs). `input` is now a
+ *  named bucket, and `encryptedContent` reports the `encrypted_content` leaves
+ *  inside it (a subset of `input`, diagnostics only — never part of `total`).
+ *  Privacy-safe: sizes only, no field contents. */
 export interface RawBodyBreakdown {
     total: number;
     messages: number;
     tools: number;
     system: number;
+    input: number;
     other: number;
+    encryptedContent: number;
 }
 
 export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
-    const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
+    const buckets: [number, number, number, number, number] = [0, 0, 0, 0, 0]; // messages, tools, system, input, other
+    let encryptedContent = 0;
     const pending: [unknown, string | undefined, number][] = [];
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
             if (isNonModelTopLevelKey(k)) continue;
-            const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
+            const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : k === "input" ? 3 : 4;
             pending.push([v, k, bucket]);
         }
     } else {
-        pending.push([parsed, undefined, 3]);
+        pending.push([parsed, undefined, 4]);
     }
     while (pending.length > 0) {
         const [value, key, bucket] = pending.pop()!;
         if (typeof value === "string") {
-            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) {
+                buckets[bucket] += defaultCountTokens(value);
+                if (key === "encrypted_content" && bucket === 3) encryptedContent += defaultCountTokens(value);
+            }
             continue;
         }
         if (Array.isArray(value)) {
@@ -605,11 +620,13 @@ export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
         }
     }
     return {
-        total: buckets[0] + buckets[1] + buckets[2] + buckets[3],
+        total: buckets[0] + buckets[1] + buckets[2] + buckets[3] + buckets[4],
         messages: buckets[0],
         tools: buckets[1],
         system: buckets[2],
-        other: buckets[3],
+        input: buckets[3],
+        other: buckets[4],
+        encryptedContent,
     };
 }
 

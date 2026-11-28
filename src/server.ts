@@ -3918,8 +3918,22 @@ interface MeasuredOutbound {
 // of the body carries the mass, so "trim the oversized content" tells the
 // operator WHERE (a 55.2 MiB #5000 body with 1.44 MiB of messages[] means the
 // mass is tools[], not a giant paste).
+// #6876: the Responses conversation rides a top-level `input` field, not
+// `messages` — name it (with its `encrypted_content` sub-mass) so a refused
+// Responses body says "input ~1,045,895 (enc ~600,000)" instead of an opaque
+// "other ~1,045,895". `input` is shown only when present (Chat bodies keep the
+// original four-bucket clause); sizes only, no field contents.
 export function measuredBreakdownClause(b: RawBodyBreakdown): string {
-    return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
+    const parts = [
+        `messages ~${b.messages.toLocaleString("en-US")}`,
+        `tools[] ~${b.tools.toLocaleString("en-US")}`,
+        `system ~${b.system.toLocaleString("en-US")}`,
+    ];
+    if (b.input > 0) {
+        parts.push(`input ~${b.input.toLocaleString("en-US")}` + (b.encryptedContent > 0 ? ` (enc ~${b.encryptedContent.toLocaleString("en-US")})` : ""));
+    }
+    parts.push(`other ~${b.other.toLocaleString("en-US")}`);
+    return parts.join(" · ");
 }
 
 export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {

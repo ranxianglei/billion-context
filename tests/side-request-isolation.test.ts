@@ -606,7 +606,7 @@ test("estimateRawBodyBreakdown: splits the same total on the top-level field (#5
     assert.ok(b.tools >= toolsMass, "tools[] mass lands in the tools bucket");
     assert.ok(b.messages >= defaultCountTokens("m".repeat(1_000)), "message text lands in the messages bucket");
     assert.ok(b.system >= defaultCountTokens("s".repeat(1_000)), "system text lands in the system bucket");
-    assert.equal(b.total, b.messages + b.tools + b.system + b.other, "buckets are exhaustive");
+    assert.equal(b.total, b.messages + b.tools + b.system + b.input + b.other, "buckets are exhaustive");
     // the #5000 shape: a body whose mass rides tools[] — the doom message must
     // be able to name THAT dimension, not "trim the oversized content".
     assert.ok(b.tools > b.messages + b.system + b.other, "tools-dominant body reports tools-dominant");
