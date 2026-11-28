@@ -2661,9 +2661,9 @@ export async function handlePluginTool(
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
-            if (nativeCaller && tool === retrieveToolName(session) && typeof args.ref === "string") {
+            if (nativeCaller && toolResult.outcome === "success" && tool === retrieveToolName(session) && typeof args.ref === "string") {
                 // Preserve the session's export before a same-ref concurrent lookup.
-                const retrieved = applyRetrieve({ store: contentStoreOf(session), ref: args.ref, exportDir: path.join(stateDir(), "retrieve") });
+                const retrieved = applyRetrieve({ store: contentStoreOf(session), ref: toolResult.retrievalRef ?? args.ref, exportDir: path.join(stateDir(), "retrieve") });
                 if (retrieved.ok && retrieved.toolResultText === toolResult.text) retrievalExport = retrieved.export;
             }
             const creditDelta = (session.stats.compressCreditTokens ?? 0) - creditBefore;

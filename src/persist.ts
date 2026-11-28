@@ -2084,6 +2084,19 @@ export class SessionStore {
         try {
             const seqByRawId = this.unifiedSeqByRaw(session.id);
             if (seqByRawId === null || seqByRawId.size === 0) return;
+            // A block already published its citations before this first-fold
+            // save. Keep both the message and its occupied slot: removing just
+            // its own move still lets a different ledger row displace it.
+            const folded = new Set<string>();
+            for (const block of state.blocks) {
+                for (const raw of block.effectiveMessageIds ?? []) folded.add(raw);
+            }
+            for (const [raw, seq] of seqByRawId) {
+                const target = "m" + String(seq + 1).padStart(5, "0");
+                if (state.messageRefs.byRaw[raw] === target) continue;
+                const occupant = state.messageRefs.byRef[target];
+                if (folded.has(raw) || (occupant !== undefined && folded.has(occupant))) seqByRawId.delete(raw);
+            }
             const outcome = restampRefsToLedger(state, seqByRawId);
             // #4733: the ref restamp alone leaves the CCR content store keyed by
             // store-time refs — a stored original would sit under a number the
@@ -2134,6 +2147,7 @@ export class SessionStore {
                 }
             }
             state.refLedgerAligned = true;
+            session.metadata.foldedCitationsPreserved = true;
             this.log("info", `[persist] ledger-aligned refs for ${session.id}: kept=${outcome.kept} restamped=${outcome.restamped} rehomed=${outcome.rehomed} blocked=${outcome.blocked} superseded=${outcome.superseded.size} (#4316 PR3/3)`);
             this.scheduleSave(session);
         } catch (err) {
